@@ -27,7 +27,19 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+
+static NEXT_NETWORK_MODULE_ROUTING_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_network_module_routing_generation() -> u64 {
+    NEXT_NETWORK_MODULE_ROUTING_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+            Some(generation.saturating_add(1))
+        })
+        .unwrap_or_else(|generation| generation)
+        .saturating_add(1)
+}
 
 /// Boxed future returned by network-module dial operations. `'static` so the
 /// host can spawn or hold the dial without borrowing the module call site.
@@ -236,11 +248,23 @@ pub struct NetworkModuleStatus {
 pub struct NetworkModuleRegistry {
     entries: ArcSwap<BTreeMap<String, Arc<NetworkModuleEntry>>>,
     mutate: Mutex<()>,
+    routing_generation: AtomicU64,
 }
 
 impl NetworkModuleRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn advance_routing_generation(&self) {
+        self.routing_generation
+            .store(next_network_module_routing_generation(), Ordering::Release);
+    }
+
+    /// Monotonic process-local generation of this registry's role and
+    /// outbound-dialer configuration.
+    pub fn routing_generation(&self) -> u64 {
+        self.routing_generation.load(Ordering::Acquire)
     }
 
     /// Registers (or replaces) `module` under its descriptor id.
@@ -268,9 +292,14 @@ impl NetworkModuleRegistry {
             .mutate
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Fence readers on both sides of the independent ArcSwap publication:
+        // an in-flight route may linearize before or after this mutation, but a
+        // prepared connector can never retain the same generation across it.
+        self.advance_routing_generation();
         let mut entries = BTreeMap::clone(&self.entries.load());
         entries.insert(descriptor.id.clone(), entry);
         self.entries.store(Arc::new(entries));
+        self.advance_routing_generation();
         descriptor
     }
 
@@ -305,6 +334,7 @@ impl NetworkModuleRegistry {
             });
         }
         let publish = |started: bool| {
+            self.advance_routing_generation();
             let mut updated = BTreeMap::clone(&entries);
             updated.insert(
                 id.to_string(),
@@ -317,6 +347,7 @@ impl NetworkModuleRegistry {
                 }),
             );
             self.entries.store(Arc::new(updated));
+            self.advance_routing_generation();
         };
         let started = if enabled {
             match &entry.context {
@@ -395,6 +426,7 @@ impl NetworkModuleRegistry {
         let entries = self.entries.load();
         let mut updated = BTreeMap::clone(&entries);
         let mut attempts = Vec::new();
+        let mut started_changed = false;
         for (id, entry) in entries.iter() {
             let should_start = entry.enabled && !entry.started;
             let started = if should_start {
@@ -405,6 +437,7 @@ impl NetworkModuleRegistry {
             } else {
                 entry.started
             };
+            started_changed |= started != entry.started;
             updated.insert(
                 id.clone(),
                 Arc::new(NetworkModuleEntry {
@@ -416,7 +449,13 @@ impl NetworkModuleRegistry {
                 }),
             );
         }
+        if started_changed {
+            self.advance_routing_generation();
+        }
         self.entries.store(Arc::new(updated));
+        if started_changed {
+            self.advance_routing_generation();
+        }
         attempts
     }
 
@@ -446,64 +485,86 @@ impl NetworkModuleRegistry {
         })
     }
 
+    fn selected_dialer_entry_for_endpoint(
+        &self,
+        endpoint: &ClusterEndpointRecord,
+    ) -> Option<Arc<NetworkModuleEntry>> {
+        let entries = self.entries.load();
+        entries
+            .values()
+            .find(|entry| {
+                entry.enabled
+                    && entry.descriptor.dialer
+                    && entry.descriptor.transports.contains(&endpoint.transport)
+            })
+            .cloned()
+            .or_else(|| {
+                let scheme = endpoint_address_scheme(&endpoint.address)?;
+                entries
+                    .values()
+                    .find(|entry| {
+                        entry.enabled
+                            && entry.descriptor.dialer
+                            && entry
+                                .descriptor
+                                .address_schemes
+                                .iter()
+                                .any(|candidate| candidate.eq_ignore_ascii_case(scheme))
+                    })
+                    .cloned()
+            })
+    }
+
     /// Enabled dialer module claiming this endpoint by transport or address
-    /// scheme. Scheme dispatch remains useful for module-defined transports
-    /// represented by a generic transport kind.
+    /// scheme. Selection is deterministic by module id (the registry's map
+    /// order), with an exact transport claim preferred over a scheme claim.
+    /// Scheme dispatch remains useful for module-defined transports represented
+    /// by a generic transport kind.
     pub fn module_for_endpoint(
         &self,
         endpoint: &ClusterEndpointRecord,
     ) -> Option<Arc<dyn NetworkModule>> {
-        self.module_for_transport(&endpoint.transport).or_else(|| {
-            endpoint_address_scheme(&endpoint.address)
-                .and_then(|scheme| self.module_for_address_scheme(scheme))
-        })
+        self.selected_dialer_entry_for_endpoint(endpoint)
+            .map(|entry| entry.module.clone())
     }
 
-    /// Role classification for `endpoint`, when a registered module claims
-    /// either its transport kind or its address scheme.
+    /// Role classification from the exact enabled dialer selected for
+    /// `endpoint`. A disabled, listener-only, or lower-priority claimant must
+    /// not lend process-role authority to another module's connection.
     pub fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
-        self.entries
-            .load()
-            .values()
-            .find_map(|entry| {
-                let claims_transport = entry.descriptor.transports.contains(&endpoint.transport);
-                let claims_scheme =
-                    endpoint_address_scheme(&endpoint.address).is_some_and(|scheme| {
-                        entry
-                            .descriptor
-                            .address_schemes
-                            .iter()
-                            .any(|candidate| candidate.eq_ignore_ascii_case(scheme))
-                    });
-                if !claims_transport && !claims_scheme {
-                    return None;
-                }
-                match entry.module.endpoint_role(endpoint) {
-                    NetworkModuleEndpointRole::Unknown => None,
-                    role => Some(role),
-                }
-            })
+        self.selected_dialer_entry_for_endpoint(endpoint)
+            .map(|entry| entry.module.endpoint_role(endpoint))
             .unwrap_or(NetworkModuleEndpointRole::Unknown)
     }
 
     /// Returns the transport principal expected for a claimed endpoint.
     pub fn endpoint_transport_identity(&self, endpoint: &ClusterEndpointRecord) -> Option<String> {
-        self.entries.load().values().find_map(|entry| {
-            if !entry.enabled || !entry.started {
-                return None;
-            }
-            let claims_transport = entry.descriptor.transports.contains(&endpoint.transport);
-            let claims_scheme = endpoint_address_scheme(&endpoint.address).is_some_and(|scheme| {
+        self.selected_dialer_entry_for_endpoint(endpoint)
+            .filter(|entry| entry.started)
+            .and_then(|entry| entry.module.endpoint_transport_identity(endpoint))
+    }
+
+    fn authenticated_transport_metadata_matches_endpoint(
+        &self,
+        metadata: &AuthenticatedTransportMetadata,
+        endpoint: &ClusterEndpointRecord,
+    ) -> bool {
+        if metadata.transport != endpoint.transport {
+            return false;
+        }
+        self.selected_dialer_entry_for_endpoint(endpoint)
+            .filter(|entry| entry.started)
+            .is_some_and(|entry| {
                 entry
-                    .descriptor
-                    .address_schemes
-                    .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(scheme))
-            });
-            (claims_transport || claims_scheme)
-                .then(|| entry.module.endpoint_transport_identity(endpoint))
-                .flatten()
-        })
+                    .module
+                    .endpoint_transport_identity(endpoint)
+                    .is_some_and(|identity| {
+                        identity == metadata.peer_transport_identity
+                            && entry
+                                .module
+                                .verify_authenticated_transport_metadata(metadata)
+                    })
+            })
     }
 
     /// The module registered under `id`, regardless of enabled state (for
@@ -566,12 +627,21 @@ static NETWORK_MODULE_REGISTRY: LazyLock<ArcSwap<Option<Arc<NetworkModuleRegistr
 /// built-in transports dial (same provider pattern as
 /// [`crate::set_cluster_directory_provider`]).
 pub fn set_network_module_registry(registry: Arc<NetworkModuleRegistry>) {
+    registry.advance_routing_generation();
     NETWORK_MODULE_REGISTRY.store(Arc::new(Some(registry)));
 }
 
 /// The process-wide network-module registry, when one has been installed.
 pub fn network_module_registry() -> Option<Arc<NetworkModuleRegistry>> {
     NETWORK_MODULE_REGISTRY.load().as_ref().clone()
+}
+
+/// Routing generation of the currently installed module registry, or zero
+/// before any registry is installed.
+pub fn network_module_routing_generation() -> u64 {
+    network_module_registry()
+        .map(|registry| registry.routing_generation())
+        .unwrap_or(0)
 }
 
 /// Checks transport-authenticated ingress metadata and its module-owned proof
@@ -581,19 +651,9 @@ pub fn authenticated_transport_metadata_matches_endpoint(
     metadata: &AuthenticatedTransportMetadata,
     endpoint: &ClusterEndpointRecord,
 ) -> bool {
-    if metadata.transport != endpoint.transport {
-        return false;
-    }
-    network_module_registry()
-        .and_then(|registry| registry.module_for_endpoint(endpoint))
-        .is_some_and(|module| {
-            module
-                .endpoint_transport_identity(endpoint)
-                .is_some_and(|identity| {
-                    identity == metadata.peer_transport_identity
-                        && module.verify_authenticated_transport_metadata(metadata)
-                })
-        })
+    network_module_registry().is_some_and(|registry| {
+        registry.authenticated_transport_metadata_matches_endpoint(metadata, endpoint)
+    })
 }
 
 /// Returns the scheme of an address like `scheme://rest`. Scheme validation is
@@ -616,6 +676,7 @@ pub(crate) fn endpoint_address_scheme(address: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DirectStreamCapabilities;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TestModule {
@@ -686,6 +747,70 @@ mod tests {
         }
     }
 
+    struct ClaimingTestModule {
+        descriptor: NetworkModuleDescriptor,
+        role: NetworkModuleEndpointRole,
+        transport_identity: String,
+        accepted_proof: Vec<u8>,
+    }
+
+    impl ClaimingTestModule {
+        fn new(
+            id: &str,
+            dialer: bool,
+            role: NetworkModuleEndpointRole,
+            transport_identity: &str,
+            accepted_proof: &[u8],
+        ) -> Self {
+            Self {
+                descriptor: NetworkModuleDescriptor {
+                    id: id.to_string(),
+                    transports: vec![ClusterTransportKind::WebRtc],
+                    address_schemes: vec!["mesh".to_string()],
+                    dialer,
+                    listener: !dialer,
+                    supports_runtime_toggle: true,
+                },
+                role,
+                transport_identity: transport_identity.to_string(),
+                accepted_proof: accepted_proof.to_vec(),
+            }
+        }
+    }
+
+    impl NetworkModule for ClaimingTestModule {
+        fn descriptor(&self) -> NetworkModuleDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn start(&self, _ctx: &NetworkModuleContext) -> Result<(), NetworkError> {
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), NetworkError> {
+            Ok(())
+        }
+
+        fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+            Ok(Vec::new())
+        }
+
+        fn endpoint_role(&self, _endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+            self.role
+        }
+
+        fn endpoint_transport_identity(&self, _endpoint: &ClusterEndpointRecord) -> Option<String> {
+            Some(self.transport_identity.clone())
+        }
+
+        fn verify_authenticated_transport_metadata(
+            &self,
+            metadata: &AuthenticatedTransportMetadata,
+        ) -> bool {
+            metadata.transport_proof == self.accepted_proof
+        }
+    }
+
     fn test_context() -> NetworkModuleContext {
         NetworkModuleContext {
             cluster_root: PathBuf::from("cluster"),
@@ -743,9 +868,13 @@ mod tests {
             vec![ClusterTransportKind::WebRtc],
             vec!["mesh"],
         ));
+        let before_register = registry.routing_generation();
         registry.register(module.clone(), Some(test_context()), true, true);
+        assert!(registry.routing_generation() > before_register);
 
+        let before_disable = registry.routing_generation();
         let disabled = registry.set_enabled("mesh", false).expect("disable");
+        assert!(registry.routing_generation() > before_disable);
         assert!(!disabled.enabled);
         assert!(!disabled.started);
         assert_eq!(module.stops.load(Ordering::SeqCst), 1);
@@ -768,7 +897,9 @@ mod tests {
         registry.set_enabled("mesh", false).expect("disable again");
         assert_eq!(module.stops.load(Ordering::SeqCst), 1);
 
+        let before_enable = registry.routing_generation();
         let enabled = registry.set_enabled("mesh", true).expect("enable");
+        assert!(registry.routing_generation() > before_enable);
         assert!(enabled.enabled);
         assert!(enabled.started);
         assert_eq!(module.starts.load(Ordering::SeqCst), 1);
@@ -834,6 +965,38 @@ mod tests {
     }
 
     #[test]
+    fn first_successful_start_advances_routing_generation_but_context_refresh_does_not() {
+        let registry = NetworkModuleRegistry::new();
+        registry.register(
+            Arc::new(TestModule::new(
+                "mesh",
+                vec![ClusterTransportKind::WebRtc],
+                vec!["mesh"],
+            )),
+            None,
+            true,
+            false,
+        );
+        let before_start = registry.routing_generation();
+        let attempts = registry.provide_context_and_start_enabled(&test_context());
+        assert_eq!(attempts.len(), 1);
+        assert!(attempts[0].1.is_ok());
+        assert!(registry.routing_generation() > before_start);
+
+        let after_start = registry.routing_generation();
+        assert!(
+            registry
+                .provide_context_and_start_enabled(&test_context())
+                .is_empty()
+        );
+        assert_eq!(
+            registry.routing_generation(),
+            after_start,
+            "refreshing context on an already-started module must not churn route caches"
+        );
+    }
+
+    #[test]
     fn registry_classifies_module_endpoint_roles() {
         let registry = NetworkModuleRegistry::new();
         registry.register(
@@ -868,6 +1031,114 @@ mod tests {
         assert_eq!(
             registry.endpoint_role(&shadow),
             NetworkModuleEndpointRole::ShadowDaemon
+        );
+    }
+
+    #[test]
+    fn endpoint_authority_comes_only_from_the_selected_enabled_dialer() {
+        let registry = NetworkModuleRegistry::new();
+        registry.register(
+            Arc::new(ClaimingTestModule::new(
+                "a-disabled",
+                true,
+                NetworkModuleEndpointRole::MainDaemon,
+                "disabled-principal",
+                b"disabled-proof",
+            )),
+            None,
+            false,
+            false,
+        );
+        registry.register(
+            Arc::new(ClaimingTestModule::new(
+                "b-listener-only",
+                false,
+                NetworkModuleEndpointRole::MainDaemon,
+                "listener-principal",
+                b"listener-proof",
+            )),
+            None,
+            true,
+            true,
+        );
+        registry.register(
+            Arc::new(ClaimingTestModule::new(
+                "c-selected",
+                true,
+                NetworkModuleEndpointRole::Unknown,
+                "selected-principal",
+                b"selected-proof",
+            )),
+            None,
+            true,
+            true,
+        );
+        registry.register(
+            Arc::new(ClaimingTestModule::new(
+                "d-alternate",
+                true,
+                NetworkModuleEndpointRole::ShadowDaemon,
+                "alternate-principal",
+                b"alternate-proof",
+            )),
+            None,
+            true,
+            true,
+        );
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: sinomo_base::Id::generate(),
+            node_id: NodeId::from_legacy_named("node_network_module_claimant_test")
+                .expect("node id"),
+            transport: ClusterTransportKind::WebRtc,
+            address: "mesh://claimed-endpoint".to_string(),
+            source: sinomo_base::ClusterEndpointSource::Rendezvous,
+            privacy: sinomo_base::ClusterEndpointPrivacy::Relayed,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        assert_eq!(
+            registry
+                .module_for_endpoint(&endpoint)
+                .expect("selected dialer")
+                .descriptor()
+                .id,
+            "c-selected"
+        );
+        assert_eq!(
+            registry.endpoint_role(&endpoint),
+            NetworkModuleEndpointRole::Unknown,
+            "an alternate claimant must not lend its positive process role to the selected dialer"
+        );
+        assert_eq!(
+            registry.endpoint_transport_identity(&endpoint).as_deref(),
+            Some("selected-principal")
+        );
+
+        let selected_metadata = AuthenticatedTransportMetadata::try_new(
+            ClusterTransportKind::WebRtc,
+            "selected-principal",
+            [1; 32],
+            b"selected-proof".to_vec(),
+            DirectStreamCapabilities::multiplexed_full_duplex(1),
+        )
+        .expect("selected metadata");
+        assert!(
+            registry
+                .authenticated_transport_metadata_matches_endpoint(&selected_metadata, &endpoint)
+        );
+        let alternate_metadata = AuthenticatedTransportMetadata::try_new(
+            ClusterTransportKind::WebRtc,
+            "alternate-principal",
+            [2; 32],
+            b"alternate-proof".to_vec(),
+            DirectStreamCapabilities::multiplexed_full_duplex(1),
+        )
+        .expect("alternate metadata");
+        assert!(
+            !registry
+                .authenticated_transport_metadata_matches_endpoint(&alternate_metadata, &endpoint),
+            "transport identity and proof must be verified by the same selected claimant"
         );
     }
 

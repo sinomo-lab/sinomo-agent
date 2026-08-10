@@ -15,14 +15,47 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 const PREPARED_ROUTE_CACHE_TTL: Duration = Duration::from_secs(1);
+const MAX_STABLE_ROUTE_CAPTURE_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PreparedRouteCacheKey {
     cluster_root: PathBuf,
     local_node_id: NodeId,
+    directory_identity: RouteDirectoryCacheIdentity,
     directory_generation: u64,
+    module_generation: u64,
     connect_timeout: Duration,
     no_progress_timeout: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RouteDirectoryCacheIdentity {
+    Dynamic,
+    FencedBootstrap([u8; 32]),
+}
+
+impl RouteDirectoryCacheIdentity {
+    fn effective_generation(self, dynamic_generation: u64) -> u64 {
+        match self {
+            Self::Dynamic => dynamic_generation,
+            // The full fingerprint already namespaces both prepared connectors
+            // and pooled carriers. Keep the numeric generation stable across
+            // unrelated Raft terms/revisions so those hot objects are not
+            // needlessly churned.
+            Self::FencedBootstrap(_) => 0,
+        }
+    }
+
+    fn routed_stream_scope(self, cluster_id: &sinomo_node::ClusterId) -> String {
+        match self {
+            Self::Dynamic => cluster_id.to_string(),
+            Self::FencedBootstrap(fingerprint) => format!(
+                "{}:fenced-bootstrap:{}",
+                cluster_id,
+                blake3::Hash::from_bytes(fingerprint).to_hex()
+            ),
+        }
+    }
 }
 
 struct PreparedRouteCacheEntry {
@@ -34,13 +67,20 @@ static PREPARED_ROUTE_CACHE: LazyLock<
     Mutex<BTreeMap<PreparedRouteCacheKey, PreparedRouteCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+fn prepared_route_cache_entry<'a, T>(
+    cache: &'a BTreeMap<PreparedRouteCacheKey, T>,
+    key: &PreparedRouteCacheKey,
+) -> Option<&'a T> {
+    cache.get(key)
+}
+
 fn prepared_route_cache_get(
     key: &PreparedRouteCacheKey,
 ) -> Option<Arc<crate::MultiHopRoutedConnector>> {
     let now = Instant::now();
     let mut cache = PREPARED_ROUTE_CACHE.lock().ok()?;
     cache.retain(|_, entry| entry.valid_until > now);
-    cache.get(key).map(|entry| Arc::clone(&entry.connector))
+    prepared_route_cache_entry(&cache, key).map(|entry| Arc::clone(&entry.connector))
 }
 
 fn prepared_route_cache_insert(
@@ -55,7 +95,9 @@ fn prepared_route_cache_insert(
         entry.valid_until > now
             && (candidate.cluster_root != key.cluster_root
                 || candidate.local_node_id != key.local_node_id
-                || candidate.directory_generation >= key.directory_generation)
+                || candidate.directory_identity != key.directory_identity
+                || (candidate.module_generation, candidate.directory_generation)
+                    >= (key.module_generation, key.directory_generation))
     });
     cache.insert(
         key,
@@ -64,6 +106,62 @@ fn prepared_route_cache_insert(
             valid_until: now + PREPARED_ROUTE_CACHE_TTL,
         },
     );
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn prepared_dynamic_route_cache_key_for_test(
+    cluster_root: PathBuf,
+    local_node_id: NodeId,
+    directory_generation: u64,
+    module_generation: u64,
+) -> PreparedRouteCacheKey {
+    PreparedRouteCacheKey {
+        cluster_root,
+        local_node_id,
+        directory_identity: RouteDirectoryCacheIdentity::Dynamic,
+        directory_generation,
+        module_generation,
+        connect_timeout: Duration::from_millis(251),
+        no_progress_timeout: Duration::from_millis(997),
+    }
+}
+
+/// Test-support seam for proving that a changed dynamic directory or local
+/// module generation cannot reuse a connector already resident in the real
+/// prepared-route cache.
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_dynamic_route_cache_insert_for_test(
+    cluster_root: PathBuf,
+    local_node_id: NodeId,
+    directory_generation: u64,
+    module_generation: u64,
+    connector: Arc<crate::MultiHopRoutedConnector>,
+) {
+    prepared_route_cache_insert(
+        prepared_dynamic_route_cache_key_for_test(
+            cluster_root,
+            local_node_id,
+            directory_generation,
+            module_generation,
+        ),
+        connector,
+    );
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn prepared_dynamic_route_cache_contains_for_test(
+    cluster_root: PathBuf,
+    local_node_id: NodeId,
+    directory_generation: u64,
+    module_generation: u64,
+) -> bool {
+    prepared_route_cache_get(&prepared_dynamic_route_cache_key_for_test(
+        cluster_root,
+        local_node_id,
+        directory_generation,
+        module_generation,
+    ))
+    .is_some()
 }
 
 fn record_routed_rpc_timeline_stage(
@@ -498,6 +596,15 @@ impl ClusterObjectRpcOptions {
         self
     }
 
+    /// Returns the caller's whole-call budget, when one was requested.
+    ///
+    /// Stream-native callers consume a returned body under their own domain
+    /// lifetime. Compatibility callers that fold that body back into one
+    /// response must use this budget around both the call and materialization.
+    pub const fn overall_timeout(self) -> Option<Duration> {
+        self.overall_timeout
+    }
+
     /// Selects end-to-end routed-session protection for this call's reusable
     /// carrier. Plaintext is the default; AEAD must be requested explicitly.
     pub fn with_routed_session_protection(
@@ -520,8 +627,9 @@ impl ClusterObjectRpcOptions {
         self
     }
 
-    fn requested_overall_timeout(self) -> Option<Duration> {
-        self.overall_timeout
+    /// Returns the destination-process requirement for node-targeted calls.
+    pub const fn destination_process_affinity(self) -> crate::DestinationProcessAffinity {
+        self.destination_process_affinity
     }
 
     fn call_policy(self) -> NetworkCallPolicy {
@@ -704,9 +812,175 @@ fn cluster_endpoint_rpc_elapsed_latency_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ClusterObjectRpcRouteContext<'a> {
     paths: &'a ClusterPaths,
+    directory: ClusterObjectRpcRouteDirectory,
+}
+
+#[derive(Clone)]
+enum ClusterObjectRpcRouteDirectory {
+    Dynamic,
+    FencedBootstrap {
+        directory: Arc<dyn crate::ClusterDirectory>,
+        cluster_id: sinomo_node::ClusterId,
+        local_node_id: NodeId,
+        fingerprint: [u8; 32],
+    },
+}
+
+fn update_fenced_route_fingerprint_field(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn update_fenced_route_fingerprint_value<T: serde::Serialize>(
+    hasher: &mut blake3::Hasher,
+    value: &T,
+) -> Result<(), NetworkError> {
+    let encoded = serde_json::to_vec(value).map_err(|source| NetworkError::Serialization {
+        detail: format!("serialize fenced bootstrap routing field: {source}"),
+    })?;
+    update_fenced_route_fingerprint_field(hasher, &encoded);
+    Ok(())
+}
+
+fn fenced_bootstrap_endpoint_fingerprint(
+    endpoint: &ClusterEndpointRecord,
+) -> Result<[u8; 32], NetworkError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.fenced-bootstrap.endpoint.v1");
+    for value in [
+        endpoint.endpoint_id.as_str(),
+        endpoint.node_id.as_str(),
+        endpoint.address.as_str(),
+    ] {
+        update_fenced_route_fingerprint_field(&mut hasher, value.as_bytes());
+    }
+    update_fenced_route_fingerprint_value(&mut hasher, &endpoint.transport)?;
+    update_fenced_route_fingerprint_value(&mut hasher, &endpoint.source)?;
+    update_fenced_route_fingerprint_value(&mut hasher, &endpoint.privacy)?;
+    hasher.update(&endpoint.priority.to_le_bytes());
+    // `last_observed_latency_ms` is transient observation data and is not
+    // consumed by the immutable directory route planner. It must not rotate a
+    // fenced carrier scope.
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn fenced_bootstrap_member_fingerprint(
+    member: &sinomo_base::ClusterMemberRecord,
+) -> Result<[u8; 32], NetworkError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.fenced-bootstrap.member.v1");
+    for value in [
+        member.cluster_id.as_str(),
+        member.node_id.as_str(),
+        member.node_public_key.as_str(),
+    ] {
+        update_fenced_route_fingerprint_field(&mut hasher, value.as_bytes());
+    }
+    update_fenced_route_fingerprint_value(&mut hasher, &member.node_role)?;
+    update_fenced_route_fingerprint_value(&mut hasher, &member.role)?;
+    update_fenced_route_fingerprint_value(&mut hasher, &member.state)?;
+
+    let mut capabilities = member
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>();
+    capabilities.sort_unstable();
+    hasher.update(&(capabilities.len() as u64).to_le_bytes());
+    for capability in capabilities {
+        update_fenced_route_fingerprint_field(&mut hasher, capability.as_bytes());
+    }
+    let mut allowed_capabilities = member
+        .allowed_capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>();
+    allowed_capabilities.sort_unstable();
+    hasher.update(&(allowed_capabilities.len() as u64).to_le_bytes());
+    for capability in allowed_capabilities {
+        update_fenced_route_fingerprint_field(&mut hasher, capability.as_bytes());
+    }
+
+    let mut endpoints = member
+        .endpoints
+        .iter()
+        .map(fenced_bootstrap_endpoint_fingerprint)
+        .collect::<Result<Vec<_>, _>>()?;
+    endpoints.sort_unstable();
+    hasher.update(&(endpoints.len() as u64).to_le_bytes());
+    for endpoint in endpoints {
+        hasher.update(&endpoint);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn fenced_bootstrap_route_fingerprint(
+    state: &ClusterBootstrapState,
+) -> Result<[u8; 32], NetworkError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.fenced-bootstrap.route.v1");
+    for value in [state.cluster_id.as_str(), state.local_node_id.as_str()] {
+        update_fenced_route_fingerprint_field(&mut hasher, value.as_bytes());
+    }
+    let mut members = state
+        .members
+        .iter()
+        .filter(|member| member.state.is_authorized())
+        .map(fenced_bootstrap_member_fingerprint)
+        .collect::<Result<Vec<_>, _>>()?;
+    members.sort_unstable();
+    hasher.update(&(members.len() as u64).to_le_bytes());
+    for member in members {
+        hasher.update(&member);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+impl ClusterObjectRpcRouteContext<'_> {
+    fn directory(
+        &self,
+        state: &ClusterBootstrapState,
+    ) -> Result<
+        (
+            Arc<dyn crate::ClusterDirectory>,
+            RouteDirectoryCacheIdentity,
+        ),
+        NetworkError,
+    > {
+        match &self.directory {
+            ClusterObjectRpcRouteDirectory::Dynamic => Ok((
+                crate::cluster_directory_with_bootstrap_state(
+                    crate::cluster_directory_for(self.paths),
+                    state,
+                ),
+                RouteDirectoryCacheIdentity::Dynamic,
+            )),
+            ClusterObjectRpcRouteDirectory::FencedBootstrap {
+                directory,
+                cluster_id,
+                local_node_id,
+                fingerprint,
+            } => {
+                if cluster_id != &state.cluster_id
+                    || local_node_id != &state.local_node_id
+                    || *fingerprint != fenced_bootstrap_route_fingerprint(state)?
+                {
+                    return Err(NetworkError::Directory {
+                        detail:
+                            "fenced bootstrap route context does not match the call's cluster state"
+                                .to_string(),
+                    });
+                }
+                Ok((
+                    Arc::clone(directory),
+                    RouteDirectoryCacheIdentity::FencedBootstrap(*fingerprint),
+                ))
+            }
+        }
+    }
 }
 
 /// Cluster object-RPC client facade.
@@ -732,8 +1006,41 @@ impl<'a, H: ClusterObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
     pub fn routed(host: &'a mut H, paths: &'a ClusterPaths) -> Self {
         Self {
             host,
-            route_context: Some(ClusterObjectRpcRouteContext { paths }),
+            route_context: Some(ClusterObjectRpcRouteContext {
+                paths,
+                directory: ClusterObjectRpcRouteDirectory::Dynamic,
+            }),
         }
+    }
+
+    /// Build a routed client from one already-authoritative bootstrap-state
+    /// fence, without consulting the process-wide cluster directory.
+    ///
+    /// This path is for consensus and state-authority operations whose caller
+    /// already carries an accepted voter/member view (for example Raft control
+    /// messages, ReadIndex probes, and authoritative KV forwarding). Ordinary
+    /// member/application routing without such a fence should use
+    /// [`Self::routed`] so it sees the reactive KV-backed projection.
+    pub fn routed_from_fenced_bootstrap_state(
+        host: &'a mut H,
+        paths: &'a ClusterPaths,
+        state: &ClusterBootstrapState,
+    ) -> Result<Self, NetworkError> {
+        let fingerprint = fenced_bootstrap_route_fingerprint(state)?;
+        Ok(Self {
+            host,
+            route_context: Some(ClusterObjectRpcRouteContext {
+                paths,
+                directory: ClusterObjectRpcRouteDirectory::FencedBootstrap {
+                    directory: crate::directory::cluster_directory_from_fenced_bootstrap_state(
+                        state,
+                    ),
+                    cluster_id: state.cluster_id.clone(),
+                    local_node_id: state.local_node_id.clone(),
+                    fingerprint,
+                },
+            }),
+        })
     }
 }
 
@@ -755,7 +1062,7 @@ where
     ) -> Result<ObjectRpcResult, NetworkError> {
         let started = Instant::now();
         let request_head_bytes = call.request.body.len();
-        let deadline = ClusterEndpointRpcDeadline::new(options.requested_overall_timeout());
+        let deadline = ClusterEndpointRpcDeadline::new(options.overall_timeout());
         let timeout_error = deadline.timeout_error(
             "cluster endpoint object RPC",
             NetworkTimeoutPhase::Overall,
@@ -780,7 +1087,8 @@ where
         deadline: ClusterEndpointRpcDeadline,
     ) -> Result<ObjectRpcResult, NetworkError> {
         prepare_call_for_active_network_timeline(&mut call);
-        let data_dir = cluster_paths_data_dir(self.route_context.map(|context| context.paths))?;
+        let data_dir =
+            cluster_paths_data_dir(self.route_context.as_ref().map(|context| context.paths))?;
         let policy = options.call_policy();
         let directory = crate::DirectorySnapshot::try_from_records(
             crate::DirectoryVersion(0),
@@ -900,7 +1208,7 @@ where
     ) -> Result<ObjectRpcResult, NetworkError> {
         let started = Instant::now();
         let request_head_bytes = call.request.body.len();
-        let deadline = ClusterEndpointRpcDeadline::new(options.requested_overall_timeout());
+        let deadline = ClusterEndpointRpcDeadline::new(options.overall_timeout());
         let timeout_error = deadline.timeout_error(
             "local object RPC",
             NetworkTimeoutPhase::Overall,
@@ -1000,13 +1308,14 @@ where
         mut call: ObjectRpcCall,
         options: ClusterObjectRpcOptions,
     ) -> Result<ObjectRpcResult, NetworkError> {
-        let Some(context) = self.route_context else {
+        let Some(context) = self.route_context.clone() else {
             return Err(NetworkError::Io {
                 operation: "cluster target object RPC call".to_string(),
                 detail: "cluster target RPC call requires a route context".to_string(),
             });
         };
-        let route_timeout = options.requested_overall_timeout();
+        let (directory, directory_identity) = context.directory(state)?;
+        let route_timeout = options.overall_timeout();
         let deadline = ClusterEndpointRpcDeadline::new(route_timeout);
         let timeout_error = cluster_target_rpc_timeout_error(
             target_node_id,
@@ -1018,6 +1327,8 @@ where
         cluster_object_rpc_call_with_deadline(
             self.call_target_stream_native(
                 context.paths,
+                directory,
+                directory_identity,
                 state,
                 target_node_id,
                 call,
@@ -1033,6 +1344,8 @@ where
     async fn call_target_stream_native(
         &mut self,
         paths: &ClusterPaths,
+        directory: Arc<dyn crate::ClusterDirectory>,
+        directory_identity: RouteDirectoryCacheIdentity,
         state: &ClusterBootstrapState,
         target_node_id: &NodeId,
         call: ObjectRpcCall,
@@ -1047,37 +1360,47 @@ where
         }
         let policy = options.call_policy();
         let trace = crate::network_timeline_trace_context_for_request(&call.request);
-        let directory = crate::cluster_directory_with_bootstrap_state(
-            crate::cluster_directory_for(paths),
-            state,
-        );
         let snapshot_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let routing_version_result = directory.routing_version();
-        record_routed_rpc_timeline_stage(
-            trace,
-            crate::network_timeline_stage::ROUTE_SNAPSHOT,
-            snapshot_started_ns,
-            routing_version_result.is_ok(),
-        );
-        let routing_version = routing_version_result?;
-        let initial_cache_key = PreparedRouteCacheKey {
-            cluster_root: paths.root.clone(),
-            local_node_id: state.local_node_id.clone(),
-            directory_generation: routing_version.0,
-            connect_timeout: policy.health.connect_timeout,
-            no_progress_timeout: policy.health.no_progress_timeout,
-        };
         let prepare_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let prepared = if let Some(connector) = prepared_route_cache_get(&initial_cache_key) {
-            Ok((connector, routing_version.0))
-        } else {
-            (|| {
+        let mut route_snapshot_succeeded = false;
+        let prepared = (|| {
+            for _ in 0..MAX_STABLE_ROUTE_CAPTURE_ATTEMPTS {
+                // The module registry is a process-local route-realization
+                // input, independent of the distributed directory revision.
+                // Fence it around both cache lookup and snapshot construction
+                // so a connector can never combine a pre-registry directory
+                // capture with post-registry planning.
+                let module_generation = crate::network_module_routing_generation();
+                let routing_version = directory.routing_version()?;
+                route_snapshot_succeeded = true;
+                if crate::network_module_routing_generation() != module_generation {
+                    continue;
+                }
+                let cache_generation = directory_identity.effective_generation(routing_version.0);
+                let initial_cache_key = PreparedRouteCacheKey {
+                    cluster_root: paths.root.clone(),
+                    local_node_id: state.local_node_id.clone(),
+                    directory_identity,
+                    directory_generation: cache_generation,
+                    module_generation,
+                    connect_timeout: policy.health.connect_timeout,
+                    no_progress_timeout: policy.health.no_progress_timeout,
+                };
+                if let Some(connector) = prepared_route_cache_get(&initial_cache_key) {
+                    if crate::network_module_routing_generation() == module_generation {
+                        return Ok((connector, cache_generation, module_generation));
+                    }
+                    continue;
+                }
+
                 let (directory_version, members, endpoints, directory_connectivity) =
                     directory.routing_records_snapshot()?.into_parts();
+                let captured_directory_generation =
+                    directory_identity.effective_generation(directory_version.0);
                 let directory_snapshot = crate::DirectorySnapshot::try_from_records(
                     directory_version,
                     members,
@@ -1124,21 +1447,37 @@ where
                     provider,
                     identity,
                 )?);
+                if crate::network_module_routing_generation() != module_generation {
+                    continue;
+                }
                 let cache_key = PreparedRouteCacheKey {
-                    directory_generation: directory_version.0,
+                    directory_generation: captured_directory_generation,
                     ..initial_cache_key
                 };
                 prepared_route_cache_insert(cache_key, Arc::clone(&connector));
-                Ok((connector, directory_version.0))
-            })()
-        };
+                if crate::network_module_routing_generation() == module_generation {
+                    return Ok((connector, captured_directory_generation, module_generation));
+                }
+            }
+            Err(NetworkError::Directory {
+                detail:
+                    "network module registry changed repeatedly while capturing a routed connector"
+                        .to_string(),
+            })
+        })();
+        record_routed_rpc_timeline_stage(
+            trace,
+            crate::network_timeline_stage::ROUTE_SNAPSHOT,
+            snapshot_started_ns,
+            route_snapshot_succeeded,
+        );
         record_routed_rpc_timeline_stage(
             trace,
             crate::network_timeline_stage::ROUTE_PREPARE,
             prepare_started_ns,
             prepared.is_ok(),
         );
-        let (connector, directory_generation) = prepared?;
+        let (connector, directory_generation, module_generation) = prepared?;
         let connect_timeout = match deadline.checked_remaining() {
             Some(Some(remaining)) => remaining.min(policy.health.connect_timeout),
             Some(None) => policy.health.connect_timeout,
@@ -1155,8 +1494,15 @@ where
         let open_started_ns = trace
             .map(|_| crate::network_timeline_monotonic_ns())
             .unwrap_or(0);
-        let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_and_destination_process_affinity(
-            state.cluster_id.to_string(),
+        if crate::network_module_routing_generation() != module_generation {
+            return Err(NetworkError::Directory {
+                detail: "network module registry changed after capturing a routed connector"
+                    .to_string(),
+            });
+        }
+        let stream_result = crate::routed_stream_pool::open_pooled_routed_stream_with_protection_destination_affinity_and_route_compatibility(
+            directory_identity.routed_stream_scope(&state.cluster_id),
+            module_generation,
             directory_generation,
             constraints,
             destination_process_affinity,
@@ -1285,6 +1631,326 @@ fn cluster_target_rpc_timeout_error(
 mod tests {
     use super::*;
     use crate::ObjectRpcRequest;
+
+    struct NoopObjectRpcHost;
+
+    impl ClusterObjectRpcAsyncHost for NoopObjectRpcHost {}
+
+    struct PanickingRouteDirectory;
+
+    impl crate::ClusterDirectory for PanickingRouteDirectory {
+        fn members(&self) -> Result<Vec<sinomo_base::ClusterMemberRecord>, NetworkError> {
+            panic!("registered dynamic directory must not serve a fenced route")
+        }
+
+        fn endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+            panic!("registered dynamic directory must not serve a fenced route")
+        }
+
+        fn node_statuses(
+            &self,
+        ) -> Result<BTreeMap<NodeId, sinomo_base::ClusterNodeStatusRecord>, NetworkError> {
+            panic!("registered dynamic directory must not serve a fenced route")
+        }
+
+        fn connectivity_records(
+            &self,
+        ) -> Result<Vec<crate::ClusterConnectivityRecord>, NetworkError> {
+            panic!("registered dynamic directory must not serve a fenced route")
+        }
+
+        fn version(&self) -> Result<crate::DirectoryVersion, NetworkError> {
+            panic!("registered dynamic directory must not serve a fenced route")
+        }
+    }
+
+    struct RegisteredDirectoryActivation(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for RegisteredDirectoryActivation {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn fenced_bootstrap_route_never_consults_registered_directory() {
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let _activation = RegisteredDirectoryActivation(Arc::clone(&active));
+        let owner_thread = std::thread::current().id();
+        crate::set_cluster_directory_provider(Arc::new(move |_| {
+            if active.load(std::sync::atomic::Ordering::Acquire)
+                && std::thread::current().id() == owner_thread
+            {
+                Arc::new(PanickingRouteDirectory)
+            } else {
+                Arc::new(crate::EmptyClusterDirectory)
+            }
+        }));
+
+        let cluster_id = sinomo_base::Id::from_legacy_named("fenced-route-provider-cluster")
+            .expect("cluster id");
+        let local_node_id = sinomo_base::Id::from_legacy_named("fenced-route-provider-local")
+            .expect("local node id");
+        let target_node_id = sinomo_base::Id::from_legacy_named("fenced-route-provider-target")
+            .expect("target node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "fenced-route-provider",
+            local_node_id,
+            "local",
+            "local-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let mut target = sinomo_base::ClusterMemberRecord::local_voter(
+            cluster_id,
+            target_node_id.clone(),
+            "target",
+            "target-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let target_endpoint =
+            ClusterEndpointRecord::loopback(target_node_id.clone(), "127.0.0.1:45679");
+        target.endpoints.push(target_endpoint.clone());
+        state.members.push(target);
+        state.kv_revision = 41;
+
+        let root = PathBuf::from("/test/fenced-route-provider");
+        let paths = ClusterPaths {
+            state: root.join("state.sobj"),
+            connectivity_local: root.join("connectivity-local.sobj"),
+            root,
+        };
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::cluster_directory_for(&paths)
+                    .routing_version()
+                    .expect("registered dynamic directory version")
+            }))
+            .is_err(),
+            "the fixture must install a provider whose directory methods panic"
+        );
+
+        let mut host = NoopObjectRpcHost;
+        let client =
+            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(&mut host, &paths, &state)
+                .expect("fenced routed client");
+        let context = client.route_context.expect("fenced route context");
+        let (directory, identity) = context.directory(&state).expect("fenced route directory");
+        assert!(matches!(
+            identity,
+            RouteDirectoryCacheIdentity::FencedBootstrap(_)
+        ));
+        let (version, members, endpoints, connectivity) = directory
+            .routing_records_snapshot()
+            .expect("fenced routing snapshot must bypass registered provider")
+            .into_parts();
+        assert!(connectivity.is_empty());
+        let snapshot = crate::DirectorySnapshot::try_from_records(version, members, endpoints)
+            .expect("fenced directory snapshot");
+        assert_eq!(
+            snapshot
+                .node(&target_node_id)
+                .expect("fenced target member")
+                .endpoints,
+            vec![target_endpoint]
+        );
+    }
+
+    #[test]
+    fn fenced_route_cache_rejects_colliding_dynamic_generation() {
+        let common = |directory_identity| PreparedRouteCacheKey {
+            cluster_root: PathBuf::from("/test/fenced-route-cache"),
+            local_node_id: NodeId::from_legacy_named("fenced-route-cache-local")
+                .expect("local node id"),
+            directory_identity,
+            directory_generation: 41,
+            module_generation: 7,
+            connect_timeout: Duration::from_millis(250),
+            no_progress_timeout: Duration::from_secs(1),
+        };
+        let dynamic_key = common(RouteDirectoryCacheIdentity::Dynamic);
+        let fenced_key = common(RouteDirectoryCacheIdentity::FencedBootstrap([0x5a; 32]));
+        let mut cache = BTreeMap::new();
+        cache.insert(dynamic_key, "dynamic connector");
+
+        assert!(prepared_route_cache_entry(&cache, &fenced_key).is_none());
+        assert_ne!(
+            RouteDirectoryCacheIdentity::Dynamic.routed_stream_scope(
+                &sinomo_node::ClusterId::from_legacy_named("fenced-route-cache-cluster")
+                    .expect("cluster id")
+            ),
+            RouteDirectoryCacheIdentity::FencedBootstrap([0x5a; 32]).routed_stream_scope(
+                &sinomo_node::ClusterId::from_legacy_named("fenced-route-cache-cluster")
+                    .expect("cluster id")
+            ),
+            "a fenced call must not reuse a dynamic pooled carrier when numeric generations collide"
+        );
+    }
+
+    #[test]
+    fn prepared_route_cache_rejects_a_module_transition_at_the_same_directory_generation() {
+        let key = |module_generation| PreparedRouteCacheKey {
+            cluster_root: PathBuf::from("/test/module-route-cache"),
+            local_node_id: NodeId::from_legacy_named("module-route-cache-local")
+                .expect("local node id"),
+            directory_identity: RouteDirectoryCacheIdentity::Dynamic,
+            directory_generation: 41,
+            module_generation,
+            connect_timeout: Duration::from_millis(250),
+            no_progress_timeout: Duration::from_secs(1),
+        };
+        let mut cache = BTreeMap::new();
+        cache.insert(key(7), "pre-transition connector");
+
+        assert!(
+            prepared_route_cache_entry(&cache, &key(8)).is_none(),
+            "a registry change between routing_version and cache lookup must not hit the old connector"
+        );
+    }
+
+    #[test]
+    fn fenced_route_identity_tracks_only_canonical_routing_projection() {
+        let cluster_id = sinomo_base::Id::from_legacy_named("fenced-route-identity-cluster")
+            .expect("cluster id");
+        let local_node_id = sinomo_base::Id::from_legacy_named("fenced-route-identity-local")
+            .expect("local node id");
+        let target_node_id = sinomo_base::Id::from_legacy_named("fenced-route-identity-target")
+            .expect("target node id");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "fenced-route-identity",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        let mut target = sinomo_base::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            target_node_id.clone(),
+            "target",
+            "target-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        target.capabilities = vec![
+            sinomo_base::CapabilityName::new("service.write").expect("write capability"),
+            sinomo_base::CapabilityName::new("service.read").expect("read capability"),
+        ];
+        target.allowed_capabilities = vec![
+            sinomo_base::CapabilityName::new("route.relay").expect("relay capability"),
+            sinomo_base::CapabilityName::new("route.direct").expect("direct capability"),
+        ];
+        target.endpoints = vec![
+            ClusterEndpointRecord::loopback(target_node_id.clone(), "127.0.0.1:45681"),
+            ClusterEndpointRecord::loopback(target_node_id.clone(), "127.0.0.1:45680"),
+        ];
+        state.members.push(target);
+        state.kv_revision = 7;
+        let stable_fingerprint = fenced_bootstrap_route_fingerprint(&state).expect("fingerprint");
+
+        let mut non_routing_update = state.clone();
+        non_routing_update.cluster_name = "renamed-display-only".to_string();
+        non_routing_update.local_node_display_name = "renamed-local".to_string();
+        non_routing_update.term = 99;
+        non_routing_update.kv_revision = 10_000;
+        non_routing_update.initialized_at += time::Duration::days(1);
+        non_routing_update.updated_at += time::Duration::days(2);
+        for member in &mut non_routing_update.members {
+            member.display_name.push_str("-renamed");
+            member.joined_at += time::Duration::hours(1);
+            member.updated_at += time::Duration::hours(2);
+            member.capabilities.reverse();
+            member.allowed_capabilities.reverse();
+            member.endpoints.reverse();
+            for endpoint in &mut member.endpoints {
+                endpoint.last_observed_latency_ms = Some(42);
+            }
+        }
+        non_routing_update.members.reverse();
+        let pending = sinomo_base::ClusterMemberRecord::pending_learner(
+            cluster_id.clone(),
+            sinomo_base::Id::from_legacy_named("fenced-route-identity-pending")
+                .expect("pending node id"),
+            "pending",
+            "pending-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        non_routing_update.members.push(pending);
+
+        let stable_after_non_routing = fenced_bootstrap_route_fingerprint(&non_routing_update)
+            .expect("non-routing fingerprint");
+        assert_eq!(stable_after_non_routing, stable_fingerprint);
+        let original_identity = RouteDirectoryCacheIdentity::FencedBootstrap(stable_fingerprint);
+        let updated_identity =
+            RouteDirectoryCacheIdentity::FencedBootstrap(stable_after_non_routing);
+        assert_eq!(
+            original_identity.routed_stream_scope(&cluster_id),
+            updated_identity.routed_stream_scope(&cluster_id)
+        );
+        assert_eq!(
+            original_identity.effective_generation(state.kv_revision),
+            updated_identity.effective_generation(non_routing_update.kv_revision)
+        );
+        let cache_key = |state: &ClusterBootstrapState,
+                         directory_identity: RouteDirectoryCacheIdentity| {
+            PreparedRouteCacheKey {
+                cluster_root: PathBuf::from("/test/fenced-route-stable-cardinality"),
+                local_node_id: state.local_node_id.clone(),
+                directory_identity,
+                directory_generation: directory_identity.effective_generation(state.kv_revision),
+                module_generation: 7,
+                connect_timeout: Duration::from_millis(250),
+                no_progress_timeout: Duration::from_secs(1),
+            }
+        };
+        let mut cache = BTreeMap::new();
+        cache.insert(cache_key(&state, original_identity), "original connector");
+        cache.insert(
+            cache_key(&non_routing_update, updated_identity),
+            "reused connector",
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "non-routing churn must retain one cache key"
+        );
+
+        let mut endpoint_changed = state.clone();
+        endpoint_changed
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node_id)
+            .expect("target member")
+            .endpoints[0]
+            .address = "127.0.0.1:55681".to_string();
+        assert_ne!(
+            fenced_bootstrap_route_fingerprint(&endpoint_changed).expect("endpoint fingerprint"),
+            stable_fingerprint
+        );
+
+        let mut key_changed = state.clone();
+        key_changed
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node_id)
+            .expect("target member")
+            .node_public_key = "rotated-target-public-key".to_string();
+        assert_ne!(
+            fenced_bootstrap_route_fingerprint(&key_changed).expect("key fingerprint"),
+            stable_fingerprint
+        );
+
+        let mut config_changed = state.clone();
+        config_changed
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == target_node_id)
+            .expect("target member")
+            .role = sinomo_base::ClusterMemberRole::Learner;
+        assert_ne!(
+            fenced_bootstrap_route_fingerprint(&config_changed).expect("config fingerprint"),
+            stable_fingerprint
+        );
+    }
 
     #[test]
     fn cluster_rpc_protection_is_plaintext_unless_explicitly_enabled() {

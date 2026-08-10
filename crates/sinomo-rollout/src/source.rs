@@ -88,6 +88,31 @@ pub fn rollout_source_head(repo: &Path) -> Result<String, RolloutError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Resolve a full or abbreviated Git object name to its unique canonical
+/// commit. Git performs the abbreviation ambiguity check; callers must not
+/// treat a textual prefix match as artifact identity.
+pub fn resolve_rollout_source_commit(repo: &Path, revision: &str) -> Result<String, RolloutError> {
+    let revision = revision.trim();
+    if revision.len() < 7 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!("rollout source revision {revision:?} is not a Git commit id"),
+        });
+    }
+    let commit = format!("{revision}^{{commit}}");
+    let resolved = git_one_line(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &commit],
+    )?;
+    if resolved.len() < 40 || !resolved.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(RolloutError::InvalidArtifact {
+            detail: format!(
+                "rollout source revision {revision:?} resolved to invalid commit {resolved:?}"
+            ),
+        });
+    }
+    Ok(resolved.to_ascii_lowercase())
+}
+
 pub fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
     let Some(actual) = actual else {
         return false;
@@ -1176,6 +1201,44 @@ mod tests {
     }
 
     #[test]
+    fn source_commit_resolution_is_unambiguous_across_lengths_and_synthetic_heads() {
+        let root = unique_temp("sinomo-rollout-source-commit-resolution");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        run_git_for_test(&repo, &["init"]);
+        run_git_for_test(&repo, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&repo, &["config", "user.name", "Sinomo Test"]);
+        fs::write(repo.join("tracked.txt"), "first\n").expect("tracked file");
+        run_git_for_test(&repo, &["add", "tracked.txt"]);
+        run_git_for_test(&repo, &["commit", "-m", "initial"]);
+
+        let full = git_one_line(&repo, &["rev-parse", "HEAD"]).expect("full head");
+        assert_eq!(
+            resolve_rollout_source_commit(&repo, &full[..8]).expect("unique 8-char head"),
+            full
+        );
+        assert_eq!(
+            resolve_rollout_source_commit(&repo, &full[..12]).expect("unique 12-char head"),
+            full
+        );
+        assert_eq!(
+            resolve_rollout_source_commit(&repo, &full).expect("full head"),
+            full
+        );
+
+        fs::write(repo.join("tracked.txt"), "synthetic snapshot\n").expect("dirty tracked file");
+        let synthetic = git_one_line(&repo, &["stash", "create", "rollout snapshot"])
+            .expect("synthetic snapshot commit");
+        assert!(!synthetic.is_empty());
+        assert_eq!(
+            resolve_rollout_source_commit(&repo, &synthetic[..12])
+                .expect("synthetic commit remains resolvable"),
+            synthetic
+        );
+        assert!(resolve_rollout_source_commit(&repo, "unknown").is_err());
+    }
+
+    #[test]
     fn rollout_build_args_use_source_packages() {
         let module = SelfRolloutNativeDylibModuleBuild {
             package: "sinomo-test-module".to_string(),
@@ -1287,8 +1350,15 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
+        let expected_commit =
+            rollout_build_commit_override(&root).expect("rollout build commit override");
 
         assert!(!envs.contains_key("CARGO_INCREMENTAL"));
+        assert_eq!(
+            envs.get(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV),
+            Some(&Some(expected_commit)),
+            "the daemon status commit must describe the selected rollout source HEAD"
+        );
         assert_eq!(
             envs.get("CARGO_TARGET_DIR"),
             Some(&Some(target_dir.display().to_string()))
@@ -1477,6 +1547,71 @@ mod tests {
         let status = managed_source_status(&paths).expect("status");
 
         assert_eq!(status.head.as_deref(), Some(expected_head.as_str()));
+        assert!(!status.has_external_remotes);
+    }
+
+    #[test]
+    fn deploy_managed_source_repo_imports_detached_worktree_snapshot() {
+        let root = unique_temp("sinomo-rollout-detached-source-import");
+        let external = root.join("external");
+        let detached = root.join("detached-snapshot");
+        let data = root.join("data");
+        fs::create_dir_all(&external).expect("external dir");
+        run_git_for_test(&external, &["init"]);
+        run_git_for_test(&external, &["config", "user.email", "test@example.invalid"]);
+        run_git_for_test(&external, &["config", "user.name", "Sinomo Test"]);
+        fs::write(external.join("Cargo.toml"), "[workspace]\n").expect("cargo");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "initial"]);
+
+        let paths = SelfRolloutPaths::new(&data);
+        deploy_managed_source_repo(&paths, &external).expect("initial deploy");
+
+        fs::write(
+            external.join("Cargo.toml"),
+            "[workspace]\nresolver = \"3\"\n",
+        )
+        .expect("cargo update");
+        run_git_for_test(&external, &["add", "-A"]);
+        run_git_for_test(&external, &["commit", "-m", "snapshot"]);
+        let snapshot_head = git_one_line(&external, &["rev-parse", "HEAD"]).expect("head");
+        let detached_path = detached.display().to_string();
+        run_git_for_test(
+            &external,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &detached_path,
+                &snapshot_head,
+            ],
+        );
+
+        deploy_managed_source_repo_with_options(
+            &paths,
+            &detached,
+            ManagedSourceDeployOptions {
+                force_overwrite: true,
+            },
+        )
+        .expect("detached snapshot import");
+        // The apply phase points back at this managed repository. Re-selecting
+        // it must be a no-op rather than importing the caller's current repo.
+        deploy_managed_source_repo_with_options(
+            &paths,
+            &paths.source_repo,
+            ManagedSourceDeployOptions {
+                force_overwrite: true,
+            },
+        )
+        .expect("managed source re-selection");
+
+        let status = managed_source_status(&paths).expect("status");
+        assert_eq!(status.head.as_deref(), Some(snapshot_head.as_str()));
+        assert_eq!(
+            fs::read_to_string(paths.source_repo.join("Cargo.toml")).expect("manifest"),
+            "[workspace]\nresolver = \"3\"\n"
+        );
         assert!(!status.has_external_remotes);
     }
 

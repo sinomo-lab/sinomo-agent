@@ -515,6 +515,23 @@ pub fn cluster_directory_with_bootstrap_state(
     })
 }
 
+/// Builds an immutable routing directory from one already-authoritative
+/// bootstrap-state fence without consulting the process-wide directory
+/// provider.
+///
+/// This is intentionally narrower than [`cluster_directory_with_bootstrap_state`].
+/// Raft control messages whose membership was captured under the resident
+/// operation fence must route from that exact member/endpoint view: consulting
+/// the KV-backed provider again can both mix generations and synchronously
+/// enter cold snapshot/WAL hydration before the control message is dispatched.
+/// Connectivity remains local routing evidence and is overlaid by the routed
+/// client after this immutable directory snapshot is captured.
+pub(crate) fn cluster_directory_from_fenced_bootstrap_state(
+    state: &ClusterBootstrapState,
+) -> Arc<dyn ClusterDirectory> {
+    cluster_directory_with_bootstrap_state(Arc::new(EmptyClusterDirectory), state)
+}
+
 /// Builds the [`ClusterDirectory`] for a cluster data root. Registered once at
 /// process startup by whoever owns cluster state (the daemon registers the
 /// KV-backed directory from `sinomo-cluster`).
@@ -693,6 +710,41 @@ mod tests {
         let snapshot = directory.snapshot().expect("bootstrap snapshot");
         assert!(snapshot.is_authorized(&local.node_id));
         assert!(snapshot.is_authorized(&target.node_id));
+    }
+
+    #[test]
+    fn fenced_bootstrap_directory_carries_member_endpoints_without_provider_state() {
+        let cluster_id = id("directory-fenced-bootstrap-cluster");
+        let local = member(&cluster_id, "directory-fenced-bootstrap-local", "local-key");
+        let mut target = member(
+            &cluster_id,
+            "directory-fenced-bootstrap-target",
+            "target-key",
+        );
+        let target_endpoint =
+            ClusterEndpointRecord::loopback(target.node_id.clone(), "127.0.0.1:45678");
+        target.endpoints.push(target_endpoint.clone());
+        let state = bootstrap_state(17, vec![local, target.clone()]);
+
+        let directory = cluster_directory_from_fenced_bootstrap_state(&state);
+        assert_eq!(directory.routing_version(), Ok(DirectoryVersion(17)));
+        let (version, members, endpoints, connectivity) = directory
+            .routing_records_snapshot()
+            .expect("fenced bootstrap routing snapshot")
+            .into_parts();
+        assert_eq!(version, DirectoryVersion(17));
+        assert!(endpoints.is_empty());
+        assert!(connectivity.is_empty());
+
+        let snapshot = DirectorySnapshot::try_from_records(version, members, endpoints)
+            .expect("fenced bootstrap directory snapshot");
+        assert_eq!(
+            snapshot
+                .node(&target.node_id)
+                .expect("target member")
+                .endpoints,
+            vec![target_endpoint]
+        );
     }
 
     #[test]

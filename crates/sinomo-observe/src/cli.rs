@@ -2305,7 +2305,7 @@ where
     let next_target = std::sync::atomic::AtomicUsize::new(0);
     let target_results =
         std::sync::Mutex::new((0..targets.len()).map(|_| None).collect::<Vec<Option<_>>>());
-    std::thread::scope(|scope| {
+    std::thread::scope(|scope| -> Result<(), CliCommandError> {
         let worker_count = targets.len().min(OBSERVE_FANOUT_MAX_WORKERS);
         let mut workers = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -2329,9 +2329,12 @@ where
             }));
         }
         for worker in workers {
-            let _ = worker.join();
+            if worker.join().is_err() {
+                return Err(CliCommandError::new("observe RPC worker panicked"));
+            }
         }
-    });
+        Ok(())
+    })?;
     let target_results = target_results
         .into_inner()
         .map_err(|_| CliCommandError::new("observe fan-out result lock is poisoned"))?

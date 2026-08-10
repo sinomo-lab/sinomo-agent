@@ -19,6 +19,10 @@ pub struct ClusterRolloutNativeDylibModuleArtifact {
 pub struct ClusterRolloutNativeDylibModuleRequest {
     pub source: String,
     pub host: String,
+    /// Explicit operator-requested replacement for the target main and shadow
+    /// bind hosts. Absent requests preserve both current listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_override: Option<String>,
     pub port: u16,
     pub shadow_port: u16,
     pub requested_at: String,
@@ -71,6 +75,10 @@ pub struct ClusterRolloutBinaryManifest {
     #[serde(default)]
     pub target_arch: String,
     pub host: String,
+    /// Explicit operator-requested replacement for the target main and shadow
+    /// bind hosts. Absent manifests preserve both current listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_override: Option<String>,
     pub port: u16,
     pub shadow_port: u16,
     pub requested_at: String,
@@ -129,6 +137,10 @@ pub struct ClusterRolloutBuildRequest {
     #[serde(default)]
     pub force_source_overwrite: bool,
     pub host: String,
+    /// Explicit operator-requested replacement for the target main and shadow
+    /// bind hosts. Absent requests preserve both current listeners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_override: Option<String>,
     pub port: u16,
     pub shadow_port: u16,
     pub requested_at: String,
@@ -211,6 +223,7 @@ pub fn prepare_cluster_rollout_binary_manifest_for_target(
         target_os: target_os.into(),
         target_arch: target_arch.into(),
         host: host.into(),
+        host_override: None,
         port,
         shadow_port,
         requested_at: requested_at.into(),
@@ -281,6 +294,7 @@ pub fn prepare_cluster_rollout_native_dylib_module_request(
     Ok(ClusterRolloutNativeDylibModuleRequest {
         source: source.into(),
         host: host.into(),
+        host_override: None,
         port,
         shadow_port,
         requested_at: requested_at.into(),
@@ -304,6 +318,7 @@ pub fn prepare_cluster_rollout_build_request(
         source_head: None,
         force_source_overwrite,
         host: host.into(),
+        host_override: None,
         port,
         shadow_port,
         requested_at: requested_at.into(),
@@ -397,6 +412,7 @@ mod tests {
         assert_eq!(manifest.binary.total_bytes, 12);
         assert_eq!(manifest.binary.blake3.len(), 32);
         assert_eq!(manifest.host, "127.0.0.1");
+        assert_eq!(manifest.host_override, None);
         assert_eq!(manifest.port, 21353);
         assert_eq!(manifest.shadow_port, 21354);
         assert!(!manifest.target_os.is_empty());
@@ -491,6 +507,7 @@ mod tests {
 
         assert_eq!(request.source, "source");
         assert_eq!(request.host, "127.0.0.1");
+        assert_eq!(request.host_override, None);
         assert_eq!(request.port, 21353);
         assert_eq!(request.shadow_port, 21354);
         assert_eq!(request.artifact.module_id, "module.test");
@@ -515,9 +532,28 @@ mod tests {
         assert_eq!(request.source_head, None);
         assert!(request.force_source_overwrite);
         assert_eq!(request.host, "127.0.0.1");
+        assert_eq!(request.host_override, None);
         assert_eq!(request.port, 21353);
         assert_eq!(request.shadow_port, 21354);
         assert_eq!(request.requested_at, "now");
+    }
+
+    #[test]
+    fn legacy_cluster_rollout_build_request_defaults_host_override_to_absent() {
+        let request: ClusterRolloutBuildRequest = serde_json::from_value(serde_json::json!({
+            "source": "legacy",
+            "remote_repo": null,
+            "source_bundle": null,
+            "source_head": null,
+            "force_source_overwrite": false,
+            "host": "127.0.0.1",
+            "port": 21353,
+            "shadow_port": 21354,
+            "requested_at": "now"
+        }))
+        .expect("legacy request");
+
+        assert_eq!(request.host_override, None);
     }
 
     #[test]

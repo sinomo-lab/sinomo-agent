@@ -41,6 +41,10 @@ pub struct RolloutMainActivation {
     pub main_host: String,
     #[serde(default = "default_rollout_main_port")]
     pub main_port: u16,
+    /// Desired shadow-supervisor bind host. Older activation records omit it
+    /// and therefore preserve the running shadow's listener during handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_host: Option<String>,
     pub shadow_port: u16,
     pub requested_at: String,
     pub mode: String,
@@ -2156,6 +2160,7 @@ mod tests {
             native_dylib_loader_rollback_generation: None,
             main_host: "127.0.0.1".to_string(),
             main_port: 21353,
+            shadow_host: None,
             shadow_port: 21354,
             requested_at: "2026-07-12T00:00:00Z".to_string(),
             mode: "test".to_string(),
@@ -2262,6 +2267,7 @@ mod tests {
             native_dylib_loader_rollback_generation: None,
             main_host: "127.0.0.1".to_string(),
             main_port: 21353,
+            shadow_host: None,
             shadow_port: 21354,
             requested_at: "2026-07-12T00:00:00Z".to_string(),
             mode: "test".to_string(),
@@ -2368,6 +2374,7 @@ mod tests {
             native_dylib_loader_rollback_generation: None,
             main_host: "127.0.0.1".to_string(),
             main_port: 21353,
+            shadow_host: None,
             shadow_port: 21354,
             requested_at: "2026-07-12T00:00:00Z".to_string(),
             mode: "test".to_string(),

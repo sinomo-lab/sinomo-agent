@@ -336,6 +336,15 @@ impl ObjectRpcResponse {
                 .get(OBJECT_RPC_ERROR_DETAIL_METADATA_KEY)
                 .cloned()
                 .unwrap_or_else(|| "daemon returned an RPC error".to_string());
+            if ["unknown service route: ", "unknown object rpc route: "]
+                .iter()
+                .find_map(|prefix| detail.strip_prefix(prefix))
+                .is_some_and(|route| route == self.route)
+            {
+                return Err(NetworkError::UnknownRoute {
+                    route: self.route.clone(),
+                });
+            }
             if let Some(detail) = detail.strip_prefix("cluster is read-only: ") {
                 return Err(NetworkError::ClusterReadOnly {
                     detail: detail.to_string(),
@@ -468,6 +477,28 @@ mod tests {
             &response.body
         ));
         assert!(slice_is_borrowed_from(decoded.bytes, &response.body));
+    }
+
+    #[test]
+    fn rpc_error_preserves_matching_unknown_service_route() {
+        let route = "/cluster/kv/authoritative/entries";
+        let response =
+            ObjectRpcResponse::encode_error(route, format!("unknown service route: {route}"))
+                .expect("error response");
+        assert!(matches!(
+            response.error_detail(),
+            Err(NetworkError::UnknownRoute { route: observed }) if observed == route
+        ));
+
+        let mismatched = ObjectRpcResponse::encode_error(
+            route,
+            "unknown service route: /cluster/kv/authoritative/snapshot",
+        )
+        .expect("mismatched error response");
+        assert!(matches!(
+            mismatched.error_detail(),
+            Err(NetworkError::ObjectRpc { .. })
+        ));
     }
 
     fn slice_is_borrowed_from(slice: &[u8], source: &[u8]) -> bool {

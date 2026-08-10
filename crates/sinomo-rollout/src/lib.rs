@@ -124,10 +124,11 @@ pub use source::{
     ensure_rollout_source_repo_with_options, managed_source_status,
     prepare_local_rollout_artifacts, prepare_local_rollout_artifacts_with_options,
     prepare_rollout_build_source, prepare_rollout_dev_artifacts, prepare_rollout_dev_binary,
-    prepare_rollout_source_bundle, remove_dir_if_exists, rollout_artifact_suffix,
-    rollout_build_dev_artifacts, rollout_build_dev_binary, rollout_build_dev_native_dylib_module,
-    rollout_remote_repo_path, rollout_source_head, rollout_status_view, source_heads_match,
-    stage_local_rollout_artifacts, sync_external_repo_from_managed,
+    prepare_rollout_source_bundle, remove_dir_if_exists, resolve_rollout_source_commit,
+    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_build_dev_binary,
+    rollout_build_dev_native_dylib_module, rollout_remote_repo_path, rollout_source_head,
+    rollout_status_view, source_heads_match, stage_local_rollout_artifacts,
+    sync_external_repo_from_managed,
 };
 pub use state::{
     NativeDylibLoaderRollbackLifecycle, NativeDylibLoaderStateRollback, NativeDylibRolloutGuard,

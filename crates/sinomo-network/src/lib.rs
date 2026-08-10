@@ -170,7 +170,7 @@ pub use endpoint_selector::{
 };
 pub use endpoint_selector::{
     ClusterEndpointSelectionPurpose, ClusterEndpointSelector,
-    cluster_endpoint_can_carry_main_daemon_rpc,
+    cluster_endpoint_can_carry_main_daemon_rpc, cluster_endpoint_identifies_shadow_daemon_for_node,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use endpoint_selector::{
@@ -221,7 +221,7 @@ pub use network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
     NetworkModuleEndpointRole, NetworkModuleRegistry, NetworkModuleStatus,
     RegisteredNetworkModuleLinkProvider, authenticated_transport_metadata_matches_endpoint,
-    network_module_registry, set_network_module_registry,
+    network_module_registry, network_module_routing_generation, set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
 pub use object::try_clone_id;
@@ -285,6 +285,10 @@ pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
     ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcFuture,
     ClusterObjectRpcObservation, ClusterObjectRpcOptions, stream_native_service_route_constraints,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use route::{
+    prepared_dynamic_route_cache_contains_for_test, prepared_dynamic_route_cache_insert_for_test,
 };
 pub use rpc::{
     CLUSTER_HEALTH_ROUTE, CLUSTER_HEALTH_RPC_CATEGORY, CLUSTER_INVITE_PUBLISH_ROUTE,

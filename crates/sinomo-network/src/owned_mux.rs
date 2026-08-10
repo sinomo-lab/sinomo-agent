@@ -1615,7 +1615,45 @@ impl OwnedRoutedStreamClient {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.owner.closed.load(Ordering::Acquire)
+        if self.owner.closed.load(Ordering::Acquire) {
+            return true;
+        }
+
+        // The routed carrier pool is process-wide, while callers may enter it
+        // from more than one Tokio runtime. Dropping a runtime cancels its
+        // spawned tasks by dropping their futures; the code after each worker
+        // future therefore does not run and cannot set `closed`. Retaining
+        // such a client in the global pool would let a later runtime enqueue a
+        // logical stream onto transmitter and receiver tasks that no longer
+        // exist. Join handles remain observable after runtime teardown, so
+        // treat either completed worker as a terminal carrier and wake every
+        // open logical stream before the pool considers reuse.
+        let reader_stopped = self
+            .owner
+            .reader_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished);
+        let writer_stopped = self
+            .owner
+            .writer_task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished);
+        if reader_stopped || writer_stopped {
+            self.owner.closed.store(true, Ordering::Release);
+            self.connection.close();
+            self.tx.close();
+            fail_slots(
+                &self.streams,
+                "owned routed carrier worker is no longer running",
+            );
+            return true;
+        }
+
+        false
     }
 
     pub(crate) fn open(self: &Arc<Self>) -> Result<PeerStream, NetworkError> {
@@ -1688,7 +1726,112 @@ pub(crate) fn owned_routed_stream_acceptor_and_client(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::owned_chunk::{BODY_CHUNK_MAX, ChunkPool, PayloadCopyReason, SECURE_WIRE_MAX};
+    use crate::owned_chunk::{
+        BODY_CHUNK_MAX, ChunkPool, PayloadCopyReason, RPC_RECORD_MAX, SECURE_WIRE_MAX,
+    };
+
+    struct RuntimeBoundTestChunkReader {
+        allocator: ChunkAllocator,
+    }
+
+    impl AuthenticatedChunkReader for RuntimeBoundTestChunkReader {
+        fn allocator(&self) -> &ChunkAllocator {
+            &self.allocator
+        }
+
+        fn max_payload_bytes(&self) -> usize {
+            RPC_RECORD_MAX
+        }
+
+        fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct RuntimeBoundTestChunkWriter {
+        allocator: ChunkAllocator,
+    }
+
+    impl AuthenticatedChunkWriter for RuntimeBoundTestChunkWriter {
+        fn max_payload_bytes(&self) -> usize {
+            RPC_RECORD_MAX
+        }
+
+        fn allocator(&self) -> &ChunkAllocator {
+            &self.allocator
+        }
+
+        fn send_chunk(&mut self, _chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn finish(&mut self) -> ChunkStreamFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn reset(&mut self, _reason: ResetReason) -> ChunkStreamFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn runtime_bound_test_carrier() -> PeerStream {
+        let local =
+            NodeId::from_legacy_named("runtime-bound-mux-client").expect("valid local node id");
+        let peer =
+            NodeId::from_legacy_named("runtime-bound-mux-server").expect("valid peer node id");
+        let allocator = ChunkAllocator::default();
+        let chunks = AuthenticatedChunkStream::new(
+            Box::new(RuntimeBoundTestChunkReader {
+                allocator: allocator.clone(),
+            }),
+            Box::new(RuntimeBoundTestChunkWriter { allocator }),
+        )
+        .expect("compatible carrier chunk halves");
+        PeerStream::new_owned(
+            chunks,
+            local.clone(),
+            peer.clone(),
+            Id::generate(),
+            [0x5a; 32],
+            RouteTrace {
+                nodes: vec![local, peer],
+                endpoint_ids: vec![Id::generate()],
+            },
+        )
+        .expect("valid runtime-bound carrier")
+    }
+
+    #[test]
+    fn runtime_teardown_marks_retained_carrier_client_closed() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build first caller runtime");
+        let client = runtime.block_on(async {
+            Arc::new(
+                OwnedRoutedStreamClient::new(runtime_bound_test_carrier())
+                    .expect("construct retained carrier client"),
+            )
+        });
+        assert!(
+            !client.is_closed(),
+            "live worker tasks keep the carrier open"
+        );
+
+        // Process-wide routing pools can outlive the runtime that created a
+        // carrier. Tokio drops both worker futures during runtime teardown,
+        // without executing their post-await `closed` stores.
+        drop(runtime);
+
+        assert!(
+            client.is_closed(),
+            "finished worker handles must prevent cross-runtime carrier reuse"
+        );
+        assert!(
+            client.open().is_err(),
+            "a later runtime must establish a new carrier instead"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn resolved_incoming_sink_tolerates_dispatcher_activation_gap() {

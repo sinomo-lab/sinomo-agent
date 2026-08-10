@@ -1160,7 +1160,9 @@ pub(crate) fn try_cluster_main_daemon_command_endpoint_candidates_impl(
     Ok(selected)
 }
 
-pub(crate) fn cluster_endpoint_identifies_shadow_daemon_for_node(
+/// Returns whether an endpoint carries positive transport-level evidence that
+/// it terminates in the shadow daemon associated with its recorded node.
+pub fn cluster_endpoint_identifies_shadow_daemon_for_node(
     endpoint: &ClusterEndpointRecord,
 ) -> bool {
     let shadow_node_id = shadow_daemon_node_id(&endpoint.node_id);

@@ -123,6 +123,31 @@ pub trait ClusterAccess: Send + Sync {
                 + 'a,
         >,
     >;
+    /// Read one ordered, exact key set from a single current-term
+    /// quorum-confirmed KV revision.
+    ///
+    /// The one returned authority proof binds every value in the result. Hosts
+    /// must not implement this as a sequence of point reads: doing so can mix
+    /// independently authoritative revisions when related control records are
+    /// changing. The compatibility default fails closed so embedders must opt
+    /// into a native exact-set authority path explicitly.
+    fn kv_get_authoritative_exact_set_async<'a>(
+        &'a self,
+        keys: Vec<String>,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, ServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ServiceError::Service(format!(
+                "authoritative exact-key-set reads are unavailable for this service host ({} keys requested)",
+                keys.len()
+            )))
+        })
+    }
     /// Commit a stable-ID cluster-KV request through the host-owned async
     /// runtime. The ID must be preserved through forwarding and retries.
     fn kv_commit_async<'a>(

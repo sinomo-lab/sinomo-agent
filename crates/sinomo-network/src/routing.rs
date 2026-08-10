@@ -151,15 +151,24 @@ impl CandidatePath {
             .filter(|hop| hop.connectivity_state == DirectConnectivityState::Degraded)
             .count()
     }
+
+    fn unreachable_hop_count(&self) -> usize {
+        self.hops
+            .iter()
+            .filter(|hop| hop.connectivity_state == DirectConnectivityState::Unreachable)
+            .count()
+    }
 }
 
 fn compare_candidate_paths(left: &CandidatePath, right: &CandidatePath) -> std::cmp::Ordering {
     // Fully healthy paths always precede paths containing degraded evidence,
     // even when the latter are shorter. Degraded edges remain executable as a
     // last resort so a transient observation generation cannot make an
-    // otherwise connected node publish zero candidates.
-    left.degraded_hop_count()
-        .cmp(&right.degraded_hop_count())
+    // otherwise connected node publish zero candidates. A stale-unreachable
+    // direct recovery is weaker still and must never outrank either kind.
+    left.unreachable_hop_count()
+        .cmp(&right.unreachable_hop_count())
+        .then_with(|| left.degraded_hop_count().cmp(&right.degraded_hop_count()))
         .then_with(|| left.hops.len().cmp(&right.hops.len()))
         .then_with(|| {
             left.total_latency_micros()
@@ -189,7 +198,8 @@ fn directory_contains_endpoint(
         })
 }
 
-/// Deterministically plans executable directed paths from immutable inputs.
+/// Deterministically plans executable directed paths from immutable directory
+/// and connectivity inputs plus the current local module-dialer registry.
 ///
 /// It performs no dialing, persistence, probing, retries, or RPC. The single
 /// routed-stream executor consumes this contract for direct and relayed paths.
@@ -308,7 +318,150 @@ fn plan_routes_with_destination_process_affinity(
             }
         }
     }
+    if candidates.is_empty() {
+        append_unobserved_direct_module_recovery_candidates(
+            &mut candidates,
+            directory,
+            connectivity,
+            source_node_id,
+            destination_node_id,
+            constraints,
+            destination_process_affinity,
+        );
+        append_unreachable_direct_recovery_candidates(
+            &mut candidates,
+            directory,
+            connectivity,
+            source_node_id,
+            destination_node_id,
+            constraints,
+            destination_process_affinity,
+        );
+    }
     candidates
+}
+
+/// Adds current directory endpoints owned by an enabled local transport module
+/// when that module cannot participate in the built-in connectivity probe.
+///
+/// These are deliberately terminal, one-edge recovery candidates rather than
+/// adjacency-graph edges: directory publication authorizes the exact endpoint
+/// and node, but it is not reachability evidence and therefore cannot authorize
+/// relay forwarding. The authenticated link and routed-session handshakes still
+/// prove the adjacent node, requested destination, capabilities, and process
+/// affinity before any application bytes are exposed.
+fn append_unobserved_direct_module_recovery_candidates(
+    candidates: &mut Vec<CandidatePath>,
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    source_node_id: &NodeId,
+    destination_node_id: &NodeId,
+    constraints: RouteConstraints,
+    destination_process_affinity: DestinationProcessAffinity,
+) {
+    let Some(registry) = crate::network_module::network_module_registry() else {
+        return;
+    };
+    let Some(destination) = directory.node(destination_node_id) else {
+        return;
+    };
+    // The module contract guarantees a full-duplex authenticated stream. No
+    // unobserved capability is assumed beyond that; realization re-checks the
+    // actual link before opening the routed session.
+    let conservative_capabilities = DirectStreamCapabilities {
+        full_duplex: true,
+        relay_forwarding: false,
+        confidential: false,
+        max_concurrent_streams: 1,
+    };
+    if !constraints.accepts_capabilities(conservative_capabilities) {
+        return;
+    }
+    for endpoint in &destination.endpoints {
+        let endpoint_role = registry.endpoint_role(endpoint);
+        let process_affinity_matches = match destination_process_affinity {
+            DestinationProcessAffinity::Any => true,
+            DestinationProcessAffinity::MainDaemon => {
+                endpoint_role == crate::network_module::NetworkModuleEndpointRole::MainDaemon
+            }
+        };
+        let already_observed = connectivity.edges().iter().any(|observation| {
+            &observation.source_node_id == source_node_id
+                && &observation.target_node_id == destination_node_id
+                && observation.endpoint.endpoint_id == endpoint.endpoint_id
+                && observation.endpoint.transport == endpoint.transport
+                && observation.endpoint.address == endpoint.address
+        });
+        if endpoint.privacy == sinomo_base::ClusterEndpointPrivacy::LocalOnly
+            || crate::endpoint_selector::cluster_endpoint_is_builtin_probe_target(endpoint)
+            || already_observed
+            || endpoint_role == crate::network_module::NetworkModuleEndpointRole::Unknown
+            || !process_affinity_matches
+        {
+            continue;
+        }
+        retain_ranked_candidate(
+            candidates,
+            CandidatePath::at_source(source_node_id.clone()).extend(RouteHop {
+                source_node_id: source_node_id.clone(),
+                target_node_id: destination_node_id.clone(),
+                endpoint: endpoint.clone(),
+                capabilities: conservative_capabilities,
+                // There is no durable reachability observation. Degraded is
+                // used only as the planner rank between observed live paths
+                // and stale-unreachable direct recovery; it is not published.
+                connectivity_state: DirectConnectivityState::Degraded,
+                latency_micros: None,
+            }),
+        );
+    }
+}
+
+/// Keeps a committed direct endpoint recoverable after its last observation
+/// marked it unreachable.
+///
+/// `Unreachable` remains excluded from the normal adjacency graph above: it can
+/// never authorize a relay or displace a healthy/degraded path. When that graph
+/// has no executable path at all, the authenticated direct-link handshake is
+/// the reactive probe that can disprove stale failure evidence. Directory
+/// membership and the exact endpoint record still fence the attempt, and the
+/// connector re-checks the established link's identity and capabilities before
+/// opening the routed session. Structured failure evidence remains fail-closed:
+/// identity/authentication negatives, as well as an in-process routed failure,
+/// must be cleared by the dedicated connectivity-maintenance probe rather than
+/// challenged by every application call.
+fn append_unreachable_direct_recovery_candidates(
+    candidates: &mut Vec<CandidatePath>,
+    directory: &DirectorySnapshot,
+    connectivity: &ConnectivitySnapshot,
+    source_node_id: &NodeId,
+    destination_node_id: &NodeId,
+    constraints: RouteConstraints,
+    destination_process_affinity: DestinationProcessAffinity,
+) {
+    for observation in connectivity.edges() {
+        if observation.state != DirectConnectivityState::Unreachable
+            || observation.failure_reason.is_some()
+            || &observation.source_node_id != source_node_id
+            || &observation.target_node_id != destination_node_id
+            || !directory_contains_endpoint(directory, observation)
+            || !constraints.accepts(observation)
+            || !destination_process_affinity.accepts_terminal_endpoint(&observation.endpoint)
+        {
+            continue;
+        }
+        retain_ranked_candidate(
+            candidates,
+            CandidatePath::at_source(source_node_id.clone()).extend(RouteHop {
+                source_node_id: observation.source_node_id.clone(),
+                target_node_id: observation.target_node_id.clone(),
+                endpoint: observation.endpoint.clone(),
+                capabilities: observation.capabilities,
+                connectivity_state: observation.state,
+                latency_micros: observation.latency_micros,
+            }),
+        );
+    }
 }
 
 const ROUTED_SESSION_PROTOCOL: &str = "sinomo.routed-session.v1";
@@ -2808,7 +2961,7 @@ impl MultiHopRoutedConnector {
         let path_count = paths.len();
         let mut attempts = 0_usize;
         let mut failures = Vec::new();
-        for (path_index, path) in paths.into_iter().enumerate() {
+        for (path_index, path) in paths.iter().enumerate() {
             let Some(first_hop) = path.hops.first() else {
                 continue;
             };
@@ -2848,7 +3001,7 @@ impl MultiHopRoutedConnector {
                 initiate_routed_session(
                     stream,
                     directory,
-                    &path,
+                    path,
                     self.identity.as_ref(),
                     attempt_deadline_unix_millis,
                     options.protection,
@@ -3015,6 +3168,10 @@ mod tests {
     };
     use crate::direct_link::{DirectLinkFuture, DirectStreamCapabilities};
     use crate::directory::{DirectoryNode, DirectoryVersion};
+    use crate::network_module::{
+        NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
+        NetworkModuleEndpointRole, NetworkModuleRegistry, set_network_module_registry,
+    };
     use sinomo_base::{
         ClusterEndpointPrivacy, ClusterEndpointSource, ClusterMemberRecord,
         ClusterNodeStatusRecord, ClusterTransportKind,
@@ -3104,6 +3261,132 @@ mod tests {
 
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
+    }
+
+    struct TestDirectoryIrohNetworkModule;
+
+    impl NetworkModule for TestDirectoryIrohNetworkModule {
+        fn descriptor(&self) -> NetworkModuleDescriptor {
+            NetworkModuleDescriptor {
+                id: "routing-test-iroh".to_string(),
+                transports: vec![ClusterTransportKind::Iroh],
+                address_schemes: vec!["iroh".to_string()],
+                dialer: true,
+                listener: false,
+                supports_runtime_toggle: true,
+            }
+        }
+
+        fn start(&self, _ctx: &NetworkModuleContext) -> Result<(), NetworkError> {
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<(), NetworkError> {
+            Ok(())
+        }
+
+        fn connect_link(
+            &self,
+            endpoint: &ClusterEndpointRecord,
+            _health: crate::NetworkHealthPolicy,
+        ) -> NetworkFuture<crate::direct_link::AuthenticatedLink> {
+            let address = endpoint.address.clone();
+            Box::pin(async move {
+                Err(NetworkError::Io {
+                    operation: "routing test iroh dial".to_string(),
+                    detail: format!("test module does not directly dial {address}"),
+                })
+            })
+        }
+
+        fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+            Ok(Vec::new())
+        }
+
+        fn endpoint_role(&self, endpoint: &ClusterEndpointRecord) -> NetworkModuleEndpointRole {
+            if endpoint.transport != ClusterTransportKind::Iroh {
+                return NetworkModuleEndpointRole::Unknown;
+            }
+            let Some(public_key) = endpoint
+                .address
+                .strip_prefix("iroh://")
+                .and_then(|rest| rest.split(['?', '#']).next())
+                .filter(|public_key| !public_key.is_empty())
+            else {
+                return NetworkModuleEndpointRole::Unknown;
+            };
+            let shadow_node_id = sinomo_node::shadow_daemon_node_id(&endpoint.node_id);
+            if endpoint.endpoint_id
+                == Id::derived(
+                    "sinomo.iroh.endpoint",
+                    format!("{}\0{public_key}", shadow_node_id.as_str()),
+                )
+            {
+                return NetworkModuleEndpointRole::ShadowDaemon;
+            }
+            if endpoint.endpoint_id
+                == Id::derived(
+                    "sinomo.iroh.endpoint",
+                    format!("{}\0{public_key}", endpoint.node_id.as_str()),
+                )
+            {
+                return NetworkModuleEndpointRole::MainDaemon;
+            }
+            NetworkModuleEndpointRole::Unknown
+        }
+    }
+
+    fn install_test_directory_iroh_network_module() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let registry = NetworkModuleRegistry::new();
+            registry.register(Arc::new(TestDirectoryIrohNetworkModule), None, true, false);
+            set_network_module_registry(Arc::new(registry));
+        });
+    }
+
+    fn directory_iroh_endpoint(
+        node_id: &NodeId,
+        endpoint_public_key: &str,
+        shadow: bool,
+    ) -> ClusterEndpointRecord {
+        let endpoint_identity = if shadow {
+            sinomo_node::shadow_daemon_node_id(node_id)
+        } else {
+            node_id.clone()
+        };
+        ClusterEndpointRecord {
+            endpoint_id: Id::derived(
+                "sinomo.iroh.endpoint",
+                format!("{}\0{endpoint_public_key}", endpoint_identity.as_str()),
+            ),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: format!(
+                "iroh://{endpoint_public_key}?relay=https://relay.routing-test.invalid./"
+            ),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn directory_fixture_with_endpoints(
+        directory_generation: u64,
+        nodes: impl IntoIterator<Item = (NodeId, Vec<ClusterEndpointRecord>)>,
+    ) -> DirectorySnapshot {
+        DirectorySnapshot::try_new(
+            DirectoryVersion(directory_generation),
+            nodes
+                .into_iter()
+                .map(|(node_id, endpoints)| {
+                    DirectoryNode::try_new(node_id.clone(), node_id.to_string(), endpoints)
+                        .expect("directory node")
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("directory")
     }
 
     #[tokio::test]
@@ -3596,6 +3879,443 @@ mod tests {
         assert_eq!(paths[0].nodes, vec![a.clone(), b, c.clone()]);
         assert_eq!(paths[1].nodes, vec![a, c]);
         assert_eq!(paths[1].degraded_hop_count(), 1);
+    }
+
+    #[test]
+    fn planner_retries_unreachable_direct_only_when_no_live_path_exists() {
+        let source = node("node_route_unreachable_recovery_source");
+        let relay = node("node_route_unreachable_recovery_relay");
+        let destination = node("node_route_unreachable_recovery_destination");
+        let mut unreachable_direct = edge(
+            &source,
+            &destination,
+            "endpoint_route_unreachable_recovery_direct",
+            83,
+            1,
+        );
+        unreachable_direct.state = DirectConnectivityState::Unreachable;
+        let (directory, connectivity) = fixtures(
+            83,
+            vec![
+                unreachable_direct,
+                edge(
+                    &source,
+                    &relay,
+                    "endpoint_route_unreachable_recovery_source_relay",
+                    83,
+                    10,
+                ),
+                edge(
+                    &relay,
+                    &destination,
+                    "endpoint_route_unreachable_recovery_relay_destination",
+                    83,
+                    10,
+                ),
+            ],
+        );
+
+        let paths = plan_routes(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+        );
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].nodes, vec![source, relay, destination]);
+        assert!(
+            paths[0]
+                .hops
+                .iter()
+                .all(|hop| hop.connectivity_state == DirectConnectivityState::Reachable)
+        );
+    }
+
+    #[test]
+    fn planner_never_uses_an_unreachable_edge_as_a_relay() {
+        let source = node("node_route_unreachable_relay_source");
+        let relay = node("node_route_unreachable_relay_middle");
+        let destination = node("node_route_unreachable_relay_destination");
+        let mut unreachable_first_hop = edge(
+            &source,
+            &relay,
+            "endpoint_route_unreachable_relay_first",
+            84,
+            1,
+        );
+        unreachable_first_hop.state = DirectConnectivityState::Unreachable;
+        let (directory, connectivity) = fixtures(
+            84,
+            vec![
+                unreachable_first_hop,
+                edge(
+                    &relay,
+                    &destination,
+                    "endpoint_route_unreachable_relay_second",
+                    84,
+                    1,
+                ),
+            ],
+        );
+
+        assert!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+            )
+            .is_empty(),
+            "failed evidence may be retried only as the exact terminal hop"
+        );
+    }
+
+    #[test]
+    fn planner_does_not_retry_unreachable_hard_negative_evidence() {
+        let source = node("node_route_unreachable_hard_negative_source");
+        let destination = node("node_route_unreachable_hard_negative_destination");
+        let mut observation = edge(
+            &source,
+            &destination,
+            "endpoint_route_unreachable_hard_negative",
+            86,
+            1,
+        );
+        observation.state = DirectConnectivityState::Unreachable;
+        observation.failure_reason = Some("IdentityMismatch".to_string());
+        let (directory, connectivity) = fixtures(86, vec![observation]);
+
+        assert!(
+            plan_routes(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+            )
+            .is_empty(),
+            "hard authentication evidence must remain fail-closed until maintenance reprobes it"
+        );
+    }
+
+    #[test]
+    fn planner_never_uses_a_directory_module_endpoint_for_the_wrong_node() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_wrong_source");
+        let destination = node("node_route_directory_module_wrong_destination");
+        let other = node("node_route_directory_module_wrong_other");
+        let endpoint = directory_iroh_endpoint(&other, "directory_module_wrong_node_key", false);
+        let directory = directory_fixture_with_endpoints(
+            87,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), Vec::new()),
+                (other, vec![endpoint]),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::empty(
+            ConnectivityGeneration(87),
+            87,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        );
+
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "a directory module endpoint for another node must never become a target path"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_a_directory_module_shadow_endpoint_for_main_affinity() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_shadow_source");
+        let destination = node("node_route_directory_module_shadow_destination");
+        let endpoint = directory_iroh_endpoint(&destination, "directory_module_shadow_key", true);
+        let directory = directory_fixture_with_endpoints(
+            88,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), vec![endpoint]),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::empty(
+            ConnectivityGeneration(88),
+            88,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        );
+
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "main-daemon affinity requires positive main-process endpoint proof"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_a_directory_endpoint_without_a_local_module_dialer() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_unsupported_source");
+        let destination = node("node_route_directory_module_unsupported_destination");
+        let endpoint = ClusterEndpointRecord {
+            endpoint_id: Id::from_legacy_named("endpoint_directory_module_unsupported")
+                .expect("endpoint"),
+            node_id: destination.clone(),
+            transport: ClusterTransportKind::WebRtc,
+            address: "webrtc://directory-module-unsupported".to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        };
+        let directory = directory_fixture_with_endpoints(
+            89,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), vec![endpoint]),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::empty(
+            ConnectivityGeneration(89),
+            89,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        );
+
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::Any,
+            )
+            .is_empty(),
+            "a directory endpoint is not executable without an enabled local module dialer"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_an_unclassified_directory_module_endpoint() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_unknown_source");
+        let destination = node("node_route_directory_module_unknown_destination");
+        let mut endpoint =
+            directory_iroh_endpoint(&destination, "directory_module_unknown_key", false);
+        endpoint.endpoint_id =
+            Id::from_legacy_named("endpoint_directory_module_unknown").expect("endpoint");
+        let directory = directory_fixture_with_endpoints(
+            90,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), vec![endpoint]),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::empty(
+            ConnectivityGeneration(90),
+            90,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        );
+
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::Any,
+            )
+            .is_empty(),
+            "module dialability without a positive process-role identity must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn directory_iroh_first_attempt_succeeds_with_shared_candidate_deadline() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_priority_source");
+        let destination = node("node_route_directory_module_priority_destination");
+        let iroh = directory_iroh_endpoint(&destination, "directory_module_priority_key", false);
+        let iroh_endpoint_id = iroh.endpoint_id.clone();
+        let mut unreachable = (0..6)
+            .map(|index| {
+                let mut observation = edge(
+                    &source,
+                    &destination,
+                    &format!("endpoint_route_directory_module_stale_{index}"),
+                    91,
+                    u64::try_from(index + 1).expect("latency"),
+                );
+                let address = format!("10.0.0.{}:21353", index + 10);
+                observation.endpoint.transport = ClusterTransportKind::LanTcp;
+                observation.endpoint.address = address.clone();
+                observation.endpoint.endpoint_id =
+                    sinomo_node::daemon_lan_endpoint_id(&destination, &address);
+                observation.state = DirectConnectivityState::Unreachable;
+                observation
+            })
+            .collect::<Vec<_>>();
+        let mut endpoints = vec![iroh.clone()];
+        endpoints.extend(
+            unreachable
+                .iter()
+                .map(|observation| observation.endpoint.clone()),
+        );
+        let directory = directory_fixture_with_endpoints(
+            91,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), endpoints),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(91),
+            91,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            unreachable.drain(..),
+        )
+        .expect("connectivity");
+
+        let paths = plan_routes_with_destination_process_affinity(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+            DestinationProcessAffinity::MainDaemon,
+        );
+
+        assert_eq!(paths.len(), 7);
+        assert_eq!(paths[0].hops[0].endpoint.endpoint_id, iroh.endpoint_id);
+        assert!(paths[1..].iter().all(|path| {
+            path.hops[0].connectivity_state == DirectConnectivityState::Unreachable
+        }));
+
+        let overall_timeout = Duration::from_millis(700);
+        let first_attempt_timeout = routed_candidate_attempt_timeout(
+            overall_timeout,
+            u32::try_from(paths.len()).expect("candidate count"),
+            paths[0].hops.len(),
+        );
+        assert!(
+            first_attempt_timeout < overall_timeout,
+            "Iroh must share the unchanged deadline with every stale fallback candidate"
+        );
+
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        network
+            .delayed_endpoints
+            .lock()
+            .expect("delayed endpoints lock")
+            .insert(iroh_endpoint_id.clone(), Duration::from_millis(25));
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source.clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect_with_destination_process_affinity(
+                destination.clone(),
+                ConnectOptions {
+                    timeout: overall_timeout,
+                    ..ConnectOptions::default()
+                },
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .await
+            .expect("directory Iroh should complete within its shared candidate allocation");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+        assert_eq!(
+            network
+                .dialed_edges
+                .lock()
+                .expect("dialed edges lock")
+                .as_slice(),
+            &[(source, destination, iroh_endpoint_id)],
+            "a prompt Iroh dial must succeed before stale LAN fallbacks are attempted"
+        );
+    }
+
+    #[test]
+    fn planner_does_not_bypass_hard_negative_module_endpoint_evidence() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_directory_module_hard_negative_source");
+        let destination = node("node_route_directory_module_hard_negative_destination");
+        let endpoint =
+            directory_iroh_endpoint(&destination, "directory_module_hard_negative_key", false);
+        let mut observation = edge(
+            &source,
+            &destination,
+            "endpoint_route_directory_module_hard_negative_placeholder",
+            92,
+            1,
+        );
+        observation.endpoint = endpoint.clone();
+        observation.state = DirectConnectivityState::Unreachable;
+        observation.failure_reason = Some("IdentityMismatch".to_string());
+        let directory = directory_fixture_with_endpoints(
+            92,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), vec![endpoint]),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(92),
+            92,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            [observation],
+        )
+        .expect("connectivity");
+
+        assert!(
+            plan_routes_with_destination_process_affinity(
+                &directory,
+                &connectivity,
+                &source,
+                &destination,
+                RouteConstraints::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .is_empty(),
+            "directory recovery must not challenge a current authentication failure"
+        );
     }
 
     #[test]
@@ -4599,6 +5319,125 @@ mod tests {
         })
         .await
         .expect("planned route completed before deadline");
+    }
+
+    #[tokio::test]
+    async fn exact_main_daemon_call_uses_a_directory_iroh_endpoint_without_connectivity_evidence() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_relay_directory_iroh_source");
+        let destination = node("node_relay_directory_iroh_destination");
+        let endpoint =
+            directory_iroh_endpoint(&destination, "directory_iroh_exact_call_key", false);
+        let endpoint_id = endpoint.endpoint_id.clone();
+        let directory = directory_fixture_with_endpoints(
+            90,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), vec![endpoint]),
+            ],
+        );
+        let connectivity =
+            ConnectivitySnapshot::empty(ConnectivityGeneration(90), 90, OffsetDateTime::now_utc());
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source.clone(),
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect_with_destination_process_affinity(
+                destination.clone(),
+                ConnectOptions::default(),
+                DestinationProcessAffinity::MainDaemon,
+            )
+            .await
+            .expect("directory Iroh endpoint should establish the exact main-daemon call");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        assert_eq!(stream.route_trace.endpoint_ids, vec![endpoint_id.clone()]);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+        assert_eq!(
+            network
+                .dialed_edges
+                .lock()
+                .expect("dialed edges lock")
+                .as_slice(),
+            &[(source, destination, endpoint_id)]
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_hop_connector_authenticates_an_unreachable_direct_recovery_attempt() {
+        let source = node("node_relay_unreachable_recovery_source");
+        let destination = node("node_relay_unreachable_recovery_destination");
+        let mut observation = edge(
+            &source,
+            &destination,
+            "endpoint_relay_unreachable_recovery",
+            85,
+            1,
+        );
+        observation.state = DirectConnectivityState::Unreachable;
+        let endpoint_id = observation.endpoint.endpoint_id.clone();
+        let (directory, connectivity) = fixtures(85, vec![observation]);
+        let network = TestRelayNetwork::new(directory.clone(), connectivity);
+        let connector = MultiHopRoutedConnector::new(
+            source.clone(),
+            Arc::new(FixedDirectory(directory)),
+            network.connectivity.clone(),
+            network.connectivity.clone(),
+            Arc::new(network.provider(source.clone())),
+            Arc::new(TestRoutedIdentity {
+                local_node_id: source,
+            }),
+        )
+        .expect("multi-hop connector");
+
+        let mut stream = connector
+            .connect(destination, ConnectOptions::default())
+            .await
+            .expect("authenticated direct retry should disprove stale unreachable evidence");
+        stream
+            .write_all(TEST_ROUTED_PAYLOAD)
+            .await
+            .expect("write routed payload");
+        let mut echoed = [0_u8; TEST_ROUTED_PAYLOAD.len()];
+        stream
+            .read_exact(&mut echoed)
+            .await
+            .expect("read routed echo");
+        assert_eq!(echoed, *TEST_ROUTED_PAYLOAD);
+        assert_eq!(stream.route_trace.endpoint_ids, vec![endpoint_id.clone()]);
+        stream.shutdown().await.expect("close routed session");
+        network.wait_idle().await;
+        assert_eq!(
+            network
+                .dialed_edges
+                .lock()
+                .expect("dialed edges lock")
+                .as_slice(),
+            &[(
+                node("node_relay_unreachable_recovery_source"),
+                node("node_relay_unreachable_recovery_destination"),
+                endpoint_id,
+            )]
+        );
     }
 
     #[tokio::test]
