@@ -311,22 +311,29 @@ pub(crate) fn run_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
-    daemon_run_daemon_control_loop_with_services(
-        options,
-        paths,
-        label,
-        cluster,
-        vec![
-            sinomo_runtime::daemon::DaemonServiceRegistryHook::new(sinomo_agent::register_services)
-                .with_config_definitions(|builder| {
-                    let builder = sinomo_lm::register_config_definitions(builder)
-                        .map_err(|error| error.to_string())?;
-                    register_cli_runtime_config_definitions(builder)
-                })
-                .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
-        ],
-    )
-    .map_err(Into::into)
+    let mut service_hooks = vec![
+        sinomo_runtime::daemon::DaemonServiceRegistryHook::new(sinomo_agent::register_services)
+            .with_config_definitions(|builder| {
+                let builder = sinomo_lm::register_config_definitions(builder)
+                    .map_err(|error| error.to_string())?;
+                register_cli_runtime_config_definitions(builder)
+            })
+            .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
+    ];
+    if label == "daemon" {
+        let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+            path: paths.root.display().to_string(),
+            detail: "main daemon paths have no data directory parent".to_string(),
+        })?;
+        service_hooks.push(
+            crate::dfs_mount_supervisor::sifs_mount_supervisor_service_hook(
+                SinomoDataDir::new(data_dir),
+                paths.clone(),
+            ),
+        );
+    }
+    daemon_run_daemon_control_loop_with_services(options, paths, label, cluster, service_hooks)
+        .map_err(Into::into)
 }
 
 pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

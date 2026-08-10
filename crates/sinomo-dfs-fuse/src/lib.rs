@@ -4,6 +4,8 @@
 //! only on Unix targets with the `fuse` feature.
 
 use std::fmt;
+#[cfg(any(test, all(unix, feature = "fuse")))]
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -58,6 +60,8 @@ pub enum DfsFuseError {
     Unsupported,
     #[error("invalid SIFS path `{path}`: {detail}")]
     InvalidPath { path: String, detail: String },
+    #[error("invalid SIFS FUSE mount point `{mount_point}`: {detail}")]
+    InvalidMountPoint { mount_point: String, detail: String },
     #[error("local data directory error: {0}")]
     LocalData(String),
     #[error("DFS error: {0}")]
@@ -67,6 +71,20 @@ pub enum DfsFuseError {
 }
 
 pub type Result<T> = std::result::Result<T, DfsFuseError>;
+
+/// Read-only Linux host readiness captured before a long-lived background
+/// mount is started.
+///
+/// The result is evidence, not a durable capability: the device, helper, or
+/// host configuration can still change before the actual mount syscall.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsFuseLinuxPreflight {
+    pub mount_point: PathBuf,
+    pub fuse_device: PathBuf,
+    pub mount_helper: PathBuf,
+    pub direct_fuse_device_access: bool,
+    pub allow_other_enabled: bool,
+}
 
 /// Owns a nonblocking SIFS FUSE mount.
 ///
@@ -78,6 +96,7 @@ pub type Result<T> = std::result::Result<T, DfsFuseError>;
 #[must_use = "dropping the SIFS mount handle immediately unmounts the filesystem"]
 pub struct DfsFuseMountHandle {
     mount_root: PathBuf,
+    cancellation: sinomo_runtime::dfs::DfsCancellationFlag,
     #[cfg(all(unix, feature = "fuse"))]
     session: Option<fuser::BackgroundSession>,
 }
@@ -103,10 +122,53 @@ impl DfsFuseMountHandle {
         }
     }
 
+    /// Returns a clone of the mount lifecycle cancellation source.
+    ///
+    /// A long-lived supervisor can retain this clone before entering a
+    /// blocking mount/open path and cancel it when daemon shutdown begins.
+    pub fn cancellation(&self) -> sinomo_runtime::dfs::DfsCancellationFlag {
+        self.cancellation.clone()
+    }
+
+    /// Cooperatively cancels in-flight DFS work owned by this mount.
+    ///
+    /// This does not itself unmount. Drop the handle after requesting shutdown
+    /// so distributed waits can observe cancellation before the FUSE session
+    /// is released.
+    pub fn request_shutdown(&self) {
+        self.cancellation.cancel();
+    }
+
+    /// Requests cooperative shutdown, unmounts, and joins the FUSE worker.
+    ///
+    /// Long-lived supervisors should prefer this over plain drop when they
+    /// need a confirmed shutdown boundary and an actionable unmount error.
+    pub fn shutdown(self) -> Result<()> {
+        self.request_shutdown();
+        #[cfg(all(unix, feature = "fuse"))]
+        {
+            let mut handle = self;
+            if let Some(session) = handle.session.take() {
+                session
+                    .umount_and_join()
+                    .map_err(|source| DfsFuseError::Mount {
+                        mount_point: handle.mount_root.display().to_string(),
+                        detail: format!("failed to shut down background mount: {source}"),
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(all(unix, feature = "fuse"))]
-    fn new(mount_root: PathBuf, session: fuser::BackgroundSession) -> Self {
+    fn new(
+        mount_root: PathBuf,
+        session: fuser::BackgroundSession,
+        cancellation: sinomo_runtime::dfs::DfsCancellationFlag,
+    ) -> Self {
         Self {
             mount_root,
+            cancellation,
             session: Some(session),
         }
     }
@@ -124,6 +186,11 @@ impl fmt::Debug for DfsFuseMountHandle {
 
 impl Drop for DfsFuseMountHandle {
     fn drop(&mut self) {
+        // Distributed reads, lock waits, and bootstrap retries must observe
+        // cancellation before unmount begins. Otherwise a supervisor can drop
+        // the session while accepted work continues through its full network
+        // timeout budget.
+        self.cancellation.cancel();
         #[cfg(all(unix, feature = "fuse"))]
         {
             // fuser's BackgroundSession owns the mount object. Dropping it
@@ -155,11 +222,43 @@ pub fn mount_sifs(options: DfsFuseMountOptions) -> Result<()> {
 /// root may be used. This lifecycle guarantee requires an executable
 /// `fusermount3` or `fusermount` helper.
 pub fn mount_sifs_background(options: DfsFuseMountOptions) -> Result<DfsFuseMountHandle> {
+    mount_sifs_background_with_cancellation(
+        options,
+        sinomo_runtime::dfs::DfsCancellationFlag::new(),
+    )
+}
+
+/// Like [`mount_sifs_background`], using a caller-owned cooperative
+/// cancellation source during both mount bootstrap and the mounted lifetime.
+///
+/// The caller should retain a clone and cancel it before joining a supervisor
+/// which may currently be blocked opening the mount. Dropping the returned
+/// handle also cancels the same source before releasing the FUSE session.
+pub fn mount_sifs_background_with_cancellation(
+    options: DfsFuseMountOptions,
+    cancellation: sinomo_runtime::dfs::DfsCancellationFlag,
+) -> Result<DfsFuseMountHandle> {
     #[cfg(all(unix, feature = "fuse"))]
     {
-        fuse::mount_sifs_background(options)
+        fuse::mount_sifs_background(options, cancellation)
     }
     #[cfg(not(all(unix, feature = "fuse")))]
+    {
+        let _ = (options, cancellation);
+        Err(DfsFuseError::Unsupported)
+    }
+}
+
+/// Verify the Linux prerequisites required by a daemon-owned background
+/// mount without changing mount or cluster state.
+pub fn preflight_linux_sifs_background_mount(
+    options: &DfsFuseMountOptions,
+) -> Result<DfsFuseLinuxPreflight> {
+    #[cfg(all(target_os = "linux", feature = "fuse"))]
+    {
+        fuse::preflight_linux_sifs_background_mount(options)
+    }
+    #[cfg(not(all(target_os = "linux", feature = "fuse")))]
     {
         let _ = options;
         Err(DfsFuseError::Unsupported)
@@ -167,31 +266,108 @@ pub fn mount_sifs_background(options: DfsFuseMountOptions) -> Result<DfsFuseMoun
 }
 
 #[cfg(any(test, all(unix, feature = "fuse")))]
-fn prepare_background_mount_point(path: &Path) -> Result<PathBuf> {
-    if path.as_os_str().is_empty() {
-        return Err(DfsFuseError::Mount {
-            mount_point: path.display().to_string(),
-            detail: "mount point cannot be empty".to_string(),
+fn validate_safe_mount_point_path(path: &Path) -> Result<()> {
+    let mount_point = path.display().to_string();
+    if !path.is_absolute() {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point,
+            detail: "SIFS mounts require an absolute host path".to_string(),
         });
     }
+    if path == Path::new("/") {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point,
+            detail: "refusing to mount over the host filesystem root".to_string(),
+        });
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point,
+            detail: "parent-directory traversal is not allowed".to_string(),
+        });
+    }
+    #[cfg(target_os = "linux")]
+    for reserved in [
+        "/bin", "/boot", "/dev", "/etc", "/proc", "/run", "/sbin", "/sys", "/usr", "/var",
+    ] {
+        if path == Path::new(reserved) || path.starts_with(reserved) {
+            return Err(DfsFuseError::InvalidMountPoint {
+                mount_point,
+                detail: format!("refusing to mount inside the system path {reserved}"),
+            });
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(DfsFuseError::InvalidMountPoint {
+                mount_point,
+                detail: "mount point must not be a symbolic link".to_string(),
+            });
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(DfsFuseError::InvalidMountPoint {
+                mount_point,
+                detail: "mount point is not a directory".to_string(),
+            });
+        }
+        Ok(_) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        // A disconnected FUSE mount reports ENOTCONN here on Linux. The
+        // background mount path retains its explicit lazy-unmount recovery.
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+#[cfg(any(test, all(unix, feature = "fuse")))]
+fn prepare_safe_mount_point(path: &Path) -> Result<PathBuf> {
+    validate_safe_mount_point_path(path)?;
     std::fs::create_dir_all(path).map_err(|source| DfsFuseError::Mount {
         mount_point: path.display().to_string(),
         detail: format!("failed to create mount point: {source}"),
     })?;
-    let metadata = std::fs::metadata(path).map_err(|source| DfsFuseError::Mount {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| DfsFuseError::Mount {
         mount_point: path.display().to_string(),
         detail: format!("failed to inspect mount point: {source}"),
     })?;
+    if metadata.file_type().is_symlink() {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point: path.display().to_string(),
+            detail: "mount point must not be a symbolic link".to_string(),
+        });
+    }
     if !metadata.is_dir() {
         return Err(DfsFuseError::Mount {
             mount_point: path.display().to_string(),
             detail: "mount point is not a directory".to_string(),
         });
     }
-    std::fs::canonicalize(path).map_err(|source| DfsFuseError::Mount {
+    let resolved = std::fs::canonicalize(path).map_err(|source| DfsFuseError::Mount {
         mount_point: path.display().to_string(),
         detail: format!("failed to resolve mount point: {source}"),
-    })
+    })?;
+    if std::fs::read_dir(&resolved)
+        .map_err(|source| DfsFuseError::Mount {
+            mount_point: resolved.display().to_string(),
+            detail: format!("failed to inspect mount point contents: {source}"),
+        })?
+        .next()
+        .transpose()
+        .map_err(|source| DfsFuseError::Mount {
+            mount_point: resolved.display().to_string(),
+            detail: format!("failed to inspect mount point contents: {source}"),
+        })?
+        .is_some()
+    {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point: resolved.display().to_string(),
+            detail: "refusing to hide entries in a non-empty mount point".to_string(),
+        });
+    }
+    Ok(resolved)
 }
 
 #[cfg(any(test, all(unix, feature = "fuse")))]
@@ -298,7 +474,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-background-mount-point");
         let mount_point = root.join("nested").join("sifs");
 
-        let resolved = prepare_background_mount_point(&mount_point).expect("mount point");
+        let resolved = prepare_safe_mount_point(&mount_point).expect("mount point");
 
         assert!(mount_point.is_dir());
         assert!(resolved.is_absolute());
@@ -311,8 +487,70 @@ mod tests {
         let file = root.join("not-a-directory");
         std::fs::write(&file, b"fixture").expect("mount point fixture");
 
-        assert!(prepare_background_mount_point(&file).is_err());
-        assert!(prepare_background_mount_point(Path::new("")).is_err());
+        assert!(prepare_safe_mount_point(&file).is_err());
+        assert!(prepare_safe_mount_point(Path::new("")).is_err());
+    }
+
+    #[test]
+    fn background_mount_point_requires_a_safe_absolute_empty_directory() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-background-mount-safety");
+        let nonempty = root.join("nonempty");
+        std::fs::create_dir_all(&nonempty).expect("nonempty mount point");
+        std::fs::write(nonempty.join("keep"), b"host data").expect("host data");
+
+        assert!(matches!(
+            validate_safe_mount_point_path(Path::new("relative/mount")),
+            Err(DfsFuseError::InvalidMountPoint { detail, .. })
+                if detail.contains("absolute")
+        ));
+        assert!(matches!(
+            validate_safe_mount_point_path(Path::new("/")),
+            Err(DfsFuseError::InvalidMountPoint { detail, .. })
+                if detail.contains("filesystem root")
+        ));
+        assert!(matches!(
+            validate_safe_mount_point_path(Path::new("/tmp/sinomo/../mount")),
+            Err(DfsFuseError::InvalidMountPoint { detail, .. })
+                if detail.contains("traversal")
+        ));
+        assert!(matches!(
+            prepare_safe_mount_point(&nonempty),
+            Err(DfsFuseError::InvalidMountPoint { detail, .. })
+                if detail.contains("non-empty")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn background_mount_point_rejects_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-background-mount-symlink");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir_all(&target).expect("symlink target");
+        symlink(&target, &link).expect("mount point symlink");
+
+        assert!(matches!(
+            prepare_safe_mount_point(&link),
+            Err(DfsFuseError::InvalidMountPoint { detail, .. })
+                if detail.contains("symbolic link")
+        ));
+    }
+
+    #[test]
+    fn mount_handle_shutdown_cancels_the_external_source() {
+        let cancellation = sinomo_runtime::dfs::DfsCancellationFlag::new();
+        let handle = DfsFuseMountHandle {
+            mount_root: PathBuf::from("/tmp/sinomo-inactive-test-mount"),
+            cancellation: cancellation.clone(),
+            #[cfg(all(unix, feature = "fuse"))]
+            session: None,
+        };
+
+        handle.shutdown().expect("inactive handle shutdown");
+
+        assert!(cancellation.is_cancelled());
     }
 
     #[cfg(all(unix, feature = "fuse"))]

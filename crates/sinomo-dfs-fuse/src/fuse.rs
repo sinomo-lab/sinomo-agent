@@ -1,6 +1,7 @@
 use crate::{
-    DfsFuseError, DfsFuseMountHandle, DfsFuseMountOptions, Result, join_sifs_child,
-    normalize_sifs_root, parent_sifs_path, prepare_background_mount_point,
+    DfsFuseError, DfsFuseLinuxPreflight, DfsFuseMountHandle, DfsFuseMountOptions, Result,
+    join_sifs_child, normalize_sifs_root, parent_sifs_path, prepare_safe_mount_point,
+    validate_safe_mount_point_path,
 };
 use fuser::{
     AccessFlags, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
@@ -15,7 +16,7 @@ use sinomo_runtime::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -167,25 +168,200 @@ impl Drop for FuseReadExecutor {
 
 pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
-    let mount_helper = fuse_mount_helper();
+    let mount_helper = prepare_safe_fuse_mount(&mut options)?;
     let mount_point = options.mount_point.clone();
-    let fs = SifsFuseFileSystem::open(options.clone())?;
-    let mount_config = fuse_mount_config(&options, mount_helper.is_some());
+    let fs = SifsFuseFileSystem::open(options.clone(), dfs::DfsCancellationFlag::new())?;
+    let mount_config = fuse_mount_config(&options, true);
     fuser::mount2(fs, &mount_point, &mount_config)
-        .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))
+        .map_err(|source| map_mount_error(&mount_point, mount_helper.exists(), source))
 }
 
-pub fn mount_sifs_background(mut options: DfsFuseMountOptions) -> Result<DfsFuseMountHandle> {
+pub fn mount_sifs_background(
+    mut options: DfsFuseMountOptions,
+    cancellation: dfs::DfsCancellationFlag,
+) -> Result<DfsFuseMountHandle> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
-    let mount_helper = fuse_mount_helper();
-    recover_disconnected_mount_point(&options.mount_point, mount_helper.as_deref())?;
-    let mount_point = prepare_background_mount_point(&options.mount_point)?;
-    options.mount_point = mount_point.clone();
-    let fs = SifsFuseFileSystem::open(options.clone())?;
-    let mount_config = background_fuse_mount_config(&options, mount_helper.is_some());
+    let _mount_helper = prepare_safe_fuse_mount(&mut options)?;
+    let mount_point = options.mount_point.clone();
+    let fs = SifsFuseFileSystem::open(options.clone(), cancellation.clone())?;
+    let mount_config = background_fuse_mount_config(&options, true);
     let session = fuser::spawn_mount2(fs, &mount_point, &mount_config)
-        .map_err(|source| map_mount_error(&mount_point, mount_helper.is_some(), source))?;
-    Ok(DfsFuseMountHandle::new(mount_point, session))
+        .map_err(|source| map_mount_error(&mount_point, true, source))?;
+    Ok(DfsFuseMountHandle::new(mount_point, session, cancellation))
+}
+
+fn prepare_safe_fuse_mount(options: &mut DfsFuseMountOptions) -> Result<PathBuf> {
+    validate_safe_mount_point_path(&options.mount_point)?;
+    let mount_helper = required_fuse_mount_helper(&options.mount_point)?;
+    #[cfg(target_os = "linux")]
+    preflight_linux_sifs_background_mount_with(
+        options,
+        Path::new("/dev/fuse"),
+        &mount_helper,
+        Path::new("/etc/fuse.conf"),
+    )?;
+    validate_mount_point_preserves_data_dir(options, &options.mount_point)?;
+    recover_disconnected_mount_point(&options.mount_point, Some(&mount_helper))?;
+    let mount_point = prepare_safe_mount_point(&options.mount_point)?;
+    validate_mount_point_preserves_data_dir(options, &mount_point)?;
+    options.mount_point = mount_point;
+    Ok(mount_helper)
+}
+
+#[cfg(target_os = "linux")]
+pub fn preflight_linux_sifs_background_mount(
+    options: &DfsFuseMountOptions,
+) -> Result<DfsFuseLinuxPreflight> {
+    validate_safe_mount_point_path(&options.mount_point)?;
+    let mount_helper = required_fuse_mount_helper(&options.mount_point)?;
+    preflight_linux_sifs_background_mount_with(
+        options,
+        Path::new("/dev/fuse"),
+        &mount_helper,
+        Path::new("/etc/fuse.conf"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn preflight_linux_sifs_background_mount_with(
+    options: &DfsFuseMountOptions,
+    fuse_device: &Path,
+    mount_helper: &Path,
+    fuse_config: &Path,
+) -> Result<DfsFuseLinuxPreflight> {
+    validate_safe_mount_point_path(&options.mount_point)?;
+    let metadata = std::fs::metadata(fuse_device).map_err(|source| DfsFuseError::Mount {
+        mount_point: options.mount_point.display().to_string(),
+        detail: format!(
+            "{} is unavailable; load or enable the FUSE kernel device: {source}",
+            fuse_device.display()
+        ),
+    })?;
+    if !metadata.file_type().is_char_device() {
+        return Err(DfsFuseError::Mount {
+            mount_point: options.mount_point.display().to_string(),
+            detail: format!("{} is not a character device", fuse_device.display()),
+        });
+    }
+    if !is_executable_file(mount_helper) {
+        return Err(DfsFuseError::Mount {
+            mount_point: options.mount_point.display().to_string(),
+            detail: format!(
+                "background mount lifecycle requires an executable `fusermount3` or `fusermount` helper; {} is not executable",
+                mount_helper.display()
+            ),
+        });
+    }
+    let allow_other_enabled = if options.allow_other {
+        fuse_config_allows_other(fuse_config).map_err(|source| DfsFuseError::Mount {
+            mount_point: options.mount_point.display().to_string(),
+            detail: format!(
+                "`--allow-other` requires an active `user_allow_other` entry in {}: {source}",
+                fuse_config.display()
+            ),
+        })?
+    } else {
+        false
+    };
+    if options.allow_other && !allow_other_enabled {
+        return Err(DfsFuseError::Mount {
+            mount_point: options.mount_point.display().to_string(),
+            detail: format!(
+                "`--allow-other` requires an active `user_allow_other` entry in {}",
+                fuse_config.display()
+            ),
+        });
+    }
+    let direct_fuse_device_access = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fuse_device)
+        .is_ok();
+    Ok(DfsFuseLinuxPreflight {
+        mount_point: options.mount_point.clone(),
+        fuse_device: fuse_device.to_path_buf(),
+        mount_helper: mount_helper.to_path_buf(),
+        direct_fuse_device_access,
+        allow_other_enabled,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn fuse_config_allows_other(path: &Path) -> io::Result<bool> {
+    let contents = std::fs::read_to_string(path)?;
+    Ok(contents.lines().any(|line| {
+        line.split_once('#').map_or(line, |(value, _)| value).trim() == "user_allow_other"
+    }))
+}
+
+fn required_fuse_mount_helper(mount_point: &Path) -> Result<PathBuf> {
+    fuse_mount_helper().ok_or_else(|| DfsFuseError::Mount {
+        mount_point: mount_point.display().to_string(),
+        detail: "background mount lifecycle requires an executable `fusermount3` or `fusermount` helper on PATH or in a standard system location".to_string(),
+    })
+}
+
+fn validate_mount_point_preserves_data_dir(
+    options: &DfsFuseMountOptions,
+    mount_point: &Path,
+) -> Result<()> {
+    let data_dir = match options.data_dir.as_ref() {
+        Some(path) => SinomoDataDir::new(path),
+        None => SinomoDataDir::from_env_or_home()
+            .map_err(|source| DfsFuseError::LocalData(source.to_string()))?,
+    };
+    let data_root = absolute_or_canonical_host_path(&data_dir.root()).map_err(|source| {
+        DfsFuseError::Mount {
+            mount_point: mount_point.display().to_string(),
+            detail: format!("failed to resolve Sinomo data directory for mount safety: {source}"),
+        }
+    })?;
+    if data_root.starts_with(mount_point) || mount_point.starts_with(&data_root) {
+        return Err(DfsFuseError::InvalidMountPoint {
+            mount_point: mount_point.display().to_string(),
+            detail: format!(
+                "refusing a mount that overlaps the Sinomo data directory {}",
+                data_root.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn absolute_or_canonical_host_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut candidate = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::canonicalize(candidate) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = candidate.file_name().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("cannot resolve {}", absolute.display()),
+                    )
+                })?;
+                missing.push(component.to_os_string());
+                candidate = candidate.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("cannot resolve {}", absolute.display()),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn recover_disconnected_mount_point(path: &Path, mount_helper: Option<&Path>) -> Result<()> {
@@ -270,10 +446,17 @@ fn background_fuse_mount_config(
 
 fn fuse_mount_helper() -> Option<PathBuf> {
     fuse_mount_helper_on_path(std::env::var_os("PATH").as_deref()).or_else(|| {
-        ["/bin/fusermount3", "/bin/fusermount"]
-            .into_iter()
-            .map(PathBuf::from)
-            .find(|candidate| is_executable_file(candidate))
+        [
+            "/usr/bin/fusermount3",
+            "/usr/bin/fusermount",
+            "/bin/fusermount3",
+            "/bin/fusermount",
+            "/usr/local/bin/fusermount3",
+            "/usr/local/bin/fusermount",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|candidate| is_executable_file(candidate))
     })
 }
 
@@ -339,14 +522,22 @@ struct SifsFuseFileSystem {
 }
 
 impl SifsFuseFileSystem {
-    fn open(options: DfsFuseMountOptions) -> Result<Self> {
+    fn open(
+        options: DfsFuseMountOptions,
+        read_cancellation: dfs::DfsCancellationFlag,
+    ) -> Result<Self> {
+        if read_cancellation.is_cancelled() {
+            return Err(DfsFuseError::Dfs(
+                "SIFS FUSE mount was cancelled before open".to_string(),
+            ));
+        }
         let data_dir = match options.data_dir {
             Some(path) => SinomoDataDir::new(path),
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsFuseError::LocalData(source.to_string()))?,
         };
         let dfs::OpenedMountedSifsService {
-            mut service,
+            service,
             replica_candidates,
         } = if sinomo_runtime::network::ClusterPaths::new(&data_dir)
             .state
@@ -358,17 +549,21 @@ impl SifsFuseFileSystem {
             );
             let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> = peer_transport.clone();
             let async_peer_transport: Arc<dyn dfs::AsyncDfsPeerTransport> = peer_transport;
-            dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane(
+            dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
                 data_dir,
                 sync_peer_transport,
                 async_peer_transport,
+                Some(read_cancellation.clone()),
             )
             .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
         } else {
             // A standalone one-node data directory has no daemon-owned cluster
             // transport to share, so retain the local-only mounted service.
-            dfs::open_mounted_sifs_service(Some(data_dir.root()))
-                .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
+            dfs::open_mounted_sifs_service_with_cancellation(
+                Some(data_dir.root()),
+                Some(read_cancellation.clone()),
+            )
+            .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
         };
         // Resolve the local-only fallback before the service is placed behind
         // the mount-wide mutex. FUSE mutation handlers already hold that
@@ -377,8 +572,6 @@ impl SifsFuseFileSystem {
         // the cluster currently advertises no content-service candidates.
         let replica_candidates =
             fuse_write_replica_candidates(replica_candidates, service.node_id().clone());
-        let read_cancellation = dfs::DfsCancellationFlag::new();
-        service.add_cancellation(read_cancellation.clone());
         let content_reads = service.mounted_content_read_context();
         let read_executor = FuseReadExecutor::new(read_cancellation.clone())
             .map_err(|source| DfsFuseError::Dfs(format!("start FUSE read workers: {source}")))?;
@@ -3732,6 +3925,18 @@ mod errno_tests {
     use super::*;
 
     #[test]
+    fn foreground_mount_rejects_unsafe_host_paths_before_opening_sifs() {
+        for mount_point in ["/", "/etc/sinomo-unsafe-mount"] {
+            let error = mount_sifs(DfsFuseMountOptions::new(mount_point))
+                .expect_err("unsafe foreground mount must fail before FUSE or DFS side effects");
+            assert!(
+                matches!(error, DfsFuseError::InvalidMountPoint { .. }),
+                "unexpected error for {mount_point}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn fuse_mount_helper_lookup_requires_an_executable_helper() {
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-helper-path");
         let helper = root.join("fusermount3");
@@ -3748,6 +3953,110 @@ mod errno_tests {
             Some(helper)
         );
         assert!(fuse_mount_helper_on_path(None).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_background_preflight_requires_explicit_allow_other_consent() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-linux-preflight");
+        let helper = root.join("fusermount3");
+        let fuse_config = root.join("fuse.conf");
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        std::fs::write(&fuse_config, b"# user_allow_other\n").expect("fuse config");
+        let mut options = DfsFuseMountOptions::new(root.join("mount"));
+        options.allow_other = true;
+
+        let error = preflight_linux_sifs_background_mount_with(
+            &options,
+            Path::new("/dev/null"),
+            &helper,
+            &fuse_config,
+        )
+        .expect_err("commented consent must fail closed");
+        assert!(error.to_string().contains("user_allow_other"));
+
+        std::fs::write(
+            &fuse_config,
+            b"# owner-only remains the default\n user_allow_other # explicit\n",
+        )
+        .expect("enabled fuse config");
+        let report = preflight_linux_sifs_background_mount_with(
+            &options,
+            Path::new("/dev/null"),
+            &helper,
+            &fuse_config,
+        )
+        .expect("explicit allow_other consent");
+        assert!(report.allow_other_enabled);
+        assert_eq!(report.mount_helper, helper);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_background_preflight_requires_an_executable_helper_and_fuse_device() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-linux-preflight-capability");
+        let helper = root.join("fusermount3");
+        let missing_device = root.join("missing-fuse");
+        let options = DfsFuseMountOptions::new(root.join("mount"));
+        std::fs::write(&helper, b"helper").expect("write helper fixture");
+
+        let helper_error = preflight_linux_sifs_background_mount_with(
+            &options,
+            Path::new("/dev/null"),
+            &helper,
+            root.join("unused-fuse.conf").as_path(),
+        )
+        .expect_err("non-executable helper must fail");
+        assert!(helper_error.to_string().contains("not executable"));
+
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        let device_error = preflight_linux_sifs_background_mount_with(
+            &options,
+            &missing_device,
+            &helper,
+            root.join("unused-fuse.conf").as_path(),
+        )
+        .expect_err("missing fuse device must fail");
+        assert!(device_error.to_string().contains("missing-fuse"));
+    }
+
+    #[test]
+    fn background_mount_cannot_hide_its_sinomo_data_directory() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-data-dir-mount-safety");
+        let data_dir = root.join("data");
+        let nested_mount = data_dir.join("mounts").join("sifs");
+        std::fs::create_dir_all(&nested_mount).expect("nested mount point");
+
+        let options = DfsFuseMountOptions::new(&root).with_data_dir(&data_dir);
+        let error = validate_mount_point_preserves_data_dir(&options, &root)
+            .expect_err("mount ancestor must not hide the data directory");
+        assert!(error.to_string().contains("data directory"));
+
+        let nested_options = DfsFuseMountOptions::new(&nested_mount).with_data_dir(&data_dir);
+        let error = validate_mount_point_preserves_data_dir(&nested_options, &nested_mount)
+            .expect_err("a mount inside the data directory must also be rejected");
+        assert!(error.to_string().contains("overlaps"));
+    }
+
+    #[test]
+    fn pre_cancelled_mount_open_stops_before_touching_local_state() {
+        let cancellation = dfs::DfsCancellationFlag::new();
+        cancellation.cancel();
+        let error = SifsFuseFileSystem::open(
+            DfsFuseMountOptions::new("/tmp/sinomo-pre-cancelled-mount"),
+            cancellation,
+        )
+        .expect_err("pre-cancelled mount must stop before open");
+        assert!(error.to_string().contains("cancelled before open"));
     }
 
     #[test]

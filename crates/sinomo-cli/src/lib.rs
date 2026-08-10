@@ -704,11 +704,23 @@ fn cli_fetch_cluster_health_rows_from_member(
 
 mod commands;
 mod completion;
+mod dfs_mount_supervisor;
 mod file_manager;
 mod sifs_file_manager;
 mod sobj_file_preview;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
+
+/// Application-host integration for one node-local supervised SIFS mount.
+///
+/// Standalone and embedded main daemons register the same application-ring
+/// service so UI-written local consent has identical lifecycle semantics.
+pub fn sifs_mount_supervisor_service_hook(
+    data_dir: sinomo_runtime::local::SinomoDataDir,
+    daemon_paths: sinomo_runtime::daemon::DaemonPaths,
+) -> sinomo_runtime::daemon::DaemonServiceRegistryHook {
+    dfs_mount_supervisor::sifs_mount_supervisor_service_hook(data_dir, daemon_paths)
+}
 
 thread_local! {
     static CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };

@@ -3,7 +3,8 @@
 use crate::{
     DFS_DIRECT_READ_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_RPC_CATEGORY,
-    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
+    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, sifs_mount_config_definition,
+    sifs_mount_status_config_definition,
 };
 use sinomo_core::{
     CapabilityName, FileSystemAccess, ModuleCapabilities, ModuleResourceLimits, NetworkAccess,
@@ -170,6 +171,11 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ));
     }
+    surfaces = surfaces
+        .with_config_definition(sifs_mount_config_definition())
+        .expect("valid SIFS mount settings surface")
+        .with_config_definition(sifs_mount_status_config_definition())
+        .expect("valid SIFS mount status surface");
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }

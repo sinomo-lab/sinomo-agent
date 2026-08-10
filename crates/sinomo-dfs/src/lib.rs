@@ -55,6 +55,7 @@ mod metadata_tombstone;
 mod metadata_visible_commit;
 mod model;
 mod module_surface;
+mod mount_config;
 mod mounted_sifs;
 mod namespace;
 mod namespace_change_feed;
@@ -419,6 +420,13 @@ pub use module_surface::{
     DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, SINOMO_DFS_MODULE_LEGACY_ID,
     SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_module_capabilities,
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
+};
+pub use mount_config::{
+    SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_STATUS_CONFIG_KEY, SIFS_MOUNT_STATUS_ROUTE,
+    SifsMountAttentionKind, SifsMountAttentionNextAction, SifsMountAttentionSummary,
+    SifsMountConfig, SifsMountPlatform, SifsMountRetainedLocalEvidence, SifsMountRuntimePhase,
+    SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
+    SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_status_config_definition,
 };
 pub use mounted_sifs::{
     MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsService,

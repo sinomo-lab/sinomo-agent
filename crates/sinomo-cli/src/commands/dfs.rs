@@ -115,7 +115,14 @@ pub(crate) struct DfsConflictSaveVersionOptions {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct DfsMountOptions {
+pub(crate) enum DfsMountOptions {
+    Mount(DfsHostMountOptions),
+    Status { json: bool },
+    Disable { json: bool },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsHostMountOptions {
     pub(crate) mount_point: PathBuf,
     pub(crate) root_path: String,
     pub(crate) data_dir: Option<PathBuf>,
@@ -457,19 +464,35 @@ fn dfs_cli_spec() -> CliCommandSpec {
             ]),
             CliCommandSpec::new("mount", "expose SIFS locally")
                 .with_options([
+                    CliOptionSpec::flag(
+                        "--status",
+                        "query the local daemon's live SIFS mount supervisor status",
+                    ),
+                    CliOptionSpec::flag(
+                        "--disable",
+                        "disable the local supervised mount while preserving its identity",
+                    ),
+                    json(),
                     option("--root", "SIFS root path", "path").with_aliases(["--path"]),
                     option("--data-dir", "Sinomo data directory", "path"),
-                    CliOptionSpec::flag("--read-only", "mount read-only").with_aliases(["--ro"]),
+                    CliOptionSpec::flag(
+                        "--read-only",
+                        "mount read-only (Unix FUSE; Windows Cloud Files requires durable writable sync)",
+                    )
+                    .with_aliases(["--ro"]),
                     CliOptionSpec::flag("--allow-other", "allow other local users"),
                     CliOptionSpec::flag("--foreground", "stay in the foreground"),
-                    CliOptionSpec::flag("--background", "run mount in the background"),
+                    CliOptionSpec::flag(
+                        "--background",
+                        "configure the main daemon to supervise this mount",
+                    ),
                     CliOptionSpec::flag("--sync-local-changes", "sync local mount changes"),
                     CliOptionSpec::flag(
                         "--no-sync-local-changes",
                         "disable local change synchronization",
                     ),
                 ])
-                .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
                     "mount-point",
                     "local mount directory",
                 ))]),
@@ -784,6 +807,55 @@ pub(crate) fn parse_dfs_schema_for_test(args: &[String]) -> Result<DfsCliCommand
 }
 
 fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOptions, CliParseError> {
+    let status = matches.contains("--status");
+    let disable = matches.contains("--disable");
+    if status && disable {
+        return Err(CliParseError::Parse {
+            detail: "dfs mount cannot combine --status and --disable".to_string(),
+        });
+    }
+    if status || disable {
+        if !matches.positionals().is_empty() {
+            return Err(CliParseError::Parse {
+                detail: "dfs mount --status and --disable do not accept a mount-point".to_string(),
+            });
+        }
+        const MOUNT_ONLY_OPTIONS: [&str; 8] = [
+            "--root",
+            "--data-dir",
+            "--read-only",
+            "--allow-other",
+            "--foreground",
+            "--background",
+            "--sync-local-changes",
+            "--no-sync-local-changes",
+        ];
+        if let Some(option) = MOUNT_ONLY_OPTIONS
+            .into_iter()
+            .find(|option| matches.contains(option))
+        {
+            return Err(CliParseError::Parse {
+                detail: format!(
+                    "dfs mount {} cannot be combined with mount option {option}",
+                    if status { "--status" } else { "--disable" }
+                ),
+            });
+        }
+        return Ok(if status {
+            DfsMountOptions::Status {
+                json: matches.contains("--json"),
+            }
+        } else {
+            DfsMountOptions::Disable {
+                json: matches.contains("--json"),
+            }
+        });
+    }
+    if matches.contains("--json") {
+        return Err(CliParseError::Parse {
+            detail: "dfs mount --json requires --status or --disable".to_string(),
+        });
+    }
     if matches.contains("--foreground") && matches.contains("--background") {
         return Err(CliParseError::Parse {
             detail: "dfs mount cannot combine --foreground and --background".to_string(),
@@ -795,15 +867,16 @@ fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOption
                 .to_string(),
         });
     }
-    Ok(DfsMountOptions {
+    let sync_local_changes = matches.contains("--sync-local-changes");
+    Ok(DfsMountOptions::Mount(DfsHostMountOptions {
         mount_point: PathBuf::from(required_positional(matches, 0)?),
         root_path: matches.value("--root").unwrap_or("/").to_string(),
         data_dir: matches.value("--data-dir").map(PathBuf::from),
-        read_only: matches.contains("--read-only"),
+        read_only: matches.contains("--read-only") || (cfg!(windows) && !sync_local_changes),
         allow_other: matches.contains("--allow-other"),
         foreground: !matches.contains("--background"),
-        sync_local_changes: matches.contains("--sync-local-changes"),
-    })
+        sync_local_changes,
+    }))
 }
 
 fn parse_dfs_pin_matches(
@@ -2303,8 +2376,175 @@ fn publish_dfs_metadata_journal_from_data_dir(
     )
 }
 
+const DFS_MOUNT_LOCAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DFS_MOUNT_STATUS_RPC_CATEGORY: &str = "sifs-mount-supervisor";
+
+trait DfsMountSupervisorControl {
+    fn live_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError>;
+    fn mount_config(&self) -> Result<sinomo_runtime::dfs::SifsMountConfig, CliError>;
+    fn write_mount_config(
+        &self,
+        config: &sinomo_runtime::dfs::SifsMountConfig,
+    ) -> Result<(), CliError>;
+}
+
+struct LocalDfsMountSupervisorControl {
+    daemon: DaemonApiClient,
+}
+
+impl LocalDfsMountSupervisorControl {
+    fn connect() -> Result<Self, CliError> {
+        Ok(Self {
+            daemon: DaemonApiClient::connect()?.with_timeout(DFS_MOUNT_LOCAL_RPC_TIMEOUT),
+        })
+    }
+
+    fn config_client(&self) -> sinomo_runtime::api::RemoteConfigClient {
+        sinomo_runtime::api::RemoteConfigClient::new(
+            self.daemon.address().to_string(),
+            DFS_MOUNT_LOCAL_RPC_TIMEOUT,
+        )
+    }
+}
+
+impl DfsMountSupervisorControl for LocalDfsMountSupervisorControl {
+    fn live_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError> {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::SIFS_MOUNT_STATUS_ROUTE,
+            DFS_MOUNT_STATUS_RPC_CATEGORY,
+            &sinomo_runtime::dfs::SifsMountStatusRequest,
+        )?
+        .with_trace_context_if_missing();
+        let response = self.daemon.call_request(&request)?;
+        Ok(response
+            .decode_body::<sinomo_runtime::dfs::SifsMountStatusResponse>()?
+            .status)
+    }
+
+    fn mount_config(&self) -> Result<sinomo_runtime::dfs::SifsMountConfig, CliError> {
+        use sinomo_runtime::config::ConfigClientExt as _;
+
+        self.config_client()
+            .get_typed(sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY)
+            .map_err(Into::into)
+    }
+
+    fn write_mount_config(
+        &self,
+        config: &sinomo_runtime::dfs::SifsMountConfig,
+    ) -> Result<(), CliError> {
+        use sinomo_runtime::config::ConfigClientExt as _;
+
+        self.config_client()
+            .set_typed(
+                sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY,
+                config,
+                sinomo_runtime::config::ConfigWriteTarget::Local,
+            )
+            .map(drop)
+            .map_err(Into::into)
+    }
+}
+
+fn query_live_dfs_mount_status(
+    control: &dyn DfsMountSupervisorControl,
+) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError> {
+    control.live_status()
+}
+
+fn disable_managed_dfs_mount(
+    control: &dyn DfsMountSupervisorControl,
+) -> Result<sinomo_runtime::dfs::SifsMountConfig, CliError> {
+    let mut config = control.mount_config()?;
+    config.enabled = false;
+    control.write_mount_config(&config)?;
+    Ok(config)
+}
+
+fn print_live_dfs_mount_status(
+    status: &sinomo_runtime::dfs::SifsMountRuntimeStatus,
+    json: bool,
+) -> Result<(), CliError> {
+    if json {
+        return print_json("<dfs-mount-status>", status);
+    }
+    println!(
+        "SIFS mount {:?}: {} -> {} ({:?})",
+        status.phase, status.configured_mount_point, status.root_path, status.platform
+    );
+    if let Some(resolved_mount_point) = &status.resolved_mount_point {
+        println!("  resolved mount point: {resolved_mount_point}");
+    }
+    println!("  detail: {}", status.detail);
+    println!("  updated: {}", status.updated_at);
+    Ok(())
+}
+
+fn run_dfs_mount_status_command(json: bool) -> Result<(), CliError> {
+    let control = LocalDfsMountSupervisorControl::connect()?;
+    let status = query_live_dfs_mount_status(&control)?;
+    print_live_dfs_mount_status(&status, json)
+}
+
+fn run_dfs_mount_disable_command(json: bool) -> Result<(), CliError> {
+    let control = LocalDfsMountSupervisorControl::connect()?;
+    let config = disable_managed_dfs_mount(&control)?;
+    if json {
+        print_json("<dfs-mount-config>", &config)
+    } else {
+        println!(
+            "disabled supervised SIFS mount {} -> {}; mount identity was preserved",
+            config.mount_point, config.root_path
+        );
+        Ok(())
+    }
+}
+
 pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
     validate_dfs_mount_options_for_platform(&options)?;
+    match options {
+        DfsMountOptions::Status { json } => run_dfs_mount_status_command(json),
+        DfsMountOptions::Disable { json } => run_dfs_mount_disable_command(json),
+        DfsMountOptions::Mount(options) => run_dfs_host_mount_command(options),
+    }
+}
+
+fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliError> {
+    let data_dir = match options.data_dir.clone() {
+        Some(path) => SinomoDataDir::new(path),
+        None => SinomoDataDir::from_env_or_home()?,
+    };
+    if !options.foreground {
+        let config = sinomo_runtime::dfs::SifsMountConfig {
+            enabled: true,
+            mount_point: options.mount_point.display().to_string(),
+            root_path: options.root_path,
+            read_only: options.read_only,
+            allow_other: options.allow_other,
+            sync_local_changes: options.sync_local_changes,
+        };
+        let resolved =
+            crate::dfs_mount_supervisor::configure_managed_sifs_mount(&data_dir, &config)
+                .map_err(|detail| CliError::Parse { detail })?;
+        println!(
+            "configured supervised SIFS mount {} -> {}; the main daemon will keep it connected",
+            resolved.display(),
+            config.root_path
+        );
+        return Ok(());
+    }
+    if crate::dfs_mount_supervisor::managed_sifs_mount_config(&data_dir)
+        .map_err(|detail| CliError::Parse { detail })?
+        .enabled
+    {
+        return Err(CliError::Parse {
+            detail: "the supervised SIFS mount is enabled; disable `storage.sifs-mount` before starting a second foreground mount".to_string(),
+        });
+    }
+    let lease_owner = format!("foreground CLI mount {}", options.mount_point.display());
+    let _mount_lease =
+        crate::dfs_mount_supervisor::SifsMountLease::try_acquire(&data_dir, &lease_owner)
+            .map_err(|detail| CliError::Parse { detail })?;
     #[cfg(windows)]
     {
         run_dfs_cloud_files_mount_command(options)
@@ -2336,13 +2576,11 @@ pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliE
 pub(crate) fn validate_dfs_mount_options_for_platform(
     options: &DfsMountOptions,
 ) -> Result<(), CliError> {
+    let DfsMountOptions::Mount(options) = options else {
+        return Ok(());
+    };
     #[cfg(not(windows))]
     {
-        if !options.foreground {
-            return Err(CliError::Parse {
-                detail: "`--background` is not supported by the Unix FUSE mount yet; keep this command running in a supervised terminal or service".to_string(),
-            });
-        }
         if options.sync_local_changes {
             return Err(CliError::Parse {
                 detail: "`--sync-local-changes` is only supported by Windows Cloud Files; Unix FUSE writes are already sent directly to SIFS".to_string(),
@@ -2351,13 +2589,173 @@ pub(crate) fn validate_dfs_mount_options_for_platform(
     }
     #[cfg(windows)]
     {
-        let _ = options;
+        if options.allow_other {
+            return Err(CliError::Parse {
+                detail: "`--allow-other` is only supported by Unix FUSE".to_string(),
+            });
+        }
+        if options.read_only || !options.sync_local_changes {
+            return Err(CliError::Parse {
+                detail: "Windows Cloud Files requires durable writable synchronization; pass `--sync-local-changes` without `--read-only`"
+                    .to_string(),
+            });
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
+mod dfs_mount_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::{
+        DfsHostMountOptions, DfsMountOptions, DfsMountSupervisorControl, disable_managed_dfs_mount,
+        query_live_dfs_mount_status, run_dfs_mount_command,
+    };
+    use sinomo_runtime::dfs::{SifsMountConfig, SifsMountRuntimePhase, SifsMountRuntimeStatus};
+    use sinomo_runtime::local::SinomoDataDir;
+
+    struct FakeMountSupervisorControl {
+        live_status: SifsMountRuntimeStatus,
+        live_error: Option<&'static str>,
+        config: SifsMountConfig,
+        live_calls: Cell<usize>,
+        config_reads: Cell<usize>,
+        config_writes: RefCell<Vec<SifsMountConfig>>,
+    }
+
+    impl FakeMountSupervisorControl {
+        fn new(live_status: SifsMountRuntimeStatus, config: SifsMountConfig) -> Self {
+            Self {
+                live_status,
+                live_error: None,
+                config,
+                live_calls: Cell::new(0),
+                config_reads: Cell::new(0),
+                config_writes: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DfsMountSupervisorControl for FakeMountSupervisorControl {
+        fn live_status(&self) -> Result<SifsMountRuntimeStatus, crate::CliError> {
+            self.live_calls.set(self.live_calls.get() + 1);
+            if let Some(detail) = self.live_error {
+                return Err(crate::CliError::Parse {
+                    detail: detail.to_string(),
+                });
+            }
+            Ok(self.live_status.clone())
+        }
+
+        fn mount_config(&self) -> Result<SifsMountConfig, crate::CliError> {
+            self.config_reads.set(self.config_reads.get() + 1);
+            Ok(self.config.clone())
+        }
+
+        fn write_mount_config(&self, config: &SifsMountConfig) -> Result<(), crate::CliError> {
+            self.config_writes.borrow_mut().push(config.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn status_uses_only_the_live_supervisor_and_never_falls_back_to_config() {
+        let live_status = SifsMountRuntimeStatus {
+            phase: SifsMountRuntimePhase::Mounted,
+            detail: "live supervisor observation".to_string(),
+            updated_at: "2026-08-10T00:00:00Z".to_string(),
+            ..SifsMountRuntimeStatus::default()
+        };
+        let stale_config = SifsMountConfig {
+            enabled: true,
+            mount_point: "/stale/persisted/mount".to_string(),
+            ..SifsMountConfig::default()
+        };
+        let control = FakeMountSupervisorControl::new(live_status.clone(), stale_config.clone());
+
+        assert_eq!(
+            query_live_dfs_mount_status(&control).expect("live status"),
+            live_status
+        );
+        assert_eq!(control.live_calls.get(), 1);
+        assert_eq!(control.config_reads.get(), 0);
+        assert!(control.config_writes.borrow().is_empty());
+
+        let mut unavailable =
+            FakeMountSupervisorControl::new(SifsMountRuntimeStatus::default(), stale_config);
+        unavailable.live_error = Some("live supervisor unavailable");
+        assert!(
+            query_live_dfs_mount_status(&unavailable)
+                .expect_err("live failure must not fall back")
+                .to_string()
+                .contains("live supervisor unavailable")
+        );
+        assert_eq!(unavailable.live_calls.get(), 1);
+        assert_eq!(unavailable.config_reads.get(), 0);
+        assert!(unavailable.config_writes.borrow().is_empty());
+    }
+
+    #[test]
+    fn disable_changes_only_enabled_and_preserves_mount_identity() {
+        let original = SifsMountConfig {
+            enabled: true,
+            mount_point: "~/sinomo".to_string(),
+            root_path: "/sinomo/agents/owner/home".to_string(),
+            read_only: false,
+            allow_other: true,
+            sync_local_changes: true,
+        };
+        let control =
+            FakeMountSupervisorControl::new(SifsMountRuntimeStatus::default(), original.clone());
+
+        let disabled = disable_managed_dfs_mount(&control).expect("disable mount");
+        let expected = SifsMountConfig {
+            enabled: false,
+            ..original
+        };
+        assert_eq!(disabled, expected);
+        assert_eq!(control.config_reads.get(), 1);
+        assert_eq!(control.live_calls.get(), 0);
+        assert_eq!(control.config_writes.borrow().as_slice(), &[expected]);
+    }
+
+    #[test]
+    fn foreground_mount_is_rejected_before_platform_side_effect_when_lease_is_owned() {
+        let temp = sinomo_testdir::TestDir::new("sinomo-cli-foreground-mount-lease");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        let _lease = crate::dfs_mount_supervisor::SifsMountLease::try_acquire(
+            &data_dir,
+            "foreground collision test",
+        )
+        .expect("test lease");
+
+        let error = run_dfs_mount_command(DfsMountOptions::Mount(DfsHostMountOptions {
+            mount_point: mount_point.clone(),
+            root_path: "/".to_string(),
+            data_dir: Some(data_dir.root()),
+            read_only: true,
+            allow_other: false,
+            foreground: true,
+            sync_local_changes: false,
+        }))
+        .expect_err("a held lease must reject a foreground mount");
+
+        assert!(
+            error
+                .to_string()
+                .contains("another managed or foreground mount")
+        );
+        assert!(
+            !mount_point.exists(),
+            "lease rejection must happen before the platform mount creates its mount point"
+        );
+    }
+}
+
 #[cfg(windows)]
-fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
+fn run_dfs_cloud_files_mount_command(options: DfsHostMountOptions) -> Result<(), CliError> {
     use sinomo_runtime::dfs_cloud_files_api::{
         CloudFilesModuleRequest, CloudFilesModuleResponse, CloudFilesMountRequest,
         SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,

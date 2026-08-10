@@ -12,7 +12,7 @@ use super::{
     DaemonProbeStatus, DaemonRunOptions, DaemonStatus, DaemonStatusOptions, DfsCliCommand,
     DfsCommonOptions, DfsConflictResolveOptions, DfsConflictSaveVersionOptions,
     DfsConflictUseVersionOptions, DfsConflictVersionsOptions, DfsFilterOptions,
-    DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
+    DfsHostMountOptions, DfsMetadataShardTransferPrimaryOptions, DfsMountOptions, DfsPinCliCommand,
     DfsPlacementAuthorityClearOptions, DfsPlacementAuthorityCliCommand,
     DfsPlacementAuthorityInspectOptions, DfsPlacementAuthorityRecovery, InstallLayout,
     InstallOptions, InteractionModel, InteractionRuntime, InteractionSession, InteractionSurface,
@@ -8314,7 +8314,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             "/tmp/sinomo-data".to_string(),
         ])
         .expect("dfs mount"),
-        DfsCliCommand::Mount(DfsMountOptions {
+        DfsCliCommand::Mount(DfsMountOptions::Mount(DfsHostMountOptions {
             mount_point: PathBuf::from("/mnt/sifs"),
             root_path: "/sinomo/nodes/node_alpha/files".to_string(),
             data_dir: Some(PathBuf::from("/tmp/sinomo-data")),
@@ -8322,7 +8322,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             allow_other: true,
             foreground: true,
             sync_local_changes: false,
-        })
+        }))
     );
     assert!(matches!(
         parse_dfs_schema_for_test(&[
@@ -8333,11 +8333,56 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
             "--sync-local-changes".to_string(),
         ])
         .expect("dfs mount with local sync"),
-        DfsCliCommand::Mount(DfsMountOptions {
+        DfsCliCommand::Mount(DfsMountOptions::Mount(DfsHostMountOptions {
             sync_local_changes: true,
             ..
-        })
+        }))
     ));
+    assert_eq!(
+        parse_dfs_schema_for_test(&[
+            "mount".to_string(),
+            "--status".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("parse live mount status"),
+        DfsCliCommand::Mount(DfsMountOptions::Status { json: true })
+    );
+    assert_eq!(
+        parse_dfs_schema_for_test(&["mount".to_string(), "--disable".to_string()])
+            .expect("parse supervised mount disable"),
+        DfsCliCommand::Mount(DfsMountOptions::Disable { json: false })
+    );
+    for invalid in [
+        vec![
+            "mount".to_string(),
+            "--status".to_string(),
+            "--disable".to_string(),
+        ],
+        vec![
+            "mount".to_string(),
+            "--status".to_string(),
+            "/mnt/sifs".to_string(),
+        ],
+        vec![
+            "mount".to_string(),
+            "--disable".to_string(),
+            "--background".to_string(),
+        ],
+        vec![
+            "mount".to_string(),
+            "/mnt/sifs".to_string(),
+            "--json".to_string(),
+        ],
+    ] {
+        assert!(
+            parse_dfs_schema_for_test(&invalid).is_err(),
+            "invalid mount control combination unexpectedly parsed: {invalid:?}"
+        );
+    }
+    assert!(
+        parse_dfs_schema_for_test(&["mount".to_string()]).is_err(),
+        "ordinary mount mode must still require a mount-point"
+    );
     #[cfg(not(windows))]
     {
         let background = match parse_dfs_schema_for_test(&[
@@ -8347,12 +8392,12 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         ])
         .expect("parse background mount")
         {
-            DfsCliCommand::Mount(options) => options,
+            DfsCliCommand::Mount(DfsMountOptions::Mount(options)) => options,
             other => panic!("expected mount options, got {other:?}"),
         };
-        let error = crate::validate_dfs_mount_options_for_platform(&background)
-            .expect_err("Unix background mount must be rejected explicitly");
-        assert!(error.to_string().contains("--background"));
+        crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(background.clone()))
+            .expect("Unix background mount configures the main-daemon supervisor");
+        assert!(!background.foreground);
 
         let sync_local = match parse_dfs_schema_for_test(&[
             "mount".to_string(),
@@ -8361,12 +8406,47 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         ])
         .expect("parse sync-local mount")
         {
-            DfsCliCommand::Mount(options) => options,
+            DfsCliCommand::Mount(DfsMountOptions::Mount(options)) => options,
             other => panic!("expected mount options, got {other:?}"),
         };
-        let error = crate::validate_dfs_mount_options_for_platform(&sync_local)
-            .expect_err("Unix Cloud Files flag must be rejected explicitly");
+        let error =
+            crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(sync_local))
+                .expect_err("Unix Cloud Files flag must be rejected explicitly");
         assert!(error.to_string().contains("Windows Cloud Files"));
+    }
+    #[cfg(windows)]
+    {
+        let writable = match parse_dfs_schema_for_test(&[
+            "mount".to_string(),
+            r"C:\Users\IX\Sinomo".to_string(),
+            "--sync-local-changes".to_string(),
+        ])
+        .expect("parse Windows writable mount")
+        {
+            DfsCliCommand::Mount(DfsMountOptions::Mount(options)) => options,
+            other => panic!("expected mount options, got {other:?}"),
+        };
+        assert!(!writable.read_only);
+        crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(writable))
+            .expect("explicit Windows writeback mode");
+
+        let read_only = match parse_dfs_schema_for_test(&[
+            "mount".to_string(),
+            r"C:\Users\IX\Sinomo".to_string(),
+            "--read-only".to_string(),
+            "--sync-local-changes".to_string(),
+        ])
+        .expect("parse conflicting Windows mount mode")
+        {
+            DfsCliCommand::Mount(DfsMountOptions::Mount(options)) => options,
+            other => panic!("expected mount options, got {other:?}"),
+        };
+        assert!(
+            crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(read_only))
+                .expect_err("read-only Cloud Files cannot claim writable sync")
+                .to_string()
+                .contains("durable writable synchronization")
+        );
     }
     assert!(matches!(
         parse_dfs_schema_for_test(&[
