@@ -5193,6 +5193,12 @@ pub fn register_storage_paths(
         "module/loader-state",
         "node-local module loader runtime state keyed by module id",
     )?;
+    layout.register_escape_path(
+        "sinomo-module",
+        StorageRing::R1,
+        "module/runtime",
+        "node-local module-owned runtime journals, receipts, and recovery state keyed by module id",
+    )?;
     layout.register_sinomo_object(
         "sinomo-module",
         StorageRing::R1,

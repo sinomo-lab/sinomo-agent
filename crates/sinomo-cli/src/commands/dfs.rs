@@ -2425,7 +2425,7 @@ fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), Cli
         sync_local_changes: options.sync_local_changes,
         provider_name: "Sinomo SIFS".to_string(),
         provider_version: env!("CARGO_PKG_VERSION").to_string(),
-        prepopulate_depth: 1,
+        prepopulate_depth: 0,
         connect: options.foreground,
         max_run_seconds: None,
     };
@@ -2462,6 +2462,13 @@ fn run_dfs_cloud_files_mount_command(options: DfsMountOptions) -> Result<(), Cli
                     );
                     Ok(())
                 }
+                CloudFilesModuleResponse::Unregistered(response) => Err(CliError::Parse {
+                    detail: format!(
+                        "Cloud Files mount returned an unexpected unregister response for {}: {}",
+                        response.sync_root.display(),
+                        response.detail
+                    ),
+                }),
                 CloudFilesModuleResponse::Error(error) => Err(CliError::Parse {
                     detail: format!("Cloud Files mount failed: {}: {}", error.code, error.detail),
                 }),

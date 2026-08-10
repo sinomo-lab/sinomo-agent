@@ -84,6 +84,15 @@ impl SinomoDataDir {
         self.root.join("files")
     }
 
+    /// Node-local runtime state owned by dynamically loaded Sinomo modules.
+    ///
+    /// Module implementations append their validated module id below this
+    /// directory. Keeping the root in the shared data-dir contract avoids
+    /// ad-hoc host paths while preserving node-local consent and recovery.
+    pub fn module_runtime_dir(&self) -> PathBuf {
+        self.root.join("module").join("runtime")
+    }
+
     pub fn cluster_endpoint_config_file(&self) -> PathBuf {
         self.shared_configs_dir()
             .join("cluster")
@@ -210,6 +219,16 @@ mod tests {
                 .join("providers")
                 .join("github-copilot")
                 .join("credentials.json")
+        );
+    }
+
+    #[test]
+    fn module_runtime_state_stays_under_the_sinomo_data_directory() {
+        let data = SinomoDataDir::new("root");
+
+        assert_eq!(
+            data.module_runtime_dir(),
+            PathBuf::from("root").join("module").join("runtime")
         );
     }
 }

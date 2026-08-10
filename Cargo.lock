@@ -8888,10 +8888,14 @@ dependencies = [
 name = "sinomo-dfs-cloud-files"
 version = "0.1.0"
 dependencies = [
+ "blake3",
+ "fs2",
+ "serde",
  "sinomo-dfs-cloud-files-api",
  "sinomo-module-api",
  "sinomo-runtime",
  "tokio",
+ "ulid",
  "windows",
 ]
 

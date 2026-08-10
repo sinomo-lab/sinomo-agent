@@ -1,0 +1,4837 @@
+//! Platform-neutral state and worker shell for writable Windows Cloud Files.
+//!
+//! The live CFAPI adapter stays gated until DFS exposes every stable mutation
+//! and read-only receipt-reconciliation contract. This module still owns the
+//! ordering contract so the Windows layer only supplies notifications,
+//! concrete DFS calls, and idempotent placeholder effects.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use sinomo_dfs_cloud_files_api::{
+    CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT, CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE,
+    CloudFilesLocalChangeSyncStatus, CloudFilesModuleError, CloudFilesPlaceholderIdentity,
+    CloudFilesRetainedLocalEvidenceSummary, CloudFilesSyncAttentionKind,
+    CloudFilesSyncAttentionNextAction, CloudFilesSyncAttentionSummary,
+};
+use sinomo_runtime::dfs;
+use sinomo_runtime::local::SinomoDataDir;
+
+use crate::local_change_queue::{
+    CloudFilesConflictEvidence, CloudFilesDestinationPrecondition, CloudFilesExpectedObjectState,
+    CloudFilesLocalChangeQueue, CloudFilesLocalChangeQueueError, CloudFilesLocalOperation,
+    CloudFilesLocalOperationKind, CloudFilesLocalOperationPreconditions,
+    CloudFilesLocalOperationRequest, CloudFilesLocalOperationStatus,
+    CloudFilesRemoteMutationEvidence, CloudFilesStagedContent,
+};
+use crate::namespace_reconciler::{
+    CloudFilesLocalPathState, CloudFilesMaterializationAuditIntentStore, CloudFilesNamespaceAction,
+    CloudFilesNamespaceConflict, CloudFilesNamespaceCursor, CloudFilesNamespaceEffectAdapter,
+    CloudFilesNamespaceFeedBatch, CloudFilesNamespaceFeedEvent, CloudFilesNamespaceProvenance,
+    CloudFilesNamespaceReconcileError, CloudFilesNamespaceReconcileProgress,
+    CloudFilesNamespaceReconciler, CloudFilesNamespaceSuppression,
+    CloudFilesReconciledManifestEntry,
+};
+#[cfg(test)]
+use crate::sync_executor::CloudFilesLocalCompletionOutcome;
+use crate::sync_executor::{
+    CloudFilesDfsMutationAdapter, CloudFilesDfsMutationCommand, CloudFilesDfsMutationOutcome,
+    CloudFilesDfsMutationReconciliation, CloudFilesLocalCompletionEffect,
+    CloudFilesSyncExecutionProgress, CloudFilesSyncExecutorError,
+    execute_ready_cloud_files_operations_bounded,
+};
+
+/// One remote mutation per cooperative pass keeps cancellation latency tied to
+/// one bounded DFS operation rather than to the current queue depth.
+const CLOUD_FILES_MUTATIONS_PER_PASS: usize = 1;
+/// Poll/process one shard-local feed batch per pass. Later batches retain their
+/// durable input cursors and are fetched again on the next pass.
+const CLOUD_FILES_FEED_BATCHES_PER_PASS: usize = 1;
+const CLOUD_FILES_FEED_EVENTS_PER_PASS: usize = 32;
+pub(crate) const CLOUD_FILES_DIRECTORY_PAGE_ENTRIES: usize = 32;
+const CLOUD_FILES_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
+const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
+
+pub(crate) fn sparse_root_is_enumerated(
+    prepopulate_depth: u32,
+    already_materialized: bool,
+) -> bool {
+    prepopulate_depth > 0 || already_materialized
+}
+
+pub(crate) fn sparse_child_directory_is_enumerated(
+    child_depth: u32,
+    prepopulate_depth: u32,
+    already_materialized: bool,
+) -> bool {
+    child_depth < prepopulate_depth || already_materialized
+}
+
+pub(crate) fn cloud_files_root_kind_is_supported(kind: &dfs::DfsObjectKind) -> bool {
+    matches!(
+        kind,
+        dfs::DfsObjectKind::Directory | dfs::DfsObjectKind::Mount
+    )
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CloudFilesSparseKnownPathPage {
+    pub path: Option<String>,
+    pub before: Option<String>,
+    pub complete: bool,
+    pub examined: usize,
+}
+
+/// Select at most one materialized manifest path while examining a fixed
+/// number of reverse-lexicographic keys. Prefix descendants sort after their
+/// parent, so reverse traversal guarantees leaf-before-parent deletion within
+/// each missing subtree without cloning/sorting the whole manifest.
+pub(crate) fn next_sparse_known_path(
+    manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    materialized_directories: &BTreeSet<String>,
+    before: Option<&str>,
+    examine_limit: usize,
+) -> CloudFilesSparseKnownPathPage {
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    let mut page = CloudFilesSparseKnownPathPage {
+        before: before.map(str::to_string),
+        ..CloudFilesSparseKnownPathPage::default()
+    };
+    if examine_limit == 0 {
+        return page;
+    }
+    for _ in 0..examine_limit {
+        let next = match page.before.as_deref() {
+            Some(before) => manifest
+                .range::<str, _>((Unbounded, Excluded(before)))
+                .next_back(),
+            None => manifest.iter().next_back(),
+        };
+        let Some((path, _)) = next else {
+            page.complete = true;
+            break;
+        };
+        page.examined = page.examined.saturating_add(1);
+        page.before = Some(path.clone());
+        let owned = sifs_parent_path(path)
+            .is_some_and(|parent| materialized_directories.contains(&parent))
+            || materialized_directories.contains(path);
+        if owned {
+            page.path = Some(path.clone());
+            break;
+        }
+    }
+    page
+}
+
+/// Explicit Windows projection for every SIFS object kind. Unsupported kinds
+/// stay authoritative in the sparse reconciliation manifest, but no file-like
+/// placeholder is ever synthesized for them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CloudFilesObjectProjection {
+    File,
+    Directory,
+    Unsupported(&'static str),
+}
+
+pub(crate) fn cloud_files_object_projection(
+    kind: &dfs::DfsObjectKind,
+) -> CloudFilesObjectProjection {
+    match kind {
+        dfs::DfsObjectKind::File => CloudFilesObjectProjection::File,
+        dfs::DfsObjectKind::Directory | dfs::DfsObjectKind::Mount => {
+            CloudFilesObjectProjection::Directory
+        }
+        dfs::DfsObjectKind::Symlink => CloudFilesObjectProjection::Unsupported("symlink"),
+        dfs::DfsObjectKind::Hardlink => CloudFilesObjectProjection::Unsupported("hardlink"),
+        dfs::DfsObjectKind::Artifact => CloudFilesObjectProjection::Unsupported("artifact"),
+        dfs::DfsObjectKind::Tombstone => CloudFilesObjectProjection::Unsupported("tombstone"),
+    }
+}
+
+#[derive(Debug)]
+pub struct CloudFilesWindowsSyncError {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl std::fmt::Display for CloudFilesWindowsSyncError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for CloudFilesWindowsSyncError {}
+
+fn sync_error(code: &'static str, detail: impl Into<String>) -> CloudFilesWindowsSyncError {
+    CloudFilesWindowsSyncError {
+        code,
+        detail: detail.into(),
+    }
+}
+
+fn sifs_parent_path(path: &str) -> Option<String> {
+    if path == "/" {
+        return None;
+    }
+    let (parent, _) = path.rsplit_once('/')?;
+    Some(if parent.is_empty() {
+        "/".to_string()
+    } else {
+        parent.to_string()
+    })
+}
+
+fn queue_error(error: CloudFilesLocalChangeQueueError) -> CloudFilesWindowsSyncError {
+    sync_error("local-change-queue", error.to_string())
+}
+
+fn reconcile_error(error: CloudFilesNamespaceReconcileError) -> CloudFilesWindowsSyncError {
+    if error.detail == "sync-cancelled" {
+        sync_error(
+            "sync-cancelled",
+            "writable Cloud Files worker was cancelled",
+        )
+    } else {
+        sync_error("namespace-reconciliation", error.to_string())
+    }
+}
+
+fn executor_error(error: CloudFilesSyncExecutorError) -> CloudFilesWindowsSyncError {
+    sync_error("mutation-executor", error.to_string())
+}
+
+/// One stable local observation produced by the Windows change accelerator.
+///
+/// `capture_id` must be stable for the same Windows change, normally from a
+/// volume/file identity plus USN (or equivalent durable journal position).
+/// File bytes are captured once and immediately moved into the queue's
+/// immutable content-addressed staging area.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CloudFilesCapturedContent {
+    /// Test/synthetic seam. Production Windows capture uses `Staged` and never
+    /// materializes a whole file in memory.
+    Inline(Vec<u8>),
+    Staged(CloudFilesStagedContent),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudFilesCapturedLocalChange {
+    pub capture_id: String,
+    pub kind: CloudFilesLocalOperationKind,
+    pub source_path: String,
+    pub destination_path: Option<String>,
+    pub preconditions: CloudFilesLocalOperationPreconditions,
+    pub captured_content: Option<CloudFilesCapturedContent>,
+}
+
+/// A local Cloud Files placeholder whose exact remote identity was omitted
+/// from the intentionally sparse durable manifest. It must be authoritatively
+/// recovered before the same local path can be classified as a create,
+/// replace, delete, or rename.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudFilesSparsePlaceholderObservation {
+    pub local_path: String,
+    pub identity: CloudFilesPlaceholderIdentity,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CloudFilesCapturedChangeBatch {
+    pub changes: Vec<CloudFilesCapturedLocalChange>,
+    pub sparse_placeholders: Vec<CloudFilesSparsePlaceholderObservation>,
+    /// `ReadDirectoryChangesW` reports overflow by returning no usable byte
+    /// range. The worker discards partial observations and performs a full
+    /// reconciliation before accepting more notifications.
+    pub overflowed: bool,
+}
+
+/// Semantic records emitted by the Windows directory-change parser. Keeping
+/// the pairing state here makes split-buffer rename behavior testable without
+/// requiring a Windows host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CloudFilesDirectoryChange {
+    Added(PathBuf),
+    Modified(PathBuf),
+    Removed(PathBuf),
+    Renamed { from: PathBuf, to: PathBuf },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) enum CloudFilesDirectoryChangeAction {
+    Added,
+    Modified,
+    Removed,
+    RenamedOldName,
+    RenamedNewName,
+}
+
+/// `ReadDirectoryChangesW` may split the old/new halves of one rename across
+/// two buffers. The unmatched old name therefore belongs to the watcher, not
+/// to one parser invocation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CloudFilesRenamePairingState {
+    pending_old_name: Option<PathBuf>,
+}
+
+impl CloudFilesRenamePairingState {
+    pub(crate) fn push(
+        &mut self,
+        action: CloudFilesDirectoryChangeAction,
+        path: PathBuf,
+        output: &mut Vec<CloudFilesDirectoryChange>,
+    ) {
+        match action {
+            CloudFilesDirectoryChangeAction::RenamedOldName => {
+                if let Some(old) = self.pending_old_name.replace(path) {
+                    output.push(CloudFilesDirectoryChange::Removed(old));
+                }
+            }
+            CloudFilesDirectoryChangeAction::RenamedNewName => {
+                if let Some(from) = self.pending_old_name.take() {
+                    output.push(CloudFilesDirectoryChange::Renamed { from, to: path });
+                } else {
+                    output.push(CloudFilesDirectoryChange::Added(path));
+                }
+            }
+            action => {
+                if let Some(old) = self.pending_old_name.take() {
+                    output.push(CloudFilesDirectoryChange::Removed(old));
+                }
+                output.push(match action {
+                    CloudFilesDirectoryChangeAction::Added => {
+                        CloudFilesDirectoryChange::Added(path)
+                    }
+                    CloudFilesDirectoryChangeAction::Modified => {
+                        CloudFilesDirectoryChange::Modified(path)
+                    }
+                    CloudFilesDirectoryChangeAction::Removed => {
+                        CloudFilesDirectoryChange::Removed(path)
+                    }
+                    CloudFilesDirectoryChangeAction::RenamedOldName
+                    | CloudFilesDirectoryChangeAction::RenamedNewName => unreachable!(),
+                });
+            }
+        }
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn reset_for_overflow(&mut self) {
+        self.pending_old_name = None;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CloudFilesDirectoryChangePlan {
+    Ordered(Vec<CloudFilesDirectoryChange>),
+    FullScanRequired,
+}
+
+/// Preserve notification order and accept coalescing only when every repeated
+/// path is an upsert. Remove+recreate, modify+rename, and rename chains need a
+/// snapshot because a set-based reduction cannot retain their semantics.
+pub(crate) fn plan_directory_changes(
+    changes: Vec<CloudFilesDirectoryChange>,
+) -> CloudFilesDirectoryChangePlan {
+    let mut seen = BTreeMap::<PathBuf, bool>::new();
+    for change in &changes {
+        let roles: Vec<(&PathBuf, bool)> = match change {
+            CloudFilesDirectoryChange::Added(path) | CloudFilesDirectoryChange::Modified(path) => {
+                vec![(path, true)]
+            }
+            CloudFilesDirectoryChange::Removed(path) => vec![(path, false)],
+            CloudFilesDirectoryChange::Renamed { from, to } => {
+                vec![(from, false), (to, false)]
+            }
+        };
+        for (path, upsert) in roles {
+            if let Some(previous_upsert) = seen.get(path) {
+                if !(*previous_upsert && upsert) {
+                    return CloudFilesDirectoryChangePlan::FullScanRequired;
+                }
+            } else {
+                seen.insert(path.clone(), upsert);
+            }
+        }
+    }
+
+    let mut keep = vec![true; changes.len()];
+    let mut last_upsert = BTreeMap::<PathBuf, usize>::new();
+    for (index, change) in changes.iter().enumerate() {
+        if let CloudFilesDirectoryChange::Added(path) | CloudFilesDirectoryChange::Modified(path) =
+            change
+            && let Some(previous) = last_upsert.insert(path.clone(), index)
+        {
+            keep[previous] = false;
+        }
+    }
+    let ordered = changes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, change)| keep[index].then_some(change))
+        .collect();
+    CloudFilesDirectoryChangePlan::Ordered(ordered)
+}
+
+pub(crate) fn local_capture_retry_delay(attempt: u32) -> Duration {
+    const INITIAL_MILLIS: u64 = 50;
+    const MAX_MILLIS: u64 = 2_000;
+    let shift = attempt.saturating_sub(1).min(6);
+    Duration::from_millis(
+        INITIAL_MILLIS
+            .saturating_mul(1_u64 << shift)
+            .min(MAX_MILLIS),
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CloudFilesDeferredCaptureRetry {
+    attempts: u32,
+    retry_at: Duration,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CloudFilesLocalCaptureRetries {
+    deferred: BTreeMap<PathBuf, CloudFilesDeferredCaptureRetry>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CloudFilesOfflineCreatePlan {
+    QueueNow,
+    DeferUntilParentIsRemote,
+    ConflictWithRemote,
+}
+
+/// Classify a no-identity local path discovered in a previously owned root.
+/// Upload is allowed only with an authoritative absent destination and a
+/// remotely established directory parent. Nested offline subtrees advance one
+/// parent generation at a time rather than racing unordered child creates.
+pub(crate) fn plan_owned_offline_create(
+    root: &str,
+    path: &str,
+    remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) -> CloudFilesOfflineCreatePlan {
+    if remote_manifest.contains_key(path) {
+        return CloudFilesOfflineCreatePlan::ConflictWithRemote;
+    }
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+        .unwrap_or("/");
+    if parent == root {
+        return CloudFilesOfflineCreatePlan::QueueNow;
+    }
+    match remote_manifest.get(parent) {
+        Some(entry) if matches!(entry.kind.as_str(), "directory" | "mount") => {
+            CloudFilesOfflineCreatePlan::QueueNow
+        }
+        Some(_) => CloudFilesOfflineCreatePlan::ConflictWithRemote,
+        None => CloudFilesOfflineCreatePlan::DeferUntilParentIsRemote,
+    }
+}
+
+impl CloudFilesLocalCaptureRetries {
+    pub(crate) fn schedule(&mut self, path: PathBuf, now: Duration) -> u32 {
+        let attempts = self
+            .deferred
+            .get(&path)
+            .map_or(1, |retry| retry.attempts.saturating_add(1));
+        self.deferred.insert(
+            path,
+            CloudFilesDeferredCaptureRetry {
+                attempts,
+                retry_at: now.saturating_add(local_capture_retry_delay(attempts)),
+            },
+        );
+        attempts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn due(&self, now: Duration) -> Vec<PathBuf> {
+        self.due_bounded(now, usize::MAX)
+    }
+
+    pub(crate) fn due_bounded(&self, now: Duration, limit: usize) -> Vec<PathBuf> {
+        self.deferred
+            .iter()
+            .filter(|(_, retry)| retry.retry_at <= now)
+            .take(limit)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.deferred.len()
+    }
+
+    pub(crate) fn clear(&mut self, path: &PathBuf) {
+        self.deferred.remove(path);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CloudFilesStartupConflictEvidence {
+    pub path: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CloudFilesStartupScanBatch {
+    pub changes: Vec<CloudFilesCapturedLocalChange>,
+    pub sparse_placeholders: Vec<CloudFilesSparsePlaceholderObservation>,
+    pub complete: bool,
+}
+
+pub trait CloudFilesLocalChangeAccelerator {
+    /// Discover local divergence that may have happened while the provider was
+    /// stopped. The previous durable manifest distinguishes a true local
+    /// delete from a remote path that has never been materialized locally.
+    fn startup_scan(
+        &mut self,
+        _previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        _remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        _cancelled: &AtomicBool,
+    ) -> Result<CloudFilesStartupScanBatch, String> {
+        Ok(CloudFilesStartupScanBatch {
+            changes: Vec::new(),
+            sparse_placeholders: Vec::new(),
+            complete: true,
+        })
+    }
+
+    /// Return local differences that cannot safely become remote mutations.
+    /// The worker persists these independently from the mutation queue before
+    /// it can report readiness.
+    fn drain_startup_conflicts(&mut self) -> Vec<CloudFilesStartupConflictEvidence> {
+        Vec::new()
+    }
+
+    /// Requeue one classification after the worker has durably recovered its
+    /// exact remote identity. `accepted=false` permanently blocks this scan
+    /// observation; it must never fall through to offline-create handling.
+    fn finish_sparse_placeholder_resolution(&mut self, _path: &str, _accepted: bool) {}
+
+    /// Start the lossy notification accelerator before startup scanning. This
+    /// closes the scan-to-connection observation gap; placeholder effects are
+    /// filtered through the exact local suppression ledger.
+    fn activate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn drain_changes(
+        &mut self,
+        manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesCapturedChangeBatch, String>;
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CloudFilesFullScanSnapshot {
+    /// Authoritative upserts observed in this bounded scan quantum.
+    pub manifest: BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    /// Previously materialized paths authoritatively absent in this quantum.
+    pub removed_paths: Vec<String>,
+    /// Directory audit intents authoritatively resolved in this quantum. An
+    /// existing directory becomes durable ownership evidence even when its
+    /// page was empty or every child already matched. A directory also present
+    /// in `removed_paths` is atomically removed instead, then its intent can be
+    /// acknowledged without forcing an endless re-audit.
+    pub materialized_directories: Vec<String>,
+    /// Cursor boundary is meaningful only when this terminal delta is true.
+    pub scan_complete: bool,
+    pub cursors: BTreeMap<String, CloudFilesNamespaceCursor>,
+}
+
+/// Concrete Windows implementations obtain batches from the routed,
+/// per-shard DFS feed and obtain a full placeholder snapshot from exact DFS
+/// stat/list calls. A full snapshot must be taken after its cursor boundaries
+/// are observed; replay after those older boundaries is intentionally safe.
+pub trait CloudFilesNamespaceSource {
+    fn poll_batches(
+        &mut self,
+        root: &str,
+        cursors: &[CloudFilesNamespaceCursor],
+    ) -> Result<Vec<CloudFilesNamespaceFeedBatch>, String>;
+
+    fn full_scan(
+        &mut self,
+        root: &str,
+        previous_cursors: &[CloudFilesNamespaceCursor],
+        materialized_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        materialized_directories: &std::collections::BTreeSet<String>,
+    ) -> Result<CloudFilesFullScanSnapshot, String>;
+
+    fn resolve_placeholder_identity(
+        &mut self,
+        identity: &CloudFilesPlaceholderIdentity,
+    ) -> Result<Option<CloudFilesReconciledManifestEntry>, String>;
+
+    fn has_pending_materialized_directories(
+        &self,
+        _durable_materialized_directories: &BTreeSet<String>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn acknowledge_materialized_directories(
+        &mut self,
+        _directories: &[String],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// One idempotent Windows placeholder adapter shared by feed reconciliation,
+/// local mutation completion, and startup/overflow full scans.
+pub trait CloudFilesWindowsPlaceholderEffect:
+    CloudFilesNamespaceEffectAdapter + CloudFilesLocalCompletionEffect
+{
+    /// Must be idempotent. A crash after this effect but before durable cursor
+    /// installation repeats the same full reconciliation on restart.
+    fn apply_full_scan(&mut self, snapshot: &CloudFilesFullScanSnapshot) -> Result<(), String>;
+
+    /// Local completion computes suppression before its idempotent Windows
+    /// effect, then hands it back for durable recording. If a process dies in
+    /// the narrow gap, replay is still safe because every placeholder effect
+    /// must recognize its already-applied exact identity.
+    fn drain_namespace_suppressions(&mut self) -> Vec<CloudFilesNamespaceSuppression> {
+        Vec::new()
+    }
+}
+
+/// Additional readiness proof required by the writable worker. Merely
+/// implementing the phase-3 mutation trait is insufficient: every mutation
+/// kind, including mkdir, must have stable caller IDs and read-only receipt
+/// reconciliation before Windows registration is allowed.
+pub trait CloudFilesWritableMutationAdapter: CloudFilesDfsMutationAdapter {
+    fn ensure_contracts_ready(&self) -> Result<(), String>;
+}
+
+/// Small concrete mapping layer. A DFS backend supplies one method per stable
+/// mutation plus one read-only reconciliation method; the adapter validates
+/// queue shapes before dispatching them.
+pub trait CloudFilesStableMutationBackend {
+    fn ensure_contracts_ready(&self) -> Result<(), String>;
+
+    fn create_file(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    fn create_directory(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    fn replace_file(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    fn unlink(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    fn rmdir(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    fn rename(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String>;
+
+    /// This method may inspect receipts and authoritative generations, but it
+    /// must not submit or replay the mutation itself.
+    fn reconcile(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationReconciliation, String>;
+}
+
+pub struct CloudFilesConcreteDfsAdapter<B> {
+    backend: B,
+}
+
+/// Production mapping over the mounted SIFS service. The service is shared
+/// with hydration/feed workers behind one short-lived mutex; durable queue
+/// state is never held while this mutex is acquired.
+pub struct CloudFilesDfsServiceMutationBackend<T> {
+    service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
+    write_options: dfs::DfsWriteOptions,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<T> CloudFilesDfsServiceMutationBackend<T> {
+    pub fn new(
+        service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
+        write_options: dfs::DfsWriteOptions,
+    ) -> Self {
+        Self {
+            service,
+            write_options,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn new_with_cancellation(
+        service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
+        write_options: dfs::DfsWriteOptions,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            service,
+            write_options,
+            cancelled,
+        }
+    }
+
+    pub fn shared_service(&self) -> &Arc<Mutex<dfs::NetworkedDfsService<T>>> {
+        &self.service
+    }
+}
+
+struct CancellationReader<R> {
+    inner: R,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R> CancellationReader<R> {
+    fn new(inner: R, cancelled: Arc<AtomicBool>) -> Self {
+        Self { inner, cancelled }
+    }
+}
+
+impl<R: Read> Read for CancellationReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancelled.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Cloud Files DFS content upload was cancelled",
+            ));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
+    for CloudFilesDfsServiceMutationBackend<T>
+{
+    fn ensure_contracts_ready(&self) -> Result<(), String> {
+        if self.write_options.replica_candidates.is_empty() {
+            return Err(
+                "no advertised DFS content replica is available for durable Cloud Files writes"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn create_file(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let content = required_staged_content(command)?;
+        let reader = File::open(&content.blob_path)
+            .map_err(|error| format!("open immutable Cloud Files queue blob: {error}"))?;
+        let reader = CancellationReader::new(reader, Arc::clone(&self.cancelled));
+        let result = self
+            .lock_service()?
+            .posix_create_file_from_reader_with_operation_id(
+                &command.source_path,
+                reader,
+                self.write_options.clone(),
+                &command.operation_id,
+            );
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn create_directory(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let result = self
+            .lock_service()?
+            .posix_mkdir_with_operation_id(&command.source_path, &command.operation_id);
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn replace_file(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let expected = required_source_precondition(command)?;
+        let content = required_staged_content(command)?;
+        let object_id = parse_object_id(&expected.object_id)?;
+        let version = parse_version(&expected.version)?;
+        let reader = File::open(&content.blob_path)
+            .map_err(|error| format!("open immutable Cloud Files queue blob: {error}"))?;
+        let reader = CancellationReader::new(reader, Arc::clone(&self.cancelled));
+        let result = self
+            .lock_service()?
+            .posix_replace_file_if_version_from_reader_with_operation_id(
+                &command.source_path,
+                &object_id,
+                &version,
+                reader,
+                self.write_options.clone(),
+                &command.operation_id,
+            );
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn unlink(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let expected = namespace_object_precondition(required_source_precondition(command)?)?;
+        let result = self.lock_service()?.posix_unlink_if_generation(
+            &command.source_path,
+            command.operation_id.clone(),
+            expected,
+        );
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn rmdir(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let expected = namespace_object_precondition(required_source_precondition(command)?)?;
+        let result = self.lock_service()?.posix_rmdir_if_generation(
+            &command.source_path,
+            command.operation_id.clone(),
+            expected,
+        );
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn rename(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        let destination_path = command
+            .destination_path
+            .as_deref()
+            .ok_or_else(|| "rename command has no destination path".to_string())?;
+        let source = namespace_object_precondition(required_source_precondition(command)?)?;
+        let destination = namespace_destination_precondition(&command.preconditions.destination)?;
+        let result = self.lock_service()?.posix_rename_if_generation(
+            &command.source_path,
+            destination_path,
+            command.operation_id.clone(),
+            source,
+            destination,
+        );
+        Ok(classify_posix_mutation_result(command, result))
+    }
+
+    fn reconcile(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+        match command.kind {
+            CloudFilesLocalOperationKind::CreateFile => {
+                let content = required_staged_content(command)?;
+                let receipt = self
+                    .lock_service()?
+                    .reconcile_stable_create_file_operation(
+                        &command.source_path,
+                        &command.operation_id,
+                        &content.descriptor.content_hash,
+                        content.descriptor.length,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(classify_write_reconciliation(command, receipt))
+            }
+            CloudFilesLocalOperationKind::ReplaceFile => {
+                let content = required_staged_content(command)?;
+                let expected = required_source_precondition(command)?;
+                let object_id = parse_object_id(&expected.object_id)?;
+                let receipt = self
+                    .lock_service()?
+                    .reconcile_stable_write_operation(
+                        &command.source_path,
+                        &object_id,
+                        &command.operation_id,
+                        &content.descriptor.content_hash,
+                        content.descriptor.length,
+                    )
+                    .map_err(|error| error.to_string())?;
+                Ok(classify_write_reconciliation(command, receipt))
+            }
+            CloudFilesLocalOperationKind::CreateDirectory
+            | CloudFilesLocalOperationKind::DeleteFile
+            | CloudFilesLocalOperationKind::DeleteDirectory
+            | CloudFilesLocalOperationKind::Rename => {
+                let operation = namespace_operation(command)?;
+                let receipt = self
+                    .lock_service()?
+                    .reconcile_stable_namespace_operation(&command.operation_id, &operation)
+                    .map_err(|error| error.to_string())?;
+                self.classify_namespace_reconciliation(command, receipt)
+            }
+        }
+    }
+}
+
+impl<T: dfs::DfsMessageTransport> CloudFilesDfsServiceMutationBackend<T> {
+    fn lock_service(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, dfs::NetworkedDfsService<T>>, String> {
+        lock_service_with_timeout(&self.service, CLOUD_FILES_SERVICE_LOCK_TIMEOUT)
+    }
+
+    fn classify_namespace_reconciliation(
+        &self,
+        command: &CloudFilesDfsMutationCommand,
+        reconciliation: dfs::DfsStableNamespaceOperationReconciliation,
+    ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+        match reconciliation {
+            dfs::DfsStableNamespaceOperationReconciliation::Applied { receipt } => {
+                let visible_path = match command.kind {
+                    CloudFilesLocalOperationKind::CreateDirectory => {
+                        Some(command.source_path.as_str())
+                    }
+                    CloudFilesLocalOperationKind::Rename => command.destination_path.as_deref(),
+                    CloudFilesLocalOperationKind::DeleteFile
+                    | CloudFilesLocalOperationKind::DeleteDirectory => None,
+                    CloudFilesLocalOperationKind::CreateFile
+                    | CloudFilesLocalOperationKind::ReplaceFile => {
+                        unreachable!("file writes use stable write reconciliation")
+                    }
+                };
+                if let Some(path) = visible_path {
+                    let stat = self
+                        .lock_service()?
+                        .posix_lstat_distributed(path)
+                        .map_err(|error| {
+                            format!(
+                                "namespace receipt {} is applied, but exact result stat is not yet visible: {error}",
+                                receipt.operation_id
+                            )
+                        })?;
+                    return Ok(CloudFilesDfsMutationReconciliation::Applied(
+                        mutation_evidence_from_stat(command, stat),
+                    ));
+                }
+                let expected = required_source_precondition(command)?;
+                Ok(CloudFilesDfsMutationReconciliation::Applied(
+                    CloudFilesRemoteMutationEvidence {
+                        operation_id: command.operation_id.clone(),
+                        object_id: Some(expected.object_id.clone()),
+                        version: Some(expected.version.clone()),
+                        content_hash: expected.content_hash.clone(),
+                        content_size_bytes: None,
+                        kind: Some(
+                            match command.kind {
+                                CloudFilesLocalOperationKind::DeleteDirectory => "directory",
+                                CloudFilesLocalOperationKind::DeleteFile => "file",
+                                _ => unreachable!("only deletion lacks a visible result stat"),
+                            }
+                            .to_string(),
+                        ),
+                        detail: format!(
+                            "stable namespace receipt {} proves deletion applied; result tombstone generation is delivered by the namespace feed",
+                            receipt.operation_id
+                        ),
+                    },
+                ))
+            }
+            dfs::DfsStableNamespaceOperationReconciliation::NotApplied => {
+                Ok(CloudFilesDfsMutationReconciliation::NotApplied)
+            }
+            dfs::DfsStableNamespaceOperationReconciliation::AmbiguousOrExpired { reason } => {
+                Ok(CloudFilesDfsMutationReconciliation::Ambiguous { detail: reason })
+            }
+            dfs::DfsStableNamespaceOperationReconciliation::Conflict { reason } => {
+                Ok(CloudFilesDfsMutationReconciliation::Conflict(
+                    conflict_evidence("stable-namespace-operation-conflict", reason),
+                ))
+            }
+        }
+    }
+}
+
+fn lock_service_with_timeout<T>(
+    service: &Arc<Mutex<T>>,
+    timeout: Duration,
+) -> Result<MutexGuard<'_, T>, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "mounted SIFS service lock deadline overflowed".to_string())?;
+    loop {
+        match service.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err("mounted SIFS service lock is poisoned".to_string());
+            }
+            Err(TryLockError::WouldBlock) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "mounted SIFS service remained busy for {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            Err(TryLockError::WouldBlock) => thread::sleep(CLOUD_FILES_SERVICE_LOCK_RETRY),
+        }
+    }
+}
+
+fn required_staged_content(
+    command: &CloudFilesDfsMutationCommand,
+) -> Result<&crate::sync_executor::CloudFilesDfsMutationContent, String> {
+    command
+        .staged_content
+        .as_ref()
+        .ok_or_else(|| "file mutation has no immutable staged content".to_string())
+}
+
+fn required_source_precondition(
+    command: &CloudFilesDfsMutationCommand,
+) -> Result<&crate::local_change_queue::CloudFilesExpectedObjectState, String> {
+    command
+        .preconditions
+        .source
+        .as_ref()
+        .ok_or_else(|| "conditional mutation has no exact source generation".to_string())
+}
+
+fn parse_object_id(value: &str) -> Result<dfs::DfsObjectId, String> {
+    value
+        .parse()
+        .map_err(|error| format!("invalid DFS object ID `{value}`: {error}"))
+}
+
+fn parse_version(value: &str) -> Result<dfs::DfsVersion, String> {
+    value
+        .parse()
+        .map_err(|error| format!("invalid DFS version `{value}`: {error}"))
+}
+
+fn namespace_object_precondition(
+    expected: &crate::local_change_queue::CloudFilesExpectedObjectState,
+) -> Result<dfs::DfsNamespaceObjectPrecondition, String> {
+    Ok(dfs::DfsNamespaceObjectPrecondition {
+        object_id: parse_object_id(&expected.object_id)?,
+        version: parse_version(&expected.version)?,
+    })
+}
+
+fn namespace_destination_precondition(
+    expected: &CloudFilesDestinationPrecondition,
+) -> Result<dfs::DfsNamespaceDestinationPrecondition, String> {
+    match expected {
+        CloudFilesDestinationPrecondition::Absent => {
+            Ok(dfs::DfsNamespaceDestinationPrecondition::Absent)
+        }
+        CloudFilesDestinationPrecondition::Exact(expected) => {
+            Ok(dfs::DfsNamespaceDestinationPrecondition::Exact(
+                namespace_object_precondition(expected)?,
+            ))
+        }
+        CloudFilesDestinationPrecondition::Unspecified => {
+            Err("conditional rename has no destination generation fence".to_string())
+        }
+    }
+}
+
+fn namespace_operation(
+    command: &CloudFilesDfsMutationCommand,
+) -> Result<dfs::DfsNamespaceOperation, String> {
+    Ok(match command.kind {
+        CloudFilesLocalOperationKind::CreateDirectory => dfs::DfsNamespaceOperation::Mkdir {
+            path: command.source_path.clone(),
+        },
+        CloudFilesLocalOperationKind::DeleteFile => dfs::DfsNamespaceOperation::ConditionalUnlink {
+            path: command.source_path.clone(),
+            expected: namespace_object_precondition(required_source_precondition(command)?)?,
+        },
+        CloudFilesLocalOperationKind::DeleteDirectory => {
+            dfs::DfsNamespaceOperation::ConditionalRmdir {
+                path: command.source_path.clone(),
+                expected: namespace_object_precondition(required_source_precondition(command)?)?,
+            }
+        }
+        CloudFilesLocalOperationKind::Rename => dfs::DfsNamespaceOperation::ConditionalRename {
+            from: command.source_path.clone(),
+            to: command
+                .destination_path
+                .clone()
+                .ok_or_else(|| "rename command has no destination path".to_string())?,
+            expected_source: namespace_object_precondition(required_source_precondition(command)?)?,
+            expected_destination: namespace_destination_precondition(
+                &command.preconditions.destination,
+            )?,
+        },
+        CloudFilesLocalOperationKind::CreateFile | CloudFilesLocalOperationKind::ReplaceFile => {
+            return Err("file writes do not use namespace reconciliation".to_string());
+        }
+    })
+}
+
+fn classify_posix_mutation_result(
+    command: &CloudFilesDfsMutationCommand,
+    result: Result<dfs::DfsStat, dfs::DfsPosixError>,
+) -> CloudFilesDfsMutationOutcome {
+    match result {
+        Ok(stat) => {
+            CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+        }
+        Err(
+            error @ (dfs::DfsPosixError::NotFound { .. }
+            | dfs::DfsPosixError::AlreadyExists { .. }
+            | dfs::DfsPosixError::NotDirectory { .. }
+            | dfs::DfsPosixError::IsDirectory { .. }
+            | dfs::DfsPosixError::NotSymlink { .. }
+            | dfs::DfsPosixError::MissingParent { .. }
+            | dfs::DfsPosixError::InvalidPath { .. }
+            | dfs::DfsPosixError::Conflict { .. }
+            | dfs::DfsPosixError::DirectoryNotEmpty { .. }),
+        ) => CloudFilesDfsMutationOutcome::Conflict(conflict_evidence(
+            "dfs-mutation-conflict",
+            error.to_string(),
+        )),
+        Err(error) => CloudFilesDfsMutationOutcome::Ambiguous {
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn mutation_evidence_from_stat(
+    command: &CloudFilesDfsMutationCommand,
+    stat: dfs::DfsStat,
+) -> CloudFilesRemoteMutationEvidence {
+    CloudFilesRemoteMutationEvidence {
+        operation_id: command.operation_id.clone(),
+        object_id: Some(stat.object_id.to_string()),
+        version: Some(stat.version.to_string()),
+        content_hash: stat.content_hash,
+        content_size_bytes: stat.size_bytes,
+        kind: Some(dfs_object_kind_name(&stat.kind).to_string()),
+        detail: format!("stable DFS mutation applied at {}", stat.path),
+    }
+}
+
+fn classify_write_reconciliation(
+    command: &CloudFilesDfsMutationCommand,
+    reconciliation: dfs::DfsStableWriteOperationReconciliation,
+) -> CloudFilesDfsMutationReconciliation {
+    match reconciliation {
+        dfs::DfsStableWriteOperationReconciliation::Applied { receipt } => {
+            CloudFilesDfsMutationReconciliation::Applied(CloudFilesRemoteMutationEvidence {
+                operation_id: receipt.operation_id,
+                object_id: Some(receipt.object_id.to_string()),
+                version: Some(receipt.target_version.to_string()),
+                content_hash: receipt.content_hash,
+                content_size_bytes: receipt.content_size_bytes,
+                kind: Some("file".to_string()),
+                detail: format!(
+                    "stable DFS write receipt {} is committed",
+                    receipt.intent_id
+                ),
+            })
+        }
+        dfs::DfsStableWriteOperationReconciliation::NotApplied => {
+            CloudFilesDfsMutationReconciliation::NotApplied
+        }
+        dfs::DfsStableWriteOperationReconciliation::AmbiguousOrExpired { reason } => {
+            CloudFilesDfsMutationReconciliation::Ambiguous { detail: reason }
+        }
+        dfs::DfsStableWriteOperationReconciliation::Conflict { reason } => {
+            CloudFilesDfsMutationReconciliation::Conflict(conflict_evidence(
+                "stable-write-operation-conflict",
+                format!("{}: {reason}", command.operation_id),
+            ))
+        }
+    }
+}
+
+impl<B> CloudFilesConcreteDfsAdapter<B> {
+    pub fn new(backend: B) -> Self {
+        Self { backend }
+    }
+
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+}
+
+impl<B: CloudFilesStableMutationBackend> CloudFilesDfsMutationAdapter
+    for CloudFilesConcreteDfsAdapter<B>
+{
+    fn apply(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        validate_mutation_command(command)?;
+        match command.kind {
+            CloudFilesLocalOperationKind::CreateFile => self.backend.create_file(command),
+            CloudFilesLocalOperationKind::CreateDirectory => self.backend.create_directory(command),
+            CloudFilesLocalOperationKind::ReplaceFile => self.backend.replace_file(command),
+            CloudFilesLocalOperationKind::DeleteFile => self.backend.unlink(command),
+            CloudFilesLocalOperationKind::DeleteDirectory => self.backend.rmdir(command),
+            CloudFilesLocalOperationKind::Rename => self.backend.rename(command),
+        }
+    }
+
+    fn reconcile(
+        &mut self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+        validate_mutation_command(command)?;
+        self.backend.reconcile(command)
+    }
+}
+
+impl<B: CloudFilesStableMutationBackend> CloudFilesWritableMutationAdapter
+    for CloudFilesConcreteDfsAdapter<B>
+{
+    fn ensure_contracts_ready(&self) -> Result<(), String> {
+        self.backend.ensure_contracts_ready()
+    }
+}
+
+fn validate_mutation_command(command: &CloudFilesDfsMutationCommand) -> Result<(), String> {
+    let has_source = command.preconditions.source.is_some();
+    let destination = &command.preconditions.destination;
+    let has_content = command.staged_content.is_some();
+    let has_destination_path = command.destination_path.is_some();
+    let valid = match command.kind {
+        CloudFilesLocalOperationKind::CreateFile => {
+            !has_source
+                && has_content
+                && !has_destination_path
+                && matches!(destination, CloudFilesDestinationPrecondition::Absent)
+        }
+        CloudFilesLocalOperationKind::CreateDirectory => {
+            !has_source
+                && !has_content
+                && !has_destination_path
+                && matches!(destination, CloudFilesDestinationPrecondition::Absent)
+        }
+        CloudFilesLocalOperationKind::ReplaceFile => {
+            has_source
+                && has_content
+                && !has_destination_path
+                && matches!(destination, CloudFilesDestinationPrecondition::Unspecified)
+        }
+        CloudFilesLocalOperationKind::DeleteFile
+        | CloudFilesLocalOperationKind::DeleteDirectory => {
+            has_source
+                && !has_content
+                && !has_destination_path
+                && matches!(destination, CloudFilesDestinationPrecondition::Unspecified)
+        }
+        CloudFilesLocalOperationKind::Rename => {
+            has_source
+                && !has_content
+                && has_destination_path
+                && !matches!(destination, CloudFilesDestinationPrecondition::Unspecified)
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "queued {:?} operation `{}` does not carry its required immutable content and CAS shape",
+            command.kind, command.operation_id
+        ))
+    }
+}
+
+/// Durable queue and reconciliation state opened before any Windows sync-root
+/// registration or callback connection.
+pub struct CloudFilesWritableSyncState {
+    mount: String,
+    root: String,
+    queue: CloudFilesLocalChangeQueue,
+    reconciler: CloudFilesNamespaceReconciler,
+    materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
+    ready: bool,
+    last_error: Option<CloudFilesModuleError>,
+}
+
+impl CloudFilesWritableSyncState {
+    pub fn open(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+    ) -> Result<Self, CloudFilesWindowsSyncError> {
+        let mount = mount.into();
+        let root = root.into();
+        let queue = CloudFilesLocalChangeQueue::open(data_dir, mount.clone(), root.clone())
+            .map_err(queue_error)?;
+        let reconciler = CloudFilesNamespaceReconciler::open(data_dir, mount.clone(), root.clone())
+            .map_err(reconcile_error)?;
+        let materialization_audit_intents = Arc::new(Mutex::new(
+            CloudFilesMaterializationAuditIntentStore::open(data_dir, mount.clone(), root.clone())
+                .map_err(reconcile_error)?,
+        ));
+        Ok(Self {
+            mount,
+            root,
+            queue,
+            reconciler,
+            materialization_audit_intents,
+            ready: false,
+            last_error: None,
+        })
+    }
+
+    pub fn queue(&self) -> &CloudFilesLocalChangeQueue {
+        &self.queue
+    }
+
+    pub fn reconciler(&self) -> &CloudFilesNamespaceReconciler {
+        &self.reconciler
+    }
+
+    pub fn materialization_audit_intents(
+        &self,
+    ) -> Arc<Mutex<CloudFilesMaterializationAuditIntentStore>> {
+        Arc::clone(&self.materialization_audit_intents)
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn status(&self) -> CloudFilesLocalChangeSyncStatus {
+        let summary = self.queue.summary();
+        let conflict_count = summary
+            .conflict_count
+            .saturating_add(self.reconciler.conflict_count())
+            .saturating_add(self.reconciler.unsupported_projection_count());
+        let (attention, total_attention) = self.attention_summaries();
+        let status = if let Some(error) = self.last_error.clone() {
+            CloudFilesLocalChangeSyncStatus::writable_blocked(
+                summary.pending_operations,
+                summary.retrying_operations,
+                conflict_count,
+                summary.failed_operations,
+                error,
+            )
+        } else if self.ready {
+            CloudFilesLocalChangeSyncStatus::writable_active(
+                summary.pending_operations,
+                summary.retrying_operations,
+                conflict_count,
+                summary.failed_operations,
+            )
+        } else {
+            CloudFilesLocalChangeSyncStatus::writable_starting(
+                summary.pending_operations,
+                summary.retrying_operations,
+                conflict_count,
+                summary.failed_operations,
+            )
+        };
+        status.with_attention(attention, total_attention)
+    }
+
+    fn attention_summaries(&self) -> (Vec<CloudFilesSyncAttentionSummary>, u64) {
+        let mut attention = Vec::new();
+        let mut total = 0u64;
+        let mut add = |summary: CloudFilesSyncAttentionSummary| {
+            total = total.saturating_add(1);
+            if attention.len() < CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT {
+                attention.push(summary);
+            }
+        };
+
+        for operation in self.queue.operations() {
+            let (kind, reason_code, reason, safe_next_action) = match operation.status {
+                CloudFilesLocalOperationStatus::Conflict => {
+                    let conflict = operation.conflict.as_ref();
+                    (
+                        CloudFilesSyncAttentionKind::LocalOperationConflict,
+                        conflict.map_or("local-operation-conflict", |value| value.code.as_str()),
+                        conflict.map_or_else(
+                            || {
+                                "local operation conflicts with authoritative SIFS state"
+                                    .to_string()
+                            },
+                            |value| value.detail.clone(),
+                        ),
+                        CloudFilesSyncAttentionNextAction::ReviewAndResolve,
+                    )
+                }
+                CloudFilesLocalOperationStatus::Failed => (
+                    CloudFilesSyncAttentionKind::FailedLocalOperation,
+                    "local-operation-failed",
+                    operation
+                        .last_error
+                        .clone()
+                        .unwrap_or_else(|| "local operation failed without detail".to_string()),
+                    CloudFilesSyncAttentionNextAction::RepairCauseAndRetry,
+                ),
+                CloudFilesLocalOperationStatus::Retrying
+                    if operation.last_error.as_ref().is_some_and(|detail| {
+                        let detail = detail.to_ascii_lowercase();
+                        detail.contains("ambiguous")
+                            || detail.contains("expired")
+                            || detail.contains("stale")
+                    }) =>
+                {
+                    (
+                        CloudFilesSyncAttentionKind::StaleOrAmbiguousReconciliation,
+                        "stable-operation-reconciliation",
+                        operation.last_error.clone().expect("matched error"),
+                        CloudFilesSyncAttentionNextAction::WaitForAuthoritativeReconciliation,
+                    )
+                }
+                _ => continue,
+            };
+            let staged = operation.request.staged_content.as_ref();
+            add(CloudFilesSyncAttentionSummary {
+                kind,
+                path: operation
+                    .request
+                    .destination_path
+                    .clone()
+                    .unwrap_or_else(|| operation.request.source_path.clone()),
+                reason_code: reason_code.to_string(),
+                reason,
+                retained_local_evidence: Some(CloudFilesRetainedLocalEvidenceSummary {
+                    operation_id: Some(operation.request.operation_id.clone()),
+                    evidence_id: operation
+                        .remote_evidence
+                        .as_ref()
+                        .map(|evidence| evidence.operation_id.clone()),
+                    staged_content_hash: staged.map(|content| content.content_hash.clone()),
+                    staged_content_size_bytes: staged.map(|content| content.length),
+                    local_state: Some(format!(
+                        "status={:?}; attempts={}",
+                        operation.status, operation.attempts
+                    )),
+                }),
+                safe_next_action,
+            });
+        }
+
+        for conflict in self.reconciler.conflicts().values() {
+            let (path, local_state) = namespace_conflict_summary(conflict);
+            add(CloudFilesSyncAttentionSummary {
+                kind: CloudFilesSyncAttentionKind::RemoteNamespaceConflict,
+                path,
+                reason_code: "remote-namespace-conflict".to_string(),
+                reason: conflict.detail.clone(),
+                retained_local_evidence: Some(CloudFilesRetainedLocalEvidenceSummary {
+                    evidence_id: Some(conflict.event_id.clone()),
+                    local_state: Some(local_state),
+                    ..CloudFilesRetainedLocalEvidenceSummary::default()
+                }),
+                safe_next_action: CloudFilesSyncAttentionNextAction::ReviewAndResolve,
+            });
+        }
+        for conflict in self.reconciler.startup_conflicts().values() {
+            let unsupported = is_unsupported_projection_detail(&conflict.detail);
+            add(CloudFilesSyncAttentionSummary {
+                kind: if unsupported {
+                    CloudFilesSyncAttentionKind::UnsupportedObjectKind
+                } else {
+                    CloudFilesSyncAttentionKind::StartupConflict
+                },
+                path: conflict.path.clone(),
+                reason_code: if unsupported {
+                    "unsupported-object-kind"
+                } else {
+                    "startup-conflict"
+                }
+                .to_string(),
+                reason: conflict.detail.clone(),
+                retained_local_evidence: Some(CloudFilesRetainedLocalEvidenceSummary {
+                    local_state: Some(
+                        "durable startup conflict; local path is preserved".to_string(),
+                    ),
+                    ..CloudFilesRetainedLocalEvidenceSummary::default()
+                }),
+                safe_next_action: if unsupported {
+                    CloudFilesSyncAttentionNextAction::ReviewUnsupportedEntry
+                } else {
+                    CloudFilesSyncAttentionNextAction::PreserveLocalCopyAndRescan
+                },
+            });
+        }
+        let unsupported_examples = self.reconciler.unsupported_projection_examples();
+        for (path, kind) in unsupported_examples {
+            add(CloudFilesSyncAttentionSummary {
+                kind: CloudFilesSyncAttentionKind::UnsupportedObjectKind,
+                path: path.clone(),
+                reason_code: "unsupported-object-kind".to_string(),
+                reason: format!(
+                    "SIFS {kind} has no lossless Windows Cloud Files projection; no misleading file placeholder was created"
+                ),
+                retained_local_evidence: Some(CloudFilesRetainedLocalEvidenceSummary {
+                    local_state: Some(format!(
+                        "authoritative SIFS kind={kind}; Windows projection intentionally absent"
+                    )),
+                    ..CloudFilesRetainedLocalEvidenceSummary::default()
+                }),
+                safe_next_action: CloudFilesSyncAttentionNextAction::ReviewUnsupportedEntry,
+            });
+        }
+        total = total.saturating_add(
+            self.reconciler
+                .unsupported_projection_count()
+                .saturating_sub(unsupported_examples.len() as u64),
+        );
+        (attention, total)
+    }
+
+    pub fn enqueue_capture(
+        &mut self,
+        capture: CloudFilesCapturedLocalChange,
+    ) -> Result<CloudFilesLocalOperation, CloudFilesWindowsSyncError> {
+        if capture.capture_id.trim().is_empty() {
+            return Err(sync_error(
+                "invalid-capture-id",
+                "Windows local change lacks a stable file/USN capture identity",
+            ));
+        }
+        let operation_id = self
+            .queue
+            .operation_id_for_capture(&capture.capture_id)
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(new_sortable_operation_id);
+        let staged_content = match capture.captured_content {
+            Some(CloudFilesCapturedContent::Inline(bytes)) => {
+                Some(self.queue.stage_content(&bytes).map_err(queue_error)?)
+            }
+            Some(CloudFilesCapturedContent::Staged(content)) => {
+                self.queue
+                    .verify_staged_content(&content)
+                    .map_err(queue_error)?;
+                Some(content)
+            }
+            None => None,
+        };
+        let request = CloudFilesLocalOperationRequest {
+            operation_id,
+            capture_id: Some(capture.capture_id),
+            mount: self.mount.clone(),
+            root: self.root.clone(),
+            kind: capture.kind,
+            source_path: capture.source_path,
+            destination_path: capture.destination_path,
+            preconditions: capture.preconditions,
+            staged_content,
+        };
+        self.queue.enqueue(request).map_err(queue_error)
+    }
+
+    fn mark_ready(&mut self) {
+        self.ready = true;
+        self.last_error = None;
+    }
+
+    fn mark_failed(&mut self, error: &CloudFilesWindowsSyncError) {
+        self.ready = false;
+        self.last_error = Some(CloudFilesModuleError {
+            code: error.code.to_string(),
+            detail: error.detail.clone(),
+        });
+    }
+}
+
+fn namespace_conflict_summary(conflict: &CloudFilesNamespaceConflict) -> (String, String) {
+    let path = match &conflict.action {
+        CloudFilesNamespaceAction::Upsert { path, .. }
+        | CloudFilesNamespaceAction::Remove { path, .. } => path.clone(),
+        CloudFilesNamespaceAction::Rename { to_path, .. } => to_path.clone(),
+    };
+    let local_state = conflict
+        .local_states
+        .iter()
+        .map(|(path, state)| match state {
+            CloudFilesLocalPathState::Clean => format!("{path}=clean"),
+            CloudFilesLocalPathState::Dirty { detail } => {
+                format!("{path}=dirty({detail})")
+            }
+            CloudFilesLocalPathState::Pending { operation_id } => {
+                format!("{path}=pending({operation_id})")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    (path, local_state)
+}
+
+fn is_unsupported_projection_detail(detail: &str) -> bool {
+    let detail = detail.to_ascii_lowercase();
+    detail.contains("unsupported")
+        || detail.contains("no safe sifs projection")
+        || detail.contains("reparse point")
+}
+
+pub(crate) fn new_sortable_operation_id() -> String {
+    format!(
+        "cf_{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    )
+}
+
+pub(crate) fn completion_follow_up_request(
+    mount: &str,
+    root: &str,
+    parent_operation_id: &str,
+    entry: &CloudFilesReconciledManifestEntry,
+    staged_content: CloudFilesStagedContent,
+    local_signature: &str,
+) -> CloudFilesLocalOperationRequest {
+    let mut hasher = blake3::Hasher::new();
+    for part in [
+        "completion-follow-up",
+        parent_operation_id,
+        entry.path.as_str(),
+        entry.object_id.as_str(),
+        entry.version.as_str(),
+        local_signature,
+    ] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    CloudFilesLocalOperationRequest {
+        operation_id: new_sortable_operation_id(),
+        capture_id: Some(format!("windows:{}", hasher.finalize().to_hex())),
+        mount: mount.to_string(),
+        root: root.to_string(),
+        kind: CloudFilesLocalOperationKind::ReplaceFile,
+        source_path: entry.path.clone(),
+        destination_path: None,
+        preconditions: CloudFilesLocalOperationPreconditions {
+            source: Some(CloudFilesExpectedObjectState {
+                object_id: entry.object_id.clone(),
+                version: entry.version.clone(),
+                content_hash: entry.content_hash.clone(),
+            }),
+            destination: CloudFilesDestinationPrecondition::Unspecified,
+        },
+        staged_content: Some(staged_content),
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CloudFilesWritableSyncProgress {
+    pub captures_enqueued: u64,
+    pub mutation_progress: Vec<CloudFilesSyncExecutionProgress>,
+    pub namespace_progress: Vec<CloudFilesNamespaceReconcileProgress>,
+    pub full_scan_applied: bool,
+}
+
+/// Cooperative worker shell. The Windows owner may run it on a dedicated
+/// thread, but cancellation is checked between every durable or remote phase.
+pub struct CloudFilesWritableSyncWorker<C, D, F, E> {
+    state: CloudFilesWritableSyncState,
+    capture: C,
+    mutations: D,
+    namespace: F,
+    effects: E,
+    full_scan_pending: bool,
+    startup_scan_baseline: Option<BTreeMap<String, CloudFilesReconciledManifestEntry>>,
+}
+
+impl<C, D, F, E> CloudFilesWritableSyncWorker<C, D, F, E>
+where
+    C: CloudFilesLocalChangeAccelerator,
+    D: CloudFilesWritableMutationAdapter,
+    F: CloudFilesNamespaceSource,
+    E: CloudFilesWindowsPlaceholderEffect,
+{
+    pub fn new(
+        state: CloudFilesWritableSyncState,
+        capture: C,
+        mutations: D,
+        namespace: F,
+        effects: E,
+    ) -> Self {
+        Self {
+            state,
+            capture,
+            mutations,
+            namespace,
+            effects,
+            full_scan_pending: false,
+            startup_scan_baseline: None,
+        }
+    }
+
+    pub fn state(&self) -> &CloudFilesWritableSyncState {
+        &self.state
+    }
+
+    pub fn startup(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        let result = self.startup_inner(cancelled);
+        if let Err(error) = &result {
+            self.state.mark_failed(error);
+        }
+        result
+    }
+
+    fn startup_inner(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        self.mutations.ensure_contracts_ready().map_err(|detail| {
+            sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
+        })?;
+        self.capture
+            .activate()
+            .map_err(|detail| sync_error("read-directory-changes-start", detail))?;
+        // A namespace effect intent is durable before its local placeholder
+        // side effect. Recover it before any full-scan install, which rejects
+        // replacing state while that effect is still in flight.
+        self.state
+            .reconciler
+            .recover_inflight_effect(&mut self.effects)
+            .map_err(reconcile_error)?;
+        // Recover durable in-flight/remote-applied/completed work before the
+        // local scan. Otherwise a crash midway through placeholder completion
+        // can be misclassified as a new local mutation or startup conflict.
+        let mut progress = CloudFilesWritableSyncProgress {
+            mutation_progress: self.execute_mutations()?,
+            ..CloudFilesWritableSyncProgress::default()
+        };
+        let previous_manifest = self.state.reconciler.manifest().clone();
+        let snapshot = self.full_scan_snapshot(cancelled)?;
+        let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+        progress.full_scan_applied = true;
+        if scan_complete {
+            if self.finish_startup_local_scan(cancelled, &previous_manifest, &mut progress)? {
+                self.poll_namespace(cancelled, &mut progress)?;
+            } else {
+                self.startup_scan_baseline = Some(previous_manifest);
+            }
+        } else {
+            self.full_scan_pending = true;
+            self.startup_scan_baseline = Some(previous_manifest);
+        }
+        // Readiness proves contracts, watcher activation, one bounded
+        // authoritative root/scan quantum, and durable recovery. The remaining
+        // sparse local/full audit continues cooperatively; requiring the whole
+        // local namespace here makes activation O(namespace) and exceeds the
+        // registration deadline for large owned roots.
+        self.state.mark_ready();
+        Ok(progress)
+    }
+
+    pub fn run_once(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        let result = self.run_once_inner(cancelled);
+        if let Err(error) = &result {
+            self.state.mark_failed(error);
+        }
+        result
+    }
+
+    fn run_once_inner(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        if !self.state.ready && !self.full_scan_pending && self.startup_scan_baseline.is_none() {
+            return Err(sync_error(
+                "worker-not-ready",
+                "writable Cloud Files worker has not completed startup reconciliation",
+            ));
+        }
+        check_cancelled(cancelled)?;
+        if self.full_scan_pending {
+            let mut progress = CloudFilesWritableSyncProgress::default();
+            let snapshot = self.full_scan_snapshot(cancelled)?;
+            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            progress.full_scan_applied = true;
+            if scan_complete {
+                self.full_scan_pending = false;
+                if let Some(baseline) = self.startup_scan_baseline.take()
+                    && !self.finish_startup_local_scan(cancelled, &baseline, &mut progress)?
+                {
+                    self.startup_scan_baseline = Some(baseline);
+                }
+                if self.startup_scan_baseline.is_none() {
+                    self.state.mark_ready();
+                    self.poll_namespace(cancelled, &mut progress)?;
+                }
+            }
+            self.run_maintenance()?;
+            return Ok(progress);
+        }
+        if let Some(baseline) = self.startup_scan_baseline.take() {
+            let mut progress = CloudFilesWritableSyncProgress::default();
+            if !self.finish_startup_local_scan(cancelled, &baseline, &mut progress)? {
+                self.startup_scan_baseline = Some(baseline);
+            } else {
+                self.state.mark_ready();
+                self.poll_namespace(cancelled, &mut progress)?;
+            }
+            self.run_maintenance()?;
+            return Ok(progress);
+        }
+        let materialization_audit_pending = self
+            .namespace
+            .has_pending_materialized_directories(self.state.reconciler.materialized_directories())
+            .map_err(|detail| sync_error("materialization-audit-intents", detail))?;
+        if materialization_audit_pending {
+            let mut progress = CloudFilesWritableSyncProgress::default();
+            let snapshot = self.full_scan_snapshot(cancelled)?;
+            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            progress.full_scan_applied = true;
+            if scan_complete {
+                self.poll_namespace(cancelled, &mut progress)?;
+            } else {
+                self.full_scan_pending = true;
+            }
+            self.run_maintenance()?;
+            return Ok(progress);
+        }
+        let captures = self
+            .capture
+            .drain_changes(self.state.reconciler.manifest(), cancelled)
+            .map_err(capture_sync_error("read-directory-changes"))?;
+        let mut progress = CloudFilesWritableSyncProgress::default();
+        if captures.overflowed {
+            let previous_manifest = self.state.reconciler.manifest().clone();
+            let snapshot = self.full_scan_snapshot(cancelled)?;
+            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            progress.full_scan_applied = true;
+            if scan_complete {
+                if !self.finish_startup_local_scan(cancelled, &previous_manifest, &mut progress)? {
+                    self.startup_scan_baseline = Some(previous_manifest);
+                }
+            } else {
+                self.full_scan_pending = true;
+                self.startup_scan_baseline = Some(previous_manifest);
+            }
+        } else {
+            self.resolve_sparse_placeholders(captures.sparse_placeholders)?;
+            for capture in captures.changes {
+                check_cancelled(cancelled)?;
+                self.state.enqueue_capture(capture)?;
+                progress.captures_enqueued += 1;
+            }
+            check_cancelled(cancelled)?;
+            progress.mutation_progress = self.execute_mutations()?;
+        }
+        if !self.full_scan_pending && self.startup_scan_baseline.is_none() {
+            self.poll_namespace(cancelled, &mut progress)?;
+        }
+        self.run_maintenance()?;
+        Ok(progress)
+    }
+
+    fn finish_startup_local_scan(
+        &mut self,
+        cancelled: &AtomicBool,
+        previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        progress: &mut CloudFilesWritableSyncProgress,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        let batch = self
+            .capture
+            .startup_scan(
+                previous_manifest,
+                self.state.reconciler.manifest(),
+                cancelled,
+            )
+            .map_err(capture_sync_error("startup-local-scan"))?;
+        self.resolve_sparse_placeholders(batch.sparse_placeholders)?;
+        for capture in batch.changes {
+            check_cancelled(cancelled)?;
+            self.state.enqueue_capture(capture)?;
+            progress.captures_enqueued += 1;
+        }
+        self.persist_startup_conflicts()?;
+        progress.mutation_progress.extend(self.execute_mutations()?);
+        Ok(batch.complete)
+    }
+
+    fn resolve_sparse_placeholders(
+        &mut self,
+        observations: Vec<CloudFilesSparsePlaceholderObservation>,
+    ) -> Result<(), CloudFilesWindowsSyncError> {
+        for observation in observations {
+            let identity = &observation.identity;
+            let scope_matches =
+                identity.mount == self.state.mount && identity.root == self.state.root;
+            let resolved = if scope_matches {
+                self.namespace.resolve_placeholder_identity(identity)
+            } else {
+                Ok(None)
+            };
+            let exact = match resolved {
+                Ok(Some(entry))
+                    if entry.path == identity.path
+                        && entry.object_id == identity.object_id
+                        && entry.version == identity.version
+                        && entry.content_hash == identity.content_hash =>
+                {
+                    Some(entry)
+                }
+                Ok(Some(entry)) => {
+                    self.state
+                        .reconciler
+                        .record_startup_conflict(
+                            &observation.local_path,
+                            format!(
+                                "sparse placeholder identity changed remotely: expected object={} version={} hash={:?}, observed object={} version={} hash={:?}",
+                                identity.object_id,
+                                identity.version,
+                                identity.content_hash,
+                                entry.object_id,
+                                entry.version,
+                                entry.content_hash
+                            ),
+                        )
+                        .map_err(reconcile_error)?;
+                    None
+                }
+                Ok(None) => {
+                    self.state
+                        .reconciler
+                        .record_startup_conflict(
+                            &observation.local_path,
+                            format!(
+                                "sparse placeholder source `{}` is authoritatively absent; local create/replace is blocked",
+                                identity.path
+                            ),
+                        )
+                        .map_err(reconcile_error)?;
+                    None
+                }
+                Err(detail) => {
+                    self.state
+                        .reconciler
+                        .record_startup_conflict(
+                            &observation.local_path,
+                            format!(
+                                "cannot authoritatively recover sparse placeholder `{}`: {detail}; local mutation is blocked",
+                                identity.path
+                            ),
+                        )
+                        .map_err(reconcile_error)?;
+                    None
+                }
+            };
+            if let Some(entry) = exact {
+                let directory = sifs_parent_path(&entry.path).ok_or_else(|| {
+                    sync_error(
+                        "invalid-sparse-placeholder",
+                        format!("placeholder `{}` has no owning directory", entry.path),
+                    )
+                })?;
+                self.state
+                    .reconciler
+                    .record_materialized_placeholder(&directory, entry)
+                    .map_err(reconcile_error)?;
+                self.state
+                    .reconciler
+                    .resolve_startup_conflict(&observation.local_path)
+                    .map_err(reconcile_error)?;
+                self.capture
+                    .finish_sparse_placeholder_resolution(&observation.local_path, true);
+            } else {
+                self.capture
+                    .finish_sparse_placeholder_resolution(&observation.local_path, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_maintenance(&mut self) -> Result<(), CloudFilesWindowsSyncError> {
+        self.state.queue.compact_and_prune().map_err(queue_error)?;
+        self.state
+            .reconciler
+            .compact_durable_state()
+            .map_err(reconcile_error)?;
+        Ok(())
+    }
+
+    fn persist_startup_conflicts(&mut self) -> Result<(), CloudFilesWindowsSyncError> {
+        for conflict in self.capture.drain_startup_conflicts() {
+            self.state
+                .reconciler
+                .record_startup_conflict(conflict.path, conflict.detail)
+                .map_err(reconcile_error)?;
+        }
+        Ok(())
+    }
+
+    fn execute_mutations(
+        &mut self,
+    ) -> Result<Vec<CloudFilesSyncExecutionProgress>, CloudFilesWindowsSyncError> {
+        self.repair_completed_local_applications()?;
+        self.retire_feed_reconciled_operations()?;
+        let progress = execute_ready_cloud_files_operations_bounded(
+            &mut self.state.queue,
+            &mut self.mutations,
+            &mut self.effects,
+            CLOUD_FILES_MUTATIONS_PER_PASS,
+        )
+        .map_err(executor_error)?;
+        for suppression in self.effects.drain_namespace_suppressions() {
+            let expected = self.completed_operation_suppression(&suppression.operation_id)?;
+            if suppression != expected {
+                return Err(sync_error(
+                    "completion-suppression-mismatch",
+                    format!(
+                        "Windows completion returned suppression that does not match durable operation `{}`",
+                        suppression.operation_id
+                    ),
+                ));
+            }
+            self.state
+                .reconciler
+                .record_local_application(suppression)
+                .map_err(reconcile_error)?;
+            self.state
+                .queue
+                .retire_terminal_operation(&expected.operation_id)
+                .map_err(queue_error)?;
+        }
+        // A completion adapter may crash after its local effect and the queue's
+        // Completed commit but before returning its in-memory suppression. The
+        // durable request and remote evidence are sufficient to reconstruct the
+        // exact manifest/no-echo commit before feed polling.
+        self.repair_completed_local_applications()?;
+        Ok(progress)
+    }
+
+    fn completed_operation_suppression(
+        &self,
+        operation_id: &str,
+    ) -> Result<CloudFilesNamespaceSuppression, CloudFilesWindowsSyncError> {
+        let operation = self.state.queue.operation(operation_id).ok_or_else(|| {
+            sync_error(
+                "completed-operation-missing",
+                format!("completed operation `{operation_id}` is absent from the durable queue"),
+            )
+        })?;
+        if operation.status != CloudFilesLocalOperationStatus::Completed {
+            return Err(sync_error(
+                "completion-status-mismatch",
+                format!(
+                    "operation `{operation_id}` is {:?}, not durably Completed",
+                    operation.status
+                ),
+            ));
+        }
+        let evidence = operation.remote_evidence.as_ref().ok_or_else(|| {
+            sync_error(
+                "completion-evidence-missing",
+                format!("completed operation `{operation_id}` has no durable remote evidence"),
+            )
+        })?;
+        let command = CloudFilesDfsMutationCommand {
+            operation_id: operation.request.operation_id.clone(),
+            request_digest: operation.request_digest.clone(),
+            kind: operation.request.kind.clone(),
+            source_path: operation.request.source_path.clone(),
+            destination_path: operation.request.destination_path.clone(),
+            preconditions: operation.request.preconditions.clone(),
+            // Suppression reconstruction consumes only immutable request
+            // metadata and authoritative evidence; completed blobs may already
+            // have been safely pruned.
+            staged_content: None,
+        };
+        suppression_for_completed_mutation(&command, evidence)
+    }
+
+    fn repair_completed_local_applications(&mut self) -> Result<(), CloudFilesWindowsSyncError> {
+        let operation_ids = self
+            .state
+            .queue
+            .operations()
+            .filter(|operation| operation.status == CloudFilesLocalOperationStatus::Completed)
+            .map(|operation| operation.request.operation_id.clone())
+            .take(CLOUD_FILES_MUTATIONS_PER_PASS)
+            .collect::<Vec<_>>();
+        for operation_id in operation_ids {
+            let suppression = self.completed_operation_suppression(&operation_id)?;
+            self.state
+                .reconciler
+                .record_local_application(suppression)
+                .map_err(reconcile_error)?;
+            self.state
+                .queue
+                .retire_terminal_operation(&operation_id)
+                .map_err(queue_error)?;
+        }
+        Ok(())
+    }
+
+    fn retire_feed_reconciled_operations(&mut self) -> Result<(), CloudFilesWindowsSyncError> {
+        let operation_ids = self
+            .state
+            .queue
+            .operations()
+            .filter(|operation| {
+                operation.status == CloudFilesLocalOperationStatus::Superseded
+                    && operation.remote_evidence.is_some()
+                    && operation.conflict.is_none()
+                    && operation.last_error.is_none()
+                    && !self
+                        .state
+                        .reconciler
+                        .has_suppression(&operation.request.operation_id)
+            })
+            .map(|operation| operation.request.operation_id.clone())
+            .take(CLOUD_FILES_MUTATIONS_PER_PASS)
+            .collect::<Vec<_>>();
+        self.state
+            .queue
+            .acknowledge_reconciled_retirements(&operation_ids)
+            .map_err(queue_error)?;
+        Ok(())
+    }
+
+    fn poll_namespace(
+        &mut self,
+        cancelled: &AtomicBool,
+        progress: &mut CloudFilesWritableSyncProgress,
+    ) -> Result<(), CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        let cursors = self
+            .state
+            .reconciler
+            .cursors()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let batches = self
+            .namespace
+            .poll_batches(&self.state.root, &cursors)
+            .map_err(|detail| sync_error("namespace-feed", detail))?;
+        for batch in batches.into_iter().take(CLOUD_FILES_FEED_BATCHES_PER_PASS) {
+            check_cancelled(cancelled)?;
+            let batch = bound_namespace_feed_batch(batch, CLOUD_FILES_FEED_EVENTS_PER_PASS);
+            let batch_progress = self
+                .state
+                .reconciler
+                .reconcile_batch(batch, &mut self.effects)
+                .map_err(reconcile_error)?;
+            self.state
+                .queue
+                .acknowledge_reconciled_retirements(&batch_progress.reconciled_local_operation_ids)
+                .map_err(queue_error)?;
+            progress.namespace_progress.push(batch_progress);
+        }
+        if self.state.reconciler.full_scan_request().is_some() {
+            let baseline = self.state.reconciler.manifest().clone();
+            let scan_complete = self.full_reconcile(cancelled)?;
+            if !scan_complete {
+                self.full_scan_pending = true;
+                self.startup_scan_baseline = Some(baseline);
+            }
+            progress.full_scan_applied = true;
+        }
+        Ok(())
+    }
+
+    fn full_reconcile(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        let snapshot = self.full_scan_snapshot(cancelled)?;
+        self.apply_full_scan_snapshot(cancelled, snapshot)
+    }
+
+    fn full_scan_snapshot(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesFullScanSnapshot, CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        let cursors = self
+            .state
+            .reconciler
+            .cursors()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        self.namespace
+            .full_scan(
+                &self.state.root,
+                &cursors,
+                self.state.reconciler.manifest(),
+                self.state.reconciler.materialized_directories(),
+            )
+            .map_err(|detail| sync_error("full-reconciliation-scan", detail))
+    }
+
+    fn apply_full_scan_snapshot(
+        &mut self,
+        cancelled: &AtomicBool,
+        snapshot: CloudFilesFullScanSnapshot,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        let scan_complete = snapshot.scan_complete;
+        let materialized_directories = snapshot.materialized_directories.clone();
+        self.effects
+            .apply_full_scan(&snapshot)
+            .map_err(|detail| sync_error("full-reconciliation-effect", detail))?;
+        check_cancelled(cancelled)?;
+        let reconciled_local_operation_ids = self
+            .state
+            .reconciler
+            .install_full_scan_delta(
+                snapshot.manifest,
+                snapshot.removed_paths,
+                materialized_directories.clone(),
+                snapshot.cursors,
+                snapshot.scan_complete,
+            )
+            .map_err(reconcile_error)?;
+        self.namespace
+            .acknowledge_materialized_directories(&materialized_directories)
+            .map_err(|detail| sync_error("materialization-audit-acknowledge", detail))?;
+        self.state
+            .queue
+            .acknowledge_reconciled_retirements(&reconciled_local_operation_ids)
+            .map_err(queue_error)?;
+        Ok(scan_complete)
+    }
+}
+
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), CloudFilesWindowsSyncError> {
+    if cancelled.load(Ordering::SeqCst) {
+        Err(sync_error(
+            "sync-cancelled",
+            "writable Cloud Files worker was cancelled",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn capture_sync_error(code: &'static str) -> impl FnOnce(String) -> CloudFilesWindowsSyncError {
+    move |detail| {
+        if detail == "sync-cancelled" {
+            sync_error(
+                "sync-cancelled",
+                "writable Cloud Files worker was cancelled",
+            )
+        } else {
+            sync_error(code, detail)
+        }
+    }
+}
+
+/// Drive a worker loop whose health generation advances only after one whole
+/// pass completes successfully. A blocked DFS/capture/effect phase therefore
+/// cannot manufacture fresh liveness while it is making no progress.
+pub(crate) fn run_progress_gated_worker_loop<S, E>(
+    cancelled: &AtomicBool,
+    initial_generation: u64,
+    mut run_once: impl FnMut() -> Result<S, E>,
+    mut on_progress: impl FnMut(S, u64),
+    mut wait_between_passes: impl FnMut(&AtomicBool),
+) -> Result<(), E> {
+    let mut generation = initial_generation;
+    while !cancelled.load(Ordering::SeqCst) {
+        let status = run_once()?;
+        if cancelled.load(Ordering::SeqCst) {
+            break;
+        }
+        generation = generation.saturating_add(1);
+        on_progress(status, generation);
+        wait_between_passes(cancelled);
+    }
+    Ok(())
+}
+
+/// Build the durable no-echo entry before a local completion effect marks its
+/// placeholder in sync. Missing authoritative evidence fails closed.
+pub fn suppression_for_completed_mutation(
+    command: &CloudFilesDfsMutationCommand,
+    evidence: &CloudFilesRemoteMutationEvidence,
+) -> Result<CloudFilesNamespaceSuppression, CloudFilesWindowsSyncError> {
+    if command.operation_id != evidence.operation_id {
+        return Err(sync_error(
+            "suppression-operation-mismatch",
+            "remote evidence belongs to a different stable operation ID",
+        ));
+    }
+    let object_id = evidence.object_id.clone().ok_or_else(|| {
+        sync_error(
+            "suppression-evidence-missing",
+            "remote evidence has no object identity",
+        )
+    })?;
+    let version = evidence.version.clone().ok_or_else(|| {
+        sync_error(
+            "suppression-evidence-missing",
+            "remote evidence has no object version",
+        )
+    })?;
+    let action = match command.kind {
+        CloudFilesLocalOperationKind::CreateFile | CloudFilesLocalOperationKind::ReplaceFile => {
+            CloudFilesNamespaceAction::Upsert {
+                path: command.source_path.clone(),
+                object_id,
+                version,
+                content_hash: evidence.content_hash.clone(),
+                content_size_bytes: evidence.content_size_bytes,
+                kind: "file".to_string(),
+            }
+        }
+        CloudFilesLocalOperationKind::CreateDirectory => CloudFilesNamespaceAction::Upsert {
+            path: command.source_path.clone(),
+            object_id,
+            version,
+            content_hash: evidence.content_hash.clone(),
+            content_size_bytes: evidence.content_size_bytes,
+            kind: "directory".to_string(),
+        },
+        CloudFilesLocalOperationKind::DeleteFile
+        | CloudFilesLocalOperationKind::DeleteDirectory => CloudFilesNamespaceAction::Remove {
+            path: command.source_path.clone(),
+            object_id,
+            version,
+            content_hash: evidence.content_hash.clone(),
+        },
+        CloudFilesLocalOperationKind::Rename => CloudFilesNamespaceAction::Rename {
+            from_path: command.source_path.clone(),
+            to_path: command.destination_path.clone().ok_or_else(|| {
+                sync_error(
+                    "suppression-evidence-missing",
+                    "rename command has no destination path",
+                )
+            })?,
+            object_id,
+            version,
+            content_hash: evidence.content_hash.clone(),
+            content_size_bytes: evidence.content_size_bytes,
+            kind: evidence.kind.clone().ok_or_else(|| {
+                sync_error(
+                    "suppression-evidence-missing",
+                    "rename evidence has no authoritative object kind",
+                )
+            })?,
+        },
+    };
+    Ok(CloudFilesNamespaceSuppression {
+        operation_id: command.operation_id.clone(),
+        expected_action: action,
+    })
+}
+
+pub fn cloud_namespace_cursor_from_dfs(
+    cursor: &dfs::DfsNamespaceChangeCursor,
+) -> CloudFilesNamespaceCursor {
+    CloudFilesNamespaceCursor {
+        file_system_id: cursor.file_system_id.to_string(),
+        shard_id: cursor.shard_id.0.clone(),
+        authority_epoch: cursor.authority_epoch,
+        after_sequence: cursor.after_sequence,
+    }
+}
+
+pub fn dfs_namespace_cursor_from_cloud(
+    cursor: &CloudFilesNamespaceCursor,
+) -> Result<dfs::DfsNamespaceChangeCursor, CloudFilesWindowsSyncError> {
+    Ok(dfs::DfsNamespaceChangeCursor {
+        file_system_id: cursor.file_system_id.parse().map_err(|error| {
+            sync_error(
+                "invalid-dfs-cursor",
+                format!("parse filesystem ID: {error}"),
+            )
+        })?,
+        shard_id: dfs::DfsMetadataShardId::new(cursor.shard_id.clone()),
+        authority_epoch: cursor.authority_epoch,
+        after_sequence: cursor.after_sequence,
+    })
+}
+
+pub fn cloud_namespace_batch_from_dfs(
+    input_cursor: &dfs::DfsNamespaceChangeCursor,
+    batch: dfs::DfsNamespaceChangeBatch,
+) -> CloudFilesNamespaceFeedBatch {
+    CloudFilesNamespaceFeedBatch {
+        input_cursor: cloud_namespace_cursor_from_dfs(input_cursor),
+        next_cursor: cloud_namespace_cursor_from_dfs(&batch.next_cursor),
+        events: batch
+            .events
+            .into_iter()
+            .map(cloud_namespace_event_from_dfs)
+            .collect(),
+        journal_head_sequence: batch.journal_head_sequence,
+        has_more: batch.has_more,
+    }
+}
+
+/// Bound one reconciliation pass without splitting the multiple semantic
+/// effects projected from a single journal sequence. Cursor durability is
+/// sequence-based, so a pass either processes every event at that sequence or
+/// leaves the sequence untouched for the next poll.
+pub(crate) fn bound_namespace_feed_batch(
+    mut batch: CloudFilesNamespaceFeedBatch,
+    max_events: usize,
+) -> CloudFilesNamespaceFeedBatch {
+    if batch.events.len() <= max_events
+        || matches!(
+            batch.events.as_slice(),
+            [CloudFilesNamespaceFeedEvent::RescanRequired { .. }]
+        )
+    {
+        return batch;
+    }
+    let target_index = max_events.max(1).saturating_sub(1);
+    let Some(target_sequence) = batch
+        .events
+        .get(target_index)
+        .and_then(namespace_event_sequence)
+    else {
+        return batch;
+    };
+    let keep = batch
+        .events
+        .iter()
+        .take_while(|event| {
+            namespace_event_sequence(event).is_some_and(|sequence| sequence <= target_sequence)
+        })
+        .count();
+    batch.events.truncate(keep);
+    batch.next_cursor.after_sequence = target_sequence;
+    batch.has_more = true;
+    batch
+}
+
+fn namespace_event_sequence(event: &CloudFilesNamespaceFeedEvent) -> Option<u64> {
+    match event {
+        CloudFilesNamespaceFeedEvent::Upsert { provenance, .. }
+        | CloudFilesNamespaceFeedEvent::Remove { provenance, .. }
+        | CloudFilesNamespaceFeedEvent::Rename { provenance, .. } => {
+            Some(provenance.journal_sequence)
+        }
+        CloudFilesNamespaceFeedEvent::RescanRequired { .. } => None,
+    }
+}
+
+fn cloud_namespace_event_from_dfs(
+    event: dfs::DfsNamespaceChangeEvent,
+) -> CloudFilesNamespaceFeedEvent {
+    match event {
+        dfs::DfsNamespaceChangeEvent::Upsert {
+            path,
+            object_id,
+            version,
+            content_hash,
+            content_size_bytes,
+            kind,
+            provenance,
+        } => CloudFilesNamespaceFeedEvent::Upsert {
+            path,
+            object_id: object_id.to_string(),
+            version: version.to_string(),
+            content_hash,
+            content_size_bytes,
+            kind: dfs_object_kind_name(&kind).to_string(),
+            provenance: cloud_namespace_provenance_from_dfs(provenance),
+        },
+        dfs::DfsNamespaceChangeEvent::Remove {
+            path,
+            object_id,
+            version,
+            content_hash,
+            provenance,
+        } => CloudFilesNamespaceFeedEvent::Remove {
+            path,
+            object_id: object_id.to_string(),
+            version: version.to_string(),
+            content_hash,
+            provenance: cloud_namespace_provenance_from_dfs(provenance),
+        },
+        dfs::DfsNamespaceChangeEvent::Rename {
+            from_path,
+            to_path,
+            object_id,
+            version,
+            content_hash,
+            content_size_bytes,
+            kind,
+            provenance,
+        } => CloudFilesNamespaceFeedEvent::Rename {
+            from_path,
+            to_path,
+            object_id: object_id.to_string(),
+            version: version.to_string(),
+            content_hash,
+            content_size_bytes,
+            kind: dfs_object_kind_name(&kind).to_string(),
+            provenance: cloud_namespace_provenance_from_dfs(provenance),
+        },
+        dfs::DfsNamespaceChangeEvent::RescanRequired { reason, detail } => {
+            CloudFilesNamespaceFeedEvent::RescanRequired {
+                reason: dfs_rescan_reason_name(reason).to_string(),
+                detail,
+            }
+        }
+    }
+}
+
+fn cloud_namespace_provenance_from_dfs(
+    provenance: dfs::DfsNamespaceChangeProvenance,
+) -> CloudFilesNamespaceProvenance {
+    CloudFilesNamespaceProvenance {
+        event_id: provenance.event_id,
+        journal_sequence: provenance.journal_sequence,
+        journal_ordinal: provenance.journal_ordinal,
+        operation_id: provenance.operation_id,
+    }
+}
+
+fn dfs_object_kind_name(kind: &dfs::DfsObjectKind) -> &'static str {
+    match kind {
+        dfs::DfsObjectKind::File => "file",
+        dfs::DfsObjectKind::Directory => "directory",
+        dfs::DfsObjectKind::Symlink => "symlink",
+        dfs::DfsObjectKind::Hardlink => "hardlink",
+        dfs::DfsObjectKind::Artifact => "artifact",
+        dfs::DfsObjectKind::Mount => "mount",
+        dfs::DfsObjectKind::Tombstone => "tombstone",
+    }
+}
+
+fn dfs_rescan_reason_name(reason: dfs::DfsNamespaceRescanReason) -> &'static str {
+    match reason {
+        dfs::DfsNamespaceRescanReason::FileSystemChanged => "file-system-changed",
+        dfs::DfsNamespaceRescanReason::ShardChanged => "shard-changed",
+        dfs::DfsNamespaceRescanReason::AuthorityEpochChanged => "authority-epoch-changed",
+        dfs::DfsNamespaceRescanReason::JournalCompactionGap => "journal-compaction-gap",
+        dfs::DfsNamespaceRescanReason::JournalRewound => "journal-rewound",
+        dfs::DfsNamespaceRescanReason::PayloadUnavailable => "payload-unavailable",
+        dfs::DfsNamespaceRescanReason::CrossShardRenameCorrelationUnavailable => {
+            "cross-shard-rename-correlation-unavailable"
+        }
+        dfs::DfsNamespaceRescanReason::NonAtomicRenameProjectionUnavailable => {
+            "non-atomic-rename-projection-unavailable"
+        }
+    }
+}
+
+pub fn mutation_contract_blocker() -> CloudFilesModuleError {
+    CloudFilesModuleError {
+        code: CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE.to_string(),
+        detail: "DFS has not yet exposed both caller-stable mkdir and a public read-only stable-operation receipt reconciliation facade"
+            .to_string(),
+    }
+}
+
+pub fn conflict_evidence(
+    code: impl Into<String>,
+    detail: impl Into<String>,
+) -> CloudFilesConflictEvidence {
+    CloudFilesConflictEvidence {
+        code: code.into(),
+        detail: detail.into(),
+        observed_object_id: None,
+        observed_version: None,
+        observed_content_hash: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::thread;
+    use std::time::Duration;
+
+    use sinomo_dfs_cloud_files_api::CloudFilesLocalChangeSyncMode;
+
+    use super::*;
+    use crate::local_change_queue::{CloudFilesExpectedObjectState, CloudFilesStagedContent};
+    use crate::namespace_reconciler::{
+        CloudFilesFullScanRequest, CloudFilesLocalPathState, CloudFilesNamespaceConflict,
+    };
+    use crate::sync_executor::CloudFilesDfsMutationContent;
+
+    static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn namespace_effect_cancellation_stops_the_worker_without_a_failure_event() {
+        let error = reconcile_error(CloudFilesNamespaceReconcileError {
+            code: "namespace-effect",
+            detail: "sync-cancelled".to_string(),
+        });
+
+        assert_eq!(error.code, "sync-cancelled");
+        assert_eq!(error.detail, "writable Cloud Files worker was cancelled");
+    }
+
+    #[test]
+    fn object_projection_never_fabricates_unsupported_file_kinds() {
+        assert_eq!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::File),
+            CloudFilesObjectProjection::File
+        );
+        assert_eq!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::Directory),
+            CloudFilesObjectProjection::Directory
+        );
+        assert_eq!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::Mount),
+            CloudFilesObjectProjection::Directory
+        );
+        assert!(matches!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::Symlink),
+            CloudFilesObjectProjection::Unsupported("symlink")
+        ));
+        assert!(matches!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::Hardlink),
+            CloudFilesObjectProjection::Unsupported("hardlink")
+        ));
+        assert!(matches!(
+            cloud_files_object_projection(&dfs::DfsObjectKind::Artifact),
+            CloudFilesObjectProjection::Unsupported("artifact")
+        ));
+    }
+
+    #[test]
+    fn blocked_run_once_cannot_advance_worker_health_generation() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (progress_sender, progress_receiver) = mpsc::channel();
+        let thread_cancelled = Arc::clone(&cancelled);
+        let thread_calls = Arc::clone(&calls);
+        let join = thread::spawn(move || {
+            run_progress_gated_worker_loop(
+                &thread_cancelled,
+                41,
+                || {
+                    let call = thread_calls.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        started_sender.send(()).expect("signal blocked pass");
+                        release_receiver.recv().expect("release blocked pass");
+                    } else {
+                        thread_cancelled.store(true, Ordering::SeqCst);
+                    }
+                    Ok::<_, ()>("healthy")
+                },
+                |status, generation| {
+                    progress_sender
+                        .send((status, generation))
+                        .expect("record progress")
+                },
+                |_| {},
+            )
+        });
+
+        started_receiver.recv().expect("worker pass started");
+        assert!(matches!(
+            progress_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).expect("release worker pass");
+        assert_eq!(
+            progress_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("completed pass advances health"),
+            ("healthy", 42)
+        );
+        join.join().expect("join worker loop").expect("worker loop");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn split_directory_change_buffers_preserve_one_atomic_rename() {
+        let mut pairing = CloudFilesRenamePairingState::default();
+        let mut first = Vec::new();
+        pairing.push(
+            CloudFilesDirectoryChangeAction::RenamedOldName,
+            PathBuf::from("old.txt"),
+            &mut first,
+        );
+        assert!(first.is_empty());
+
+        let mut second = Vec::new();
+        pairing.push(
+            CloudFilesDirectoryChangeAction::RenamedNewName,
+            PathBuf::from("new.txt"),
+            &mut second,
+        );
+        assert_eq!(
+            second,
+            vec![CloudFilesDirectoryChange::Renamed {
+                from: PathBuf::from("old.txt"),
+                to: PathBuf::from("new.txt"),
+            }]
+        );
+    }
+
+    #[test]
+    fn sparse_prepopulation_depth_is_exact_and_materialized_dirs_remain_audited() {
+        assert!(!sparse_root_is_enumerated(0, false));
+        assert!(sparse_root_is_enumerated(1, false));
+        assert!(sparse_root_is_enumerated(0, true));
+
+        assert!(!sparse_child_directory_is_enumerated(1, 1, false));
+        assert!(sparse_child_directory_is_enumerated(1, 2, false));
+        assert!(sparse_child_directory_is_enumerated(25, 0, true));
+        assert!(!sparse_child_directory_is_enumerated(25, 0, false));
+    }
+
+    #[test]
+    fn depth_zero_large_root_has_constant_activation_and_lazy_bounded_pages() {
+        const REMOTE_ROOT_CHILDREN: usize = 1_000_000;
+        assert!(!sparse_root_is_enumerated(0, false));
+
+        let mut observed = 0usize;
+        let mut page_count = 0usize;
+        while observed < REMOTE_ROOT_CHILDREN {
+            let page = REMOTE_ROOT_CHILDREN
+                .saturating_sub(observed)
+                .min(CLOUD_FILES_DIRECTORY_PAGE_ENTRIES);
+            assert!(page <= CLOUD_FILES_DIRECTORY_PAGE_ENTRIES);
+            observed = observed.saturating_add(page);
+            page_count = page_count.saturating_add(1);
+        }
+        assert_eq!(observed, REMOTE_ROOT_CHILDREN);
+        assert_eq!(
+            page_count,
+            REMOTE_ROOT_CHILDREN.div_ceil(CLOUD_FILES_DIRECTORY_PAGE_ENTRIES)
+        );
+    }
+
+    #[test]
+    fn sparse_missing_subtree_is_removed_leaf_to_root() {
+        let paths = ["/services/a", "/services/a/b", "/services/a/b/file.txt"];
+        let manifest = paths
+            .iter()
+            .map(|path| {
+                (
+                    (*path).to_string(),
+                    CloudFilesReconciledManifestEntry {
+                        path: (*path).to_string(),
+                        object_id: format!("object-{path}"),
+                        version: format!("version-{path}"),
+                        content_hash: None,
+                        content_size_bytes: None,
+                        kind: if path.ends_with(".txt") {
+                            "file".to_string()
+                        } else {
+                            "directory".to_string()
+                        },
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let materialized = BTreeSet::from([
+            "/services".to_string(),
+            "/services/a".to_string(),
+            "/services/a/b".to_string(),
+        ]);
+        let mut before = None;
+        let mut ordered = Vec::new();
+        for _ in 0..3 {
+            let page = next_sparse_known_path(
+                &manifest,
+                &materialized,
+                before.as_deref(),
+                CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+            );
+            before = page.before;
+            ordered.push(page.path.expect("known path"));
+        }
+        assert_eq!(
+            ordered,
+            vec!["/services/a/b/file.txt", "/services/a/b", "/services/a",]
+        );
+    }
+
+    #[test]
+    fn sparse_manifest_cursor_is_bounded_and_does_not_clone_large_unmaterialized_namespace() {
+        let mut manifest = BTreeMap::new();
+        for index in 0..10_000 {
+            let path = format!("/services/unmaterialized/{index:05}");
+            manifest.insert(
+                path.clone(),
+                CloudFilesReconciledManifestEntry {
+                    path,
+                    object_id: format!("object-{index}"),
+                    version: format!("version-{index}"),
+                    content_hash: None,
+                    content_size_bytes: None,
+                    kind: "file".to_string(),
+                },
+            );
+        }
+        let owned_path = "/services/z/file.txt".to_string();
+        manifest.insert(
+            owned_path.clone(),
+            CloudFilesReconciledManifestEntry {
+                path: owned_path.clone(),
+                object_id: "owned-object".to_string(),
+                version: "owned-version".to_string(),
+                content_hash: None,
+                content_size_bytes: None,
+                kind: "file".to_string(),
+            },
+        );
+        let page = next_sparse_known_path(
+            &manifest,
+            &BTreeSet::from(["/services/z".to_string()]),
+            None,
+            CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+        );
+        assert_eq!(page.path.as_deref(), Some(owned_path.as_str()));
+        assert!(page.examined <= CLOUD_FILES_DIRECTORY_PAGE_ENTRIES);
+    }
+
+    #[test]
+    fn cloud_files_root_requires_authoritative_directory_projection() {
+        assert!(cloud_files_root_kind_is_supported(
+            &dfs::DfsObjectKind::Directory
+        ));
+        assert!(cloud_files_root_kind_is_supported(
+            &dfs::DfsObjectKind::Mount
+        ));
+        assert!(!cloud_files_root_kind_is_supported(
+            &dfs::DfsObjectKind::File
+        ));
+        assert!(!cloud_files_root_kind_is_supported(
+            &dfs::DfsObjectKind::Tombstone
+        ));
+    }
+
+    #[test]
+    fn dirty_completion_follow_up_is_exact_generation_and_capture_stable() {
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/renamed.txt".to_string(),
+            object_id: "01postrenameobject".to_string(),
+            version: "01postrenameversion".to_string(),
+            content_hash: Some("blake3:remote".to_string()),
+            content_size_bytes: Some(12),
+            kind: "file".to_string(),
+        };
+        let staged = CloudFilesStagedContent {
+            content_hash: "blake3:local-newer".to_string(),
+            length: 17,
+        };
+        let first = completion_follow_up_request(
+            "mount-a",
+            "/services",
+            "cf_parent",
+            &entry,
+            staged.clone(),
+            "volume:file:usn:local-newer",
+        );
+        let second = completion_follow_up_request(
+            "mount-a",
+            "/services",
+            "cf_parent",
+            &entry,
+            staged,
+            "volume:file:usn:local-newer",
+        );
+        assert_eq!(first.capture_id, second.capture_id);
+        assert_eq!(first.kind, CloudFilesLocalOperationKind::ReplaceFile);
+        assert_eq!(first.source_path, entry.path);
+        assert_eq!(
+            first.preconditions.source,
+            Some(CloudFilesExpectedObjectState {
+                object_id: entry.object_id,
+                version: entry.version,
+                content_hash: entry.content_hash,
+            })
+        );
+        assert!(matches!(
+            first.preconditions.destination,
+            CloudFilesDestinationPrecondition::Unspecified
+        ));
+    }
+
+    #[test]
+    fn staged_upload_reader_observes_cancellation_between_reads() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut reader = CancellationReader::new(
+            std::io::Cursor::new(vec![7u8; 128 * 1024]),
+            Arc::clone(&cancelled),
+        );
+        let mut first = [0u8; 4096];
+        assert_eq!(reader.read(&mut first).expect("first read"), first.len());
+        cancelled.store(true, Ordering::SeqCst);
+        let error = reader
+            .read(&mut first)
+            .expect_err("cancelled upload read must stop");
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn ambiguous_directory_change_order_forces_snapshot_reconciliation() {
+        let modify_then_rename = vec![
+            CloudFilesDirectoryChange::Modified(PathBuf::from("new.txt")),
+            CloudFilesDirectoryChange::Renamed {
+                from: PathBuf::from("old.txt"),
+                to: PathBuf::from("new.txt"),
+            },
+        ];
+        assert_eq!(
+            plan_directory_changes(modify_then_rename),
+            CloudFilesDirectoryChangePlan::FullScanRequired
+        );
+
+        let atomic_save = vec![
+            CloudFilesDirectoryChange::Removed(PathBuf::from("report.txt")),
+            CloudFilesDirectoryChange::Added(PathBuf::from("report.txt")),
+        ];
+        assert_eq!(
+            plan_directory_changes(atomic_save),
+            CloudFilesDirectoryChangePlan::FullScanRequired
+        );
+
+        let rename_chain = vec![
+            CloudFilesDirectoryChange::Renamed {
+                from: PathBuf::from("a.txt"),
+                to: PathBuf::from("b.txt"),
+            },
+            CloudFilesDirectoryChange::Renamed {
+                from: PathBuf::from("b.txt"),
+                to: PathBuf::from("c.txt"),
+            },
+        ];
+        assert_eq!(
+            plan_directory_changes(rename_chain),
+            CloudFilesDirectoryChangePlan::FullScanRequired
+        );
+    }
+
+    #[test]
+    fn repeated_upserts_coalesce_to_last_observation_without_reordering_paths() {
+        let changes = vec![
+            CloudFilesDirectoryChange::Modified(PathBuf::from("a.txt")),
+            CloudFilesDirectoryChange::Added(PathBuf::from("b.txt")),
+            CloudFilesDirectoryChange::Modified(PathBuf::from("a.txt")),
+        ];
+        assert_eq!(
+            plan_directory_changes(changes),
+            CloudFilesDirectoryChangePlan::Ordered(vec![
+                CloudFilesDirectoryChange::Added(PathBuf::from("b.txt")),
+                CloudFilesDirectoryChange::Modified(PathBuf::from("a.txt")),
+            ])
+        );
+    }
+
+    #[test]
+    fn local_capture_retry_backoff_is_real_and_bounded() {
+        assert_eq!(local_capture_retry_delay(1), Duration::from_millis(50));
+        assert_eq!(local_capture_retry_delay(2), Duration::from_millis(100));
+        assert_eq!(local_capture_retry_delay(3), Duration::from_millis(200));
+        assert_eq!(local_capture_retry_delay(7), Duration::from_secs(2));
+        assert_eq!(local_capture_retry_delay(u32::MAX), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn long_held_local_write_is_deferred_with_backoff_instead_of_failing_worker() {
+        let path = PathBuf::from("held-open.txt");
+        let mut retries = CloudFilesLocalCaptureRetries::default();
+        assert_eq!(retries.schedule(path.clone(), Duration::ZERO), 1);
+        assert!(retries.due(Duration::from_millis(49)).is_empty());
+        assert_eq!(retries.due(Duration::from_millis(50)), vec![path.clone()]);
+
+        assert_eq!(retries.schedule(path.clone(), Duration::from_millis(50)), 2);
+        assert!(retries.due(Duration::from_millis(149)).is_empty());
+        assert_eq!(retries.due(Duration::from_millis(150)), vec![path.clone()]);
+
+        for attempt in 3..=12 {
+            assert_eq!(
+                retries.schedule(path.clone(), Duration::from_secs(1)),
+                attempt
+            );
+        }
+        assert!(retries.due(Duration::from_millis(2_999)).is_empty());
+        assert_eq!(retries.due(Duration::from_secs(3)), vec![path.clone()]);
+        retries.clear(&path);
+        assert!(retries.due(Duration::from_secs(10)).is_empty());
+    }
+
+    #[test]
+    fn deferred_capture_retry_pass_is_strictly_bounded() {
+        let mut retries = CloudFilesLocalCaptureRetries::default();
+        for index in 0..1_000 {
+            retries.schedule(
+                PathBuf::from(format!("held-{index:04}.txt")),
+                Duration::ZERO,
+            );
+        }
+        let due = retries.due_bounded(Duration::from_secs(10), 64);
+        assert_eq!(due.len(), 64);
+        assert_eq!(retries.len(), 1_000);
+        assert_eq!(due.first(), Some(&PathBuf::from("held-0000.txt")));
+        assert_eq!(due.last(), Some(&PathBuf::from("held-0063.txt")));
+    }
+
+    #[test]
+    fn owned_restart_offline_creates_require_absence_and_parent_ordering() {
+        let remote = BTreeMap::from([(
+            "/services/existing".to_string(),
+            CloudFilesReconciledManifestEntry {
+                path: "/services/existing".to_string(),
+                object_id: "01existing".to_string(),
+                version: "01version".to_string(),
+                content_hash: None,
+                content_size_bytes: None,
+                kind: "directory".to_string(),
+            },
+        )]);
+        assert_eq!(
+            plan_owned_offline_create("/services", "/services/new.txt", &remote),
+            CloudFilesOfflineCreatePlan::QueueNow
+        );
+        assert_eq!(
+            plan_owned_offline_create("/services", "/services/existing/child.txt", &remote),
+            CloudFilesOfflineCreatePlan::QueueNow
+        );
+        assert_eq!(
+            plan_owned_offline_create("/services", "/services/offline/child.txt", &remote),
+            CloudFilesOfflineCreatePlan::DeferUntilParentIsRemote
+        );
+        assert_eq!(
+            plan_owned_offline_create("/services", "/services/existing", &remote),
+            CloudFilesOfflineCreatePlan::ConflictWithRemote
+        );
+    }
+
+    #[test]
+    fn owned_restart_offline_create_enters_durable_absent_cas_queue() {
+        let root = TestRoot::new("offline-create-restart");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        let capture = FakeCapture {
+            startup_captures: vec![create_capture("offline-file-usn-7", b"offline")],
+            ..FakeCapture::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([
+                CloudFilesFullScanSnapshot {
+                    scan_complete: true,
+                    ..CloudFilesFullScanSnapshot::default()
+                },
+                CloudFilesFullScanSnapshot {
+                    scan_complete: true,
+                    ..CloudFilesFullScanSnapshot::default()
+                },
+            ]),
+            FakeEffects::default(),
+        );
+
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("startup queues offline create");
+        let operation = worker
+            .state()
+            .queue()
+            .operations()
+            .next()
+            .expect("durable offline operation");
+        assert_eq!(
+            operation.request.kind,
+            CloudFilesLocalOperationKind::CreateFile
+        );
+        assert_eq!(
+            operation.request.preconditions.destination,
+            CloudFilesDestinationPrecondition::Absent
+        );
+        assert_eq!(operation.status, CloudFilesLocalOperationStatus::Retrying);
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .read_staged_content(&operation.request.operation_id)
+                .expect("immutable offline bytes"),
+            b"offline"
+        );
+    }
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new(label: &str) -> Self {
+            let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "sinomo-cloud-files-windows-sync-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test root");
+            Self(path)
+        }
+
+        fn data_dir(&self) -> SinomoDataDir {
+            SinomoDataDir::new(&self.0)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn expected_object() -> CloudFilesExpectedObjectState {
+        CloudFilesExpectedObjectState {
+            object_id: "01oldobject".to_string(),
+            version: "01oldversion".to_string(),
+            content_hash: Some("blake3:old".to_string()),
+        }
+    }
+
+    fn create_capture(capture_id: &str, bytes: &[u8]) -> CloudFilesCapturedLocalChange {
+        CloudFilesCapturedLocalChange {
+            capture_id: capture_id.to_string(),
+            kind: CloudFilesLocalOperationKind::CreateFile,
+            source_path: "/services/new.txt".to_string(),
+            destination_path: None,
+            preconditions: CloudFilesLocalOperationPreconditions {
+                source: None,
+                destination: CloudFilesDestinationPrecondition::Absent,
+            },
+            captured_content: Some(CloudFilesCapturedContent::Inline(bytes.to_vec())),
+        }
+    }
+
+    fn cursor(sequence: u64) -> CloudFilesNamespaceCursor {
+        CloudFilesNamespaceCursor {
+            file_system_id: "filesystem-a".to_string(),
+            shard_id: "root".to_string(),
+            authority_epoch: 7,
+            after_sequence: sequence,
+        }
+    }
+
+    fn feed_upsert(sequence: u64, ordinal: u64, name: &str) -> CloudFilesNamespaceFeedEvent {
+        CloudFilesNamespaceFeedEvent::Upsert {
+            path: format!("/services/{name}"),
+            object_id: format!("object-{sequence}-{ordinal}"),
+            version: format!("version-{sequence}-{ordinal}"),
+            content_hash: Some(format!("blake3:{sequence}-{ordinal}")),
+            content_size_bytes: Some(1),
+            kind: "file".to_string(),
+            provenance: CloudFilesNamespaceProvenance {
+                event_id: format!("event-{sequence}-{ordinal}"),
+                journal_sequence: sequence,
+                journal_ordinal: ordinal,
+                operation_id: None,
+            },
+        }
+    }
+
+    #[test]
+    fn feed_budget_never_splits_one_journal_sequence() {
+        let batch = CloudFilesNamespaceFeedBatch {
+            input_cursor: cursor(0),
+            next_cursor: cursor(3),
+            events: vec![
+                feed_upsert(1, 0, "a"),
+                feed_upsert(1, 1, "b"),
+                feed_upsert(2, 0, "c"),
+                feed_upsert(3, 0, "d"),
+            ],
+            journal_head_sequence: 7,
+            has_more: false,
+        };
+
+        let first = bound_namespace_feed_batch(batch.clone(), 1);
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.next_cursor.after_sequence, 1);
+        assert!(first.has_more);
+
+        let second = bound_namespace_feed_batch(batch, 3);
+        assert_eq!(second.events.len(), 3);
+        assert_eq!(second.next_cursor.after_sequence, 2);
+        assert!(second.has_more);
+    }
+
+    fn snapshot(sequence: u64) -> CloudFilesFullScanSnapshot {
+        let cursor = cursor(sequence);
+        CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(
+                "/services/remote.txt".to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: "/services/remote.txt".to_string(),
+                    object_id: "01remoteobject".to_string(),
+                    version: format!("01version{sequence}"),
+                    content_hash: Some(format!("blake3:{sequence}")),
+                    content_size_bytes: Some(sequence),
+                    kind: "file".to_string(),
+                },
+            )]),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: true,
+            cursors: BTreeMap::from([(cursor.shard_key().expect("key"), cursor)]),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCapture {
+        batches: VecDeque<Result<CloudFilesCapturedChangeBatch, String>>,
+        activated: Arc<AtomicBool>,
+        require_activation_before_scan: bool,
+        startup_batches: VecDeque<CloudFilesStartupScanBatch>,
+        startup_captures: Vec<CloudFilesCapturedLocalChange>,
+        startup_conflicts: Vec<CloudFilesStartupConflictEvidence>,
+    }
+
+    impl CloudFilesLocalChangeAccelerator for FakeCapture {
+        fn startup_scan(
+            &mut self,
+            _previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            _remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            _cancelled: &AtomicBool,
+        ) -> Result<CloudFilesStartupScanBatch, String> {
+            if self.require_activation_before_scan && !self.activated.load(Ordering::SeqCst) {
+                return Err("startup scan ran before change capture was active".to_string());
+            }
+            if let Some(batch) = self.startup_batches.pop_front() {
+                return Ok(batch);
+            }
+            Ok(CloudFilesStartupScanBatch {
+                changes: std::mem::take(&mut self.startup_captures),
+                sparse_placeholders: Vec::new(),
+                complete: true,
+            })
+        }
+
+        fn drain_startup_conflicts(&mut self) -> Vec<CloudFilesStartupConflictEvidence> {
+            std::mem::take(&mut self.startup_conflicts)
+        }
+
+        fn activate(&mut self) -> Result<(), String> {
+            self.activated.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn drain_changes(
+            &mut self,
+            _manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            _cancelled: &AtomicBool,
+        ) -> Result<CloudFilesCapturedChangeBatch, String> {
+            self.batches.pop_front().unwrap_or_else(|| {
+                Ok(CloudFilesCapturedChangeBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: Vec::new(),
+                    overflowed: false,
+                })
+            })
+        }
+    }
+
+    struct FakeBackend {
+        readiness_error: Option<String>,
+        calls: Vec<CloudFilesLocalOperationKind>,
+        reconcile_calls: usize,
+        outcome: CloudFilesDfsMutationOutcome,
+        reconciliation: CloudFilesDfsMutationReconciliation,
+    }
+
+    impl Default for FakeBackend {
+        fn default() -> Self {
+            Self {
+                readiness_error: None,
+                calls: Vec::new(),
+                reconcile_calls: 0,
+                outcome: CloudFilesDfsMutationOutcome::Ambiguous {
+                    detail: "test outcome".to_string(),
+                },
+                reconciliation: CloudFilesDfsMutationReconciliation::Ambiguous {
+                    detail: "test reconciliation".to_string(),
+                },
+            }
+        }
+    }
+
+    impl FakeBackend {
+        fn record(
+            &mut self,
+            kind: CloudFilesLocalOperationKind,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.calls.push(kind);
+            Ok(self.outcome.clone())
+        }
+    }
+
+    impl CloudFilesStableMutationBackend for FakeBackend {
+        fn ensure_contracts_ready(&self) -> Result<(), String> {
+            self.readiness_error.clone().map_or(Ok(()), Err)
+        }
+
+        fn create_file(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::CreateFile)
+        }
+
+        fn create_directory(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::CreateDirectory)
+        }
+
+        fn replace_file(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::ReplaceFile)
+        }
+
+        fn unlink(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::DeleteFile)
+        }
+
+        fn rmdir(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::DeleteDirectory)
+        }
+
+        fn rename(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.record(CloudFilesLocalOperationKind::Rename)
+        }
+
+        fn reconcile(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+            self.reconcile_calls += 1;
+            Ok(self.reconciliation.clone())
+        }
+    }
+
+    struct FakeNamespace {
+        scans: VecDeque<Result<CloudFilesFullScanSnapshot, String>>,
+        batches: VecDeque<Result<Vec<CloudFilesNamespaceFeedBatch>, String>>,
+        scan_calls: Arc<AtomicUsize>,
+        resolved: BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        materialization_audit_intents:
+            Option<Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>>,
+    }
+
+    impl FakeNamespace {
+        fn with_scans(scans: impl IntoIterator<Item = CloudFilesFullScanSnapshot>) -> Self {
+            Self {
+                scans: scans.into_iter().map(Ok).collect(),
+                batches: VecDeque::new(),
+                scan_calls: Arc::new(AtomicUsize::new(0)),
+                resolved: BTreeMap::new(),
+                materialization_audit_intents: None,
+            }
+        }
+
+        fn with_materialization_audit_intents(
+            scans: impl IntoIterator<Item = CloudFilesFullScanSnapshot>,
+            intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
+        ) -> Self {
+            Self {
+                materialization_audit_intents: Some(intents),
+                ..Self::with_scans(scans)
+            }
+        }
+    }
+
+    impl CloudFilesNamespaceSource for FakeNamespace {
+        fn poll_batches(
+            &mut self,
+            _root: &str,
+            _cursors: &[CloudFilesNamespaceCursor],
+        ) -> Result<Vec<CloudFilesNamespaceFeedBatch>, String> {
+            self.batches.pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        fn full_scan(
+            &mut self,
+            _root: &str,
+            _previous_cursors: &[CloudFilesNamespaceCursor],
+            _materialized_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            _materialized_directories: &std::collections::BTreeSet<String>,
+        ) -> Result<CloudFilesFullScanSnapshot, String> {
+            self.scan_calls.fetch_add(1, Ordering::Relaxed);
+            self.scans
+                .pop_front()
+                .expect("configured full-scan snapshot")
+        }
+
+        fn resolve_placeholder_identity(
+            &mut self,
+            identity: &CloudFilesPlaceholderIdentity,
+        ) -> Result<Option<CloudFilesReconciledManifestEntry>, String> {
+            Ok(self.resolved.get(&identity.path).cloned())
+        }
+
+        fn has_pending_materialized_directories(
+            &self,
+            _durable_materialized_directories: &BTreeSet<String>,
+        ) -> Result<bool, String> {
+            let Some(intents) = &self.materialization_audit_intents else {
+                return Ok(false);
+            };
+            let intents = intents
+                .lock()
+                .map_err(|_| "fake materialization audit store is poisoned".to_string())?;
+            Ok(!intents.pending_directories().is_empty())
+        }
+
+        fn acknowledge_materialized_directories(
+            &mut self,
+            directories: &[String],
+        ) -> Result<(), String> {
+            let Some(intents) = &self.materialization_audit_intents else {
+                return Ok(());
+            };
+            intents
+                .lock()
+                .map_err(|_| "fake materialization audit store is poisoned".to_string())?
+                .acknowledge_directories(directories.iter().map(String::as_str))
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeEffects {
+        path_states: BTreeMap<String, CloudFilesLocalPathState>,
+        actions: Vec<CloudFilesNamespaceAction>,
+        completions: usize,
+        full_scan_effects: Arc<Mutex<Vec<CloudFilesFullScanSnapshot>>>,
+        fail_full_scan: bool,
+        apply_results: VecDeque<Result<(), String>>,
+    }
+
+    impl CloudFilesNamespaceEffectAdapter for FakeEffects {
+        fn local_path_state(&mut self, path: &str) -> Result<CloudFilesLocalPathState, String> {
+            Ok(self
+                .path_states
+                .get(path)
+                .cloned()
+                .unwrap_or(CloudFilesLocalPathState::Clean))
+        }
+
+        fn apply(&mut self, action: &CloudFilesNamespaceAction) -> Result<(), String> {
+            self.actions.push(action.clone());
+            self.apply_results.pop_front().unwrap_or(Ok(()))
+        }
+
+        fn record_conflict(
+            &mut self,
+            _conflict: &CloudFilesNamespaceConflict,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn request_full_scan(
+            &mut self,
+            _request: &CloudFilesFullScanRequest,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl CloudFilesLocalCompletionEffect for FakeEffects {
+        fn complete(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+            _evidence: &CloudFilesRemoteMutationEvidence,
+        ) -> Result<CloudFilesLocalCompletionOutcome, String> {
+            self.completions += 1;
+            Ok(CloudFilesLocalCompletionOutcome::Completed)
+        }
+    }
+
+    impl CloudFilesWindowsPlaceholderEffect for FakeEffects {
+        fn apply_full_scan(&mut self, snapshot: &CloudFilesFullScanSnapshot) -> Result<(), String> {
+            self.full_scan_effects
+                .lock()
+                .expect("full-scan log")
+                .push(snapshot.clone());
+            if self.fail_full_scan {
+                Err("simulated crash after idempotent placeholder effect".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn content() -> CloudFilesDfsMutationContent {
+        CloudFilesDfsMutationContent {
+            descriptor: CloudFilesStagedContent {
+                content_hash: "blake3:staged".to_string(),
+                length: 6,
+            },
+            blob_path: PathBuf::from("staged-test-blob"),
+        }
+    }
+
+    fn command(kind: CloudFilesLocalOperationKind) -> CloudFilesDfsMutationCommand {
+        let (source, destination, destination_path, staged_content) = match kind {
+            CloudFilesLocalOperationKind::CreateFile => (
+                None,
+                CloudFilesDestinationPrecondition::Absent,
+                None,
+                Some(content()),
+            ),
+            CloudFilesLocalOperationKind::CreateDirectory => {
+                (None, CloudFilesDestinationPrecondition::Absent, None, None)
+            }
+            CloudFilesLocalOperationKind::ReplaceFile => (
+                Some(expected_object()),
+                CloudFilesDestinationPrecondition::Unspecified,
+                None,
+                Some(content()),
+            ),
+            CloudFilesLocalOperationKind::DeleteFile
+            | CloudFilesLocalOperationKind::DeleteDirectory => (
+                Some(expected_object()),
+                CloudFilesDestinationPrecondition::Unspecified,
+                None,
+                None,
+            ),
+            CloudFilesLocalOperationKind::Rename => (
+                Some(expected_object()),
+                CloudFilesDestinationPrecondition::Absent,
+                Some("/services/new-name.txt".to_string()),
+                None,
+            ),
+        };
+        CloudFilesDfsMutationCommand {
+            operation_id: format!("operation-{kind:?}"),
+            request_digest: "blake3:request".to_string(),
+            kind,
+            source_path: "/services/source.txt".to_string(),
+            destination_path,
+            preconditions: CloudFilesLocalOperationPreconditions {
+                source,
+                destination,
+            },
+            staged_content,
+        }
+    }
+
+    #[test]
+    fn stable_capture_id_is_the_idempotency_key_and_changed_payload_is_rejected() {
+        let root = TestRoot::new("stable-capture");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let first = state
+            .enqueue_capture(create_capture("volume-7:file-9:usn-11", b"first"))
+            .expect("first capture");
+        let replay = state
+            .enqueue_capture(create_capture("volume-7:file-9:usn-11", b"first"))
+            .expect("idempotent replay");
+        assert_eq!(first.request.operation_id, replay.request.operation_id);
+        let suffix = first
+            .request
+            .operation_id
+            .strip_prefix("cf_")
+            .expect("Cloud Files operation prefix");
+        assert_eq!(suffix.len(), 26);
+        assert_eq!(suffix, suffix.to_ascii_lowercase());
+        assert!(suffix.parse::<ulid::Ulid>().is_ok());
+        assert_eq!(
+            state
+                .queue()
+                .read_staged_content(&first.request.operation_id)
+                .expect("staged bytes"),
+            b"first"
+        );
+
+        let error = state
+            .enqueue_capture(create_capture("volume-7:file-9:usn-11", b"changed"))
+            .expect_err("same capture cannot change bytes");
+        assert_eq!(error.code, "local-change-queue");
+        assert!(error.detail.contains("operation-id-reused"));
+        assert_eq!(state.queue().operations().count(), 1);
+        let operation_id = first.request.operation_id;
+        drop(state);
+        let mut reopened =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                .expect("reopen state");
+        let replay = reopened
+            .enqueue_capture(create_capture("volume-7:file-9:usn-11", b"first"))
+            .expect("replay after restart");
+        assert_eq!(replay.request.operation_id, operation_id);
+    }
+
+    #[test]
+    fn completed_operation_repairs_manifest_before_retirement_after_restart() {
+        let root = TestRoot::new("completed-repair");
+        let data_dir = root.data_dir();
+        let operation_id = {
+            let mut state = CloudFilesWritableSyncState::open(&data_dir, "mount-a", "/services")
+                .expect("open first state");
+            let operation = state
+                .enqueue_capture(create_capture("captured-before-crash", b"stable"))
+                .expect("enqueue capture");
+            let operation_id = operation.request.operation_id.clone();
+            state
+                .queue
+                .mark_remote_applied_with_evidence(CloudFilesRemoteMutationEvidence {
+                    operation_id: operation_id.clone(),
+                    object_id: Some("01newobject".to_string()),
+                    version: Some("01newversion".to_string()),
+                    content_hash: Some("blake3:new".to_string()),
+                    content_size_bytes: Some(6),
+                    kind: Some("file".to_string()),
+                    detail: "stable DFS mutation applied".to_string(),
+                })
+                .expect("mark remote applied");
+            state
+                .queue
+                .mark_completed(&operation_id)
+                .expect("simulate crash after Completed before reconciler commit");
+            operation_id
+        };
+
+        let state = CloudFilesWritableSyncState::open(&data_dir, "mount-a", "/services")
+            .expect("reopen state");
+        assert!(
+            !state
+                .reconciler()
+                .manifest()
+                .contains_key("/services/new.txt")
+        );
+        let scan_cursor = cursor(1);
+        let full_scan = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(
+                "/services/new.txt".to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: "/services/new.txt".to_string(),
+                    object_id: "01newobject".to_string(),
+                    version: "01newversion".to_string(),
+                    content_hash: Some("blake3:new".to_string()),
+                    content_size_bytes: Some(6),
+                    kind: "file".to_string(),
+                },
+            )]),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: true,
+            cursors: BTreeMap::from([(scan_cursor.shard_key().expect("cursor key"), scan_cursor)]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([full_scan]),
+            FakeEffects::default(),
+        );
+
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("startup repairs completed operation");
+
+        assert!(
+            worker.state().queue().operation(&operation_id).is_none(),
+            "full-scan reconciliation moves the successful full record into the bounded retired-ID ledger"
+        );
+        let manifest = worker
+            .state()
+            .reconciler()
+            .manifest()
+            .get("/services/new.txt")
+            .expect("repaired manifest entry");
+        assert_eq!(manifest.object_id, "01newobject");
+        assert_eq!(manifest.version, "01newversion");
+    }
+
+    #[test]
+    fn concrete_adapter_validates_and_dispatches_all_mutation_kinds() {
+        let mut adapter = CloudFilesConcreteDfsAdapter::new(FakeBackend::default());
+        let kinds = [
+            CloudFilesLocalOperationKind::CreateFile,
+            CloudFilesLocalOperationKind::CreateDirectory,
+            CloudFilesLocalOperationKind::ReplaceFile,
+            CloudFilesLocalOperationKind::DeleteFile,
+            CloudFilesLocalOperationKind::DeleteDirectory,
+            CloudFilesLocalOperationKind::Rename,
+        ];
+        for kind in &kinds {
+            assert!(matches!(
+                adapter.apply(&command(kind.clone())).expect("dispatch"),
+                CloudFilesDfsMutationOutcome::Ambiguous { .. }
+            ));
+        }
+        assert_eq!(adapter.backend().calls, kinds);
+
+        let valid = command(CloudFilesLocalOperationKind::CreateFile);
+        assert!(matches!(
+            adapter.reconcile(&valid).expect("read-only reconcile"),
+            CloudFilesDfsMutationReconciliation::Ambiguous { .. }
+        ));
+        assert_eq!(adapter.backend().reconcile_calls, 1);
+
+        let mut invalid = valid;
+        invalid.staged_content = None;
+        assert!(adapter.apply(&invalid).is_err());
+        assert_eq!(adapter.backend().calls.len(), kinds.len());
+    }
+
+    #[test]
+    fn readiness_failure_blocks_before_full_scan_or_placeholder_effect() {
+        let root = TestRoot::new("readiness-gate");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let namespace = FakeNamespace::with_scans([snapshot(1)]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let effects = FakeEffects::default();
+        let effect_calls = Arc::clone(&effects.full_scan_effects);
+        let backend = FakeBackend {
+            readiness_error: Some("stable mkdir unavailable".to_string()),
+            ..FakeBackend::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            effects,
+        );
+
+        let error = worker
+            .startup(&AtomicBool::new(false))
+            .expect_err("readiness must fail closed");
+        assert_eq!(
+            error.code,
+            CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE
+        );
+        assert_eq!(scan_calls.load(Ordering::Relaxed), 0);
+        assert!(effect_calls.lock().expect("effects").is_empty());
+        let status = worker.state().status();
+        assert_eq!(status.mode, CloudFilesLocalChangeSyncMode::Blocked);
+        assert!(status.local_mutations_blocked);
+    }
+
+    #[test]
+    fn lifecycle_status_exposes_bounded_typed_local_and_projection_evidence() {
+        let root = TestRoot::new("typed-attention");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let operation = state
+            .enqueue_capture(create_capture("capture-attention", b"retained bytes"))
+            .expect("enqueue retained content");
+        state
+            .queue
+            .mark_conflict(
+                &operation.request.operation_id,
+                CloudFilesConflictEvidence {
+                    code: "destination-exists".to_string(),
+                    detail: "authoritative destination already exists".to_string(),
+                    observed_object_id: Some("remote-object".to_string()),
+                    observed_version: Some("remote-version".to_string()),
+                    observed_content_hash: Some("blake3:remote".to_string()),
+                },
+            )
+            .expect("record local conflict");
+        state
+            .reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(
+                    "/services/link".to_string(),
+                    CloudFilesReconciledManifestEntry {
+                        path: "/services/link".to_string(),
+                        object_id: "link-object".to_string(),
+                        version: "link-version".to_string(),
+                        content_hash: None,
+                        content_size_bytes: None,
+                        kind: "symlink".to_string(),
+                    },
+                )]),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+                false,
+            )
+            .expect("record unsupported projection");
+
+        let status = state.status();
+        assert_eq!(status.conflict_count, 2);
+        let local = status
+            .attention
+            .iter()
+            .find(|summary| summary.kind == CloudFilesSyncAttentionKind::LocalOperationConflict)
+            .expect("local conflict summary");
+        assert_eq!(local.path, "/services/new.txt");
+        let evidence = local
+            .retained_local_evidence
+            .as_ref()
+            .expect("retained local evidence");
+        assert_eq!(
+            evidence.operation_id.as_deref(),
+            Some(operation.request.operation_id.as_str())
+        );
+        assert_eq!(evidence.staged_content_size_bytes, Some(14));
+        assert!(status.attention.iter().any(|summary| {
+            summary.kind == CloudFilesSyncAttentionKind::UnsupportedObjectKind
+                && summary.path == "/services/link"
+        }));
+    }
+
+    #[test]
+    fn change_capture_is_ready_before_scan_and_startup_conflicts_are_durable() {
+        let root = TestRoot::new("capture-before-scan");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let activated = Arc::new(AtomicBool::new(false));
+        let capture = FakeCapture {
+            activated: Arc::clone(&activated),
+            require_activation_before_scan: true,
+            startup_conflicts: vec![CloudFilesStartupConflictEvidence {
+                path: "/services/untracked.txt".to_string(),
+                detail: "owned root contains an untracked local path".to_string(),
+            }],
+            ..FakeCapture::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot(1)]),
+            FakeEffects::default(),
+        );
+
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("startup with surfaced conflict");
+
+        assert!(activated.load(Ordering::SeqCst));
+        assert_eq!(worker.state().reconciler().startup_conflicts().len(), 1);
+        assert_eq!(worker.state().status().conflict_count, 1);
+    }
+
+    #[test]
+    fn partial_startup_local_scan_reports_active_after_one_safe_bounded_quantum() {
+        let root = TestRoot::new("partial-local-startup");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let capture = FakeCapture {
+            startup_batches: VecDeque::from([
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: Vec::new(),
+                    complete: false,
+                },
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: Vec::new(),
+                    complete: false,
+                },
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: Vec::new(),
+                    complete: true,
+                },
+            ]),
+            ..FakeCapture::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot(1)]),
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+
+        worker.startup(&cancelled).expect("first bounded scan page");
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+        worker
+            .run_once(&cancelled)
+            .expect("second bounded scan page");
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+        worker
+            .run_once(&cancelled)
+            .expect("terminal bounded scan page");
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+    }
+
+    #[test]
+    fn depth_zero_sparse_placeholder_is_authoritatively_adopted_before_restart_classification() {
+        let root = TestRoot::new("depth-zero-sparse-restart");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let identity = CloudFilesPlaceholderIdentity::new(
+            "mount-a",
+            "/services",
+            "/services/a.txt",
+            "01aobject",
+            "01aversion",
+            Some("blake3:a".to_string()),
+        );
+        let capture = FakeCapture {
+            startup_batches: VecDeque::from([
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: vec![CloudFilesSparsePlaceholderObservation {
+                        local_path: "/services/a.txt".to_string(),
+                        identity: identity.clone(),
+                    }],
+                    complete: false,
+                },
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: Vec::new(),
+                    complete: true,
+                },
+            ]),
+            ..FakeCapture::default()
+        };
+        let mut namespace = FakeNamespace::with_scans([snapshot(1)]);
+        namespace.resolved.insert(
+            identity.path.clone(),
+            CloudFilesReconciledManifestEntry {
+                path: identity.path.clone(),
+                object_id: identity.object_id.clone(),
+                version: identity.version.clone(),
+                content_hash: identity.content_hash.clone(),
+                content_size_bytes: Some(7),
+                kind: "file".to_string(),
+            },
+        );
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("bounded startup");
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/a.txt")
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        assert_eq!(worker.state().queue().operations().count(), 0);
+        assert_eq!(worker.state().reconciler().conflict_count(), 0);
+        worker.run_once(&cancelled).expect("finish sparse audit");
+        assert_eq!(worker.state().queue().operations().count(), 0);
+        drop(worker);
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen durable sparse state");
+        assert!(
+            reopened
+                .reconciler()
+                .manifest()
+                .contains_key("/services/a.txt")
+        );
+        assert!(
+            reopened
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        assert_eq!(reopened.queue().operations().count(), 0);
+    }
+
+    #[test]
+    fn changed_sparse_placeholder_generation_is_conflict_never_create() {
+        let root = TestRoot::new("sparse-generation-conflict");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let identity = CloudFilesPlaceholderIdentity::new(
+            "mount-a",
+            "/services",
+            "/services/a.txt",
+            "01oldobject",
+            "01oldversion",
+            Some("blake3:old".to_string()),
+        );
+        let capture = FakeCapture {
+            startup_batches: VecDeque::from([CloudFilesStartupScanBatch {
+                changes: Vec::new(),
+                sparse_placeholders: vec![CloudFilesSparsePlaceholderObservation {
+                    local_path: "/services/a.txt".to_string(),
+                    identity: identity.clone(),
+                }],
+                complete: false,
+            }]),
+            ..FakeCapture::default()
+        };
+        let mut namespace = FakeNamespace::with_scans([snapshot(1)]);
+        namespace.resolved.insert(
+            identity.path.clone(),
+            CloudFilesReconciledManifestEntry {
+                path: identity.path,
+                object_id: "01newobject".to_string(),
+                version: "01newversion".to_string(),
+                content_hash: Some("blake3:new".to_string()),
+                content_size_bytes: Some(9),
+                kind: "file".to_string(),
+            },
+        );
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("fail-closed startup continues");
+        assert_eq!(worker.state().queue().operations().count(), 0);
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .startup_conflicts()
+                .contains_key("/services/a.txt")
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key("/services/a.txt")
+        );
+    }
+
+    #[test]
+    fn sparse_adoption_reclassifies_dirty_path_as_exact_replace_not_create() {
+        let root = TestRoot::new("sparse-dirty-replace");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let identity = CloudFilesPlaceholderIdentity::new(
+            "mount-a",
+            "/services",
+            "/services/a.txt",
+            "01aobject",
+            "01aversion",
+            Some("blake3:a".to_string()),
+        );
+        let expected = CloudFilesExpectedObjectState {
+            object_id: identity.object_id.clone(),
+            version: identity.version.clone(),
+            content_hash: identity.content_hash.clone(),
+        };
+        let replacement = CloudFilesCapturedLocalChange {
+            capture_id: "dirty-after-sparse-adoption".to_string(),
+            kind: CloudFilesLocalOperationKind::ReplaceFile,
+            source_path: identity.path.clone(),
+            destination_path: None,
+            preconditions: CloudFilesLocalOperationPreconditions {
+                source: Some(expected.clone()),
+                destination: CloudFilesDestinationPrecondition::Unspecified,
+            },
+            captured_content: Some(CloudFilesCapturedContent::Inline(b"local-newer".to_vec())),
+        };
+        let capture = FakeCapture {
+            startup_batches: VecDeque::from([
+                CloudFilesStartupScanBatch {
+                    changes: Vec::new(),
+                    sparse_placeholders: vec![CloudFilesSparsePlaceholderObservation {
+                        local_path: identity.path.clone(),
+                        identity: identity.clone(),
+                    }],
+                    complete: false,
+                },
+                CloudFilesStartupScanBatch {
+                    changes: vec![replacement],
+                    sparse_placeholders: Vec::new(),
+                    complete: true,
+                },
+            ]),
+            ..FakeCapture::default()
+        };
+        let mut namespace = FakeNamespace::with_scans([snapshot(1)]);
+        namespace.resolved.insert(
+            identity.path.clone(),
+            CloudFilesReconciledManifestEntry {
+                path: identity.path,
+                object_id: expected.object_id.clone(),
+                version: expected.version.clone(),
+                content_hash: expected.content_hash.clone(),
+                content_size_bytes: Some(7),
+                kind: "file".to_string(),
+            },
+        );
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("adopt sparse identity");
+        worker
+            .run_once(&cancelled)
+            .expect("queue exact replacement");
+        let operation = worker
+            .state()
+            .queue()
+            .operations()
+            .find(|operation| {
+                operation.request.capture_id.as_deref() == Some("dirty-after-sparse-adoption")
+            })
+            .expect("durable replacement");
+        assert_eq!(
+            operation.request.kind,
+            CloudFilesLocalOperationKind::ReplaceFile
+        );
+        assert_eq!(operation.request.preconditions.source, Some(expected));
+        assert_ne!(
+            operation.request.kind,
+            CloudFilesLocalOperationKind::CreateFile
+        );
+    }
+
+    #[test]
+    fn full_scan_cursor_is_installed_only_after_effect_and_replays_after_crash() {
+        let root = TestRoot::new("cursor-after-effect");
+        let effect_calls = Arc::new(Mutex::new(Vec::new()));
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open first state");
+        let mut first_effects = FakeEffects {
+            full_scan_effects: Arc::clone(&effect_calls),
+            fail_full_scan: true,
+            ..FakeEffects::default()
+        };
+        first_effects.path_states.clear();
+        let mut first = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot(9)]),
+            first_effects,
+        );
+        let error = first
+            .startup(&AtomicBool::new(false))
+            .expect_err("simulated effect crash");
+        assert_eq!(error.code, "full-reconciliation-effect");
+        assert!(first.state().reconciler().cursors().is_empty());
+        drop(first);
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen after crash");
+        assert!(reopened.reconciler().cursors().is_empty());
+        let effects = FakeEffects {
+            full_scan_effects: Arc::clone(&effect_calls),
+            ..FakeEffects::default()
+        };
+        let mut second = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot(9)]),
+            effects,
+        );
+        second
+            .startup(&AtomicBool::new(false))
+            .expect("idempotent effect replay");
+        assert_eq!(effect_calls.lock().expect("effects").len(), 2);
+        assert_eq!(
+            second
+                .state()
+                .reconciler()
+                .cursors()
+                .values()
+                .next()
+                .expect("installed cursor")
+                .after_sequence,
+            9
+        );
+        assert_eq!(
+            second.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+    }
+
+    #[test]
+    fn empty_materialized_directory_intent_survives_crash_before_worker_pass() {
+        let root = TestRoot::new("empty-materialization-intent-restart");
+        let empty_directory = CloudFilesReconciledManifestEntry {
+            path: "/services/empty".to_string(),
+            object_id: "01emptydirectory".to_string(),
+            version: "01emptydirectoryv1".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
+        {
+            let mut state =
+                CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                    .expect("open state before browse");
+            state
+                .reconciler
+                .install_full_scan_delta(
+                    BTreeMap::from([(empty_directory.path.clone(), empty_directory.clone())]),
+                    Vec::new(),
+                    Vec::new(),
+                    BTreeMap::new(),
+                    false,
+                )
+                .expect("seed remote directory identity without materialization ownership");
+            state
+                .materialization_audit_intents()
+                .lock()
+                .expect("audit intents")
+                .record_directory(&empty_directory.path)
+                .expect("fsync pre-CFAPI audit intent");
+            // Simulate process loss after the callback's durable intent and
+            // before the writable worker gets a pass.
+        }
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen after callback crash");
+        let intents = reopened.materialization_audit_intents();
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .contains(&empty_directory.path)
+        );
+        let terminal_cursor = cursor(11);
+        let scan = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::new(),
+            removed_paths: Vec::new(),
+            materialized_directories: vec![empty_directory.path.clone()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                terminal_cursor.shard_key().expect("cursor key"),
+                terminal_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_materialization_audit_intents([scan], Arc::clone(&intents)),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("audit empty materialized directory");
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .materialized_directories()
+                .contains(&empty_directory.path)
+        );
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .is_empty()
+        );
+        drop(worker);
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen committed empty browse");
+        assert!(
+            reopened
+                .reconciler()
+                .materialized_directories()
+                .contains(&empty_directory.path)
+        );
+        assert!(
+            reopened
+                .reconciler()
+                .manifest()
+                .contains_key(&empty_directory.path)
+        );
+        assert_eq!(reopened.reconciler().cursors().len(), 1);
+    }
+
+    #[test]
+    fn already_matching_materialized_page_commits_ownership_before_cursor() {
+        let root = TestRoot::new("noop-materialization-intent-restart");
+        let existing = CloudFilesReconciledManifestEntry {
+            path: "/services/existing.txt".to_string(),
+            object_id: "01existingobject".to_string(),
+            version: "01existingversion".to_string(),
+            content_hash: Some("blake3:existing".to_string()),
+            content_size_bytes: Some(8),
+            kind: "file".to_string(),
+        };
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state before no-op browse");
+        let intents = state.materialization_audit_intents();
+        let initial_cursor = cursor(10);
+        let initial_scan = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(existing.path.clone(), existing.clone())]),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                initial_cursor.shard_key().expect("initial cursor key"),
+                initial_cursor,
+            )]),
+        };
+        let terminal_cursor = cursor(12);
+        let materialization_scan = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(existing.path.clone(), existing.clone())]),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                terminal_cursor.shard_key().expect("cursor key"),
+                terminal_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_materialization_audit_intents(
+                [initial_scan, materialization_scan],
+                Arc::clone(&intents),
+            ),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("seed exact child without directory ownership");
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        intents
+            .lock()
+            .expect("audit intents")
+            .record_directory("/services")
+            .expect("fsync no-op page audit intent");
+        worker
+            .run_once(&AtomicBool::new(false))
+            .expect("commit active no-op page ownership");
+        assert_eq!(worker.state().queue().operations().count(), 0);
+        assert_eq!(worker.state().reconciler().conflict_count(), 0);
+        assert_eq!(
+            worker.state().reconciler().manifest().get(&existing.path),
+            Some(&existing)
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .is_empty()
+        );
+        drop(worker);
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen committed no-op page");
+        assert!(
+            reopened
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        assert_eq!(
+            reopened.reconciler().manifest().get(&existing.path),
+            Some(&existing)
+        );
+        assert_eq!(reopened.reconciler().cursors().len(), 1);
+    }
+
+    #[test]
+    fn materialization_intent_replays_after_marker_commit_before_ack() {
+        let root = TestRoot::new("materialization-marker-before-ack");
+        {
+            let mut state =
+                CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                    .expect("open state");
+            state
+                .materialization_audit_intents()
+                .lock()
+                .expect("audit intents")
+                .record_directory("/services")
+                .expect("record durable intent");
+            let committed_cursor = cursor(20);
+            state
+                .reconciler
+                .install_full_scan_delta(
+                    BTreeMap::new(),
+                    Vec::new(),
+                    vec!["/services".to_string()],
+                    BTreeMap::from([(
+                        committed_cursor.shard_key().expect("cursor key"),
+                        committed_cursor,
+                    )]),
+                    true,
+                )
+                .expect("commit marker and cursor before simulated crash");
+            // Drop before acknowledgement: both the committed marker and the
+            // older intent must survive and replay safely.
+        }
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen after marker-before-ack crash");
+        let intents = reopened.materialization_audit_intents();
+        assert!(
+            reopened
+                .reconciler()
+                .materialized_directories()
+                .contains("/services")
+        );
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .contains("/services")
+        );
+        let replay_cursor = cursor(21);
+        let replay = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::new(),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                replay_cursor.shard_key().expect("cursor key"),
+                replay_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_materialization_audit_intents([replay], Arc::clone(&intents)),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("replay durable materialization intent");
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authoritative_absence_retires_materialization_intent_without_marker() {
+        let root = TestRoot::new("materialization-intent-not-found");
+        let directory = CloudFilesReconciledManifestEntry {
+            path: "/services/deleted".to_string(),
+            object_id: "01deleteddirectory".to_string(),
+            version: "01deletedv1".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        state
+            .reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(directory.path.clone(), directory.clone())]),
+                Vec::new(),
+                vec![directory.path.clone()],
+                BTreeMap::new(),
+                false,
+            )
+            .expect("seed materialized directory");
+        let intents = state.materialization_audit_intents();
+        intents
+            .lock()
+            .expect("audit intents")
+            .record_directory(&directory.path)
+            .expect("record audit intent before authoritative absence");
+        let terminal_cursor = cursor(22);
+        let absent = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::new(),
+            removed_paths: vec![directory.path.clone()],
+            // The adapter reports the intent as authoritatively resolved even
+            // though list returned NotFound. The remove wins atomically.
+            materialized_directories: vec![directory.path.clone()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                terminal_cursor.shard_key().expect("cursor key"),
+                terminal_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_materialization_audit_intents([absent], Arc::clone(&intents)),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("commit authoritative absence and retire intent");
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key(&directory.path)
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .materialized_directories()
+                .contains(&directory.path)
+        );
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .is_empty()
+        );
+        worker
+            .run_once(&AtomicBool::new(false))
+            .expect("no repeated full scan after absence retirement");
+    }
+
+    #[test]
+    fn startup_recovers_durable_namespace_rename_effect_before_full_scan_install() {
+        let root = TestRoot::new("inflight-namespace-before-full-scan");
+        let old_entry = CloudFilesReconciledManifestEntry {
+            path: "/services/old.txt".to_string(),
+            object_id: "01renameobject".to_string(),
+            version: "01renamev1".to_string(),
+            content_hash: Some("blake3:rename".to_string()),
+            content_size_bytes: Some(6),
+            kind: "file".to_string(),
+        };
+        {
+            let mut state =
+                CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                    .expect("open pre-crash state");
+            state
+                .reconciler
+                .install_full_scan_delta(
+                    BTreeMap::from([(old_entry.path.clone(), old_entry.clone())]),
+                    Vec::new(),
+                    vec!["/services".to_string()],
+                    BTreeMap::new(),
+                    false,
+                )
+                .expect("seed old identity");
+            let rename = CloudFilesNamespaceFeedEvent::Rename {
+                from_path: old_entry.path.clone(),
+                to_path: "/services/new.txt".to_string(),
+                object_id: old_entry.object_id.clone(),
+                version: "01renamev2".to_string(),
+                content_hash: old_entry.content_hash.clone(),
+                content_size_bytes: old_entry.content_size_bytes,
+                kind: old_entry.kind.clone(),
+                provenance: CloudFilesNamespaceProvenance {
+                    event_id: "rename-crash-event".to_string(),
+                    journal_sequence: 1,
+                    journal_ordinal: 0,
+                    operation_id: None,
+                },
+            };
+            let batch = CloudFilesNamespaceFeedBatch {
+                input_cursor: cursor(0),
+                next_cursor: cursor(1),
+                events: vec![rename],
+                journal_head_sequence: 1,
+                has_more: false,
+            };
+            let mut crashing = FakeEffects {
+                apply_results: VecDeque::from([Err(
+                    "simulated crash after idempotent local rename".to_string(),
+                )]),
+                ..FakeEffects::default()
+            };
+            let error = state
+                .reconciler
+                .reconcile_batch(batch, &mut crashing)
+                .expect_err("leave durable inflight rename");
+            assert_eq!(error.code, "namespace-effect");
+        }
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen with inflight rename");
+        let terminal_cursor = cursor(1);
+        let scan = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::new(),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                terminal_cursor.shard_key().expect("cursor key"),
+                terminal_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([scan]),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("recover rename before full scan install");
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .manifest()
+                .contains_key(&old_entry.path)
+        );
+        let renamed = worker
+            .state()
+            .reconciler()
+            .manifest()
+            .get("/services/new.txt")
+            .expect("recovered renamed identity");
+        assert_eq!(renamed.object_id, old_entry.object_id);
+        assert_eq!(renamed.version, "01renamev2");
+        assert_eq!(worker.state().reconciler().cursors().len(), 1);
+    }
+
+    #[test]
+    fn paged_full_scan_replays_partial_delta_after_restart_before_cursor_commit() {
+        let root = TestRoot::new("paged-scan-restart");
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/page-a.txt".to_string(),
+            object_id: "01pagea".to_string(),
+            version: "01pageav1".to_string(),
+            content_hash: Some("blake3:page-a".to_string()),
+            content_size_bytes: Some(7),
+            kind: "file".to_string(),
+        };
+        let partial = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(entry.path.clone(), entry.clone())]),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: false,
+            cursors: BTreeMap::new(),
+        };
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open first state");
+        let mut first = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([partial.clone()]),
+            FakeEffects::default(),
+        );
+        first
+            .startup(&AtomicBool::new(false))
+            .expect("install first bounded page");
+        assert!(first.state().reconciler().cursors().is_empty());
+        assert_eq!(first.state().reconciler().manifest().len(), 1);
+        drop(first);
+
+        let reopened = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("reopen between pages");
+        assert!(reopened.reconciler().cursors().is_empty());
+        assert_eq!(
+            reopened.reconciler().manifest().get(&entry.path),
+            Some(&entry)
+        );
+        let terminal_cursor = cursor(17);
+        let terminal = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(
+                "/services/page-b.txt".to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: "/services/page-b.txt".to_string(),
+                    object_id: "01pageb".to_string(),
+                    version: "01pagebv1".to_string(),
+                    content_hash: Some("blake3:page-b".to_string()),
+                    content_size_bytes: Some(7),
+                    kind: "file".to_string(),
+                },
+            )]),
+            removed_paths: Vec::new(),
+            materialized_directories: Vec::new(),
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                terminal_cursor.shard_key().expect("cursor key"),
+                terminal_cursor,
+            )]),
+        };
+        let mut second = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([partial, terminal]),
+            FakeEffects::default(),
+        );
+        second
+            .startup(&AtomicBool::new(false))
+            .expect("idempotently replay partial page");
+        assert!(second.state().reconciler().cursors().is_empty());
+        second
+            .run_once(&AtomicBool::new(false))
+            .expect("install terminal page");
+        assert_eq!(second.state().reconciler().manifest().len(), 2);
+        assert_eq!(
+            second
+                .state()
+                .reconciler()
+                .cursors()
+                .values()
+                .next()
+                .expect("terminal cursor")
+                .after_sequence,
+            17
+        );
+    }
+
+    #[test]
+    fn notification_overflow_discards_partial_batch_and_forces_full_scan() {
+        let root = TestRoot::new("overflow");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let capture = FakeCapture {
+            batches: VecDeque::from([Ok(CloudFilesCapturedChangeBatch {
+                changes: vec![create_capture("partial-overflow", b"must-not-stage")],
+                sparse_placeholders: Vec::new(),
+                overflowed: true,
+            })]),
+            ..FakeCapture::default()
+        };
+        let namespace = FakeNamespace::with_scans([snapshot(1), snapshot(2)]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let effects = FakeEffects::default();
+        let effect_calls = Arc::clone(&effects.full_scan_effects);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            effects,
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("startup");
+        let progress = worker.run_once(&cancelled).expect("overflow reconcile");
+
+        assert!(progress.full_scan_applied);
+        assert_eq!(progress.captures_enqueued, 0);
+        assert_eq!(worker.state().queue().operations().count(), 0);
+        assert_eq!(scan_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(effect_calls.lock().expect("effects").len(), 2);
+        assert_eq!(
+            worker
+                .state()
+                .reconciler()
+                .cursors()
+                .values()
+                .next()
+                .expect("overflow cursor")
+                .after_sequence,
+            2
+        );
+    }
+
+    #[test]
+    fn suppression_requires_authoritative_rename_kind_and_identity() {
+        let command = command(CloudFilesLocalOperationKind::Rename);
+        let evidence = CloudFilesRemoteMutationEvidence {
+            operation_id: command.operation_id.clone(),
+            object_id: Some("01renamedobject".to_string()),
+            version: Some("01renamedversion".to_string()),
+            content_hash: Some("blake3:renamed".to_string()),
+            content_size_bytes: Some(44),
+            kind: Some("directory".to_string()),
+            detail: "applied".to_string(),
+        };
+        assert!(matches!(
+            suppression_for_completed_mutation(&command, &evidence)
+                .expect("authoritative suppression")
+                .expected_action,
+            CloudFilesNamespaceAction::Rename {
+                ref from_path,
+                ref to_path,
+                ref kind,
+                content_size_bytes: Some(44),
+                ..
+            } if from_path == "/services/source.txt"
+                && to_path == "/services/new-name.txt"
+                && kind == "directory"
+        ));
+
+        let mut missing_kind = evidence;
+        missing_kind.kind = None;
+        assert_eq!(
+            suppression_for_completed_mutation(&command, &missing_kind)
+                .expect_err("rename kind is required")
+                .code,
+            "suppression-evidence-missing"
+        );
+    }
+
+    #[test]
+    fn queued_capture_starts_as_pending_and_status_reports_it() {
+        let root = TestRoot::new("status");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let operation = state
+            .enqueue_capture(create_capture("capture-status", b"pending"))
+            .expect("enqueue");
+        assert_eq!(operation.status, CloudFilesLocalOperationStatus::Queued);
+        let status = state.status();
+        assert_eq!(status.mode, CloudFilesLocalChangeSyncMode::Starting);
+        assert_eq!(status.pending_operations, 1);
+        assert_eq!(status.retrying_operations, 0);
+        assert_eq!(status.conflict_count, 0);
+    }
+}

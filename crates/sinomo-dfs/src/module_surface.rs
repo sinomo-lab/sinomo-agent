@@ -89,6 +89,10 @@ pub fn register_storage_paths(
             "durable DFS maintenance cursors, retry ledgers, and suppression records",
         ),
         (
+            "dfs/cloud-files-unregister-recovery",
+            "content-addressed Cloud Files provider artifacts and retirement intents needed for crash-safe sync-root cleanup",
+        ),
+        (
             "dfs/metadata",
             "dynamic DFS metadata shard directories with object records and journal entries",
         ),
