@@ -7,13 +7,11 @@
 //! `metadata_backend`.
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, NetworkError, ObjectRpcCall,
-    ObjectRpcResponse, ObjectRpcResult, cluster_directory_for,
-    cluster_nodes_share_healthy_component,
+    ClusterConnectivityGraph, ClusterConnectivityState, ClusterPaths, ObjectRpcResponse,
+    ObjectRpcResult, cluster_directory_for, cluster_nodes_share_healthy_component,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::{ClusterBootstrapState, ClusterEndpointRecord};
@@ -351,13 +349,15 @@ const DEFAULT_DFS_METADATA_REPLICATION_MAX_CONCURRENT_TARGET_NODES: usize = 8;
 fn read_cluster_dfs_metadata_publish_state(
     cluster_paths: &ClusterPaths,
 ) -> Result<ClusterBootstrapState, DfsError> {
-    // Metadata replica targets are cluster membership, not bootstrap state.
-    // A joining node can retain a deliberately small bootstrap file while a
-    // newer accepted KV snapshot already contains the full member set. Using
-    // the bootstrap-only view here turns valid replica targets into
-    // `MissingRoute` and parks the retained publisher until another mutation
-    // happens to wake it.
-    sinomo_core::cluster::read_cluster_state(cluster_paths).map_err(DfsError::from_network)
+    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
+        .map_err(DfsError::from_network)?;
+    if !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
+        return Err(DfsError::Metadata {
+            message: "non-voter DFS metadata publication requires an explicit retained authority projection"
+                .to_string(),
+        });
+    }
+    Ok(state)
 }
 
 pub fn publish_cluster_dfs_metadata_journal(
@@ -440,10 +440,6 @@ pub fn publish_cluster_dfs_metadata_journal_with_peer_transport(
     peer_transport: Arc<dyn DfsPeerTransport>,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
-        cluster_paths,
-        peer_transport.as_ref(),
-    )?;
     publish_cluster_dfs_metadata_journal(
         data_dir,
         cluster_paths,
@@ -490,23 +486,11 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async(
 pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
-    sync_peer_transport: Arc<dyn DfsPeerTransport>,
+    _sync_peer_transport: Arc<dyn DfsPeerTransport>,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let refresh_cluster_paths = cluster_paths.clone();
-    tokio::task::spawn_blocking(move || {
-        refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
-            &refresh_cluster_paths,
-            sync_peer_transport.as_ref(),
-        )
-    })
-    .await
-    .map_err(|source| DfsError::Metadata {
-        message: format!("DFS metadata publish KV refresh task failed: {source}"),
-    })??;
-
     publish_cluster_dfs_metadata_journal_async_with_execution_exclusions(
         data_dir,
         cluster_paths,
@@ -521,10 +505,11 @@ pub async fn publish_cluster_dfs_metadata_journal_with_peer_transports_async_and
 /// Capture one shard's durable publication plan without performing any peer
 /// I/O.
 ///
-/// Daemon callers can hold their exact-shard mutation admission around this
-/// bounded local phase, then release it before executing the potentially slow
-/// network plan. Cluster KV refresh, when required, must complete before
-/// entering this function because it can itself perform peer RPC.
+/// This compatibility path is voter-local and fails closed for non-voters;
+/// it never refreshes or materializes the complete cluster KV store. Daemon
+/// callers should use the explicit-authority resident-backend entry point,
+/// holding exact-shard admission only around bounded local plan capture and
+/// releasing it before the potentially slow peer execution phase.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions(
     data_dir: &SinomoDataDir,
@@ -576,6 +561,46 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
+    if !cluster_paths.state.exists() {
+        return Err(DfsError::Metadata {
+            message: "exact DFS metadata publish lacks cluster state".to_string(),
+        });
+    }
+
+    let state = read_cluster_dfs_metadata_publish_state(cluster_paths)?;
+    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let shard = cluster_dfs_metadata_shards(cluster_paths, &file_system_id)?
+        .into_iter()
+        .find(|shard| shard.shard_id == shard_id.0);
+    prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
+        data_dir,
+        &state.local_node_id,
+        peer_node_ids,
+        file_system_id,
+        shard_id,
+        shard,
+        backend,
+        execution_exclusions,
+        options,
+    )
+}
+
+/// Capture one shard publication plan from an explicit, coherent authority
+/// projection. Daemon callers use this after binding the resident backend to
+/// the same retained generation, so retries never fetch or materialize the
+/// complete cluster KV snapshot.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    peer_node_ids: Vec<NodeId>,
+    file_system_id: DfsFileSystemId,
+    shard_id: DfsMetadataShardId,
+    authoritative_shard: Option<DfsMetadataShardConfig>,
+    backend: &mut ResidentLocalMetadataShardLease,
+    execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    options: DfsMetadataJournalReplicationOptions,
+) -> Result<Option<DfsPreparedClusterMetadataJournalPublish>, DfsError> {
     let trace_started = Instant::now();
     let expected_shard_root = local_dfs_metadata_shard_path(data_dir, &shard_id);
     if backend.file_system_id() != &file_system_id
@@ -594,24 +619,24 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
             ),
         });
     }
-    if !cluster_paths.state.exists() {
+    if authoritative_shard
+        .as_ref()
+        .is_some_and(|shard| shard.file_system_id != file_system_id || shard.shard_id != shard_id.0)
+    {
         return Err(DfsError::Metadata {
-            message: "exact DFS metadata publish lacks cluster state".to_string(),
+            message: format!(
+                "authoritative DFS metadata shard does not match requested {}:{}",
+                file_system_id, shard_id.0,
+            ),
         });
     }
-
-    let state = read_cluster_dfs_metadata_publish_state(cluster_paths)?;
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
-    let shard = cluster_dfs_metadata_shards(cluster_paths, &file_system_id)?
-        .into_iter()
-        .find(|shard| shard.shard_id == shard_id.0);
     let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
         &default_dfs_metadata_replication_suppression_snapshot_path(data_dir),
     )?
     .map(|snapshot| snapshot.records)
     .unwrap_or_default();
 
-    let (outcomes, targets) = match shard {
+    let (outcomes, targets) = match authoritative_shard {
         None => (
             vec![DfsMetadataJournalReplicationOutcome::MissingShard {
                 file_system_id,
@@ -619,14 +644,14 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
             }],
             Vec::new(),
         ),
-        Some(shard) if shard.primary_node_id != state.local_node_id => {
+        Some(shard) if shard.primary_node_id != *local_node_id => {
             let primary_node_id = shard.primary_node_id;
             let epoch = shard.epoch;
             (
                 vec![DfsMetadataJournalReplicationOutcome::NotPrimary {
                     file_system_id,
                     shard_id,
-                    local_node_id: state.local_node_id.clone(),
+                    local_node_id: local_node_id.clone(),
                     primary_node_id,
                     epoch,
                 }],
@@ -637,7 +662,7 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
             backend.refresh_metadata_shard_durable_view(&shard_id)?;
             prepare_dfs_metadata_journal_publish_for_primary_shard(
                 &mut **backend,
-                &state.local_node_id,
+                local_node_id,
                 shard,
                 &metadata_suppressions,
                 execution_exclusions,
@@ -655,7 +680,7 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
     };
     let prepared = Some(DfsPreparedClusterMetadataJournalPublish {
         data_dir: data_dir.clone(),
-        local_node_id: state.local_node_id,
+        local_node_id: local_node_id.clone(),
         peer_node_ids,
         outcomes,
         targets,
@@ -691,95 +716,6 @@ pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_trans
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
     execute_prepared_dfs_metadata_journal_publish_async(plan, &mut transport, options).await
-}
-
-pub fn refresh_cluster_dfs_kv_snapshot_with_peer_transport(
-    cluster_paths: &ClusterPaths,
-    peer_transport: Arc<dyn DfsPeerTransport>,
-) -> Result<(), DfsError> {
-    if !cluster_paths.state.exists() {
-        return Ok(());
-    }
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
-        .map_err(DfsError::from_network)?;
-    if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-        return Ok(());
-    }
-    refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
-        cluster_paths,
-        &state,
-        peer_transport.as_ref(),
-    )
-}
-
-pub(crate) fn refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
-    cluster_paths: &ClusterPaths,
-    peer_transport: &dyn DfsPeerTransport,
-) -> Result<(), DfsError> {
-    if !cluster_paths.state.exists() {
-        return Ok(());
-    }
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
-        .map_err(DfsError::from_network)?;
-    if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-        return Ok(());
-    }
-    let file_system = distributed_sifs(state.local_node_id.clone());
-    let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    if !shards
-        .iter()
-        .any(|shard| shard.primary_node_id == state.local_node_id)
-    {
-        return Ok(());
-    }
-    refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
-        cluster_paths,
-        &state,
-        peer_transport,
-    )
-}
-
-fn refresh_cluster_dfs_kv_snapshot_with_peer_transport_for_state(
-    cluster_paths: &ClusterPaths,
-    state: &ClusterBootstrapState,
-    peer_transport: &dyn DfsPeerTransport,
-) -> Result<(), DfsError> {
-    let options = sinomo_core::cluster::ClusterControlPlaneTimeouts::default_daemon_transport()
-        .kv_snapshot_refresh_options();
-    sinomo_core::cluster::refresh_current_cluster_kv_store_with_local_storage_and_transport(
-        cluster_paths,
-        state,
-        options,
-        |target_node_id, timeout| {
-            let call = ObjectRpcCall::encode_value(
-                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE,
-                sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
-                sinomo_core::kv::ClusterKvAuthoritativeSnapshotRequest,
-            )?;
-            let response = peer_transport
-                .call_object_rpc(
-                    target_node_id,
-                    call,
-                    DfsObjectRpcSendOptions::default()
-                        .with_overall_timeout(timeout)
-                        .with_observe_connectivity(false),
-                )
-                .map_err(|source| NetworkError::Io {
-                    operation: "DFS cluster KV snapshot refresh".to_string(),
-                    detail: source.to_string(),
-                })?;
-            let response =
-                value_response_from_rpc_result(response).map_err(|source| NetworkError::Io {
-                    operation: "decode DFS cluster KV snapshot response".to_string(),
-                    detail: source.to_string(),
-                })?;
-            response.error_detail()?;
-            sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(&response.body)
-                .map_err(sinomo_core::network::NetworkError::directory)
-        },
-    )
-    .map_err(DfsError::from_network)?;
-    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2904,7 +2840,7 @@ mod metadata_publish_membership_tests {
         cluster_paths.ensure().expect("cluster paths");
         let local_node_id =
             NodeId::from_legacy_named("node_dfs_resident_publish_local").expect("local node");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             sinomo_core::node::ClusterId::from_legacy_named(
                 "cluster_dfs_resident_publish_identity",
             )
@@ -2915,6 +2851,9 @@ mod metadata_publish_membership_tests {
             "pk-local",
             OffsetDateTime::now_utc(),
         );
+        let capabilities = sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
         let snapshot =
             sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
@@ -2996,7 +2935,7 @@ mod metadata_publish_membership_tests {
     }
 
     #[test]
-    fn metadata_publish_peers_use_latest_observed_cluster_membership() {
+    fn generic_metadata_publish_does_not_import_materialized_membership() {
         let root = sinomo_testdir::TestDir::new("dfs-metadata-publish-latest-membership");
         let data_dir = SinomoDataDir::new(root.path());
         let cluster_paths = ClusterPaths::new(&data_dir);
@@ -3010,7 +2949,7 @@ mod metadata_publish_membership_tests {
             NodeId::from_legacy_named("node_dfs_metadata_publish_local").expect("local node");
         let joined_node_id =
             NodeId::from_legacy_named("node_dfs_metadata_publish_joined").expect("joined node");
-        let state = ClusterBootstrapState::initialized_locally(
+        let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "metadata publish latest membership",
             local_node_id.clone(),
@@ -3018,6 +2957,9 @@ mod metadata_publish_membership_tests {
             "pk-local",
             now,
         );
+        let capabilities = sinomo_core::node::main_daemon_capabilities(&state.members[0].role);
+        state.members[0].capabilities = capabilities.clone();
+        state.members[0].allowed_capabilities = capabilities;
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
             .expect("initial cluster KV snapshot");
@@ -3064,13 +3006,42 @@ mod metadata_publish_membership_tests {
             cluster_dfs_peer_node_ids(&publish_state)
                 .into_iter()
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([local_node_id, joined_node_id]),
-            "metadata publishing must authorize peers from the latest accepted membership"
+            BTreeSet::from([local_node_id]),
+            "generic publication must not reconstruct or import the materialized KV snapshot"
         );
+        assert_ne!(publish_state.local_node_id, joined_node_id);
     }
 
     #[test]
-    fn metadata_replica_ingress_uses_latest_observed_shard_authority() {
+    fn generic_metadata_publish_fails_closed_for_non_voter() {
+        let root = sinomo_testdir::TestDir::new("dfs-metadata-publish-non-voter");
+        let data_dir = SinomoDataDir::new(root.path());
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local_node_id =
+            NodeId::from_legacy_named("node_dfs_metadata_publish_non_voter").expect("local node");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(
+                "cluster_dfs_metadata_publish_non_voter",
+            )
+            .expect("cluster id"),
+            "metadata publish non-voter",
+            local_node_id,
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        state.members[0].role = sinomo_core::ClusterMemberRole::Learner;
+        state.members[0].state = sinomo_core::ClusterMemberState::Learner;
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let error = read_cluster_dfs_metadata_publish_state(&cluster_paths)
+            .expect_err("non-voter generic publication must fail closed");
+        assert!(error.to_string().contains("explicit retained authority"));
+    }
+
+    #[test]
+    fn generic_metadata_replica_ingress_rejects_retired_primary_from_stale_local_raft() {
         let root = sinomo_testdir::TestDir::new("dfs-metadata-ingress-latest-authority");
         let data_dir = SinomoDataDir::new(root.path());
         data_dir.ensure_root_layout().expect("data root layout");
@@ -3083,8 +3054,12 @@ mod metadata_publish_membership_tests {
         .expect("cluster id");
         let receiver_node_id =
             NodeId::from_legacy_named("node_dfs_metadata_ingress_receiver").expect("receiver");
-        let source_node_id =
-            NodeId::from_legacy_named("node_dfs_metadata_ingress_source").expect("source");
+        let retired_primary_node_id =
+            NodeId::from_legacy_named("node_dfs_metadata_ingress_retired_primary")
+                .expect("retired primary");
+        let current_primary_node_id =
+            NodeId::from_legacy_named("node_dfs_metadata_ingress_current_primary")
+                .expect("current primary");
         let state = ClusterBootstrapState::initialized_locally(
             cluster_id,
             "metadata ingress latest authority",
@@ -3094,23 +3069,41 @@ mod metadata_publish_membership_tests {
             now,
         );
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
-        let initial_snapshot =
-            sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-                .expect("initial cluster KV snapshot");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("initial cluster KV snapshot");
 
         let file_system_id = sifs_file_system_id();
         let shard_key = metadata_shard_key(&file_system_id, "root");
+        let retired_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: retired_primary_node_id.clone(),
+            replica_node_ids: vec![receiver_node_id.clone()],
+            epoch: 8,
+            assignment: crate::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let retired_snapshot = sinomo_core::cluster::append_cluster_raft_command(
+            &cluster_paths,
+            &receiver_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(&shard_key, &retired_shard, None)
+                    .expect("retired shard operation"),
+            ),
+        )
+        .expect("persist retired local Raft authority");
         let current_shard = DfsMetadataShardConfig {
             file_system_id: file_system_id.clone(),
             shard_id: "root".to_string(),
-            primary_node_id: source_node_id.clone(),
+            primary_node_id: current_primary_node_id,
             replica_node_ids: vec![receiver_node_id.clone()],
             epoch: 9,
             assignment: crate::DfsMetadataShardAssignment::Root,
             namespace_prepare_codec: Default::default(),
             default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
         };
-        let mut accepted = sinomo_core::kv::InProcessKvStore::restore(initial_snapshot)
+        let mut accepted = sinomo_core::kv::InProcessKvStore::restore(retired_snapshot)
             .expect("accepted KV store");
         accepted
             .put_serde(&shard_key, &current_shard, None)
@@ -3123,32 +3116,29 @@ mod metadata_publish_membership_tests {
         )
         .expect("import current KV snapshot");
 
-        assert!(
-            sinomo_core::cluster::read_cluster_kv_local_snapshot(&cluster_paths, &state)
-                .expect("local Raft snapshot")
-                .value
-                .get(&shard_key)
-                .is_none(),
-            "the regression requires the local Raft view to trail the imported authority"
+        let local_shard =
+            sinomo_core::cluster::read_cluster_kv_local_snapshot(&cluster_paths, &state);
+        let local_shard = local_shard
+            .expect("local Raft snapshot")
+            .value
+            .get(&shard_key)
+            .expect("retired local shard")
+            .decode::<DfsMetadataShardConfig>()
+            .expect("decode retired local shard");
+        assert_eq!(
+            local_shard, retired_shard,
+            "the regression requires a coherent but retired local Raft assignment"
         );
-
-        let context = cluster_dfs_metadata_replica_shard_context(
-            &cluster_paths,
-            &DfsMetadataShardId::new("root"),
-        )
-        .expect("replica shard context")
-        .expect("configured replica shard");
-        assert_eq!(context.shard, current_shard);
 
         let response = process_cluster_dfs_metadata_journal_batch(
             &data_dir,
             &cluster_paths,
-            &source_node_id,
+            &retired_primary_node_id,
             DfsMetadataJournalBatchCommand {
-                request_id: "latest-authority-empty-batch".to_string(),
-                source_node_id: Some(source_node_id.clone()),
+                request_id: "retired-primary-empty-batch".to_string(),
+                source_node_id: Some(retired_primary_node_id.clone()),
                 file_system_id: Some(file_system_id),
-                authority_epoch: Some(current_shard.epoch),
+                authority_epoch: Some(retired_shard.epoch),
                 verify_prefix_only: false,
                 prefix_probe: None,
                 authority_probe: None,
@@ -3163,8 +3153,16 @@ mod metadata_publish_membership_tests {
         .expect("replica ingress response");
         assert!(matches!(
             response.result,
-            DfsMetadataJournalBatchResult::Applied
+            DfsMetadataJournalBatchResult::Rejected { .. }
         ));
+        assert!(
+            !local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("root")).exists(),
+            "a retired-primary request must not create replica metadata state"
+        );
+        assert!(
+            !local_dfs_metadata_shard_path(&data_dir, &DfsMetadataShardId::new("root")).exists(),
+            "an unproven generic replica request must not create local metadata state"
+        );
     }
 }
 
@@ -5471,8 +5469,10 @@ fn bind_pending_primary_handoff_snapshot_for_cluster_target(
     command: &mut DfsMetadataSnapshotInstallCommand,
 ) -> Result<(), DfsError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let Some(context) =
-        cluster_dfs_metadata_replica_shard_context(&cluster_paths, &command.shard_id)?
+    let Some(context) = cluster_dfs_metadata_resident_shard_context_for_outbound_handoff(
+        &cluster_paths,
+        &command.shard_id,
+    )?
     else {
         return Ok(());
     };
@@ -6230,7 +6230,26 @@ pub(crate) fn verify_dfs_metadata_journal_prefix(
     Ok(verified_primary_handoff_id)
 }
 
+/// Compatibility authority lookup for host-agnostic callers.
+///
+/// `ClusterPaths` exposes only resident local state, which cannot prove that a
+/// shard assignment belongs to the current Raft term. Callers must obtain a
+/// retained control-plane context or a current-term exact-set proof and use the
+/// explicit-context ingress functions instead.
 pub fn cluster_dfs_metadata_replica_shard_context(
+    _cluster_paths: &ClusterPaths,
+    _shard_id: &DfsMetadataShardId,
+) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
+    Ok(None)
+}
+
+/// Read the resident local shard projection for an outbound handoff hint.
+///
+/// This projection is deliberately not an ingress authority proof: it can be
+/// coherent but stale after the local node loses quorum or a primary retires.
+/// Replica ingress must instead receive a retained control-plane context or a
+/// current-term exact-set proof through `ClusterAccess`.
+fn cluster_dfs_metadata_resident_shard_context_for_outbound_handoff(
     cluster_paths: &ClusterPaths,
     shard_id: &DfsMetadataShardId,
 ) -> Result<Option<DfsMetadataReplicaShardContext>, DfsError> {
@@ -6239,28 +6258,27 @@ pub fn cluster_dfs_metadata_replica_shard_context(
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(cluster_paths)
         .map_err(DfsError::from_network)?;
-    // Replica ingress must validate against the newest durable view accepted
-    // by this node. Non-voters can have a deliberately stale local Raft store
-    // while their imported snapshot cache has already observed a newer shard
-    // epoch; using only the local store here permanently rejects the current
-    // primary and prevents snapshot repair from closing that gap.
-    let shard = sinomo_core::cluster::read_cluster_kv_latest_observed_entry(
-        cluster_paths,
-        &metadata_shard_key(&sifs_file_system_id(), &shard_id.0),
+    let file_system_id = sifs_file_system_id();
+    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
+    let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
+    let keys = vec![shard_key, handoff_key];
+    let read = sinomo_core::kv::read_cluster_kv_resident_local_entries(
+        &cluster_paths.kv_paths(),
+        &state.local_node_id,
+        &keys,
     )
-    .map_err(DfsError::from_network)?
-    .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-    .transpose()?;
-    let pending_membership_handoff = match shard.as_ref() {
-        Some(shard) => sinomo_core::cluster::read_cluster_kv_latest_observed_entry(
-            cluster_paths,
-            &metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id),
-        )
-        .map_err(DfsError::from_network)?
+    .map_err(DfsError::from)?;
+    let mut values = read.value.into_iter();
+    let shard = values
+        .next()
+        .expect("resident exact-key set preserves requested cardinality")
+        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+        .transpose()?;
+    let pending_membership_handoff = values
+        .next()
+        .expect("resident exact-key set preserves requested cardinality")
         .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
-        .transpose()?,
-        None => None,
-    };
+        .transpose()?;
     Ok(shard.map(|shard| DfsMetadataReplicaShardContext {
         local_node_id: state.local_node_id,
         pending_membership_handoff: pending_membership_handoff.filter(|handoff| {
@@ -6275,17 +6293,42 @@ pub fn cluster_dfs_metadata_replica_shard_context(
 
 pub fn process_cluster_dfs_metadata_journal_batch(
     data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
+    _cluster_paths: &ClusterPaths,
     authenticated_source_node_id: &NodeId,
     command: DfsMetadataJournalBatchCommand,
 ) -> Result<DfsMetadataJournalBatchResponse, DfsError> {
-    let context =
-        cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.batch.shard_id)?;
+    // ClusterPaths alone cannot prove that its resident Raft projection is
+    // current. The host-agnostic entry point therefore fails closed; service
+    // ingress uses the `_with_context` path after establishing retained or
+    // current-term exact-set authority.
     process_cluster_dfs_metadata_journal_batch_with_context(
         data_dir,
         authenticated_source_node_id,
         command,
-        context,
+        None,
+    )
+}
+
+/// Test-support ingress for callers that have already established the exact
+/// replica shard authority context used by the daemon data plane.
+///
+/// Production ingress must obtain this context from its retained control-plane
+/// authority projection; this helper exists only so cross-crate tests exercise
+/// the same validation and durable apply path without falling back to the
+/// deliberately fail-closed host-agnostic entry point above.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test(
+    data_dir: &SinomoDataDir,
+    authenticated_source_node_id: &NodeId,
+    command: DfsMetadataJournalBatchCommand,
+    context: DfsMetadataReplicaShardContext,
+) -> Result<DfsMetadataJournalBatchResponse, DfsError> {
+    process_cluster_dfs_metadata_journal_batch_with_context(
+        data_dir,
+        authenticated_source_node_id,
+        command,
+        Some(context),
     )
 }
 
@@ -6592,16 +6635,17 @@ pub(crate) fn validate_dfs_metadata_snapshot_install_state(
 
 pub fn process_cluster_dfs_metadata_snapshot_install(
     data_dir: &SinomoDataDir,
-    cluster_paths: &ClusterPaths,
+    _cluster_paths: &ClusterPaths,
     authenticated_source_node_id: &NodeId,
     command: DfsMetadataSnapshotInstallCommand,
 ) -> Result<DfsMetadataSnapshotInstallResponse, DfsError> {
-    let context = cluster_dfs_metadata_replica_shard_context(cluster_paths, &command.shard_id)?;
+    // See the journal entry point above: resident local state is observational,
+    // not a current-term authority proof.
     process_cluster_dfs_metadata_snapshot_install_with_context(
         data_dir,
         authenticated_source_node_id,
         command,
-        context,
+        None,
     )
 }
 
@@ -8930,6 +8974,13 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
     if report.reached_limit {
         write_default_sifs_migration_cursor(metadata_root, &cursor)?;
     } else {
+        // The completed catalog sweep and quiescent journal fence above are
+        // the durable proof that no live record still depends on an obsolete
+        // route. Retire only this filesystem from the already-open router;
+        // this adds no second scan and preserves other filesystems' fallbacks.
+        // Persist retirement before clearing the cursor so a history-write
+        // failure retains bounded completion progress for the next retry.
+        shard_backends.retire_routing_fallbacks_for_file_system(&file_system.file_system_id)?;
         clear_default_sifs_migration_cursor(metadata_root, &file_system.file_system_id)?;
     }
 
@@ -10011,6 +10062,7 @@ mod cursor_update_tests {
         receiver_data_dir: SinomoDataDir,
         source_node_id: NodeId,
         target_node_id: NodeId,
+        authority_context: DfsMetadataReplicaShardContext,
         journal_rejection_reason: Option<String>,
         snapshot_install_calls: usize,
     }
@@ -10028,12 +10080,11 @@ mod cursor_update_tests {
         ) -> Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>
         {
             assert_eq!(target_node_id, &self.target_node_id);
-            let cluster_paths = ClusterPaths::new(&self.receiver_data_dir);
-            let response = process_cluster_dfs_metadata_journal_batch(
+            let response = process_cluster_dfs_metadata_journal_batch_with_context(
                 &self.receiver_data_dir,
-                &cluster_paths,
                 &self.source_node_id,
                 command.clone(),
+                Some(self.authority_context.clone()),
             )
             .map_err(
                 |error| DfsMetadataJournalReplicationTransportError::Failed {
@@ -10055,12 +10106,11 @@ mod cursor_update_tests {
         {
             assert_eq!(target_node_id, &self.target_node_id);
             self.snapshot_install_calls = self.snapshot_install_calls.saturating_add(1);
-            let cluster_paths = ClusterPaths::new(&self.receiver_data_dir);
-            process_cluster_dfs_metadata_snapshot_install(
+            process_cluster_dfs_metadata_snapshot_install_with_context(
                 &self.receiver_data_dir,
-                &cluster_paths,
                 &self.source_node_id,
                 command.clone(),
+                Some(self.authority_context.clone()),
             )
             .map_err(
                 |error| DfsMetadataJournalReplicationTransportError::Failed {
@@ -10078,6 +10128,7 @@ mod cursor_update_tests {
         receiver_node_id: NodeId,
         shard_id: DfsMetadataShardId,
         file_system: DfsFileSystem,
+        shard: DfsMetadataShardConfig,
         shard_epoch: u64,
         durable_head_sequence: u64,
     }
@@ -10160,6 +10211,7 @@ mod cursor_update_tests {
             receiver_node_id,
             shard_id,
             file_system,
+            shard,
             shard_epoch,
             durable_head_sequence,
         }
@@ -10218,6 +10270,11 @@ mod cursor_update_tests {
             receiver_data_dir: fixture.receiver_data_dir.clone(),
             source_node_id: fixture.source_node_id.clone(),
             target_node_id: fixture.receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: fixture.receiver_node_id.clone(),
+                shard: fixture.shard.clone(),
+                pending_membership_handoff: None,
+            },
             journal_rejection_reason: None,
             snapshot_install_calls: 0,
         };
@@ -10284,6 +10341,11 @@ mod cursor_update_tests {
             receiver_data_dir: fixture.receiver_data_dir.clone(),
             source_node_id: fixture.source_node_id.clone(),
             target_node_id: fixture.receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: fixture.receiver_node_id.clone(),
+                shard: fixture.shard.clone(),
+                pending_membership_handoff: None,
+            },
             journal_rejection_reason: None,
             snapshot_install_calls: 0,
         };
@@ -10718,6 +10780,237 @@ mod cursor_update_tests {
             report.migration.scanned_objects, 1,
             "catalog inspection must share the per-generation work bound"
         );
+    }
+
+    #[test]
+    fn completed_default_migration_retires_only_its_filesystem_routing_fallbacks() {
+        #[derive(Deserialize)]
+        struct RoutingTopologyHistoryProbe {
+            #[serde(default)]
+            fallbacks: Vec<Vec<DfsMetadataShardConfig>>,
+        }
+
+        let root = sinomo_testdir::TestDir::new("dfs-default-migration-retires-fallbacks");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let metadata_root = crate::default_dfs_metadata_shards_root(&data_dir);
+        let local = NodeId::from_legacy_named("node_dfs_retire_routing_fallbacks").expect("node");
+        let file_system = distributed_sifs(local.clone());
+        let mut shards = local_default_migration_shards(&file_system.file_system_id, &local);
+        let active_primary_shard_ids = shards
+            .iter()
+            .map(|shard| DfsMetadataShardId::new(&shard.shard_id))
+            .collect::<BTreeSet<_>>();
+
+        let other_file_system_id =
+            DfsFileSystemId::from_legacy_named("fs_other_routing_history").expect("filesystem");
+        shards.extend([
+            DfsMetadataShardConfig {
+                file_system_id: other_file_system_id.clone(),
+                shard_id: "other-root".to_string(),
+                primary_node_id: local.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: crate::DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
+                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            },
+            DfsMetadataShardConfig {
+                file_system_id: other_file_system_id.clone(),
+                shard_id: "other-prefix".to_string(),
+                primary_node_id: local.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: crate::DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/other".to_string(),
+                },
+                namespace_prepare_codec: Default::default(),
+                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            },
+        ]);
+
+        let fallback_file_system_ids = || {
+            crate::metadata_io::read_sobj::<RoutingTopologyHistoryProbe>(
+                &crate::metadata_sharded_backend::routing_topology_history_path(&metadata_root),
+            )
+            .expect("routing topology history")
+            .fallbacks
+            .into_iter()
+            .flatten()
+            .map(|shard| shard.file_system_id)
+            .collect::<BTreeSet<_>>()
+        };
+
+        let mut backend = LocalShardedMetadataBackend::new(&metadata_root, shards.clone())
+            .expect("production migration router");
+        let root_shard_id = DfsMetadataShardId::new("root");
+        let services_shard_id = DfsMetadataShardId::new("services");
+        let mut legacy_object = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("bootstrap object");
+        legacy_object.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_retire_routing_fallback")
+                .expect("object id");
+        legacy_object.path = "/services/retire-routing-fallback.txt".to_string();
+        let root_backend = backend
+            .shard_backend_mut(&root_shard_id)
+            .expect("root shard");
+        root_backend
+            .put_file_system(&file_system)
+            .expect("filesystem");
+        root_backend
+            .put_object(&legacy_object)
+            .expect("legacy-routed object");
+
+        let initial_fallbacks = fallback_file_system_ids();
+        assert!(initial_fallbacks.contains(&file_system.file_system_id));
+        assert!(initial_fallbacks.contains(&other_file_system_id));
+
+        let incomplete = migrate_default_sifs_metadata_on_active_primary_shards(
+            &metadata_root,
+            &mut backend,
+            &file_system,
+            &shards,
+            &active_primary_shard_ids,
+            &local,
+            1,
+        )
+        .expect("bounded incomplete migration");
+        assert!(incomplete.migration.reached_limit);
+        assert_eq!(
+            fallback_file_system_ids(),
+            initial_fallbacks,
+            "an incomplete pass must retain every historical route"
+        );
+
+        let mut invalid_shards = shards.clone();
+        invalid_shards.push(DfsMetadataShardConfig {
+            file_system_id: file_system.file_system_id.clone(),
+            shard_id: "missing-local-primary".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: crate::DfsMetadataShardAssignment::PathPrefix {
+                prefix: "/missing".to_string(),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        });
+        let mut invalid_active_primary_shard_ids = active_primary_shard_ids.clone();
+        invalid_active_primary_shard_ids.insert(DfsMetadataShardId::new("missing-local-primary"));
+        migrate_default_sifs_metadata_on_active_primary_shards(
+            &metadata_root,
+            &mut backend,
+            &file_system,
+            &invalid_shards,
+            &invalid_active_primary_shard_ids,
+            &local,
+            256,
+        )
+        .expect_err("an unbound active primary must fail migration");
+        assert_eq!(
+            fallback_file_system_ids(),
+            initial_fallbacks,
+            "a failed pass must retain every historical route"
+        );
+
+        let cursor_path =
+            default_sifs_migration_cursor_path(&metadata_root, &file_system.file_system_id);
+        assert!(
+            cursor_path.exists(),
+            "the incomplete pass must leave durable progress"
+        );
+        let routing_history_path =
+            crate::metadata_sharded_backend::routing_topology_history_path(&metadata_root);
+        let routing_history_bytes =
+            std::fs::read(&routing_history_path).expect("read routing history fixture");
+        std::fs::write(&routing_history_path, b"invalid routing history")
+            .expect("corrupt routing history fixture");
+        let mut retirement_error = None;
+        for _ in 0..16 {
+            match migrate_default_sifs_metadata_on_active_primary_shards(
+                &metadata_root,
+                &mut backend,
+                &file_system,
+                &shards,
+                &active_primary_shard_ids,
+                &local,
+                256,
+            ) {
+                Ok(report) => assert!(
+                    report.migration.reached_limit,
+                    "a complete pass must attempt durable fallback retirement"
+                ),
+                Err(error) => {
+                    retirement_error = Some(error);
+                    break;
+                }
+            }
+        }
+        let retirement_error = retirement_error.expect("routing history retirement must fail");
+        assert!(
+            retirement_error
+                .to_string()
+                .contains("routing-topologies.sobj")
+        );
+        assert!(
+            cursor_path.exists(),
+            "failed durable fallback retirement must retain the completed migration cursor"
+        );
+        std::fs::write(&routing_history_path, routing_history_bytes)
+            .expect("restore routing history fixture");
+        assert_eq!(
+            fallback_file_system_ids(),
+            initial_fallbacks,
+            "failed durable retirement must retain every historical route"
+        );
+
+        let mut settled = false;
+        for _ in 0..16 {
+            let report = materialize_default_sifs_metadata_on_bound_primary_shards(
+                metadata_root.clone(),
+                &mut backend,
+                &file_system,
+                &shards,
+                &active_primary_shard_ids,
+                &local,
+                [local.clone()],
+                local.clone(),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .expect("production default materialization");
+            if !report.migration.reached_limit {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "bounded production migration must converge");
+
+        let retired_fallbacks = fallback_file_system_ids();
+        assert!(
+            !retired_fallbacks.contains(&file_system.file_system_id),
+            "the completed filesystem must leave no obsolete fallback route"
+        );
+        assert!(
+            retired_fallbacks.contains(&other_file_system_id),
+            "retiring SIFS must preserve another filesystem's fallback route"
+        );
+        let source_marker = backend
+            .shard_backend(&root_shard_id)
+            .expect("source shard")
+            .get_object(&legacy_object.object_id)
+            .expect("source lookup")
+            .expect("durable source marker");
+        let durable_target = backend
+            .shard_backend(&services_shard_id)
+            .expect("target shard")
+            .get_object(&legacy_object.object_id)
+            .expect("target lookup")
+            .expect("durable migrated target");
+        assert_eq!(source_marker.kind, DfsObjectKind::Tombstone);
+        assert_ne!(durable_target.kind, DfsObjectKind::Tombstone);
+        assert_eq!(durable_target.path, legacy_object.path);
     }
 
     fn local_default_migration_shards(
@@ -12307,6 +12600,11 @@ mod cursor_update_tests {
             receiver_data_dir: receiver_data_dir.clone(),
             source_node_id: source_node_id.clone(),
             target_node_id: receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: receiver_node_id.clone(),
+                shard: shard.clone(),
+                pending_membership_handoff: None,
+            },
             journal_rejection_reason: None,
             snapshot_install_calls: 0,
         };
@@ -12359,6 +12657,11 @@ mod cursor_update_tests {
             receiver_data_dir: receiver_data_dir.clone(),
             source_node_id: source_node_id.clone(),
             target_node_id: receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: receiver_node_id.clone(),
+                shard: shard.clone(),
+                pending_membership_handoff: None,
+            },
             journal_rejection_reason: None,
             snapshot_install_calls: 0,
         };
@@ -12494,6 +12797,11 @@ mod cursor_update_tests {
             receiver_data_dir: receiver_data_dir.clone(),
             source_node_id: source_node_id.clone(),
             target_node_id: receiver_node_id.clone(),
+            authority_context: DfsMetadataReplicaShardContext {
+                local_node_id: receiver_node_id.clone(),
+                shard: shard.clone(),
+                pending_membership_handoff: None,
+            },
             journal_rejection_reason: None,
             snapshot_install_calls: 0,
         };
@@ -12576,11 +12884,16 @@ mod cursor_update_tests {
                 next_after_sequence: 0,
             },
         );
-        let error = process_cluster_dfs_metadata_journal_batch(
+        let authority_context = DfsMetadataReplicaShardContext {
+            local_node_id: receiver_node_id,
+            shard: shard.clone(),
+            pending_membership_handoff: None,
+        };
+        let error = process_cluster_dfs_metadata_journal_batch_with_context(
             &data_dir,
-            &ClusterPaths::new(&data_dir),
             &source_node_id,
             command,
+            Some(authority_context.clone()),
         )
         .expect_err("non-corruption open error must propagate");
         assert!(matches!(error, DfsError::Metadata { .. }));
@@ -12600,9 +12913,8 @@ mod cursor_update_tests {
             .expect("snapshot filesystem");
         let snapshot_sequence = snapshot_source.journal_last_sequence();
         let snapshot = snapshot_source.export_table_snapshot();
-        let snapshot_error = process_cluster_dfs_metadata_snapshot_install(
+        let snapshot_error = process_cluster_dfs_metadata_snapshot_install_with_context(
             &data_dir,
-            &ClusterPaths::new(&data_dir),
             &source_node_id,
             DfsMetadataSnapshotInstallCommand {
                 request_id: "replica-io-snapshot".to_string(),
@@ -12615,6 +12927,7 @@ mod cursor_update_tests {
                 snapshot,
                 reason: "IO errors must not archive replica state".to_string(),
             },
+            Some(authority_context),
         )
         .expect_err("snapshot install must propagate non-corruption open error");
         assert!(matches!(snapshot_error, DfsError::Metadata { .. }));

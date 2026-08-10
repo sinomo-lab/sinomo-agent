@@ -35,19 +35,16 @@ use crate::{
     DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
     LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
     NetworkedDfsWriteOutcome, async_dfs_metadata_journal_batch_sender_from_peer_transport,
-    async_dfs_metadata_snapshot_install_sender_from_peer_transport,
-    cluster_dfs_all_file_system_configs, cluster_dfs_all_metadata_shard_head_watermarks,
-    cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
-    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, default_dfs_content_root_catalog_store,
-    dfs_message_sender_from_peer_transport, dfs_metadata_journal_batch_sender_from_peer_transport,
-    dfs_metadata_replication_notice_lines, dfs_metadata_replication_sent_count,
-    dfs_metadata_snapshot_install_sender_from_peer_transport, dfs_now_unix_nanos,
-    dfs_path_safe_segment, distributed_sifs, open_cluster_dfs_service_with_message_sender,
+    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_peer_node_ids,
+    default_dfs_content_root_catalog_store, dfs_message_sender_from_peer_transport,
+    dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
+    dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
+    dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
+    open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
     publish_dfs_metadata_journal_with_host,
-    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
 
 /// Returns true when an authority-side message commit created durable DFS work
@@ -102,7 +99,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
     message_sender: DfsMessageSender,
     metadata_sender: DfsMetadataJournalBatchSender,
     snapshot_sender: DfsMetadataSnapshotInstallSender,
-    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    mut control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<Option<DfsMaintenanceTickReport>, DfsError> {
     data_dir
@@ -118,7 +115,19 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
+    let authoritative_topology = control_plane
+        .as_mut()
+        .map(|control_plane| {
+            crate::local_state::DfsClusterTopologyProjection::read_authoritative(
+                control_plane.as_mut(),
+            )
+        })
+        .transpose()?;
+    let metadata_shards = authoritative_topology
+        .as_ref()
+        .map(|topology| topology.metadata_shards(&file_system.file_system_id))
+        .transpose()?
+        .unwrap_or_default();
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
@@ -146,10 +155,18 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         metadata_options,
     )?;
     if dfs_content_gc_requested(content_lifecycle) {
-        let expected_file_systems = cluster_dfs_all_file_system_configs(cluster_paths)?;
-        let expected_shards = cluster_dfs_all_metadata_shards(cluster_paths)?;
-        let pending_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(cluster_paths)?;
-        let head_watermarks = cluster_dfs_all_metadata_shard_head_watermarks(cluster_paths)?;
+        let topology = authoritative_topology
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message:
+                    "destructive DFS content collection requires authoritative cluster topology"
+                        .to_string(),
+            })?;
+        topology.require_destructive_authority()?;
+        let expected_file_systems = topology.all_file_system_configs()?;
+        let expected_shards = topology.all_metadata_shards()?;
+        let pending_handoffs = topology.all_metadata_shard_membership_handoffs()?;
+        let head_watermarks = topology.all_metadata_shard_head_watermarks()?;
         if let Some(content_gc) = run_dfs_content_gc_with_catalog(
             &mut service,
             &data_dir.dfs_dir().join("content"),
@@ -321,26 +338,6 @@ pub async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_deta
     .await
 }
 
-/// Refresh cluster KV for maintenance and return the exact resulting bootstrap
-/// state.
-///
-/// A reusable backend must be selected only after this refresh so topology
-/// changes observed while maintenance waited for admission cannot run against
-/// a stale service generation.
-pub async fn refresh_cluster_dfs_maintenance_state_with_peer_transport(
-    runtime: &tokio::runtime::Handle,
-    cluster_paths: &ClusterPaths,
-    peer_transport: &dyn DfsPeerTransport,
-) -> Result<sinomo_core::ClusterBootstrapState, DfsError> {
-    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
-        cluster_paths,
-        peer_transport,
-    )?;
-    sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, cluster_paths)
-        .await
-        .map_err(DfsError::from_network)
-}
-
 /// Run one cluster maintenance tick against a reusable service after the
 /// caller refreshed cluster KV and captured the returned bootstrap state.
 ///
@@ -353,6 +350,7 @@ pub async fn run_cluster_dfs_maintenance_tick_with_reusable_service_until_hydrat
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     state: sinomo_core::ClusterBootstrapState,
+    authoritative_prefix: crate::DfsAuthoritativePrefixProjection,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
     committed_work_tracker: DfsCommittedWorkTracker,
@@ -371,10 +369,13 @@ where
         return Ok(None);
     }
 
-    service.refresh_control_plane_latest()?;
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let authoritative_topology =
+        crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix(
+            authoritative_prefix.clone(),
+        )?;
+    let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
 
     service.set_committed_work_tracker(committed_work_tracker);
@@ -401,6 +402,7 @@ where
         &mut metadata_publisher_host,
         &mut metadata_transport,
         &execution_exclusions,
+        Some(authoritative_prefix),
         options,
     )
     .await
@@ -420,6 +422,7 @@ pub async fn run_cluster_dfs_reactive_maintenance_tick_with_reusable_service<T>(
     data_dir: SinomoDataDir,
     cluster_paths: ClusterPaths,
     state: sinomo_core::ClusterBootstrapState,
+    authoritative_prefix: crate::DfsAuthoritativePrefixProjection,
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     execution_exclusions: DfsMaintenanceExecutionExclusions,
     committed_work_tracker: DfsCommittedWorkTracker,
@@ -439,11 +442,14 @@ where
         });
     }
 
-    service.refresh_control_plane_latest()?;
     service.set_committed_work_tracker(committed_work_tracker);
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let authoritative_topology =
+        crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix(
+            authoritative_prefix.clone(),
+        )?;
+    let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
@@ -463,6 +469,7 @@ where
         &mut metadata_publisher_host,
         &mut metadata_transport,
         &execution_exclusions,
+        Some(authoritative_prefix),
         options,
     )
     .await
@@ -491,17 +498,22 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
         return Ok(None);
     }
 
-    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport(
-        &cluster_paths,
-        sync_peer_transport.as_ref(),
-    )?;
-
     let state = sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths)
         .await
         .map_err(DfsError::from_network)?;
     let local_node_id = state.local_node_id.clone();
     let file_system = distributed_sifs(local_node_id.clone());
-    let metadata_shards = cluster_dfs_metadata_shards(&cluster_paths, &file_system.file_system_id)?;
+    let (control_plane, authoritative_topology) =
+        read_authoritative_topology_on_blocking_lane(control_plane).await?;
+    let metadata_shards = match authoritative_topology.as_ref() {
+        Some(prefix) => {
+            crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix(
+                prefix.clone(),
+            )?
+            .metadata_shards(&file_system.file_system_id)?
+        }
+        None => Vec::new(),
+    };
     let peer_node_ids = cluster_dfs_peer_node_ids(&state);
     let mut service = match (detached_send_state, should_cancel_hydration) {
         (Some(detached_send_state), Some(should_cancel_hydration)) => {
@@ -565,10 +577,34 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
         &mut metadata_publisher_host,
         &mut metadata_transport,
         &execution_exclusions,
+        authoritative_topology,
         options,
     )
     .await
     .map(Some)
+}
+
+async fn read_authoritative_topology_on_blocking_lane(
+    control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+) -> Result<
+    (
+        Option<Box<dyn DfsControlPlaneKvClient>>,
+        Option<crate::DfsAuthoritativePrefixProjection>,
+    ),
+    DfsError,
+> {
+    let Some(mut control_plane) = control_plane else {
+        return Ok((None, None));
+    };
+    let (control_plane, projection) = tokio::task::spawn_blocking(move || {
+        let projection = control_plane.range_prefix_authoritative("/dfs/filesystems/");
+        (control_plane, projection)
+    })
+    .await
+    .map_err(|source| DfsError::Metadata {
+        message: format!("authoritative DFS topology task failed: {source}"),
+    })?;
+    Ok((Some(control_plane), Some(projection?)))
 }
 
 pub fn run_cluster_dfs_maintenance_tick_with_peer_transport(
@@ -2534,6 +2570,7 @@ where
         metadata_publisher_host,
         metadata_transport,
         &DfsMaintenanceExecutionExclusions::default(),
+        None,
         options,
     )
     .await
@@ -2550,17 +2587,26 @@ pub async fn run_dfs_maintenance_tick_with_async_host_and_execution_exclusions<T
     metadata_publisher_host: &mut impl DfsMetadataJournalPublisherHost,
     metadata_transport: &mut dyn AsyncDfsMetadataJournalReplicationTransport,
     execution_exclusions: &DfsMaintenanceExecutionExclusions,
+    authoritative_prefix: Option<crate::DfsAuthoritativePrefixProjection>,
     options: DfsMaintenanceTickOptions,
 ) -> Result<DfsMaintenanceTickReport, DfsError>
 where
     T: AsyncDfsMessageTransport + DfsTransportIdentity + DfsMessageTransport,
 {
+    let authoritative_topology = authoritative_prefix
+        .map(crate::local_state::DfsClusterTopologyProjection::from_authoritative_prefix)
+        .transpose()?;
     // Keep the async tick's safety ordering identical to the synchronous tick:
     // handoff activation/rebind must precede every freeze-sensitive mutation.
     service.reconcile_pending_metadata_shard_membership_handoffs(
         &metadata_shards,
         options.metadata_replication.target_timeout,
     )?;
+    // The daemon races this globally fenced routine against foreground DFS
+    // admission. End each completed synchronous phase with a cooperative yield
+    // so that race can observe a waiting request instead of making it wait
+    // through the complete maintenance scan.
+    tokio::task::yield_now().await;
     // Keep the asynchronous production path identical to the synchronous
     // path: an absent committed topology is retryable startup state, not a
     // reason to fail durable namespace work.
@@ -2572,6 +2618,7 @@ where
     let _namespace_requests = service.recover_pending_namespace_requests_bounded(
         crate::service_routed_namespace::DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT,
     )?;
+    tokio::task::yield_now().await;
     let namespace_jobs = service
         .posix_resume_namespace_jobs_bounded(
             namespace_job_max_jobs,
@@ -2580,27 +2627,39 @@ where
         .map_err(|error| DfsError::Metadata {
             message: error.to_string(),
         })?;
+    tokio::task::yield_now().await;
     let conflicts = service.reconcile_stale_conflicts_bounded(options.conflict_max_records)?;
+    tokio::task::yield_now().await;
     let write_intents = service.reconcile_stale_write_intents_bounded(
         options.write_intent_max_records,
         options.stale_write_intent_min_age,
     )?;
+    tokio::task::yield_now().await;
     let placement_reconciliation = service
         .run_placement_reconciliation_bounded(options.placement_reconciliation_max_objects)?;
+    tokio::task::yield_now().await;
     let mut lifecycle_reports = run_dfs_lifecycle_maintenance_with_host(
         service,
         maintenance_host,
         dfs_metadata_lifecycle_options(options.lifecycle),
     )?;
+    tokio::task::yield_now().await;
     if dfs_content_gc_requested(options.lifecycle) {
         // Metadata history removal is authoritative and journaled above. Build
         // the node-wide content-root catalog only after that durable cut, and
         // cover every filesystem whose manifests share this content store.
-        let cluster_paths = ClusterPaths::new(data_dir);
-        let expected_file_systems = cluster_dfs_all_file_system_configs(&cluster_paths)?;
-        let expected_shards = cluster_dfs_all_metadata_shards(&cluster_paths)?;
-        let pending_handoffs = cluster_dfs_all_metadata_shard_membership_handoffs(&cluster_paths)?;
-        let head_watermarks = cluster_dfs_all_metadata_shard_head_watermarks(&cluster_paths)?;
+        let topology = authoritative_topology
+            .as_ref()
+            .ok_or_else(|| DfsError::Metadata {
+                message:
+                    "destructive DFS content collection requires authoritative cluster topology"
+                        .to_string(),
+            })?;
+        topology.require_destructive_authority()?;
+        let expected_file_systems = topology.all_file_system_configs()?;
+        let expected_shards = topology.all_metadata_shards()?;
+        let pending_handoffs = topology.all_metadata_shard_membership_handoffs()?;
+        let head_watermarks = topology.all_metadata_shard_head_watermarks()?;
         if let Some(content_gc) = run_dfs_content_gc_with_catalog(
             service,
             &data_dir.dfs_dir().join("content"),
@@ -2612,8 +2671,10 @@ where
         )? {
             lifecycle_reports.push(content_gc);
         }
+        tokio::task::yield_now().await;
     }
     let durable_repair_queue_before = maintenance_host.load_repair_attempt_records()?;
+    tokio::task::yield_now().await;
     let repair_execution_exclusions =
         execution_exclusions.allowing_unattempted_repairs(&durable_repair_queue_before);
     let (parked_repair_attempts, eligible_repair_attempts): (Vec<_>, Vec<_>) =
@@ -2670,6 +2731,7 @@ where
         .filter(|record| record.attempts > 0)
         .collect();
     maintenance_host.store_repair_attempt_records(&durable_repair_queue_after)?;
+    tokio::task::yield_now().await;
     let metadata_replication = if options.publish_metadata {
         crate::publish_dfs_metadata_journal_with_async_host_and_execution_exclusions(
             file_system_id,

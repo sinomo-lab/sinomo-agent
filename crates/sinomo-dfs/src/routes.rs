@@ -309,6 +309,21 @@ fn authority_shard_execution_scope(
     }
 }
 
+fn namespace_authority_shard_execution_scope(
+    command: &DfsNamespaceCommand,
+) -> Option<DfsMessageExecutionScope> {
+    let [stamped] = command.authority_shards.as_slice() else {
+        return None;
+    };
+    if stamped.file_system_id != command.file_system_id || stamped.shard_id.trim().is_empty() {
+        return None;
+    }
+    Some(DfsMessageExecutionScope::ExactShard {
+        file_system_id: command.file_system_id.clone(),
+        shard_id: DfsMetadataShardId::new(stamped.shard_id.clone()),
+    })
+}
+
 /// Classify a direct or routed metadata journal command using its explicit
 /// filesystem and batch-shard identity. Rolling-upgrade commands that omit the
 /// filesystem remain on the conservative global path.
@@ -338,19 +353,12 @@ fn dfs_network_message_execution_scope(message: &DfsNetworkMessage) -> DfsMessag
                     | DfsNamespaceOperation::LookupPaths { .. }
             ) =>
         {
-            DfsMessageExecutionScope::ReadOnly
+            namespace_authority_shard_execution_scope(command)
+                .unwrap_or(DfsMessageExecutionScope::ReadOnly)
         }
         DfsNetworkMessage::NamespaceRequest(command) => {
-            if command.authority_shards.len() == 1 {
-                let stamped = &command.authority_shards[0];
-                if stamped.file_system_id == command.file_system_id
-                    && !stamped.shard_id.trim().is_empty()
-                {
-                    return DfsMessageExecutionScope::ExactShard {
-                        file_system_id: command.file_system_id.clone(),
-                        shard_id: DfsMetadataShardId::new(stamped.shard_id.clone()),
-                    };
-                }
+            if let Some(scope) = namespace_authority_shard_execution_scope(command) {
+                return scope;
             }
             let paths = command
                 .operation
@@ -867,6 +875,33 @@ mod tests {
                 file_system_id: file_system_id.clone(),
                 shard_id: DfsMetadataShardId::new("services"),
             }
+        );
+        let lookup_command = |authority_shards| {
+            message_command(DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                request_id: "scope-stamped-lookup".to_string(),
+                file_system_id: file_system_id.clone(),
+                requesting_node_id: node_id("scope-source"),
+                include_metadata_journal_batches: false,
+                metadata_journal_after_sequences: Vec::new(),
+                authority_shards,
+                operation: DfsNamespaceOperation::LookupPath {
+                    path: "/services/existing".to_string(),
+                },
+            }))
+        };
+        let stamped_lookup = lookup_command(vec![shard.clone()]);
+        assert_eq!(
+            dfs_message_execution_scope(&stamped_lookup),
+            DfsMessageExecutionScope::ExactShard {
+                file_system_id: file_system_id.clone(),
+                shard_id: DfsMetadataShardId::new("services"),
+            }
+        );
+        assert!(dfs_message_is_read_only_request(&stamped_lookup));
+        assert_eq!(
+            dfs_message_execution_scope(&lookup_command(Vec::new())),
+            DfsMessageExecutionScope::ReadOnly,
+            "an unstamped lookup must retain the conservative read classification"
         );
         assert!(matches!(
             dfs_message_execution_scope(&namespace_command(vec![

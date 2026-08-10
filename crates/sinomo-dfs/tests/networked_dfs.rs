@@ -2578,7 +2578,10 @@ fn networked_dfs_applies_metadata_journal_batches_from_peer() {
             .expect("replica object"),
         Some(metadata.clone())
     );
-    assert_eq!(replica_dfs.metadata().object(&object_id), Some(&metadata));
+    assert!(
+        replica_dfs.metadata().object(&object_id).is_none(),
+        "replica journal ingest must not duplicate durable backend objects in the service shell"
+    );
 
     owner_dfs
         .send_metadata_journal_since(&replica, 0)
@@ -2972,8 +2975,19 @@ fn networked_dfs_applies_metadata_journal_incrementally_without_full_hydrate() {
     }));
 
     assert_eq!(
-        replica_dfs.metadata().object(&replicated_object_id),
-        Some(&replicated_metadata)
+        replica_dfs
+            .metadata_backend()
+            .expect("replica backend")
+            .get_object(&replicated_object_id)
+            .expect("replicated backend object"),
+        Some(replicated_metadata)
+    );
+    assert!(
+        replica_dfs
+            .metadata()
+            .object(&replicated_object_id)
+            .is_none(),
+        "replica journal ingest must keep the durable backend authoritative without mirroring its complete namespace into the service shell"
     );
     assert_eq!(
         replica_dfs.metadata().object(&transient_object_id),
@@ -3886,7 +3900,6 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
         network.add_node(owner.clone()),
         sinomo_dfs::LocalContentStore::new(root.join("owner-content")).expect("owner content"),
     )
-    .with_control_plane(control_plane.clone())
     .with_metadata_backend(owner_backend)
     .expect("owner metadata backend");
     let mut replica_dfs = NetworkedDfsService::new(
@@ -3940,6 +3953,12 @@ fn networked_dfs_configured_metadata_replication_drains_bounded_batches() {
             .expect("owner metadata");
         last_object_id = Some(object_id);
     }
+    // Seed the durable journal before enabling clustered publication. This
+    // test owns the later catch-up loop; attaching the configured replica while
+    // creating the backlog would make every foreground namespace transaction
+    // wait for an authority acknowledgement from a replica that this fixture
+    // intentionally does not pump until below.
+    owner_dfs = owner_dfs.with_control_plane(control_plane.clone());
 
     let expected_entries = 1 + object_count * 2;
     let mut replicated_entries = 0usize;

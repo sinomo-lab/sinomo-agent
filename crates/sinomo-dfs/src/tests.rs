@@ -2759,6 +2759,8 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         .decode_body::<()>()
         .expect("status empty body");
     let status = DfsOperatorStatus {
+        incomplete_reasons: Vec::new(),
+        bounded_omissions: Vec::new(),
         file_system_count: 1,
         object_count: 2,
         version_count: 3,
@@ -2770,6 +2772,7 @@ fn dfs_peer_rpc_helpers_preserve_route_contracts() {
         repair_attempt_count: 0,
         pending_namespace_job_count: 9,
         failed_namespace_job_count: 10,
+        cross_shard_namespace_lock_count: Some(11),
         metadata_shards: Vec::new(),
         repair_attempts: Vec::new(),
     };
@@ -5760,6 +5763,39 @@ struct ApplyingMetadataJournalTransport {
     snapshot_installs: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct UnavailableAsyncMetadataJournalTransport;
+
+impl AsyncDfsMetadataJournalReplicationTransport for UnavailableAsyncMetadataJournalTransport {
+    fn has_metadata_replication_route(&self, _target_node_id: &NodeId) -> bool {
+        false
+    }
+
+    fn send_metadata_journal_batch_async<'a>(
+        &'a self,
+        _target_node_id: &'a NodeId,
+        _command: &'a DfsMetadataJournalBatchCommand,
+        _timeout: Duration,
+    ) -> DfsMetadataJournalReplicationTransportFuture<
+        'a,
+        Result<DfsMetadataJournalBatchResponse, DfsMetadataJournalReplicationTransportError>,
+    > {
+        Box::pin(async { Err(DfsMetadataJournalReplicationTransportError::MissingRoute) })
+    }
+
+    fn send_metadata_snapshot_install_async<'a>(
+        &'a self,
+        _target_node_id: &'a NodeId,
+        _command: &'a DfsMetadataSnapshotInstallCommand,
+        _timeout: Duration,
+    ) -> DfsMetadataJournalReplicationTransportFuture<
+        'a,
+        Result<DfsMetadataSnapshotInstallResponse, DfsMetadataJournalReplicationTransportError>,
+    > {
+        Box::pin(async { Err(DfsMetadataJournalReplicationTransportError::MissingRoute) })
+    }
+}
+
 fn applied_metadata_journal_command_entry_count(command: &DfsMetadataJournalBatchCommand) -> usize {
     command
         .durable_replication
@@ -5982,6 +6018,7 @@ struct RecordingMaintenanceHost {
     cleared: Vec<DfsFileSystemId>,
     repair_attempt_records: Vec<DfsRepairAttemptRecord>,
     stored_repair_attempt_records: Vec<Vec<DfsRepairAttemptRecord>>,
+    load_repair_attempt_records_count: Arc<AtomicUsize>,
 }
 
 impl DfsMaintenanceHost for RecordingMaintenanceHost {
@@ -6019,6 +6056,8 @@ impl DfsMaintenanceHost for RecordingMaintenanceHost {
     }
 
     fn load_repair_attempt_records(&mut self) -> Result<Vec<DfsRepairAttemptRecord>, DfsError> {
+        self.load_repair_attempt_records_count
+            .fetch_add(1, Ordering::Relaxed);
         Ok(self.repair_attempt_records.clone())
     }
 
@@ -6869,8 +6908,8 @@ fn dfs_message_command_processor_rejects_wrong_target_node() {
     .expect_err("wrong target rejected");
 
     let error = error.to_string();
-    assert!(error.contains(local.as_str()));
-    assert!(error.contains(remote.as_str()));
+    assert!(error.contains(local.as_str()), "{error}");
+    assert!(error.contains(remote.as_str()), "{error}");
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -6971,7 +7010,7 @@ fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
         .expect("cluster");
     let local = NodeId::from_legacy_named("node_cluster_message_local").expect("local");
     let remote = NodeId::from_legacy_named("node_cluster_message_remote").expect("remote");
-    let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+    let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
         cluster_id,
         "dfs message command",
         local.clone(),
@@ -6979,7 +7018,16 @@ fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
         "pk-local",
         now,
     );
+    state.members[0] = sinomo_core::cluster::local_cluster_state_authority_member(
+        state.cluster_id.clone(),
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
     sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+    sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+        .expect("cluster kv state");
     let command = DfsMessageCommand {
         request_id: "message-command-cluster-wrong-target".to_string(),
         routed_message: DfsRoutedMessage {
@@ -7003,8 +7051,14 @@ fn cluster_dfs_message_command_processor_uses_cluster_local_node_id() {
         .expect_err("wrong target rejected");
 
     let error = error.to_string();
-    assert!(error.contains(local.as_str()));
-    assert!(error.contains(remote.as_str()));
+    assert!(
+        error.contains(local.as_str()),
+        "local id missing from: {error}"
+    );
+    assert!(
+        error.contains(remote.as_str()),
+        "remote id missing from: {error}"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -8077,6 +8131,80 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
     std::fs::remove_dir_all(root).ok();
 }
 
+#[tokio::test]
+async fn async_maintenance_yields_between_completed_synchronous_phases() {
+    struct NoopWake;
+
+    impl std::task::Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let root = temp_root("async-maintenance-yields-between-completed-phases");
+    let local = NodeId::from_legacy_named("node_async_maintenance_yield").expect("local");
+    let content = LocalContentStore::new(root.join("content")).expect("content");
+    let metadata = open_root_local_metadata_backend(root.join("metadata")).expect("metadata");
+    let mut dfs = NetworkedDfsService::new(
+        RecordingFailingSendTransport {
+            local_node_id: local.clone(),
+            targets: Arc::new(Mutex::new(Vec::new())),
+        },
+        content,
+    )
+    .with_metadata_backend(metadata)
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
+    let mut maintenance_host = RecordingMaintenanceHost::default();
+    let repair_queue_load_count = Arc::clone(&maintenance_host.load_repair_attempt_records_count);
+    let mut publisher_host = RecordingMetadataJournalPublisherHost::new(root.join("journal"));
+    let mut transport = UnavailableAsyncMetadataJournalTransport;
+    let data_dir = SinomoDataDir::new(&root);
+    let execution_exclusions = DfsMaintenanceExecutionExclusions::default();
+    let mut maintenance = Box::pin(
+        run_dfs_maintenance_tick_with_async_host_and_execution_exclusions(
+            &mut dfs,
+            &mut maintenance_host,
+            &data_dir,
+            sifs_file_system_id(),
+            &local,
+            Vec::new(),
+            &mut publisher_host,
+            &mut transport,
+            &execution_exclusions,
+            None,
+            DfsMaintenanceTickOptions {
+                publish_metadata: false,
+                ..DfsMaintenanceTickOptions::default()
+            },
+        ),
+    );
+    let waker = std::task::Waker::from(Arc::new(NoopWake));
+    let mut context = std::task::Context::from_waker(&waker);
+
+    for phase in 0..7 {
+        assert!(
+            matches!(
+                std::future::Future::poll(maintenance.as_mut(), &mut context),
+                std::task::Poll::Pending
+            ),
+            "bounded synchronous maintenance phase {phase} must yield"
+        );
+        assert_eq!(
+            repair_queue_load_count.load(Ordering::Relaxed),
+            0,
+            "repair queue load must not run in the same poll as an earlier bounded phase"
+        );
+    }
+
+    assert!(matches!(
+        std::future::Future::poll(maintenance.as_mut(), &mut context),
+        std::task::Poll::Pending
+    ));
+    drop(maintenance);
+    assert_eq!(repair_queue_load_count.load(Ordering::Relaxed), 1);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn maintenance_tick_rebinds_activated_handoff_before_namespace_job_mutation() {
     let root = temp_root("maintenance-tick-rebinds-activated-handoff-first");
@@ -8484,6 +8612,14 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
                 "snapshot install should not be needed",
             ))
         });
+    let mut control_plane = sinomo_core::kv::InProcessKvStore::new();
+    control_plane
+        .put(
+            metadata_shard_key(&file_system.file_system_id, "root"),
+            sinomo_core::kv::encode_kv_value(&shard).expect("encode authority shard"),
+            None,
+        )
+        .expect("seed authoritative maintenance topology");
 
     let report = run_cluster_dfs_maintenance_tick(
         &data_dir,
@@ -8491,7 +8627,7 @@ fn cluster_maintenance_tick_opens_service_and_publishes_metadata() {
         message_sender,
         sender,
         snapshot_sender,
-        None,
+        Some(Box::new(control_plane)),
         DfsMaintenanceTickOptions::default(),
     )
     .expect("maintenance tick")
@@ -11061,6 +11197,13 @@ fn cluster_metadata_journal_publish_reads_cluster_state_and_shards() {
         "pk-local",
         now,
     );
+    state.members[0] = sinomo_core::cluster::local_cluster_state_authority_member(
+        cluster_id.clone(),
+        local.clone(),
+        "local",
+        "pk-local",
+        now,
+    );
     let replica_member = sinomo_core::cluster::local_cluster_state_authority_member(
         cluster_id.clone(),
         replica.clone(),
@@ -11185,6 +11328,13 @@ fn async_cluster_metadata_publish_repairs_sequence_conflict_with_snapshot() {
         let mut state = sinomo_core::ClusterBootstrapState::initialized_locally(
             cluster_id.clone(),
             "async DFS metadata snapshot repair",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members[0] = sinomo_core::cluster::local_cluster_state_authority_member(
+            cluster_id.clone(),
             local.clone(),
             "local",
             "pk-local",
@@ -37734,19 +37884,22 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
         )
         .expect("initial remote-primary write");
 
+    let stale_metadata = writer.metadata().clone();
     let mut reader = NetworkedDfsService::new(
         network.add_node(writer_node.clone()),
         LocalContentStore::new(writer_root.join("content")).expect("reader content"),
-    )
-    .with_control_plane(shared_kv)
-    .with_metadata_backend_lazy(
-        open_local_sharded_metadata_backend(writer_root.join("metadata"), shards)
-            .expect("reader metadata"),
-    )
-    .expect("reader metadata backend");
-    reader
-        .bootstrap_distributed_sifs()
-        .expect("reader bootstrap");
+    );
+    for file_system in stale_metadata.filesystems.values().cloned() {
+        reader
+            .add_file_system(file_system)
+            .expect("seed reader filesystem");
+    }
+    for object in stale_metadata.objects.values().cloned() {
+        reader
+            .add_object_metadata(object)
+            .expect("seed reader metadata");
+    }
+    let mut reader = reader.with_control_plane(shared_kv);
     assert_eq!(
         reader
             .posix_read_file_distributed(path)
@@ -37754,7 +37907,7 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
         old
     );
 
-    writer
+    let replacement = writer
         .posix_write_file(
             path,
             &new,
@@ -37762,11 +37915,29 @@ fn sharded_lazy_reader_refreshes_after_remote_primary_overwrite() {
         )
         .expect("remote-primary overwrite");
 
+    let mut stale_stream = reader
+        .posix_open_file_stream(path)
+        .expect("reader retained local stream");
+    let mut stale = Vec::new();
+    stale_stream
+        .reader
+        .read_to_end(&mut stale)
+        .expect("read retained local stream");
+    assert_eq!(stale, old, "the fixture must retain the pre-overwrite view");
+
+    let mut current_stream = reader
+        .posix_open_current_file_stream(path)
+        .expect("open current local stream after authoritative lookup");
+    assert_eq!(current_stream.object_id, replacement.object_id);
+    assert_eq!(current_stream.version, replacement.version);
+    let mut current = Vec::new();
+    current_stream
+        .reader
+        .read_to_end(&mut current)
+        .expect("read current local stream");
     assert_eq!(
-        reader
-            .posix_read_file_distributed(path)
-            .expect("reader current payload"),
-        new
+        current, new,
+        "current-metadata stream must keep using local exact-version content"
     );
 
     stop_primary.store(true, Ordering::SeqCst);
@@ -44179,6 +44350,7 @@ fn sifs_cluster_posix_hardlink_across_shard_primaries_links_and_promotes() {
 fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
     let mut cluster = sifs_two_primary_cluster("sifs-xshard-recovery");
     let ghost = NodeId::from_legacy_named("node_sifs_xshard_recovery_ghost").expect("ghost node");
+    let reactive_route_budget = Duration::from_secs(5);
 
     // Create the source file directly on the users primary (local commit).
     let bytes = b"survives a destination outage".to_vec();
@@ -44217,11 +44389,44 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             control.put_metadata_shard(shard).expect("ghost shard");
         }
     });
+    // Keep every still-online replica reactive while only the configured
+    // destination primary is absent. Otherwise this fixture also models two
+    // unrelated replica outages and spends the metadata durability boundary
+    // before it reaches the immediately-failing ghost route.
+    let services_primary = std::mem::replace(
+        &mut cluster.services_primary,
+        NetworkedDfsService::new(
+            sinomo_core::network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_services_pump").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-services-content")).expect("content"),
+        ),
+    );
+    let replica = std::mem::replace(
+        &mut cluster.replica,
+        NetworkedDfsService::new(
+            sinomo_core::network::InProcessNetwork::new()
+                .add_node(NodeId::from_legacy_named("node_unused_replica_pump").expect("node")),
+            LocalContentStore::new(cluster.root.join("unused-replica-content")).expect("content"),
+        ),
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let services_stop = Arc::clone(&stop);
+    let replica_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let replica_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(replica, replica_stop));
     cluster.users_primary.begin_message_committed_work();
+    let initial_rename_started = Instant::now();
     let error = cluster
         .users_primary
         .posix_rename("/users/stuck.txt", "/services/stuck-moved.txt")
         .expect_err("rename to unreachable destination primary must not block forever");
+    assert!(
+        initial_rename_started.elapsed() < reactive_route_budget,
+        "a known-unreachable destination route must fail reactively instead of consuming a durability timeout: {:?}",
+        initial_rename_started.elapsed()
+    );
     assert!(
         matches!(error, DfsPosixError::Dfs(DfsError::Network { .. })),
         "expected a transport error, got {error:?}"
@@ -44264,10 +44469,16 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             .contains("moving between metadata shards"),
         "unexpected namespace lock error: {chmod_error}"
     );
+    let parked_resume_started = Instant::now();
     let parked_report = cluster
         .users_primary
         .posix_resume_namespace_jobs_bounded(8, 512)
         .expect("maintenance scan while destination is still unreachable");
+    assert!(
+        parked_resume_started.elapsed() < reactive_route_budget,
+        "a parked job retry must rediscover the still-unreachable destination reactively: {:?}",
+        parked_resume_started.elapsed()
+    );
     assert_eq!(
         (
             parked_report.resumed_job_count,
@@ -44300,22 +44511,16 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
             control.put_metadata_shard(shard).expect("healed shard");
         }
     });
-    let services_primary = std::mem::replace(
-        &mut cluster.services_primary,
-        NetworkedDfsService::new(
-            sinomo_core::network::InProcessNetwork::new()
-                .add_node(NodeId::from_legacy_named("node_unused_pump").expect("node")),
-            LocalContentStore::new(cluster.root.join("unused-content")).expect("content"),
-        ),
-    );
-    let stop = Arc::new(AtomicBool::new(false));
-    let services_stop = Arc::clone(&stop);
-    let services_thread =
-        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let healed_resume_started = Instant::now();
     let report = cluster
         .users_primary
         .posix_resume_namespace_jobs_bounded(8, 512)
         .expect("maintenance resume");
+    assert!(
+        healed_resume_started.elapsed() < reactive_route_budget,
+        "healed live replicas must complete the parked job without an idle-replica timeout: {:?}",
+        healed_resume_started.elapsed()
+    );
     assert_eq!(
         (report.resumed_job_count, report.completed_job_count),
         (1, 1),
@@ -44323,6 +44528,7 @@ fn sifs_cluster_posix_cross_shard_rename_recovers_after_destination_outage() {
     );
     stop.store(true, Ordering::SeqCst);
     cluster.services_primary = services_thread.join().expect("services thread");
+    cluster.replica = replica_thread.join().expect("replica thread");
 
     // The move completed: old path gone, new path adopted, lock released.
     assert!(matches!(

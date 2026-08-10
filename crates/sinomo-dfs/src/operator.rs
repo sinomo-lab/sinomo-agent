@@ -112,8 +112,168 @@ pub enum DaemonDfsInspectionResponse {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsOperatorStatusMetric {
+    ObjectCount,
+    VersionCount,
+    ReceiptCount,
+    IntentCount,
+    PendingWriteCount,
+    OpenConflictCount,
+    PendingRepairCount,
+    RepairAttemptCount,
+    PendingNamespaceJobCount,
+    FailedNamespaceJobCount,
+    CrossShardNamespaceLockCount,
+    MetadataShardJournalSequence,
+    MetadataShardReplayCursor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum DfsOperatorStatusOmission {
+    /// Historical routing generations can contain both the source and target
+    /// copy of an object. A bounded projection cannot choose the authoritative
+    /// copy without the durable probes used by the exact read path.
+    HistoricalRoutingTopology {
+        generation_count: usize,
+        /// Every resident shard summary was available and their bounded
+        /// cross-shard namespace-lock counts were all zero. Union emptiness is
+        /// exact even though historical placement can make a positive summed
+        /// cardinality ambiguous.
+        #[serde(default, skip_serializing_if = "bool_is_false")]
+        cross_shard_namespace_locks_zero_proven: bool,
+    },
+    /// Status deliberately did not replay a cold node-local repair queue.
+    ResidentRepairQueueNotHydrated,
+    /// A replica shard which is not authoritative on this node has never been
+    /// opened. Bounded status retains its configured topology without opening
+    /// it merely to recover replica-local counters and replay cursors.
+    NonPrimaryResidentMetadataNotHydrated {
+        file_system_id: DfsFileSystemId,
+        shard_id: crate::DfsMetadataShardId,
+    },
+}
+
+impl DfsOperatorStatusOmission {
+    pub fn historical_routing_topology(generation_count: usize) -> Self {
+        Self::HistoricalRoutingTopology {
+            generation_count,
+            cross_shard_namespace_locks_zero_proven: false,
+        }
+    }
+
+    pub fn historical_routing_topology_with_cross_shard_lock_zero_proof(
+        generation_count: usize,
+    ) -> Self {
+        Self::HistoricalRoutingTopology {
+            generation_count,
+            cross_shard_namespace_locks_zero_proven: true,
+        }
+    }
+
+    pub fn resident_repair_queue_not_hydrated() -> Self {
+        Self::ResidentRepairQueueNotHydrated
+    }
+
+    pub fn non_primary_resident_metadata_not_hydrated(
+        file_system_id: DfsFileSystemId,
+        shard_id: crate::DfsMetadataShardId,
+    ) -> Self {
+        Self::NonPrimaryResidentMetadataNotHydrated {
+            file_system_id,
+            shard_id,
+        }
+    }
+
+    pub fn legacy_reason(&self) -> String {
+        match self {
+            Self::HistoricalRoutingTopology {
+                generation_count, ..
+            } => format!(
+                "{generation_count} historical routing topology generation(s) remain active; metadata counters requiring authoritative visibility were omitted"
+            ),
+            Self::ResidentRepairQueueNotHydrated =>
+                "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated"
+                    .to_string(),
+            Self::NonPrimaryResidentMetadataNotHydrated {
+                file_system_id,
+                shard_id,
+            } => format!(
+                "non-primary resident metadata shard {} for filesystem {} is not hydrated for bounded status; shard counters and replay cursors were omitted",
+                shard_id.0, file_system_id
+            ),
+        }
+    }
+
+    pub fn omitted_metrics(&self) -> &'static [DfsOperatorStatusMetric] {
+        use DfsOperatorStatusMetric::*;
+
+        match self {
+            Self::HistoricalRoutingTopology {
+                cross_shard_namespace_locks_zero_proven: true,
+                ..
+            } => &[
+                ObjectCount,
+                VersionCount,
+                ReceiptCount,
+                IntentCount,
+                PendingWriteCount,
+                OpenConflictCount,
+                PendingRepairCount,
+                PendingNamespaceJobCount,
+                FailedNamespaceJobCount,
+            ],
+            Self::HistoricalRoutingTopology { .. } => &[
+                ObjectCount,
+                VersionCount,
+                ReceiptCount,
+                IntentCount,
+                PendingWriteCount,
+                OpenConflictCount,
+                PendingRepairCount,
+                PendingNamespaceJobCount,
+                FailedNamespaceJobCount,
+                CrossShardNamespaceLockCount,
+            ],
+            Self::ResidentRepairQueueNotHydrated => &[RepairAttemptCount],
+            Self::NonPrimaryResidentMetadataNotHydrated { .. } => &[
+                ObjectCount,
+                VersionCount,
+                ReceiptCount,
+                IntentCount,
+                CrossShardNamespaceLockCount,
+                MetadataShardJournalSequence,
+                MetadataShardReplayCursor,
+            ],
+        }
+    }
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl std::fmt::Display for DfsOperatorStatusOmission {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.legacy_reason())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsOperatorStatus {
+    /// Human-readable compatibility mirrors for every unavailable observation.
+    /// New readers use [`Self::blocking_incomplete_reasons`] so typed bounded
+    /// omissions do not masquerade as corruption. Old readers remain
+    /// fail-closed because producers continue to mirror omissions here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incomplete_reasons: Vec<String>,
+    /// Deliberate, bounded omissions that keep status from hydrating or
+    /// scanning production-sized durable state. These remain operator-visible
+    /// but are not themselves evidence of a DFS invariant violation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bounded_omissions: Vec<DfsOperatorStatusOmission>,
     pub file_system_count: usize,
     pub object_count: usize,
     pub version_count: usize,
@@ -128,10 +288,54 @@ pub struct DfsOperatorStatus {
     pub pending_namespace_job_count: usize,
     #[serde(default)]
     pub failed_namespace_job_count: usize,
+    /// Unique effective `(filesystem, root path)` cross-shard namespace locks
+    /// retained by running durable jobs. `None` fails closed when an older
+    /// daemon or bounded omission cannot provide this incremental metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_shard_namespace_lock_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub metadata_shards: Vec<DfsMetadataShardStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub repair_attempts: Vec<DfsRepairAttemptRecord>,
+}
+
+impl DfsOperatorStatus {
+    /// Return only incomplete observations which are not exact legacy mirrors
+    /// of a typed bounded omission. An old payload has no typed omissions, so
+    /// every legacy reason remains blocking. Likewise, an unmatched reason in
+    /// a new payload fails closed.
+    pub fn blocking_incomplete_reasons(&self) -> Vec<&str> {
+        let bounded_legacy_reasons = self
+            .bounded_omissions
+            .iter()
+            .map(DfsOperatorStatusOmission::legacy_reason)
+            .collect::<BTreeSet<_>>();
+        self.incomplete_reasons
+            .iter()
+            .map(String::as_str)
+            .filter(|reason| !bounded_legacy_reasons.contains(*reason))
+            .collect()
+    }
+
+    pub fn push_bounded_omission(&mut self, omission: DfsOperatorStatusOmission) {
+        if omission
+            .omitted_metrics()
+            .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount)
+        {
+            self.cross_shard_namespace_lock_count = None;
+        }
+        let legacy_reason = omission.legacy_reason();
+        if !self
+            .incomplete_reasons
+            .iter()
+            .any(|reason| reason == &legacy_reason)
+        {
+            self.incomplete_reasons.push(legacy_reason);
+        }
+        if !self.bounded_omissions.contains(&omission) {
+            self.bounded_omissions.push(omission);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -296,6 +500,8 @@ impl<'a> DfsOperatorInspector<'a> {
         summary: DfsMetadataSummary,
     ) -> Result<DfsOperatorStatus, MetadataBackendError> {
         Ok(DfsOperatorStatus {
+            incomplete_reasons: Vec::new(),
+            bounded_omissions: Vec::new(),
             file_system_count: summary.file_system_count,
             object_count: summary.object_count,
             version_count: summary.version_count,
@@ -307,6 +513,7 @@ impl<'a> DfsOperatorInspector<'a> {
             repair_attempt_count: 0,
             pending_namespace_job_count: summary.pending_namespace_job_count,
             failed_namespace_job_count: summary.failed_namespace_job_count,
+            cross_shard_namespace_lock_count: Some(summary.cross_shard_namespace_lock_count),
             metadata_shards: self.backend.metadata_shard_statuses()?,
             repair_attempts: Vec::new(),
         })
@@ -1719,6 +1926,130 @@ mod tests {
     use sinomo_core::events::EventId;
     use sinomo_core::{DfsObjectPolicy, DfsWriteReceipt};
 
+    fn empty_operator_status() -> DfsOperatorStatus {
+        DfsOperatorStatus {
+            incomplete_reasons: Vec::new(),
+            bounded_omissions: Vec::new(),
+            file_system_count: 0,
+            object_count: 0,
+            version_count: 0,
+            receipt_count: 0,
+            intent_count: 0,
+            pending_write_count: 0,
+            open_conflict_count: 0,
+            pending_repair_count: 0,
+            repair_attempt_count: 0,
+            pending_namespace_job_count: 0,
+            failed_namespace_job_count: 0,
+            cross_shard_namespace_lock_count: Some(0),
+            metadata_shards: Vec::new(),
+            repair_attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn typed_bounded_omissions_preserve_legacy_fail_closed_serde() {
+        let legacy_reason = "4 historical routing topology generation(s) remain active; metadata counters requiring authoritative visibility were omitted";
+        let mut status = empty_operator_status();
+        status.push_bounded_omission(DfsOperatorStatusOmission::historical_routing_topology(4));
+
+        assert_eq!(status.incomplete_reasons, vec![legacy_reason]);
+        assert!(status.blocking_incomplete_reasons().is_empty());
+        assert_eq!(status.bounded_omissions.len(), 1);
+        assert!(
+            status.bounded_omissions[0]
+                .omitted_metrics()
+                .contains(&DfsOperatorStatusMetric::OpenConflictCount)
+        );
+        assert!(
+            status.bounded_omissions[0]
+                .omitted_metrics()
+                .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount)
+        );
+        assert_eq!(status.cross_shard_namespace_lock_count, None);
+
+        let encoded = serde_json::to_value(&status).expect("encode status");
+        let decoded: DfsOperatorStatus =
+            serde_json::from_value(encoded.clone()).expect("decode current status");
+        assert_eq!(decoded, status);
+        assert!(decoded.blocking_incomplete_reasons().is_empty());
+
+        let mut legacy_encoded = encoded;
+        legacy_encoded
+            .as_object_mut()
+            .expect("status object")
+            .remove("bounded_omissions");
+        let legacy_decoded: DfsOperatorStatus =
+            serde_json::from_value(legacy_encoded).expect("decode old status payload");
+        assert!(legacy_decoded.bounded_omissions.is_empty());
+        assert_eq!(
+            legacy_decoded.blocking_incomplete_reasons(),
+            vec![legacy_reason]
+        );
+    }
+
+    #[test]
+    fn historical_routing_zero_lock_proof_is_explicit_and_legacy_safe() {
+        let omission =
+            DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
+                4,
+            );
+        assert!(
+            !omission
+                .omitted_metrics()
+                .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "an explicit union-empty proof keeps the lock metric available"
+        );
+
+        let mut status = empty_operator_status();
+        status.push_bounded_omission(omission.clone());
+        assert_eq!(status.cross_shard_namespace_lock_count, Some(0));
+
+        let mut legacy_encoded = serde_json::to_value(omission).expect("encode omission");
+        legacy_encoded
+            .as_object_mut()
+            .expect("omission object")
+            .remove("cross_shard_namespace_locks_zero_proven");
+        let legacy_decoded: DfsOperatorStatusOmission =
+            serde_json::from_value(legacy_encoded).expect("decode legacy omission");
+        assert!(
+            legacy_decoded
+                .omitted_metrics()
+                .contains(&DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "an old omission without the proof flag must remain fail closed"
+        );
+    }
+
+    #[test]
+    fn legacy_status_without_cross_shard_lock_metric_decodes_as_unknown() {
+        let mut encoded = serde_json::to_value(empty_operator_status()).expect("encode status");
+        encoded
+            .as_object_mut()
+            .expect("status object")
+            .remove("cross_shard_namespace_lock_count");
+
+        let decoded: DfsOperatorStatus =
+            serde_json::from_value(encoded).expect("decode legacy status");
+        assert_eq!(decoded.cross_shard_namespace_lock_count, None);
+    }
+
+    #[test]
+    fn unmatched_incomplete_reason_remains_blocking_with_typed_omissions() {
+        let legacy_reason = "repair queue observation unavailable: bounded DFS repair queue status unavailable because the resident queue is not hydrated";
+        let mut status = empty_operator_status();
+        status
+            .push_bounded_omission(DfsOperatorStatusOmission::resident_repair_queue_not_hydrated());
+        assert_eq!(status.incomplete_reasons, vec![legacy_reason]);
+        status
+            .incomplete_reasons
+            .push("metadata shard cursor projection is corrupt".to_string());
+
+        assert_eq!(
+            status.blocking_incomplete_reasons(),
+            vec!["metadata shard cursor projection is corrupt"]
+        );
+    }
+
     #[test]
     fn operator_inspector_reports_status_object_conflicts_and_repairs() {
         let root = temp_root("operator_inspector_reports_status_object_conflicts_and_repairs");
@@ -2712,10 +3043,10 @@ mod tests {
                 job_id: "namespace-job-running".to_string(),
                 file_system_id: file_system_id(),
                 origin: None,
-                kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
+                kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
                 status: DfsNamespaceJobStatus::Running,
                 root_path: "/alpha".to_string(),
-                target_path: None,
+                target_path: Some("/beta/alpha".to_string()),
                 pending_frames: vec![DfsNamespaceJobFrame::ScanDirectory {
                     path: "/alpha".to_string(),
                     cursor: None,
@@ -2756,6 +3087,7 @@ mod tests {
         assert_eq!(summary.pending_repair_count, 1);
         assert_eq!(summary.pending_namespace_job_count, 1);
         assert_eq!(summary.failed_namespace_job_count, 1);
+        assert_eq!(summary.cross_shard_namespace_lock_count, 1);
         let scoped_summary = backend
             .metadata_summary_for_file_system(&file_system_id())
             .expect("scoped summary")
@@ -2790,6 +3122,7 @@ mod tests {
         );
         assert_eq!(status.pending_namespace_job_count, 1);
         assert_eq!(status.failed_namespace_job_count, 1);
+        assert_eq!(status.cross_shard_namespace_lock_count, Some(1));
         let file_system = inspector
             .file_system(&file_system_id())
             .expect("filesystem view")

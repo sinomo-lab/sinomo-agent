@@ -1296,8 +1296,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut trace_execute_ms = 0;
         let mut trace_completion_ms = 0;
         let mut affected_shard_ids: Vec<DfsMetadataShardId> = Vec::new();
-        for expected in &command.authority_shards {
-            self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+        let read_only_lookup = matches!(
+            &command.operation,
+            DfsNamespaceOperation::LookupPath { .. } | DfsNamespaceOperation::LookupPaths { .. }
+        );
+        if !read_only_lookup {
+            // Mutation lanes retain the existing availability behavior: an
+            // exact completed handoff can rebind the durable writer before
+            // authority planning. Lookups are observation-only. In
+            // particular, a stale same-shard-id stamp must reach the complete
+            // affected-shard comparison below without first clearing a
+            // durable handoff fence or running rebind hydration/recovery.
+            for expected in &command.authority_shards {
+                self.rebind_completed_local_metadata_shard_membership_handoff_if_frozen(expected)?;
+            }
         }
         // The authority the requester should retry against when this node is
         // not the shard primary (the requester routed on a stale shard view).

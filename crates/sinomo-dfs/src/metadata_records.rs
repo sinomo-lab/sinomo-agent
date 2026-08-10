@@ -724,10 +724,11 @@ pub(crate) fn dfs_metadata_prefix_proof_seed(
     }
 }
 
-/// Extend a validated contiguous prefix with one payload-complete journal
-/// entry. Replicas hash the exact entry received from the authority, so equal
-/// proofs imply equal journal payloads rather than merely equal sequence IDs.
-#[cfg(test)]
+/// Extend a legacy V1 prefix with one payload-complete journal entry.
+///
+/// New writes use the exact-frame V2 helper below. This encoder remains in
+/// production only so a restarted authority can authenticate a durable V1
+/// handoff tail before checkpointing it at the current head.
 pub(crate) fn dfs_metadata_prefix_proof_after(
     previous: &DfsMetadataPrefixProof,
     entry: &DfsMetadataJournalEntry,
@@ -2621,6 +2622,10 @@ pub struct DfsMetadataSummary {
     pub pending_repair_count: usize,
     pub pending_namespace_job_count: usize,
     pub failed_namespace_job_count: usize,
+    /// Unique effective `(filesystem, root path)` cross-shard namespace locks
+    /// retained by running durable namespace jobs until they become terminal.
+    #[serde(default)]
+    pub cross_shard_namespace_lock_count: usize,
 }
 
 /// Exact durable routed-request identity which originated a namespace job.
@@ -2733,6 +2738,17 @@ pub enum DfsNamespaceJobKind {
     RenameObjectAcrossShardPrimaries,
     HardlinkAcrossShardPrimaries,
     RenameDirectoryAcrossShardPrimaries,
+}
+
+impl DfsNamespaceJobKind {
+    pub(crate) fn holds_cross_shard_namespace_lock_while_running(&self) -> bool {
+        matches!(
+            self,
+            Self::RenameObjectAcrossShardPrimaries
+                | Self::HardlinkAcrossShardPrimaries
+                | Self::RenameDirectoryAcrossShardPrimaries
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

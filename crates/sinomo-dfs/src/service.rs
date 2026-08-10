@@ -205,6 +205,22 @@ pub trait DfsDataPlaneHost: Send + Sync {
         request: DaemonDfsInspectionRequest,
     ) -> DfsDataPlaneHostFuture<'a, DaemonDfsInspectionResponse>;
 
+    /// Return a metadata-replica authority context from the host's retained,
+    /// coherent control-plane generation. `None` means this host does not own
+    /// such a projection; the service may then use a configured `ClusterAccess`
+    /// current-term exact-set read, but must not promote a resident local KV
+    /// projection into authority. `Some(future)` is authoritative even when the
+    /// future returns `Ok(None)`, which fails closed without issuing a second
+    /// authority read.
+    fn retained_metadata_replica_shard_context<'a>(
+        &'a self,
+        _data_dir: Arc<SinomoDataDir>,
+        _file_system_id: DfsFileSystemId,
+        _shard_id: DfsMetadataShardId,
+    ) -> Option<DfsDataPlaneHostFuture<'a, Option<DfsMetadataReplicaShardContext>>> {
+        None
+    }
+
     /// Persist an already-authorized replica journal command through the
     /// process-resident exact shard backend. The service boundary supplies the
     /// committed authority context so the host must not repeat a remote KV
@@ -401,6 +417,7 @@ impl Service for DfsService {
                             .is_some_and(|probe| probe.durable_journal_ack);
                     let materialize_shard_id = command.batch.shard_id.clone();
                     let context = authoritative_metadata_replica_shard_context(
+                        host.as_deref(),
                         ctx.cluster.clone(),
                         Arc::clone(&ctx.data_dir),
                         command.file_system_id.clone(),
@@ -480,6 +497,7 @@ impl Service for DfsService {
                         return Ok(ServiceDisposition::Continue);
                     }
                     let context = authoritative_metadata_replica_shard_context(
+                        host.as_deref(),
                         ctx.cluster.clone(),
                         Arc::clone(&ctx.data_dir),
                         command.file_system_id.clone(),
@@ -708,94 +726,84 @@ fn dfs_inspection(
 }
 
 async fn authoritative_metadata_replica_shard_context(
+    host: Option<&dyn DfsDataPlaneHost>,
     cluster: Option<Arc<dyn ClusterAccess>>,
     data_dir: Arc<SinomoDataDir>,
     file_system_id: Option<DfsFileSystemId>,
     shard_id: DfsMetadataShardId,
-    source_node_id: NodeId,
-    authority_epoch: Option<u64>,
+    _source_node_id: NodeId,
+    _authority_epoch: Option<u64>,
     primary_handoff_id: Option<String>,
 ) -> Result<Option<DfsMetadataReplicaShardContext>, ServiceError> {
     let started_at = Instant::now();
     let Some(file_system_id) = file_system_id else {
         return Ok(None);
     };
-    let local_read_started_at = Instant::now();
-    let local_data_dir = Arc::clone(&data_dir);
-    let local_shard_id = shard_id.clone();
-    let local_context = tokio::task::spawn_blocking(move || {
-        crate::metadata_replication::cluster_dfs_metadata_replica_shard_context(
-            &ClusterPaths::new(local_data_dir.as_ref()),
-            &local_shard_id,
+    if let Some(retained) = host.and_then(|host| {
+        host.retained_metadata_replica_shard_context(
+            Arc::clone(&data_dir),
+            file_system_id.clone(),
+            shard_id.clone(),
         )
-    })
-    .await
-    .map_err(|source| {
-        ServiceError::Service(format!(
-            "DFS metadata replica authority read task failed: {source}"
-        ))
-    })?
-    .map_err(service_error)?;
-    let local_read_ms = local_read_started_at.elapsed().as_millis();
-    if metadata_replica_context_can_skip_authoritative_read(
-        local_context.as_ref(),
-        &file_system_id,
-        &shard_id,
-        &source_node_id,
-        authority_epoch,
-        primary_handoff_id.as_deref(),
-    ) {
+    }) {
+        let context = retained.await.map_err(service_error)?;
         dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=local local_read_ms={} total_ms={}",
+            "metadata-replica-authority-context shard={} mode=host-retained handoff={} total_ms={}",
             shard_id.0,
-            local_read_ms,
-            started_at.elapsed().as_millis(),
-        ));
-        return Ok(local_context);
-    }
-    let Some(cluster) = cluster else {
-        // A role-rotation probe can persist a promotion marker and authorize
-        // the next primary generation. A locally coherent but retired KV
-        // snapshot is therefore not sufficient; fail closed without a
-        // current-term authoritative read.
-        dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=no-cluster local_read_ms={} handoff={} total_ms={}",
-            shard_id.0,
-            local_read_ms,
             primary_handoff_id.is_some(),
             started_at.elapsed().as_millis(),
         ));
-        return if primary_handoff_id.is_some() {
-            Ok(None)
-        } else {
-            Ok(local_context)
-        };
-    };
-    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
-    let shard_read_started_at = Instant::now();
-    let shard = cluster
-        .kv_get_authoritative_async(&shard_key)
-        .await?
-        .value
-        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
-        .transpose()?;
-    let shard_read_ms = shard_read_started_at.elapsed().as_millis();
-    let Some(shard) = shard else {
+        return Ok(context);
+    }
+
+    let Some(cluster) = cluster else {
+        // A resident local Raft projection can be internally coherent yet
+        // belong to a retired primary generation. Without a retained host
+        // proof or current-term ClusterAccess proof there is no authority to
+        // admit metadata replica writes, so fail closed immediately.
         dfs_service_perf_trace(format_args!(
-            "metadata-replica-authority-context shard={} mode=authoritative-missing local_read_ms={} shard_read_ms={} total_ms={}",
+            "metadata-replica-authority-context shard={} mode=authority-unavailable handoff={} total_ms={}",
             shard_id.0,
-            local_read_ms,
-            shard_read_ms,
+            primary_handoff_id.is_some(),
             started_at.elapsed().as_millis(),
         ));
         return Ok(None);
     };
-    let handoff_key = metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id);
-    let handoff_read_started_at = Instant::now();
-    let pending_membership_handoff = cluster
-        .kv_get_authoritative_async(&handoff_key)
-        .await?
-        .value
+    let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
+    let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
+    let authority_keys = vec![shard_key, handoff_key];
+    let authority_read_started_at = Instant::now();
+    let authoritative = cluster
+        .kv_get_authoritative_exact_set_async(authority_keys.clone())
+        .await?;
+    let authority_read_ms = authority_read_started_at.elapsed().as_millis();
+    let authority_term = authoritative.authority.term;
+    let authority_revision = authoritative.authority.revision;
+    // Besides proving one current-term authority point for both records, this
+    // rejects wrong-order values and entries whose revisions exceed that proof.
+    sinomo_core::kv::validate_cluster_kv_authoritative_entries_read(
+        &authority_keys,
+        &authoritative,
+    )?;
+    let mut values = authoritative.value.into_iter();
+    let shard_entry = values.next().expect("validated exact-key-set length");
+    let handoff_entry = values.next().expect("validated exact-key-set length");
+    let shard = shard_entry
+        .map(|entry| entry.decode::<DfsMetadataShardConfig>())
+        .transpose()?;
+    let Some(shard) = shard else {
+        dfs_service_perf_trace(format_args!(
+            "metadata-replica-authority-context shard={} mode=authoritative-missing local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} total_ms={}",
+            shard_id.0,
+            0,
+            authority_read_ms,
+            authority_term,
+            authority_revision.0,
+            started_at.elapsed().as_millis(),
+        ));
+        return Ok(None);
+    };
+    let pending_membership_handoff = handoff_entry
         .map(|entry| entry.decode::<DfsMetadataShardMembershipHandoff>())
         .transpose()?
         .filter(|handoff| {
@@ -804,7 +812,6 @@ async fn authoritative_metadata_replica_shard_context(
                 && handoff.desired_shard.shard_id == shard.shard_id
                 && handoff.desired_shard.epoch == shard.epoch.saturating_add(1)
         });
-    let handoff_read_ms = handoff_read_started_at.elapsed().as_millis();
     let state =
         sinomo_core::cluster::read_cluster_state_without_kv(&ClusterPaths::new(data_dir.as_ref()))?;
     let context = DfsMetadataReplicaShardContext {
@@ -813,17 +820,19 @@ async fn authoritative_metadata_replica_shard_context(
         pending_membership_handoff,
     };
     dfs_service_perf_trace(format_args!(
-        "metadata-replica-authority-context shard={} mode=authoritative local_read_ms={} shard_read_ms={} handoff_read_ms={} handoff={} total_ms={}",
+        "metadata-replica-authority-context shard={} mode=authoritative local_read_ms={} authority_read_ms={} authority_term={} authority_revision={} handoff={} total_ms={}",
         shard_id.0,
-        local_read_ms,
-        shard_read_ms,
-        handoff_read_ms,
+        0,
+        authority_read_ms,
+        authority_term,
+        authority_revision.0,
         primary_handoff_id.is_some(),
         started_at.elapsed().as_millis(),
     ));
     Ok(Some(context))
 }
 
+#[cfg(test)]
 fn metadata_replica_context_can_skip_authoritative_read(
     context: Option<&DfsMetadataReplicaShardContext>,
     file_system_id: &DfsFileSystemId,
@@ -845,6 +854,7 @@ fn metadata_replica_context_can_skip_authoritative_read(
         })
 }
 
+#[cfg(test)]
 fn metadata_replica_context_has_local_ingest_membership(
     context: &DfsMetadataReplicaShardContext,
 ) -> bool {
@@ -866,6 +876,7 @@ fn metadata_replica_context_has_local_ingest_membership(
             })
 }
 
+#[cfg(test)]
 fn metadata_replica_context_matches_authority(
     context: &DfsMetadataReplicaShardContext,
     file_system_id: &DfsFileSystemId,
@@ -918,8 +929,14 @@ mod tests {
     };
     use sinomo_core::DfsObjectPolicy;
     use sinomo_core::cluster::ClusterKvPathsExt;
+    use sinomo_core::kv::{
+        ClusterKvTxnCommitResult, KvAuthoritativeRead, KvAuthorityBasis, KvAuthorityProof, KvEntry,
+        KvLocalRead, KvRevision, KvTxnRequest, KvVersion,
+    };
     use sinomo_core::node::NodeId;
     use sinomo_core::service::{ResponseSink, ServiceRegistry, ServiceSigner};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
@@ -950,6 +967,7 @@ mod tests {
         message_request_ids: Mutex<Vec<String>>,
         message_traceparents: Mutex<Vec<Option<String>>>,
         shared_content_store: Mutex<Option<Arc<LocalContentStore>>>,
+        retained_metadata_replica_context: Mutex<Option<DfsMetadataReplicaShardContext>>,
     }
 
     impl DfsDataPlaneHost for StubDfsDataPlaneHost {
@@ -957,6 +975,8 @@ mod tests {
             Box::pin(async move {
                 *self.status_calls.lock().expect("status calls") += 1;
                 Ok(DfsOperatorStatus {
+                    incomplete_reasons: Vec::new(),
+                    bounded_omissions: Vec::new(),
                     file_system_count: 0,
                     object_count: 0,
                     version_count: 0,
@@ -968,6 +988,7 @@ mod tests {
                     repair_attempt_count: 0,
                     pending_namespace_job_count: 0,
                     failed_namespace_job_count: 0,
+                    cross_shard_namespace_lock_count: Some(0),
                     metadata_shards: Vec::new(),
                     repair_attempts: Vec::new(),
                 })
@@ -983,6 +1004,20 @@ mod tests {
                 .lock()
                 .expect("shared content store")
                 .clone())
+        }
+
+        fn retained_metadata_replica_shard_context<'a>(
+            &'a self,
+            _data_dir: Arc<SinomoDataDir>,
+            _file_system_id: DfsFileSystemId,
+            _shard_id: DfsMetadataShardId,
+        ) -> Option<DfsDataPlaneHostFuture<'a, Option<DfsMetadataReplicaShardContext>>> {
+            let context = self
+                .retained_metadata_replica_context
+                .lock()
+                .expect("retained metadata replica context")
+                .clone();
+            Some(Box::pin(async move { Ok(context) }))
         }
 
         fn run_smoke<'a>(&'a self) -> DfsDataPlaneHostFuture<'a, DfsSmokeReport> {
@@ -1150,6 +1185,391 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-service-dfs");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         (root, data_dir)
+    }
+
+    struct ExactSetMetadataAuthorityState {
+        revision: KvRevision,
+        entries: BTreeMap<String, KvEntry>,
+        pending_handoff_mutation: Option<(KvRevision, KvEntry)>,
+    }
+
+    struct ExactSetMetadataAuthority {
+        state: Mutex<ExactSetMetadataAuthorityState>,
+        authoritative_point_calls: AtomicUsize,
+        authoritative_exact_set_calls: AtomicUsize,
+        requested_exact_sets: Mutex<Vec<Vec<String>>>,
+        returned_proof_revisions: Mutex<Vec<KvRevision>>,
+    }
+
+    impl ExactSetMetadataAuthority {
+        fn new(
+            revision: KvRevision,
+            entries: BTreeMap<String, KvEntry>,
+            pending_handoff_mutation: Option<(KvRevision, KvEntry)>,
+        ) -> Self {
+            Self {
+                state: Mutex::new(ExactSetMetadataAuthorityState {
+                    revision,
+                    entries,
+                    pending_handoff_mutation,
+                }),
+                authoritative_point_calls: AtomicUsize::new(0),
+                authoritative_exact_set_calls: AtomicUsize::new(0),
+                requested_exact_sets: Mutex::new(Vec::new()),
+                returned_proof_revisions: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ClusterAccess for ExactSetMetadataAuthority {
+        fn kv_get_local(&self, _key: &str) -> Result<KvLocalRead<Option<KvEntry>>, ServiceError> {
+            Err(ServiceError::Service(
+                "unexpected local KV point read in exact-set metadata authority test".to_string(),
+            ))
+        }
+
+        fn kv_range_prefix_local(
+            &self,
+            _prefix: &str,
+        ) -> Result<KvLocalRead<Vec<KvEntry>>, ServiceError> {
+            Err(ServiceError::Service(
+                "unexpected local KV prefix read in exact-set metadata authority test".to_string(),
+            ))
+        }
+
+        fn kv_get_authoritative_async<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<KvAuthoritativeRead<Option<KvEntry>>, ServiceError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.authoritative_point_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Err(ServiceError::Service(
+                    "metadata replica authority must not use sequential point reads".to_string(),
+                ))
+            })
+        }
+
+        fn kv_get_authoritative_exact_set_async<'a>(
+            &'a self,
+            keys: Vec<String>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<KvAuthoritativeRead<Vec<Option<KvEntry>>>, ServiceError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.authoritative_exact_set_calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.requested_exact_sets
+                .lock()
+                .expect("requested exact sets")
+                .push(keys.clone());
+            Box::pin(async move {
+                let read = {
+                    let mut state = self.state.lock().expect("exact-set authority state");
+                    let revision = state.revision;
+                    let value = keys
+                        .iter()
+                        .map(|key| state.entries.get(key).cloned())
+                        .collect();
+                    // Linearize the exact set first, then deterministically
+                    // change the live handoff before returning. A sequential
+                    // shard/handoff read would be able to straddle this hook;
+                    // one exact-set proof cannot.
+                    if let Some((next_revision, entry)) = state.pending_handoff_mutation.take() {
+                        state.revision = next_revision;
+                        state.entries.insert(entry.key.clone(), entry);
+                    }
+                    KvAuthoritativeRead {
+                        value,
+                        authority: KvAuthorityProof {
+                            term: 9,
+                            commit_index: revision.0,
+                            revision,
+                            basis: KvAuthorityBasis::CurrentTermQuorum {
+                                voter_acks: 2,
+                                required_quorum: 2,
+                            },
+                        },
+                    }
+                };
+                self.returned_proof_revisions
+                    .lock()
+                    .expect("returned proof revisions")
+                    .push(read.authority.revision);
+                Ok(read)
+            })
+        }
+
+        fn kv_commit_async<'a>(
+            &'a self,
+            _request: KvTxnRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ClusterKvTxnCommitResult, ServiceError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                Err(ServiceError::Service(
+                    "unexpected KV commit in exact-set metadata authority test".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn exact_set_metadata_entry<T: serde::Serialize>(
+        key: String,
+        value: &T,
+        revision: KvRevision,
+    ) -> KvEntry {
+        KvEntry {
+            key,
+            value: sinomo_core::kv::encode_kv_value(value).expect("encode exact-set value"),
+            create_revision: revision,
+            modify_revision: revision,
+            version: KvVersion(1),
+            lease_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_replica_authority_without_host_or_cluster_rejects_stale_local_raft() {
+        let (_root, data_dir) = temp_data_dir();
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        cluster_paths.ensure().expect("cluster paths");
+        let local_node_id =
+            NodeId::from_legacy_named("node_dfs_stale_authority_local").expect("local node");
+        let retired_primary_node_id =
+            NodeId::from_legacy_named("node_dfs_stale_authority_primary").expect("retired primary");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_stale_authority")
+                .expect("cluster"),
+            "DFS stale local metadata authority",
+            local_node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("write local cluster KV state");
+
+        let file_system_id = sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let stale_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: retired_primary_node_id.clone(),
+            replica_node_ids: vec![local_node_id.clone()],
+            epoch: 7,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        sinomo_core::cluster::append_cluster_raft_command(
+            &cluster_paths,
+            &local_node_id,
+            sinomo_core::kv::KvCommand::Op(
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system_id, &shard_id.0),
+                    &stale_shard,
+                    None,
+                )
+                .expect("stale shard operation"),
+            ),
+        )
+        .expect("persist stale local Raft shard");
+
+        let context = authoritative_metadata_replica_shard_context(
+            None,
+            None,
+            data_dir,
+            Some(file_system_id),
+            shard_id,
+            retired_primary_node_id,
+            Some(stale_shard.epoch),
+            None,
+        )
+        .await
+        .expect("fail-closed authority result");
+        assert!(
+            context.is_none(),
+            "a hostless service must not promote a resident stale Raft assignment into ingress authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_replica_authority_exact_set_linearizes_handoff_mutation() {
+        let (_root, data_dir) = temp_data_dir();
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        let local_node_id =
+            NodeId::from_legacy_named("node_dfs_exact_set_local").expect("local node");
+        let primary_node_id =
+            NodeId::from_legacy_named("node_dfs_exact_set_primary").expect("primary node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_exact_set")
+                .expect("cluster"),
+            "DFS exact-set metadata authority",
+            local_node_id.clone(),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("write local cluster KV state");
+
+        let file_system_id = sifs_file_system_id();
+        let shard_id = DfsMetadataShardId::new("root");
+        let retiring_shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.0.clone(),
+            primary_node_id: primary_node_id.clone(),
+            replica_node_ids: vec![local_node_id.clone()],
+            epoch: 41,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired_shard = DfsMetadataShardConfig {
+            primary_node_id: local_node_id.clone(),
+            replica_node_ids: vec![primary_node_id.clone()],
+            epoch: retiring_shard.epoch + 1,
+            ..retiring_shard.clone()
+        };
+        let old_handoff = DfsMetadataShardMembershipHandoff {
+            handoff_id: "handoff-exact-set-old".to_string(),
+            retiring_shard: retiring_shard.clone(),
+            desired_shard: desired_shard.clone(),
+            required_prepared_sequence: 0,
+            required_head_watermark: None,
+            retiring_primary_fence: None,
+        };
+        let new_handoff = DfsMetadataShardMembershipHandoff {
+            handoff_id: "handoff-exact-set-new".to_string(),
+            ..old_handoff.clone()
+        };
+        let shard_key = metadata_shard_key(&file_system_id, &shard_id.0);
+        let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard_id.0);
+        let old_revision = KvRevision(17);
+        let new_revision = KvRevision(18);
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            shard_key.clone(),
+            exact_set_metadata_entry(shard_key.clone(), &retiring_shard, old_revision),
+        );
+        entries.insert(
+            handoff_key.clone(),
+            exact_set_metadata_entry(handoff_key.clone(), &old_handoff, old_revision),
+        );
+        let authority = Arc::new(ExactSetMetadataAuthority::new(
+            old_revision,
+            entries,
+            Some((
+                new_revision,
+                exact_set_metadata_entry(handoff_key.clone(), &new_handoff, new_revision),
+            )),
+        ));
+        let cluster: Arc<dyn ClusterAccess> = authority.clone();
+
+        let old_context = authoritative_metadata_replica_shard_context(
+            None,
+            Some(Arc::clone(&cluster)),
+            Arc::clone(&data_dir),
+            Some(file_system_id.clone()),
+            shard_id.clone(),
+            primary_node_id.clone(),
+            Some(retiring_shard.epoch),
+            Some(old_handoff.handoff_id.clone()),
+        )
+        .await
+        .expect("old exact-set authority context")
+        .expect("old context");
+        assert_eq!(old_context.shard, retiring_shard);
+        assert_eq!(
+            old_context.pending_membership_handoff,
+            Some(old_handoff.clone()),
+            "the first proof must contain the pre-mutation pair, even though the handoff changed before the RPC returned"
+        );
+        assert!(metadata_replica_context_matches_authority(
+            &old_context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(retiring_shard.epoch),
+            Some(&old_handoff.handoff_id),
+        ));
+        assert_eq!(
+            authority
+                .authoritative_exact_set_calls
+                .load(Ordering::SeqCst),
+            1,
+            "one replica validation must establish exactly one authority proof"
+        );
+        assert_eq!(
+            authority.authoritative_point_calls.load(Ordering::SeqCst),
+            0,
+            "replica validation must not issue independently linearized point reads"
+        );
+        assert_eq!(
+            authority
+                .requested_exact_sets
+                .lock()
+                .expect("requested exact sets")
+                .as_slice(),
+            &[vec![shard_key, handoff_key]],
+        );
+        assert_eq!(
+            authority
+                .returned_proof_revisions
+                .lock()
+                .expect("proof revisions")
+                .as_slice(),
+            &[old_revision],
+        );
+
+        let new_context = authoritative_metadata_replica_shard_context(
+            None,
+            Some(cluster),
+            data_dir,
+            Some(file_system_id.clone()),
+            shard_id.clone(),
+            primary_node_id.clone(),
+            Some(retiring_shard.epoch),
+            Some(old_handoff.handoff_id.clone()),
+        )
+        .await
+        .expect("new exact-set authority context")
+        .expect("new context");
+        assert_eq!(
+            new_context.pending_membership_handoff,
+            Some(new_handoff),
+            "a later proof observes the complete post-mutation revision"
+        );
+        assert!(!metadata_replica_context_matches_authority(
+            &new_context,
+            &file_system_id,
+            &shard_id,
+            &primary_node_id,
+            Some(retiring_shard.epoch),
+            Some(&old_handoff.handoff_id),
+        ));
+        assert_eq!(
+            authority
+                .returned_proof_revisions
+                .lock()
+                .expect("proof revisions")
+                .as_slice(),
+            &[old_revision, new_revision],
+            "no context may combine values from the two revisions"
+        );
     }
 
     #[test]
@@ -1582,6 +2002,21 @@ mod tests {
         let snapshot = cluster_kv.snapshot().expect("cluster kv snapshot");
         sinomo_core::kv::write_cluster_kv_snapshot(&cluster_paths.kv_paths(), &snapshot)
             .expect("write shard config");
+        cluster_paths
+            .kv_paths()
+            .raft_store()
+            .append_command_with_response(
+                &local,
+                sinomo_core::kv::KvCommand::Op(
+                    sinomo_core::kv::KvOp::put_serde(
+                        metadata_shard_key(&file_system.file_system_id, "root"),
+                        &shard,
+                        None,
+                    )
+                    .expect("canonical shard op"),
+                ),
+            )
+            .expect("write canonical shard config");
 
         let object_id =
             DfsObjectId::from_legacy_named("obj_dfs_status_scope_repair").expect("object");
@@ -1802,6 +2237,14 @@ mod tests {
             namespace_prepare_codec: Default::default(),
             default_policy: DfsObjectPolicy::ReplicatedEventual,
         };
+        *host
+            .retained_metadata_replica_context
+            .lock()
+            .expect("retained metadata replica context") = Some(DfsMetadataReplicaShardContext {
+            local_node_id: local.clone(),
+            shard: shard.clone(),
+            pending_membership_handoff: None,
+        });
         let mut cluster_kv = sinomo_core::kv::InProcessKvStore::restore(
             sinomo_core::kv::read_cluster_kv_cached_snapshot(&cluster_paths.kv_paths())
                 .expect("cluster kv snapshot"),

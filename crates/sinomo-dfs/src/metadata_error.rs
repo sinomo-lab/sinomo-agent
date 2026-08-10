@@ -8,7 +8,9 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::{DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsVersion};
+use crate::{
+    DfsFileSystemId, DfsMetadataShardId, DfsObjectId, DfsOperatorStatusOmission, DfsVersion,
+};
 
 /// Error returned by DFS metadata backends and metadata helper modules.
 #[derive(Debug, Error)]
@@ -17,6 +19,12 @@ pub enum MetadataBackendError {
     Io { path: PathBuf, source: io::Error },
     #[error("metadata serialization error: {0}")]
     Serde(String),
+    #[error("bounded metadata status unavailable: {reason}")]
+    StatusUnavailable { reason: String },
+    #[error("resident metadata shard {shard_id:?} is not hydrated for bounded status")]
+    StatusUnhydrated { shard_id: DfsMetadataShardId },
+    #[error("bounded metadata status omitted: {omission}")]
+    StatusOmitted { omission: DfsOperatorStatusOmission },
     #[error("filesystem not found: {file_system_id}")]
     UnknownFileSystem { file_system_id: DfsFileSystemId },
     #[error("object not found: {object_id}")]

@@ -11,8 +11,9 @@ use super::{
 };
 use crate::namespace::next_version;
 use crate::posix_model::{
-    DfsPosixError, DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsStat, Result,
-    read_conflict_error,
+    DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome,
+    DfsPosixDistributedOpenedFileRangeReadOutcome, DfsPosixError, DfsPosixFileRangeReadStream,
+    DfsPosixFileReadStream, DfsStat, Result, read_conflict_error,
 };
 use crate::posix_path::normalize_posix_path;
 use crate::{
@@ -42,12 +43,215 @@ struct PosixPendingBulkRead {
 
 #[derive(Clone, Debug)]
 enum PosixBulkReadPlan {
-    Local(Vec<u8>),
+    Immediate(DfsPosixDistributedFileReadOutcome),
     Remote {
         source: NodeId,
         pending: PosixPendingBulkRead,
     },
     Fallback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DistributedPosixFileContentObjectOutcome {
+    Found {
+        path: String,
+        object: DfsObjectMetadata,
+    },
+    NotFound {
+        path: String,
+    },
+    ContentUnavailable {
+        path: String,
+        detail: String,
+    },
+}
+
+fn distributed_file_content_outcome(
+    path: String,
+    object: &DfsObjectMetadata,
+    outcome: NetworkedDfsReadOutcome,
+) -> Result<DfsPosixDistributedFileReadOutcome> {
+    match outcome {
+        NetworkedDfsReadOutcome::Found {
+            data: DfsReadData { bytes, .. },
+            ..
+        } => Ok(DfsPosixDistributedFileReadOutcome::Found { bytes }),
+        NetworkedDfsReadOutcome::PendingReplication {
+            object_id,
+            version,
+            current_locations,
+            ..
+        } => Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+            path,
+            detail: format!(
+                "content for object {object_id} version {version} is pending replication; current locations: {current_locations:?}"
+            ),
+        }),
+        NetworkedDfsReadOutcome::NotConfirmed {
+            object_id,
+            version,
+            confirmed_locations,
+            required_locations,
+        } => Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+            path,
+            detail: format!(
+                "content for object {object_id} version {version} is not confirmed; confirmed locations: {confirmed_locations:?}; required locations: {required_locations:?}"
+            ),
+        }),
+        NetworkedDfsReadOutcome::NotFound => {
+            Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+                path,
+                detail: format!(
+                    "authoritative metadata exists for object {} version {}, but its content is unavailable from every eligible replica",
+                    object.object_id, object.version
+                ),
+            })
+        }
+        NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+            Err(read_conflict_error(path, conflicts))
+        }
+    }
+}
+
+fn legacy_distributed_file_read_result(
+    outcome: DfsPosixDistributedFileReadOutcome,
+) -> Result<Vec<u8>> {
+    match outcome {
+        DfsPosixDistributedFileReadOutcome::Found { bytes } => Ok(bytes),
+        DfsPosixDistributedFileReadOutcome::NotFound { path }
+        | DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, .. } => {
+            Err(DfsPosixError::NotFound { path })
+        }
+    }
+}
+
+fn distributed_file_range_content_outcome(
+    path: String,
+    object: &DfsObjectMetadata,
+    outcome: NetworkedDfsRangeReadOutcome,
+) -> Result<DfsPosixDistributedFileReadOutcome> {
+    match outcome {
+        NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+            validate_complete_posix_range_content_hash(object, &data)?;
+            Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: data.bytes })
+        }
+        NetworkedDfsRangeReadOutcome::PendingReplication {
+            object_id,
+            version,
+            current_locations,
+            ..
+        } => Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+            path,
+            detail: format!(
+                "content for object {object_id} version {version} is pending replication; current locations: {current_locations:?}"
+            ),
+        }),
+        NetworkedDfsRangeReadOutcome::NotConfirmed {
+            object_id,
+            version,
+            confirmed_locations,
+            required_locations,
+        } => Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+            path,
+            detail: format!(
+                "content for object {object_id} version {version} is not confirmed; confirmed locations: {confirmed_locations:?}; required locations: {required_locations:?}"
+            ),
+        }),
+        NetworkedDfsRangeReadOutcome::NotFound => {
+            Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+                path,
+                detail: format!(
+                    "authoritative metadata exists for object {} version {}, but its content is unavailable from every eligible replica",
+                    object.object_id, object.version
+                ),
+            })
+        }
+        NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+            Err(read_conflict_error(path, conflicts))
+        }
+    }
+}
+
+fn distributed_file_prefix_content_outcome(
+    path: String,
+    object: &DfsObjectMetadata,
+    outcome: NetworkedDfsRangeReadOutcome,
+    max_bytes: usize,
+) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
+    match outcome {
+        NetworkedDfsRangeReadOutcome::Found { data, .. } => {
+            let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+            validate_complete_posix_range_content_hash(object, &data)?;
+            Ok(DfsPosixDistributedFilePrefixReadOutcome::Found {
+                read: DfsPosixFilePrefixRead {
+                    bytes: data.bytes,
+                    truncated: data.total_size_bytes > max_bytes_u64,
+                },
+            })
+        }
+        NetworkedDfsRangeReadOutcome::PendingReplication {
+            object_id,
+            version,
+            current_locations,
+            ..
+        } => Ok(
+            DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable {
+                path,
+                detail: format!(
+                    "content for object {object_id} version {version} is pending replication; current locations: {current_locations:?}"
+                ),
+            },
+        ),
+        NetworkedDfsRangeReadOutcome::NotConfirmed {
+            object_id,
+            version,
+            confirmed_locations,
+            required_locations,
+        } => Ok(
+            DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable {
+                path,
+                detail: format!(
+                    "content for object {object_id} version {version} is not confirmed; confirmed locations: {confirmed_locations:?}; required locations: {required_locations:?}"
+                ),
+            },
+        ),
+        NetworkedDfsRangeReadOutcome::NotFound => Ok(
+            DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable {
+                path,
+                detail: format!(
+                    "authoritative metadata exists for object {} version {}, but its content is unavailable from every eligible replica",
+                    object.object_id, object.version
+                ),
+            },
+        ),
+        NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
+            Err(read_conflict_error(path, conflicts))
+        }
+    }
+}
+
+fn legacy_distributed_opened_file_range_read_result(
+    outcome: DfsPosixDistributedOpenedFileRangeReadOutcome,
+) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
+    match outcome {
+        DfsPosixDistributedOpenedFileRangeReadOutcome::Found { stat, read } => Ok((stat, read)),
+        DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path }
+        | DfsPosixDistributedOpenedFileRangeReadOutcome::ContentUnavailable { path, .. } => {
+            Err(DfsPosixError::NotFound { path })
+        }
+    }
+}
+
+fn legacy_distributed_file_prefix_read_result(
+    outcome: DfsPosixDistributedFilePrefixReadOutcome,
+) -> Result<DfsPosixFilePrefixRead> {
+    match outcome {
+        DfsPosixDistributedFilePrefixReadOutcome::Found { read } => Ok(read),
+        DfsPosixDistributedFilePrefixReadOutcome::NotFound { path }
+        | DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { path, .. } => {
+            Err(DfsPosixError::NotFound { path })
+        }
+    }
 }
 
 fn validate_complete_posix_range_content_hash(
@@ -108,6 +312,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsPosixError::IsDirectory { path });
         }
         Ok((path, object))
+    }
+
+    fn posix_file_content_object_candidate_outcome(
+        &self,
+        path: String,
+        object: DfsObjectMetadata,
+    ) -> Result<DistributedPosixFileContentObjectOutcome> {
+        if object.kind == DfsObjectKind::Tombstone {
+            return Ok(DistributedPosixFileContentObjectOutcome::NotFound { path });
+        }
+        let candidate_kind = object.kind.clone();
+        let candidate_object_id = object.object_id.clone();
+        let candidate_target_id = object.link_target_object_id.clone();
+        let object = match self.resolve_hardlink_target(&object) {
+            Ok(object) => object,
+            Err(DfsPosixError::NotFound { .. }) if candidate_kind == DfsObjectKind::Hardlink => {
+                return Ok(
+                    DistributedPosixFileContentObjectOutcome::ContentUnavailable {
+                        path,
+                        detail: format!(
+                            "hardlink object {candidate_object_id} references unavailable target {}",
+                            candidate_target_id
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "<missing target id>".to_string())
+                        ),
+                    },
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        if object.kind == DfsObjectKind::Directory {
+            return Err(DfsPosixError::IsDirectory { path });
+        }
+        Ok(DistributedPosixFileContentObjectOutcome::Found { path, object })
+    }
+
+    fn distributed_posix_file_content_object_outcome(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<DistributedPosixFileContentObjectOutcome> {
+        let (path, object) = match self.lookup_sifs_path_distributed_synced(path, follow_final) {
+            Ok(lookup) => lookup,
+            Err(DfsPosixError::NotFound { path }) => {
+                // Path resolution follows hardlinks before returning the
+                // terminal dentry. Probe the exact failing path only on this
+                // error path so a present hardlink whose target metadata is
+                // unavailable cannot be mistaken for namespace absence. Raw
+                // path absence, tombstones, and absent symlink targets still
+                // have no live hardlink at the failing path and remain
+                // authoritative NotFound outcomes.
+                let candidate = self.lookup_sifs_path_direct_distributed_synced(&path)?;
+                if let Some(candidate) = candidate
+                    && candidate.kind == DfsObjectKind::Hardlink
+                {
+                    return self.posix_file_content_object_candidate_outcome(path, candidate);
+                }
+                return Ok(DistributedPosixFileContentObjectOutcome::NotFound { path });
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(object) = object else {
+            return Ok(DistributedPosixFileContentObjectOutcome::NotFound { path });
+        };
+        self.posix_file_content_object_candidate_outcome(path, object)
     }
 
     fn local_posix_file_content_object(
@@ -177,6 +447,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_open_file_stream(&self, path: &str) -> Result<DfsPosixFileReadStream> {
         let (path, object) = self.local_posix_file_content_object(path, true)?;
+        self.open_local_posix_file_stream_for_object(path, object)
+    }
+
+    /// Resolve the current distributed namespace object before opening its
+    /// exact version from the local content store.
+    ///
+    /// Unlike [`Self::posix_open_file_stream`], this does not trust a live
+    /// service shell's local metadata hit: a different writer may have advanced
+    /// the path at its metadata-shard primary. Callers may fall back to the
+    /// remote stream API when the current exact version is not present locally.
+    pub fn posix_open_current_file_stream(&mut self, path: &str) -> Result<DfsPosixFileReadStream> {
+        self.check_cancelled("distributed local stream read")?;
+        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
+        self.open_local_posix_file_stream_for_object(path, object)
+    }
+
+    fn open_local_posix_file_stream_for_object(
+        &self,
+        path: String,
+        object: DfsObjectMetadata,
+    ) -> Result<DfsPosixFileReadStream> {
         match self.open_local_object_metadata_stream_with_state(&object)? {
             NetworkedDfsReadStreamOutcome::Found(stream) => Ok(DfsPosixFileReadStream {
                 object_id: stream.data.object_id,
@@ -252,6 +543,48 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Read a distributed file without collapsing content availability into
+    /// namespace absence.
+    ///
+    /// The metadata lookup establishes whether the path exists. Once it has
+    /// returned an exact object/version, every non-conflict content miss is an
+    /// availability failure, including a replica-layer `NotFound`: it cannot
+    /// revoke the already confirmed namespace object.
+    pub fn posix_read_file_distributed_outcome(
+        &mut self,
+        path: &str,
+    ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        self.check_cancelled("distributed read")?;
+        let trace_started = Instant::now();
+        let lookup_started = Instant::now();
+        let (path, object) = match self.distributed_posix_file_content_object_outcome(path, true)? {
+            DistributedPosixFileContentObjectOutcome::Found { path, object } => (path, object),
+            DistributedPosixFileContentObjectOutcome::NotFound { path } => {
+                return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
+            }
+            DistributedPosixFileContentObjectOutcome::ContentUnavailable { path, detail } => {
+                return Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail });
+            }
+        };
+        let lookup_elapsed_ms = lookup_started.elapsed().as_millis();
+        let fetch_started = Instant::now();
+        let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
+        let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+        let outcome = distributed_file_content_outcome(path.clone(), &object, outcome)?;
+        if let DfsPosixDistributedFileReadOutcome::Found { bytes } = &outcome {
+            crate::dfs_perf_trace(format_args!(
+                "posix-read-distributed path={} object={} bytes={} lookup_ms={} fetch_ms={} total_ms={}",
+                path,
+                object.object_id,
+                bytes.len(),
+                lookup_elapsed_ms,
+                fetch_elapsed_ms,
+                trace_started.elapsed().as_millis()
+            ));
+        }
+        Ok(outcome)
+    }
+
     /// Reads at most `max_bytes` from the authoritative version of `path` and
     /// reports whether more content remains. Path metadata is resolved once,
     /// then reused for the range fetch so callers do not perform a separate
@@ -261,26 +594,32 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<DfsPosixFilePrefixRead> {
+        let outcome = self.posix_read_file_prefix_distributed_outcome(path, max_bytes)?;
+        legacy_distributed_file_prefix_read_result(outcome)
+    }
+
+    /// Read a bounded distributed file prefix without collapsing content
+    /// availability into namespace absence.
+    pub fn posix_read_file_prefix_distributed_outcome(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
         self.check_cancelled("distributed prefix read")?;
-        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
-        match self
-            .read_object_metadata_range_or_fetch_remote_without_cache(&object, 0, max_bytes)?
-        {
-            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-                validate_complete_posix_range_content_hash(&object, &data)?;
-                Ok(DfsPosixFilePrefixRead {
-                    bytes: data.bytes,
-                    truncated: data.total_size_bytes > max_bytes_u64,
-                })
+        let (path, object) = match self.distributed_posix_file_content_object_outcome(path, true)? {
+            DistributedPosixFileContentObjectOutcome::Found { path, object } => (path, object),
+            DistributedPosixFileContentObjectOutcome::NotFound { path } => {
+                return Ok(DfsPosixDistributedFilePrefixReadOutcome::NotFound { path });
             }
-            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
-            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
+            DistributedPosixFileContentObjectOutcome::ContentUnavailable { path, detail } => {
+                return Ok(
+                    DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { path, detail },
+                );
             }
-        }
+        };
+        let outcome =
+            self.read_object_metadata_range_or_fetch_remote_without_cache(&object, 0, max_bytes)?;
+        distributed_file_prefix_content_outcome(path, &object, outcome, max_bytes)
     }
 
     /// Read a bounded prefix through a no-link scoped open.
@@ -295,7 +634,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
-        self.posix_read_file_range_beneath_no_links_distributed(root, path, 0, max_bytes)
+        legacy_distributed_opened_file_range_read_result(
+            self.posix_read_file_prefix_beneath_no_links_distributed_outcome(
+                root, path, max_bytes,
+            )?,
+        )
+    }
+
+    /// Typed counterpart of
+    /// [`Self::posix_read_file_prefix_beneath_no_links_distributed`].
+    ///
+    /// Compatibility callers retain the historical NotFound collapse. VFS and
+    /// service boundaries that make optional-read decisions use this method so
+    /// an exact opened file with unavailable content cannot look absent.
+    pub fn posix_read_file_prefix_beneath_no_links_distributed_outcome(
+        &mut self,
+        root: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<DfsPosixDistributedOpenedFileRangeReadOutcome> {
+        self.posix_read_file_range_beneath_no_links_distributed_outcome(root, path, 0, max_bytes)
     }
 
     /// Read one bounded range through a no-link scoped open.
@@ -311,7 +669,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<(DfsStat, DfsPosixFilePrefixRead)> {
-        let opened = self.posix_open_beneath_no_links_distributed(root, path)?;
+        legacy_distributed_opened_file_range_read_result(
+            self.posix_read_file_range_beneath_no_links_distributed_outcome(
+                root, path, offset, max_bytes,
+            )?,
+        )
+    }
+
+    /// Typed counterpart of
+    /// [`Self::posix_read_file_range_beneath_no_links_distributed`].
+    pub fn posix_read_file_range_beneath_no_links_distributed_outcome(
+        &mut self,
+        root: &str,
+        path: &str,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<DfsPosixDistributedOpenedFileRangeReadOutcome> {
+        let opened = match self.posix_open_beneath_no_links_distributed(root, path) {
+            Ok(opened) => opened,
+            Err(DfsPosixError::NotFound { path }) => {
+                return Ok(DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path });
+            }
+            Err(error) => return Err(error),
+        };
         if opened.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory {
                 path: opened.path.clone(),
@@ -327,11 +707,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: opened.path.clone(),
             });
         }
-        let bytes =
-            self.posix_read_file_range_for_opened_stat(&opened.path, &opened, offset, max_bytes)?;
-        let range_end = offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-        let truncated = size_bytes > range_end;
-        Ok((opened, DfsPosixFilePrefixRead { bytes, truncated }))
+        match self.posix_read_file_range_for_opened_stat_outcome(
+            &opened.path,
+            &opened,
+            offset,
+            max_bytes,
+        )? {
+            DfsPosixDistributedFileReadOutcome::Found { bytes } => {
+                let range_end =
+                    offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+                let truncated = size_bytes > range_end;
+                Ok(DfsPosixDistributedOpenedFileRangeReadOutcome::Found {
+                    stat: opened,
+                    read: DfsPosixFilePrefixRead { bytes, truncated },
+                })
+            }
+            DfsPosixDistributedFileReadOutcome::NotFound { path } => {
+                Ok(DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path })
+            }
+            DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail } => Ok(
+                DfsPosixDistributedOpenedFileRangeReadOutcome::ContentUnavailable { path, detail },
+            ),
+        }
     }
 
     /// Reads one bounded range from the authoritative version of `path`, fetching
@@ -364,10 +761,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_files_distributed(&mut self, paths: &[String]) -> Vec<Result<Vec<u8>>> {
+        self.posix_read_files_distributed_outcomes(paths)
+            .into_iter()
+            .map(|result| result.and_then(legacy_distributed_file_read_result))
+            .collect()
+    }
+
+    /// Bulk-read distributed files without collapsing unavailable content into
+    /// namespace absence.
+    ///
+    /// Metadata lookup and remote content transfer remain grouped exactly like
+    /// [`Self::posix_read_files_distributed`]. Each item retains the typed
+    /// distinction needed by optional-read service boundaries.
+    pub fn posix_read_files_distributed_outcomes(
+        &mut self,
+        paths: &[String],
+    ) -> Vec<Result<DfsPosixDistributedFileReadOutcome>> {
         if paths.len() <= 1 {
             return paths
                 .iter()
-                .map(|path| self.posix_read_file_distributed(path))
+                .map(|path| self.posix_read_file_distributed_outcome(path))
                 .collect();
         }
 
@@ -378,8 +791,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
         for (index, input_path) in paths.iter().enumerate() {
             match self.prepare_posix_bulk_read(input_path, index, &prefetched_objects) {
-                Ok(PosixBulkReadPlan::Local(bytes)) => {
-                    results[index] = Some(Ok(bytes));
+                Ok(PosixBulkReadPlan::Immediate(outcome)) => {
+                    results[index] = Some(Ok(outcome));
                 }
                 Ok(PosixBulkReadPlan::Remote { source, pending }) => {
                     grouped.entry(source).or_default().push(pending);
@@ -408,13 +821,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     for pending in pending_by_request_id.into_values() {
                         results[pending.index] =
-                            Some(self.posix_read_file_distributed(&pending.path));
+                            Some(self.posix_read_file_distributed_outcome(&pending.path));
                     }
                 }
                 Err(_) => {
                     for pending in pending_reads {
                         results[pending.index] =
-                            Some(self.posix_read_file_distributed(&pending.path));
+                            Some(self.posix_read_file_distributed_outcome(&pending.path));
                     }
                 }
             }
@@ -424,7 +837,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .into_iter()
             .enumerate()
             .map(|(index, result)| {
-                result.unwrap_or_else(|| self.posix_read_file_distributed(&paths[index]))
+                result.unwrap_or_else(|| self.posix_read_file_distributed_outcome(&paths[index]))
             })
             .collect()
     }
@@ -502,12 +915,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         index: usize,
         prefetched_objects: &BTreeMap<String, DfsObjectMetadata>,
     ) -> Result<PosixBulkReadPlan> {
-        let resolved = self.resolve_existing_posix_path_distributed(input_path, true)?;
-        let (path, object) = match prefetched_objects.get(&resolved) {
-            Some(object) => self.posix_file_content_object(resolved, object.clone())?,
-            None => self.distributed_posix_file_content_object(input_path, true)?,
+        let resolved = match self.resolve_existing_posix_path_distributed(input_path, true) {
+            Ok(resolved) => resolved,
+            Err(DfsPosixError::NotFound { .. }) => {
+                return match self.distributed_posix_file_content_object_outcome(input_path, true)? {
+                    DistributedPosixFileContentObjectOutcome::Found { path, object } => {
+                        self.prepare_posix_bulk_read_for_object(path, object, index)
+                    }
+                    DistributedPosixFileContentObjectOutcome::NotFound { path } => {
+                        Ok(PosixBulkReadPlan::Immediate(
+                            DfsPosixDistributedFileReadOutcome::NotFound { path },
+                        ))
+                    }
+                    DistributedPosixFileContentObjectOutcome::ContentUnavailable {
+                        path,
+                        detail,
+                    } => Ok(PosixBulkReadPlan::Immediate(
+                        DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail },
+                    )),
+                };
+            }
+            Err(error) => return Err(error),
         };
-        self.prepare_posix_bulk_read_for_object(path, object, index)
+        let candidate = match prefetched_objects.get(&resolved) {
+            Some(object) => {
+                self.posix_file_content_object_candidate_outcome(resolved, object.clone())?
+            }
+            None => self.distributed_posix_file_content_object_outcome(input_path, true)?,
+        };
+        match candidate {
+            DistributedPosixFileContentObjectOutcome::Found { path, object } => {
+                self.prepare_posix_bulk_read_for_object(path, object, index)
+            }
+            DistributedPosixFileContentObjectOutcome::NotFound { path } => Ok(
+                PosixBulkReadPlan::Immediate(DfsPosixDistributedFileReadOutcome::NotFound { path }),
+            ),
+            DistributedPosixFileContentObjectOutcome::ContentUnavailable { path, detail } => {
+                Ok(PosixBulkReadPlan::Immediate(
+                    DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail },
+                ))
+            }
+        }
     }
 
     fn prepare_posix_bulk_read_for_object(
@@ -520,12 +968,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             NetworkedDfsReadOutcome::Found {
                 data: DfsReadData { bytes, .. },
                 ..
-            } => return Ok(PosixBulkReadPlan::Local(bytes)),
+            } => {
+                return Ok(PosixBulkReadPlan::Immediate(
+                    DfsPosixDistributedFileReadOutcome::Found { bytes },
+                ));
+            }
             NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
                 return Err(read_conflict_error(path, conflicts));
             }
-            NetworkedDfsReadOutcome::NotConfirmed { .. } | NetworkedDfsReadOutcome::NotFound => {
-                return Err(DfsPosixError::NotFound { path });
+            outcome @ NetworkedDfsReadOutcome::NotConfirmed { .. }
+            | outcome @ NetworkedDfsReadOutcome::NotFound => {
+                return distributed_file_content_outcome(path, &object, outcome)
+                    .map(PosixBulkReadPlan::Immediate);
             }
             NetworkedDfsReadOutcome::PendingReplication { .. } => {}
         }
@@ -646,7 +1100,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         pending: &PosixPendingBulkRead,
         response: DfsBulkReadItemResponse,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<DfsPosixDistributedFileReadOutcome> {
         if response.object_id != pending.object_id {
             return Err(DfsPosixError::Dfs(DfsError::ContentHashMismatch {
                 expected: pending.object_id.to_string(),
@@ -690,13 +1144,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         actual: actual_hash,
                     }));
                 }
-                Ok(data.bytes)
+                Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: data.bytes })
             }
             DfsReadResult::RangeFound(_) => Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!("bulk read for {} returned a range result", pending.path),
             })),
-            DfsReadResult::NotFound => Err(DfsPosixError::NotFound {
+            DfsReadResult::NotFound => Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable {
                 path: pending.path.clone(),
+                detail: format!(
+                    "authoritative metadata exists for object {} version {}, but bulk-read source returned no content",
+                    pending.object_id, pending.version
+                ),
             }),
             DfsReadResult::Rejected { reason } => Err(DfsPosixError::Dfs(DfsError::Distributed {
                 message: reason,
@@ -891,12 +1349,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<u8>> {
+        legacy_distributed_file_read_result(
+            self.posix_read_file_range_for_opened_stat_outcome(path, opened, offset, max_bytes)?,
+        )
+    }
+
+    /// Typed exact-content range read for an already opened metadata receipt.
+    ///
+    /// The legacy method above intentionally preserves its public NotFound
+    /// compatibility contract. Guarded VFS reads use this outcome so a retained
+    /// receipt with an unavailable immutable content version remains distinct
+    /// from namespace absence.
+    pub fn posix_read_file_range_for_opened_stat_outcome(
+        &mut self,
+        path: &str,
+        opened: &DfsStat,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<DfsPosixDistributedFileReadOutcome> {
         if max_bytes == 0 {
-            return Ok(Vec::new());
+            return Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: Vec::new() });
         }
         let path = normalize_posix_path(path)?;
         if opened.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
+            return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
         }
         if opened.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
@@ -929,7 +1405,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             created_by_event_id: None,
             last_modified_by_event_id: None,
         };
-        self.posix_read_file_range_for_opened_metadata(path, object, offset, max_bytes, false)
+        self.posix_read_file_range_for_opened_metadata_outcome(
+            path, object, offset, max_bytes, false,
+        )
     }
 
     fn posix_read_file_range_for_opened_metadata(
@@ -940,31 +1418,43 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
         update_access: bool,
     ) -> Result<Vec<u8>> {
-        match self
-            .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?
+        legacy_distributed_file_read_result(
+            self.posix_read_file_range_for_opened_metadata_outcome(
+                path,
+                object,
+                offset,
+                max_bytes,
+                update_access,
+            )?,
+        )
+    }
+
+    fn posix_read_file_range_for_opened_metadata_outcome(
+        &mut self,
+        path: String,
+        object: DfsObjectMetadata,
+        offset: u64,
+        max_bytes: usize,
+        update_access: bool,
+    ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let outcome = self
+            .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?;
+        let read = distributed_file_range_content_outcome(path.clone(), &object, outcome)?;
+        if matches!(read, DfsPosixDistributedFileReadOutcome::Found { .. })
+            && update_access
+            && self.is_local_metadata_primary_for_object(&object)?
         {
-            NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                validate_complete_posix_range_content_hash(&object, &data)?;
-                if update_access && self.is_local_metadata_primary_for_object(&object)? {
-                    let mut current = self
-                        .object_by_id(&object.object_id)?
-                        .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-                    if current.kind == DfsObjectKind::Tombstone {
-                        return Err(DfsPosixError::NotFound { path });
-                    }
-                    current.accessed_at_unix_nanos = now_unix_nanos();
-                    current.version = next_version(&current.version);
-                    self.add_object_metadata(current)?;
-                }
-                Ok(data.bytes)
+            let Some(mut current) = self.object_by_id(&object.object_id)? else {
+                return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
+            };
+            if current.kind == DfsObjectKind::Tombstone {
+                return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
             }
-            NetworkedDfsRangeReadOutcome::PendingReplication { .. }
-            | NetworkedDfsRangeReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsRangeReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsRangeReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
+            current.accessed_at_unix_nanos = now_unix_nanos();
+            current.version = next_version(&current.version);
+            self.add_object_metadata(current)?;
         }
+        Ok(read)
     }
 
     pub(super) fn read_current_object_or_fetch_remote(
@@ -1442,6 +1932,182 @@ mod opened_stat_tests {
         ) -> std::result::Result<Vec<DfsRoutedMessage>, NetworkError> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn distributed_content_outcome_keeps_replica_unavailability_distinct_from_path_absence() {
+        let local = NodeId::from_legacy_named("node_typed_content_unavailable").expect("node id");
+        let object_id =
+            DfsObjectId::from_legacy_named("object_typed_content_unavailable").expect("object id");
+        let version =
+            DfsVersion::from_legacy_named("version_typed_content_unavailable").expect("version");
+        let object = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: sifs_file_system_id(),
+            path: "/catalog.sobj".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: local.clone(),
+            current_locations: vec![local.clone()],
+            content_hash: Some("blake3:catalog".to_string()),
+            content_size_bytes: Some(7),
+            link_target_object_id: None,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 1,
+            created_at_unix_nanos: 1,
+            changed_at_unix_nanos: 1,
+            version: version.clone(),
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+
+        for outcome in [
+            NetworkedDfsReadOutcome::PendingReplication {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: object.content_hash.clone(),
+                current_locations: vec![local.clone()],
+            },
+            NetworkedDfsReadOutcome::NotConfirmed {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                confirmed_locations: Vec::new(),
+                required_locations: vec![local.clone()],
+            },
+            // A content-layer miss after authoritative metadata lookup is not
+            // proof that the namespace path is absent.
+            NetworkedDfsReadOutcome::NotFound,
+        ] {
+            assert!(matches!(
+                distributed_file_content_outcome("/catalog.sobj".to_string(), &object, outcome,)
+                    .expect("typed content outcome"),
+                DfsPosixDistributedFileReadOutcome::ContentUnavailable { .. }
+            ));
+        }
+
+        for outcome in [
+            NetworkedDfsRangeReadOutcome::PendingReplication {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                content_hash: object.content_hash.clone(),
+                current_locations: vec![local.clone()],
+            },
+            NetworkedDfsRangeReadOutcome::NotConfirmed {
+                object_id: object_id.clone(),
+                version: version.clone(),
+                confirmed_locations: Vec::new(),
+                required_locations: vec![local.clone()],
+            },
+            NetworkedDfsRangeReadOutcome::NotFound,
+        ] {
+            assert!(matches!(
+                distributed_file_prefix_content_outcome(
+                    "/catalog.sobj".to_string(),
+                    &object,
+                    outcome,
+                    4,
+                )
+                .expect("typed prefix content outcome"),
+                DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { .. }
+            ));
+        }
+
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-hardlink-target-unavailable");
+        let mut service = NetworkedDfsService::new(
+            NoNetworkTransport {
+                local_node_id: local,
+            },
+            LocalContentStore::new(root.join("content")).expect("content store"),
+        );
+        let mut hardlink = object.clone();
+        hardlink.object_id = DfsObjectId::from_legacy_named("hardlink_typed_content_unavailable")
+            .expect("hardlink id");
+        hardlink.path = "/catalog-link.sobj".to_string();
+        hardlink.kind = DfsObjectKind::Hardlink;
+        hardlink.link_target_object_id = Some(
+            DfsObjectId::from_legacy_named("missing_hardlink_target").expect("missing target id"),
+        );
+        service
+            .add_object_metadata(hardlink.clone())
+            .expect("publish present hardlink dentry");
+        assert!(matches!(
+            service
+                .posix_read_file_distributed_outcome(&hardlink.path)
+                .expect("read present hardlink with unavailable target"),
+            DfsPosixDistributedFileReadOutcome::ContentUnavailable { .. }
+        ));
+        assert!(matches!(
+            service.posix_read_file_distributed(&hardlink.path),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(matches!(
+            service
+                .posix_read_file_prefix_distributed_outcome(&hardlink.path, 4)
+                .expect("prefix-read present hardlink with unavailable target"),
+            DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable { .. }
+        ));
+        assert!(matches!(
+            service.posix_read_file_prefix_distributed(&hardlink.path, 4),
+            Err(DfsPosixError::NotFound { .. })
+        ));
+        assert!(matches!(
+            service
+                .posix_read_file_prefix_distributed_outcome("/missing-prefix.sobj", 4)
+                .expect("classify missing prefix path"),
+            DfsPosixDistributedFilePrefixReadOutcome::NotFound { .. }
+        ));
+
+        let bulk_paths = vec![hardlink.path.clone(), "/missing-catalog.sobj".to_string()];
+        let bulk_outcomes = service.posix_read_files_distributed_outcomes(&bulk_paths);
+        assert!(matches!(
+            &bulk_outcomes[0],
+            Ok(DfsPosixDistributedFileReadOutcome::ContentUnavailable { .. })
+        ));
+        assert!(matches!(
+            &bulk_outcomes[1],
+            Ok(DfsPosixDistributedFileReadOutcome::NotFound { .. })
+        ));
+        let legacy_bulk = service.posix_read_files_distributed(&bulk_paths);
+        assert!(
+            legacy_bulk
+                .iter()
+                .all(|result| matches!(result, Err(DfsPosixError::NotFound { .. }))),
+            "legacy bulk callers retain their POSIX NotFound compatibility: {legacy_bulk:?}"
+        );
+
+        let pending = PosixPendingBulkRead {
+            index: 0,
+            path: hardlink.path.clone(),
+            request_id: "typed-bulk-content-miss".to_string(),
+            object_id: hardlink.object_id.clone(),
+            version: hardlink.version.clone(),
+            content_hash: "blake3:missing".to_string(),
+            content_size_bytes: 7,
+        };
+        let remote_miss = DfsBulkReadItemResponse {
+            request_id: pending.request_id.clone(),
+            object_id: pending.object_id.clone(),
+            result: DfsReadResult::NotFound,
+        };
+        assert!(matches!(
+            service
+                .validate_posix_bulk_read_response(&pending, remote_miss)
+                .expect("classify a bulk source content miss"),
+            DfsPosixDistributedFileReadOutcome::ContentUnavailable { .. }
+        ));
+
+        let mut tombstone = object;
+        tombstone.kind = DfsObjectKind::Tombstone;
+        assert!(matches!(
+            service
+                .posix_file_content_object_candidate_outcome(tombstone.path.clone(), tombstone,)
+                .expect("classify tombstone"),
+            DistributedPosixFileContentObjectOutcome::NotFound { .. }
+        ));
     }
 
     #[test]

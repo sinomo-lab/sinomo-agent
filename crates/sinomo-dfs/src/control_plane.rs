@@ -936,6 +936,92 @@ pub enum DfsMetadataShardAssignment {
     },
 }
 
+/// One bounded prefix projection paired with the revision and completeness
+/// certificate supplied by its authority path.
+///
+/// `complete` is deliberately explicit: callers which fence destructive work
+/// must reject a truncated projection even when every returned entry is valid.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsAuthoritativePrefixProjection {
+    entries: Vec<KvEntry>,
+    revision: KvRevision,
+    complete: bool,
+}
+
+impl DfsAuthoritativePrefixProjection {
+    pub fn complete(
+        prefix: &str,
+        entries: Vec<KvEntry>,
+        revision: KvRevision,
+    ) -> Result<Self, KvError> {
+        if entries.len() > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES {
+            return Err(KvError::RangeLimit {
+                prefix: prefix.to_string(),
+                max_entries: sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES,
+            });
+        }
+        let mut payload_bytes = 0_usize;
+        let mut previous_key: Option<&str> = None;
+        for entry in &entries {
+            payload_bytes = payload_bytes
+                .saturating_add(entry.key.len())
+                .saturating_add(entry.value.len());
+            if payload_bytes > sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES {
+                return Err(KvError::RangePayloadLimit {
+                    prefix: prefix.to_string(),
+                    observed_bytes: payload_bytes,
+                    max_bytes: sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES,
+                });
+            }
+            if !entry.key.starts_with(prefix) {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "authoritative prefix {prefix:?} returned out-of-scope key {:?}",
+                        entry.key,
+                    ),
+                });
+            }
+            if previous_key.is_some_and(|previous| previous >= entry.key.as_str()) {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "authoritative prefix {prefix:?} did not return strictly ordered keys"
+                    ),
+                });
+            }
+            if entry.create_revision > entry.modify_revision || entry.modify_revision > revision {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "authoritative prefix entry {:?} has revisions {}..{} outside proof revision {}",
+                        entry.key, entry.create_revision.0, entry.modify_revision.0, revision.0,
+                    ),
+                });
+            }
+            previous_key = Some(entry.key.as_str());
+        }
+        Ok(Self {
+            entries,
+            revision,
+            complete: true,
+        })
+    }
+
+    pub fn entries(&self) -> &[KvEntry] {
+        &self.entries
+    }
+
+    pub fn revision(&self) -> KvRevision {
+        self.revision
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub fn into_parts(self) -> (Vec<KvEntry>, KvRevision, bool) {
+        (self.entries, self.revision, self.complete)
+    }
+}
+
 pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     fn refresh_latest(&mut self) -> Result<(), KvError> {
         Ok(())
@@ -964,7 +1050,51 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
     }
 
     fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError>;
+
+    /// Read a small set of exact keys from one coherent client view.
+    ///
+    /// The default is sufficient for clients whose `&self` reads are backed by
+    /// one immutable or exclusively-owned snapshot. Clients that issue a fresh
+    /// authority RPC for each point read must override this method and pin all
+    /// returned entries to one authoritative revision.
+    fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
+        keys.iter().map(|key| self.get(key)).collect()
+    }
+
+    /// Establish one authoritative view for an exact, bounded key set.
+    ///
+    /// The default preserves compatibility with snapshot-backed clients by
+    /// refreshing once and then projecting every key from that one view.
+    /// Clients with a native exact-key-set ReadIndex route override this method
+    /// so an operation fence never imports the complete KV snapshot first.
+    fn get_authoritative_consistent(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.refresh_latest()?;
+        self.get_consistent(keys)
+    }
+
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
+
+    /// Establish one authoritative, complete view of a bounded prefix.
+    ///
+    /// Unlike [`Self::range_prefix`], this method is an authority capability:
+    /// callers may use a successful result to fence destructive work. Generic
+    /// observational clients deliberately fail closed instead of promoting a
+    /// local/materialized projection to cluster authority. Daemon and mounted
+    /// clients override this with their bounded ReadIndex prefix route.
+    fn range_prefix_authoritative(
+        &mut self,
+        prefix: &str,
+    ) -> Result<DfsAuthoritativePrefixProjection, KvError> {
+        Err(KvError::AuthorityUnavailable {
+            detail: format!(
+                "control-plane client cannot establish authoritative prefix {prefix:?}"
+            ),
+        })
+    }
+
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError>;
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError>;
 
@@ -1005,6 +1135,24 @@ pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
     }
 
     fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>>;
+
+    /// Async counterpart of [`DfsControlPlaneKvClient::get_consistent`].
+    fn get_consistent_async<'a>(
+        &'a self,
+        keys: Vec<String>,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>>;
+
+    /// Async counterpart of
+    /// [`DfsControlPlaneKvClient::get_authoritative_consistent`].
+    fn get_authoritative_consistent_async<'a>(
+        &'a mut self,
+        keys: Vec<String>,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        Box::pin(async move {
+            self.refresh_latest_async().await?;
+            self.get_consistent_async(keys).await
+        })
+    }
 
     fn range_prefix_async<'a>(
         &'a self,
@@ -1107,6 +1255,27 @@ where
             .get(key)
     }
 
+    fn get_consistent(&self, keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .get_consistent(keys)
+    }
+
+    fn get_authoritative_consistent(
+        &mut self,
+        keys: &[String],
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .get_authoritative_consistent(keys)
+    }
+
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
         self.inner
             .lock()
@@ -1114,6 +1283,18 @@ where
                 detail: "control-plane KV client lock poisoned".to_string(),
             })?
             .range_prefix(prefix)
+    }
+
+    fn range_prefix_authoritative(
+        &mut self,
+        prefix: &str,
+    ) -> Result<DfsAuthoritativePrefixProjection, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .range_prefix_authoritative(prefix)
     }
 
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -1163,6 +1344,17 @@ impl DfsControlPlaneKvClient for InProcessKvStore {
         self.range_prefix(prefix)
     }
 
+    fn range_prefix_authoritative(
+        &mut self,
+        prefix: &str,
+    ) -> Result<DfsAuthoritativePrefixProjection, KvError> {
+        DfsAuthoritativePrefixProjection::complete(
+            prefix,
+            self.range_prefix(prefix)?,
+            self.revision(),
+        )
+    }
+
     fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
         InProcessKvStore::put(self, key, value, None)
     }
@@ -1175,6 +1367,14 @@ impl DfsControlPlaneKvClient for InProcessKvStore {
 impl AsyncDfsControlPlaneKvClient for InProcessKvStore {
     fn get_async<'a>(&'a self, key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
         Box::pin(async move { DfsControlPlaneKvClient::get(self, key) })
+    }
+
+    fn get_consistent_async<'a>(
+        &'a self,
+        keys: Vec<String>,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        let result = DfsControlPlaneKvClient::get_consistent(self, &keys);
+        Box::pin(async move { result })
     }
 
     fn range_prefix_async<'a>(
@@ -2972,7 +3172,7 @@ impl<'a> DfsControlPlaneStore<'a> {
             metadata_shard_operation_floor_key(&expected.file_system_id, &expected.shard_id);
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
-        for _ in 0..METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
+        for attempt in 0..METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
             let Some(shard_entry) = self.kv.get(&shard_key)? else {
                 return Ok(None);
             };
@@ -2986,6 +3186,52 @@ impl<'a> DfsControlPlaneStore<'a> {
             let floor_entry = self.kv.get(&floor_key)?;
             if let Some(previous_entry) = floor_entry.as_ref() {
                 let previous = previous_entry.decode::<DfsMetadataShardOperationFloor>()?;
+                if previous.authority_epoch == expected.epoch
+                    && previous.prepared_sequence == prepared_sequence
+                    && previous.operation_digest == operation_digest
+                    && !previous.permit_id.is_empty()
+                {
+                    // The floor came from an observational projection. Reuse
+                    // its permit only after one authoritative transaction has
+                    // revalidated the exact assignment, exact floor bytes,
+                    // and absence of a handoff. The nonce advances only the
+                    // generic authority barrier; exact replay must not replace
+                    // the operation floor or mint a new permit.
+                    let response = self.kv.txn(KvTxn {
+                        compares: vec![
+                            KvCompare::ValueEquals {
+                                key: shard_key.clone(),
+                                value: shard_entry.value.clone(),
+                            },
+                            KvCompare::ValueEquals {
+                                key: floor_key.clone(),
+                                value: previous_entry.value.clone(),
+                            },
+                            KvCompare::Missing {
+                                key: handoff_key.clone(),
+                            },
+                        ],
+                        success: vec![KvOp::Put {
+                            key: metadata_shard_authority_barrier_key(
+                                &expected.file_system_id,
+                                &expected.shard_id,
+                            ),
+                            value: sinomo_core::kv::encode_kv_value(
+                                &sinomo_core::Id::generate().to_string(),
+                            )?,
+                            lease_id: None,
+                        }],
+                        failure: Vec::new(),
+                    })?;
+                    if response.succeeded {
+                        return Ok(Some(previous.permit_id));
+                    }
+                    if attempt + 1 < METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
+                        self.kv.refresh_latest()?;
+                        continue;
+                    }
+                    return Ok(None);
+                }
                 if previous.authority_epoch > expected.epoch
                     || previous.prepared_sequence > prepared_sequence
                     || (previous.prepared_sequence == prepared_sequence
@@ -3028,6 +3274,15 @@ impl<'a> DfsControlPlaneStore<'a> {
             if response.succeeded {
                 return Ok(Some(permit_id));
             }
+            // Reads above may come from a lagging materialized projection,
+            // while the transaction compare always executes against the
+            // authoritative Raft state. Do not repeat the same stale CAS for
+            // every retry: refresh before rebuilding the next compare. This
+            // path is reached only after the healthy full-shard DFS authority
+            // probe could not complete.
+            if attempt + 1 < METADATA_OPERATION_FLOOR_PUBLISH_RETRIES {
+                self.kv.refresh_latest()?;
+            }
         }
         Ok(None)
     }
@@ -3043,17 +3298,40 @@ impl<'a> DfsControlPlaneStore<'a> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, KvError> {
-        self.kv.refresh_latest()?;
         let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
-        let Some(entry) = self.kv.get(&key)? else {
+        let requested_keys = [key, handoff_key];
+        let entries = self.kv.get_authoritative_consistent(&requested_keys)?;
+        if entries.len() != requested_keys.len() {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "consistent metadata-shard authority read returned {} entries for {} exact keys",
+                    entries.len(),
+                    requested_keys.len(),
+                ),
+            });
+        }
+        for (requested_key, entry) in requested_keys.iter().zip(&entries) {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.key != *requested_key)
+            {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "consistent metadata-shard authority read returned an out-of-order entry for exact key {requested_key:?}"
+                    ),
+                });
+            }
+        }
+        let mut entries = entries.into_iter();
+        let Some(entry) = entries.next().flatten() else {
             return Ok(false);
         };
         if entry.decode::<DfsMetadataShardConfig>()? != *expected {
             return Ok(false);
         }
-        if self.kv.get(&handoff_key)?.is_some() {
+        if entries.next().flatten().is_some() {
             return Ok(false);
         }
         Ok(true)
@@ -3884,17 +4162,43 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, KvError> {
-        self.kv.refresh_latest_async().await?;
         let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
-        let Some(entry) = self.kv.get_async(&key).await? else {
+        let requested_keys = vec![key, handoff_key];
+        let entries = self
+            .kv
+            .get_authoritative_consistent_async(requested_keys.clone())
+            .await?;
+        if entries.len() != requested_keys.len() {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "consistent metadata-shard authority read returned {} entries for {} exact keys",
+                    entries.len(),
+                    requested_keys.len(),
+                ),
+            });
+        }
+        for (requested_key, entry) in requested_keys.iter().zip(&entries) {
+            if entry
+                .as_ref()
+                .is_some_and(|entry| entry.key != *requested_key)
+            {
+                return Err(KvError::Serialization {
+                    detail: format!(
+                        "consistent metadata-shard authority read returned an out-of-order entry for exact key {requested_key:?}"
+                    ),
+                });
+            }
+        }
+        let mut entries = entries.into_iter();
+        let Some(entry) = entries.next().flatten() else {
             return Ok(false);
         };
         if entry.decode::<DfsMetadataShardConfig>()? != *expected {
             return Ok(false);
         }
-        if self.kv.get_async(&handoff_key).await?.is_some() {
+        if entries.next().flatten().is_some() {
             return Ok(false);
         }
         Ok(true)
@@ -5065,6 +5369,143 @@ fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
 mod tests {
     use super::*;
     use crate::{DfsNodeAdvertisement, DfsPlacementReconciliationState, DfsPlacementScope};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A client whose generic refresh and point-read paths are deliberately
+    /// unusable. Metadata authority validation can succeed only by selecting
+    /// the single native exact-key-set operation.
+    #[derive(Debug)]
+    struct ExactAuthorityOnlyKv {
+        inner: InProcessKvStore,
+        refresh_calls: AtomicUsize,
+        coherent_observation_calls: AtomicUsize,
+        authoritative_exact_set_calls: AtomicUsize,
+        requested_exact_sets: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ExactAuthorityOnlyKv {
+        fn new(inner: InProcessKvStore) -> Self {
+            Self {
+                inner,
+                refresh_calls: AtomicUsize::new(0),
+                coherent_observation_calls: AtomicUsize::new(0),
+                authoritative_exact_set_calls: AtomicUsize::new(0),
+                requested_exact_sets: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reject_full_refresh(&self) -> KvError {
+            KvError::Io {
+                path: "test full snapshot refresh".to_string(),
+                detail: "metadata authority validation must not import a full snapshot".to_string(),
+            }
+        }
+
+        fn authoritative_exact_set(
+            &self,
+            keys: &[String],
+        ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.authoritative_exact_set_calls
+                .fetch_add(1, Ordering::SeqCst);
+            self.requested_exact_sets
+                .lock()
+                .expect("exact authority requests")
+                .push(keys.to_vec());
+            Ok(keys
+                .iter()
+                .map(|key| self.inner.get(key).cloned())
+                .collect())
+        }
+    }
+
+    impl DfsControlPlaneKvClient for ExactAuthorityOnlyKv {
+        fn refresh_latest(&mut self) -> Result<(), KvError> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.reject_full_refresh())
+        }
+
+        fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            Err(self.reject_full_refresh())
+        }
+
+        fn get_consistent(&self, _keys: &[String]) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.coherent_observation_calls
+                .fetch_add(1, Ordering::SeqCst);
+            Err(self.reject_full_refresh())
+        }
+
+        fn get_authoritative_consistent(
+            &mut self,
+            keys: &[String],
+        ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.authoritative_exact_set(keys)
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.inner.txn(txn)
+        }
+    }
+
+    impl AsyncDfsControlPlaneKvClient for ExactAuthorityOnlyKv {
+        fn refresh_latest_async<'a>(&'a mut self) -> DfsControlPlaneKvFuture<'a, ()> {
+            self.refresh_calls.fetch_add(1, Ordering::SeqCst);
+            let result = Err(self.reject_full_refresh());
+            Box::pin(async move { result })
+        }
+
+        fn get_async<'a>(&'a self, _key: &'a str) -> DfsControlPlaneKvFuture<'a, Option<KvEntry>> {
+            let result = Err(self.reject_full_refresh());
+            Box::pin(async move { result })
+        }
+
+        fn get_consistent_async<'a>(
+            &'a self,
+            _keys: Vec<String>,
+        ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+            self.coherent_observation_calls
+                .fetch_add(1, Ordering::SeqCst);
+            let result = Err(self.reject_full_refresh());
+            Box::pin(async move { result })
+        }
+
+        fn get_authoritative_consistent_async<'a>(
+            &'a mut self,
+            keys: Vec<String>,
+        ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+            let result = self.authoritative_exact_set(&keys);
+            Box::pin(async move { result })
+        }
+
+        fn range_prefix_async<'a>(
+            &'a self,
+            prefix: &'a str,
+        ) -> DfsControlPlaneKvFuture<'a, Vec<KvEntry>> {
+            let result = self.inner.range_prefix(prefix);
+            Box::pin(async move { result })
+        }
+
+        fn put_async<'a>(
+            &'a mut self,
+            key: String,
+            value: Vec<u8>,
+        ) -> DfsControlPlaneKvFuture<'a, KvRevision> {
+            let result = self.inner.put(key, value, None);
+            Box::pin(async move { result })
+        }
+
+        fn txn_async<'a>(&'a mut self, txn: KvTxn) -> DfsControlPlaneKvFuture<'a, KvTxnResponse> {
+            let result = self.inner.txn(txn);
+            Box::pin(async move { result })
+        }
+    }
 
     #[derive(Debug)]
     struct RejectPlacementHistoryRangeKv {
@@ -8202,6 +8643,78 @@ mod tests {
         assert_eq!(handoff.desired_shard, desired);
     }
 
+    fn exact_authority_test_fixture(
+        test_name: &str,
+    ) -> (ExactAuthorityOnlyKv, DfsMetadataShardConfig) {
+        let owner = node(&format!("{test_name}-owner"));
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: Vec::new(),
+            epoch: 19,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("put exact-authority shard");
+        (ExactAuthorityOnlyKv::new(inner), shard)
+    }
+
+    fn assert_one_exact_authority_read(
+        client: &ExactAuthorityOnlyKv,
+        shard: &DfsMetadataShardConfig,
+    ) {
+        assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client.coherent_observation_calls.load(Ordering::SeqCst),
+            0,
+            "authority validation must not fall back to cached point reads"
+        );
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            1,
+            "one operation fence must issue exactly one exact-key-set read"
+        );
+        assert_eq!(
+            client
+                .requested_exact_sets
+                .lock()
+                .expect("exact authority requests")
+                .as_slice(),
+            &[vec![
+                metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id,),
+            ]]
+        );
+    }
+
+    #[test]
+    fn metadata_shard_authority_uses_one_exact_set_without_full_snapshot_refresh() {
+        let (mut client, shard) = exact_authority_test_fixture("sync-exact-authority");
+        assert!(
+            DfsControlPlaneStore::new(&mut client)
+                .metadata_shard_authority_is_current(&shard)
+                .expect("exact operation-bound authority validation")
+        );
+        assert_one_exact_authority_read(&client, &shard);
+    }
+
+    #[tokio::test]
+    async fn async_metadata_shard_authority_uses_one_exact_set_without_full_snapshot_refresh() {
+        let (mut client, shard) = exact_authority_test_fixture("async-exact-authority");
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut client)
+                .metadata_shard_authority_is_current(&shard)
+                .await
+                .expect("async exact operation-bound authority validation")
+        );
+        assert_one_exact_authority_read(&client, &shard);
+    }
+
     #[test]
     fn metadata_shard_authority_check_rejects_stale_assignment_without_writing_kv() {
         let owner = node("node_authority_stale_owner");
@@ -8237,6 +8750,234 @@ mod tests {
                 .expect("stale authority check")
         );
         assert_eq!(kv.revision(), revision_before);
+    }
+
+    #[test]
+    fn metadata_operation_floor_refreshes_after_stale_observed_cas() {
+        let owner = node("node_operation_floor_refresh_owner");
+        let replica = node("node_operation_floor_refresh_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replica],
+            epoch: 73,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
+        let stale_floor = DfsMetadataShardOperationFloor {
+            operation_digest: "blake3:stale-observed-floor".to_string(),
+            prepared_sequence: 20268,
+            authority_epoch: 71,
+            permit_id: "stale-observed-permit".to_string(),
+        };
+        let authoritative_floor = DfsMetadataShardOperationFloor {
+            operation_digest: "blake3:authoritative-predecessor-floor".to_string(),
+            prepared_sequence: 20274,
+            authority_epoch: shard.epoch,
+            permit_id: "authoritative-predecessor-permit".to_string(),
+        };
+
+        let mut observed = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut observed)
+            .put_metadata_shard(&shard)
+            .expect("put observed shard");
+        observed
+            .put_serde(floor_key.clone(), &stale_floor, None)
+            .expect("put stale observed floor");
+        let mut authoritative = InProcessKvStore::restore(
+            observed
+                .try_snapshot()
+                .expect("snapshot stale observed state"),
+        )
+        .expect("restore authoritative state");
+        authoritative
+            .put_serde(floor_key.clone(), &authoritative_floor, None)
+            .expect("advance authoritative floor");
+
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let requested_digest = "blake3:requested-after-refresh";
+        let requested_sequence = authoritative_floor.prepared_sequence + 1;
+        let permit_id = DfsControlPlaneStore::new(&mut client)
+            .certify_metadata_shard_operation(&shard, requested_digest, requested_sequence)
+            .expect("certify after refreshing stale floor")
+            .expect("operation permit");
+        let committed = client
+            .authoritative
+            .get(&floor_key)
+            .expect("committed operation floor")
+            .decode::<DfsMetadataShardOperationFloor>()
+            .expect("decode committed operation floor");
+        assert_eq!(committed.operation_digest, requested_digest);
+        assert_eq!(committed.prepared_sequence, requested_sequence);
+        assert_eq!(committed.authority_epoch, shard.epoch);
+        assert_eq!(committed.permit_id, permit_id);
+    }
+
+    #[test]
+    fn metadata_operation_floor_exact_replay_reuses_authoritative_permit() {
+        let owner = node("node_operation_floor_replay_owner");
+        let replica = node("node_operation_floor_replay_replica");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replica],
+            epoch: 73,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
+        let stale_floor = DfsMetadataShardOperationFloor {
+            operation_digest: "blake3:stale-replay-floor".to_string(),
+            prepared_sequence: 20268,
+            authority_epoch: 71,
+            permit_id: "stale-replay-permit".to_string(),
+        };
+        let exact_floor = DfsMetadataShardOperationFloor {
+            operation_digest: "blake3:exact-replayed-operation".to_string(),
+            prepared_sequence: 20274,
+            authority_epoch: shard.epoch,
+            permit_id: "existing-authoritative-permit".to_string(),
+        };
+
+        let mut observed = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut observed)
+            .put_metadata_shard(&shard)
+            .expect("put observed shard");
+        observed
+            .put_serde(floor_key.clone(), &stale_floor, None)
+            .expect("put stale observed floor");
+        let mut authoritative = InProcessKvStore::restore(
+            observed
+                .try_snapshot()
+                .expect("snapshot stale observed state"),
+        )
+        .expect("restore authoritative state");
+        authoritative
+            .put_serde(floor_key.clone(), &exact_floor, None)
+            .expect("install exact authoritative floor");
+        let barrier_key = metadata_shard_authority_barrier_key(&file_system_id, &shard.shard_id);
+
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        let permit_id = DfsControlPlaneStore::new(&mut client)
+            .certify_metadata_shard_operation(
+                &shard,
+                &exact_floor.operation_digest,
+                exact_floor.prepared_sequence,
+            )
+            .expect("certify exact replay after refreshing stale floor")
+            .expect("existing operation permit");
+        assert_eq!(permit_id, exact_floor.permit_id);
+        assert!(
+            client.authoritative.get(&barrier_key).is_some(),
+            "exact replay must be revalidated through an authoritative barrier"
+        );
+        assert_eq!(
+            client
+                .authoritative
+                .get(&floor_key)
+                .expect("exact operation floor")
+                .decode::<DfsMetadataShardOperationFloor>()
+                .expect("decode exact operation floor"),
+            exact_floor
+        );
+    }
+
+    #[test]
+    fn metadata_operation_floor_stale_exact_replay_cannot_bypass_authoritative_handoff() {
+        let owner = node("node_operation_floor_handoff_owner");
+        let replica = node("node_operation_floor_handoff_replica");
+        let replacement = node("node_operation_floor_handoff_replacement");
+        let file_system_id = file_system_id();
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: owner,
+            replica_node_ids: vec![replica],
+            epoch: 73,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            replica_node_ids: vec![replacement],
+            epoch: shard.epoch + 1,
+            ..shard.clone()
+        };
+        let floor_key = metadata_shard_operation_floor_key(&file_system_id, &shard.shard_id);
+        let handoff_key = metadata_shard_membership_handoff_key(&file_system_id, &shard.shard_id);
+        let barrier_key = metadata_shard_authority_barrier_key(&file_system_id, &shard.shard_id);
+        let exact_floor = DfsMetadataShardOperationFloor {
+            operation_digest: "blake3:exact-before-authoritative-handoff".to_string(),
+            prepared_sequence: 20274,
+            authority_epoch: shard.epoch,
+            permit_id: "permit-before-authoritative-handoff".to_string(),
+        };
+
+        let mut observed = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut observed)
+            .put_metadata_shard(&shard)
+            .expect("put observed shard");
+        observed
+            .put_serde(floor_key.clone(), &exact_floor, None)
+            .expect("put observed exact floor");
+        let mut authoritative = InProcessKvStore::restore(
+            observed
+                .try_snapshot()
+                .expect("snapshot stale observed state"),
+        )
+        .expect("restore authoritative state");
+        authoritative
+            .put_serde(
+                handoff_key,
+                &DfsMetadataShardMembershipHandoff {
+                    handoff_id: "authoritative-handoff".to_string(),
+                    retiring_shard: shard.clone(),
+                    desired_shard: desired,
+                    required_prepared_sequence: exact_floor.prepared_sequence,
+                    required_head_watermark: None,
+                    retiring_primary_fence: None,
+                },
+                None,
+            )
+            .expect("install authoritative handoff");
+
+        let mut client = StaleObservedAuthoritativeTxnKv {
+            observed,
+            authoritative,
+        };
+        assert!(
+            DfsControlPlaneStore::new(&mut client)
+                .certify_metadata_shard_operation(
+                    &shard,
+                    &exact_floor.operation_digest,
+                    exact_floor.prepared_sequence,
+                )
+                .expect("reject stale exact replay against authoritative handoff")
+                .is_none()
+        );
+        assert!(client.authoritative.get(&barrier_key).is_none());
+        assert_eq!(
+            client
+                .authoritative
+                .get(&floor_key)
+                .expect("operation floor remains")
+                .decode::<DfsMetadataShardOperationFloor>()
+                .expect("decode operation floor"),
+            exact_floor
+        );
     }
 
     #[test]

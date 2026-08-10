@@ -137,12 +137,40 @@ impl MountedSifsVfsBackend {
     }
 
     fn stat_exists(opened: &mut OpenedMountedSifsService, path: &str) -> Result<bool> {
-        let stat = opened.service.posix_stat_distributed(path);
-        match stat {
+        match mounted_distributed_stat(opened, path) {
             Ok(_) => Ok(true),
-            Err(DfsPosixError::NotFound { .. }) => Ok(false),
-            Err(source) => Err(dfs_error_to_vfs("mounted-sifs", path, source)),
+            Err(VfsError::NotFound { .. }) => Ok(false),
+            Err(source) => Err(source),
         }
+    }
+}
+
+fn mounted_distributed_stat(opened: &mut OpenedMountedSifsService, path: &str) -> Result<DfsStat> {
+    match opened.service.posix_stat_distributed(path) {
+        Ok(stat) => Ok(stat),
+        Err(DfsPosixError::NotFound { path: missing_path }) => {
+            match opened.service.posix_namespace_lstat_distributed(path) {
+                Err(DfsPosixError::NotFound { .. }) => {
+                    Err(VfsError::NotFound { path: missing_path })
+                }
+                // A dangling symlink has a confirmed absent dereferenced
+                // target. Missing link-body content is a distinct
+                // SymlinkContentPending error and never reaches this branch.
+                Ok(candidate) if candidate.kind == DfsObjectKind::Symlink => {
+                    Err(VfsError::NotFound { path: missing_path })
+                }
+                Ok(candidate) => Err(VfsError::Backend {
+                    backend: "mounted-sifs".to_string(),
+                    path: path.to_string(),
+                    detail: format!(
+                        "SIFS stat could not resolve the path, but authoritative namespace metadata still contains {:?} object {}",
+                        candidate.kind, candidate.object_id
+                    ),
+                }),
+                Err(source) => Err(dfs_error_to_vfs("mounted-sifs", path, source)),
+            }
+        }
+        Err(source) => Err(dfs_error_to_vfs("mounted-sifs", path, source)),
     }
 }
 
@@ -153,10 +181,7 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn stat(&self, path: &str) -> Result<VfsMetadata> {
         let mut opened = self.lock(path)?;
-        let stat = opened
-            .service
-            .posix_stat_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let stat = mounted_distributed_stat(&mut opened, path)?;
         Ok(metadata_from_dfs_stat(stat))
     }
 
@@ -260,30 +285,24 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
         let mut opened = self.lock(path)?;
-        opened
+        let outcome = opened
             .service
-            .posix_read_file_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))
+            .posix_read_file_distributed_outcome(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        dfs_distributed_read_outcome_to_vfs(self.backend_name(), path, outcome)
     }
 
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
         let mut opened = self.lock(path)?;
-        let stat = opened
-            .service
-            .posix_stat_distributed(path)
-            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
         let length = usize::try_from(max_bytes).map_err(|_| VfsError::InvalidPath {
             path: path.to_string(),
             detail: "read prefix length does not fit this platform".to_string(),
         })?;
-        let bytes = opened
+        let outcome = opened
             .service
-            .posix_read_file_range_distributed(path, 0, length)
+            .posix_read_file_prefix_distributed_outcome(path, length)
             .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(VfsFileRead {
-            bytes,
-            truncated: stat.size_bytes.unwrap_or(0) > max_bytes,
-        })
+        dfs_distributed_prefix_read_outcome_to_vfs(self.backend_name(), path, outcome)
     }
 
     fn read_prefix_beneath_no_links(
@@ -297,15 +316,11 @@ impl VfsBackend for MountedSifsVfsBackend {
             detail: "read prefix length does not fit this platform".to_string(),
         })?;
         let mut opened = self.lock(path)?;
-        let (stat, read) = opened
+        let outcome = opened
             .service
-            .posix_read_file_prefix_beneath_no_links_distributed(root, path, length)
+            .posix_read_file_prefix_beneath_no_links_distributed_outcome(root, path, length)
             .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(VfsOpenedFileRead {
-            metadata: metadata_from_dfs_stat(stat),
-            bytes: read.bytes,
-            truncated: read.truncated,
-        })
+        dfs_distributed_opened_range_read_outcome_to_vfs(self.backend_name(), path, outcome)
     }
 
     fn read_range_beneath_no_links(
@@ -320,15 +335,11 @@ impl VfsBackend for MountedSifsVfsBackend {
             detail: "read range length does not fit this platform".to_string(),
         })?;
         let mut opened = self.lock(path)?;
-        let (stat, read) = opened
+        let outcome = opened
             .service
-            .posix_read_file_range_beneath_no_links_distributed(root, path, offset, length)
+            .posix_read_file_range_beneath_no_links_distributed_outcome(root, path, offset, length)
             .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
-        Ok(VfsOpenedFileRead {
-            metadata: metadata_from_dfs_stat(stat),
-            bytes: read.bytes,
-            truncated: read.truncated,
-        })
+        dfs_distributed_opened_range_read_outcome_to_vfs(self.backend_name(), path, outcome)
     }
 
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
@@ -498,11 +509,16 @@ impl VfsBackend for MountedSifsVfsBackend {
 
     fn append(&self, path: &str, bytes: &[u8], options: &VfsAppendOptions) -> Result<()> {
         let mut opened = self.lock(path)?;
-        let mut contents = match opened.service.posix_read_file_distributed(path) {
-            Ok(bytes) => bytes,
-            Err(DfsPosixError::NotFound { .. }) if options.create => Vec::new(),
-            Err(source) => return Err(dfs_error_to_vfs(self.backend_name(), path, source)),
-        };
+        let outcome = opened
+            .service
+            .posix_read_file_distributed_outcome(path)
+            .map_err(|source| dfs_error_to_vfs(self.backend_name(), path, source))?;
+        let mut contents =
+            match dfs_distributed_read_outcome_to_vfs(self.backend_name(), path, outcome) {
+                Ok(bytes) => bytes,
+                Err(VfsError::NotFound { .. }) if options.create => Vec::new(),
+                Err(source) => return Err(source),
+            };
         contents.extend_from_slice(bytes);
         let mut candidates = if options.durability == VfsWriteDurability::Local {
             vec![opened.service.node_id().clone()]
@@ -594,14 +610,123 @@ impl DaemonSifsVfsBackend {
         let request =
             ObjectRpcRequest::encode_body(route, sinomo_api::DAEMON_RPC_CATEGORY, request_body)
                 .map_err(|source| {
-                    daemon_detail_to_vfs(self.backend_name(), path, source.to_string())
+                    daemon_non_absence_detail_to_vfs(
+                        self.backend_name(),
+                        path,
+                        route,
+                        source.to_string(),
+                    )
                 })?;
         let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| daemon_detail_to_vfs(self.backend_name(), path, source.to_string()),
+            |source| {
+                daemon_non_absence_detail_to_vfs(
+                    self.backend_name(),
+                    path,
+                    route,
+                    source.to_string(),
+                )
+            },
         )?;
-        response
-            .decode_body()
-            .map_err(|source| daemon_detail_to_vfs(self.backend_name(), path, source.to_string()))
+        response.decode_body().map_err(|source| {
+            daemon_non_absence_detail_to_vfs(self.backend_name(), path, route, source.to_string())
+        })
+    }
+
+    fn read_file_rpc(&self, path: &str) -> Result<sinomo_api::DaemonDfsBrowserReadFileResponse> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserReadFileRequest {
+                path: path.to_string(),
+            },
+        )
+        .map_err(|source| {
+            daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })?;
+        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
+            |source| daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string()),
+        )?;
+        response.decode_body().map_err(|source| {
+            daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })
+    }
+
+    fn stat_rpc(&self, path: &str) -> Result<sinomo_api::DaemonDfsBrowserStatOutcomeResponse> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_STAT_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserStatRequest {
+                path: path.to_string(),
+                max_staleness_millis: 0,
+            },
+        )
+        .map_err(|source| {
+            daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })?;
+        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
+            |source| daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string()),
+        )?;
+        response.decode_body().map_err(|source| {
+            daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })
+    }
+
+    fn read_file_prefix_rpc(
+        &self,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<sinomo_api::DaemonDfsBrowserReadFilePrefixResponse> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserReadFilePrefixRequest {
+                path: path.to_string(),
+                max_bytes,
+            },
+        )
+        .map_err(|source| {
+            daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })?;
+        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
+            |source| {
+                daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
+            },
+        )?;
+        response.decode_body().map_err(|source| {
+            daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })
+    }
+
+    fn list_directory_rpc(&self, path: &str) -> Result<sinomo_api::DaemonDfsBrowserListResponse> {
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_api::DAEMON_DFS_BROWSER_LIST_ROUTE,
+            sinomo_api::DAEMON_RPC_CATEGORY,
+            &sinomo_api::DaemonDfsBrowserListRequest {
+                path: path.to_string(),
+                shallow: true,
+                // The daemon establishes namespace absence before returning
+                // an empty listing. This preserves rolling compatibility with
+                // older daemons without interpreting an opaque RPC error as
+                // authoritative NotFound.
+                missing_is_empty: true,
+                sort_key: sinomo_api::DaemonDfsBrowserSortKey::Name,
+                sort_direction: sinomo_api::DaemonDfsBrowserSortDirection::Ascending,
+                offset: 0,
+                limit: None,
+                include_metadata: false,
+            },
+        )
+        .map_err(|source| {
+            daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })?;
+        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
+            |source| {
+                daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
+            },
+        )?;
+        response.decode_body().map_err(|source| {
+            daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
+        })
     }
 
     fn stat_exists(&self, path: &str) -> Result<bool> {
@@ -619,14 +744,8 @@ impl VfsBackend for DaemonSifsVfsBackend {
     }
 
     fn stat(&self, path: &str) -> Result<VfsMetadata> {
-        let response: sinomo_api::DaemonDfsBrowserStatResponse = self.rpc(
-            path,
-            sinomo_api::DAEMON_DFS_BROWSER_STAT_ROUTE,
-            &sinomo_api::DaemonDfsBrowserStatRequest {
-                path: path.to_string(),
-                max_staleness_millis: 0,
-            },
-        )?;
+        let response = self.stat_rpc(path)?;
+        let response = daemon_stat_response_to_vfs(self.backend_name(), path, response)?;
         Ok(VfsMetadata {
             path: response.path,
             kind: vfs_kind_from_dfs(&response.kind),
@@ -638,20 +757,7 @@ impl VfsBackend for DaemonSifsVfsBackend {
     }
 
     fn list(&self, path: &str) -> Result<Vec<VfsDirEntry>> {
-        let response: sinomo_api::DaemonDfsBrowserListResponse = self.rpc(
-            path,
-            sinomo_api::DAEMON_DFS_BROWSER_LIST_ROUTE,
-            &sinomo_api::DaemonDfsBrowserListRequest {
-                path: path.to_string(),
-                shallow: true,
-                missing_is_empty: false,
-                sort_key: sinomo_api::DaemonDfsBrowserSortKey::Name,
-                sort_direction: sinomo_api::DaemonDfsBrowserSortDirection::Ascending,
-                offset: 0,
-                limit: None,
-                include_metadata: false,
-            },
-        )?;
+        let response = self.list_directory_rpc(path)?;
         Ok(response
             .entries
             .into_iter()
@@ -665,29 +771,13 @@ impl VfsBackend for DaemonSifsVfsBackend {
     }
 
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        let response: sinomo_api::DaemonDfsBrowserReadFileResponse = self.rpc(
-            path,
-            sinomo_api::DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
-            &sinomo_api::DaemonDfsBrowserReadFileRequest {
-                path: path.to_string(),
-            },
-        )?;
-        Ok(response.bytes)
+        let response = self.read_file_rpc(path)?;
+        daemon_read_file_response_to_vfs(self.backend_name(), path, response)
     }
 
     fn read_prefix(&self, path: &str, max_bytes: u64) -> Result<VfsFileRead> {
-        let response: sinomo_api::DaemonDfsBrowserReadFilePrefixResponse = self.rpc(
-            path,
-            sinomo_api::DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
-            &sinomo_api::DaemonDfsBrowserReadFilePrefixRequest {
-                path: path.to_string(),
-                max_bytes,
-            },
-        )?;
-        Ok(VfsFileRead {
-            bytes: response.bytes,
-            truncated: response.truncated,
-        })
+        let response = self.read_file_prefix_rpc(path, max_bytes)?;
+        daemon_read_file_prefix_response_to_vfs(self.backend_name(), path, response)
     }
 
     fn write(&self, path: &str, bytes: &[u8], options: &VfsWriteOptions) -> Result<()> {
@@ -935,9 +1025,381 @@ fn daemon_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
     }
 }
 
+fn daemon_read_file_response_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    response: sinomo_api::DaemonDfsBrowserReadFileResponse,
+) -> Result<Vec<u8>> {
+    match response.into_result() {
+        Ok(bytes) => Ok(bytes),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::NotFound { path }) => {
+            Err(VfsError::NotFound { path })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ContentUnavailable { path, detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path,
+                detail: format!("SIFS content is temporarily unavailable: {detail}"),
+            })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ReadFailed { path, detail }) => Err(
+            daemon_non_absence_detail_to_vfs(backend, &path, "read-file", detail),
+        ),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::InvalidResponse { detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path: requested_path.to_string(),
+                detail,
+            })
+        }
+    }
+}
+
+fn daemon_stat_response_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    response: sinomo_api::DaemonDfsBrowserStatOutcomeResponse,
+) -> Result<sinomo_api::DaemonDfsBrowserStatResponse> {
+    match response.into_result() {
+        Ok(stat) => Ok(stat),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::NotFound { path }) => {
+            Err(VfsError::NotFound { path })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ContentUnavailable { path, detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path,
+                detail: format!(
+                    "SIFS stat content dependency is temporarily unavailable: {detail}"
+                ),
+            })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ReadFailed { path, detail }) => Err(
+            daemon_non_absence_detail_to_vfs(backend, &path, "stat", detail),
+        ),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::InvalidResponse { detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path: requested_path.to_string(),
+                detail,
+            })
+        }
+    }
+}
+
+fn dfs_distributed_read_outcome_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    outcome: sinomo_dfs::DfsPosixDistributedFileReadOutcome,
+) -> Result<Vec<u8>> {
+    match outcome {
+        sinomo_dfs::DfsPosixDistributedFileReadOutcome::Found { bytes } => Ok(bytes),
+        sinomo_dfs::DfsPosixDistributedFileReadOutcome::NotFound { path } => {
+            Err(VfsError::NotFound { path })
+        }
+        sinomo_dfs::DfsPosixDistributedFileReadOutcome::ContentUnavailable { path, detail } => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path,
+                detail: format!(
+                    "SIFS content is temporarily unavailable while reading {requested_path}: {detail}"
+                ),
+            })
+        }
+    }
+}
+
+fn dfs_distributed_prefix_read_outcome_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    outcome: sinomo_dfs::DfsPosixDistributedFilePrefixReadOutcome,
+) -> Result<VfsFileRead> {
+    match outcome {
+        sinomo_dfs::DfsPosixDistributedFilePrefixReadOutcome::Found { read } => Ok(VfsFileRead {
+            bytes: read.bytes,
+            truncated: read.truncated,
+        }),
+        sinomo_dfs::DfsPosixDistributedFilePrefixReadOutcome::NotFound { path } => {
+            Err(VfsError::NotFound { path })
+        }
+        sinomo_dfs::DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable {
+            path,
+            detail,
+        } => Err(VfsError::Backend {
+            backend: backend.to_string(),
+            path,
+            detail: format!(
+                "SIFS content prefix is temporarily unavailable while reading {requested_path}: {detail}"
+            ),
+        }),
+    }
+}
+
+fn dfs_distributed_opened_range_read_outcome_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    outcome: sinomo_dfs::DfsPosixDistributedOpenedFileRangeReadOutcome,
+) -> Result<VfsOpenedFileRead> {
+    match outcome {
+        sinomo_dfs::DfsPosixDistributedOpenedFileRangeReadOutcome::Found { stat, read } => {
+            Ok(VfsOpenedFileRead {
+                metadata: metadata_from_dfs_stat(stat),
+                bytes: read.bytes,
+                truncated: read.truncated,
+            })
+        }
+        sinomo_dfs::DfsPosixDistributedOpenedFileRangeReadOutcome::NotFound { path } => {
+            Err(VfsError::NotFound { path })
+        }
+        sinomo_dfs::DfsPosixDistributedOpenedFileRangeReadOutcome::ContentUnavailable {
+            path,
+            detail,
+        } => Err(VfsError::Backend {
+            backend: backend.to_string(),
+            path,
+            detail: format!(
+                "SIFS opened content range is temporarily unavailable while reading {requested_path}: {detail}"
+            ),
+        }),
+    }
+}
+
+fn daemon_read_file_prefix_response_to_vfs(
+    backend: &str,
+    requested_path: &str,
+    response: sinomo_api::DaemonDfsBrowserReadFilePrefixResponse,
+) -> Result<VfsFileRead> {
+    match response.into_result() {
+        Ok((bytes, truncated)) => Ok(VfsFileRead { bytes, truncated }),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::NotFound { path }) => {
+            Err(VfsError::NotFound { path })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ContentUnavailable { path, detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path,
+                detail: format!("SIFS content prefix is temporarily unavailable: {detail}"),
+            })
+        }
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::ReadFailed { path, detail }) => Err(
+            daemon_non_absence_detail_to_vfs(backend, &path, "read-file-prefix", detail),
+        ),
+        Err(sinomo_api::DaemonDfsBrowserReadFileFailure::InvalidResponse { detail }) => {
+            Err(VfsError::Backend {
+                backend: backend.to_string(),
+                path: requested_path.to_string(),
+                detail,
+            })
+        }
+    }
+}
+
+fn daemon_read_file_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
+    daemon_non_absence_detail_to_vfs(backend, path, "read-file", detail)
+}
+
+fn daemon_stat_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
+    daemon_non_absence_detail_to_vfs(backend, path, "stat", detail)
+}
+
+fn daemon_read_file_prefix_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
+    daemon_non_absence_detail_to_vfs(backend, path, "read-file-prefix", detail)
+}
+
+fn daemon_list_directory_detail_to_vfs(backend: &str, path: &str, detail: String) -> VfsError {
+    daemon_non_absence_detail_to_vfs(backend, path, "list-directory", detail)
+}
+
+fn daemon_non_absence_detail_to_vfs(
+    backend: &str,
+    path: &str,
+    operation: &str,
+    detail: String,
+) -> VfsError {
+    match daemon_detail_to_vfs(backend, path, detail.clone()) {
+        VfsError::NotFound { .. } => VfsError::Backend {
+            backend: backend.to_string(),
+            path: path.to_string(),
+            detail: format!("daemon SIFS {operation} request failed: {detail}"),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_read_file_preserves_absence_and_fails_closed_on_content_unavailability() {
+        let missing = daemon_read_file_response_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            sinomo_api::DaemonDfsBrowserReadFileResponse::not_found(
+                "/services/skills/catalog.sobj",
+            ),
+        )
+        .expect_err("confirmed namespace absence remains NotFound");
+        assert!(matches!(missing, VfsError::NotFound { .. }));
+
+        let unavailable = daemon_read_file_response_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            sinomo_api::DaemonDfsBrowserReadFileResponse::content_unavailable(
+                "/services/skills/catalog.sobj",
+                "authoritative metadata exists but no content replica is readable",
+            ),
+        )
+        .expect_err("content unavailability must fail closed");
+        assert!(
+            matches!(unavailable, VfsError::Backend { ref backend, .. } if backend == "daemon-sifs"),
+            "unexpected unavailable mapping: {unavailable}"
+        );
+
+        let legacy_route_error = daemon_read_file_detail_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            "SIFS path not found: /services/skills/catalog.sobj".to_string(),
+        );
+        assert!(
+            matches!(legacy_route_error, VfsError::Backend { .. }),
+            "only a typed read response may establish namespace absence"
+        );
+
+        let conflict = daemon_read_file_detail_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            "SIFS path is conflicted".to_string(),
+        );
+        assert!(matches!(conflict, VfsError::Conflict { .. }));
+
+        let directory = daemon_read_file_detail_to_vfs(
+            "daemon-sifs",
+            "/services/skills",
+            "SIFS path is a directory".to_string(),
+        );
+        assert!(matches!(directory, VfsError::IsDirectory { .. }));
+
+        let stat_missing = daemon_stat_response_to_vfs(
+            "daemon-sifs",
+            "/services/skills/missing.sobj",
+            sinomo_api::DaemonDfsBrowserStatOutcomeResponse::not_found(
+                "/services/skills/missing.sobj",
+            ),
+        )
+        .expect_err("typed stat absence remains NotFound");
+        assert!(matches!(stat_missing, VfsError::NotFound { .. }));
+
+        let legacy_stat_route_error = daemon_stat_detail_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            "SIFS path not found: /services/skills/catalog.sobj".to_string(),
+        );
+        assert!(
+            matches!(legacy_stat_route_error, VfsError::Backend { .. }),
+            "an old daemon's untyped stat error must fail closed"
+        );
+
+        let stat_conflict = daemon_stat_detail_to_vfs(
+            "daemon-sifs",
+            "/services/skills/catalog.sobj",
+            "SIFS path is conflicted".to_string(),
+        );
+        assert!(matches!(stat_conflict, VfsError::Conflict { .. }));
+
+        for operation in [
+            sinomo_api::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            sinomo_api::DAEMON_DFS_BROWSER_DELETE_ROUTE,
+            sinomo_api::DAEMON_DFS_BROWSER_RENAME_ROUTE,
+        ] {
+            let opaque_missing = daemon_non_absence_detail_to_vfs(
+                "daemon-sifs",
+                "/services/skills/catalog.sobj",
+                operation,
+                "daemon object RPC route not found while delivery is unknown".to_string(),
+            );
+            assert!(
+                matches!(opaque_missing, VfsError::Backend { .. }),
+                "mutation route {operation} must not report opaque transport failure as absence"
+            );
+        }
+
+        let prefix_missing = daemon_read_file_prefix_response_to_vfs(
+            "daemon-sifs",
+            "/files/missing.bin",
+            sinomo_api::DaemonDfsBrowserReadFilePrefixResponse::not_found("/files/missing.bin"),
+        )
+        .expect_err("typed prefix absence remains NotFound");
+        assert!(matches!(prefix_missing, VfsError::NotFound { .. }));
+
+        let prefix_unavailable = daemon_read_file_prefix_response_to_vfs(
+            "daemon-sifs",
+            "/files/preview.bin",
+            sinomo_api::DaemonDfsBrowserReadFilePrefixResponse::content_unavailable(
+                "/files/preview.bin",
+                "metadata exists but the exact version has no readable replica",
+            ),
+        )
+        .expect_err("prefix content unavailability must fail closed");
+        assert!(matches!(prefix_unavailable, VfsError::Backend { .. }));
+
+        let legacy_prefix_route_error = daemon_read_file_prefix_detail_to_vfs(
+            "daemon-sifs",
+            "/files/preview.bin",
+            "SIFS path not found: /files/preview.bin".to_string(),
+        );
+        assert!(
+            matches!(legacy_prefix_route_error, VfsError::Backend { .. }),
+            "an old daemon's untyped prefix error must fail closed"
+        );
+
+        let mounted_unavailable = dfs_distributed_read_outcome_to_vfs(
+            "mounted-sifs",
+            "/services/skills/catalog.sobj",
+            sinomo_dfs::DfsPosixDistributedFileReadOutcome::ContentUnavailable {
+                path: "/services/skills/catalog.sobj".to_string(),
+                detail: "authoritative metadata exists but no exact content version is readable"
+                    .to_string(),
+            },
+        )
+        .expect_err("mounted content unavailability must fail closed");
+        assert!(matches!(mounted_unavailable, VfsError::Backend { .. }));
+
+        let mounted_prefix_unavailable = dfs_distributed_prefix_read_outcome_to_vfs(
+            "mounted-sifs",
+            "/files/preview.bin",
+            sinomo_dfs::DfsPosixDistributedFilePrefixReadOutcome::ContentUnavailable {
+                path: "/files/preview.bin".to_string(),
+                detail: "authoritative metadata exists but the prefix replica is unavailable"
+                    .to_string(),
+            },
+        )
+        .expect_err("mounted prefix unavailability must fail closed");
+        assert!(matches!(
+            mounted_prefix_unavailable,
+            VfsError::Backend { .. }
+        ));
+    }
+
+    #[test]
+    fn daemon_catalog_listing_does_not_infer_absence_from_opaque_error_text() {
+        let route_error = daemon_list_directory_detail_to_vfs(
+            "daemon-sifs",
+            "/services/agents/definitions",
+            "daemon service route not found while the cluster is unavailable".to_string(),
+        );
+        assert!(
+            matches!(route_error, VfsError::Backend { .. }),
+            "only the daemon's successful missing-is-empty response may establish an absent catalog directory"
+        );
+
+        let not_directory = daemon_list_directory_detail_to_vfs(
+            "daemon-sifs",
+            "/services/agents/definitions.json",
+            "SIFS path is not a directory".to_string(),
+        );
+        assert!(matches!(not_directory, VfsError::NotDirectory { .. }));
+    }
 
     fn temp_data_dir(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -982,6 +1444,71 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.contains(&"entry.json".to_string()), "{names:?}");
         assert!(reader.stat("catalog/entry.json").is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mounted_sifs_does_not_treat_missing_content_as_namespace_absence() {
+        let root = temp_data_dir("missing-content-is-not-absence");
+        let backend = MountedSifsVfsBackend::open(Some(root.clone())).expect("open mounted SIFS");
+        let path = "/catalog/present.sobj";
+        backend
+            .create_dir_all("/catalog")
+            .expect("create catalog directory");
+        backend
+            .write(
+                path,
+                &vec![0x5a; 2 * 1024 * 1024 + 4096],
+                &VfsWriteOptions::service_artifact(),
+            )
+            .expect("write catalog object");
+        let metadata = backend.stat(path).expect("stat written catalog object");
+        let content_hash = metadata.content_hash.expect("catalog content hash");
+        sinomo_dfs::LocalContentStore::new(root.join("dfs").join("content"))
+            .expect("open content store")
+            .debug_remove_loose_blob(&content_hash)
+            .expect("remove only the local content blob");
+
+        let read_error = backend
+            .read(path)
+            .expect_err("metadata-present content miss must fail closed");
+        assert!(
+            matches!(read_error, VfsError::Backend { .. }),
+            "full read must retain content unavailability: {read_error}"
+        );
+
+        let prefix_error = backend
+            .read_prefix(path, 8)
+            .expect_err("metadata-present prefix miss must fail closed");
+        assert!(
+            matches!(prefix_error, VfsError::Backend { .. }),
+            "prefix read must retain content unavailability: {prefix_error}"
+        );
+
+        let guarded_prefix_error = backend
+            .read_prefix_beneath_no_links("/catalog", path, 8)
+            .expect_err("guarded prefix must retain metadata-present content unavailability");
+        assert!(
+            matches!(guarded_prefix_error, VfsError::Backend { .. }),
+            "guarded prefix must not turn content unavailability into absence: {guarded_prefix_error}"
+        );
+
+        let guarded_range_error = backend
+            .read_range_beneath_no_links("/catalog", path, 4, 8)
+            .expect_err("guarded range must retain metadata-present content unavailability");
+        assert!(
+            matches!(guarded_range_error, VfsError::Backend { .. }),
+            "guarded range must not turn content unavailability into absence: {guarded_range_error}"
+        );
+
+        let append_error = backend
+            .append(path, b"replacement", &VfsAppendOptions::default())
+            .expect_err("append must not recreate a metadata-present unavailable file");
+        assert!(
+            matches!(append_error, VfsError::Backend { .. }),
+            "append must retain content unavailability: {append_error}"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

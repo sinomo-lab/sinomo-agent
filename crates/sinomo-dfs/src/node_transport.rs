@@ -112,6 +112,7 @@ fn dfs_detached_send_retry_delay(retry_attempts: u32) -> Duration {
 pub struct DfsPeerTransportError {
     detail: String,
     delivery_state: Option<sinomo_core::network::NetworkDeliveryState>,
+    unknown_route: Option<String>,
 }
 
 impl DfsPeerTransportError {
@@ -119,6 +120,7 @@ impl DfsPeerTransportError {
         Self {
             detail: detail.into(),
             delivery_state: None,
+            unknown_route: None,
         }
     }
 
@@ -129,16 +131,29 @@ impl DfsPeerTransportError {
         Self {
             detail: detail.into(),
             delivery_state,
+            unknown_route: None,
         }
     }
 
     pub fn from_network(error: sinomo_core::network::NetworkError) -> Self {
         let delivery_state = error.delivery_state();
-        Self::with_delivery_state(error.to_string(), delivery_state)
+        let unknown_route = match &error {
+            sinomo_core::network::NetworkError::UnknownRoute { route } => Some(route.clone()),
+            _ => None,
+        };
+        Self {
+            detail: error.to_string(),
+            delivery_state,
+            unknown_route,
+        }
     }
 
     pub fn delivery_state(&self) -> Option<sinomo_core::network::NetworkDeliveryState> {
         self.delivery_state
+    }
+
+    pub fn is_unknown_route(&self, expected: &str) -> bool {
+        self.unknown_route.as_deref() == Some(expected)
     }
 }
 

@@ -146,6 +146,54 @@ pub struct DfsPosixFilePrefixRead {
     pub truncated: bool,
 }
 
+/// Typed result for a distributed POSIX file read.
+///
+/// Namespace absence is distinct from a file whose authoritative metadata is
+/// visible but whose exact content version is not currently readable. Most
+/// POSIX compatibility callers still consume [`DfsPosixError::NotFound`], but
+/// service boundaries that expose optional reads must retain this distinction
+/// so temporary replica unavailability cannot become a false empty result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsPosixDistributedFileReadOutcome {
+    Found { bytes: Vec<u8> },
+    NotFound { path: String },
+    ContentUnavailable { path: String, detail: String },
+}
+
+/// Typed result for a bounded distributed POSIX file read.
+///
+/// This is the prefix-read counterpart of
+/// [`DfsPosixDistributedFileReadOutcome`]. A missing content replica after
+/// authoritative metadata resolution is an availability failure, not proof
+/// that the namespace path is absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsPosixDistributedFilePrefixReadOutcome {
+    Found { read: DfsPosixFilePrefixRead },
+    NotFound { path: String },
+    ContentUnavailable { path: String, detail: String },
+}
+
+/// Typed result for a bounded range read through a no-link scoped open.
+///
+/// The successful variant carries the exact metadata receipt captured by the
+/// guarded namespace walk. Once that receipt exists, a missing exact content
+/// version is an availability failure rather than proof that the path is
+/// absent.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsPosixDistributedOpenedFileRangeReadOutcome {
+    Found {
+        stat: DfsStat,
+        read: DfsPosixFilePrefixRead,
+    },
+    NotFound {
+        path: String,
+    },
+    ContentUnavailable {
+        path: String,
+        detail: String,
+    },
+}
+
 #[derive(Debug)]
 pub struct DfsPosixFileReadStream {
     pub object_id: DfsObjectId,

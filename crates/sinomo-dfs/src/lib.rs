@@ -149,18 +149,19 @@ pub use content_store::{
 };
 pub use control_plane::{
     AsyncDfsControlPlaneKvClient, DFS_PLACEMENT_AUTHORITY_BREAK_GLASS_ACKNOWLEDGEMENT,
-    DfsControlPlaneAsyncStore, DfsControlPlaneKvClient, DfsControlPlaneKvFuture,
-    DfsControlPlaneStore, DfsFileSystemConfig, DfsMetadataNamespacePrepareCodec,
-    DfsMetadataShardAssignment, DfsMetadataShardConfig, DfsMetadataShardHeadWatermark,
-    DfsMetadataShardMembershipHandoff, DfsMetadataShardMembershipHandoffFence,
-    DfsMetadataShardMembershipHandoffProof, DfsPlacementAuthorityPermitHolderKind,
-    DfsPlacementAuthorityPermitStatus, DfsPlacementAuthorityProcessIdentity,
-    DfsPlacementAuthorityRecoveryOutcome, DfsPlacementAuthorityRecoveryRefusal,
-    SharedDfsControlPlaneKvClient, file_system_config_key, metadata_shard_authority_barrier_key,
-    metadata_shard_head_watermark_key, metadata_shard_key, metadata_shard_membership_handoff_key,
-    metadata_shard_membership_handoff_proof_key, metadata_shards_prefix,
-    placement_authority_permit_key, placement_reconciliation_activity_index_key,
-    placement_reconciliation_key, placement_reconciliations_prefix,
+    DfsAuthoritativePrefixProjection, DfsControlPlaneAsyncStore, DfsControlPlaneKvClient,
+    DfsControlPlaneKvFuture, DfsControlPlaneStore, DfsFileSystemConfig,
+    DfsMetadataNamespacePrepareCodec, DfsMetadataShardAssignment, DfsMetadataShardConfig,
+    DfsMetadataShardHeadWatermark, DfsMetadataShardMembershipHandoff,
+    DfsMetadataShardMembershipHandoffFence, DfsMetadataShardMembershipHandoffProof,
+    DfsPlacementAuthorityPermitHolderKind, DfsPlacementAuthorityPermitStatus,
+    DfsPlacementAuthorityProcessIdentity, DfsPlacementAuthorityRecoveryOutcome,
+    DfsPlacementAuthorityRecoveryRefusal, SharedDfsControlPlaneKvClient, file_system_config_key,
+    metadata_shard_authority_barrier_key, metadata_shard_head_watermark_key, metadata_shard_key,
+    metadata_shard_membership_handoff_key, metadata_shard_membership_handoff_proof_key,
+    metadata_shards_prefix, placement_authority_permit_key,
+    placement_reconciliation_activity_index_key, placement_reconciliation_key,
+    placement_reconciliations_prefix,
     select_metadata_shard_config_for_path_strict_default_sifs_split,
 };
 #[cfg(test)]
@@ -233,14 +234,17 @@ pub use local_state::{
     evict_cluster_aware_dfs_metadata_inspection_cache, inspect_cluster_aware_dfs,
     inspect_cluster_aware_dfs_from_metadata, inspect_cluster_aware_dfs_status,
     inspect_dfs_conflicts, inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path,
-    inspect_dfs_repairs, inspect_dfs_status, inspect_dfs_status_from_metadata, list_local_dfs_pins,
+    inspect_dfs_repairs, inspect_dfs_status, inspect_dfs_status_from_metadata,
+    inspect_dfs_status_from_resident_snapshot, inspect_incomplete_dfs_status, list_local_dfs_pins,
     local_dfs_metadata_shard_path, open_cluster_aware_dfs_metadata_backend,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
+    open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
     open_root_local_metadata_backend, read_local_dfs_metadata_shard_write_freeze,
     remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root,
     with_cached_cluster_aware_dfs_metadata_inspection,
+    with_cached_cluster_aware_dfs_metadata_inspection_with_topology,
 };
 pub(crate) use maintenance::record_anti_entropy_issue;
 pub use maintenance::{
@@ -270,7 +274,6 @@ pub use maintenance::{
     legacy_dfs_metadata_replication_cursor_path, migrate_legacy_dfs_metadata_replication_cursor,
     put_local_dfs_metadata_replication_suppression, read_dfs_anti_entropy_cursor,
     read_dfs_metadata_replication_suppression_snapshot, read_dfs_repair_attempt_snapshot,
-    refresh_cluster_dfs_maintenance_state_with_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
@@ -343,6 +346,9 @@ pub(crate) use metadata_records::{
     put_visible_version_record_if_changed, read_conflicts_reason,
     remote_read_rejection_prunes_location,
 };
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
 pub use metadata_replication::{
     AsyncDfsMetadataJournalBatchSender, AsyncDfsMetadataJournalReplicationTransport,
     AsyncDfsMetadataNodeTransport, AsyncDfsMetadataSnapshotInstallSender,
@@ -361,6 +367,7 @@ pub use metadata_replication::{
     dfs_metadata_replication_report_needs_retry, dfs_metadata_replication_sent_count,
     execute_prepared_cluster_dfs_metadata_publish_with_async_peer_transport,
     materialize_default_sifs_metadata, materialize_default_sifs_metadata_on_shards,
+    prepare_cluster_dfs_metadata_shard_publish_with_backend_and_authority,
     prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exclusions,
     prepare_cluster_dfs_metadata_shard_publish_with_execution_exclusions,
     process_cluster_dfs_metadata_journal_batch, process_cluster_dfs_metadata_snapshot_install,
@@ -372,8 +379,8 @@ pub use metadata_replication::{
     publish_cluster_dfs_metadata_journal_with_peer_transports_async,
     publish_cluster_dfs_metadata_journal_with_peer_transports_async_and_execution_exclusions,
     publish_dfs_metadata_journal_with_async_host_and_execution_exclusions,
-    publish_dfs_metadata_journal_with_host, refresh_cluster_dfs_kv_snapshot_with_peer_transport,
-    replicate_dfs_metadata_shard_to_target, run_cluster_dfs_metadata_publish_after_events,
+    publish_dfs_metadata_journal_with_host, replicate_dfs_metadata_shard_to_target,
+    run_cluster_dfs_metadata_publish_after_events,
     run_cluster_dfs_metadata_publish_after_events_with_peer_transport,
     run_dfs_metadata_publish_after_events, run_dfs_metadata_publish_after_events_async,
     schedule_default_dfs_metadata_publish_after_events_async_on_runtime,
@@ -388,7 +395,6 @@ pub(crate) use metadata_replication::{
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport,
     metadata_journal_rejection_allows_snapshot_repair,
-    refresh_cluster_dfs_kv_snapshot_before_metadata_publish_with_peer_transport,
 };
 #[cfg(test)]
 pub(crate) use metadata_replication::{
@@ -397,7 +403,8 @@ pub(crate) use metadata_replication::{
     prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions,
 };
 pub use metadata_sharded_backend::{
-    LocalShardedMetadataBackend, ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
+    DfsResidentMetadataStatusSnapshot, LocalShardedMetadataBackend,
+    ResidentLocalMetadataShardHandle, ResidentLocalMetadataShardLease,
     ResidentLocalShardedMetadataBackend, ResidentLocalShardedMetadataBackendLease,
 };
 pub use model::{
@@ -413,9 +420,10 @@ pub use module_surface::{
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
 };
 pub use mounted_sifs::{
-    MountedSifsContentReadContext, MountedSifsService, OpenedMountedSifsService,
-    discover_mounted_sifs_content_replica_candidates, open_mounted_sifs_service,
-    open_mounted_sifs_service_with_cancellation, open_mounted_sifs_service_with_peer_transports,
+    MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsService,
+    OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
+    open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
+    open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation,
 };
@@ -451,8 +459,9 @@ pub use operator::{
     DfsOperatorConflictVersionView, DfsOperatorConflictVersionsReport, DfsOperatorFileSystemView,
     DfsOperatorInspectionCursor, DfsOperatorInspectionItemCursor, DfsOperatorInspector,
     DfsOperatorObjectView, DfsOperatorRepairPage, DfsOperatorRepairView, DfsOperatorStatus,
-    DfsOperatorUseConflictVersionReport, DfsPinAddRequest, DfsPinMode, DfsPinRecord,
-    DfsPinStoreError, LocalDfsPinStore, resolve_dfs_conflicts, use_dfs_conflict_version,
+    DfsOperatorStatusMetric, DfsOperatorStatusOmission, DfsOperatorUseConflictVersionReport,
+    DfsPinAddRequest, DfsPinMode, DfsPinRecord, DfsPinStoreError, LocalDfsPinStore,
+    resolve_dfs_conflicts, use_dfs_conflict_version,
 };
 pub use placement::{
     DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE, DFS_PLACEMENT_PREVIEW_SCHEMA_VERSION,
@@ -473,10 +482,11 @@ pub use placement::{
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{
     DfsDirEntry, DfsDirEntryPage, DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport,
-    DfsPosixCreateAttrs, DfsPosixDirectorySyncTarget, DfsPosixError, DfsPosixFilePrefixRead,
-    DfsPosixFileRangeReadStream, DfsPosixFileReadStream, DfsPosixFileSyncEvidence,
-    DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream, DfsPosixRemoteFileReadStream,
-    DfsPosixSyncKind, DfsStat, DfsWriteOptions,
+    DfsPosixCreateAttrs, DfsPosixDirectorySyncTarget, DfsPosixDistributedFilePrefixReadOutcome,
+    DfsPosixDistributedFileReadOutcome, DfsPosixDistributedOpenedFileRangeReadOutcome,
+    DfsPosixError, DfsPosixFilePrefixRead, DfsPosixFileRangeReadStream, DfsPosixFileReadStream,
+    DfsPosixFileSyncEvidence, DfsPosixFileSyncTarget, DfsPosixRemoteFileRangeReadStream,
+    DfsPosixRemoteFileReadStream, DfsPosixSyncKind, DfsStat, DfsWriteOptions,
 };
 pub use protocol::{
     DfsBlobTransferResult, DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest,
@@ -506,9 +516,9 @@ pub(crate) use repair::{
     repair_rejection_indicates_stale_replica_base,
 };
 pub use repair_queue_store::{
-    DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport, DfsRepairQueueKey,
-    DfsRepairQueueOperation, DfsRepairQueueReconcileOutcome, DfsRepairQueueView,
-    LocalDfsRepairQueueStore,
+    DfsRepairQueueBoundedStatus, DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport,
+    DfsRepairQueueKey, DfsRepairQueueOperation, DfsRepairQueueReconcileOutcome,
+    DfsRepairQueueStatusView, DfsRepairQueueView, LocalDfsRepairQueueStore,
 };
 pub use routes::{
     DFS_CONTROL_PLANE_ROUTES, DFS_DATA_BULK_READ_RESPONSE_ROUTE, DFS_DATA_BULK_READ_ROUTE,

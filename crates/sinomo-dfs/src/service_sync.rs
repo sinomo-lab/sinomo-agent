@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 
 use crate::metadata_journal::metadata_prefix_proof_after_exact_frame;
-use crate::metadata_records::DfsMetadataPrefixProof;
+use crate::metadata_records::{
+    DFS_METADATA_PREFIX_PROOF_VERSION, DfsMetadataPrefixProof, dfs_metadata_prefix_proof_after,
+};
 use crate::{
     DEFAULT_METADATA_JOURNAL_BATCH_BYTE_LIMIT, DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT,
     DfsControlPlaneStore, DfsError, DfsFileSystemId, DfsMessageTransport, DfsMetadataBackend,
@@ -2114,12 +2116,25 @@ fn metadata_shard_prefix_matches_or_extends_marker(
         if batch.entries.is_empty() || batch.shard_id != *shard_id {
             return Ok(false);
         }
-        let frames = backend.journal_frames_for_batch(&batch)?;
-        if frames.len() != batch.entries.len() {
+        // V1 proofs hash the decoded journal entry's canonical JSON. Keep
+        // that compatibility path until a successful rebind checkpoints the
+        // current proof in the durable marker. V2 proofs instead authenticate
+        // the exact immutable SOBJ frame bytes.
+        let legacy_current = current.version == DFS_METADATA_PREFIX_PROOF_VERSION;
+        if legacy_current && reconstructed.version != DFS_METADATA_PREFIX_PROOF_VERSION {
             return Ok(false);
         }
+        let frames = if legacy_current {
+            None
+        } else {
+            let frames = backend.journal_frames_for_batch(&batch)?;
+            if frames.len() != batch.entries.len() {
+                return Ok(false);
+            }
+            Some(frames)
+        };
         let previous_sequence = reconstructed.journal_sequence;
-        for (entry, frame) in batch.entries.iter().zip(&frames) {
+        for (index, entry) in batch.entries.iter().enumerate() {
             if entry.shard_id != *shard_id {
                 return Ok(false);
             }
@@ -2131,15 +2146,30 @@ fn metadata_shard_prefix_matches_or_extends_marker(
             if entry.sequence > current.journal_sequence {
                 return Ok(false);
             }
-            if frame.sequence != entry.sequence {
-                return Ok(false);
-            }
-            reconstructed = metadata_prefix_proof_after_exact_frame(
-                &reconstructed,
-                entry,
-                shard_id,
-                &frame.exact_bytes,
-            )?;
+            reconstructed = if legacy_current {
+                dfs_metadata_prefix_proof_after(&reconstructed, entry).map_err(|source| {
+                    DfsError::Metadata {
+                        message: format!(
+                            "encode legacy metadata shard {} handoff extension entry {}: {source}",
+                            shard_id.0, entry.sequence
+                        ),
+                    }
+                })?
+            } else {
+                let frame = frames
+                    .as_ref()
+                    .and_then(|frames| frames.get(index))
+                    .expect("the exact frame count was validated above");
+                if frame.sequence != entry.sequence {
+                    return Ok(false);
+                }
+                metadata_prefix_proof_after_exact_frame(
+                    &reconstructed,
+                    entry,
+                    shard_id,
+                    &frame.exact_bytes,
+                )?
+            };
         }
         if reconstructed.journal_sequence <= previous_sequence {
             return Ok(false);
@@ -2887,6 +2917,124 @@ mod tests {
                 .expect("complete exact local membership handoff")
         }));
         handoff
+    }
+
+    #[test]
+    fn stale_same_id_lookup_does_not_rebind_completed_handoff_or_write_repair_state() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-stale-lookup-no-rebind");
+        let local = node("node_stale_lookup_local");
+        let requester = node("node_stale_lookup_requester");
+        let replacement_replica = node("node_stale_lookup_replacement");
+        let file_system_id = sifs_file_system_id();
+        let retiring = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "root".to_string(),
+            primary_node_id: local.clone(),
+            replica_node_ids: vec![requester.clone()],
+            epoch: 17,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        };
+        let desired = DfsMetadataShardConfig {
+            replica_node_ids: vec![replacement_replica],
+            epoch: retiring.epoch + 1,
+            ..retiring.clone()
+        };
+        let control_plane = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+        control_plane.with_client(|kv| {
+            DfsControlPlaneStore::new(kv)
+                .put_metadata_shard(&retiring)
+                .expect("retiring shard config");
+        });
+
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut backend =
+            LocalSobjMetadataBackend::new(shard_id.clone(), root.path().join("metadata"))
+                .expect("metadata backend");
+        backend
+            .put_file_system(&DfsFileSystem::sifs(local.clone()))
+            .expect("filesystem");
+        backend
+            .put_object(&directory_object("/", local.clone()))
+            .expect("root object");
+        let handoff =
+            complete_local_membership_handoff(&control_plane, &mut backend, &retiring, &desired);
+        assert!(
+            backend
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("pre-request handoff fence")
+        );
+
+        let mut service = NetworkedDfsService::new(
+            MetadataAckTransport::new(local.clone(), []),
+            LocalContentStore::new(root.path().join("content")).expect("content store"),
+        )
+        .with_control_plane(control_plane)
+        .with_metadata_backend(backend)
+        .expect("metadata-backed service");
+        let committed_work = crate::DfsCommittedWorkTracker::new();
+        service.set_committed_work_tracker(committed_work.clone());
+        crate::metadata_backend::reset_metadata_journal_write_count();
+        crate::service_hydration::reset_full_metadata_hydration_calls();
+
+        for (request_id, operation) in [
+            (
+                "stale-same-id-lookup-path",
+                crate::DfsNamespaceOperation::LookupPath {
+                    path: "/".to_string(),
+                },
+            ),
+            (
+                "stale-same-id-lookup-paths",
+                crate::DfsNamespaceOperation::LookupPaths {
+                    paths: vec!["/".to_string()],
+                },
+            ),
+        ] {
+            let event = service
+                .handle_namespace_request(
+                    requester.clone(),
+                    crate::DfsNamespaceCommand {
+                        request_id: request_id.to_string(),
+                        file_system_id: file_system_id.clone(),
+                        requesting_node_id: requester.clone(),
+                        include_metadata_journal_batches: false,
+                        metadata_journal_after_sequences: Vec::new(),
+                        authority_shards: vec![retiring.clone()],
+                        operation,
+                    },
+                )
+                .expect("serve stale stamped lookup");
+
+            assert!(matches!(
+                event,
+                NetworkedDfsServiceEvent::RemoteNamespaceServed {
+                    result: crate::DfsNamespaceResult::Rejected { ref reason, .. },
+                    mutates_metadata: false,
+                    ..
+                } if reason.contains("authority shard stamp")
+            ));
+        }
+        assert_eq!(crate::metadata_backend::metadata_journal_write_count(), 0);
+        assert_eq!(crate::service_hydration::full_metadata_hydration_calls(), 0);
+        assert_eq!(committed_work.take(), Default::default());
+        assert!(service.durable_repair_queue_records().is_empty());
+        let marker = service
+            .metadata_backend()
+            .expect("metadata backend")
+            .metadata_shard_write_freeze(&shard_id)
+            .expect("post-request handoff fence")
+            .expect("handoff marker remains durable");
+        assert_eq!(marker.handoff_id, handoff.handoff_id);
+        assert_eq!(marker.activated_epoch, None);
+        assert!(
+            service
+                .metadata_backend()
+                .expect("metadata backend")
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("lookup leaves writer fenced")
+        );
     }
 
     #[test]
@@ -4542,6 +4690,72 @@ mod tests {
                 Some(&marker),
             )
             .expect("reject divergent extension")
+        );
+    }
+
+    #[test]
+    fn handoff_marker_replays_a_persisted_multi_page_v1_tail_without_switching_to_v2() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-handoff-v1-prefix-extension");
+        let shard_id = DfsMetadataShardId::new("services");
+        let local = node("node_handoff_v1_prefix_extension");
+        let file_system = DfsFileSystem::sifs(local);
+        let seed = {
+            let backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
+                .expect("initialize metadata backend");
+            backend.metadata_prefix_proof().expect("legacy V1 seed")
+        };
+        assert_eq!(seed.version, DFS_METADATA_PREFIX_PROOF_VERSION);
+
+        // The live regression had more than one bounded journal page between
+        // its activated marker and current head. Persist 513 legacy entries so
+        // both the V1 compatibility choice and loop continuation are covered.
+        let mut entries = Vec::with_capacity(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT + 1);
+        let mut expected = seed.clone();
+        for sequence in 1..=(DEFAULT_METADATA_JOURNAL_BATCH_ENTRY_LIMIT as u64 + 1) {
+            let entry = crate::DfsMetadataJournalEntry {
+                shard_id: shard_id.clone(),
+                sequence,
+                created_at: time::OffsetDateTime::UNIX_EPOCH,
+                mutation: crate::DfsMetadataMutation::PutFileSystem {
+                    file_system_id: file_system.file_system_id.clone(),
+                    file_system: Some(file_system.clone()),
+                },
+            };
+            expected = dfs_metadata_prefix_proof_after(&expected, &entry)
+                .expect("extend legacy V1 prefix");
+            entries.push(entry);
+        }
+        let entry_refs = entries.iter().collect::<Vec<_>>();
+        crate::metadata_journal::append_segmented_journal_entries(root.path(), &entry_refs)
+            .expect("persist legacy journal tail");
+        crate::metadata_table_store::append_metadata_table_batch(
+            root.path(),
+            &crate::metadata_records::DfsMetadataTableBatch {
+                sequence: expected.journal_sequence,
+                ops: vec![crate::metadata_records::DfsMetadataTableOp::PutFileSystem {
+                    file_system,
+                }],
+                prefix_proof: Some(expected.clone()),
+                journal_reference_replay_cost_bytes: 0,
+            },
+        )
+        .expect("persist legacy materialized head");
+
+        let backend = LocalSobjMetadataBackend::new(shard_id.clone(), root.path())
+            .expect("reopen legacy metadata backend");
+        assert_eq!(
+            backend.metadata_prefix_proof().expect("current V1 proof"),
+            expected
+        );
+        assert!(
+            metadata_shard_prefix_matches_or_extends_marker(
+                &backend,
+                &shard_id,
+                seed.journal_sequence,
+                &seed.digest,
+                Some(&seed),
+            )
+            .expect("verify persisted multi-page V1 extension")
         );
     }
 

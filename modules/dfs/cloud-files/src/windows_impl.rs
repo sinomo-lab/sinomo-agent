@@ -18,18 +18,16 @@ use std::time::{Duration, Instant};
 use sinomo_dfs_cloud_files_api::{
     CloudFilesModuleError, CloudFilesMountRequest, CloudFilesMountResponse,
 };
+use sinomo_runtime::api::{DaemonApiClient, DaemonPaths};
 use sinomo_runtime::daemon;
 use sinomo_runtime::dfs::{
     self, DfsControlPlaneKvClient, DfsMessageResponse, DfsMessageTransport, DfsObjectKind,
-    DfsPosixError, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions,
-    LocalContentStore, NetworkedDfsService,
-};
-use sinomo_runtime::kv::{
-    KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse, read_cluster_kv_entry,
-    read_cluster_kv_prefix_entries,
+    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPosixError, DfsRoutedCall,
+    DfsRoutedMessage, DfsTransportIdentity, DfsWriteOptions, LocalContentStore,
+    MountedSifsControlPlaneKvClient, NetworkedDfsService,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, NetworkError};
+use sinomo_runtime::network::{self, NetworkError, ObjectRpcCall, ObjectRpcResult};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
     CloseHandle, HANDLE, NTSTATUS, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY,
@@ -1102,6 +1100,13 @@ fn open_sifs_service(
         .unwrap_or_default();
     let content =
         LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(error("dfs"))?;
+    let control_plane = cluster_state.as_ref().map(|_| {
+        let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(DfsCloudFilesKvPeerTransport {
+            data_dir: data_dir.clone(),
+            local_node_id: local_node_id.clone(),
+        });
+        MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths.clone(), peer_transport)
+    });
     let mut service = NetworkedDfsService::new(
         DfsCloudFilesEndpointTransport::new(
             local_node_id,
@@ -1110,12 +1115,10 @@ fn open_sifs_service(
         ),
         content,
     );
-    if cluster_paths.kv_paths().snapshot.exists() {
-        service = service.with_control_plane(DfsCloudFilesControlPlaneKvClient {
-            cluster_paths: cluster_paths.clone(),
-        });
+    if let Some(control_plane) = control_plane.as_ref() {
+        service = service.with_control_plane(control_plane.clone());
     }
-    let metadata = open_metadata_backend(&data_dir, &cluster_paths)?;
+    let metadata = open_metadata_backend(&data_dir, &cluster_paths, control_plane.as_ref())?;
     let mut service = service
         .with_boxed_metadata_backend(metadata)
         .map_err(error("dfs"))?;
@@ -1126,18 +1129,25 @@ fn open_sifs_service(
 fn open_metadata_backend(
     data_dir: &SinomoDataDir,
     cluster_paths: &network::ClusterPaths,
+    control_plane: Option<&MountedSifsControlPlaneKvClient>,
 ) -> Result<Box<dyn dfs::DfsMetadataBackend>, CloudFilesModuleError> {
     if cluster_paths.state.exists() {
+        let control_plane = control_plane.ok_or_else(|| CloudFilesModuleError {
+            code: "network".to_string(),
+            detail: "clustered Cloud Files requires an authoritative DFS control-plane client"
+                .to_string(),
+        })?;
         let file_system_id = dfs::sifs_file_system_id();
-        let mut shards = read_cluster_kv_prefix_entries(
-            &cluster_paths.kv_paths(),
-            &format!("{}/", dfs::metadata_shards_prefix(&file_system_id)),
-        )
-        .map_err(error("network"))?
-        .into_iter()
-        .map(|entry| entry.decode::<dfs::DfsMetadataShardConfig>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(error("dfs"))?;
+        let mut shards = control_plane
+            .range_prefix(&format!(
+                "{}/",
+                dfs::metadata_shards_prefix(&file_system_id)
+            ))
+            .map_err(error("network"))?
+            .into_iter()
+            .map(|entry| entry.decode::<dfs::DfsMetadataShardConfig>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(error("dfs"))?;
         shards.sort_by(|left, right| left.shard_id.cmp(&right.shard_id));
         if !shards.is_empty() {
             let backend = dfs::open_local_sharded_metadata_backend(
@@ -1154,52 +1164,41 @@ fn open_metadata_backend(
 }
 
 #[derive(Clone, Debug)]
-struct DfsCloudFilesControlPlaneKvClient {
-    cluster_paths: network::ClusterPaths,
+struct DfsCloudFilesKvPeerTransport {
+    data_dir: SinomoDataDir,
+    local_node_id: NodeId,
 }
 
-impl DfsCloudFilesControlPlaneKvClient {
-    fn daemon_error(&self, source: impl std::fmt::Display) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.kv_paths().snapshot.display().to_string(),
-            detail: source.to_string(),
+impl DfsPeerTransport for DfsCloudFilesKvPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: DfsObjectRpcSendOptions,
+    ) -> std::result::Result<ObjectRpcResult, DfsPeerTransportError> {
+        if target_node_id != &self.local_node_id {
+            return Err(DfsPeerTransportError::new(format!(
+                "Cloud Files KV control-plane call targeted non-local node {target_node_id}"
+            )));
         }
-    }
-}
-
-impl DfsControlPlaneKvClient for DfsCloudFilesControlPlaneKvClient {
-    fn get(&self, key: &str) -> std::result::Result<Option<KvEntry>, KvError> {
-        read_cluster_kv_entry(&self.cluster_paths.kv_paths(), key)
-    }
-
-    fn range_prefix(&self, prefix: &str) -> std::result::Result<Vec<KvEntry>, KvError> {
-        read_cluster_kv_prefix_entries(&self.cluster_paths.kv_paths(), prefix)
-    }
-
-    fn put(&mut self, key: String, value: Vec<u8>) -> std::result::Result<KvRevision, KvError> {
-        let response = self.txn(KvTxn {
-            compares: Vec::new(),
-            success: vec![KvOp::Put {
-                key,
-                value,
-                lease_id: None,
-            }],
-            failure: Vec::new(),
-        })?;
-        Ok(response.revision)
-    }
-
-    fn txn(&mut self, txn: KvTxn) -> std::result::Result<KvTxnResponse, KvError> {
-        let mut state = sinomo_runtime::cluster::read_cluster_state(&self.cluster_paths)
-            .map_err(|source| self.daemon_error(source))?;
-        let snapshot =
-            daemon::commit_cluster_kv_txn_with_quorum(&self.cluster_paths, &mut state, txn)
-                .map_err(|source| self.daemon_error(source))?;
-        Ok(KvTxnResponse {
-            succeeded: true,
-            revision: snapshot.revision,
-            responses: Vec::new(),
-        })
+        if !call.body.is_empty() {
+            return Err(DfsPeerTransportError::new(
+                "Cloud Files KV control-plane call unexpectedly carried a streamed body",
+            ));
+        }
+        let timeout = options
+            .overall_timeout
+            .unwrap_or(network::DEFAULT_NETWORK_TIMEOUT);
+        let client = DaemonApiClient::connect_for_paths_with_timeout(
+            &DaemonPaths::new(&self.data_dir),
+            options.connect_timeout,
+        )
+        .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
+        .with_timeout(timeout);
+        client
+            .call_request(&call.request)
+            .map(ObjectRpcResult::value)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
 

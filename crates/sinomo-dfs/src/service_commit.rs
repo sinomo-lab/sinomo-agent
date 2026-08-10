@@ -975,28 +975,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let existing_matching_receipt = self
             .backend_receipt_for_replica(object_id, version, replica_node_id)?
             .is_some_and(|receipt| receipt.content_hash.as_deref() == Some(content_hash));
-        let inserted = {
-            let Some(backend) = self.metadata_backend.as_mut() else {
-                return Ok(false);
+        let has_metadata_backend = self.metadata_backend.is_some();
+        let inserted = if existing_matching_receipt {
+            false
+        } else if let Some(backend) = self.metadata_backend.as_mut() {
+            let receipt = DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    committed_version: version.clone(),
+                    owner_node_id: self.node_id.clone(),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: replica_node_id.clone(),
+                content_hash: Some(content_hash.to_string()),
+                received_at: OffsetDateTime::now_utc(),
             };
-            if existing_matching_receipt {
-                false
-            } else {
-                let receipt = DfsReplicaReceiptRecord {
-                    receipt: DfsWriteReceipt {
-                        file_system_id: file_system_id.clone(),
-                        object_id: object_id.clone(),
-                        committed_version: version.clone(),
-                        owner_node_id: self.node_id.clone(),
-                        event_id: EventId::generate(),
-                    },
-                    replica_node_id: replica_node_id.clone(),
-                    content_hash: Some(content_hash.to_string()),
-                    received_at: OffsetDateTime::now_utc(),
-                };
-                backend.put_receipt_for_object(object.as_ref(), &receipt)?;
-                true
-            }
+            backend.put_receipt_for_object(object.as_ref(), &receipt)?;
+            true
+        } else {
+            false
         };
         if inserted {
             // Receipt insertion is the durable authority boundary. Retain its
@@ -1016,7 +1014,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(DfsError::UnknownObject { .. }) => false,
                 Err(error) => return Err(error),
             };
-        if location_changed && !inserted {
+        if has_metadata_backend && location_changed && !inserted {
             // A retry can observe the receipt from an earlier partial success
             // while still needing to journal the visible replica location.
             // Retain that second durable edge independently so it cannot leave

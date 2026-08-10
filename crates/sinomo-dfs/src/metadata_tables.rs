@@ -8,6 +8,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::Hash;
+use std::ops::Bound::{Included, Unbounded};
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -15,9 +16,11 @@ use sinomo_core::{Id, node::NodeId};
 use time::OffsetDateTime;
 
 use crate::advisory_lock::DfsAdvisoryLockStateRecord;
+use crate::intent::write_intent_status_is_active;
 use crate::metadata_error::{MetadataBackendError, Result};
 use crate::metadata_keys::{
-    dentry_key, intent_key, normalize_path, write_intent_scan_key, write_intent_target_key,
+    dentry_key, id_lower_bound, intent_key, normalize_path, write_intent_scan_key,
+    write_intent_target_key,
 };
 use crate::metadata_namespace_transaction::{
     materialize_committed_namespace_transaction_table_state,
@@ -25,15 +28,16 @@ use crate::metadata_namespace_transaction::{
 };
 use crate::metadata_object_index::object_index_table_ops_with_previous;
 use crate::metadata_records::{
-    DfsConflictRecord, DfsCrossShardPinTransferRecord, DfsDirFragmentId, DfsDirFragmentRecord,
-    DfsInodeId, DfsInodeRecord, DfsMetadataPrefixProof, DfsMetadataTableOp,
-    DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
-    DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord, DfsNamespacePrepareStatus,
-    DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState, DfsNamespaceRequestReceipt,
-    DfsNamespaceRequestRecord, DfsNamespaceRequestStatus, DfsNamespaceTransaction,
-    DfsNamespaceTransactionReceipt, DfsObjectVersionRecord, DfsPathRecord, DfsReplicaReceiptRecord,
-    DfsVisibleVersionCommitRecord, DfsWriteIntentReceipt, DfsWriteIntentReceiptRetentionState,
-    DfsWriteIntentRecord, normalized_object_metadata,
+    DfsConflictRecord, DfsConflictStatus, DfsCrossShardPinTransferRecord, DfsDirFragmentId,
+    DfsDirFragmentRecord, DfsInodeId, DfsInodeRecord, DfsMetadataPrefixProof, DfsMetadataSummary,
+    DfsMetadataTableOp, DfsMetadataVersionPinRecord, DfsNamespaceJobReceipt, DfsNamespaceJobRecord,
+    DfsNamespaceJobStatus, DfsNamespacePrepareReceipt, DfsNamespacePrepareRecord,
+    DfsNamespacePrepareStatus, DfsNamespaceReceiptOrderKey, DfsNamespaceReceiptRetentionState,
+    DfsNamespaceRequestReceipt, DfsNamespaceRequestRecord, DfsNamespaceRequestStatus,
+    DfsNamespaceTransaction, DfsNamespaceTransactionReceipt, DfsObjectVersionRecord, DfsPathRecord,
+    DfsReplicaReceiptRecord, DfsVisibleVersionCommitRecord, DfsWriteIntentReceipt,
+    DfsWriteIntentReceiptRetentionState, DfsWriteIntentRecord, DfsWriteIntentStatus,
+    normalized_object_metadata,
 };
 use crate::{
     DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
@@ -148,6 +152,38 @@ pub(crate) struct DfsMetadataTables {
     /// Derived oldest-attempt-first recovery index. Terminal idempotency rows
     /// stay in `namespace_requests` without participating in maintenance scans.
     pub(crate) pending_namespace_request_order: BTreeSet<(OffsetDateTime, NodeId, String)>,
+    /// Incremental operator projection maintained at the same table-op
+    /// boundary as the materialized indexes above. Status must never rediscover
+    /// these counts by walking a production-sized metadata generation.
+    status_index: DfsMetadataStatusIndex,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DfsMetadataStatusIndex {
+    object_count_by_file_system: BTreeMap<DfsFileSystemId, usize>,
+    pending_repair_count_by_file_system: BTreeMap<DfsFileSystemId, usize>,
+    pending_write_count: usize,
+    open_conflict_count: usize,
+    pending_namespace_job_count: usize,
+    failed_namespace_job_count: usize,
+    cross_shard_namespace_lock_ref_counts: BTreeMap<(DfsFileSystemId, String), usize>,
+    cross_shard_namespace_lock_count: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DfsMetadataObjectStatusContribution {
+    file_system_id: Option<DfsFileSystemId>,
+    object_count: usize,
+    pending_repair_count: usize,
+    pending_write_count: usize,
+}
+
+#[derive(Clone, Debug)]
+enum DfsMetadataStatusMutationEffect {
+    None,
+    Object(DfsObjectId),
+    Conflict(DfsObjectId, String),
+    NamespaceJob(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -398,6 +434,339 @@ pub(crate) fn namespace_request_receipt_eviction_delta(
 }
 
 impl DfsMetadataTables {
+    /// Return the operator counters maintained incrementally with table
+    /// materialization. This is bounded by the filesystem catalog, not by the
+    /// number of objects, versions, receipts, intents, or jobs.
+    pub(crate) fn metadata_status_summary(&self) -> DfsMetadataSummary {
+        let object_count = self
+            .file_systems
+            .keys()
+            .map(|file_system_id| {
+                self.status_index
+                    .object_count_by_file_system
+                    .get(file_system_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .fold(0usize, usize::saturating_add);
+        let pending_repair_count = self
+            .file_systems
+            .keys()
+            .map(|file_system_id| {
+                self.status_index
+                    .pending_repair_count_by_file_system
+                    .get(file_system_id)
+                    .copied()
+                    .unwrap_or_default()
+            })
+            .fold(0usize, usize::saturating_add);
+        DfsMetadataSummary {
+            file_system_count: self.file_systems.len(),
+            object_count,
+            version_count: self.versions.len(),
+            receipt_count: self.receipts.len(),
+            intent_count: self.intents.len(),
+            pending_write_count: self.status_index.pending_write_count,
+            open_conflict_count: self.status_index.open_conflict_count,
+            pending_repair_count,
+            pending_namespace_job_count: self.status_index.pending_namespace_job_count,
+            failed_namespace_job_count: self.status_index.failed_namespace_job_count,
+            cross_shard_namespace_lock_count: self.status_index.cross_shard_namespace_lock_count,
+        }
+    }
+
+    fn status_mutation_effect(op: &DfsMetadataTableOp) -> DfsMetadataStatusMutationEffect {
+        match op {
+            DfsMetadataTableOp::PutObject { object } => {
+                DfsMetadataStatusMutationEffect::Object(object.object_id.clone())
+            }
+            DfsMetadataTableOp::RemoveObject { object_id }
+            | DfsMetadataTableOp::RemoveFileSystemObject { object_id, .. }
+            | DfsMetadataTableOp::RemoveReceipt { object_id, .. }
+            | DfsMetadataTableOp::PutIntentReceipt {
+                receipt: DfsWriteIntentReceipt { object_id, .. },
+            } => DfsMetadataStatusMutationEffect::Object(object_id.clone()),
+            DfsMetadataTableOp::PutFileSystemObject { path_record } => {
+                DfsMetadataStatusMutationEffect::Object(path_record.object_id.clone())
+            }
+            DfsMetadataTableOp::PutReceipt { receipt } => {
+                DfsMetadataStatusMutationEffect::Object(receipt.receipt.object_id.clone())
+            }
+            DfsMetadataTableOp::PutIntent { intent } => {
+                DfsMetadataStatusMutationEffect::Object(intent.object_id.clone())
+            }
+            DfsMetadataTableOp::PutConflict { conflict } => {
+                DfsMetadataStatusMutationEffect::Conflict(
+                    conflict.object_id.clone(),
+                    conflict.conflict_id.clone(),
+                )
+            }
+            DfsMetadataTableOp::RemoveConflict {
+                object_id,
+                conflict_id,
+            } => DfsMetadataStatusMutationEffect::Conflict(object_id.clone(), conflict_id.clone()),
+            DfsMetadataTableOp::PutNamespaceJob { job } => {
+                DfsMetadataStatusMutationEffect::NamespaceJob(job.job_id.clone())
+            }
+            DfsMetadataTableOp::PutNamespaceJobReceipt { receipt } => {
+                DfsMetadataStatusMutationEffect::NamespaceJob(receipt.job_id.clone())
+            }
+            _ => DfsMetadataStatusMutationEffect::None,
+        }
+    }
+
+    fn object_status_contribution(
+        &self,
+        object_id: &DfsObjectId,
+    ) -> DfsMetadataObjectStatusContribution {
+        let intents = self
+            .intents
+            .range((Included((object_id.clone(), String::new())), Unbounded))
+            .take_while(|((record_object_id, _), _)| record_object_id == object_id)
+            .map(|(_, intent)| intent)
+            .collect::<Vec<_>>();
+        let pending_write_count = intents
+            .iter()
+            .filter(|intent| write_intent_status_is_active(&intent.status))
+            .count();
+
+        let Some(object) = self.objects.get(object_id) else {
+            return DfsMetadataObjectStatusContribution {
+                pending_write_count,
+                ..DfsMetadataObjectStatusContribution::default()
+            };
+        };
+        let Some(path_record) = self
+            .file_system_objects
+            .get(&(object.file_system_id.clone(), object.object_id.clone()))
+        else {
+            return DfsMetadataObjectStatusContribution {
+                pending_write_count,
+                ..DfsMetadataObjectStatusContribution::default()
+            };
+        };
+        if path_record.file_system_id != object.file_system_id
+            || normalize_path(&object.path) != path_record.path
+        {
+            return DfsMetadataObjectStatusContribution {
+                pending_write_count,
+                ..DfsMetadataObjectStatusContribution::default()
+            };
+        }
+        // A cross-shard source-eviction tombstone is retained as migration
+        // evidence, not as a logical object. The exact sharded scanner rejects
+        // it through its routing callback; the bounded projection must encode
+        // the same decision while the affected object is already in hand.
+        if object.kind == DfsObjectKind::Tombstone
+            && matches!(
+                object.tombstone_provenance.as_ref(),
+                Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
+            )
+        {
+            return DfsMetadataObjectStatusContribution {
+                pending_write_count,
+                ..DfsMetadataObjectStatusContribution::default()
+            };
+        }
+
+        let mut pending_repair_count = 0usize;
+        for intent in intents {
+            if intent.status != DfsWriteIntentStatus::Committed
+                || intent.target_version != object.version
+            {
+                continue;
+            }
+            let receipt_nodes = self
+                .receipts
+                .range((
+                    Included((
+                        object_id.clone(),
+                        intent.target_version.clone(),
+                        id_lower_bound(),
+                    )),
+                    Unbounded,
+                ))
+                .take_while(|((record_object_id, record_version, _), _)| {
+                    record_object_id == object_id && record_version == &intent.target_version
+                })
+                .filter(|(_, receipt)| {
+                    intent
+                        .content_hash
+                        .as_ref()
+                        .is_none_or(|hash| receipt.content_hash.as_ref() == Some(hash))
+                })
+                .map(|(_, receipt)| receipt.replica_node_id.clone())
+                .collect::<BTreeSet<_>>();
+            pending_repair_count = pending_repair_count.saturating_add(
+                intent
+                    .desired_replica_node_ids
+                    .iter()
+                    .filter(|node_id| !receipt_nodes.contains(*node_id))
+                    .count(),
+            );
+        }
+
+        DfsMetadataObjectStatusContribution {
+            file_system_id: Some(object.file_system_id.clone()),
+            object_count: 1,
+            pending_repair_count,
+            pending_write_count,
+        }
+    }
+
+    fn adjust_status_map_count(
+        counts: &mut BTreeMap<DfsFileSystemId, usize>,
+        file_system_id: &DfsFileSystemId,
+        before: usize,
+        after: usize,
+    ) {
+        let current = counts.get(file_system_id).copied().unwrap_or_default();
+        debug_assert!(current >= before);
+        let updated = current.saturating_sub(before).saturating_add(after);
+        if updated == 0 {
+            counts.remove(file_system_id);
+        } else {
+            counts.insert(file_system_id.clone(), updated);
+        }
+    }
+
+    fn replace_object_status_contribution(
+        &mut self,
+        before: DfsMetadataObjectStatusContribution,
+        after: DfsMetadataObjectStatusContribution,
+    ) {
+        let mut file_system_ids = BTreeSet::new();
+        file_system_ids.extend(before.file_system_id.iter().cloned());
+        file_system_ids.extend(after.file_system_id.iter().cloned());
+        for file_system_id in file_system_ids {
+            let before_matches = before.file_system_id.as_ref() == Some(&file_system_id);
+            let after_matches = after.file_system_id.as_ref() == Some(&file_system_id);
+            Self::adjust_status_map_count(
+                &mut self.status_index.object_count_by_file_system,
+                &file_system_id,
+                before_matches
+                    .then_some(before.object_count)
+                    .unwrap_or_default(),
+                after_matches
+                    .then_some(after.object_count)
+                    .unwrap_or_default(),
+            );
+            Self::adjust_status_map_count(
+                &mut self.status_index.pending_repair_count_by_file_system,
+                &file_system_id,
+                before_matches
+                    .then_some(before.pending_repair_count)
+                    .unwrap_or_default(),
+                after_matches
+                    .then_some(after.pending_repair_count)
+                    .unwrap_or_default(),
+            );
+        }
+        debug_assert!(self.status_index.pending_write_count >= before.pending_write_count);
+        self.status_index.pending_write_count = self
+            .status_index
+            .pending_write_count
+            .saturating_sub(before.pending_write_count)
+            .saturating_add(after.pending_write_count);
+    }
+
+    fn conflict_is_open(&self, object_id: &DfsObjectId, conflict_id: &str) -> bool {
+        self.conflicts
+            .get(&(object_id.clone(), conflict_id.to_string()))
+            .is_some_and(|conflict| conflict.status == DfsConflictStatus::Open)
+    }
+
+    fn namespace_job_status(
+        &self,
+        job_id: &str,
+    ) -> Option<(DfsNamespaceJobStatus, Option<(DfsFileSystemId, String)>)> {
+        self.namespace_jobs.get(job_id).map(|job| {
+            (
+                job.status.clone(),
+                (job.status == DfsNamespaceJobStatus::Running
+                    && job.kind.holds_cross_shard_namespace_lock_while_running())
+                .then(|| (job.file_system_id.clone(), job.root_path.clone())),
+            )
+        })
+    }
+
+    fn replace_namespace_job_status(
+        &mut self,
+        before: Option<(DfsNamespaceJobStatus, Option<(DfsFileSystemId, String)>)>,
+        after: Option<(DfsNamespaceJobStatus, Option<(DfsFileSystemId, String)>)>,
+    ) {
+        if before == after {
+            return;
+        }
+        match before.as_ref().map(|(status, _)| status) {
+            Some(DfsNamespaceJobStatus::Running) => {
+                debug_assert!(self.status_index.pending_namespace_job_count > 0);
+                self.status_index.pending_namespace_job_count = self
+                    .status_index
+                    .pending_namespace_job_count
+                    .saturating_sub(1);
+            }
+            Some(DfsNamespaceJobStatus::Failed) => {
+                debug_assert!(self.status_index.failed_namespace_job_count > 0);
+                self.status_index.failed_namespace_job_count = self
+                    .status_index
+                    .failed_namespace_job_count
+                    .saturating_sub(1);
+            }
+            Some(DfsNamespaceJobStatus::Completed) | None => {}
+        }
+        match after.as_ref().map(|(status, _)| status) {
+            Some(DfsNamespaceJobStatus::Running) => {
+                self.status_index.pending_namespace_job_count = self
+                    .status_index
+                    .pending_namespace_job_count
+                    .saturating_add(1);
+            }
+            Some(DfsNamespaceJobStatus::Failed) => {
+                self.status_index.failed_namespace_job_count = self
+                    .status_index
+                    .failed_namespace_job_count
+                    .saturating_add(1);
+            }
+            Some(DfsNamespaceJobStatus::Completed) | None => {}
+        }
+        if let Some(lock_key) = before.as_ref().and_then(|(_, lock_key)| lock_key.as_ref()) {
+            let remove_effective_lock = self
+                .status_index
+                .cross_shard_namespace_lock_ref_counts
+                .get_mut(lock_key)
+                .is_some_and(|ref_count| {
+                    debug_assert!(*ref_count > 0);
+                    *ref_count = ref_count.saturating_sub(1);
+                    *ref_count == 0
+                });
+            if remove_effective_lock {
+                self.status_index
+                    .cross_shard_namespace_lock_ref_counts
+                    .remove(lock_key);
+                debug_assert!(self.status_index.cross_shard_namespace_lock_count > 0);
+                self.status_index.cross_shard_namespace_lock_count = self
+                    .status_index
+                    .cross_shard_namespace_lock_count
+                    .saturating_sub(1);
+            }
+        }
+        if let Some(lock_key) = after.as_ref().and_then(|(_, lock_key)| lock_key.as_ref()) {
+            let ref_count = self
+                .status_index
+                .cross_shard_namespace_lock_ref_counts
+                .entry(lock_key.clone())
+                .or_default();
+            if *ref_count == 0 {
+                self.status_index.cross_shard_namespace_lock_count = self
+                    .status_index
+                    .cross_shard_namespace_lock_count
+                    .saturating_add(1);
+            }
+            *ref_count = ref_count.saturating_add(1);
+        }
+    }
+
     /// Apply one table operation while preserving fail-closed validation for
     /// compact semantic transitions.
     ///
@@ -1184,6 +1553,64 @@ impl DfsMetadataTables {
     }
 
     pub(crate) fn apply(&mut self, op: DfsMetadataTableOp) {
+        let effect = Self::status_mutation_effect(&op);
+        let object_before = match &effect {
+            DfsMetadataStatusMutationEffect::Object(object_id) => {
+                Some(self.object_status_contribution(object_id))
+            }
+            _ => None,
+        };
+        let conflict_before = match &effect {
+            DfsMetadataStatusMutationEffect::Conflict(object_id, conflict_id) => {
+                Some(self.conflict_is_open(object_id, conflict_id))
+            }
+            _ => None,
+        };
+        let namespace_job_before = match &effect {
+            DfsMetadataStatusMutationEffect::NamespaceJob(job_id) => {
+                Some(self.namespace_job_status(job_id))
+            }
+            _ => None,
+        };
+
+        self.apply_unindexed(op);
+
+        match effect {
+            DfsMetadataStatusMutationEffect::None => {}
+            DfsMetadataStatusMutationEffect::Object(object_id) => {
+                let after = self.object_status_contribution(&object_id);
+                self.replace_object_status_contribution(
+                    object_before.expect("object status mutation captured prior contribution"),
+                    after,
+                );
+            }
+            DfsMetadataStatusMutationEffect::Conflict(object_id, conflict_id) => {
+                let before =
+                    conflict_before.expect("conflict status mutation captured prior contribution");
+                let after = self.conflict_is_open(&object_id, &conflict_id);
+                match (before, after) {
+                    (false, true) => {
+                        self.status_index.open_conflict_count =
+                            self.status_index.open_conflict_count.saturating_add(1);
+                    }
+                    (true, false) => {
+                        debug_assert!(self.status_index.open_conflict_count > 0);
+                        self.status_index.open_conflict_count =
+                            self.status_index.open_conflict_count.saturating_sub(1);
+                    }
+                    _ => {}
+                }
+            }
+            DfsMetadataStatusMutationEffect::NamespaceJob(job_id) => {
+                let before = namespace_job_before
+                    .expect("namespace-job status mutation captured prior contribution");
+                let after = self.namespace_job_status(&job_id);
+                self.replace_namespace_job_status(before, after);
+            }
+        }
+    }
+
+    fn apply_unindexed(&mut self, op: DfsMetadataTableOp) {
         match op {
             DfsMetadataTableOp::PutFileSystem { file_system } => {
                 self.file_systems
@@ -1719,10 +2146,14 @@ pub(crate) struct DfsMetadataTableRollback {
     namespace_requests: HashMap<(NodeId, String), Option<DfsNamespaceRequestRecord>>,
     namespace_request_receipts: HashMap<(NodeId, String), Option<DfsNamespaceRequestReceipt>>,
     namespace_receipt_retention: Option<DfsNamespaceReceiptRetentionState>,
+    status_index: Option<DfsMetadataStatusIndex>,
 }
 
 impl DfsMetadataTableRollback {
     fn record(&mut self, tables: &DfsMetadataTables, op: &DfsMetadataTableOp) {
+        if self.status_index.is_none() {
+            self.status_index = Some(tables.status_index.clone());
+        }
         match op {
             DfsMetadataTableOp::PutFileSystem { file_system } => record_rollback_value(
                 &mut self.file_systems,
@@ -2240,6 +2671,9 @@ impl DfsMetadataTableRollback {
             tables.namespace_receipt_retention = retention;
         }
         tables.rebuild_pending_namespace_request_index();
+        if let Some(status_index) = self.status_index {
+            tables.status_index = status_index;
+        }
     }
 }
 

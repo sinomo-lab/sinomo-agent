@@ -2423,10 +2423,24 @@ pub struct LocalSobjMetadataBackend {
     /// Persisted prepare representation selected by the quorum-committed shard
     /// configuration. Direct and legacy backends remain fail-safe legacy.
     namespace_prepare_codec: DfsMetadataNamespacePrepareCodec,
+    /// Cursor values already observed by this open backend for bounded
+    /// resident status. The durable sidecars remain authoritative; this
+    /// projection is seeded once when the backend enters the resident pool
+    /// and advanced by the ordinary cursor read/write paths. In particular,
+    /// returning a mutation lease never has to rescan the replay-cursor
+    /// directory or reopen every replica cursor sidecar.
+    resident_cursor_status_projection: Arc<Mutex<ResidentMetadataCursorStatusProjection>>,
     #[cfg(test)]
     receipt_scan_counters: Arc<MetadataReceiptScanCounters>,
     #[cfg(test)]
     content_root_catalog_snapshot_builds: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResidentMetadataCursorStatusProjection {
+    initialized: bool,
+    replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
+    replay_cursors: BTreeMap<DfsMetadataShardId, u64>,
 }
 
 impl LocalSobjMetadataBackend {
@@ -2465,6 +2479,9 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            resident_cursor_status_projection: Arc::new(Mutex::new(
+                ResidentMetadataCursorStatusProjection::default(),
+            )),
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2595,6 +2612,9 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            resident_cursor_status_projection: Arc::new(Mutex::new(
+                ResidentMetadataCursorStatusProjection::default(),
+            )),
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -2700,6 +2720,9 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: true,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            resident_cursor_status_projection: Arc::new(Mutex::new(
+                ResidentMetadataCursorStatusProjection::default(),
+            )),
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -3378,6 +3401,10 @@ impl LocalSobjMetadataBackend {
         let all_entries = batch.entries.iter().collect::<Vec<_>>();
         self.persist_replayed_journal_entries_unlocked(&all_entries, persisted_through_sequence)?;
         if replay_entries.is_empty() {
+            self.observe_resident_metadata_replay_cursor(
+                &batch.shard_id,
+                source_cursor.last_sequence,
+            );
             return Ok(DfsMetadataReplicaApplyReport::default());
         }
         for entry in &replay_entries {
@@ -3430,6 +3457,7 @@ impl LocalSobjMetadataBackend {
         // exact prefix proof are authoritative, so checkpointing them in
         // batches avoids two atomic file rewrites on every replicated commit.
         metadata_cursor::checkpoint_replay_cursor_if_due(&self.root, &source_cursor)?;
+        self.observe_resident_metadata_replay_cursor(&batch.shard_id, source_cursor.last_sequence);
         Ok(
             DfsMetadataReplicaApplyReport::with_namespace_authority_proof(
                 applied,
@@ -3562,6 +3590,9 @@ impl LocalSobjMetadataBackend {
             consistent_read_snapshot_depth: 0,
             replica_repair_only: false,
             namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            resident_cursor_status_projection: Arc::new(Mutex::new(
+                ResidentMetadataCursorStatusProjection::default(),
+            )),
             #[cfg(test)]
             receipt_scan_counters: Arc::new(MetadataReceiptScanCounters::default()),
             #[cfg(test)]
@@ -3712,10 +3743,11 @@ impl LocalSobjMetadataBackend {
         metadata_cursor::write_replay_cursor(
             &self.root,
             &DfsMetadataReplayCursor {
-                shard_id: source_shard_id,
+                shard_id: source_shard_id.clone(),
                 last_sequence: replayed_through_sequence,
             },
         )?;
+        self.observe_resident_metadata_replay_cursor(&source_shard_id, replayed_through_sequence);
         self.write_local_materialization_cursor(&DfsMetadataReplayCursor {
             shard_id: self.shard_id.clone(),
             last_sequence: replayed_through_sequence,
@@ -5097,7 +5129,126 @@ impl LocalSobjMetadataBackend {
                 .replayed_through_sequence
                 .max(prefix_proof.journal_sequence);
         }
+        let mut projection = self
+            .resident_cursor_status_projection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if projection.initialized {
+            projection.replay_cursors = cursors
+                .iter()
+                .map(|cursor| {
+                    (
+                        cursor.source_shard_id.clone(),
+                        cursor.replayed_through_sequence,
+                    )
+                })
+                .collect();
+        }
         Ok(cursors)
+    }
+
+    /// Seed the bounded resident cursor projection from the durable sidecars.
+    ///
+    /// This is intentionally an open/attach operation, not a status or lease
+    /// return operation. Once seeded, normal cursor transitions maintain the
+    /// projection incrementally.
+    pub(crate) fn initialize_resident_metadata_cursor_status_projection(
+        &self,
+        target_node_ids: &[NodeId],
+        shard_id: &DfsMetadataShardId,
+    ) -> Result<()> {
+        let mut replication_cursors = BTreeMap::new();
+        for target_node_id in target_node_ids {
+            replication_cursors.insert(
+                (target_node_id.clone(), shard_id.clone()),
+                metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?,
+            );
+        }
+        let replay_cursors = self
+            .replay_cursor_statuses()?
+            .into_iter()
+            .map(|cursor| (cursor.source_shard_id, cursor.replayed_through_sequence))
+            .collect();
+        let mut projection = self
+            .resident_cursor_status_projection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        projection.initialized = true;
+        projection.replication_cursors = replication_cursors;
+        projection.replay_cursors = replay_cursors;
+        Ok(())
+    }
+
+    pub(crate) fn resident_metadata_cursor_status_projection(
+        &self,
+        target_node_ids: &[NodeId],
+        shard_id: &DfsMetadataShardId,
+    ) -> Option<(Vec<(NodeId, u64)>, Vec<DfsMetadataReplayCursorStatus>)> {
+        let projection = self
+            .resident_cursor_status_projection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !projection.initialized {
+            return None;
+        }
+        let replication_cursors = target_node_ids
+            .iter()
+            .map(|target_node_id| {
+                projection
+                    .replication_cursors
+                    .get(&(target_node_id.clone(), shard_id.clone()))
+                    .copied()
+                    .map(|sequence| (target_node_id.clone(), sequence))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let replay_cursors = projection
+            .replay_cursors
+            .iter()
+            .map(
+                |(source_shard_id, replayed_through_sequence)| DfsMetadataReplayCursorStatus {
+                    source_shard_id: source_shard_id.clone(),
+                    replayed_through_sequence: *replayed_through_sequence,
+                },
+            )
+            .collect();
+        Some((replication_cursors, replay_cursors))
+    }
+
+    fn observe_resident_metadata_replication_cursor(
+        &self,
+        target_node_id: &NodeId,
+        shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) {
+        let mut projection = self
+            .resident_cursor_status_projection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if projection.initialized {
+            let current = projection
+                .replication_cursors
+                .entry((target_node_id.clone(), shard_id.clone()))
+                .or_default();
+            *current = (*current).max(sequence);
+        }
+    }
+
+    fn observe_resident_metadata_replay_cursor(
+        &self,
+        source_shard_id: &DfsMetadataShardId,
+        sequence: u64,
+    ) {
+        let mut projection = self
+            .resident_cursor_status_projection
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if projection.initialized {
+            let current = projection
+                .replay_cursors
+                .entry(source_shard_id.clone())
+                .or_default();
+            *current = (*current).max(sequence);
+        }
     }
 
     fn ensure_metadata_prefix_proof_checkpoint_unlocked(&mut self) -> Result<bool> {
@@ -6300,6 +6451,7 @@ impl LocalSobjMetadataBackend {
         &mut self,
         handoff_id: &str,
         activated_epoch: u64,
+        rebound_prefix_proof: Option<&DfsMetadataPrefixProof>,
     ) -> Result<bool> {
         let Some(existing) = self.membership_handoff_write_freeze()? else {
             return Ok(false);
@@ -6339,11 +6491,38 @@ impl LocalSobjMetadataBackend {
                 activated_epoch
             )));
         }
-        let marker_changed = existing.activated_epoch != Some(activated_epoch)
-            || existing.rebind_prefix_proof.is_none();
-        let mut activated = existing;
+        let mut activated = existing.clone();
         activated.activated_epoch = Some(activated_epoch);
-        if activated.rebind_prefix_proof.is_none() {
+        // Primary rebind is the proof-validation boundary. Persist its exact
+        // current prefix in the same atomic marker update as activation, so a
+        // later V2 append can restart from this checkpoint instead of replaying
+        // an older (possibly V1) handoff tail.
+        if let Some(rebound_prefix_proof) = rebound_prefix_proof {
+            if !rebound_prefix_proof.is_well_formed()
+                || rebound_prefix_proof.journal_sequence < activated.journal_sequence
+                || (rebound_prefix_proof.journal_sequence == activated.journal_sequence
+                    && rebound_prefix_proof.digest != activated.state_fingerprint)
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} membership handoff {} cannot checkpoint rebound prefix {} from marker prefix {}",
+                    self.shard_id.0,
+                    handoff_id,
+                    rebound_prefix_proof.journal_sequence,
+                    activated.journal_sequence
+                )));
+            }
+            if let Some(previous) = activated.rebind_prefix_proof.as_ref()
+                && (rebound_prefix_proof.journal_sequence < previous.journal_sequence
+                    || (rebound_prefix_proof.journal_sequence == previous.journal_sequence
+                        && rebound_prefix_proof.digest != previous.digest))
+            {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata shard {} membership handoff {} rebound prefix regressed or diverged at sequence {}",
+                    self.shard_id.0, handoff_id, rebound_prefix_proof.journal_sequence
+                )));
+            }
+            activated.rebind_prefix_proof = Some(rebound_prefix_proof.clone());
+        } else if activated.rebind_prefix_proof.is_none() {
             let current = self.prefix_proof.as_ref().ok_or_else(|| {
                 MetadataBackendError::Serde(format!(
                     "metadata shard {} legacy membership handoff {} has no current exact prefix proof",
@@ -6365,7 +6544,7 @@ impl LocalSobjMetadataBackend {
             }
             activated.rebind_prefix_proof = Some(current.clone());
         }
-        if marker_changed {
+        if activated != existing {
             write_sobj_atomic(&self.membership_handoff_write_freeze_path(), &activated)?;
         }
         Ok(true)
@@ -6377,7 +6556,11 @@ impl LocalSobjMetadataBackend {
         activated_epoch: u64,
     ) -> Result<bool> {
         let _lock = self.begin_metadata_write_allow_frozen()?;
-        self.mark_membership_handoff_write_freeze_activated_unlocked(handoff_id, activated_epoch)
+        self.mark_membership_handoff_write_freeze_activated_unlocked(
+            handoff_id,
+            activated_epoch,
+            None,
+        )
     }
 
     fn clear_membership_handoff_write_freeze(
@@ -6386,6 +6569,23 @@ impl LocalSobjMetadataBackend {
         active_shard: &DfsMetadataShardConfig,
     ) -> Result<bool> {
         let lock = self.begin_metadata_write_allow_frozen()?;
+        let rebound_prefix_proof = self.prefix_proof.clone().ok_or_else(|| {
+            MetadataBackendError::Serde(format!(
+                "metadata shard {} membership handoff {} cannot bind without an exact current prefix proof",
+                self.shard_id.0, handoff_id
+            ))
+        })?;
+        if !rebound_prefix_proof.is_well_formed()
+            || rebound_prefix_proof.journal_sequence != self.journal_last_sequence()
+        {
+            return Err(MetadataBackendError::Serde(format!(
+                "metadata shard {} membership handoff {} current prefix sequence {} does not match durable head {}",
+                self.shard_id.0,
+                handoff_id,
+                rebound_prefix_proof.journal_sequence,
+                self.journal_last_sequence()
+            )));
+        }
         let previous_namespace_prepare_codec = std::mem::replace(
             &mut self.namespace_prepare_codec,
             active_shard.namespace_prepare_codec,
@@ -6395,6 +6595,7 @@ impl LocalSobjMetadataBackend {
         let marker_activated = self.mark_membership_handoff_write_freeze_activated_unlocked(
             handoff_id,
             active_shard.epoch,
+            Some(&rebound_prefix_proof),
         );
         match marker_activated {
             Ok(true) => {}
@@ -6652,6 +6853,13 @@ impl LocalSobjMetadataBackend {
             &self.prefix_proof,
             &self.read_snapshot_cache,
         )
+    }
+
+    /// Read the operator projection owned by this already-resident table
+    /// generation. The projection is maintained while table operations are
+    /// applied, so this never walks the materialized metadata maps.
+    pub(crate) fn resident_metadata_status_summary(&self) -> DfsMetadataSummary {
+        self.tables.metadata_status_summary()
     }
 
     pub(crate) fn cached_table_generation(
@@ -8682,6 +8890,12 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         metadata_summary_from_tables(&tables, |_| Ok(true))
     }
 
+    fn metadata_status_summaries(&self) -> Result<(DfsMetadataSummary, DfsMetadataSummary)> {
+        let tables = self.current_tables_snapshot()?;
+        let summary = tables.metadata_status_summary();
+        Ok((summary.clone(), summary))
+    }
+
     fn metadata_summary_for_file_system(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -10472,7 +10686,10 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         target_node_id: &NodeId,
         shard_id: &DfsMetadataShardId,
     ) -> Result<u64> {
-        metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)
+        let sequence =
+            metadata_cursor::metadata_replication_cursor(&self.root, target_node_id, shard_id)?;
+        self.observe_resident_metadata_replication_cursor(target_node_id, shard_id, sequence);
+        Ok(sequence)
     }
 
     fn put_metadata_replication_cursor(
@@ -10492,7 +10709,13 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             target_node_id,
             shard_id,
             next_after_sequence,
-        )
+        )?;
+        self.observe_resident_metadata_replication_cursor(
+            target_node_id,
+            shard_id,
+            next_after_sequence,
+        );
+        Ok(())
     }
 
     fn metadata_prefix_ack_floor(
@@ -10533,12 +10756,14 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         self.require_replication_source_shard(source_shard_id)?;
         let checkpoint =
             metadata_cursor::read_replay_cursor(&self.root, source_shard_id)?.last_sequence;
-        Ok(self
+        let sequence = self
             .prefix_proof
             .as_ref()
             .filter(|_| &self.shard_id == source_shard_id)
             .map(|proof| proof.journal_sequence.max(checkpoint))
-            .unwrap_or(checkpoint))
+            .unwrap_or(checkpoint);
+        self.observe_resident_metadata_replay_cursor(source_shard_id, sequence);
+        Ok(sequence)
     }
 
     fn metadata_shard_statuses(&self) -> Result<Vec<DfsMetadataShardStatus>> {
@@ -26205,6 +26430,131 @@ mod tests {
         retiring
             .put_object(&object(version("version_after_explicit_bind")))
             .expect("explicitly rebound generation may append");
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn successful_membership_rebind_checkpoints_current_prefix_for_next_restart() {
+        let root = temp_root("membership-handoff-rebind-prefix-checkpoint");
+        let shard_id = DfsMetadataShardId::new("root");
+        let local_node_id = node("node_owner");
+        let retiring_shard = root_shard_config_at_epoch(&shard_id.0, 17);
+        let active_shard = root_shard_config_at_epoch(&shard_id.0, 18);
+        let source_root = root.join("source");
+        let rebound_root = root.join("rebound");
+        let mut source = LocalSobjMetadataBackend::new(shard_id.clone(), &source_root)
+            .expect("source metadata backend");
+        let mut rebound = LocalSobjMetadataBackend::new(shard_id.clone(), &rebound_root)
+            .expect("rebound metadata backend");
+
+        source
+            .put_file_system(&file_system())
+            .expect("source filesystem");
+        let initial = source
+            .journal_batch_since_limited(0, 16, usize::MAX)
+            .expect("initial source batch")
+            .expect("initial source entries");
+        rebound
+            .apply_journal_batch(&initial)
+            .expect("seed rebound replica");
+        let freeze = rebound
+            .freeze_metadata_shard_for_membership_handoff(
+                &shard_id,
+                "handoff-rebind-prefix-checkpoint",
+                17,
+            )
+            .expect("freeze retiring generation")
+            .expect("local shard");
+        let proof = crate::DfsMetadataShardMembershipHandoffProof {
+            handoff_id: "handoff-rebind-prefix-checkpoint".to_string(),
+            retiring_shard,
+            desired_shard: active_shard.clone(),
+            journal_sequence: freeze.journal_sequence,
+            state_fingerprint: freeze.state_fingerprint.clone(),
+            acknowledged_node_ids: vec![local_node_id.clone()],
+        };
+        rebound
+            .mark_metadata_shard_membership_handoff_activated(
+                &shard_id,
+                "handoff-rebind-prefix-checkpoint",
+                18,
+            )
+            .expect("mark successor generation activated");
+
+        source
+            .put_object(&object(version("version_rebind_prefix_replica")))
+            .expect("successor object");
+        let batch = source
+            .journal_batch_since_limited(initial.next_after_sequence, 16, usize::MAX)
+            .expect("successor journal batch")
+            .expect("successor journal entries");
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system_id(),
+            shard_id.clone(),
+            node("active-successor"),
+            18,
+        );
+        rebound
+            .apply_journal_batch_with_replica_permit(&permit, &batch)
+            .expect("replicate successor prefix while local authority remains fenced");
+        let rebound_prefix = rebound
+            .metadata_prefix_proof()
+            .expect("current replicated prefix");
+        assert!(rebound_prefix.journal_sequence > freeze.journal_sequence);
+        assert_ne!(
+            rebound
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("activated marker")
+                .and_then(|marker| marker.rebind_prefix_proof),
+            Some(rebound_prefix.clone()),
+            "replica ingest alone must not bind or advance the local authority marker"
+        );
+
+        assert!(
+            crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+                &mut rebound,
+                &local_node_id,
+                &active_shard,
+                None,
+                Some(&proof),
+            )
+            .expect("bind validated successor prefix")
+        );
+        assert_eq!(
+            rebound
+                .metadata_shard_write_freeze(&shard_id)
+                .expect("rebound marker")
+                .and_then(|marker| marker.rebind_prefix_proof),
+            Some(rebound_prefix),
+            "successful authority rebind must durably checkpoint the exact current prefix"
+        );
+
+        rebound
+            .put_object(&object(version("version_rebind_prefix_first_v2_write")))
+            .expect("first write after rebind");
+        drop(rebound);
+
+        let mut restarted = LocalSobjMetadataBackend::new(shard_id.clone(), &rebound_root)
+            .expect("restart rebound metadata backend");
+        assert!(
+            restarted
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("fresh handle remains fenced before proof-bound rebind")
+        );
+        assert!(
+            crate::service_sync::rebind_completed_metadata_shard_membership_handoff(
+                &mut restarted,
+                &local_node_id,
+                &active_shard,
+                None,
+                Some(&proof),
+            )
+            .expect("proof-bound rebind after the first post-handoff write")
+        );
+        restarted
+            .put_object(&object(version("version_rebind_prefix_second_restart")))
+            .expect("second restart may append after rebind");
 
         cleanup(&root);
     }

@@ -69,6 +69,20 @@ pub struct DfsRepairQueueView {
     pub records: Vec<DfsRepairAttemptRecord>,
 }
 
+/// Bounded operator projection from an already-materialized repair queue.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsRepairQueueStatusView {
+    pub head_sequence: u64,
+    pub record_count: usize,
+    pub records: Vec<DfsRepairAttemptRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DfsRepairQueueBoundedStatus {
+    Hydrated(DfsRepairQueueStatusView),
+    NotHydrated,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DfsRepairQueueReconcileOutcome {
     Applied {
@@ -301,6 +315,12 @@ static DFS_REPAIR_QUEUE_STORES: OnceLock<
     Mutex<BTreeMap<PathBuf, Arc<Mutex<DfsRepairQueueState>>>>,
 > = OnceLock::new();
 
+#[cfg(test)]
+thread_local! {
+    static BOUNDED_STATUS_RECORD_CLONES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Cloneable handle to the process-local materialized repair queue.
 ///
 /// Handles for the same snapshot path share one sequence allocator and map, so
@@ -343,6 +363,52 @@ impl LocalDfsRepairQueueStore {
             head_sequence: state.head_sequence,
             records: state.records.values().cloned().collect(),
         })
+    }
+
+    /// Read queue cardinality plus a bounded deterministic sample without
+    /// loading/replaying durable state or cloning the complete queue. If the
+    /// process-local generation has never been materialized, status is
+    /// explicitly unavailable rather than turning an operator probe into a
+    /// cold recovery pass.
+    pub fn bounded_status_view(
+        &self,
+        max_records: usize,
+    ) -> Result<DfsRepairQueueBoundedStatus, DfsError> {
+        let state = match self.inner.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(DfsError::Metadata {
+                    message: "bounded DFS repair queue status unavailable while the resident queue is being updated"
+                        .to_string(),
+                });
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(DfsError::Metadata {
+                    message: "bounded DFS repair queue status lock is poisoned".to_string(),
+                });
+            }
+        };
+        if !state.loaded {
+            return Ok(DfsRepairQueueBoundedStatus::NotHydrated);
+        }
+        let records = state
+            .records
+            .values()
+            .take(max_records)
+            .map(|record| {
+                #[cfg(test)]
+                BOUNDED_STATUS_RECORD_CLONES
+                    .set(BOUNDED_STATUS_RECORD_CLONES.get().saturating_add(1));
+                record.clone()
+            })
+            .collect();
+        Ok(DfsRepairQueueBoundedStatus::Hydrated(
+            DfsRepairQueueStatusView {
+                head_sequence: state.head_sequence,
+                record_count: state.records.len(),
+                records,
+            },
+        ))
     }
 
     pub fn append_enqueues(
@@ -814,6 +880,48 @@ mod tests {
         let view = reopen(&snapshot_path).view().expect("replay");
         assert_eq!(view.head_sequence, 1);
         assert_eq!(view.records, vec![existing]);
+    }
+
+    #[test]
+    fn bounded_status_samples_large_resident_queue_without_replay_or_full_clone() {
+        let root = sinomo_testdir::TestDir::new("dfs-repair-queue-bounded-status");
+        let snapshot_path = root.join("repair-attempts.sobj");
+        let store = LocalDfsRepairQueueStore::new(&snapshot_path);
+        let mut records = (0..4096)
+            .map(|index| {
+                record(
+                    &format!("bounded-{index:04}"),
+                    &format!("node-bounded-{index:04}"),
+                    0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let sentinel = record("zzzz-sentinel", "node-zzzz-sentinel", 0);
+        records.push(sentinel.clone());
+        store.append_enqueues(records).expect("seed large queue");
+
+        BOUNDED_STATUS_RECORD_CLONES.set(0);
+        let DfsRepairQueueBoundedStatus::Hydrated(view) =
+            store.bounded_status_view(32).expect("bounded hot view")
+        else {
+            panic!("materialized queue must return a hydrated bounded view");
+        };
+        assert_eq!(view.record_count, 4097);
+        assert_eq!(view.records.len(), 32);
+        assert!(!view.records.contains(&sentinel));
+        assert_eq!(
+            BOUNDED_STATUS_RECORD_CLONES.get(),
+            32,
+            "status may clone only the requested sample, not the complete resident queue"
+        );
+
+        let cold = reopen(&snapshot_path);
+        fs::write(&snapshot_path, b"not a repair queue snapshot")
+            .expect("install disk replay sentinel");
+        let cold_status = cold
+            .bounded_status_view(32)
+            .expect("cold bounded status must not replay disk");
+        assert_eq!(cold_status, DfsRepairQueueBoundedStatus::NotHydrated);
     }
 
     #[test]

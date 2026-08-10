@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, TryLockError};
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
@@ -79,7 +79,8 @@ use crate::metadata_table_store::METADATA_TABLE_SNAPSHOT_FORMAT_VERSION;
 use crate::metadata_tombstone::{metadata_now_unix_nanos, plan_tombstone_compaction};
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{
-    DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsVersion,
+    DfsFileSystem, DfsFileSystemId, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
+    DfsOperatorStatusOmission, DfsVersion,
 };
 
 fn is_source_eviction_tombstone(object: &DfsObjectMetadata) -> bool {
@@ -648,6 +649,34 @@ fn canonicalize_routing_topology(shards: &mut [DfsMetadataShardConfig]) {
     });
 }
 
+/// Fields that can change which shard receives a path or object lookup.
+/// Authority, replication, codec, and policy changes do not create old routes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DfsMetadataRoutingShardIdentity {
+    file_system_id: DfsFileSystemId,
+    shard_id: String,
+    assignment: DfsMetadataShardAssignment,
+}
+
+fn routing_topology_identity(
+    topology: &[DfsMetadataShardConfig],
+) -> Vec<DfsMetadataRoutingShardIdentity> {
+    let mut identity = topology
+        .iter()
+        .map(|shard| DfsMetadataRoutingShardIdentity {
+            file_system_id: shard.file_system_id.clone(),
+            shard_id: shard.shard_id.clone(),
+            assignment: shard.assignment.clone(),
+        })
+        .collect::<Vec<_>>();
+    identity.sort_by(|left, right| {
+        left.file_system_id
+            .cmp(&right.file_system_id)
+            .then_with(|| left.shard_id.cmp(&right.shard_id))
+    });
+    identity
+}
+
 fn compile_routing_indexes(
     shards: impl IntoIterator<Item = DfsMetadataShardConfig>,
 ) -> Result<BTreeMap<DfsFileSystemId, DfsMetadataShardRoutingIndex>> {
@@ -693,17 +722,171 @@ fn load_routing_topology_history(
         }
     } else if history.active != active {
         let previous = std::mem::replace(&mut history.active, active.to_vec());
-        history.fallbacks.insert(0, previous);
+        if routing_topology_identity(&previous) != routing_topology_identity(active) {
+            history.fallbacks.insert(0, previous);
+        }
     }
-    history
-        .fallbacks
-        .retain(|topology| !topology.is_empty() && topology != &history.active);
-    history.fallbacks.dedup();
+    let active_identity = routing_topology_identity(&history.active);
+    let mut fallback_identities = Vec::new();
+    history.fallbacks.retain(|topology| {
+        if topology.is_empty() {
+            return false;
+        }
+        let identity = routing_topology_identity(topology);
+        if identity == active_identity || fallback_identities.contains(&identity) {
+            return false;
+        }
+        fallback_identities.push(identity);
+        true
+    });
     history.fallbacks.truncate(ROUTING_TOPOLOGY_HISTORY_LIMIT);
     if persist && persisted.as_ref() != Some(&history) {
         write_sobj_atomic(&path, &history)?;
     }
     Ok(history)
+}
+
+#[cfg(test)]
+mod routing_topology_history_tests {
+    use super::*;
+    use crate::control_plane::DfsMetadataNamespacePrepareCodec;
+    use sinomo_core::DfsObjectPolicy;
+
+    fn node(value: &str) -> NodeId {
+        NodeId::from_legacy_named(value).expect("valid node id")
+    }
+
+    fn root_config() -> DfsMetadataShardConfig {
+        DfsMetadataShardConfig {
+            file_system_id: crate::sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node("routing-history-primary"),
+            replica_node_ids: vec![node("routing-history-replica")],
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        }
+    }
+
+    fn split_configs() -> Vec<DfsMetadataShardConfig> {
+        let root = root_config();
+        vec![
+            root,
+            DfsMetadataShardConfig {
+                file_system_id: crate::sifs_file_system_id(),
+                shard_id: "services".to_string(),
+                primary_node_id: node("routing-history-services-primary"),
+                replica_node_ids: vec![node("routing-history-services-replica")],
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::PathPrefix {
+                    prefix: crate::SIFS_SERVICES_PATH.to_string(),
+                },
+                namespace_prepare_codec: DfsMetadataNamespacePrepareCodec::Legacy,
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            },
+        ]
+    }
+
+    fn change_non_routing_fields(
+        topology: &[DfsMetadataShardConfig],
+    ) -> Vec<DfsMetadataShardConfig> {
+        topology
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                let mut shard = shard.clone();
+                shard.primary_node_id = node(&format!("routing-history-new-primary-{index}"));
+                shard.replica_node_ids = vec![
+                    node(&format!("routing-history-new-replica-{index}")),
+                    node(&format!("routing-history-new-replica-{index}-b")),
+                ];
+                shard.epoch += 10;
+                shard.namespace_prepare_codec = DfsMetadataNamespacePrepareCodec::PackedV2;
+                shard.default_policy = DfsObjectPolicy::AppendOnly;
+                shard
+            })
+            .collect()
+    }
+
+    fn metadata_root(name: &str) -> (sinomo_testdir::TestDir, PathBuf) {
+        let root = sinomo_testdir::TestDir::new(name);
+        let metadata_root = root.path().join("metadata");
+        create_dir_all(metadata_root.join("shard-index")).expect("create shard index root");
+        (root, metadata_root)
+    }
+
+    #[test]
+    fn routing_topology_history_does_not_fallback_for_non_routing_changes() {
+        let (_root, metadata_root) = metadata_root("dfs-routing-history-non-routing-change");
+        let initial = vec![root_config()];
+        let initial_history = load_routing_topology_history(&metadata_root, &initial, true)
+            .expect("persist initial routing history");
+        assert!(initial_history.fallbacks.is_empty());
+
+        let changed = change_non_routing_fields(&initial);
+        let history = load_routing_topology_history(&metadata_root, &changed, true)
+            .expect("refresh full active shard configs");
+
+        assert_eq!(history.active, changed);
+        assert!(
+            history.fallbacks.is_empty(),
+            "authority, replica, epoch, codec, and policy changes must not create routing fallbacks"
+        );
+        assert_eq!(
+            read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(
+                &routing_topology_history_path(&metadata_root),
+            )
+            .expect("read refreshed routing history"),
+            Some(history),
+            "the complete active configs must still be refreshed on disk"
+        );
+    }
+
+    #[test]
+    fn routing_topology_history_compacts_existing_semantic_duplicates() {
+        let (_root, metadata_root) = metadata_root("dfs-routing-history-semantic-dedup");
+        let active = split_configs();
+        let active_duplicate = change_non_routing_fields(&active);
+        let root_fallback = vec![root_config()];
+        let root_duplicate = change_non_routing_fields(&root_fallback);
+        let persisted = DfsMetadataRoutingTopologyHistory {
+            active: active.clone(),
+            fallbacks: vec![active_duplicate, root_fallback.clone(), root_duplicate],
+        };
+        let path = routing_topology_history_path(&metadata_root);
+        write_sobj_atomic(&path, &persisted).expect("persist duplicate routing history");
+
+        let history = load_routing_topology_history(&metadata_root, &active, true)
+            .expect("compact routing history");
+
+        assert_eq!(history.fallbacks, vec![root_fallback]);
+        assert_eq!(
+            read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(&path)
+                .expect("read compacted routing history"),
+            Some(history),
+            "semantic compaction must be persisted"
+        );
+    }
+
+    #[test]
+    fn routing_topology_history_retains_genuine_root_to_split_change() {
+        let (_root, metadata_root) = metadata_root("dfs-routing-history-root-to-split");
+        let root_topology = vec![root_config()];
+        load_routing_topology_history(&metadata_root, &root_topology, true)
+            .expect("persist root routing topology");
+
+        let split = split_configs();
+        let history = load_routing_topology_history(&metadata_root, &split, true)
+            .expect("persist split routing topology");
+
+        assert_eq!(history.active, split);
+        assert_eq!(
+            history.fallbacks,
+            vec![root_topology],
+            "a genuine shard or assignment change must remain routable until migration retirement"
+        );
+    }
 }
 
 /// Local sharded metadata router.
@@ -742,6 +925,11 @@ struct ResidentLocalMetadataShardSlot {
     open_mode: LocalMetadataShardOpenMode,
     state: Mutex<ResidentLocalMetadataShardState>,
     available: Condvar,
+    async_available: tokio::sync::Notify,
+    /// Last complete shard-local operator projection. It stays readable while
+    /// the backend itself is checked out by a long mutation, so status never
+    /// queues behind data-plane ownership.
+    status_snapshot: RwLock<Option<ResidentLocalMetadataShardStatusSnapshot>>,
 }
 
 #[derive(Debug)]
@@ -750,6 +938,57 @@ enum ResidentLocalMetadataShardState {
     Opening,
     Available(Box<LocalSobjMetadataBackend>),
     CheckedOut,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResidentLocalMetadataShardStatusSnapshot {
+    summary: DfsMetadataSummary,
+    shard_status: DfsMetadataShardStatus,
+    incomplete_reasons: Vec<String>,
+}
+
+/// One bounded operator image from a resident sharded metadata generation.
+///
+/// The image is assembled from per-shard projections published when shard
+/// leases complete. It never checks out or scans a metadata table generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DfsResidentMetadataStatusSnapshot {
+    pub summary: DfsMetadataSummary,
+    pub primary_summary: DfsMetadataSummary,
+    pub metadata_shards: Vec<DfsMetadataShardStatus>,
+    pub incomplete_reasons: Vec<String>,
+    pub bounded_omissions: Vec<DfsOperatorStatusOmission>,
+}
+
+pub(crate) fn metadata_shard_topology_status(
+    config: &DfsMetadataShardConfig,
+) -> DfsMetadataShardStatus {
+    DfsMetadataShardStatus {
+        shard_id: DfsMetadataShardId::new(config.shard_id.clone()),
+        file_system_id: Some(config.file_system_id.clone()),
+        primary_node_id: Some(config.primary_node_id.clone()),
+        replica_node_ids: config.replica_node_ids.clone(),
+        epoch: Some(config.epoch),
+        journal_next_sequence: 0,
+        journal_last_sequence: 0,
+        replica_lag: Vec::new(),
+        replay_cursors: Vec::new(),
+    }
+}
+
+fn non_primary_unhydrated_status_omission(
+    local_node_id: Option<&NodeId>,
+    config: &DfsMetadataShardConfig,
+    shard_id: &DfsMetadataShardId,
+) -> Option<DfsOperatorStatusOmission> {
+    local_node_id
+        .filter(|local_node_id| &config.primary_node_id != *local_node_id)
+        .map(|_| {
+            DfsOperatorStatusOmission::non_primary_resident_metadata_not_hydrated(
+                config.file_system_id.clone(),
+                shard_id.clone(),
+            )
+        })
 }
 
 impl ResidentLocalMetadataShardSlot {
@@ -761,15 +1000,21 @@ impl ResidentLocalMetadataShardSlot {
             initialization: _,
             backend,
         } = slot;
+        let backend = backend.into_inner();
+        let status_snapshot = backend
+            .as_deref()
+            .map(|backend| initialize_resident_metadata_shard_status_snapshot(&config, backend));
         Self {
             config,
             root,
             open_mode,
-            state: Mutex::new(match backend.into_inner() {
+            state: Mutex::new(match backend {
                 Some(backend) => ResidentLocalMetadataShardState::Available(backend),
                 None => ResidentLocalMetadataShardState::Unopened,
             }),
             available: Condvar::new(),
+            async_available: tokio::sync::Notify::new(),
+            status_snapshot: RwLock::new(status_snapshot),
         }
     }
 
@@ -777,55 +1022,119 @@ impl ResidentLocalMetadataShardSlot {
         open_local_metadata_shard_backend(&self.config, &self.root, self.open_mode).map(Box::new)
     }
 
+    fn try_checkout(self: &Arc<Self>) -> Result<Option<Box<LocalSobjMetadataBackend>>> {
+        let mut state = self.state.lock().map_err(|error| {
+            MetadataBackendError::Serde(format!(
+                "resident metadata shard {} state lock failed: {error}",
+                self.config.shard_id
+            ))
+        })?;
+        match &*state {
+            ResidentLocalMetadataShardState::Unopened => {
+                *state = ResidentLocalMetadataShardState::Opening;
+                drop(state);
+                let opened = self.open_backend();
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                match opened {
+                    Ok(backend) => {
+                        let snapshot = initialize_resident_metadata_shard_status_snapshot(
+                            &self.config,
+                            &backend,
+                        );
+                        *self
+                            .status_snapshot
+                            .write()
+                            .unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+                        *state = ResidentLocalMetadataShardState::CheckedOut;
+                        Ok(Some(backend))
+                    }
+                    Err(error) => {
+                        *state = ResidentLocalMetadataShardState::Unopened;
+                        self.available.notify_all();
+                        self.async_available.notify_waiters();
+                        Err(error)
+                    }
+                }
+            }
+            ResidentLocalMetadataShardState::Available(_) => {
+                let ResidentLocalMetadataShardState::Available(backend) =
+                    std::mem::replace(&mut *state, ResidentLocalMetadataShardState::CheckedOut)
+                else {
+                    unreachable!("resident metadata shard availability checked above")
+                };
+                Ok(Some(backend))
+            }
+            ResidentLocalMetadataShardState::Opening
+            | ResidentLocalMetadataShardState::CheckedOut => Ok(None),
+        }
+    }
+
     fn checkout(self: &Arc<Self>) -> Result<Box<LocalSobjMetadataBackend>> {
         loop {
+            if let Some(backend) = self.try_checkout()? {
+                return Ok(backend);
+            }
             let mut state = self.state.lock().map_err(|error| {
                 MetadataBackendError::Serde(format!(
                     "resident metadata shard {} state lock failed: {error}",
                     self.config.shard_id
                 ))
             })?;
-            match &*state {
-                ResidentLocalMetadataShardState::Unopened => {
-                    *state = ResidentLocalMetadataShardState::Opening;
-                    drop(state);
-                    let opened = self.open_backend();
-                    let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                    match opened {
-                        Ok(backend) => {
-                            *state = ResidentLocalMetadataShardState::CheckedOut;
-                            return Ok(backend);
-                        }
-                        Err(error) => {
-                            *state = ResidentLocalMetadataShardState::Unopened;
-                            self.available.notify_all();
-                            return Err(error);
-                        }
-                    }
-                }
-                ResidentLocalMetadataShardState::Available(_) => {
-                    let ResidentLocalMetadataShardState::Available(backend) =
-                        std::mem::replace(&mut *state, ResidentLocalMetadataShardState::CheckedOut)
-                    else {
-                        unreachable!("resident metadata shard availability checked above")
-                    };
-                    return Ok(backend);
-                }
+            while matches!(
+                *state,
                 ResidentLocalMetadataShardState::Opening
-                | ResidentLocalMetadataShardState::CheckedOut => {
-                    state = self.available.wait(state).map_err(|error| {
-                        MetadataBackendError::Serde(format!(
-                            "resident metadata shard {} availability wait failed: {error}",
-                            self.config.shard_id
-                        ))
-                    })?;
-                    drop(state);
-                }
+                    | ResidentLocalMetadataShardState::CheckedOut
+            ) {
+                state = self.available.wait(state).map_err(|error| {
+                    MetadataBackendError::Serde(format!(
+                        "resident metadata shard {} availability wait failed: {error}",
+                        self.config.shard_id
+                    ))
+                })?;
             }
         }
     }
 
+    async fn wait_until_checkout_available(&self) -> Result<()> {
+        loop {
+            // Register before inspecting state so a restore between the check
+            // and await cannot strand this waiter. Unlike the blocking
+            // checkout, this owns no backend while it waits.
+            let notified = self.async_available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let state = self.state.lock().map_err(|error| {
+                    MetadataBackendError::Serde(format!(
+                        "resident metadata shard {} state lock failed: {error}",
+                        self.config.shard_id
+                    ))
+                })?;
+                if matches!(
+                    *state,
+                    ResidentLocalMetadataShardState::Unopened
+                        | ResidentLocalMetadataShardState::Available(_)
+                ) {
+                    return Ok(());
+                }
+            }
+            notified.await;
+        }
+    }
+
     fn restore(&self, backend: Box<LocalSobjMetadataBackend>) {
+        let refreshed = resident_metadata_shard_status_snapshot_from_projection(
+            &self.config,
+            &backend,
+            Vec::new(),
+        );
+        {
+            let mut snapshot = self
+                .status_snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            *snapshot = Some(refreshed);
+        }
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         debug_assert!(matches!(
             *state,
@@ -833,6 +1142,47 @@ impl ResidentLocalMetadataShardSlot {
         ));
         *state = ResidentLocalMetadataShardState::Available(backend);
         self.available.notify_all();
+        self.async_available.notify_waiters();
+    }
+
+    /// Return a bounded operator projection without waiting for ownership of
+    /// the shard backend. A checked-out shard deliberately serves the last
+    /// completed generation; an unopened shard has no truthful generation to
+    /// serve and is reported as unavailable instead of being hydrated here.
+    fn bounded_status_snapshot(&self) -> Result<ResidentLocalMetadataShardStatusSnapshot> {
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(TryLockError::WouldBlock) => return self.last_status_snapshot(),
+            Err(TryLockError::Poisoned(error)) => {
+                return Err(MetadataBackendError::Serde(format!(
+                    "resident metadata shard {} state lock failed: {error}",
+                    self.config.shard_id
+                )));
+            }
+        };
+        match &*state {
+            ResidentLocalMetadataShardState::Available(_) => self.last_status_snapshot(),
+            ResidentLocalMetadataShardState::Opening
+            | ResidentLocalMetadataShardState::CheckedOut => self.last_status_snapshot(),
+            ResidentLocalMetadataShardState::Unopened => {
+                Err(MetadataBackendError::StatusUnhydrated {
+                    shard_id: DfsMetadataShardId::new(self.config.shard_id.clone()),
+                })
+            }
+        }
+    }
+
+    fn last_status_snapshot(&self) -> Result<ResidentLocalMetadataShardStatusSnapshot> {
+        self.status_snapshot
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| MetadataBackendError::StatusUnavailable {
+                reason: format!(
+                    "resident metadata shard {} has no completed generation for bounded status",
+                    self.config.shard_id
+                ),
+            })
     }
 
     fn is_open(&self) -> bool {
@@ -842,6 +1192,99 @@ impl ResidentLocalMetadataShardSlot {
             ResidentLocalMetadataShardState::Available(_)
                 | ResidentLocalMetadataShardState::CheckedOut
         )
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_resident_metadata_status_durable_cursor_reads() {
+    RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS.set(0);
+}
+
+#[cfg(test)]
+fn resident_metadata_status_durable_cursor_reads() -> usize {
+    RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS.get()
+}
+
+fn initialize_resident_metadata_shard_status_snapshot(
+    config: &DfsMetadataShardConfig,
+    backend: &LocalSobjMetadataBackend,
+) -> ResidentLocalMetadataShardStatusSnapshot {
+    #[cfg(test)]
+    RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS.set(
+        RESIDENT_METADATA_STATUS_DURABLE_CURSOR_READS
+            .get()
+            .saturating_add(1),
+    );
+    let incomplete_reasons = backend
+        .initialize_resident_metadata_cursor_status_projection(
+            &config.replica_node_ids,
+            &DfsMetadataShardId::new(config.shard_id.clone()),
+        )
+        .err()
+        .map(|error| {
+            vec![format!(
+                "metadata shard {} cursor projection could not be initialized: {error}",
+                config.shard_id
+            )]
+        })
+        .unwrap_or_default();
+    resident_metadata_shard_status_snapshot_from_projection(config, backend, incomplete_reasons)
+}
+
+fn resident_metadata_shard_status_snapshot_from_projection(
+    config: &DfsMetadataShardConfig,
+    backend: &LocalSobjMetadataBackend,
+    mut incomplete_reasons: Vec<String>,
+) -> ResidentLocalMetadataShardStatusSnapshot {
+    let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+    let journal_last_sequence = backend.journal_last_sequence();
+    let (replica_lag, replay_cursors) = match backend
+        .resident_metadata_cursor_status_projection(&config.replica_node_ids, &shard_id)
+    {
+        Some((replication_cursors, replay_cursors)) => (
+            replication_cursors
+                .into_iter()
+                .map(
+                    |(target_node_id, replicated_through_sequence)| DfsMetadataReplicaLagStatus {
+                        target_node_id,
+                        replicated_through_sequence,
+                        lag_entries: journal_last_sequence
+                            .saturating_sub(replicated_through_sequence),
+                    },
+                )
+                .collect(),
+            replay_cursors,
+        ),
+        None => {
+            if incomplete_reasons.is_empty() {
+                incomplete_reasons.push(format!(
+                    "metadata shard {} has no complete resident cursor projection",
+                    config.shard_id
+                ));
+            }
+            (Vec::new(), Vec::new())
+        }
+    };
+    ResidentLocalMetadataShardStatusSnapshot {
+        summary: backend.resident_metadata_status_summary(),
+        shard_status: DfsMetadataShardStatus {
+            shard_id,
+            file_system_id: Some(config.file_system_id.clone()),
+            primary_node_id: Some(config.primary_node_id.clone()),
+            replica_node_ids: config.replica_node_ids.clone(),
+            epoch: Some(config.epoch),
+            journal_next_sequence: journal_last_sequence.saturating_add(1),
+            journal_last_sequence,
+            replica_lag,
+            replay_cursors,
+        },
+        incomplete_reasons,
     }
 }
 
@@ -876,6 +1319,28 @@ impl ResidentLocalMetadataShardHandle {
             slot: Arc::clone(&self.slot),
             backend: Some(backend),
         })
+    }
+
+    /// Attempt to check out this shard without waiting for a competing owner.
+    ///
+    /// `Ok(None)` means the shard is opening or checked out. Callers that hold
+    /// another admission or lock can release it before waiting for
+    /// [`Self::wait_until_checkout_available`], avoiding cross-lock cycles.
+    pub fn try_checkout(&self) -> Result<Option<ResidentLocalMetadataShardLease>> {
+        self.slot.try_checkout().map(|backend| {
+            backend.map(|backend| ResidentLocalMetadataShardLease {
+                file_system_id: self.file_system_id.clone(),
+                shard_id: self.shard_id.clone(),
+                slot: Arc::clone(&self.slot),
+                backend: Some(backend),
+            })
+        })
+    }
+
+    /// Wait asynchronously until a checkout can be retried without retaining
+    /// a shard lease or another subsystem's admission guard.
+    pub async fn wait_until_checkout_available(&self) -> Result<()> {
+        self.slot.wait_until_checkout_available().await
     }
 
     /// Run one bounded operation against the exact resident backend instance.
@@ -1009,6 +1474,129 @@ impl ResidentLocalShardedMetadataBackend {
             return Ok(false);
         }
         self.with_router(|router| router.root == metadata_root && router.shard_configs == expected)
+    }
+
+    /// Assemble an operator status image without checking out any shard or
+    /// scanning a materialized metadata table. Shards currently owned by a
+    /// mutation contribute their last completed generation.
+    ///
+    /// Historical routing fallbacks mean a namespace move can temporarily
+    /// have live copies in both the source and destination shards. Determining
+    /// which copy is authoritative requires the durable routing/index probes
+    /// used by the exact scanner, so this bounded path omits visibility-based
+    /// counters and marks the image incomplete until migration retires the
+    /// fallbacks. Status itself must remain bounded and available.
+    pub fn bounded_status_snapshot(&self) -> Result<DfsResidentMetadataStatusSnapshot> {
+        let (local_node_id, shard_configs, fallback_count) = self.with_router(|router| {
+            (
+                router.local_node_id.clone(),
+                router.shard_configs.clone(),
+                router.fallback_routing_indexes.len(),
+            )
+        })?;
+        let mut summary = DfsMetadataSummary::default();
+        let mut primary_summary = DfsMetadataSummary::default();
+        let mut file_system_ids = BTreeSet::new();
+        let mut primary_file_system_ids = BTreeSet::new();
+        let mut metadata_shards = Vec::with_capacity(shard_configs.len());
+        let mut incomplete_reasons = Vec::new();
+        let mut bounded_omissions = Vec::new();
+        let mut every_configured_shard_summary_available = true;
+        for config in shard_configs.values() {
+            let shard_id = DfsMetadataShardId::new(config.shard_id.clone());
+            let local_primary = local_node_id
+                .as_ref()
+                .is_none_or(|local_node_id| config.primary_node_id == *local_node_id);
+            file_system_ids.insert(config.file_system_id.clone());
+            if local_primary {
+                primary_file_system_ids.insert(config.file_system_id.clone());
+            }
+            let Some(slot) = self.inner.shards.get(&shard_id) else {
+                every_configured_shard_summary_available = false;
+                incomplete_reasons.push(format!(
+                    "metadata shard {} has no resident bounded-status slot",
+                    shard_id.0
+                ));
+                metadata_shards.push(metadata_shard_topology_status(config));
+                continue;
+            };
+            let mut snapshot = match slot.bounded_status_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(MetadataBackendError::StatusUnhydrated {
+                    shard_id: unhydrated_shard_id,
+                }) if unhydrated_shard_id == shard_id && !local_primary => {
+                    every_configured_shard_summary_available = false;
+                    let omission = non_primary_unhydrated_status_omission(
+                        local_node_id.as_ref(),
+                        config,
+                        &shard_id,
+                    )
+                    .expect("non-primary shard must produce a bounded omission");
+                    incomplete_reasons.push(omission.legacy_reason());
+                    bounded_omissions.push(omission);
+                    metadata_shards.push(metadata_shard_topology_status(config));
+                    continue;
+                }
+                Err(error) => {
+                    every_configured_shard_summary_available = false;
+                    incomplete_reasons.push(format!(
+                        "metadata shard {} status unavailable: {error}",
+                        shard_id.0
+                    ));
+                    metadata_shards.push(metadata_shard_topology_status(config));
+                    continue;
+                }
+            };
+            incomplete_reasons.append(&mut snapshot.incomplete_reasons);
+            accumulate_metadata_summary_detail_counts(&mut summary, &snapshot.summary);
+            if local_primary {
+                accumulate_metadata_summary_detail_counts(&mut primary_summary, &snapshot.summary);
+            }
+
+            // The router config is the generation-level authority for
+            // topology fields. A checked-out shard snapshot can legitimately
+            // predate a just-completed topology update.
+            snapshot.shard_status.file_system_id = Some(config.file_system_id.clone());
+            snapshot.shard_status.primary_node_id = Some(config.primary_node_id.clone());
+            snapshot.shard_status.replica_node_ids = config.replica_node_ids.clone();
+            snapshot.shard_status.epoch = Some(config.epoch);
+            metadata_shards.push(snapshot.shard_status);
+        }
+        summary.file_system_count = file_system_ids.len();
+        primary_summary.file_system_count = primary_file_system_ids.len();
+        if fallback_count > 0 {
+            let cross_shard_namespace_locks_zero_proven = every_configured_shard_summary_available
+                && summary.cross_shard_namespace_lock_count == 0;
+            let file_system_count = summary.file_system_count;
+            let primary_file_system_count = primary_summary.file_system_count;
+            summary = DfsMetadataSummary {
+                file_system_count,
+                ..DfsMetadataSummary::default()
+            };
+            primary_summary = DfsMetadataSummary {
+                file_system_count: primary_file_system_count,
+                ..DfsMetadataSummary::default()
+            };
+            let omission = if cross_shard_namespace_locks_zero_proven {
+                DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
+                    fallback_count,
+                )
+            } else {
+                DfsOperatorStatusOmission::historical_routing_topology(fallback_count)
+            };
+            let legacy_reason = omission.legacy_reason();
+            incomplete_reasons.push(legacy_reason.clone());
+            bounded_omissions.push(omission);
+        }
+        incomplete_reasons.sort();
+        incomplete_reasons.dedup();
+        Ok(DfsResidentMetadataStatusSnapshot {
+            summary,
+            primary_summary,
+            metadata_shards,
+            incomplete_reasons,
+            bounded_omissions,
+        })
     }
 
     /// Scope a handle to an exact filesystem and shard identity.
@@ -1819,26 +2407,38 @@ impl LocalShardedMetadataBackend {
         }
     }
 
-    fn clear_routing_fallbacks_for_file_system(
+    /// Retire one filesystem from every historical routing generation after
+    /// the caller has completed a quiescent, durable migration proof.
+    ///
+    /// This performs no metadata scan. Persist the narrowed history before
+    /// changing the resident indexes so an I/O failure keeps the conservative
+    /// fallback routes active in the current process.
+    pub(crate) fn retire_routing_fallbacks_for_file_system(
         &mut self,
         file_system_id: &DfsFileSystemId,
     ) -> Result<()> {
+        let path = routing_topology_history_path(&self.root);
+        if let Some(mut history) = read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(&path)? {
+            let mut changed = false;
+            for topology in &mut history.fallbacks {
+                let previous_len = topology.len();
+                topology.retain(|shard| shard.file_system_id != *file_system_id);
+                changed |= topology.len() != previous_len;
+            }
+            let previous_generation_count = history.fallbacks.len();
+            history.fallbacks.retain(|topology| !topology.is_empty());
+            changed |= history.fallbacks.len() != previous_generation_count;
+            if changed {
+                write_sobj_atomic(&path, &history)?;
+            }
+        }
+
         for indexes in &mut self.fallback_routing_indexes {
             indexes.remove(file_system_id);
         }
         self.fallback_routing_indexes
             .retain(|indexes| !indexes.is_empty());
-
-        let path = routing_topology_history_path(&self.root);
-        let Some(mut history) = read_sobj_optional::<DfsMetadataRoutingTopologyHistory>(&path)?
-        else {
-            return Ok(());
-        };
-        for topology in &mut history.fallbacks {
-            topology.retain(|shard| shard.file_system_id != *file_system_id);
-        }
-        history.fallbacks.retain(|topology| !topology.is_empty());
-        write_sobj_atomic(&path, &history)
+        Ok(())
     }
 
     fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
@@ -2581,7 +3181,7 @@ impl LocalShardedMetadataBackend {
         // route (or has durable source-eviction evidence). Retire historical
         // routing generations so steady-state negative lookups touch exactly
         // one shard.
-        self.clear_routing_fallbacks_for_file_system(file_system_id)?;
+        self.retire_routing_fallbacks_for_file_system(file_system_id)?;
         Ok(report)
     }
 
@@ -2682,9 +3282,10 @@ impl LocalShardedMetadataBackend {
 #[cfg(test)]
 mod lazy_replica_slot_tests {
     use super::*;
+    use crate::namespace::{directory_object, distributed_sifs};
     use sinomo_core::DfsObjectPolicy;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn node(value: &str) -> NodeId {
         NodeId::from_legacy_named(value).expect("valid node id")
@@ -2888,6 +3489,473 @@ mod lazy_replica_slot_tests {
             !resident
                 .matches_topology(&metadata_root, &shards[1..])
                 .expect("missing shard")
+        );
+    }
+
+    #[test]
+    fn bounded_status_does_not_hydrate_a_never_opened_replica() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-unhydrated-replica");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-replica-local");
+        let mut shard = configs(&local_node_id)[0].clone();
+        shard.primary_node_id = node("bounded-status-replica-primary");
+        shard.replica_node_ids = vec![local_node_id.clone()];
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            vec![shard.clone()],
+            &local_node_id,
+        )
+        .expect("open deferred resident replica")
+        .into_resident();
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("a never-hydrated shard returns bounded partial status");
+        let expected_omission =
+            DfsOperatorStatusOmission::non_primary_resident_metadata_not_hydrated(
+                shard.file_system_id.clone(),
+                DfsMetadataShardId::new(&shard.shard_id),
+            );
+        assert_eq!(snapshot.bounded_omissions, vec![expected_omission.clone()]);
+        assert_eq!(
+            snapshot.incomplete_reasons,
+            vec![expected_omission.legacy_reason()]
+        );
+        assert!(
+            expected_omission
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::MetadataShardReplayCursor)
+        );
+        assert!(
+            !expected_omission
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::OpenConflictCount),
+            "an unopened non-primary shard must not weaken primary-owned debt gates"
+        );
+        assert_eq!(snapshot.metadata_shards.len(), 1);
+        assert_eq!(snapshot.metadata_shards[0].shard_id.0, "root");
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "bounded status must report unavailable instead of hydrating metadata"
+        );
+    }
+
+    #[test]
+    fn bounded_status_keeps_an_unopened_local_primary_blocking() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-unhydrated-primary");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-primary-local");
+        let shard = configs(&local_node_id)[0].clone();
+        let shard_id = DfsMetadataShardId::new(&shard.shard_id);
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            vec![shard],
+            &local_node_id,
+        )
+        .expect("open resident primary")
+        .into_resident();
+        let slot = resident
+            .inner
+            .shards
+            .get(&shard_id)
+            .expect("resident primary slot");
+        *slot.state.lock().unwrap_or_else(|error| error.into_inner()) =
+            ResidentLocalMetadataShardState::Unopened;
+        *slot
+            .status_snapshot
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("an unopened local primary returns blocking partial status");
+        assert!(snapshot.bounded_omissions.is_empty());
+        assert_eq!(snapshot.incomplete_reasons.len(), 1);
+        assert!(snapshot.incomplete_reasons[0].contains("status unavailable"));
+        assert!(snapshot.incomplete_reasons[0].contains("is not hydrated for bounded status"));
+        assert_eq!(snapshot.metadata_shards.len(), 1);
+        assert_eq!(snapshot.metadata_shards[0].shard_id, shard_id);
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "bounded status must fail closed without hydrating a local primary"
+        );
+    }
+
+    #[test]
+    fn unhydrated_status_is_omitted_only_for_a_non_primary_shard() {
+        let local_node_id = node("bounded-status-role-local");
+        let shard_id = DfsMetadataShardId::new("root");
+        let local_primary = configs(&local_node_id)[0].clone();
+        assert_eq!(
+            non_primary_unhydrated_status_omission(Some(&local_node_id), &local_primary, &shard_id,),
+            None,
+            "an unopened local primary must remain a blocking incomplete status"
+        );
+
+        let mut non_primary = local_primary;
+        non_primary.primary_node_id = node("bounded-status-role-primary");
+        assert!(matches!(
+            non_primary_unhydrated_status_omission(
+                Some(&local_node_id),
+                &non_primary,
+                &shard_id,
+            ),
+            Some(DfsOperatorStatusOmission::NonPrimaryResidentMetadataNotHydrated {
+                file_system_id,
+                shard_id: omitted_shard_id,
+            }) if file_system_id == non_primary.file_system_id && omitted_shard_id == shard_id
+        ));
+        assert_eq!(
+            non_primary_unhydrated_status_omission(None, &non_primary, &shard_id),
+            None,
+            "missing local identity must fail closed"
+        );
+    }
+
+    #[test]
+    fn bounded_status_serves_last_complete_generation_while_shard_is_checked_out() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-checked-out-shard");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-checked-out-local");
+        let file_system = distributed_sifs(local_node_id.clone());
+        let replica_node_id = node("bounded-status-checked-out-replica");
+        let mut shard = configs(&local_node_id)[0].clone();
+        shard.replica_node_ids = vec![replica_node_id.clone()];
+        let mut backend = LocalShardedMetadataBackend::new(&metadata_root, vec![shard])
+            .expect("open status backend");
+        backend
+            .put_file_system(&file_system)
+            .expect("seed status filesystem");
+        let resident = backend.into_resident();
+        let handle = resident
+            .scope_shard(
+                &file_system.file_system_id,
+                &DfsMetadataShardId::new("root"),
+            )
+            .expect("scope root shard");
+        let initial = resident
+            .bounded_status_snapshot()
+            .expect("initial bounded status");
+        assert_eq!(initial.summary.object_count, 0);
+
+        reset_resident_metadata_status_durable_cursor_reads();
+        let mut lease = handle.checkout().expect("hold shard mutation lease");
+        let object = directory_object("/users/status-while-mutating", local_node_id);
+        lease.put_object(&object).expect("mutate checked-out shard");
+        lease
+            .put_metadata_replication_cursor(&replica_node_id, &DfsMetadataShardId::new("root"), 1)
+            .expect("advance resident replica cursor");
+        let started = Instant::now();
+        let during = resident
+            .bounded_status_snapshot()
+            .expect("serve prior complete generation");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded status must never wait for the checked-out shard"
+        );
+        assert_eq!(during.summary.object_count, 0);
+
+        drop(lease);
+        assert_eq!(
+            resident_metadata_status_durable_cursor_reads(),
+            0,
+            "mutating and returning a resident shard lease must not reread durable cursor sidecars"
+        );
+        let after = resident
+            .bounded_status_snapshot()
+            .expect("status after mutation release");
+        assert_eq!(
+            after.summary.object_count, 1,
+            "the completed mutation generation must publish on lease return"
+        );
+        assert_eq!(
+            after.metadata_shards[0].replica_lag[0].replicated_through_sequence, 1,
+            "cursor operations must advance the in-memory resident projection"
+        );
+    }
+
+    #[test]
+    fn bounded_status_matches_exact_scan_without_running_a_full_scan() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-stable-topology");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-stable-local");
+        let file_system = distributed_sifs(local_node_id.clone());
+        let shard = configs(&local_node_id)[0].clone();
+        let mut backend = LocalShardedMetadataBackend::new(&metadata_root, vec![shard])
+            .expect("open stable status backend");
+        backend
+            .put_file_system(&file_system)
+            .expect("seed stable filesystem");
+        backend
+            .put_object(&directory_object("/users/stable-status", local_node_id))
+            .expect("seed stable object");
+        let exact = backend.metadata_summary().expect("exact stable summary");
+        let resident = backend.into_resident();
+
+        crate::metadata_summary::reset_full_metadata_summary_scans();
+        reset_resident_metadata_status_durable_cursor_reads();
+        let bounded = resident
+            .bounded_status_snapshot()
+            .expect("bounded stable summary");
+        resident
+            .bounded_status_snapshot()
+            .expect("repeat bounded stable summary");
+        assert_eq!(bounded.summary, exact);
+        assert_eq!(
+            crate::metadata_summary::full_metadata_summary_scans(),
+            0,
+            "bounded status must not invoke the materialized-table scanner"
+        );
+        assert_eq!(
+            resident_metadata_status_durable_cursor_reads(),
+            0,
+            "status must reuse the published cursor projection instead of rereading durable sidecars"
+        );
+    }
+
+    #[test]
+    fn historical_routing_preserves_a_complete_zero_lock_proof() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-routing-zero-locks");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-routing-zero-local");
+        let file_system = distributed_sifs(local_node_id.clone());
+        let root_shard = configs(&local_node_id)[0].clone();
+        {
+            let mut initial = LocalShardedMetadataBackend::new(&metadata_root, vec![root_shard])
+                .expect("open predecessor topology");
+            initial
+                .put_file_system(&file_system)
+                .expect("seed predecessor filesystem");
+            initial
+                .put_object(&directory_object(
+                    "/services/routing-zero-locks",
+                    local_node_id.clone(),
+                ))
+                .expect("seed predecessor-routed object");
+        }
+
+        let resident = LocalShardedMetadataBackend::new(&metadata_root, configs(&local_node_id))
+            .expect("open successor topology")
+            .into_resident();
+        crate::metadata_summary::reset_full_metadata_summary_scans();
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("bounded historical status");
+        let historical = snapshot
+            .bounded_omissions
+            .iter()
+            .find(|omission| {
+                matches!(
+                    omission,
+                    DfsOperatorStatusOmission::HistoricalRoutingTopology { .. }
+                )
+            })
+            .expect("historical routing omission");
+
+        assert_eq!(snapshot.summary.cross_shard_namespace_lock_count, 0);
+        assert!(
+            !historical
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "the complete union-empty projection must retain an exact zero lock proof"
+        );
+        assert_eq!(
+            crate::metadata_summary::full_metadata_summary_scans(),
+            0,
+            "the zero proof must use resident shard summaries only"
+        );
+    }
+
+    #[test]
+    fn historical_routing_zero_lock_proof_requires_every_shard_summary() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-routing-zero-incomplete");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-routing-zero-incomplete-local");
+        let root_shard = configs(&local_node_id)[0].clone();
+        drop(
+            LocalShardedMetadataBackend::new(&metadata_root, vec![root_shard])
+                .expect("open predecessor topology"),
+        );
+
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            configs(&local_node_id),
+            &local_node_id,
+        )
+        .expect("open successor topology with deferred replica")
+        .into_resident();
+        crate::metadata_backend::reset_metadata_backend_open_calls();
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("bounded incomplete historical status");
+        let historical = snapshot
+            .bounded_omissions
+            .iter()
+            .find(|omission| {
+                matches!(
+                    omission,
+                    DfsOperatorStatusOmission::HistoricalRoutingTopology { .. }
+                )
+            })
+            .expect("historical routing omission");
+
+        assert!(
+            historical
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "an unhydrated shard must keep the lock projection unknown"
+        );
+        assert!(snapshot.bounded_omissions.iter().any(|omission| matches!(
+            omission,
+            DfsOperatorStatusOmission::NonPrimaryResidentMetadataNotHydrated { .. }
+        )));
+        assert_eq!(
+            crate::metadata_backend::metadata_backend_open_calls(),
+            0,
+            "zero-proof status must not hydrate a missing shard summary"
+        );
+    }
+
+    #[test]
+    fn bounded_status_is_explicitly_unavailable_during_routing_migration() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-routing-migration");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-migration-local");
+        let file_system = distributed_sifs(local_node_id.clone());
+        let root_shard = configs(&local_node_id)[0].clone();
+        {
+            let mut initial = LocalShardedMetadataBackend::new(&metadata_root, vec![root_shard])
+                .expect("open predecessor topology");
+            initial
+                .put_file_system(&file_system)
+                .expect("seed predecessor filesystem");
+            initial
+                .put_object(&directory_object(
+                    "/services/migrated-status-object",
+                    local_node_id.clone(),
+                ))
+                .expect("seed predecessor-routed object");
+        }
+        let mut migrating =
+            LocalShardedMetadataBackend::new(&metadata_root, configs(&local_node_id))
+                .expect("open successor topology");
+        let error = migrating
+            .metadata_status_summaries()
+            .expect_err("routing handoff counts are not exact without durable probes");
+        let MetadataBackendError::StatusOmitted { omission } = error else {
+            panic!("routing migration must return a typed bounded omission");
+        };
+        assert!(matches!(
+            &omission,
+            DfsOperatorStatusOmission::HistoricalRoutingTopology {
+                generation_count: 1,
+                ..
+            }
+        ));
+        assert!(
+            omission
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::OpenConflictCount)
+        );
+        assert!(
+            !omission
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "a complete cold aggregate also preserves the exact zero lock proof"
+        );
+
+        migrating
+            .migrate_objects_to_configured_shards(&file_system.file_system_id, 16)
+            .expect("migrate predecessor topology");
+        let exact = migrating
+            .metadata_summary()
+            .expect("exact post-migration summary");
+        let (bounded, _) = migrating
+            .metadata_status_summaries()
+            .expect("bounded status resumes after migration proves a stable topology");
+        assert_eq!(
+            bounded, exact,
+            "source-eviction tombstones must not inflate bounded post-migration status"
+        );
+    }
+
+    #[test]
+    fn historical_routing_omits_a_job_only_cross_shard_lock_projection() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-routing-lock-only");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-routing-lock-local");
+        let file_system = distributed_sifs(local_node_id.clone());
+        let root_shard = configs(&local_node_id)[0].clone();
+        {
+            let mut initial = LocalShardedMetadataBackend::new(&metadata_root, vec![root_shard])
+                .expect("open predecessor topology");
+            initial
+                .put_file_system(&file_system)
+                .expect("seed predecessor filesystem");
+            initial
+                .put_namespace_job(&DfsNamespaceJobRecord {
+                    job_id: "job-routing-lock-only".to_string(),
+                    file_system_id: file_system.file_system_id.clone(),
+                    origin: None,
+                    kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
+                    status: DfsNamespaceJobStatus::Running,
+                    root_path: "/services/lock-only".to_string(),
+                    target_path: Some("/users/lock-only".to_string()),
+                    pending_frames: Vec::new(),
+                    processed_object_count: 0,
+                    created_at: time::OffsetDateTime::UNIX_EPOCH,
+                    updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                    completed_at: None,
+                    failure_reason: None,
+                })
+                .expect("seed cross-shard namespace lock");
+        }
+
+        let migrating = LocalShardedMetadataBackend::new(&metadata_root, configs(&local_node_id))
+            .expect("open successor topology");
+        let error = migrating
+            .metadata_status_summaries()
+            .expect_err("historical lock-only status must fail closed");
+        let MetadataBackendError::StatusOmitted { omission } = &error else {
+            panic!("historical lock-only status must return a typed omission");
+        };
+        assert!(matches!(
+            omission,
+            DfsOperatorStatusOmission::HistoricalRoutingTopology {
+                generation_count: 1,
+                ..
+            }
+        ));
+        assert!(
+            omission
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "a positive cold aggregate under historical routing must remain unknown"
+        );
+
+        let snapshot = migrating
+            .into_resident()
+            .bounded_status_snapshot()
+            .expect("bounded resident historical lock status");
+        let historical = snapshot
+            .bounded_omissions
+            .iter()
+            .find(|omission| {
+                matches!(
+                    omission,
+                    DfsOperatorStatusOmission::HistoricalRoutingTopology { .. }
+                )
+            })
+            .expect("historical routing omission");
+        assert!(
+            historical
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "a positive physical sum under historical routing cannot expose an exact effective count"
         );
     }
 
@@ -5798,7 +6866,19 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
     }
 
     fn metadata_summary(&self) -> Result<DfsMetadataSummary> {
-        self.metadata_status_summaries().map(|(summary, _)| summary)
+        let mut summary = DfsMetadataSummary::default();
+        let mut file_system_ids = BTreeSet::new();
+        for (shard_id, slot) in &self.shards {
+            let backend = slot.backend()?;
+            let tables = backend.current_tables_snapshot()?;
+            file_system_ids.extend(tables.file_systems.keys().cloned());
+            let shard_summary = metadata_summary_from_tables(&tables, |object| {
+                self.object_is_listable_from_shard(object, shard_id)
+            })?;
+            accumulate_metadata_summary_detail_counts(&mut summary, &shard_summary);
+        }
+        summary.file_system_count = file_system_ids.len();
+        Ok(summary)
     }
 
     fn metadata_summary_for_local_primary_shards(&self) -> Result<DfsMetadataSummary> {
@@ -5829,14 +6909,20 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let mut primary_file_system_ids = BTreeSet::new();
         for (shard_id, slot) in &self.shards {
             let backend = slot.backend()?;
-            let tables = backend.current_tables_snapshot()?;
-            file_system_ids.extend(tables.file_systems.keys().cloned());
-            let shard_summary = metadata_summary_from_tables(&tables, |object| {
-                self.object_is_listable_from_shard(object, shard_id)
-            })?;
+            let shard_summary = backend.resident_metadata_status_summary();
+            if shard_summary.file_system_count > 0
+                && let Some(config) = self.shard_configs.get(&shard_id.0)
+            {
+                file_system_ids.insert(config.file_system_id.clone());
+            }
             accumulate_metadata_summary_detail_counts(&mut summary, &shard_summary);
             if self.shard_is_local_authoritative_primary(shard_id) {
                 if let Some(config) = self.shard_configs.get(&shard_id.0) {
+                    // Primary-owned operational status counts the configured
+                    // filesystem even before its first metadata object is
+                    // materialized. Keep this identical to
+                    // `metadata_summary_for_local_primary_shards` without
+                    // reopening or scanning the shard tables.
                     primary_file_system_ids.insert(config.file_system_id.clone());
                 }
                 accumulate_metadata_summary_detail_counts(&mut primary_summary, &shard_summary);
@@ -5844,6 +6930,21 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         }
         summary.file_system_count = file_system_ids.len();
         primary_summary.file_system_count = primary_file_system_ids.len();
+        if !self.fallback_routing_indexes.is_empty()
+            && (summary.object_count > 0
+                || summary.pending_repair_count > 0
+                || summary.cross_shard_namespace_lock_count > 0)
+        {
+            let generation_count = self.fallback_routing_indexes.len();
+            let omission = if summary.cross_shard_namespace_lock_count == 0 {
+                DfsOperatorStatusOmission::historical_routing_topology_with_cross_shard_lock_zero_proof(
+                    generation_count,
+                )
+            } else {
+                DfsOperatorStatusOmission::historical_routing_topology(generation_count)
+            };
+            return Err(MetadataBackendError::StatusOmitted { omission });
+        }
         Ok((summary, primary_summary))
     }
 
