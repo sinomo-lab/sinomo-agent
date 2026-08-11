@@ -1366,6 +1366,19 @@ fn complete_pending_shadow_rollout_after_start(
     if rehydrate_main_activation_if_staged_main_is_pending(paths, rollout_paths, &finalize)? {
         return Ok(());
     }
+    if let Some(staged_shadow) = finalize
+        .staged_shadow_binary
+        .as_deref()
+        .filter(|path| path.exists())
+    {
+        return Err(sinomo_rollout::RolloutError::InvalidTransition {
+            detail: format!(
+                "shadow finalization refused because staged shadow binary {} is still pending; keeping the rollout pending for deferred finalization",
+                staged_shadow.display()
+            ),
+        }
+        .into());
+    }
     record_shadow_rollout_finalized(
         rollout_paths,
         &finalize,
@@ -7005,6 +7018,89 @@ mod tests {
     }
 
     #[test]
+    fn shadow_start_completion_retains_pending_when_staged_shadow_remains() {
+        let root = temp_rollout_test_root("shadow-start-staged-shadow-pending");
+        let rollout_paths = SelfRolloutPaths::new(&root);
+        ensure_rollout_layout(&rollout_paths).expect("rollout layout");
+        let main_name = rollout_paths
+            .main_binary
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("main binary name");
+        let recovery_backups = (1..=(sinomo_rollout::ROLLOUT_RECOVERY_BACKUP_RETENTION + 2))
+            .map(|generation| {
+                let path = rollout_paths
+                    .bin
+                    .join(format!("{main_name}.previous.8-{}-0", generation * 100));
+                write_test_executable(&path);
+                path
+            })
+            .collect::<Vec<_>>();
+        let current_exe = env::current_exe().expect("current exe");
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        write_test_executable(&staged_shadow);
+        let mut activation = test_main_activation(&rollout_paths);
+        activation.shadow_binary = current_exe;
+        let previous_shadow_binary = root.join("previous-shadow");
+        write_test_executable(&previous_shadow_binary);
+        let monitor = ShadowMainRolloutMonitor {
+            activation: activation.clone(),
+            main_options: crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21353,
+            },
+            previous_main_binary: rollout_paths.main_binary.clone(),
+            previous_shadow_binary,
+            diagnostics: CandidateMainDiagnostics {
+                stdout_log: root.join("stdout.log"),
+                stderr_log: root.join("stderr.log"),
+                diagnostics_path: root.join("diagnostics.json"),
+            },
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        stage_pending_shadow_rollout(&rollout_paths, &monitor, "127.0.0.1", 21354)
+            .expect("pending shadow");
+        record_main_activation_staged(&rollout_paths, &activation).expect("staged status");
+        let status_before = read_rollout_status(&rollout_paths)
+            .expect("read status")
+            .expect("status");
+
+        let error = complete_pending_shadow_rollout_after_start(
+            &DaemonPaths::with_root(root.join("shadow-daemon")),
+            &rollout_paths,
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port: 21354,
+            },
+        )
+        .expect_err("old installed shadow must not finalize staged replacement");
+
+        assert!(error.to_string().contains("staged shadow binary"));
+        assert!(error.to_string().contains("deferred finalization"));
+        assert!(staged_shadow.exists());
+        assert!(rollout_shadow_finalize_path(&rollout_paths).exists());
+        let pending = read_pending_shadow_rollout(&rollout_paths)
+            .expect("read pending shadow")
+            .expect("pending shadow");
+        assert_eq!(
+            pending.staged_shadow_binary.as_deref(),
+            Some(staged_shadow.as_path())
+        );
+        assert_eq!(
+            read_rollout_status(&rollout_paths)
+                .expect("read status")
+                .expect("status"),
+            status_before
+        );
+        for path in recovery_backups {
+            assert!(
+                path.exists(),
+                "deferred finalization must retain recovery backup: {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn shadow_start_completion_clears_pending_finalize_when_running_installed_shadow() {
         let root = temp_rollout_test_root("shadow-start-completes");
         let rollout_paths = SelfRolloutPaths::new(&root);
@@ -7080,6 +7176,8 @@ mod tests {
         let current_exe = env::current_exe().expect("current exe");
         let staged_main = rollout_staged_main_binary(&rollout_paths);
         write_test_executable(&staged_main);
+        let staged_shadow = rollout_staged_shadow_binary(&rollout_paths);
+        write_test_executable(&staged_shadow);
         let mut activation = test_main_activation(&rollout_paths);
         activation.shadow_binary = current_exe.clone();
         let previous_shadow_binary = root.join("previous-shadow");
@@ -7121,6 +7219,7 @@ mod tests {
             activation.staged_main_binary.as_deref(),
             Some(staged_main.as_path())
         );
+        assert!(staged_shadow.exists());
         let status = read_rollout_status(&rollout_paths)
             .expect("read status")
             .expect("status");

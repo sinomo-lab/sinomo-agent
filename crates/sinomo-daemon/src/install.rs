@@ -879,6 +879,12 @@ fn boot_entry_path(boot_dir: &Path, name: &str) -> PathBuf {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootEntryChildProcessPolicy {
+    SystemdDefault,
+    PreserveDetachedChildren,
+}
+
 fn write_boot_entry(
     path: &Path,
     data_dir: &Path,
@@ -887,6 +893,7 @@ fn write_boot_entry(
     host: &str,
     port: u16,
     description: &str,
+    child_process_policy: BootEntryChildProcessPolicy,
     extra_env: &[(&str, String)],
 ) -> Result<(), DaemonError> {
     if let Some(parent) = path.parent() {
@@ -902,6 +909,7 @@ fn write_boot_entry(
         host,
         port,
         description,
+        child_process_policy,
         extra_env,
     );
     fs::write(path, content).map_err(|source| DaemonError::Io {
@@ -933,6 +941,7 @@ pub fn write_install_boot_entries(
         host,
         main_port,
         "Sinomo daemon",
+        BootEntryChildProcessPolicy::SystemdDefault,
         &[],
     )?;
     let shadow_env = vec![
@@ -948,6 +957,7 @@ pub fn write_install_boot_entries(
         host,
         shadow_port,
         "Sinomo shadow daemon",
+        BootEntryChildProcessPolicy::PreserveDetachedChildren,
         &shadow_env,
     )
 }
@@ -970,12 +980,13 @@ fn boot_entry_content(
     host: &str,
     port: u16,
     description: &str,
+    child_process_policy: BootEntryChildProcessPolicy,
     extra_env: &[(&str, String)],
 ) -> String {
     let command = command_prefix.join(" ");
     #[cfg(windows)]
     {
-        let _ = description;
+        let _ = (description, child_process_policy);
         let extra_env = extra_env
             .iter()
             .map(|(key, value)| {
@@ -1002,12 +1013,16 @@ fn boot_entry_content(
     }
     #[cfg(not(windows))]
     {
+        let kill_mode = match child_process_policy {
+            BootEntryChildProcessPolicy::SystemdDefault => "",
+            BootEntryChildProcessPolicy::PreserveDetachedChildren => "KillMode=process\n",
+        };
         let extra_env = extra_env
             .iter()
             .map(|(key, value)| format!("Environment={key}={value}\n"))
             .collect::<String>();
         format!(
-            "[Unit]\nDescription={description}\n\n[Service]\nEnvironment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription={description}\n\n[Service]\n{kill_mode}Environment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
             data_dir.display(),
             extra_env,
             binary.display(),
@@ -1070,6 +1085,23 @@ mod tests {
                 (SHADOW_MAIN_PORT_ENV, "21400".to_string()),
             ]
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_shadow_boot_entry_preserves_detached_rollout_children() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-kill-mode");
+        let data_dir = SinomoDataDir::new(&root);
+        let layout = InstallLayout::new(&data_dir, root.join("startup"));
+
+        write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354).expect("write boot entries");
+
+        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        assert!(main.contains("[Service]\nEnvironment=SINOMO_DATA_DIR="));
+        assert!(!main.contains("KillMode="));
+        assert!(shadow.contains("[Service]\nKillMode=process\nEnvironment=SINOMO_DATA_DIR="));
+        assert_eq!(shadow.matches("KillMode=process").count(), 1);
     }
 
     #[test]
