@@ -8,6 +8,7 @@
 
 use crate::endpoint::{IrohEndpointRecord, IrohRelayMode, iroh_endpoint_dir};
 use fs2::FileExt;
+use iroh::Watcher;
 use sinomo_core::ClusterTransportKind;
 use sinomo_core::network::{
     AuthenticatedTransportMetadata, ClusterPaths, DEFAULT_NETWORK_TIMEOUT,
@@ -32,6 +33,7 @@ const IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN: Duration = Duration::from_secs(5);
 const IROH_DAEMON_PROXY_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(300);
 const IROH_DAEMON_PROXY_RESTART_JITTER_MAX: Duration = Duration::from_secs(30);
 const IROH_DAEMON_PROXY_STABLE_RUNTIME: Duration = Duration::from_secs(60);
+const IROH_DAEMON_PROXY_INITIAL_ONLINE_WAIT: Duration = Duration::from_secs(15);
 const IROH_SECRET_KEY_LOCK_WAIT: Duration = Duration::from_secs(2);
 const IROH_SECRET_KEY_LOCK_RETRY_INITIAL: Duration = Duration::from_millis(2);
 const IROH_SECRET_KEY_LOCK_RETRY_MAX: Duration = Duration::from_millis(40);
@@ -246,6 +248,29 @@ pub(crate) fn iroh_endpoint_record_from_addr(
     }
 }
 
+fn iroh_endpoint_record_from_connected_relays<'a>(
+    cluster_id: &ClusterId,
+    node_id: &NodeId,
+    addr: iroh::EndpointAddr,
+    connected_relays: impl IntoIterator<Item = &'a iroh::RelayUrl>,
+) -> Option<IrohEndpointRecord> {
+    let advertised_relays = addr.relay_urls().cloned().collect::<Vec<_>>();
+    let connected_relay_url = connected_relays
+        .into_iter()
+        .find(|relay| {
+            advertised_relays
+                .iter()
+                .any(|advertised| advertised == *relay)
+        })?
+        .to_string();
+    let mut record = iroh_endpoint_record_from_addr(cluster_id, node_id, addr);
+    record.relay_url = Some(connected_relay_url.clone());
+    record.relay_mode = IrohRelayMode::Custom {
+        relay_url: connected_relay_url,
+    };
+    Some(record)
+}
+
 fn iroh_daemon_proxy_restart_backoff(consecutive_failures: u32) -> Duration {
     let shift = consecutive_failures.saturating_sub(1).min(8);
     IROH_DAEMON_PROXY_RESTART_BACKOFF_MIN
@@ -456,15 +481,22 @@ pub struct IrohProxyConfig {
 /// Running proxy handle: the advertised record, a shutdown signal, and the
 /// supervisor task (which restarts the proxy with backoff on failure).
 pub struct IrohDaemonProxy {
-    record: IrohEndpointRecord,
+    record: tokio::sync::watch::Receiver<Option<IrohEndpointRecord>>,
     endpoint: tokio::sync::watch::Receiver<Option<iroh::Endpoint>>,
     shutdown: tokio::sync::watch::Sender<bool>,
     supervisor: tokio::task::JoinHandle<()>,
 }
 
 impl IrohDaemonProxy {
-    pub fn record(&self) -> &IrohEndpointRecord {
-        &self.record
+    pub fn record(&self) -> Option<IrohEndpointRecord> {
+        self.record.borrow().clone()
+    }
+
+    pub fn endpoint_public_key(&self) -> Option<String> {
+        self.endpoint
+            .borrow()
+            .as_ref()
+            .map(|endpoint| endpoint.id().to_string())
     }
 
     pub fn endpoint_receiver(&self) -> tokio::sync::watch::Receiver<Option<iroh::Endpoint>> {
@@ -487,11 +519,11 @@ impl IrohDaemonProxy {
 }
 
 enum IrohDaemonProxyReady {
-    Async(tokio::sync::oneshot::Sender<Result<IrohEndpointRecord, NetworkError>>),
+    Async(tokio::sync::oneshot::Sender<Result<(), NetworkError>>),
 }
 
 impl IrohDaemonProxyReady {
-    fn send(self, result: Result<IrohEndpointRecord, NetworkError>) {
+    fn send(self, result: Result<(), NetworkError>) {
         match self {
             Self::Async(sender) => {
                 let _ = sender.send(result);
@@ -502,7 +534,7 @@ impl IrohDaemonProxyReady {
 
 fn send_iroh_daemon_proxy_ready(
     ready: &mut Option<IrohDaemonProxyReady>,
-    result: Result<IrohEndpointRecord, NetworkError>,
+    result: Result<(), NetworkError>,
 ) {
     if let Some(sender) = ready.take() {
         sender.send(result);
@@ -518,16 +550,18 @@ pub async fn start_iroh_daemon_proxy(
     let (tx, rx) = tokio::sync::oneshot::channel();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let (endpoint_tx, endpoint_rx) = tokio::sync::watch::channel(None);
+    let (record_tx, record_rx) = tokio::sync::watch::channel(None);
     let supervisor_runtime = runtime.clone();
     let task = runtime.spawn(run_iroh_daemon_proxy_supervisor(
         supervisor_runtime,
         config,
         Some(IrohDaemonProxyReady::Async(tx)),
         endpoint_tx,
+        record_tx,
         shutdown_rx,
     ));
-    let record = match rx.await {
-        Ok(Ok(record)) => record,
+    match rx.await {
+        Ok(Ok(())) => {}
         Ok(Err(error)) => {
             let _ = shutdown_tx.send(true);
             task.abort();
@@ -541,9 +575,9 @@ pub async fn start_iroh_daemon_proxy(
                 detail: source.to_string(),
             });
         }
-    };
+    }
     Ok(IrohDaemonProxy {
-        record,
+        record: record_rx,
         endpoint: endpoint_rx,
         shutdown: shutdown_tx,
         supervisor: task,
@@ -572,6 +606,7 @@ async fn run_iroh_daemon_proxy_supervisor(
     config: IrohProxyConfig,
     mut first_ready: Option<IrohDaemonProxyReady>,
     endpoint: tokio::sync::watch::Sender<Option<iroh::Endpoint>>,
+    record: tokio::sync::watch::Sender<Option<IrohEndpointRecord>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut restart_failures = 0_u32;
@@ -616,6 +651,7 @@ async fn run_iroh_daemon_proxy_supervisor(
             secret_key,
             first_ready.take(),
             endpoint.clone(),
+            record.clone(),
             shutdown.clone(),
         )
         .await;
@@ -643,12 +679,60 @@ async fn run_iroh_daemon_proxy_supervisor(
     }
 }
 
+fn expose_persisted_iroh_endpoint_record(
+    published_record: &tokio::sync::watch::Sender<Option<IrohEndpointRecord>>,
+    record: IrohEndpointRecord,
+    persist_result: Result<(), NetworkError>,
+) -> Result<(), NetworkError> {
+    persist_result?;
+    published_record.send_replace(Some(record));
+    Ok(())
+}
+
+async fn persist_and_publish_iroh_endpoint_record(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    published_record: &tokio::sync::watch::Sender<Option<IrohEndpointRecord>>,
+    record: IrohEndpointRecord,
+) -> Result<(), NetworkError> {
+    // The file under `ClusterPaths::iroh` is the pinned cross-ring contract.
+    // Never expose a changed record to the host before that exact value is
+    // durably installed; otherwise cluster membership can advertise an
+    // address that recovery cannot reconstruct.
+    let persist_paths = paths.clone();
+    let persist_record = record.clone();
+    let persist_result = runtime
+        .spawn_blocking(move || persist_record.write(&persist_paths))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "persist iroh endpoint record".to_string(),
+            detail: source.to_string(),
+        })
+        .and_then(|result| result);
+    expose_persisted_iroh_endpoint_record(published_record, record, persist_result)
+}
+
+async fn persist_and_publish_connected_iroh_endpoint_record(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    published_record: &tokio::sync::watch::Sender<Option<IrohEndpointRecord>>,
+    record: Option<IrohEndpointRecord>,
+) -> Result<Option<IrohEndpointRecord>, NetworkError> {
+    let Some(record) = record else {
+        return Ok(None);
+    };
+    persist_and_publish_iroh_endpoint_record(runtime, paths, published_record, record.clone())
+        .await?;
+    Ok(Some(record))
+}
+
 async fn run_iroh_daemon_proxy(
     runtime: tokio::runtime::Handle,
     config: IrohProxyConfig,
     secret_key: iroh::SecretKey,
     mut ready: Option<IrohDaemonProxyReady>,
     published_endpoint: tokio::sync::watch::Sender<Option<iroh::Endpoint>>,
+    published_record: tokio::sync::watch::Sender<Option<IrohEndpointRecord>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), NetworkError> {
     let endpoint_secret_key = secret_key.clone();
@@ -676,27 +760,50 @@ async fn run_iroh_daemon_proxy(
         }
     };
     let endpoint = IrohEndpointCloseGuard::new(runtime.clone(), endpoint);
-    let _ = tokio::time::timeout(DEFAULT_NETWORK_TIMEOUT, endpoint.endpoint().online()).await;
-    let record = iroh_endpoint_record_from_addr(
+    let endpoint_public_key = endpoint.endpoint().id().to_string();
+    let published_identity_changed = published_record
+        .borrow()
+        .as_ref()
+        .is_some_and(|record| record.endpoint_public_key != endpoint_public_key);
+    if published_identity_changed {
+        published_record.send_replace(None);
+    }
+    let mut endpoint_state = endpoint
+        .endpoint()
+        .watch_addr()
+        .or(endpoint.endpoint().home_relay_status());
+    let _ = tokio::time::timeout(
+        IROH_DAEMON_PROXY_INITIAL_ONLINE_WAIT,
+        endpoint.endpoint().online(),
+    )
+    .await;
+    let (endpoint_addr, relay_status) = endpoint_state.get();
+    let record = iroh_endpoint_record_from_connected_relays(
         &config.cluster_id,
         &config.node_id,
-        endpoint.endpoint().addr(),
+        endpoint_addr,
+        relay_status
+            .iter()
+            .filter(|status| status.is_connected())
+            .map(|status| status.url()),
     );
-    // Persist the endpoint record; the on-disk record under
-    // `ClusterPaths::iroh` is the pinned cross-ring contract that
-    // sinomo-network keeps reading.
-    let persist_paths = config.paths.clone();
-    let persist_record = record.clone();
-    let persist_result = runtime
-        .spawn_blocking(move || persist_record.write(&persist_paths))
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: "persist iroh endpoint record".to_string(),
-            detail: source.to_string(),
-        })
-        .and_then(|result| result);
-    if let Err(error) = persist_result {
-        eprintln!("sinomo iroh daemon endpoint record write failed: {error}");
+    let mut persisted_record = published_record.borrow().clone();
+    let initial_record = match persist_and_publish_connected_iroh_endpoint_record(
+        &runtime,
+        &config.paths,
+        &published_record,
+        record,
+    )
+    .await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            send_iroh_daemon_proxy_ready(&mut ready, Err(error.clone()));
+            return Err(error);
+        }
+    };
+    if let Some(record) = initial_record {
+        persisted_record = Some(record);
     }
     published_endpoint.send_replace(Some(endpoint.endpoint().clone()));
     struct PublishedEndpointGuard(tokio::sync::watch::Sender<Option<iroh::Endpoint>>);
@@ -706,7 +813,7 @@ async fn run_iroh_daemon_proxy(
         }
     }
     let _published_endpoint_guard = PublishedEndpointGuard(published_endpoint);
-    send_iroh_daemon_proxy_ready(&mut ready, Ok(record));
+    send_iroh_daemon_proxy_ready(&mut ready, Ok(()));
 
     let connection_limiter = Arc::new(tokio::sync::Semaphore::new(
         IROH_DAEMON_PROXY_MAX_CONNECTIONS,
@@ -725,6 +832,39 @@ async fn run_iroh_daemon_proxy(
                     abort_and_drain_iroh_daemon_proxy_tasks(&mut connection_tasks, "connection").await;
                     return Ok(());
                 }
+                continue;
+            }
+            updated = endpoint_state.updated() => {
+                if let Err(source) = updated {
+                    return Err(NetworkError::Io {
+                        operation: "watch iroh daemon endpoint address".to_string(),
+                        detail: source.to_string(),
+                    });
+                }
+                let (endpoint_addr, relay_status) = endpoint_state.get();
+                let record = iroh_endpoint_record_from_connected_relays(
+                    &config.cluster_id,
+                    &config.node_id,
+                    endpoint_addr,
+                    relay_status
+                        .iter()
+                        .filter(|status| status.is_connected())
+                        .map(|status| status.url()),
+                );
+                let Some(record) = record else {
+                    continue;
+                };
+                if persisted_record.as_ref() == Some(&record) {
+                    continue;
+                }
+                persist_and_publish_iroh_endpoint_record(
+                    &runtime,
+                    &config.paths,
+                    &published_record,
+                    record.clone(),
+                )
+                .await?;
+                persisted_record = Some(record);
                 continue;
             }
             joined = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
@@ -923,6 +1063,214 @@ mod tests {
                 "https://relay-b.example./".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn initial_online_wait_covers_multiple_iroh_net_report_windows_and_is_bounded() {
+        let net_report_window = Duration::from_secs(iroh::NET_REPORT_TIMEOUT);
+        assert!(IROH_DAEMON_PROXY_INITIAL_ONLINE_WAIT >= net_report_window * 2);
+        assert!(IROH_DAEMON_PROXY_INITIAL_ONLINE_WAIT <= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn endpoint_record_is_not_exposed_when_persistence_fails() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_record_persist_order").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_iroh_record_persist_order").expect("node");
+        let endpoint_public_key = iroh::SecretKey::generate().public().to_string();
+        let relay_a = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            node_id.clone(),
+            endpoint_public_key.clone(),
+            "https://relay-a.example./",
+        );
+        let relay_b = IrohEndpointRecord::from_relay_url(
+            cluster_id,
+            node_id,
+            endpoint_public_key,
+            "https://relay-b.example./",
+        );
+        let (published, current) = tokio::sync::watch::channel(Some(relay_a.clone()));
+        let error = NetworkError::StorageIo {
+            path: "endpoint.sobj".to_string(),
+            detail: "injected persistence failure".to_string(),
+        };
+
+        assert!(
+            expose_persisted_iroh_endpoint_record(&published, relay_b.clone(), Err(error)).is_err()
+        );
+        assert_eq!(
+            current.borrow().as_ref(),
+            Some(&relay_a),
+            "a failed durable write must retain the last exposed record"
+        );
+
+        expose_persisted_iroh_endpoint_record(&published, relay_b.clone(), Ok(()))
+            .expect("expose persisted relay update");
+        assert_eq!(current.borrow().as_ref(), Some(&relay_b));
+    }
+
+    #[test]
+    fn only_a_selected_and_connected_relay_is_marked_dialable() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_disconnected_relay").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_iroh_disconnected_relay").expect("node");
+        let selected_relay: iroh::RelayUrl = "https://relay-selected.example./"
+            .parse()
+            .expect("selected relay url");
+        let other_relay: iroh::RelayUrl = "https://relay-other.example./"
+            .parse()
+            .expect("other relay url");
+        let endpoint_addr = iroh::EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_relay_url(selected_relay.clone());
+
+        assert!(
+            iroh_endpoint_record_from_connected_relays(
+                &cluster_id,
+                &node_id,
+                endpoint_addr.clone(),
+                std::iter::empty(),
+            )
+            .is_none(),
+            "a selected but disconnected relay must not be published"
+        );
+        assert!(
+            iroh_endpoint_record_from_connected_relays(
+                &cluster_id,
+                &node_id,
+                endpoint_addr.clone(),
+                [&other_relay],
+            )
+            .is_none(),
+            "a connected relay that is not in the endpoint address must not be published"
+        );
+
+        let record = iroh_endpoint_record_from_connected_relays(
+            &cluster_id,
+            &node_id,
+            endpoint_addr,
+            [&selected_relay],
+        )
+        .expect("selected connected relay record");
+        assert_eq!(record.relay_url.as_deref(), Some(selected_relay.as_str()));
+        assert!(matches!(record.relay_mode, IrohRelayMode::Custom { .. }));
+    }
+
+    #[tokio::test]
+    async fn relay_disconnect_retains_last_good_record_and_late_relay_replaces_it() {
+        let root = sinomo_testdir::TestDir::new("sinomo-iroh-relay-record-update");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_relay_record_update").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_record_update").expect("node");
+        let endpoint_public_key = iroh::SecretKey::generate().public().to_string();
+        let relay_a = IrohEndpointRecord::from_relay_url(
+            cluster_id.clone(),
+            node_id.clone(),
+            endpoint_public_key.clone(),
+            "https://relay-a.example./",
+        );
+        let relay_b = IrohEndpointRecord::from_relay_url(
+            cluster_id,
+            node_id.clone(),
+            endpoint_public_key,
+            "https://relay-b.example./",
+        );
+        let (published, current) = tokio::sync::watch::channel(None);
+
+        persist_and_publish_connected_iroh_endpoint_record(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &published,
+            Some(relay_a.clone()),
+        )
+        .await
+        .expect("persist relay A");
+
+        let record_path =
+            iroh_endpoint_dir(&paths).join(format!("{}.endpoint.sobj", node_id.as_str()));
+        assert_eq!(
+            read_object_file::<IrohEndpointRecord>(&record_path).expect("read relay A"),
+            relay_a
+        );
+        assert_eq!(current.borrow().as_ref(), Some(&relay_a));
+
+        assert_eq!(
+            persist_and_publish_connected_iroh_endpoint_record(
+                &tokio::runtime::Handle::current(),
+                &paths,
+                &published,
+                None,
+            )
+            .await
+            .expect("ignore disconnected relay"),
+            None
+        );
+        assert_eq!(
+            read_object_file::<IrohEndpointRecord>(&record_path)
+                .expect("last good relay remains durable"),
+            relay_a
+        );
+        assert_eq!(current.borrow().as_ref(), Some(&relay_a));
+
+        persist_and_publish_connected_iroh_endpoint_record(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &published,
+            Some(relay_b.clone()),
+        )
+        .await
+        .expect("persist relay B");
+        assert_eq!(
+            read_object_file::<IrohEndpointRecord>(&record_path).expect("read relay B"),
+            relay_b
+        );
+        assert_eq!(current.borrow().as_ref(), Some(&relay_b));
+        assert_eq!(
+            relay_a.endpoint().endpoint_id,
+            relay_b.endpoint().endpoint_id
+        );
+    }
+
+    #[tokio::test]
+    async fn no_relay_initial_state_stays_ready_for_late_connected_publication() {
+        let root = sinomo_testdir::TestDir::new("sinomo-iroh-late-relay-record");
+        let paths = ClusterPaths::new(&SinomoDataDir::new(&root));
+        paths.ensure().expect("cluster paths");
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_late_relay_record").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_iroh_late_relay_record").expect("node");
+        let relay = IrohEndpointRecord::from_relay_url(
+            cluster_id,
+            node_id,
+            iroh::SecretKey::generate().public().to_string(),
+            "https://relay-late.example./",
+        );
+        let (published, current) = tokio::sync::watch::channel(None);
+
+        assert_eq!(
+            persist_and_publish_connected_iroh_endpoint_record(
+                &tokio::runtime::Handle::current(),
+                &paths,
+                &published,
+                None,
+            )
+            .await
+            .expect("no-relay startup remains successful"),
+            None
+        );
+        assert!(current.borrow().is_none());
+
+        persist_and_publish_connected_iroh_endpoint_record(
+            &tokio::runtime::Handle::current(),
+            &paths,
+            &published,
+            Some(relay.clone()),
+        )
+        .await
+        .expect("late relay publication");
+        assert_eq!(current.borrow().as_ref(), Some(&relay));
     }
 
     #[test]
@@ -1208,7 +1556,11 @@ mod tests {
         let dialer = crate::dial::IrohDaemonDialer::new();
         let opened = dialer
             .open_daemon_stream_async(
-                &proxy.record().endpoint().address,
+                &proxy
+                    .record()
+                    .expect("running proxy endpoint record")
+                    .endpoint()
+                    .address,
                 DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
             )
             .await
@@ -1298,14 +1650,22 @@ mod tests {
         )
         .await
         .expect("start target proxy");
-        let source_transport_identity = source.record().endpoint_public_key.clone();
-        let target_transport_identity = target.record().endpoint_public_key.clone();
+        let source_transport_identity = source
+            .endpoint_public_key()
+            .expect("running source endpoint identity");
+        let target_transport_identity = target
+            .endpoint_public_key()
+            .expect("running target endpoint identity");
 
         let dialer = crate::dial::IrohDaemonDialer::new();
         dialer.use_shared_endpoint(source.endpoint_receiver()).await;
         let opened = dialer
             .open_daemon_stream_async(
-                &target.record().endpoint().address,
+                &target
+                    .record()
+                    .expect("running target endpoint record")
+                    .endpoint()
+                    .address,
                 DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
             )
             .await

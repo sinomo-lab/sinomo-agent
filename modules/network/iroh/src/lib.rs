@@ -488,8 +488,10 @@ impl IrohNetworkModuleInstance {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|proxy| vec![proxy.record().endpoint()])
-            .unwrap_or_default()
+            .and_then(|proxy| proxy.record())
+            .and_then(advertised_iroh_cluster_endpoint)
+            .into_iter()
+            .collect()
     }
 
     fn verify_authenticated_transport_metadata(
@@ -501,7 +503,7 @@ impl IrohNetworkModuleInstance {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .map(|proxy| proxy.record().endpoint_public_key.clone());
+            .and_then(|proxy| proxy.endpoint_public_key());
         local_transport_identity
             .is_some_and(|local| auth::verify_transport_metadata(&local, metadata))
     }
@@ -547,6 +549,16 @@ impl IrohNetworkModuleInstance {
             eprintln!("sinomo iroh network module instance destruction panicked");
         }
     }
+}
+
+fn advertised_iroh_cluster_endpoint(
+    record: endpoint::IrohEndpointRecord,
+) -> Option<sinomo_core::ClusterEndpointRecord> {
+    // A key plus private/direct addresses is not a generally dialable cluster
+    // endpoint. Keep it available to the local proxy, but do not publish it to
+    // remote members until Iroh reports a relay address.
+    record.relay_url.as_ref()?;
+    Some(record.endpoint())
 }
 
 /// Runs a synchronous operation that drives the private Iroh runtime. Tokio
@@ -1235,6 +1247,48 @@ mod tests {
     }
 
     #[test]
+    fn local_endpoint_publication_requires_relay_and_tracks_relay_changes() {
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_iroh_local_endpoint_refresh").expect("cluster");
+        let node_id = NodeId::from_legacy_named("node_iroh_local_endpoint_refresh").expect("node");
+        let endpoint_public_key = iroh::SecretKey::generate().public().to_string();
+        let key_only = endpoint::IrohEndpointRecord {
+            cluster_id: cluster_id.clone(),
+            node_id: node_id.clone(),
+            endpoint_public_key: endpoint_public_key.clone(),
+            direct_addresses: vec!["10.14.5.15:49241".to_string()],
+            relay_url: None,
+            relay_mode: endpoint::IrohRelayMode::Default,
+            expires_after_tick: 0,
+        };
+        assert!(
+            advertised_iroh_cluster_endpoint(key_only).is_none(),
+            "private/direct-only records must not enter cluster membership"
+        );
+
+        let relay_a =
+            advertised_iroh_cluster_endpoint(endpoint::IrohEndpointRecord::from_relay_url(
+                cluster_id.clone(),
+                node_id.clone(),
+                endpoint_public_key.clone(),
+                "https://relay-a.example./",
+            ))
+            .expect("relay A endpoint");
+        let relay_b =
+            advertised_iroh_cluster_endpoint(endpoint::IrohEndpointRecord::from_relay_url(
+                cluster_id,
+                node_id,
+                endpoint_public_key,
+                "https://relay-b.example./",
+            ))
+            .expect("relay B endpoint");
+
+        assert_eq!(relay_a.endpoint_id, relay_b.endpoint_id);
+        assert_ne!(relay_a.address, relay_b.address);
+        assert!(relay_b.address.contains("relay-b.example"));
+    }
+
+    #[test]
     fn network_descriptor_matches_the_pinned_stage_c_shape() {
         let descriptor = iroh_network_module_descriptor();
         assert_eq!(descriptor.id, "iroh");
@@ -1431,10 +1485,16 @@ mod tests {
             .expect("start iroh proxy");
         let dialer = dial::IrohDaemonDialer::new();
         let opened = runtime
-            .block_on(dialer.open_daemon_stream_async(
-                &proxy.record().endpoint().address,
-                DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
-            ))
+            .block_on(
+                dialer.open_daemon_stream_async(
+                    &proxy
+                        .record()
+                        .expect("running proxy endpoint record")
+                        .endpoint()
+                        .address,
+                    DaemonRpcTimeouts::connect_and_idle(Duration::from_secs(5)),
+                ),
+            )
             .expect("open authenticated iroh daemon stream");
         let channel_binding = opened.channel_binding;
         let stream = IrohNetworkStream {
