@@ -637,7 +637,7 @@ impl MountedSifsMutationOutboxStore {
             .join(PREPARING_SESSIONS_DIRECTORY)
             .join(session_id.as_str());
         create_private_directory(&preparing_directory).map_err(durable_error)?;
-        let mut lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))?;
+        let lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))?;
         let now = now_unix_nanos();
         let marker = MountedSifsHostMountSessionMarker {
             schema_version: MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION,
@@ -650,12 +650,14 @@ impl MountedSifsMutationOutboxStore {
             phase: MountedSifsHostMountSessionPhase::Active,
         };
         self.write_session_marker_in_directory(&preparing_directory, &marker)?;
-        // Publish only a complete marker and already-held lease. A crash at
-        // any earlier cut leaves private staging state which startup may
-        // remove after proving the staging lease dead; it can never create an
-        // undecodable entry in the authoritative sessions namespace.
-        retire_directory(&preparing_directory, &directory)?;
-        lease.relocate_path(directory.join(LEASE_FILE))?;
+        // The store lock serializes publication with every production scan.
+        // Close the staging lease before the directory rename because Windows
+        // rejects renaming a directory while a child handle is open, then
+        // reacquire the published lease before exposing the session. A crash
+        // before the rename leaves dead private staging; a crash after it
+        // leaves a complete, unreferenced session with a dead lease which the
+        // next store-locked scan can retire without fabricating recovery work.
+        let lease = publish_host_mount_session_directory(&preparing_directory, &directory, lease)?;
         Ok(MountedSifsHostMountSessionLease {
             store: self.clone(),
             marker,
@@ -2113,40 +2115,6 @@ impl HeldLeaseLock {
     fn is_held(&self) -> bool {
         self.held
     }
-
-    /// Update the process-local path identity after the containing staging
-    /// directory has been atomically published. The locked file descriptor
-    /// continues to refer to the same inode/Windows file object across the
-    /// rename; only the in-process duplicate-lock fence needs rebinding.
-    fn relocate_path(&mut self, new_path: PathBuf) -> Result<(), DfsError> {
-        if !self.held {
-            return Err(outbox_error(
-                "cannot relocate a released mounted-mutation lease",
-            ));
-        }
-        if self.path == new_path {
-            return Ok(());
-        }
-        let mut locks = process_locks()
-            .lock()
-            .map_err(|_| outbox_error("mounted-mutation process lock registry is poisoned"))?;
-        if !locks.contains(&self.path) {
-            return Err(outbox_error(format!(
-                "mounted-mutation process lease registry lost {}",
-                self.path.display()
-            )));
-        }
-        if locks.contains(&new_path) {
-            return Err(outbox_error(format!(
-                "mounted-mutation published lease path is already held: {}",
-                new_path.display()
-            )));
-        }
-        locks.remove(&self.path);
-        locks.insert(new_path.clone());
-        self.path = new_path;
-        Ok(())
-    }
 }
 
 impl Drop for HeldLeaseLock {
@@ -2328,6 +2296,61 @@ fn retire_directory(source: &Path, destination: &Path) -> Result<(), DfsError> {
         durable_file::sync_directory(destination_parent).map_err(durable_error)?;
     }
     Ok(())
+}
+
+fn publish_host_mount_session_directory(
+    preparing_directory: &Path,
+    published_directory: &Path,
+    staged_lease: HeldLeaseLock,
+) -> Result<HeldLeaseLock, DfsError> {
+    publish_host_mount_session_directory_with_cuts(
+        preparing_directory,
+        published_directory,
+        staged_lease,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+}
+
+fn publish_host_mount_session_directory_with_cuts<BeforeRename, BeforeReacquire>(
+    preparing_directory: &Path,
+    published_directory: &Path,
+    staged_lease: HeldLeaseLock,
+    before_rename: BeforeRename,
+    before_reacquire: BeforeReacquire,
+) -> Result<HeldLeaseLock, DfsError>
+where
+    BeforeRename: FnOnce(&Path) -> Result<(), DfsError>,
+    BeforeReacquire: FnOnce(&Path) -> Result<(), DfsError>,
+{
+    let preparing_lease_path = preparing_directory.join(LEASE_FILE);
+    if staged_lease.path != preparing_lease_path || !staged_lease.is_held() {
+        return Err(outbox_error(
+            "mounted-mutation session publication requires its live staging lease",
+        ));
+    }
+
+    // Dropping also closes the child file handle after unlocking it. This must
+    // happen before `fs::rename` on Windows; `outbox.lock` remains held by the
+    // caller and prevents a cooperating scan from entering this short gap.
+    drop(staged_lease);
+    if process_lock_is_held(&preparing_lease_path)? {
+        return Err(outbox_error(format!(
+            "mounted-mutation staging lease remained registered before publication: {}",
+            preparing_lease_path.display()
+        )));
+    }
+    before_rename(&preparing_lease_path)?;
+    retire_directory(preparing_directory, published_directory)?;
+
+    let published_lease_path = published_directory.join(LEASE_FILE);
+    before_reacquire(&published_lease_path)?;
+    HeldLeaseLock::try_acquire_existing(&published_lease_path)?.ok_or_else(|| {
+        outbox_error(format!(
+            "mounted-mutation published session lease is unavailable: {}",
+            published_lease_path.display()
+        ))
+    })
 }
 
 fn prune_retired_directory_contents(
@@ -2673,6 +2696,49 @@ mod tests {
         let data_dir = SinomoDataDir::new(root.path());
         let store = MountedSifsMutationOutboxStore::new(&data_dir).expect("open outbox");
         (root, store)
+    }
+
+    fn stage_host_mount_session_for_publication(
+        store: &MountedSifsMutationOutboxStore,
+        adapter: MountedSifsMutationAdapter,
+        mount_identity: &str,
+    ) -> (
+        MountedSifsHostMountSessionId,
+        PathBuf,
+        PathBuf,
+        HeldLeaseLock,
+    ) {
+        let session_id = Id::generate();
+        let preparing_directory = store
+            .root
+            .join(PREPARING_SESSIONS_DIRECTORY)
+            .join(session_id.as_str());
+        let published_directory = store.session_directory(&session_id);
+        create_private_directory(&preparing_directory).expect("preparing session directory");
+        let staged_lease = HeldLeaseLock::acquire_new(&preparing_directory.join(LEASE_FILE))
+            .expect("staging lease");
+        let now = now_unix_nanos();
+        store
+            .write_session_marker_in_directory(
+                &preparing_directory,
+                &MountedSifsHostMountSessionMarker {
+                    schema_version: MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION,
+                    session_id: session_id.clone(),
+                    session_nonce: Id::generate(),
+                    adapter,
+                    mount_identity: mount_identity.to_string(),
+                    started_at_unix_nanos: now,
+                    updated_at_unix_nanos: now,
+                    phase: MountedSifsHostMountSessionPhase::Active,
+                },
+            )
+            .expect("complete staged state");
+        (
+            session_id,
+            preparing_directory,
+            published_directory,
+            staged_lease,
+        )
     }
 
     fn arm(
@@ -3242,6 +3308,197 @@ mod tests {
                 .is_err(),
             "malformed authoritative session state must remain fail closed"
         );
+    }
+
+    #[test]
+    fn session_publication_recovers_pre_rename_cut_as_private_staging() {
+        let (root, store) = store("mounted-mutation-session-pre-rename-cut");
+        let store_lock =
+            lock_file_exclusive(&store.root.join(STORE_LOCK_FILE)).expect("store lock");
+        let (_session_id, preparing_directory, published_directory, staged_lease) =
+            stage_host_mount_session_for_publication(
+                &store,
+                MountedSifsMutationAdapter::CloudFiles,
+                "sync-root",
+            );
+        let preparing_lease_path = preparing_directory.join(LEASE_FILE);
+
+        let error = publish_host_mount_session_directory_with_cuts(
+            &preparing_directory,
+            &published_directory,
+            staged_lease,
+            |lease_path| {
+                assert_eq!(lease_path, preparing_lease_path);
+                assert!(!process_lock_is_held(lease_path)?);
+                Err(outbox_error("injected crash before session rename"))
+            },
+            |_| panic!("pre-rename cut must not reach final lease reacquire"),
+        )
+        .expect_err("injected pre-rename cut");
+        assert!(
+            error
+                .to_string()
+                .contains("injected crash before session rename")
+        );
+        assert!(preparing_directory.is_dir());
+        assert!(!published_directory.exists());
+        assert_eq!(
+            lock_liveness(&preparing_lease_path).expect("dead staging lease"),
+            LeaseLiveness::Dead
+        );
+        drop(store_lock);
+
+        let reopened = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+            .expect("reopen after pre-rename cut");
+        let status = reopened.status().expect("scan pre-rename cut");
+        assert_eq!(status.total_marker_count, 0);
+        assert_eq!(status.pending_marker_count, 0);
+        assert!(!status.requires_full_recovery());
+        assert!(
+            reopened
+                .recovery_candidate_marker_ids()
+                .expect("recovery candidates")
+                .is_empty(),
+            "private staging cannot fabricate recovery work"
+        );
+        assert!(!preparing_directory.exists());
+        assert!(!published_directory.exists());
+
+        reopened
+            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .expect("replacement session after dead private staging");
+    }
+
+    #[test]
+    fn windows_compatible_session_publication_recovers_post_rename_cut() {
+        let (root, store) = store("mounted-mutation-windows-session-publication");
+        let store_lock =
+            lock_file_exclusive(&store.root.join(STORE_LOCK_FILE)).expect("store lock");
+        let (_session_id, preparing_directory, published_directory, staged_lease) =
+            stage_host_mount_session_for_publication(
+                &store,
+                MountedSifsMutationAdapter::CloudFiles,
+                "sync-root",
+            );
+        let preparing_lease_path = preparing_directory.join(LEASE_FILE);
+
+        let error = publish_host_mount_session_directory_with_cuts(
+            &preparing_directory,
+            &published_directory,
+            staged_lease,
+            |lease_path| {
+                assert_eq!(lease_path, preparing_lease_path);
+                assert!(
+                    !process_lock_is_held(lease_path)?,
+                    "the staging lease and its Windows child handle must be released before rename"
+                );
+                Ok(())
+            },
+            |lease_path| {
+                assert_eq!(lease_path, published_directory.join(LEASE_FILE));
+                assert!(published_directory.is_dir());
+                assert_eq!(lock_liveness(lease_path)?, LeaseLiveness::Dead);
+                Err(outbox_error(
+                    "injected crash after session rename and before lease reacquire",
+                ))
+            },
+        )
+        .expect_err("injected post-rename cut");
+        assert!(
+            error
+                .to_string()
+                .contains("injected crash after session rename")
+        );
+        assert!(!preparing_directory.exists());
+        assert!(published_directory.is_dir());
+        assert_eq!(
+            lock_liveness(&published_directory.join(LEASE_FILE)).expect("dead published lease"),
+            LeaseLiveness::Dead
+        );
+        drop(store_lock);
+
+        let reopened = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+            .expect("reopen after post-rename cut");
+        let status = reopened.status().expect("scan post-rename cut");
+        assert_eq!(status.total_marker_count, 0);
+        assert_eq!(status.pending_marker_count, 0);
+        assert!(!status.requires_full_recovery());
+        assert!(
+            reopened
+                .recovery_candidate_marker_ids()
+                .expect("recovery candidates")
+                .is_empty(),
+            "an unpublished adapter session cannot fabricate recovery work"
+        );
+        assert!(!published_directory.exists());
+
+        let replacement = reopened
+            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .expect("replacement session after dead publication cut");
+        let replacement_directory = reopened.session_directory(&replacement.marker().session_id);
+        assert_eq!(
+            lock_liveness(&replacement_directory.join(LEASE_FILE))
+                .expect("replacement session liveness"),
+            LeaseLiveness::Live
+        );
+        assert!(
+            process_lock_is_held(&replacement_directory.join(LEASE_FILE))
+                .expect("replacement process lease")
+        );
+        assert!(
+            !reopened
+                .root
+                .join(PREPARING_SESSIONS_DIRECTORY)
+                .join(replacement.marker().session_id.as_str())
+                .exists(),
+            "the complete session directory must be authoritative before its lease is exposed"
+        );
+    }
+
+    #[test]
+    fn session_publication_does_not_recreate_a_missing_published_lease() {
+        let (root, store) = store("mounted-mutation-session-missing-published-lease");
+        let store_lock =
+            lock_file_exclusive(&store.root.join(STORE_LOCK_FILE)).expect("store lock");
+        let (_session_id, preparing_directory, published_directory, staged_lease) =
+            stage_host_mount_session_for_publication(
+                &store,
+                MountedSifsMutationAdapter::CloudFiles,
+                "sync-root",
+            );
+
+        let error = publish_host_mount_session_directory_with_cuts(
+            &preparing_directory,
+            &published_directory,
+            staged_lease,
+            |lease_path| {
+                assert!(!process_lock_is_held(lease_path)?);
+                Ok(())
+            },
+            |lease_path| {
+                remove_file_durable(lease_path)?;
+                Ok(())
+            },
+        )
+        .expect_err("a vanished published lease must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("published session lease is unavailable")
+        );
+        assert!(published_directory.is_dir());
+        assert!(!published_directory.join(LEASE_FILE).exists());
+        drop(store_lock);
+
+        let reopened = MountedSifsMutationOutboxStore::new(&SinomoDataDir::new(root.path()))
+            .expect("reopen missing-lease session");
+        assert!(
+            reopened
+                .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+                .is_err(),
+            "missing authoritative liveness proof must block admission instead of being recreated"
+        );
+        assert!(!published_directory.join(LEASE_FILE).exists());
     }
 
     #[test]
