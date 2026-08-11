@@ -22975,6 +22975,439 @@ fn hydrate_from_metadata_backend_restores_committed_pending_write_for_missing_re
 }
 
 #[test]
+fn hydration_prunes_over_bound_superseded_repair_history_and_keeps_actionable_work() {
+    fn put_visible_object(
+        backend: &mut impl DfsMetadataBackend,
+        owner: &NodeId,
+        object_id: DfsObjectId,
+        label: &str,
+        kind: DfsObjectKind,
+        version: DfsVersion,
+        content_hash: Option<String>,
+        size_bytes: Option<u64>,
+    ) -> DfsObjectMetadata {
+        let mut object = file_metadata(owner.clone());
+        object.object_id = object_id;
+        object.path = format!("/services/hydration-repair-{label}.bin");
+        object.kind = kind;
+        object.version = version;
+        object.policy = DfsObjectPolicy::ReplicatedEventual;
+        object.current_locations = vec![owner.clone()];
+        object.content_hash = content_hash;
+        object.content_size_bytes = size_bytes;
+        backend
+            .put_object_and_version(&object, &object_version_record(&object, size_bytes))
+            .expect("visible object and version");
+        object
+    }
+
+    fn put_committed_missing_replica_intent(
+        backend: &mut impl DfsMetadataBackend,
+        owner: &NodeId,
+        replica: &NodeId,
+        object: &DfsObjectMetadata,
+        intent_id: &str,
+        base_version: Option<DfsVersion>,
+        target_version: DfsVersion,
+        content_hash: Option<String>,
+    ) {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        backend
+            .put_intent(&DfsWriteIntentRecord {
+                intent_id: intent_id.to_string(),
+                file_system_id: object.file_system_id.clone(),
+                object_id: object.object_id.clone(),
+                base_version,
+                target_version: target_version.clone(),
+                coordinator_node_id: owner.clone(),
+                operation_id: None,
+                operation_order_token: None,
+                owner_epoch: 0,
+                desired_replica_node_ids: vec![owner.clone(), replica.clone()],
+                policy: DfsReplicationPolicy::new(1, 2).expect("replication policy"),
+                status: DfsWriteIntentStatus::Committed,
+                content_hash: content_hash.clone(),
+                object_metadata: None,
+                touch_parent_on_create: false,
+                create_predecessor_object_id: None,
+                created_at: now,
+                updated_at: Some(now),
+            })
+            .expect("committed intent");
+        backend
+            .put_receipt(&DfsReplicaReceiptRecord {
+                receipt: DfsWriteReceipt {
+                    file_system_id: object.file_system_id.clone(),
+                    object_id: object.object_id.clone(),
+                    committed_version: target_version,
+                    owner_node_id: owner.clone(),
+                    event_id: EventId::generate(),
+                },
+                replica_node_id: owner.clone(),
+                content_hash,
+                received_at: now,
+            })
+            .expect("owner receipt");
+    }
+
+    let root = temp_root("hydrate-prunes-superseded-repair-history");
+    let owner = NodeId::from_legacy_named("node_hydrate_history_owner").expect("owner");
+    let replica = NodeId::from_legacy_named("node_hydrate_history_replica").expect("replica");
+    let metadata_root = root.join("metadata");
+    let content_root = root.join("content");
+    let content = LocalContentStore::new(&content_root).expect("content store");
+    let mut backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+            .expect("metadata backend");
+    backend
+        .put_file_system(&file_system(owner.clone()))
+        .expect("filesystem");
+
+    let stale_intent_count = MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1;
+    let mut stale_intent_ids = BTreeSet::new();
+    for index in 0..stale_intent_count {
+        let object_id = DfsObjectId::from_legacy_named(format!("obj_hydration_stale_{index}"))
+            .expect("stale object");
+        let visible_version =
+            DfsVersion::from_legacy_named(format!("version_hydration_visible_{index}"))
+                .expect("visible version");
+        let target_version =
+            DfsVersion::from_legacy_named(format!("version_hydration_stale_target_{index}"))
+                .expect("stale target version");
+        let base_version =
+            DfsVersion::from_legacy_named(format!("version_hydration_stale_base_{index}"))
+                .expect("stale base version");
+        let visible_bytes = format!("current visible content {index}");
+        let stale_bytes = format!("superseded repair content {index}");
+        let visible_is_tombstone = index % 2 == 0;
+        let object = put_visible_object(
+            &mut backend,
+            &owner,
+            object_id,
+            &format!("stale-{index}"),
+            if visible_is_tombstone {
+                DfsObjectKind::Tombstone
+            } else {
+                DfsObjectKind::File
+            },
+            visible_version,
+            (!visible_is_tombstone).then(|| content_hash(visible_bytes.as_bytes())),
+            (!visible_is_tombstone).then_some(visible_bytes.len() as u64),
+        );
+        let intent_id = format!("dfs_intent_hydration_stale_{index:03}");
+        put_committed_missing_replica_intent(
+            &mut backend,
+            &owner,
+            &replica,
+            &object,
+            &intent_id,
+            Some(base_version),
+            target_version,
+            Some(content_hash(stale_bytes.as_bytes())),
+        );
+        stale_intent_ids.insert(intent_id);
+    }
+
+    let exact_object_id =
+        DfsObjectId::from_legacy_named("obj_hydration_actionable_exact").expect("exact object");
+    let exact_version =
+        DfsVersion::from_legacy_named("version_hydration_actionable_exact").expect("exact version");
+    let exact_manifest = content
+        .put_object_version(
+            exact_object_id.as_str(),
+            exact_version.as_str(),
+            b"exact current repair content",
+        )
+        .expect("exact content");
+    let exact_object = put_visible_object(
+        &mut backend,
+        &owner,
+        exact_object_id,
+        "actionable-exact",
+        DfsObjectKind::File,
+        exact_version.clone(),
+        Some(exact_manifest.content_hash.clone()),
+        Some(exact_manifest.size_bytes),
+    );
+    let exact_intent_id = "dfs_intent_hydration_actionable_exact";
+    put_committed_missing_replica_intent(
+        &mut backend,
+        &owner,
+        &replica,
+        &exact_object,
+        exact_intent_id,
+        Some(
+            DfsVersion::from_legacy_named("version_hydration_actionable_exact_base")
+                .expect("exact base"),
+        ),
+        exact_version,
+        Some(exact_manifest.content_hash),
+    );
+
+    let same_content_object_id =
+        DfsObjectId::from_legacy_named("obj_hydration_actionable_same_content")
+            .expect("same-content object");
+    let same_content_target =
+        DfsVersion::from_legacy_named("version_hydration_actionable_same_content_target")
+            .expect("same-content target");
+    let same_content_visible =
+        DfsVersion::from_legacy_named("version_hydration_actionable_same_content_visible")
+            .expect("same-content visible version");
+    let same_content_manifest = content
+        .put_object_version(
+            same_content_object_id.as_str(),
+            same_content_target.as_str(),
+            b"metadata-only advance keeps these bytes",
+        )
+        .expect("same-content bytes");
+    let same_content_object = put_visible_object(
+        &mut backend,
+        &owner,
+        same_content_object_id,
+        "actionable-same-content",
+        DfsObjectKind::File,
+        same_content_visible,
+        Some(same_content_manifest.content_hash.clone()),
+        Some(same_content_manifest.size_bytes),
+    );
+    let same_content_intent_id = "dfs_intent_hydration_actionable_same_content";
+    put_committed_missing_replica_intent(
+        &mut backend,
+        &owner,
+        &replica,
+        &same_content_object,
+        same_content_intent_id,
+        Some(
+            DfsVersion::from_legacy_named("version_hydration_actionable_same_content_base")
+                .expect("same-content base"),
+        ),
+        same_content_target,
+        Some(same_content_manifest.content_hash),
+    );
+
+    let base_visible_object_id =
+        DfsObjectId::from_legacy_named("obj_hydration_actionable_base_visible")
+            .expect("base-visible object");
+    let base_visible_version =
+        DfsVersion::from_legacy_named("version_hydration_actionable_base_visible")
+            .expect("base-visible version");
+    let base_visible_target =
+        DfsVersion::from_legacy_named("version_hydration_actionable_base_target")
+            .expect("base-visible target");
+    let base_visible_bytes = b"currently visible base bytes";
+    let base_target_manifest = content
+        .put_object_version(
+            base_visible_object_id.as_str(),
+            base_visible_target.as_str(),
+            b"committed target waiting for publication",
+        )
+        .expect("base recovery target bytes");
+    let base_visible_object = put_visible_object(
+        &mut backend,
+        &owner,
+        base_visible_object_id,
+        "actionable-base-visible",
+        DfsObjectKind::File,
+        base_visible_version.clone(),
+        Some(content_hash(base_visible_bytes)),
+        Some(base_visible_bytes.len() as u64),
+    );
+    let base_visible_intent_id = "dfs_intent_hydration_actionable_base_visible";
+    put_committed_missing_replica_intent(
+        &mut backend,
+        &owner,
+        &replica,
+        &base_visible_object,
+        base_visible_intent_id,
+        Some(base_visible_version),
+        base_visible_target,
+        Some(base_target_manifest.content_hash),
+    );
+
+    let ambiguous_object_id = DfsObjectId::from_legacy_named("obj_hydration_actionable_ambiguous")
+        .expect("ambiguous object");
+    let ambiguous_target =
+        DfsVersion::from_legacy_named("version_hydration_actionable_ambiguous_target")
+            .expect("ambiguous target");
+    let ambiguous_manifest = content
+        .put_object_version(
+            ambiguous_object_id.as_str(),
+            ambiguous_target.as_str(),
+            b"repair identity retained when visible hash is absent",
+        )
+        .expect("ambiguous target bytes");
+    let ambiguous_object = put_visible_object(
+        &mut backend,
+        &owner,
+        ambiguous_object_id,
+        "actionable-ambiguous",
+        DfsObjectKind::File,
+        DfsVersion::from_legacy_named("version_hydration_actionable_ambiguous_visible")
+            .expect("ambiguous visible version"),
+        None,
+        None,
+    );
+    let ambiguous_intent_id = "dfs_intent_hydration_actionable_ambiguous";
+    put_committed_missing_replica_intent(
+        &mut backend,
+        &owner,
+        &replica,
+        &ambiguous_object,
+        ambiguous_intent_id,
+        Some(
+            DfsVersion::from_legacy_named("version_hydration_actionable_ambiguous_base")
+                .expect("ambiguous base"),
+        ),
+        ambiguous_target,
+        Some(ambiguous_manifest.content_hash),
+    );
+
+    drop(backend);
+    let recovered_backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("owner"), &metadata_root)
+            .expect("recovered backend");
+    let mut recovered = NetworkedDfsService::new(
+        InProcessNetwork::new().add_node(owner.clone()),
+        LocalContentStore::new(&content_root).expect("recovered content"),
+    )
+    .with_metadata_backend(recovered_backend)
+    .expect("hydrate repair state");
+
+    assert_eq!(
+        recovered.coordinator().intent_count(),
+        stale_intent_count + 4,
+        "hydration must retain terminal intent history"
+    );
+    assert!(stale_intent_ids.iter().all(|intent_id| {
+        recovered
+            .coordinator()
+            .intent(intent_id)
+            .is_some_and(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
+    }));
+
+    let expected_actionable_intent_ids = BTreeSet::from([
+        exact_intent_id.to_string(),
+        same_content_intent_id.to_string(),
+        base_visible_intent_id.to_string(),
+        ambiguous_intent_id.to_string(),
+    ]);
+    let repair_intent_ids = recovered
+        .coordinator()
+        .repair_jobs()
+        .iter()
+        .map(|job| job.intent_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(repair_intent_ids, expected_actionable_intent_ids);
+    assert_eq!(recovered.coordinator().repair_jobs().len(), 4);
+    assert!(
+        recovered
+            .coordinator()
+            .repair_jobs()
+            .iter()
+            .all(|job| job.missing_replica_node_id == replica)
+    );
+    assert_eq!(
+        recovered
+            .pending_writes
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        expected_actionable_intent_ids,
+        "only actionable committed repairs may retain pending write state"
+    );
+    let durable_records = recovered.durable_repair_queue_records();
+    assert_eq!(durable_records.len(), 4);
+    assert_eq!(
+        durable_records
+            .iter()
+            .map(|record| record.intent_id.clone())
+            .collect::<BTreeSet<_>>(),
+        expected_actionable_intent_ids,
+        "mounted handoff inventory must retain every valid repair identity"
+    );
+    assert!(durable_records.iter().all(|record| {
+        record.missing_replica_node_id == replica && record.attempts == 0 && !record.in_flight
+    }));
+    assert!(
+        durable_records.len() <= MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS,
+        "superseded history must not overflow the exact mounted handoff bound"
+    );
+    assert!(stale_intent_ids.is_disjoint(&expected_actionable_intent_ids));
+
+    let replayed_actionable_intent = recovered
+        .coordinator
+        .intent(exact_intent_id)
+        .cloned()
+        .expect("exact-current intent retained for replay");
+    recovered
+        .coordinator
+        .restore_intent(replayed_actionable_intent)
+        .expect("later generic intent restore");
+    assert_eq!(
+        recovered
+            .coordinator
+            .repair_jobs()
+            .iter()
+            .map(|job| job.intent_id.clone())
+            .collect::<BTreeSet<_>>(),
+        expected_actionable_intent_ids,
+        "later generic rebuild must not resurrect suppressed hydration history"
+    );
+
+    let live_intent = recovered
+        .coordinator
+        .create_intent(
+            sifs_file_system_id(),
+            DfsObjectId::from_legacy_named("obj_hydration_new_live_repair")
+                .expect("new live repair object"),
+            None,
+            DfsVersion::from_legacy_named("version_hydration_new_live_repair")
+                .expect("new live repair version"),
+            owner.clone(),
+            vec![owner.clone(), replica.clone()],
+            DfsReplicationPolicy::new(1, 2).expect("live repair policy"),
+        )
+        .expect("new live intent");
+    let live_intent_id = live_intent.intent_id.clone();
+    recovered
+        .coordinator
+        .record_durable_receipt(&live_intent_id, owner.clone())
+        .expect("new live owner receipt");
+    recovered
+        .coordinator
+        .commit_intent(&live_intent_id)
+        .expect("new live commit");
+
+    recovered
+        .coordinator
+        .restore_durable_receipt(exact_intent_id, owner)
+        .expect("later generic receipt restore");
+    let mut expected_after_live_commit = expected_actionable_intent_ids.clone();
+    expected_after_live_commit.insert(live_intent_id.clone());
+    let repair_intent_ids_after_live_commit = recovered
+        .coordinator
+        .repair_jobs()
+        .iter()
+        .map(|job| job.intent_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        repair_intent_ids_after_live_commit,
+        expected_after_live_commit
+    );
+    assert!(
+        stale_intent_ids.is_disjoint(&repair_intent_ids_after_live_commit),
+        "process-generation suppression must survive every generic rebuild"
+    );
+    assert!(
+        recovered.coordinator.repair_jobs().iter().any(|job| {
+            job.intent_id == live_intent_id && job.missing_replica_node_id == replica
+        }),
+        "hydration suppression must not hide repair work from a new live commit"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn hydrate_from_metadata_backend_skips_non_coordinator_repair_sender_state() {
     let root = temp_root("hydrate-skips-non-coordinator-repair");
     let owner = NodeId::from_legacy_named("node_hydrate_noncoord_owner").expect("node");

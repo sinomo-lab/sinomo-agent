@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -35,16 +35,24 @@ type SharedLocalClusterRaftCommandStorage = Arc<Mutex<LocalClusterRaftCommandSto
 
 #[derive(Debug)]
 struct ClusterRaftHigherTermPersistenceWorker {
-    running: AtomicBool,
-    wake_generation: Mutex<u64>,
+    wake_state: Mutex<ClusterRaftHigherTermPersistenceWakeState>,
     wake: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ClusterRaftHigherTermPersistenceWakeState {
+    revision: u64,
+    target_term: Option<u64>,
+    starting: bool,
+    running: bool,
+    #[cfg(test)]
+    start_waiters: usize,
 }
 
 impl Default for ClusterRaftHigherTermPersistenceWorker {
     fn default() -> Self {
         Self {
-            running: AtomicBool::new(false),
-            wake_generation: Mutex::new(0),
+            wake_state: Mutex::new(ClusterRaftHigherTermPersistenceWakeState::default()),
             wake: Condvar::new(),
         }
     }
@@ -56,6 +64,16 @@ static CLUSTER_RAFT_HIGHER_TERM_PERSISTENCE_WORKERS: OnceLock<
 #[cfg(test)]
 static CLUSTER_RAFT_HIGHER_TERM_INJECTED_FAILURES: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
     OnceLock::new();
+#[cfg(test)]
+#[derive(Clone)]
+struct ClusterRaftHigherTermInjectedStartFailure {
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+#[cfg(test)]
+static CLUSTER_RAFT_HIGHER_TERM_INJECTED_START_FAILURES: OnceLock<
+    Mutex<BTreeMap<PathBuf, ClusterRaftHigherTermInjectedStartFailure>>,
+> = OnceLock::new();
 
 #[cfg(test)]
 fn take_cluster_raft_higher_term_injected_failure(root: &PathBuf) -> bool {
@@ -78,6 +96,66 @@ fn take_cluster_raft_higher_term_injected_failure(root: &PathBuf) -> bool {
     true
 }
 
+#[cfg(test)]
+fn take_cluster_raft_higher_term_injected_start_failure(root: &PathBuf) -> Option<std::io::Error> {
+    let failure = CLUSTER_RAFT_HIGHER_TERM_INJECTED_START_FAILURES
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(root)?;
+    failure.entered.wait();
+    failure.release.wait();
+    Some(std::io::Error::other(
+        "injected higher-term worker start failure",
+    ))
+}
+
+#[cfg(not(test))]
+fn take_cluster_raft_higher_term_injected_start_failure(_root: &PathBuf) -> Option<std::io::Error> {
+    None
+}
+
+struct ClusterRaftHigherTermStartReservation {
+    worker: Arc<ClusterRaftHigherTermPersistenceWorker>,
+    resolved: bool,
+}
+
+impl ClusterRaftHigherTermStartReservation {
+    fn publish_running(mut self) {
+        let mut wake_state = self
+            .worker
+            .wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(wake_state.starting);
+        debug_assert!(!wake_state.running);
+        wake_state.starting = false;
+        wake_state.running = true;
+        self.resolved = true;
+        self.worker.wake.notify_all();
+    }
+}
+
+impl Drop for ClusterRaftHigherTermStartReservation {
+    fn drop(&mut self) {
+        if self.resolved {
+            return;
+        }
+        let mut wake_state = self
+            .worker
+            .wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(wake_state.starting);
+        debug_assert!(!wake_state.running);
+        wake_state.starting = false;
+        wake_state.running = false;
+        // Keep revision/target intact. A publisher already waiting with this
+        // worker Arc can now claim the idle reservation and start a successor.
+        self.worker.wake.notify_all();
+    }
+}
+
 fn cluster_raft_higher_term_persistence_worker(
     root: PathBuf,
 ) -> Arc<ClusterRaftHigherTermPersistenceWorker> {
@@ -97,17 +175,73 @@ fn cluster_raft_higher_term_persistence_worker(
 
 fn wait_for_cluster_raft_higher_term_retry(
     worker: &ClusterRaftHigherTermPersistenceWorker,
+    observed_revision: u64,
     backoff: Duration,
 ) {
-    let generation = worker
-        .wake_generation
+    let wake_state = worker
+        .wake_state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let observed = *generation;
     let _ = worker
         .wake
-        .wait_timeout_while(generation, backoff, |generation| *generation == observed)
+        .wait_timeout_while(wake_state, backoff, |wake_state| {
+            wake_state.revision == observed_revision
+        })
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+}
+
+fn cluster_raft_higher_term_worker_start_was_published(
+    worker: &ClusterRaftHigherTermPersistenceWorker,
+) -> bool {
+    let mut wake_state = worker
+        .wake_state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while wake_state.starting {
+        wake_state = worker
+            .wake
+            .wait(wake_state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    wake_state.running
+}
+
+fn start_cluster_raft_higher_term_persistence_worker(
+    paths: ClusterPaths,
+    node_id: NodeId,
+    root: PathBuf,
+    reservation: ClusterRaftHigherTermStartReservation,
+) -> Result<(), NetworkError> {
+    let worker_state = Arc::clone(&reservation.worker);
+    let spawn_result = match take_cluster_raft_higher_term_injected_start_failure(&root) {
+        Some(error) => Err(error),
+        None => std::thread::Builder::new()
+            .name("sinomo-kv-higher-term".to_string())
+            .spawn(move || {
+                // The OS thread can run before `Builder::spawn` returns. Keep
+                // it behind the start latch until the publisher has made the
+                // successful spawn outcome visible to joined publishers.
+                if cluster_raft_higher_term_worker_start_was_published(&worker_state) {
+                    run_cluster_raft_higher_term_persistence_worker(paths, node_id, worker_state);
+                }
+            }),
+    };
+    match spawn_result {
+        Ok(_worker_thread) => {
+            reservation.publish_running();
+            Ok(())
+        }
+        Err(source) => {
+            let error = NetworkError::Io {
+                operation: "start mandatory higher Raft term persistence".to_string(),
+                detail: source.to_string(),
+            };
+            // Drop publishes Starting -> Idle and wakes any joined publisher
+            // before this failed starter returns its error.
+            drop(reservation);
+            Err(error)
+        }
+    }
 }
 
 fn run_cluster_raft_higher_term_persistence_worker(
@@ -120,73 +254,15 @@ fn run_cluster_raft_higher_term_persistence_worker(
     let root = store.wal_paths(&node_id).root;
     let mut backoff = Duration::from_millis(10);
     loop {
-        match store.pending_higher_term(&node_id).map_err(kv_err) {
-            Ok(Some(term)) => {
-                metrics::counter!("sinomo.kv.higher_term.persistence_attempts").increment(1);
-                #[cfg(test)]
-                let injected_failure = take_cluster_raft_higher_term_injected_failure(&root);
-                #[cfg(not(test))]
-                let injected_failure = false;
-                let result = if injected_failure {
-                    Err(NetworkError::Io {
-                        operation: "persist higher Raft term".to_string(),
-                        detail: "injected transient persistence failure".to_string(),
-                    })
-                } else {
-                    let mut storage = sinomo_kv::ClusterKvRaftLocalCommandStorage::new_with_immediate_operation_admission(
-                        store.clone(),
-                        node_id.clone(),
-                        sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
-                    );
-                    match storage.observe_pending_higher_term(term) {
-                        Ok(()) => Ok(()),
-                        Err(sinomo_kv::KvError::Busy { .. }) => {
-                            metrics::counter!(
-                                "sinomo.kv.higher_term.persistence_attempts",
-                                "outcome" => "deferred_busy"
-                            )
-                            .increment(1);
-                            wait_for_cluster_raft_higher_term_retry(&worker, backoff);
-                            backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
-                            continue;
-                        }
-                        Err(error) => Err(kv_err(error)),
-                    }
-                };
-                match result {
-                    Ok(()) => {
-                        backoff = Duration::from_millis(10);
-                        continue;
-                    }
-                    Err(error) => {
-                        metrics::counter!("sinomo.kv.higher_term.persistence_failures")
-                            .increment(1);
-                        tracing::warn!(
-                            target: "sinomo.cluster.raft_term",
-                            %node_id,
-                            term,
-                            retry_ms = backoff.as_millis().min(u128::from(u64::MAX)) as u64,
-                            %error,
-                            "mandatory higher Raft term persistence failed; retrying reactively"
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                worker.running.store(false, Ordering::Release);
-                // Close the retirement race with a publication that observed
-                // `running=true` just before this store. Either this worker
-                // reclaims ownership, or that publisher starts its successor.
-                if store.pending_higher_term(&node_id).ok().flatten().is_some()
-                    && worker
-                        .running
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                {
-                    continue;
-                }
-                return;
-            }
+        let (target_revision, target_term) = {
+            let wake_state = worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (wake_state.revision, wake_state.target_term)
+        };
+        let pending_term = match store.pending_higher_term(&node_id).map_err(kv_err) {
+            Ok(pending_term) => pending_term,
             Err(error) => {
                 metrics::counter!("sinomo.kv.higher_term.persistence_failures").increment(1);
                 tracing::warn!(
@@ -196,17 +272,141 @@ fn run_cluster_raft_higher_term_persistence_worker(
                     %error,
                     "mandatory higher Raft term floor lookup failed; retrying reactively"
                 );
+                wait_for_cluster_raft_higher_term_retry(&worker, target_revision, backoff);
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+                continue;
+            }
+        };
+        let term = match (target_term, pending_term) {
+            (Some(target), Some(pending)) => Some(target.max(pending)),
+            (Some(target), None) => Some(target),
+            (None, Some(pending)) => Some(pending),
+            (None, None) => None,
+        };
+        let Some(term) = term else {
+            // Retire under the same small mutex publication uses to install a
+            // verification target and reserve startup. A publisher either
+            // claims Starting after this worker publishes Idle, or this worker
+            // sees its target and keeps ownership. Never hold this mutex across
+            // the gate lookup.
+            let should_continue = {
+                let mut wake_state = worker
+                    .wake_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if wake_state.target_term.is_some() {
+                    true
+                } else {
+                    debug_assert!(!wake_state.starting);
+                    debug_assert!(wake_state.running);
+                    wake_state.running = false;
+                    worker.wake.notify_all();
+                    false
+                }
+            };
+            if should_continue {
+                continue;
+            }
+
+            // A non-reactive floor publication can race retirement too. Once
+            // running is false, recheck both sources; either this worker
+            // reclaims ownership or a reactive publisher starts its successor.
+            let floor_outstanding = match store.pending_higher_term(&node_id) {
+                Ok(pending) => pending.is_some(),
+                Err(_) => true,
+            };
+            let mut wake_state = worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let work_outstanding = floor_outstanding || wake_state.target_term.is_some();
+            if work_outstanding {
+                if wake_state.starting || wake_state.running {
+                    // A publisher claimed the idle lifecycle and either owns
+                    // startup or already published its live successor.
+                    return;
+                }
+                // This thread already exists, so it can reclaim Idle directly
+                // as Running without a Starting reservation.
+                wake_state.running = true;
+                drop(wake_state);
+                continue;
+            }
+            return;
+        };
+
+        metrics::counter!("sinomo.kv.higher_term.persistence_attempts").increment(1);
+        #[cfg(test)]
+        let injected_failure = take_cluster_raft_higher_term_injected_failure(&root);
+        #[cfg(not(test))]
+        let injected_failure = false;
+        let result = if injected_failure {
+            Err(NetworkError::Io {
+                operation: "persist higher Raft term".to_string(),
+                detail: "injected transient persistence failure".to_string(),
+            })
+        } else {
+            let mut storage =
+                sinomo_kv::ClusterKvRaftLocalCommandStorage::new_with_immediate_operation_admission(
+                    store.clone(),
+                    node_id.clone(),
+                    sinomo_kv::cluster_kv_key_can_defer_materialized_snapshot as fn(&str) -> bool,
+                );
+            match storage.observe_pending_higher_term(term) {
+                Ok(()) => Ok(()),
+                Err(sinomo_kv::KvError::Busy { .. }) => {
+                    metrics::counter!(
+                        "sinomo.kv.higher_term.persistence_attempts",
+                        "outcome" => "deferred_busy"
+                    )
+                    .increment(1);
+                    wait_for_cluster_raft_higher_term_retry(&worker, target_revision, backoff);
+                    backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
+                    continue;
+                }
+                Err(error) => Err(kv_err(error)),
+            }
+        };
+        match result {
+            Ok(()) => {
+                // The storage open/ACK is the durable-generation verification
+                // even when publication was suppressed and the gate floor was
+                // absent. Clear only the exact publication revision we acted
+                // on; an equal/newer concurrent publication must be retried.
+                let mut wake_state = worker
+                    .wake_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if wake_state.revision == target_revision
+                    && wake_state.target_term.is_some_and(|target| target <= term)
+                {
+                    wake_state.target_term = None;
+                }
+                backoff = Duration::from_millis(10);
+                continue;
+            }
+            Err(error) => {
+                metrics::counter!("sinomo.kv.higher_term.persistence_failures").increment(1);
+                tracing::warn!(
+                    target: "sinomo.cluster.raft_term",
+                    %node_id,
+                    term,
+                    retry_ms = backoff.as_millis().min(u128::from(u64::MAX)) as u64,
+                    %error,
+                    "mandatory higher Raft term persistence failed; retrying reactively"
+                );
             }
         }
-        wait_for_cluster_raft_higher_term_retry(&worker, backoff);
+        wait_for_cluster_raft_higher_term_retry(&worker, target_revision, backoff);
         backoff = backoff.saturating_mul(2).min(Duration::from_secs(1));
     }
 }
 
 /// Raise the higher-term floor synchronously, then ensure exactly one
 /// caller-independent worker per WAL root drives the latest floor to durable
-/// hard state. Every publication wakes retries immediately and newer terms
-/// coalesce through the monotonic floor.
+/// hard state. Every publication wakes retries immediately and records a
+/// monotonic verification target, including terms a process-local durable
+/// watermark suppresses from the gate floor.
 pub(crate) fn publish_cluster_raft_higher_term_reactively(
     paths: &ClusterPaths,
     node_id: &NodeId,
@@ -217,42 +417,56 @@ pub(crate) fn publish_cluster_raft_higher_term_reactively(
         .publish_pending_higher_term(node_id, term)
         .map_err(kv_err)?;
     let root = store.wal_paths(node_id).root;
-    let worker = cluster_raft_higher_term_persistence_worker(root);
-    {
-        let mut generation = worker
-            .wake_generation
+    let worker = cluster_raft_higher_term_persistence_worker(root.clone());
+    let reservation = {
+        let mut wake_state = worker
+            .wake_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *generation = generation.wrapping_add(1);
-        worker.wake.notify_one();
-    }
-    if worker
-        .running
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return Ok(());
-    }
-    let worker_paths = paths.clone();
-    let worker_node_id = node_id.clone();
-    let worker_state = Arc::clone(&worker);
-    std::thread::Builder::new()
-        .name("sinomo-kv-higher-term".to_string())
-        .spawn(move || {
-            run_cluster_raft_higher_term_persistence_worker(
-                worker_paths,
-                worker_node_id,
-                worker_state,
-            )
-        })
-        .map_err(|source| {
-            worker.running.store(false, Ordering::Release);
-            NetworkError::Io {
-                operation: "start mandatory higher Raft term persistence".to_string(),
-                detail: source.to_string(),
+        wake_state.revision = wake_state.revision.wrapping_add(1);
+        wake_state.target_term = Some(wake_state.target_term.unwrap_or_default().max(term));
+        worker.wake.notify_all();
+        loop {
+            // A cleared target can only come from a successful worker attempt
+            // whose snapshotted revision still matched the current revision.
+            // It therefore proves this publication was durably consumed even
+            // if the worker completed and retired before we reacquired here.
+            if wake_state.target_term.is_none() {
+                return Ok(());
             }
-        })?;
-    Ok(())
+            if wake_state.running {
+                return Ok(());
+            }
+            if !wake_state.starting {
+                wake_state.starting = true;
+                break ClusterRaftHigherTermStartReservation {
+                    worker: Arc::clone(&worker),
+                    resolved: false,
+                };
+            }
+            // A reserved start is not a live worker. Join its outcome rather
+            // than returning Ok; on failure this publisher can atomically
+            // claim the idle lifecycle and start the retained target itself.
+            #[cfg(test)]
+            {
+                wake_state.start_waiters = wake_state.start_waiters.saturating_add(1);
+            }
+            wake_state = worker
+                .wake
+                .wait(wake_state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            #[cfg(test)]
+            {
+                wake_state.start_waiters = wake_state.start_waiters.saturating_sub(1);
+            }
+        }
+    };
+    start_cluster_raft_higher_term_persistence_worker(
+        paths.clone(),
+        node_id.clone(),
+        root,
+        reservation,
+    )
 }
 
 /// Per-target delivery metadata around an immutable append payload. Voters at
@@ -6449,25 +6663,160 @@ mod read_index_tests {
         let store = paths.kv_paths().raft_store();
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if store
+            let pending_term = store
                 .pending_higher_term(node_id)
-                .expect("pending higher term")
-                .is_none()
-            {
-                let hard_state = store
-                    .wal_paths(node_id)
-                    .read_persisted_hard_state()
-                    .expect("durable hard state");
-                if hard_state.current_term >= expected_term {
-                    return;
-                }
+                .expect("pending higher term");
+            let durable_term = store
+                .wal_paths(node_id)
+                .read_persisted_hard_state()
+                .expect("durable hard state")
+                .current_term;
+            if pending_term.is_none() && durable_term >= expected_term {
+                return;
             }
             assert!(
                 Instant::now() < deadline,
-                "higher term {expected_term} did not become durable"
+                "higher term {expected_term} did not become durable: pending={pending_term:?}, durable={durable_term}"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_for_higher_term_worker_idle(worker: &ClusterRaftHigherTermPersistenceWorker) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let wake_state = worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !wake_state.starting && !wake_state.running && wake_state.target_term.is_none() {
+                return;
+            }
+            drop(wake_state);
+            assert!(
+                Instant::now() < deadline,
+                "higher-term persistence worker did not become idle"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn reactive_higher_term_publisher_joins_failed_start_and_starts_successor() {
+        let (_root, paths, node_id) =
+            initialize_higher_term_worker_fixture("higher_term_join_failed_start");
+        let store = paths.kv_paths().raft_store();
+        let wal_root = store.wal_paths(&node_id).root;
+        let worker = cluster_raft_higher_term_persistence_worker(wal_root.clone());
+        let start_entered = Arc::new(std::sync::Barrier::new(2));
+        let release_start = Arc::new(std::sync::Barrier::new(2));
+        CLUSTER_RAFT_HIGHER_TERM_INJECTED_START_FAILURES
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                wal_root,
+                ClusterRaftHigherTermInjectedStartFailure {
+                    entered: Arc::clone(&start_entered),
+                    release: Arc::clone(&release_start),
+                },
+            );
+
+        let first_paths = paths.clone();
+        let first_node = node_id.clone();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let first = std::thread::spawn(move || {
+            first_tx
+                .send(publish_cluster_raft_higher_term_reactively(
+                    &first_paths,
+                    &first_node,
+                    7,
+                ))
+                .expect("report first publisher result");
+        });
+        start_entered.wait();
+
+        let second_paths = paths.clone();
+        let second_node = node_id.clone();
+        let (second_tx, second_rx) = std::sync::mpsc::sync_channel(1);
+        let second = std::thread::spawn(move || {
+            second_tx
+                .send(publish_cluster_raft_higher_term_reactively(
+                    &second_paths,
+                    &second_node,
+                    9,
+                ))
+                .expect("report second publisher result");
+        });
+
+        let wait_deadline = Instant::now() + Duration::from_secs(1);
+        let second_joined_start = loop {
+            let wake_state = worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let joined = wake_state.revision == 2
+                && wake_state.target_term == Some(9)
+                && wake_state.starting
+                && !wake_state.running
+                && wake_state.start_waiters == 1;
+            drop(wake_state);
+            if joined || Instant::now() >= wait_deadline {
+                break joined;
+            }
+            std::thread::yield_now();
+        };
+        let premature_second = second_rx.try_recv();
+        let second_waited_for_start =
+            matches!(&premature_second, Err(std::sync::mpsc::TryRecvError::Empty));
+
+        // Always release the injected starter before asserting, so a broken
+        // implementation cannot strand either publisher in this regression.
+        release_start.wait();
+        let first_result = first_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first publisher reports injected start failure");
+        let second_result = match premature_second {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => second_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("joined publisher starts successor"),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("second publisher disconnected before reporting")
+            }
+        };
+        first.join().expect("join first publisher");
+        second.join().expect("join second publisher");
+
+        assert!(
+            second_joined_start,
+            "second publisher did not join the reserved start with revision 2 and target 9"
+        );
+        assert!(
+            second_waited_for_start,
+            "second publisher returned before the first start outcome was published"
+        );
+        assert!(matches!(
+            first_result,
+            Err(NetworkError::Io {
+                ref operation,
+                ref detail,
+            }) if operation == "start mandatory higher Raft term persistence"
+                && detail.contains("injected higher-term worker start failure")
+        ));
+        second_result.expect("joined publisher must start the successor worker");
+
+        wait_for_higher_term_persistence(&paths, &node_id, 9);
+        wait_for_higher_term_worker_idle(&worker);
+        let wake_state = worker
+            .wake_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(wake_state.revision, 2);
+        assert_eq!(wake_state.target_term, None);
+        assert!(!wake_state.starting);
+        assert!(!wake_state.running);
+        assert_eq!(wake_state.start_waiters, 0);
     }
 
     #[test]
@@ -6535,6 +6884,90 @@ mod read_index_tests {
 
         drop(admitted);
         wait_for_higher_term_persistence(&paths, &node_id, 9);
+    }
+
+    #[test]
+    fn reactive_higher_term_worker_verifies_suppressed_term_after_lower_replacement() {
+        let (_root, paths, node_id) =
+            initialize_higher_term_worker_fixture("higher_term_suppressed_replacement");
+        let store = paths.kv_paths().raft_store();
+        let wal_paths = store.wal_paths(&node_id);
+
+        publish_cluster_raft_higher_term_reactively(&paths, &node_id, 7)
+            .expect("publish initial higher term");
+        wait_for_higher_term_persistence(&paths, &node_id, 7);
+        let worker = cluster_raft_higher_term_persistence_worker(wal_paths.root.clone());
+        wait_for_higher_term_worker_idle(&worker);
+
+        // Retain only operation admission so the second worker cannot open and
+        // acknowledge B3 until the suppressed publication and its verification
+        // target have both been observed. The A7 resident stays idle: replacing
+        // hard state therefore invalidates its recorded durable-view identity,
+        // exactly like the supported same-path replacement path.
+        let admitted = store
+            .lock_operation()
+            .expect("hold Raft operation admission");
+        let mut replacement = wal_paths
+            .read_persisted_hard_state()
+            .expect("read durable A7 hard state");
+        replacement.current_term = 3;
+        replacement.voted_for = None;
+        replacement.leader_id = None;
+        wal_paths
+            .write_persisted_hard_state(&replacement)
+            .expect("replace durable hard state with B3");
+
+        publish_cluster_raft_higher_term_reactively(&paths, &node_id, 7)
+            .expect("reactively publish cached term against B3");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("suppressed higher-term floor"),
+            None,
+            "the process-known A7 watermark must suppress the second term-7 gate floor"
+        );
+        assert_eq!(
+            wal_paths
+                .read_persisted_hard_state()
+                .expect("worker remains blocked behind admitted storage")
+                .current_term,
+            3
+        );
+        assert_eq!(
+            worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .target_term,
+            Some(7),
+            "suppressed publication must remain queued for durable-generation verification"
+        );
+
+        drop(admitted);
+        wait_for_higher_term_persistence(&paths, &node_id, 7);
+        wait_for_higher_term_worker_idle(&worker);
+        assert_eq!(
+            wal_paths
+                .read_persisted_hard_state()
+                .expect("worker-persisted B7 hard state")
+                .current_term,
+            7
+        );
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("worker-settled higher-term floor"),
+            None
+        );
+        assert_eq!(
+            worker
+                .wake_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .target_term,
+            None,
+            "the worker alone must settle its generation-verification target"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

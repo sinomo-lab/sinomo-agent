@@ -13197,6 +13197,154 @@ mod tests {
     }
 
     #[test]
+    fn cold_read_handoff_probe_fences_replaced_term_before_writer_ack() {
+        let root = temp_raft_root("sinomo-kv-cold-read-handoff-term-fence");
+        let node_id = NodeId::from_legacy_named("node_cold_read_handoff_term_fence").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let store = paths.raft_store();
+        store
+            .set_leader_compact(&node_id, 3)
+            .expect("seed local leadership");
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish initial higher term");
+        let mut initial_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        initial_closer
+            .observe_pending_higher_term(7)
+            .expect("make initial term durable");
+        drop(initial_closer);
+
+        let seeded = store
+            .open_node(&node_id)
+            .expect("inspect durable log anchor");
+        let anchor_index = seeded.hard_state().commit_index;
+        let anchor_term = seeded.term_at(anchor_index).unwrap_or_default();
+        drop(seeded);
+        assert!(
+            evict_resident_raft_node_for_test(&wal_paths),
+            "the replacement must be restored by the cold reader"
+        );
+        evict_cached_raft_view(&wal_paths);
+
+        let mut replacement = wal_paths
+            .read_persisted_hard_state()
+            .expect("read learned hard state");
+        replacement.current_term = 3;
+        replacement.voted_for = Some(node_id.clone());
+        replacement.leader_id = Some(node_id.clone());
+        wal_paths
+            .write_persisted_hard_state(&replacement)
+            .expect("install authorized lower-term hard state");
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish before replacement acknowledgement");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("suppressed replacement floor"),
+            None,
+            "the cached term-7 watermark suppresses publication before B3 is opened"
+        );
+
+        let opened = Arc::new(std::sync::Barrier::new(2));
+        let resume_open = Arc::new(std::sync::Barrier::new(2));
+        install_cluster_kv_cold_read_after_open_pause_for_test(
+            wal_paths.root.clone(),
+            Arc::clone(&opened),
+            Arc::clone(&resume_open),
+        );
+        let handoff_observed = Arc::new(std::sync::Barrier::new(2));
+        let resume_handoff = Arc::new(std::sync::Barrier::new(2));
+        install_resident_raft_after_handoff_pause_for_test(
+            wal_paths.root.clone(),
+            Arc::clone(&handoff_observed),
+            Arc::clone(&resume_handoff),
+        );
+
+        let reader_paths = paths.clone();
+        let reader_node = node_id.clone();
+        let reader = std::thread::spawn(move || {
+            read_cluster_kv_local_entry(&reader_paths, &reader_node, "/handoff/fence")
+        });
+        opened.wait();
+
+        let writer_store = store.clone();
+        let writer_node = node_id.clone();
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let mut storage =
+                ClusterKvRaftLocalCommandStorage::new(writer_store, writer_node, |_| false);
+            writer_tx
+                .send(storage.read_index_state())
+                .expect("send writer result");
+        });
+        let preempt_deadline = Instant::now() + Duration::from_secs(1);
+        while !resident_raft_cold_read_preempt_requested_for_test(&wal_paths) {
+            assert!(
+                Instant::now() < preempt_deadline,
+                "writer did not request the B3 cold-read handoff"
+            );
+            std::thread::yield_now();
+        }
+
+        resume_open.wait();
+        handoff_observed.wait();
+        let probe = RaftAppendEntriesRequest {
+            term: 3,
+            leader_id: node_id.clone(),
+            prev_log_index: anchor_index,
+            prev_log_term: anchor_term,
+            entries: Vec::new(),
+            leader_commit: anchor_index,
+        };
+        let probe_outcome = store.read_index_probe(&node_id, &probe);
+        let restored_floor = store
+            .pending_higher_term(&node_id)
+            .expect("probe-restored floor");
+
+        // Release all deterministic pauses before making assertions so a
+        // failure cannot strand the reader or its waiting writer.
+        resume_handoff.wait();
+        let writer_result = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer must finish after the handoff");
+        writer.join().expect("join handoff writer");
+        let _reader_result = reader.join().expect("join handoff reader");
+        clear_resident_raft_after_handoff_pause_for_test(&wal_paths.root);
+        clear_cluster_kv_cold_read_pause_for_test(&wal_paths.root);
+
+        assert_eq!(
+            probe_outcome.expect("resident ReadIndex probe"),
+            ClusterKvRaftReadIndexProbeOutcome::NeedsDurable,
+            "the B3 resident must not answer before durable-term acknowledgement"
+        );
+        assert_eq!(
+            restored_floor,
+            Some(7),
+            "the resident probe must resurrect the suppressed term-7 floor"
+        );
+        assert!(matches!(
+            writer_result,
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+
+        let mut final_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        final_closer
+            .observe_pending_higher_term(7)
+            .expect("make replacement term durable");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("replacement floor cleared"),
+            None
+        );
+    }
+
+    #[test]
     fn timed_out_cold_read_preemptor_cannot_leave_a_ghost_resident_flock() {
         let root = temp_raft_root("sinomo-kv-cold-read-preempt-timeout");
         let node_id = NodeId::from_legacy_named("node_cold_read_preempt_timeout").expect("node");
@@ -13454,13 +13602,10 @@ mod tests {
             store.pending_higher_term(&node_id).expect("pending floor"),
             Some(7)
         );
-        assert_eq!(
-            store
-                .read_index_probe(&node_id, &probe)
-                .expect("fenced resident probe"),
-            ClusterKvRaftReadIndexProbeOutcome::NeedsDurable,
-            "the receiver fast path must not ACK from an old-term resident view"
-        );
+        assert!(matches!(
+            store.read_index_probe(&node_id, &probe),
+            Ok(ClusterKvRaftReadIndexProbeOutcome::Busy { .. })
+        ));
         assert!(matches!(
             store.apply_append_entries_with_optional_snapshot_compact(
                 &node_id,
@@ -13554,6 +13699,355 @@ mod tests {
                 .expect("authority read after durable term")
                 .current_term,
             9
+        );
+    }
+
+    #[test]
+    fn durable_higher_term_is_not_refenced_by_same_or_older_republication() {
+        let root = temp_raft_root("sinomo-kv-durable-higher-term-republication");
+        let node_id =
+            NodeId::from_legacy_named("node_durable_higher_term_republication").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let store = paths.raft_store();
+        store
+            .set_leader_compact(&node_id, 3)
+            .expect("seed local leadership");
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish higher term");
+        let mut closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        closer
+            .observe_pending_higher_term(7)
+            .expect("make higher term durable");
+        assert_eq!(
+            store.pending_higher_term(&node_id).expect("cleared floor"),
+            None
+        );
+        drop(closer);
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("republish durable term");
+        store
+            .publish_pending_higher_term(&node_id, 6)
+            .expect("publish older durable term");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("same and older terms stay settled"),
+            None
+        );
+        let mut admitted =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert_eq!(
+            admitted
+                .read_index_state()
+                .expect("durable term remains authoritative")
+                .current_term,
+            7
+        );
+        drop(admitted);
+
+        store
+            .publish_pending_higher_term(&node_id, 8)
+            .expect("publish genuinely newer term");
+        assert_eq!(
+            store.pending_higher_term(&node_id).expect("new floor"),
+            Some(8)
+        );
+        let mut fenced =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert!(matches!(
+            fenced.read_index_state(),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        drop(fenced);
+
+        let mut final_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        final_closer
+            .observe_pending_higher_term(8)
+            .expect("close newer term floor");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("newer floor cleared"),
+            None
+        );
+    }
+
+    #[test]
+    fn durable_higher_term_watermark_resets_after_same_path_hard_state_replacement() {
+        let root = temp_raft_root("sinomo-kv-durable-term-generation-replacement");
+        let node_id =
+            NodeId::from_legacy_named("node_durable_term_generation_replacement").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let store = paths.raft_store();
+        store
+            .set_leader_compact(&node_id, 3)
+            .expect("seed local leadership");
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish initial higher term");
+        let mut initial_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        initial_closer
+            .observe_pending_higher_term(7)
+            .expect("make initial higher term durable");
+        drop(initial_closer);
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("initial floor cleared"),
+            None
+        );
+
+        let root_ino = file_identity(&wal_paths.root)
+            .expect("root identity before replacement")
+            .ino;
+        let lock_identity =
+            file_identity(&wal_paths.lock).expect("lock identity before replacement");
+        let hard_state_identity =
+            file_identity(&wal_paths.hard_state).expect("hard-state identity before replacement");
+        let mut replacement = wal_paths
+            .read_persisted_hard_state()
+            .expect("read learned hard state");
+        replacement.current_term = 3;
+        replacement.voted_for = None;
+        replacement.leader_id = None;
+        wal_paths
+            .write_persisted_hard_state(&replacement)
+            .expect("replace only hard state under the same WAL root");
+        assert_eq!(
+            file_identity(&wal_paths.root)
+                .expect("root identity after replacement")
+                .ino,
+            root_ino,
+            "hard-state replacement must retain the root generation"
+        );
+        assert_eq!(
+            file_identity(&wal_paths.lock).expect("lock identity after replacement"),
+            lock_identity,
+            "hard-state replacement must retain the lock generation"
+        );
+        assert_ne!(
+            file_identity(&wal_paths.hard_state).expect("hard-state identity after replacement"),
+            hard_state_identity,
+            "the hard-state-only replacement must install a distinct durable file"
+        );
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish before acknowledging the replaced generation");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("old watermark suppresses publication"),
+            None,
+            "the old generation is still cached before the replacement is reopened"
+        );
+        let reopened = store
+            .open_node(&node_id)
+            .expect("reopen replaced durable generation");
+        assert_eq!(reopened.hard_state().current_term, 3);
+        drop(reopened);
+
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("resurrected replacement floor"),
+            Some(7),
+            "acknowledging the lower replacement must resurrect the suppressed term"
+        );
+        let mut fenced =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert!(matches!(
+            fenced.read_index_state(),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        drop(fenced);
+
+        let mut replacement_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        replacement_closer
+            .observe_pending_higher_term(7)
+            .expect("make replacement generation term durable");
+        drop(replacement_closer);
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("replacement floor cleared"),
+            None
+        );
+
+        store
+            .publish_pending_higher_term(&node_id, 8)
+            .expect("publish newer term");
+        assert_eq!(
+            store.pending_higher_term(&node_id).expect("newer floor"),
+            Some(8),
+            "a genuinely newer term must still fence the replacement generation"
+        );
+        let mut final_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        final_closer
+            .observe_pending_higher_term(8)
+            .expect("close newer term floor");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("newer floor cleared"),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_authority_read_resurrects_suppressed_replacement_floor() {
+        let root = temp_raft_root("sinomo-kv-direct-authority-term-replacement");
+        let node_id =
+            NodeId::from_legacy_named("node_direct_authority_term_replacement").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let store = paths.raft_store();
+        store
+            .set_leader_compact(&node_id, 3)
+            .expect("seed local leadership");
+
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish initial higher term");
+        let mut initial_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        initial_closer
+            .observe_pending_higher_term(7)
+            .expect("make initial higher term durable");
+        drop(initial_closer);
+
+        let mut replacement = wal_paths
+            .read_persisted_hard_state()
+            .expect("read learned hard state");
+        replacement.current_term = 3;
+        replacement.voted_for = Some(node_id.clone());
+        replacement.leader_id = Some(node_id.clone());
+        wal_paths
+            .write_persisted_hard_state(&replacement)
+            .expect("install authorized lower-term hard state");
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish before opening the replacement node");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("old watermark suppresses publication"),
+            None
+        );
+
+        assert!(matches!(
+            store.known_leader_id(&node_id),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("direct read restored floor"),
+            Some(7),
+            "the direct hard-state authority path must restore the suppressed term before admission"
+        );
+        let mut ordinary =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert!(matches!(
+            ordinary.read_index_state(),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        drop(ordinary);
+
+        let mut closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        closer
+            .observe_pending_higher_term(7)
+            .expect("make replacement term durable");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("replacement floor cleared"),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_higher_term_hard_state_persistence_keeps_floor_closed() {
+        let root = temp_raft_root("sinomo-kv-higher-term-hard-state-failure");
+        let node_id =
+            NodeId::from_legacy_named("node_higher_term_hard_state_failure").expect("node");
+        let paths = ClusterKvPaths::new(root.to_path_buf());
+        let wal_paths = paths.raft_wal_paths(&node_id);
+        let store = paths.raft_store();
+        store
+            .set_leader_compact(&node_id, 3)
+            .expect("seed local leadership");
+        store
+            .publish_pending_higher_term(&node_id, 7)
+            .expect("publish higher term");
+
+        let mut failing_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert!(matches!(
+            failing_closer.observe_pending_higher_term(3),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        let hard_state_backup = wal_paths
+            .root
+            .join("hard-state.sobj.higher-term-test-backup");
+        std::fs::rename(&wal_paths.hard_state, &hard_state_backup).expect("move hard state aside");
+        std::fs::create_dir(&wal_paths.hard_state).expect("block hard-state replacement");
+        let error = failing_closer
+            .observe_pending_higher_term(7)
+            .expect_err("higher-term hard-state failure must surface");
+        assert!(
+            error.to_string().contains("hard-state.sobj"),
+            "unexpected error: {error}"
+        );
+        std::fs::remove_dir(&wal_paths.hard_state).expect("remove hard-state blocker");
+        std::fs::rename(&hard_state_backup, &wal_paths.hard_state).expect("restore hard state");
+        drop(failing_closer);
+
+        assert_eq!(
+            wal_paths
+                .read_persisted_hard_state()
+                .expect("read unchanged hard state")
+                .current_term,
+            3,
+            "failed persistence must not advance durable hard state"
+        );
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("failed floor remains visible"),
+            Some(7),
+            "failed persistence must not advance the durable watermark or clear the floor"
+        );
+        let mut ordinary =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        assert!(matches!(
+            ordinary.read_index_state(),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        drop(ordinary);
+
+        let mut final_closer =
+            ClusterKvRaftLocalCommandStorage::new(store.clone(), node_id.clone(), |_| false);
+        final_closer
+            .observe_pending_higher_term(7)
+            .expect("retry higher-term durability");
+        assert_eq!(
+            store
+                .pending_higher_term(&node_id)
+                .expect("retried floor cleared"),
+            None
         );
     }
 

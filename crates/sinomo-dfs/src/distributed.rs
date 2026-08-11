@@ -493,6 +493,14 @@ pub struct DistributedEventualCoordinator {
     receipt_count: usize,
     committed_versions: BTreeMap<ObjectKey, DfsVersion>,
     repair_jobs: Vec<DistributedRepairJob>,
+    /// Committed historical intents which full authoritative hydration proved
+    /// cannot own repair work in this service generation.
+    ///
+    /// The durable intent and receipt rows remain available for replay and
+    /// provenance. Keeping the exact identities here prevents a later generic
+    /// intent/receipt restore from rebuilding their missing-receipt history as
+    /// live work. New live intent IDs are absent and remain actionable.
+    bulk_hydration_suppressed_repair_intent_ids: BTreeSet<String>,
     /// Repair jobs created while serving the current inbound message.
     ///
     /// The durable daemon queue consumes this delta at the committed edge.
@@ -898,8 +906,25 @@ impl DistributedEventualCoordinator {
     }
 
     /// Rebuild repair jobs once after a bulk restore that used the deferring
-    /// restore variants.
-    pub(crate) fn rebuild_repair_jobs_after_bulk_restore(&mut self) {
+    /// restore variants, retaining only work which the caller proved remains
+    /// actionable against its authoritative visible-object projection.
+    ///
+    /// Durable committed intents and receipts are history and remain in the
+    /// coordinator. This filter only keeps terminal historical versions from
+    /// being promoted back into executable repair work after hydration.
+    pub(crate) fn rebuild_repair_jobs_after_bulk_restore(
+        &mut self,
+        repair_actionable_intent_ids: &BTreeSet<String>,
+    ) {
+        self.bulk_hydration_suppressed_repair_intent_ids = self
+            .intents
+            .values()
+            .filter(|intent| {
+                matches!(intent.state, DfsWriteIntentState::Committed)
+                    && !repair_actionable_intent_ids.contains(&intent.intent_id)
+            })
+            .map(|intent| intent.intent_id.clone())
+            .collect();
         self.rebuild_repair_jobs();
     }
 
@@ -1261,11 +1286,12 @@ impl DistributedEventualCoordinator {
     fn rebuild_repair_jobs(&mut self) {
         self.repair_jobs.clear();
         let mut jobs = Vec::new();
-        for intent in self
-            .intents
-            .values()
-            .filter(|intent| matches!(intent.state, DfsWriteIntentState::Committed))
-        {
+        for intent in self.intents.values().filter(|intent| {
+            matches!(intent.state, DfsWriteIntentState::Committed)
+                && !self
+                    .bulk_hydration_suppressed_repair_intent_ids
+                    .contains(&intent.intent_id)
+        }) {
             let durable_receipts = self.receipts.get(intent.intent_id.as_str());
             for missing_replica_node_id in intent.desired_replica_nodes.iter().filter(|node_id| {
                 !durable_receipts.is_some_and(|receipts| {

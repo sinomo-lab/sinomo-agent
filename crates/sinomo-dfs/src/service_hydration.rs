@@ -35,6 +35,52 @@ fn hydration_never_cancelled() -> bool {
     false
 }
 
+/// Whether one hydrated committed intent can still own repair work for the
+/// authoritative visible object.
+///
+/// A later metadata-only version may retain the same immutable content, and a
+/// committed target may still need publication while the visible object is at
+/// its base. A later authoritative tombstone is also positive proof that the
+/// old content target is terminal. Missing hashes on a live object or a
+/// mismatched durable identity are ambiguous and remain fail-closed. Only this
+/// positive supersession evidence may discard reconstructed repair work.
+fn hydrated_committed_intent_repair_may_be_actionable(
+    intent: &DfsWriteIntentRecord,
+    visible_object: Option<&DfsObjectMetadata>,
+) -> bool {
+    let Some(visible_object) = visible_object else {
+        return true;
+    };
+    if visible_object.file_system_id != intent.file_system_id
+        || visible_object.object_id != intent.object_id
+    {
+        return true;
+    }
+    if visible_object.version == intent.target_version {
+        return true;
+    }
+    if intent
+        .base_version
+        .as_ref()
+        .is_some_and(|base_version| visible_object.version == *base_version)
+    {
+        return true;
+    }
+    if visible_object.kind == DfsObjectKind::Tombstone {
+        return false;
+    }
+    let (Some(visible_content_hash), Some(intent_content_hash)) = (
+        visible_object.content_hash.as_deref(),
+        intent.content_hash.as_deref(),
+    ) else {
+        return true;
+    };
+    if visible_content_hash == intent_content_hash {
+        return true;
+    }
+    false
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Drop the reconstructable metadata mirror while retaining the service's
     /// transport, durable backend capability, and operation-independent state.
@@ -490,6 +536,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let mut pending_write_records = Vec::new();
         let mut recovered_commit_promotion_records = Vec::new();
+        let mut repair_actionable_intent_ids = BTreeSet::new();
         if !try_walk_metadata_pages_until_cancelled(should_cancel, |intent_scan_cursor| {
             let intent_page = self
                 .metadata_backend
@@ -615,6 +662,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 )?;
                 if matches!(intent_record.status, DfsWriteIntentStatus::Committed) {
                     recovered_commit_promotion_records.push(intent_record.clone());
+                    if hydrated_committed_intent_repair_may_be_actionable(
+                        &intent_record,
+                        self.metadata.object(&intent_record.object_id),
+                    ) {
+                        repair_actionable_intent_ids.insert(intent_record.intent_id.clone());
+                    }
                 }
                 if matches!(
                     intent_record.status,
@@ -629,7 +682,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })? {
             return Ok(false);
         }
-        self.coordinator.rebuild_repair_jobs_after_bulk_restore();
+        self.coordinator
+            .rebuild_repair_jobs_after_bulk_restore(&repair_actionable_intent_ids);
         if reconstruct_commit_promotions {
             for intent_record in &recovered_commit_promotion_records {
                 if should_cancel() {

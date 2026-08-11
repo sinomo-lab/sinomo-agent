@@ -22,10 +22,51 @@ static PENDING_HIGHER_RAFT_TERM_GATES: LazyLock<
 #[derive(Debug, Default)]
 struct PendingHigherRaftTermGateState {
     floor: Option<u64>,
+    known_durable: Option<PendingHigherRaftTermDurableState>,
     active_authority_leases: usize,
     exclusive: bool,
     #[cfg(test)]
     settled_read_waiters: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingHigherRaftTermGeneration {
+    lock_identity: FileIdentity,
+    root_ino: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingHigherRaftTermDurableState {
+    generation: PendingHigherRaftTermGeneration,
+    term: u64,
+}
+
+impl PendingHigherRaftTermGateState {
+    fn acknowledge_durable_term(
+        &mut self,
+        generation: PendingHigherRaftTermGeneration,
+        term: u64,
+    ) {
+        if let Some(previous) = self.known_durable {
+            if previous.generation == generation && term >= previous.term {
+                self.known_durable = Some(PendingHigherRaftTermDurableState { generation, term });
+                return;
+            }
+            // Publication may have suppressed `previous.term` immediately
+            // before this acknowledgement proved that durable storage changed
+            // generations or regressed. Resurrect that observation as a floor
+            // before replacing the watermark. Both updates share the gate
+            // mutex, so publication cannot slip between the carry and reset;
+            // a stale lower acknowledgement retains at least the prior floor.
+            self.floor = Some(self.floor.unwrap_or_default().max(previous.term));
+        }
+        // A valid durable Raft hard-state term never decreases. Observing a
+        // lower term is therefore proof that storage was replaced/recovered,
+        // even when the supported same-path handoff preserves its root and
+        // lock identities. Resetting downward after restoring the prior floor
+        // is deliberately fail-closed.
+        self.known_durable = Some(PendingHigherRaftTermDurableState { generation, term });
+    }
 }
 
 #[derive(Debug, Default)]
@@ -45,7 +86,9 @@ fn pending_higher_term_gate_for_root(
         })?;
     // A strong registry entry is required while a floor is pending: a
     // Weak-only table could forget the fence after publication returns but
-    // before its persistence worker starts. Prune only quiescent gates.
+    // before its persistence worker starts. Retain the process-known durable
+    // term too, so replayed same/older observations cannot re-fence authority.
+    // Prune only gates that have never learned durable state and are quiescent.
     gates.retain(|_, gate| {
         if Arc::strong_count(gate) > 1 {
             return true;
@@ -54,7 +97,10 @@ fn pending_higher_term_gate_for_root(
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.floor.is_some() || state.active_authority_leases > 0 || state.exclusive
+        state.floor.is_some()
+            || state.known_durable.is_some()
+            || state.active_authority_leases > 0
+            || state.exclusive
     });
     Ok(Arc::clone(gates.entry(root.to_path_buf()).or_default()))
 }
@@ -69,6 +115,18 @@ fn acquire_pending_higher_term_authority_lease_for_root(
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(durable_term) = durable_term
+        && let Some(known) = state.known_durable
+        && known.term > durable_term
+    {
+        // A direct hard-state authority read may be the first operation to see
+        // a supported same-path replacement. Publication could already have
+        // suppressed `known.term`, so restore it as a floor before normal
+        // admission. This shares the gate mutex with publication and durable
+        // acknowledgement; no authority lease can pass between the carry and
+        // the comparison below.
+        state.floor = Some(state.floor.unwrap_or_default().max(known.term));
+    }
     if state.exclusive {
         return Err(KvError::AuthorityUnavailable {
             detail: format!("cannot {operation} while a higher Raft term is being made durable"),
@@ -132,12 +190,17 @@ impl PendingHigherRaftTermExclusiveLease {
             .floor
     }
 
-    fn clear_if_durable(&self, durable_term: u64) -> bool {
+    fn clear_if_durable(
+        &self,
+        generation: PendingHigherRaftTermGeneration,
+        durable_term: u64,
+    ) -> bool {
         let mut state = self
             .gate
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.acknowledge_durable_term(generation, durable_term);
         if state
             .floor
             .is_some_and(|pending_term| durable_term >= pending_term)
@@ -172,6 +235,16 @@ impl Drop for PendingHigherRaftTermExclusiveLease {
 /// materialized snapshot fallback when that lock is busy.
 static RESIDENT_RAFT_NODES: LazyLock<Mutex<HashMap<PathBuf, Arc<ResidentRaftNodeSlot>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+#[derive(Clone)]
+struct ResidentRaftAfterHandoffPause {
+    observed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+}
+#[cfg(test)]
+static RESIDENT_RAFT_AFTER_HANDOFF_PAUSES: LazyLock<
+    Mutex<HashMap<PathBuf, ResidentRaftAfterHandoffPause>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Raft roots that this process is permanently forbidden to own.
 ///
 /// A shadow daemon shares the main daemon's data directory and node identity,
@@ -182,6 +255,41 @@ static PROCESS_LOCAL_RAFT_DENIED_ROOTS: LazyLock<Mutex<BTreeSet<PathBuf>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 const RESIDENT_RAFT_NODE_CAPACITY: usize = 64;
 static RESIDENT_RAFT_NODE_ACCESS_CLOCK: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+pub(crate) fn install_resident_raft_after_handoff_pause_for_test(
+    root: PathBuf,
+    observed: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
+) {
+    RESIDENT_RAFT_AFTER_HANDOFF_PAUSES
+        .lock()
+        .expect("resident Raft after-handoff pause")
+        .insert(root, ResidentRaftAfterHandoffPause { observed, resume });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_resident_raft_after_handoff_pause_for_test(root: &Path) {
+    RESIDENT_RAFT_AFTER_HANDOFF_PAUSES
+        .lock()
+        .expect("resident Raft after-handoff pause")
+        .remove(root);
+}
+
+#[cfg(test)]
+fn pause_resident_raft_after_handoff_for_test(root: &Path) {
+    let pause = RESIDENT_RAFT_AFTER_HANDOFF_PAUSES
+        .lock()
+        .ok()
+        .and_then(|pauses| pauses.get(root).cloned());
+    if let Some(pause) = pause {
+        pause.observed.wait();
+        pause.resume.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_resident_raft_after_handoff_for_test(_root: &Path) {}
 
 /// Permanently denies local Raft ownership below `raft_root` for this process.
 ///
@@ -741,6 +849,10 @@ impl ResidentRaftColdReadGuard {
         self.complete = true;
         drop(state);
         self.slot.touch();
+        // Test-only synchronization for the exact cold-read handoff window:
+        // the replacement node is now idle and visible to a ReadIndex probe,
+        // while the waiting writer has not yet been notified to open/ACK it.
+        pause_resident_raft_after_handoff_for_test(&node.paths.root);
         drop(node);
         metrics::counter!(
             "sinomo.kv.raft.local_read_load_preemptions",
@@ -1482,6 +1594,21 @@ fn read_resident_raft_read_index_probe(
         .cached
         .as_ref()
         .expect("validated resident ReadIndex probe node");
+    // Preserve the resident-slot -> higher-term-gate lock order used by every
+    // resident projection. This is the linearizing authority check: a cold
+    // reader may have handed off a replacement node before its waiting writer
+    // opens and acknowledges that lower durable term.
+    let _authority_lease = match acquire_pending_higher_term_authority_lease_for_root(
+        &paths.root,
+        Some(resident.node.hard_state.current_term),
+        "acknowledge a Raft ReadIndex probe",
+    ) {
+        Ok(lease) => lease,
+        Err(KvError::AuthorityUnavailable { .. }) => {
+            return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
+        }
+        Err(error) => return Err(error),
+    };
     let Some(response) = resident.node.read_only_append_entries_response(request) else {
         return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
     };
@@ -7292,7 +7419,12 @@ impl ClusterKvRaftStore {
         // authority leases linearized before this observation and may drain;
         // the raised floor immediately rejects every later authority action.
         // The supervised durable closer owns any blocking wait.
-        state.floor = Some(state.floor.unwrap_or_default().max(term));
+        if !state
+            .known_durable
+            .is_some_and(|durable| durable.term >= term)
+        {
+            state.floor = Some(state.floor.unwrap_or_default().max(term));
+        }
         gate.changed.notify_all();
         Ok(())
     }
@@ -7333,12 +7465,16 @@ impl ClusterKvRaftStore {
         Ok(state.floor)
     }
 
-    /// Clear the fence only when durable hard state reaches the newest floor.
-    /// Returns whether a floor was removed. A concurrent higher observation is
-    /// retained because the comparison is made while holding the map lock.
-    pub fn clear_pending_higher_term_if_durable(
+    /// Record the acknowledged durable term and clear the fence only when that
+    /// hard state reaches the newest floor. A different ownership generation,
+    /// or a lower term proving same-path durable-state replacement, resets the
+    /// cached watermark. Returns whether a floor was removed. A concurrent
+    /// higher observation is retained because the comparison is made while
+    /// holding the gate lock.
+    fn clear_pending_higher_term_if_durable(
         &self,
         node_id: &NodeId,
+        generation: PendingHigherRaftTermGeneration,
         durable_term: u64,
     ) -> Result<bool, KvError> {
         let root = self.wal_paths(node_id).root;
@@ -7353,6 +7489,7 @@ impl ClusterKvRaftStore {
                 detail: format!("pending higher Raft term gate poisoned while clearing: {error}"),
             })?;
         }
+        state.acknowledge_durable_term(generation, durable_term);
         if state
             .floor
             .is_some_and(|pending_term| durable_term >= pending_term)
@@ -7385,7 +7522,11 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         node: DurableRaftKvNode,
     ) -> Result<DurableRaftKvNode, KvError> {
-        self.clear_pending_higher_term_if_durable(node_id, node.hard_state().current_term)?;
+        self.clear_pending_higher_term_if_durable(
+            node_id,
+            node.pending_higher_term_generation(),
+            node.hard_state().current_term,
+        )?;
         Ok(node)
     }
 
@@ -7429,20 +7570,6 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         request: &RaftAppendEntriesRequest,
     ) -> Result<ClusterKvRaftReadIndexProbeOutcome, KvError> {
-        let _authority_lease = match self.acquire_pending_higher_term_authority_lease(
-            node_id,
-            None,
-            "acknowledge a Raft ReadIndex probe",
-        ) {
-            Ok(lease) => lease,
-            Err(KvError::AuthorityUnavailable { .. }) => {
-                // A retained resident view may still describe the old term
-                // while mandatory hard-state persistence waits for local
-                // admission. Route to the durable append path instead.
-                return Ok(ClusterKvRaftReadIndexProbeOutcome::NeedsDurable);
-            }
-            Err(error) => return Err(error),
-        };
         read_resident_raft_read_index_probe(&self.wal_paths(node_id), node_id, request)
     }
 
@@ -7718,7 +7845,10 @@ impl ClusterKvRaftStore {
         let term_lease = self.acquire_pending_higher_term_exclusive_lease(node_id)?;
         Self::ensure_pending_higher_term_observation_is_current(&term_lease, vote.term)?;
         let response = node.request_vote(vote)?;
-        term_lease.clear_if_durable(node.hard_state().current_term);
+        term_lease.clear_if_durable(
+            node.pending_higher_term_generation(),
+            node.hard_state().current_term,
+        );
         Ok(response)
     }
 
@@ -7768,7 +7898,10 @@ impl ClusterKvRaftStore {
                 // so close the check/apply window again before durable voting.
                 Self::ensure_pending_higher_term_observation_is_current(&term_lease, vote.term)?;
                 let response = node.request_vote(vote)?;
-                term_lease.clear_if_durable(node.hard_state().current_term);
+                term_lease.clear_if_durable(
+                    node.pending_higher_term_generation(),
+                    node.hard_state().current_term,
+                );
                 (response, value)
             }
             ClusterKvRaftVoteDisposition::Reject(value) => (
@@ -7825,7 +7958,10 @@ impl ClusterKvRaftStore {
         let term_lease = self.acquire_pending_higher_term_exclusive_lease(node_id)?;
         Self::ensure_pending_higher_term_observation_is_current(&term_lease, vote.term)?;
         let response = node.request_vote(vote)?;
-        term_lease.clear_if_durable(node.hard_state().current_term);
+        term_lease.clear_if_durable(
+            node.pending_higher_term_generation(),
+            node.hard_state().current_term,
+        );
         Ok(response)
     }
 
@@ -7898,7 +8034,10 @@ impl ClusterKvRaftStore {
         let before_applied_index = node.applied_index();
         let (response, snapshot_restored, before_revision) =
             node.apply_append_entries_with_optional_snapshot_state(snapshot, append)?;
-        term_lease.clear_if_durable(node.hard_state().current_term);
+        term_lease.clear_if_durable(
+            node.pending_higher_term_generation(),
+            node.hard_state().current_term,
+        );
         let commit_advanced = node.applied_index() > before_applied_index;
         let selected_lease_mutation = commit_advanced
             && (before_applied_index.saturating_add(1)..=node.applied_index()).any(|index| {
@@ -8191,7 +8330,10 @@ impl ClusterKvRaftStore {
         if changed {
             node.refresh_resident_read_view();
         }
-        term_lease.clear_if_durable(node.hard_state().current_term);
+        term_lease.clear_if_durable(
+            node.pending_higher_term_generation(),
+            node.hard_state().current_term,
+        );
         Ok(changed)
     }
 
@@ -10108,13 +10250,14 @@ where
             if node.observe_term(target_term)? {
                 node.refresh_resident_read_view();
             }
+            let generation = node.pending_higher_term_generation();
             let durable_term = node.hard_state().current_term;
-            term_lease.clear_if_durable(durable_term);
+            term_lease.clear_if_durable(generation, durable_term);
             let Some(pending_term) = term_lease.pending_floor() else {
                 break;
             };
             if durable_term >= pending_term {
-                term_lease.clear_if_durable(durable_term);
+                term_lease.clear_if_durable(generation, durable_term);
                 if term_lease.pending_floor().is_none() {
                     break;
                 }
@@ -10414,6 +10557,13 @@ impl Drop for RaftOpenModeMetricGuard {
 }
 
 impl DurableRaftKvNode {
+    fn pending_higher_term_generation(&self) -> PendingHigherRaftTermGeneration {
+        PendingHigherRaftTermGeneration {
+            lock_identity: self.lock_identity,
+            root_ino: self.root_ino,
+        }
+    }
+
     pub fn open(node_id: NodeId, paths: KvWalPaths) -> Result<Self, KvError> {
         Self::open_nonresident_inner(node_id, paths, false, RAFT_NODE_LOCK_WAIT)
     }
@@ -11527,6 +11677,43 @@ mod pending_higher_term_gate_tests {
     use super::*;
     use std::sync::mpsc;
 
+    fn test_generation(ino: u64) -> PendingHigherRaftTermGeneration {
+        PendingHigherRaftTermGeneration {
+            lock_identity: FileIdentity {
+                mtime: None,
+                len: 0,
+                ino,
+            },
+            root_ino: ino,
+        }
+    }
+
+    #[test]
+    fn durable_watermark_reset_carries_the_suppressed_floor_atomically() {
+        let first_generation = test_generation(1);
+        let replacement_generation = test_generation(2);
+        let mut state = PendingHigherRaftTermGateState::default();
+        state.acknowledge_durable_term(first_generation, 7);
+
+        // This models a term-7 publication suppressed by the cached watermark,
+        // followed by acknowledgement of a lower replacement generation.
+        state.acknowledge_durable_term(replacement_generation, 3);
+        assert_eq!(state.floor, Some(7));
+        assert_eq!(
+            state.known_durable,
+            Some(PendingHigherRaftTermDurableState {
+                generation: replacement_generation,
+                term: 3,
+            })
+        );
+
+        // A stale lower acknowledgement cannot lower a concurrently newer
+        // floor because both the carry and watermark reset hold one mutex.
+        state.floor = Some(9);
+        state.acknowledge_durable_term(replacement_generation, 2);
+        assert_eq!(state.floor, Some(9));
+    }
+
     #[test]
     fn settled_floor_read_joins_an_exclusive_durable_close() {
         let paths = ClusterKvPaths::new("/pending-higher-term-settled-read");
@@ -11564,7 +11751,7 @@ mod pending_higher_term_gate_tests {
         );
 
         assert!(
-            exclusive.clear_if_durable(2),
+            exclusive.clear_if_durable(test_generation(1), 2),
             "the durable close must clear its matching floor"
         );
         drop(exclusive);
