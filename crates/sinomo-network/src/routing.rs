@@ -175,12 +175,26 @@ fn compare_candidate_paths(left: &CandidatePath, right: &CandidatePath) -> std::
                 .cmp(&right.total_latency_micros())
         })
         .then_with(|| left.nodes.cmp(&right.nodes))
+        .then_with(|| {
+            left.hops
+                .iter()
+                .map(|hop| &hop.endpoint.endpoint_id)
+                .cmp(right.hops.iter().map(|hop| &hop.endpoint.endpoint_id))
+        })
 }
 
 fn retain_ranked_candidate(candidates: &mut Vec<CandidatePath>, candidate: CandidatePath) {
     candidates.push(candidate);
     candidates.sort_by(compare_candidate_paths);
     candidates.truncate(MAX_ROUTE_CANDIDATES);
+}
+
+fn append_candidate_bucket(
+    candidates: &mut Vec<CandidatePath>,
+    bucket: impl IntoIterator<Item = CandidatePath>,
+) {
+    let remaining = MAX_ROUTE_CANDIDATES.saturating_sub(candidates.len());
+    candidates.extend(bucket.into_iter().take(remaining));
 }
 
 fn directory_contains_endpoint(
@@ -318,18 +332,30 @@ fn plan_routes_with_destination_process_affinity(
             }
         }
     }
-    if candidates.is_empty() {
-        append_unobserved_direct_module_recovery_candidates(
-            &mut candidates,
-            directory,
-            connectivity,
-            source_node_id,
-            destination_node_id,
-            constraints,
-            destination_process_affinity,
-        );
+    let allow_unreachable_recovery = candidates.is_empty();
+    let first_degraded = candidates.partition_point(|path| path.degraded_hop_count() == 0);
+    let degraded_observed = candidates.split_off(first_degraded);
+    let healthy_observed = candidates;
+
+    let mut unobserved_module_recovery = Vec::new();
+    append_unobserved_direct_module_recovery_candidates(
+        &mut unobserved_module_recovery,
+        directory,
+        connectivity,
+        source_node_id,
+        destination_node_id,
+        constraints,
+        destination_process_affinity,
+    );
+
+    let mut selected = Vec::new();
+    append_candidate_bucket(&mut selected, healthy_observed);
+    append_candidate_bucket(&mut selected, unobserved_module_recovery);
+    append_candidate_bucket(&mut selected, degraded_observed);
+    if allow_unreachable_recovery && selected.len() < MAX_ROUTE_CANDIDATES {
+        let mut unreachable_recovery = Vec::new();
         append_unreachable_direct_recovery_candidates(
-            &mut candidates,
+            &mut unreachable_recovery,
             directory,
             connectivity,
             source_node_id,
@@ -337,8 +363,9 @@ fn plan_routes_with_destination_process_affinity(
             constraints,
             destination_process_affinity,
         );
+        append_candidate_bucket(&mut selected, unreachable_recovery);
     }
-    candidates
+    selected
 }
 
 /// Adds current directory endpoints owned by an enabled local transport module
@@ -408,8 +435,9 @@ fn append_unobserved_direct_module_recovery_candidates(
                 endpoint: endpoint.clone(),
                 capabilities: conservative_capabilities,
                 // There is no durable reachability observation. Degraded is
-                // used only as the planner rank between observed live paths
-                // and stale-unreachable direct recovery; it is not published.
+                // the conservative availability exposed on this synthetic
+                // path; the planner's explicit recovery bucket places it
+                // ahead of observed degraded paths. It is not published.
                 connectivity_state: DirectConnectivityState::Degraded,
                 latency_micros: None,
             }),
@@ -3879,6 +3907,176 @@ mod tests {
         assert_eq!(paths[0].nodes, vec![a.clone(), b, c.clone()]);
         assert_eq!(paths[1].nodes, vec![a, c]);
         assert_eq!(paths[1].degraded_hop_count(), 1);
+    }
+
+    #[test]
+    fn planner_places_unobserved_module_recovery_between_healthy_and_degraded_paths() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_recovery_order_source");
+        let destination = node("node_route_recovery_order_destination");
+        let mut healthy = edge(
+            &source,
+            &destination,
+            "endpoint_route_recovery_order_healthy",
+            93,
+            30,
+        );
+        healthy.endpoint.transport = ClusterTransportKind::LanTcp;
+        healthy.endpoint.address = "10.93.0.1:21353".to_string();
+        healthy.endpoint.endpoint_id =
+            sinomo_node::daemon_lan_endpoint_id(&destination, &healthy.endpoint.address);
+        let healthy_endpoint_id = healthy.endpoint.endpoint_id.clone();
+
+        let mut degraded = edge(
+            &source,
+            &destination,
+            "endpoint_route_recovery_order_degraded",
+            93,
+            1,
+        );
+        degraded.endpoint.transport = ClusterTransportKind::LanTcp;
+        degraded.endpoint.address = "10.93.0.2:21353".to_string();
+        degraded.endpoint.endpoint_id =
+            sinomo_node::daemon_lan_endpoint_id(&destination, &degraded.endpoint.address);
+        degraded.state = DirectConnectivityState::Degraded;
+        let degraded_endpoint_id = degraded.endpoint.endpoint_id.clone();
+
+        let iroh =
+            directory_iroh_endpoint(&destination, "directory_module_recovery_order_key", false);
+        let iroh_endpoint_id = iroh.endpoint_id.clone();
+        let mut local_only_iroh = directory_iroh_endpoint(
+            &destination,
+            "directory_module_recovery_order_local_only",
+            false,
+        );
+        local_only_iroh.privacy = ClusterEndpointPrivacy::LocalOnly;
+        let directory = directory_fixture_with_endpoints(
+            93,
+            [
+                (source.clone(), Vec::new()),
+                (
+                    destination.clone(),
+                    vec![
+                        degraded.endpoint.clone(),
+                        local_only_iroh,
+                        iroh,
+                        healthy.endpoint.clone(),
+                    ],
+                ),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(93),
+            93,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            [degraded, healthy],
+        )
+        .expect("connectivity");
+
+        let paths = plan_routes_with_destination_process_affinity(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+            DestinationProcessAffinity::MainDaemon,
+        );
+        let endpoint_ids = paths
+            .iter()
+            .map(|path| path.hops[0].endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            endpoint_ids,
+            vec![healthy_endpoint_id, iroh_endpoint_id, degraded_endpoint_id],
+            "healthy observed built-in paths must stay first, while current unobserved module recovery must precede degraded evidence"
+        );
+        assert!(paths.iter().all(|path| path.hops.len() == 1));
+        assert!(!paths[1].hops[0].capabilities.relay_forwarding);
+    }
+
+    #[test]
+    fn planner_bounds_and_deterministically_orders_module_then_unreachable_recovery() {
+        install_test_directory_iroh_network_module();
+        let source = node("node_route_recovery_bound_source");
+        let destination = node("node_route_recovery_bound_destination");
+        let module_endpoints = vec![
+            directory_iroh_endpoint(&destination, "directory_module_recovery_bound_z", false),
+            directory_iroh_endpoint(&destination, "directory_module_recovery_bound_a", false),
+        ];
+        let mut expected_module_endpoint_ids = module_endpoints
+            .iter()
+            .map(|endpoint| endpoint.endpoint_id.clone())
+            .collect::<Vec<_>>();
+        expected_module_endpoint_ids.sort();
+
+        let unreachable = (0..MAX_ROUTE_CANDIDATES + 4)
+            .map(|index| {
+                let mut observation = edge(
+                    &source,
+                    &destination,
+                    &format!("endpoint_route_recovery_bound_{index:02}"),
+                    94,
+                    u64::try_from(index + 1).expect("latency"),
+                );
+                observation.endpoint.transport = ClusterTransportKind::LanTcp;
+                observation.endpoint.address = format!("10.94.0.{}:21353", index + 1);
+                observation.endpoint.endpoint_id = sinomo_node::daemon_lan_endpoint_id(
+                    &destination,
+                    &observation.endpoint.address,
+                );
+                observation.state = DirectConnectivityState::Unreachable;
+                observation
+            })
+            .collect::<Vec<_>>();
+        let mut endpoints = unreachable
+            .iter()
+            .map(|observation| observation.endpoint.clone())
+            .collect::<Vec<_>>();
+        endpoints.extend(module_endpoints);
+        endpoints.reverse();
+        let directory = directory_fixture_with_endpoints(
+            94,
+            [
+                (source.clone(), Vec::new()),
+                (destination.clone(), endpoints),
+            ],
+        );
+        let connectivity = ConnectivitySnapshot::try_new(
+            ConnectivityGeneration(94),
+            94,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+            unreachable,
+        )
+        .expect("connectivity");
+
+        let paths = plan_routes_with_destination_process_affinity(
+            &directory,
+            &connectivity,
+            &source,
+            &destination,
+            RouteConstraints::default(),
+            DestinationProcessAffinity::MainDaemon,
+        );
+
+        assert_eq!(paths.len(), MAX_ROUTE_CANDIDATES);
+        assert_eq!(
+            paths[..expected_module_endpoint_ids.len()]
+                .iter()
+                .map(|path| path.hops[0].endpoint.endpoint_id.clone())
+                .collect::<Vec<_>>(),
+            expected_module_endpoint_ids,
+            "unobserved module recovery order must be stable even when directory input order is reversed"
+        );
+        assert!(paths[..2].iter().all(|path| {
+            path.hops.len() == 1
+                && path.hops[0].endpoint.transport == ClusterTransportKind::Iroh
+                && !path.hops[0].capabilities.relay_forwarding
+        }));
+        assert!(paths[2..].iter().all(|path| {
+            path.hops.len() == 1
+                && path.hops[0].connectivity_state == DirectConnectivityState::Unreachable
+        }));
     }
 
     #[test]
