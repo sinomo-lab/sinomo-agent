@@ -1583,6 +1583,36 @@ pub(crate) async fn read_cluster_kv_authoritative_entries_with_cluster_paths_asy
     .await
 }
 
+/// Deadline-preserving exact-key authority read used by DFS operation-bound
+/// revalidation. The inherited deadline is also capped by the daemon's normal
+/// Raft authority budget, and is never restarted by a retrying caller.
+pub(crate) async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    deadline: Instant,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    let timeouts = cluster_control_plane_timeouts();
+    let started = Instant::now();
+    let normal_deadline = started
+        .checked_add(timeouts.raft_append_timeout)
+        .unwrap_or(started);
+    let deadline = deadline.min(normal_deadline);
+    let timeout = deadline.saturating_duration_since(started);
+    read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts_before_deadline(
+        cluster_paths,
+        keys,
+        allow_forwarding,
+        runtime,
+        timeouts,
+        deadline,
+        timeout,
+    )
+    .await
+}
+
 async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts(
     cluster_paths: &ClusterPaths,
     keys: Vec<String>,
@@ -1595,18 +1625,38 @@ async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runti
     let deadline = started
         .checked_add(timeouts.raft_append_timeout)
         .unwrap_or(started);
+    read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts_before_deadline(
+        cluster_paths,
+        keys,
+        allow_forwarding,
+        runtime,
+        timeouts,
+        deadline,
+        timeouts.raft_append_timeout,
+    )
+    .await
+}
+
+async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts_before_deadline(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    timeouts: sinomo_core::cluster::ClusterControlPlaneTimeouts,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
     let mut state = read_daemon_cluster_state_for_authority_before_deadline(
         runtime,
         cluster_paths,
         deadline,
-        timeouts.raft_append_timeout,
+        timeout,
     )
     .await?;
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(daemon_cluster_kv_authority_timeout(
-            timeouts.raft_append_timeout,
-        ));
+        return Err(daemon_cluster_kv_authority_timeout(timeout));
     }
     let mut remaining_timeouts = timeouts;
     remaining_timeouts.raft_append_timeout = remaining;
@@ -1624,9 +1674,7 @@ async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runti
     );
     match tokio::time::timeout(remaining, read).await {
         Ok(result) => result.map_err(DaemonError::from),
-        Err(_) => Err(daemon_cluster_kv_authority_timeout(
-            timeouts.raft_append_timeout,
-        )),
+        Err(_) => Err(daemon_cluster_kv_authority_timeout(timeout)),
     }
 }
 
@@ -1681,6 +1729,28 @@ pub(crate) fn read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtim
                 keys,
                 allow_forwarding,
                 runtime,
+            ),
+        ),
+    )
+}
+
+pub(crate) fn read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime_before_deadline(
+    cluster_paths: &ClusterPaths,
+    keys: Vec<String>,
+    allow_forwarding: bool,
+    runtime: &tokio::runtime::Handle,
+    deadline: Instant,
+) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
+{
+    block_on_daemon_cluster_future_on_owner_runtime(
+        runtime,
+        Box::pin(
+            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
+                cluster_paths,
+                keys,
+                allow_forwarding,
+                runtime,
+                deadline,
             ),
         ),
     )
@@ -10397,17 +10467,16 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("daemon-exact-authority-bootstrap-deadline");
         let data_dir = SinomoDataDir::new(root.path());
         let cluster_paths = ClusterPaths::new(&data_dir);
-        let mut timeouts = cluster_control_plane_timeouts();
         let timeout = Duration::from_millis(80);
-        timeouts.raft_append_timeout = timeout;
         let started = Instant::now();
+        let deadline = started + timeout;
         let result = runtime.block_on(
-            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_with_timeouts(
+            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
                 &cluster_paths,
                 vec!["/sifs/authority".to_string()],
                 false,
                 runtime.handle(),
-                timeouts,
+                deadline,
             ),
         );
         let elapsed = started.elapsed();
@@ -10416,7 +10485,7 @@ mod tests {
         runtime.block_on(blocker).expect("join blocking owner");
         let error = result.expect_err("queued bootstrap load must respect authority deadline");
         assert!(
-            error.to_string().contains("after 80ms"),
+            error.to_string().contains("network timeout"),
             "unexpected deadline error: {error}"
         );
         assert!(

@@ -86,13 +86,14 @@ use crate::{
     DAEMON_DFS_BROWSER_STAT_ROUTE, DAEMON_DFS_BROWSER_STATUS_ROUTE,
     DAEMON_DFS_BROWSER_TRANSFER_METADATA_PRIMARY_ROUTE, DAEMON_DFS_BROWSER_UNPIN_CONTENT_ROUTE,
     DAEMON_DFS_BROWSER_UNPIN_METADATA_ROUTE, DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
-    DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE, DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
-    DAEMON_STATUS_ROUTE,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+    DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE,
 };
+use sinomo_api::DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES;
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_SEARCH_ROUTE, CONFIG_SET_ROUTE, ConfigRegistry,
     ConfigRegistryBuilder, register_services as register_config_services,
@@ -836,6 +837,7 @@ const DAEMON_CONTROL_MAIN_ROUTES: &[&str] = &[
     DAEMON_SHUTDOWN_ROUTE,
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
     DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
     DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
     DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -877,11 +879,18 @@ impl Service for DaemonControlService {
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE
                 || route.route == DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
                 || route.route == DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE
+                || route.route == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
                 || route.route == DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE
                 || route.route == DAEMON_NETWORK_CHUNK_METRICS_ROUTE
                 || route.route == DAEMON_SHUTDOWN_ROUTE
             {
                 route.auth_scope = Some("local-command".to_string());
+            }
+            if route.route == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE {
+                route
+                    .required_capabilities
+                    .push("daemon.dfs.mounted-mutation".to_string());
+                route.timeout_ms = Some(30_000);
             }
             if route.route == DAEMON_OBJECT_RPC_FORWARD_ROUTE
                 || route.route == DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE
@@ -907,6 +916,7 @@ impl Service for DaemonControlService {
                     request.route.as_str(),
                     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
                         | DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE
+                        | DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
                 )
             {
                 return Err(ServiceError::UnknownRoute(request.route));
@@ -1033,6 +1043,38 @@ impl Service for DaemonControlService {
                     .await
                     .map_err(daemon_error)?;
                     ctx.respond_value(DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, response)?;
+                    ServiceDisposition::Continue
+                }
+                DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE => {
+                    let handoff: crate::DaemonDfsMountedMutationHandoffRequest = ctx
+                        .decode_request_body_bounded(
+                            &request,
+                            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+                        )
+                        .await?;
+                    handoff.validate().map_err(ServiceError::Service)?;
+                    let runtime = require_service_runtime(
+                        runtime.as_ref(),
+                        "DFS mounted-mutation durability handoff",
+                    )?
+                    .clone();
+                    let traceparent = request.traceparent().map(ToString::to_string);
+                    let handoff_paths = paths.clone();
+                    let response = run_blocking_service_task(
+                        DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+                        "DFS mounted-mutation durability handoff",
+                        move || {
+                            crate::dfs::handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                                &handoff_paths,
+                                &runtime,
+                                traceparent,
+                                handoff,
+                            )
+                            .map_err(daemon_error)
+                        },
+                    )
+                    .await?;
+                    ctx.respond_value(DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, response)?;
                     ServiceDisposition::Continue
                 }
                 DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE => {
@@ -5946,6 +5988,13 @@ impl DaemonServiceRegistryHost {
             } else {
                 None
             };
+        if !crate::daemon_paths_are_shadow(&paths)
+            && let Some(runtime) = service_runtime.as_ref()
+        {
+            crate::dfs::replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
+                &paths, runtime,
+            )?;
+        }
         Ok(Self {
             paths,
             service_data_dir,
@@ -8453,6 +8502,113 @@ mod tests {
         )
         .await
         .map(|(response, _stop)| response)
+    }
+
+    #[tokio::test]
+    async fn mounted_mutation_handoff_rejects_oversized_values_before_outbox_mutation() {
+        let inline_root = sinomo_testdir::TestDir::new(
+            "sinomo-daemon-mounted-mutation-handoff-inline-payload-bound",
+        );
+        let inline_data_dir = Arc::new(SinomoDataDir::new(&inline_root));
+        let inline_paths = DaemonPaths::new(inline_data_dir.as_ref());
+        let inline_response = Arc::new(Mutex::new(None));
+        let inline_context = ServiceContext::new(
+            Arc::clone(&inline_data_dir),
+            None,
+            ServiceSigner::Local,
+            sinomo_core::network::ObjectRpcIncomingBody::default(),
+            Box::new(BufferSink {
+                response: Arc::clone(&inline_response),
+            }),
+        );
+        let inline_request = ObjectRpcRequest::from_encoded_body(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            vec![0; DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES + 1],
+        );
+        let inline_service = DaemonControlService {
+            paths: inline_paths,
+            runtime: Some(tokio::runtime::Handle::current()),
+        };
+
+        let inline_error = inline_service
+            .handle(inline_context, inline_request)
+            .await
+            .expect_err("reject oversized inline handoff value");
+        assert!(matches!(
+            inline_error,
+            ServiceError::Network(NetworkError::FrameTooLarge {
+                actual_bytes,
+                max_bytes,
+            }) if actual_bytes == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES + 1
+                && max_bytes == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES
+        ));
+        assert!(inline_response.lock().expect("inline response").is_none());
+        assert!(
+            !inline_root
+                .join("dfs")
+                .join("mounted-mutation-outbox")
+                .exists(),
+            "an oversized inline value must be rejected before the handoff handler opens its outbox",
+        );
+
+        let streamed_root = sinomo_testdir::TestDir::new(
+            "sinomo-daemon-mounted-mutation-handoff-streamed-payload-bound",
+        );
+        let streamed_data_dir = Arc::new(SinomoDataDir::new(&streamed_root));
+        let streamed_paths = DaemonPaths::new(streamed_data_dir.as_ref());
+        let streamed_response = Arc::new(Mutex::new(None));
+        let (_sender, streamed_body) = sinomo_core::network::ObjectRpcIncomingBody::test_channel(
+            Some((DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES + 1) as u64),
+            1,
+        );
+        let streamed_context = ServiceContext::new(
+            Arc::clone(&streamed_data_dir),
+            None,
+            ServiceSigner::Local,
+            streamed_body.with_test_streamed_value_role(),
+            Box::new(BufferSink {
+                response: Arc::clone(&streamed_response),
+            }),
+        );
+        let streamed_request = ObjectRpcRequest::from_encoded_body(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            DAEMON_RPC_CATEGORY,
+            Vec::new(),
+        );
+        let streamed_service = DaemonControlService {
+            paths: streamed_paths,
+            runtime: Some(tokio::runtime::Handle::current()),
+        };
+
+        let streamed_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            streamed_service.handle(streamed_context, streamed_request),
+        )
+        .await
+        .expect("declared-length rejection must not await a streamed chunk")
+        .expect_err("reject oversized streamed handoff declaration");
+        assert!(matches!(
+            streamed_error,
+            ServiceError::Network(NetworkError::FrameTooLarge {
+                actual_bytes,
+                max_bytes,
+            }) if actual_bytes == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES + 1
+                && max_bytes == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES
+        ));
+        assert!(
+            streamed_response
+                .lock()
+                .expect("streamed response")
+                .is_none(),
+        );
+        assert!(
+            !streamed_root
+                .join("dfs")
+                .join("mounted-mutation-outbox")
+                .exists(),
+            "an oversized streamed declaration must be rejected before the handoff handler opens its outbox",
+        );
     }
 
     #[test]
@@ -13289,6 +13445,7 @@ mod tests {
         for route in [
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
             DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
         ] {
             assert!(
                 main_registry.owns(route),
@@ -13386,6 +13543,24 @@ mod tests {
             generic_shutdown.auth_scope.as_deref(),
             Some("local-command"),
             "the legacy generic shutdown route must remain local-only at service dispatch"
+        );
+        let mounted_mutation_handoff = main_host
+            .object_rpc_route_descriptor(DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE)
+            .expect("main mounted-mutation handoff route descriptor");
+        assert_eq!(
+            mounted_mutation_handoff.auth_scope.as_deref(),
+            Some("local-command")
+        );
+        assert_eq!(
+            mounted_mutation_handoff.required_capabilities,
+            vec!["daemon.dfs.mounted-mutation".to_string()]
+        );
+        assert_eq!(mounted_mutation_handoff.timeout_ms, Some(30_000));
+        assert!(
+            shadow_host
+                .object_rpc_route_descriptor(DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE)
+                .is_none(),
+            "shadow host must not advertise mounted-mutation ownership"
         );
         assert!(
             shadow_host.service_cluster.is_none(),

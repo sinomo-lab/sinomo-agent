@@ -57,6 +57,657 @@ const CLOUD_FILES_FEED_EVENTS_PER_PASS: usize = 32;
 pub(crate) const CLOUD_FILES_DIRECTORY_PAGE_ENTRIES: usize = 32;
 const CLOUD_FILES_SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
+const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
+const CLOUD_FILES_MOUNT_OPEN_ERROR: &str = "cloud-files-mount-open-error";
+const CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID: &str = "cloud-files-mount-open-capture-invalid";
+
+/// Apply the mounted-reader policy used by the production Cloud Files service.
+/// Explicit directory refresh remains handoff-wrapped, but stat/lstat must not
+/// implicitly ingest replica journals through an unowned SyncPath fallback.
+pub(crate) fn configure_cloud_files_mounted_read_policy<T: dfs::DfsMessageTransport>(
+    service: &mut dfs::NetworkedDfsService<T>,
+) {
+    service.disable_implicit_read_replica_ingest();
+}
+
+fn cloud_files_mount_open_committed_work() -> dfs::DfsCommittedWork {
+    // Backend constructors and bootstrap recovery predate operation-local work
+    // tracking. Conservatively transfer every bounded daemon ownership bit.
+    dfs::DfsCommittedWork {
+        publish_metadata: true,
+        repair_maintenance: true,
+        namespace_maintenance: true,
+        metadata_replica_progress: true,
+        metadata_materialization: true,
+    }
+}
+
+/// Local daemon seam for the mounted-mutation durability protocol. Keeping the
+/// seam small lets the ordering contract be tested without starting a daemon;
+/// the production implementation below is still the only constructor exposed
+/// to the Windows mount path.
+pub(crate) trait CloudFilesMountedMutationDaemon {
+    fn probe(&self) -> Result<(), String>;
+
+    fn arm(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+    ) -> Result<(), String>;
+
+    fn commit_applied(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        captured_work: dfs::MountedSifsMutationCapturedWork,
+    ) -> Result<(), String>;
+
+    fn commit_unknown(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        observation: dfs::MountedSifsMutationErrorObservation,
+    ) -> Result<(), String>;
+
+    fn prove_no_write(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> Result<(), String>;
+}
+
+impl CloudFilesMountedMutationDaemon
+    for sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient
+{
+    fn probe(&self) -> Result<(), String> {
+        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::probe(self)
+            .map(drop)
+            .map_err(|error| error.to_string())
+    }
+
+    fn arm(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+    ) -> Result<(), String> {
+        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::arm(
+            self,
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+        )
+        .map(drop)
+        .map_err(|error| error.to_string())
+    }
+
+    fn commit_applied(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        captured_work: dfs::MountedSifsMutationCapturedWork,
+    ) -> Result<(), String> {
+        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::commit_applied(
+            self,
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work,
+        )
+        .map(drop)
+        .map_err(|error| error.to_string())
+    }
+
+    fn commit_unknown(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        observation: dfs::MountedSifsMutationErrorObservation,
+    ) -> Result<(), String> {
+        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::commit_unknown(
+            self,
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            observation,
+        )
+        .map(drop)
+        .map_err(|error| error.to_string())
+    }
+
+    fn prove_no_write(
+        &self,
+        marker_id: dfs::MountedSifsMutationMarkerId,
+        marker_nonce: dfs::MountedSifsMutationNonce,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> Result<(), String> {
+        sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::prove_no_write(
+            self,
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code,
+        )
+        .map(drop)
+        .map_err(|error| error.to_string())
+    }
+}
+
+struct CloudFilesMountedMutationHandoffInner<C> {
+    store: dfs::MountedSifsMutationOutboxStore,
+    session: Option<dfs::MountedSifsHostMountSessionLease>,
+    client: C,
+}
+
+/// One mount-scoped handoff owner. Its mutex is deliberately distinct from
+/// the mounted DFS service mutex: it remains held while the service lock is
+/// dropped for the daemon Commit RPC, preventing a later local mutation from
+/// crossing an unacknowledged ambiguity fence.
+pub(crate) struct CloudFilesMountedMutationHandoff<
+    C = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient,
+> {
+    inner: Mutex<CloudFilesMountedMutationHandoffInner<C>>,
+    gated: AtomicBool,
+}
+
+#[cfg(windows)]
+impl CloudFilesMountedMutationHandoff {
+    pub(crate) fn open(
+        data_dir: &SinomoDataDir,
+        mount_identity: impl Into<String>,
+    ) -> Result<Self, String> {
+        let daemon = sinomo_runtime::api::DaemonApiClient::connect_for_paths(
+            &sinomo_runtime::api::DaemonPaths::new(data_dir),
+        )
+        .map_err(|error| error.to_string())?;
+        let client = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::new(
+            data_dir.clone(),
+            daemon.address().to_string(),
+        )
+        .map_err(|error| error.to_string())?;
+        Self::open_with_client(data_dir, mount_identity, client)
+    }
+}
+
+impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
+    fn open_with_client(
+        data_dir: &SinomoDataDir,
+        mount_identity: impl Into<String>,
+        client: C,
+    ) -> Result<Self, String> {
+        // Probe precedes even the host-session marker. A provider must never
+        // become visible if its main daemon cannot accept durable handoffs.
+        client.probe()?;
+        let store = dfs::MountedSifsMutationOutboxStore::new(data_dir)
+            .map_err(|error| error.to_string())?;
+        let session = store
+            .open_host_mount_session(dfs::MountedSifsMutationAdapter::CloudFiles, mount_identity)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            inner: Mutex::new(CloudFilesMountedMutationHandoffInner {
+                store,
+                session: Some(session),
+                client,
+            }),
+            gated: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn ensure_ready(&self) -> Result<(), String> {
+        if self.gated.load(Ordering::Acquire) {
+            return Err(
+                "mounted-mutation handoff is gated after an ambiguous Cloud Files write"
+                    .to_string(),
+            );
+        }
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
+        if inner.session.is_none() {
+            return Err("Cloud Files mounted-mutation host session is closed".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close_clean(&self) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
+        let Some(session) = inner.session.take() else {
+            return Ok(());
+        };
+        session.close_clean().map_err(|error| {
+            self.gated.store(true, Ordering::Release);
+            error.to_string()
+        })
+    }
+
+    fn gate<T>(&self, detail: impl Into<String>) -> Result<T, String> {
+        self.gated.store(true, Ordering::Release);
+        Err(detail.into())
+    }
+
+    /// Open and bootstrap the writable DFS service behind one durable mount
+    /// marker before the Cloud Files registration can become host-visible.
+    ///
+    /// Constructor recovery is not operation-local today, so a successful
+    /// open transfers every committed-work bit plus the service's exact
+    /// durable repair queue snapshot. Any open error or unrepresentable repair
+    /// snapshot remains a full-recovery ambiguity.
+    pub(crate) fn run_captured_mount_open<R, E>(
+        &self,
+        open: impl FnOnce() -> Result<(R, Vec<dfs::DfsRepairAttemptRecord>), E>,
+    ) -> Result<R, String>
+    where
+        E: std::fmt::Display,
+    {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
+        if self.gated.load(Ordering::Acquire) {
+            return Err(
+                "mounted-mutation handoff is gated after an ambiguous Cloud Files operation"
+                    .to_string(),
+            );
+        }
+        let session = inner
+            .session
+            .as_ref()
+            .ok_or_else(|| "Cloud Files mounted-mutation host session is closed".to_string())?;
+        let mut lease = match inner
+            .store
+            .prepare(session, None, CLOUD_FILES_MOUNT_OPEN_OPERATION)
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                return self.gate(format!(
+                    "prepare durable Cloud Files mount open before DFS service entry: {error}"
+                ));
+            }
+        };
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        let marker = lease.marker().clone();
+        if let Err(error) = inner.client.arm(
+            marker.marker_id.clone(),
+            marker.marker_nonce.clone(),
+            arm_request_id.clone(),
+        ) {
+            return self.gate(format!(
+                "arm Cloud Files mount open before DFS service entry: {error}"
+            ));
+        }
+
+        let (opened, repair_records) = match open() {
+            Ok(opened) => opened,
+            Err(error) => {
+                let service_error = error.to_string();
+                let completion = self.finish_mount_open_unknown(
+                    &inner,
+                    lease,
+                    marker,
+                    arm_request_id,
+                    CLOUD_FILES_MOUNT_OPEN_ERROR,
+                );
+                return match completion {
+                    Ok(()) => Err(format!(
+                        "Cloud Files DFS mount open returned after service entry: {service_error}"
+                    )),
+                    Err(handoff_error) => Err(format!(
+                        "Cloud Files DFS mount open returned after service entry: {service_error}; commit Unknown mount-open evidence: {handoff_error}"
+                    )),
+                };
+            }
+        };
+        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
+            cloud_files_mount_open_committed_work(),
+            repair_records,
+        ) {
+            Ok(captured_work) => captured_work,
+            Err(error) => {
+                let capture_error = error.to_string();
+                let completion = self.finish_mount_open_unknown(
+                    &inner,
+                    lease,
+                    marker,
+                    arm_request_id,
+                    CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID,
+                );
+                return match completion {
+                    Ok(()) => Err(format!(
+                        "capture Cloud Files DFS mount-open recovery work: {capture_error}"
+                    )),
+                    Err(handoff_error) => Err(format!(
+                        "capture Cloud Files DFS mount-open recovery work: {capture_error}; commit Unknown mount-open evidence: {handoff_error}"
+                    )),
+                };
+            }
+        };
+        if let Err(error) = lease
+            .record_captured_success(&arm_request_id, captured_work.clone())
+            .map_err(|source| source.to_string())
+            .and_then(|_| {
+                inner.client.commit_applied(
+                    marker.marker_id,
+                    marker.marker_nonce,
+                    arm_request_id,
+                    captured_work,
+                )
+            })
+            .and_then(|_| lease.release_after_daemon_ack().map_err(|e| e.to_string()))
+        {
+            return self.gate(format!(
+                "commit captured Cloud Files mount open to the daemon: {error}"
+            ));
+        }
+        Ok(opened)
+    }
+
+    fn finish_mount_open_unknown(
+        &self,
+        inner: &CloudFilesMountedMutationHandoffInner<C>,
+        mut lease: dfs::MountedSifsMutationLease<'_>,
+        marker: dfs::MountedSifsMutationOutboxMarker,
+        arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        error_code: &'static str,
+    ) -> Result<(), String> {
+        self.gated.store(true, Ordering::Release);
+        let captured_work = dfs::MountedSifsMutationCapturedWork::new(
+            cloud_files_mount_open_committed_work(),
+            Vec::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        let observation = dfs::MountedSifsMutationErrorObservation::new(captured_work, error_code)
+            .map_err(|error| error.to_string())?;
+        lease
+            .record_unknown_after_error(&arm_request_id, observation.clone())
+            .map_err(|error| error.to_string())?;
+        inner.client.commit_unknown(
+            marker.marker_id,
+            marker.marker_nonce,
+            arm_request_id,
+            observation,
+        )?;
+        lease
+            .release_after_daemon_ack()
+            .map_err(|error| error.to_string())
+    }
+
+    fn run_captured_mutation<S, R, E>(
+        &self,
+        service: &Arc<Mutex<S>>,
+        stable_operation_id: &str,
+        operation: &'static str,
+        mutation: impl FnOnce(&mut S) -> dfs::MountedSifsMutationReport<Result<R, E>>,
+    ) -> Result<R, String>
+    where
+        E: std::fmt::Display,
+    {
+        // This guard is the mutation lane. It covers Prepare through lease
+        // release even while the independent service mutex is dropped.
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
+        if self.gated.load(Ordering::Acquire) {
+            return Err(
+                "mounted-mutation handoff is gated after an ambiguous Cloud Files write"
+                    .to_string(),
+            );
+        }
+        let session = inner
+            .session
+            .as_ref()
+            .ok_or_else(|| "Cloud Files mounted-mutation host session is closed".to_string())?;
+        let mut lease =
+            match inner
+                .store
+                .prepare(session, Some(stable_operation_id.to_string()), operation)
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return self.gate(format!(
+                    "prepare durable Cloud Files mounted mutation before DFS service entry: {error}"
+                ));
+                }
+            };
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        let marker = lease.marker().clone();
+        if let Err(error) = inner.client.arm(
+            marker.marker_id.clone(),
+            marker.marker_nonce.clone(),
+            arm_request_id.clone(),
+        ) {
+            return self.gate(format!(
+                "arm Cloud Files mounted mutation before DFS service entry: {error}"
+            ));
+        }
+
+        let mut service = match lock_service_with_timeout(service, CLOUD_FILES_SERVICE_LOCK_TIMEOUT)
+        {
+            Ok(service) => service,
+            Err(error) => {
+                const PROOF: &str = "cloud-files-service-lock-not-entered";
+                let completion = lease
+                    .record_proven_no_write(&arm_request_id, PROOF)
+                    .map_err(|source| source.to_string())
+                    .and_then(|_| {
+                        inner.client.prove_no_write(
+                            marker.marker_id,
+                            marker.marker_nonce,
+                            arm_request_id,
+                            PROOF,
+                        )
+                    })
+                    .and_then(|_| lease.release_after_daemon_ack().map_err(|e| e.to_string()));
+                return match completion {
+                    Ok(()) => Err(error),
+                    Err(handoff_error) => self.gate(format!(
+                        "prove Cloud Files mutation did not enter DFS after lock failure: {handoff_error}"
+                    )),
+                };
+            }
+        };
+        let report = mutation(&mut service);
+        // The daemon may block on fsync/queue ownership. Never hold the DFS
+        // service mutex during Commit, while still retaining the lane above.
+        drop(service);
+
+        let captured_work = dfs::MountedSifsMutationCapturedWork::new(
+            report.committed_work,
+            report.committed_repair_records,
+        )
+        .map_err(|error| {
+            self.gated.store(true, Ordering::Release);
+            error.to_string()
+        })?;
+        match report.outcome {
+            Ok(value) => {
+                if let Err(error) = lease
+                    .record_captured_success(&arm_request_id, captured_work.clone())
+                    .map_err(|source| source.to_string())
+                    .and_then(|_| {
+                        inner.client.commit_applied(
+                            marker.marker_id,
+                            marker.marker_nonce,
+                            arm_request_id,
+                            captured_work,
+                        )
+                    })
+                    .and_then(|_| lease.release_after_daemon_ack().map_err(|e| e.to_string()))
+                {
+                    return self.gate(format!(
+                        "commit captured Cloud Files mutation to the daemon: {error}"
+                    ));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                // Once the service was entered, every Err is ambiguous even if
+                // this operation's work capture is empty. Gate later receipt
+                // reconciliation as well as later mutations.
+                self.gated.store(true, Ordering::Release);
+                let service_error = error.to_string();
+                let observation = dfs::MountedSifsMutationErrorObservation::new(
+                    captured_work,
+                    "cloud-files-dfs-service-error",
+                )
+                .map_err(|source| source.to_string())?;
+                lease
+                    .record_unknown_after_error(&arm_request_id, observation.clone())
+                    .map_err(|source| source.to_string())?;
+                inner.client.commit_unknown(
+                    marker.marker_id,
+                    marker.marker_nonce,
+                    arm_request_id,
+                    observation,
+                )?;
+                lease
+                    .release_after_daemon_ack()
+                    .map_err(|source| source.to_string())?;
+                Err(format!(
+                    "Cloud Files DFS mutation returned after service entry: {service_error}"
+                ))
+            }
+        }
+    }
+
+    /// Capture a mounted read which may synchronously ingest a metadata
+    /// journal into the local durable replica.
+    ///
+    /// Unlike a user mutation, an ordinary DFS read error does not make the
+    /// local effect ambiguous. The operation-local receipt remains exact even
+    /// when the read returns `Err`, so acknowledge that captured work before
+    /// returning the nested read outcome to the adapter. Only a failure of the
+    /// handoff protocol itself gates the mount.
+    pub(crate) fn run_captured_read_ingest<S, R, E>(
+        &self,
+        service: &Arc<Mutex<S>>,
+        operation: &'static str,
+        read: impl FnOnce(&mut S) -> dfs::MountedSifsMutationReport<Result<R, E>>,
+    ) -> Result<Result<R, E>, String> {
+        // Use the same mount-wide lane as writes. A directory refresh must not
+        // enter DFS while an earlier write is waiting for its daemon ACK, nor
+        // may a later write cross this refresh before its captured replica
+        // progress has a durable owner.
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
+        if self.gated.load(Ordering::Acquire) {
+            return Err(
+                "mounted-mutation handoff is gated after an ambiguous Cloud Files operation"
+                    .to_string(),
+            );
+        }
+        let session = inner
+            .session
+            .as_ref()
+            .ok_or_else(|| "Cloud Files mounted-mutation host session is closed".to_string())?;
+        let mut lease = match inner.store.prepare(session, None, operation) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return self.gate(format!(
+                    "prepare durable Cloud Files mounted read ingest before DFS service entry: {error}"
+                ));
+            }
+        };
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        let marker = lease.marker().clone();
+        if let Err(error) = inner.client.arm(
+            marker.marker_id.clone(),
+            marker.marker_nonce.clone(),
+            arm_request_id.clone(),
+        ) {
+            return self.gate(format!(
+                "arm Cloud Files mounted read ingest before DFS service entry: {error}"
+            ));
+        }
+
+        let mut service = match lock_service_with_timeout(service, CLOUD_FILES_SERVICE_LOCK_TIMEOUT)
+        {
+            Ok(service) => service,
+            Err(error) => {
+                const PROOF: &str = "cloud-files-read-ingest-service-lock-not-entered";
+                let completion = lease
+                    .record_proven_no_write(&arm_request_id, PROOF)
+                    .map_err(|source| source.to_string())
+                    .and_then(|_| {
+                        inner.client.prove_no_write(
+                            marker.marker_id,
+                            marker.marker_nonce,
+                            arm_request_id,
+                            PROOF,
+                        )
+                    })
+                    .and_then(|_| lease.release_after_daemon_ack().map_err(|e| e.to_string()));
+                return match completion {
+                    Ok(()) => Err(error),
+                    Err(handoff_error) => self.gate(format!(
+                        "prove Cloud Files read ingest did not enter DFS after lock failure: {handoff_error}"
+                    )),
+                };
+            }
+        };
+        let report = read(&mut service);
+        // Preserve the lane while releasing the DFS mutex for the daemon RPC.
+        drop(service);
+
+        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
+            report.committed_work,
+            report.committed_repair_records,
+        ) {
+            Ok(captured_work) => captured_work,
+            Err(error) => {
+                return self.gate(format!(
+                    "validate captured Cloud Files mounted read ingest: {error}"
+                ));
+            }
+        };
+        if let Err(error) = lease
+            .record_captured_success(&arm_request_id, captured_work.clone())
+            .map_err(|source| source.to_string())
+            .and_then(|_| {
+                inner.client.commit_applied(
+                    marker.marker_id,
+                    marker.marker_nonce,
+                    arm_request_id,
+                    captured_work,
+                )
+            })
+            .and_then(|_| lease.release_after_daemon_ack().map_err(|e| e.to_string()))
+        {
+            return self.gate(format!(
+                "commit captured Cloud Files mounted read ingest to the daemon: {error}"
+            ));
+        }
+        Ok(report.outcome)
+    }
+}
+
+impl<C> Drop for CloudFilesMountedMutationHandoff<C> {
+    fn drop(&mut self) {
+        let inner = match self.inner.get_mut() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(session) = inner.session.take()
+            && session.close_clean().is_err()
+        {
+            self.gated.store(true, Ordering::Release);
+        }
+    }
+}
 
 pub(crate) fn sparse_root_is_enumerated(
     prepopulate_depth: u32,
@@ -658,6 +1309,17 @@ pub trait CloudFilesStableMutationBackend {
     ) -> Result<CloudFilesDfsMutationReconciliation, String>;
 }
 
+fn cloud_files_mounted_mutation_label(kind: &CloudFilesLocalOperationKind) -> &'static str {
+    match kind {
+        CloudFilesLocalOperationKind::CreateFile => "cloud-files.create-file",
+        CloudFilesLocalOperationKind::CreateDirectory => "cloud-files.create-directory",
+        CloudFilesLocalOperationKind::ReplaceFile => "cloud-files.replace-file",
+        CloudFilesLocalOperationKind::DeleteFile => "cloud-files.unlink",
+        CloudFilesLocalOperationKind::DeleteDirectory => "cloud-files.rmdir",
+        CloudFilesLocalOperationKind::Rename => "cloud-files.rename",
+    }
+}
+
 pub struct CloudFilesConcreteDfsAdapter<B> {
     backend: B,
 }
@@ -669,29 +1331,22 @@ pub struct CloudFilesDfsServiceMutationBackend<T> {
     service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
     write_options: dfs::DfsWriteOptions,
     cancelled: Arc<AtomicBool>,
+    handoff: Arc<CloudFilesMountedMutationHandoff>,
 }
 
 impl<T> CloudFilesDfsServiceMutationBackend<T> {
-    pub fn new(
-        service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
-        write_options: dfs::DfsWriteOptions,
-    ) -> Self {
-        Self {
-            service,
-            write_options,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn new_with_cancellation(
+    #[cfg(windows)]
+    pub(crate) fn new_with_cancellation(
         service: Arc<Mutex<dfs::NetworkedDfsService<T>>>,
         write_options: dfs::DfsWriteOptions,
         cancelled: Arc<AtomicBool>,
+        handoff: Arc<CloudFilesMountedMutationHandoff>,
     ) -> Self {
         Self {
             service,
             write_options,
             cancelled,
+            handoff,
         }
     }
 
@@ -727,6 +1382,7 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
     for CloudFilesDfsServiceMutationBackend<T>
 {
     fn ensure_contracts_ready(&self) -> Result<(), String> {
+        self.handoff.ensure_ready()?;
         if self.write_options.replica_candidates.is_empty() {
             return Err(
                 "no advertised DFS content replica is available for durable Cloud Files writes"
@@ -744,25 +1400,44 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         let reader = File::open(&content.blob_path)
             .map_err(|error| format!("open immutable Cloud Files queue blob: {error}"))?;
         let reader = CancellationReader::new(reader, Arc::clone(&self.cancelled));
-        let result = self
-            .lock_service()?
-            .posix_create_file_from_reader_with_operation_id(
-                &command.source_path,
-                reader,
-                self.write_options.clone(),
-                &command.operation_id,
-            );
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service.posix_create_file_from_reader_with_operation_id(
+                        &command.source_path,
+                        reader,
+                        self.write_options.clone(),
+                        &command.operation_id,
+                    )
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn create_directory(
         &mut self,
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
-        let result = self
-            .lock_service()?
-            .posix_mkdir_with_operation_id(&command.source_path, &command.operation_id);
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service
+                        .posix_mkdir_with_operation_id(&command.source_path, &command.operation_id)
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn replace_file(
@@ -776,17 +1451,26 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         let reader = File::open(&content.blob_path)
             .map_err(|error| format!("open immutable Cloud Files queue blob: {error}"))?;
         let reader = CancellationReader::new(reader, Arc::clone(&self.cancelled));
-        let result = self
-            .lock_service()?
-            .posix_replace_file_if_version_from_reader_with_operation_id(
-                &command.source_path,
-                &object_id,
-                &version,
-                reader,
-                self.write_options.clone(),
-                &command.operation_id,
-            );
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service.posix_replace_file_if_version_from_reader_with_operation_id(
+                        &command.source_path,
+                        &object_id,
+                        &version,
+                        reader,
+                        self.write_options.clone(),
+                        &command.operation_id,
+                    )
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn unlink(
@@ -794,12 +1478,23 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let result = self.lock_service()?.posix_unlink_if_generation(
-            &command.source_path,
-            command.operation_id.clone(),
-            expected,
-        );
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service.posix_unlink_if_generation(
+                        &command.source_path,
+                        command.operation_id.clone(),
+                        expected,
+                    )
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn rmdir(
@@ -807,12 +1502,23 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let result = self.lock_service()?.posix_rmdir_if_generation(
-            &command.source_path,
-            command.operation_id.clone(),
-            expected,
-        );
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service.posix_rmdir_if_generation(
+                        &command.source_path,
+                        command.operation_id.clone(),
+                        expected,
+                    )
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn rename(
@@ -825,20 +1531,35 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
             .ok_or_else(|| "rename command has no destination path".to_string())?;
         let source = namespace_object_precondition(required_source_precondition(command)?)?;
         let destination = namespace_destination_precondition(&command.preconditions.destination)?;
-        let result = self.lock_service()?.posix_rename_if_generation(
-            &command.source_path,
-            destination_path,
-            command.operation_id.clone(),
-            source,
-            destination,
-        );
-        Ok(classify_posix_mutation_result(command, result))
+        let stat = self.handoff.run_captured_mutation(
+            &self.service,
+            &command.operation_id,
+            cloud_files_mounted_mutation_label(&command.kind),
+            |service| {
+                service.capture_mounted_mutation(|service| {
+                    service.posix_rename_if_generation(
+                        &command.source_path,
+                        destination_path,
+                        command.operation_id.clone(),
+                        source,
+                        destination,
+                    )
+                })
+            },
+        )?;
+        Ok(CloudFilesDfsMutationOutcome::Applied(
+            mutation_evidence_from_stat(command, stat),
+        ))
     }
 
     fn reconcile(
         &mut self,
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+        // Receipt reconciliation is read-only and never arms a new marker, but
+        // a failed prior handoff fences it so no queue state can cross that
+        // ambiguity before daemon recovery closes the mount session.
+        self.handoff.ensure_ready()?;
         match command.kind {
             CloudFilesLocalOperationKind::CreateFile => {
                 let content = required_staged_content(command)?;
@@ -1076,34 +1797,6 @@ fn namespace_operation(
             return Err("file writes do not use namespace reconciliation".to_string());
         }
     })
-}
-
-fn classify_posix_mutation_result(
-    command: &CloudFilesDfsMutationCommand,
-    result: Result<dfs::DfsStat, dfs::DfsPosixError>,
-) -> CloudFilesDfsMutationOutcome {
-    match result {
-        Ok(stat) => {
-            CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
-        }
-        Err(
-            error @ (dfs::DfsPosixError::NotFound { .. }
-            | dfs::DfsPosixError::AlreadyExists { .. }
-            | dfs::DfsPosixError::NotDirectory { .. }
-            | dfs::DfsPosixError::IsDirectory { .. }
-            | dfs::DfsPosixError::NotSymlink { .. }
-            | dfs::DfsPosixError::MissingParent { .. }
-            | dfs::DfsPosixError::InvalidPath { .. }
-            | dfs::DfsPosixError::Conflict { .. }
-            | dfs::DfsPosixError::DirectoryNotEmpty { .. }),
-        ) => CloudFilesDfsMutationOutcome::Conflict(conflict_evidence(
-            "dfs-mutation-conflict",
-            error.to_string(),
-        )),
-        Err(error) => CloudFilesDfsMutationOutcome::Ambiguous {
-            detail: error.to_string(),
-        },
-    }
 }
 
 fn mutation_evidence_from_stat(
@@ -1985,6 +2678,13 @@ where
             CLOUD_FILES_MUTATIONS_PER_PASS,
         )
         .map_err(executor_error)?;
+        // An ambiguous service result or a lost daemon Commit response gates
+        // the handoff inside `apply`. The executor durably leaves that request
+        // Retrying; stop this worker pass before feed reconciliation or a later
+        // receipt read can advance any local state across the ambiguity fence.
+        self.mutations.ensure_contracts_ready().map_err(|detail| {
+            sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
+        })?;
         for suppression in self.effects.drain_namespace_suppressions() {
             let expected = self.completed_operation_suppression(&suppression.operation_id)?;
             if suppression != expected {
@@ -3089,6 +3789,1073 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum FakeCommitBehavior {
+        Accept,
+        FailBeforeAccept,
+        LoseResponseAfterAccept,
+    }
+
+    struct FakeMountedMutationDaemon {
+        store: dfs::MountedSifsMutationOutboxStore,
+        events: Arc<Mutex<Vec<String>>>,
+        probe_error: bool,
+        commit_behavior: FakeCommitBehavior,
+        commit_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    }
+
+    impl FakeMountedMutationDaemon {
+        fn record(&self, event: impl Into<String>) {
+            self.events.lock().expect("event log").push(event.into());
+        }
+
+        fn finish_commit(&self, accept: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+            if let Some(observer) = &self.commit_observer {
+                observer();
+            }
+            match self.commit_behavior {
+                FakeCommitBehavior::Accept => accept(),
+                FakeCommitBehavior::FailBeforeAccept => {
+                    Err("simulated commit failure before acceptance".to_string())
+                }
+                FakeCommitBehavior::LoseResponseAfterAccept => {
+                    accept()?;
+                    Err("simulated lost commit response".to_string())
+                }
+            }
+        }
+    }
+
+    impl CloudFilesMountedMutationDaemon for FakeMountedMutationDaemon {
+        fn probe(&self) -> Result<(), String> {
+            self.record("probe");
+            if self.probe_error {
+                Err("simulated probe failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn arm(
+            &self,
+            marker_id: dfs::MountedSifsMutationMarkerId,
+            marker_nonce: dfs::MountedSifsMutationNonce,
+            arm_request_id: dfs::MountedSifsMutationArmRequestId,
+        ) -> Result<(), String> {
+            self.record("arm");
+            self.store
+                .arm_live(&marker_id, &marker_nonce, &arm_request_id)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        }
+
+        fn commit_applied(
+            &self,
+            marker_id: dfs::MountedSifsMutationMarkerId,
+            marker_nonce: dfs::MountedSifsMutationNonce,
+            arm_request_id: dfs::MountedSifsMutationArmRequestId,
+            captured_work: dfs::MountedSifsMutationCapturedWork,
+        ) -> Result<(), String> {
+            self.record("commit-applied");
+            self.finish_commit(|| {
+                self.store
+                    .accept_captured_live(
+                        &marker_id,
+                        &marker_nonce,
+                        &arm_request_id,
+                        &captured_work,
+                    )
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            })
+        }
+
+        fn commit_unknown(
+            &self,
+            marker_id: dfs::MountedSifsMutationMarkerId,
+            marker_nonce: dfs::MountedSifsMutationNonce,
+            arm_request_id: dfs::MountedSifsMutationArmRequestId,
+            observation: dfs::MountedSifsMutationErrorObservation,
+        ) -> Result<(), String> {
+            self.record("commit-unknown");
+            self.finish_commit(|| {
+                self.store
+                    .accept_unknown_live(&marker_id, &marker_nonce, &arm_request_id, &observation)
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            })
+        }
+
+        fn prove_no_write(
+            &self,
+            marker_id: dfs::MountedSifsMutationMarkerId,
+            marker_nonce: dfs::MountedSifsMutationNonce,
+            arm_request_id: dfs::MountedSifsMutationArmRequestId,
+            proof_code: &'static str,
+        ) -> Result<(), String> {
+            self.record("prove-no-write");
+            self.store
+                .prove_no_write_live(&marker_id, &marker_nonce, &arm_request_id, proof_code)
+                .map(drop)
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn fake_handoff(
+        root: &TestRoot,
+        behavior: FakeCommitBehavior,
+        commit_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> (
+        Arc<CloudFilesMountedMutationHandoff<FakeMountedMutationDaemon>>,
+        dfs::MountedSifsMutationOutboxStore,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let data_dir = root.data_dir();
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let client = FakeMountedMutationDaemon {
+            store: store.clone(),
+            events: Arc::clone(&events),
+            probe_error: false,
+            commit_behavior: behavior,
+            commit_observer,
+        };
+        let handoff = CloudFilesMountedMutationHandoff::open_with_client(
+            &data_dir,
+            "cloud-files:test-root",
+            client,
+        )
+        .expect("open fake Cloud Files handoff");
+        (Arc::new(handoff), store, events)
+    }
+
+    fn empty_mutation_report<R, E>(
+        outcome: Result<R, E>,
+    ) -> dfs::MountedSifsMutationReport<Result<R, E>> {
+        dfs::MountedSifsMutationReport {
+            outcome,
+            committed_work: dfs::DfsCommittedWork::default(),
+            committed_repair_records: Vec::new(),
+        }
+    }
+
+    fn mount_open_repair_record(label: &str) -> dfs::DfsRepairAttemptRecord {
+        dfs::DfsRepairAttemptRecord {
+            intent_id: format!("intent-{label}"),
+            object_id: dfs::DfsObjectId::from_legacy_named(format!("object-{label}"))
+                .expect("repair object ID"),
+            version: dfs::DfsVersion::from_legacy_named(format!("version-{label}"))
+                .expect("repair version"),
+            content_hash: format!("blake3:{label}"),
+            missing_replica_node_id: dfs::DfsNodeId::from_legacy_named(format!("node-{label}"))
+                .expect("repair target"),
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct MountedReadPolicyProbeTransport {
+        local_node_id: dfs::DfsNodeId,
+        primary_node_id: dfs::DfsNodeId,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        incoming: VecDeque<dfs::DfsRoutedMessage>,
+    }
+
+    impl dfs::DfsTransportIdentity for MountedReadPolicyProbeTransport {
+        fn local_node_id(&self) -> &dfs::DfsNodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl dfs::DfsMessageTransport for MountedReadPolicyProbeTransport {
+        fn send_routed_call(
+            &mut self,
+            target_node_id: &dfs::DfsNodeId,
+            call: dfs::DfsRoutedCall,
+        ) -> Result<(), sinomo_runtime::network::NetworkError> {
+            assert_eq!(target_node_id, &self.primary_node_id);
+            let routed = call.message;
+            let dfs::DfsNetworkMessage::NamespaceRequest(namespace) = &routed.message else {
+                panic!(
+                    "unexpected Cloud Files mounted-read request: {:?}",
+                    routed.message
+                );
+            };
+            let label = match &namespace.operation {
+                dfs::DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
+                dfs::DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+                operation => {
+                    panic!("unexpected Cloud Files mounted-read namespace operation: {operation:?}")
+                }
+            };
+            self.calls.lock().expect("mounted read calls").push(label);
+            self.incoming.push_back(dfs::DfsRoutedMessage {
+                source_node_id: self.primary_node_id.clone(),
+                target_node_id: self.local_node_id.clone(),
+                frame_id: routed.frame_id.saturating_add(1),
+                message_id: routed.message_id.saturating_add(1),
+                message: dfs::DfsNetworkMessage::NamespaceResponse(dfs::DfsNamespaceResponse {
+                    request_id: namespace.request_id.clone(),
+                    result: dfs::DfsNamespaceResult::Rejected {
+                        reason: "injected authoritative lookup failure".to_string(),
+                        posix_error: None,
+                        current_primary_node_id: None,
+                    },
+                    synced_path_object: None,
+                    synced_path_objects: Vec::new(),
+                    metadata_journal_batches: Vec::new(),
+                    metadata_journal_has_more: None,
+                    posix_coordination_result: None,
+                }),
+            });
+            Ok(())
+        }
+
+        fn drain_incoming_messages(
+            &mut self,
+        ) -> Result<Vec<dfs::DfsRoutedMessage>, sinomo_runtime::network::NetworkError> {
+            Ok(self.incoming.drain(..).collect())
+        }
+
+        fn pending_incoming_count(
+            &self,
+        ) -> Result<Option<usize>, sinomo_runtime::network::NetworkError> {
+            Ok(Some(self.incoming.len()))
+        }
+    }
+
+    struct HandoffBackedTestAdapter {
+        handoff: Arc<CloudFilesMountedMutationHandoff<FakeMountedMutationDaemon>>,
+        service: Arc<Mutex<u64>>,
+    }
+
+    impl CloudFilesDfsMutationAdapter for HandoffBackedTestAdapter {
+        fn apply(
+            &mut self,
+            command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationOutcome, String> {
+            self.handoff.run_captured_mutation(
+                &self.service,
+                &command.operation_id,
+                cloud_files_mounted_mutation_label(&command.kind),
+                |service| {
+                    *service += 1;
+                    empty_mutation_report(Ok::<_, &'static str>(()))
+                },
+            )?;
+            Ok(CloudFilesDfsMutationOutcome::Applied(
+                CloudFilesRemoteMutationEvidence {
+                    operation_id: command.operation_id.clone(),
+                    object_id: Some("remote-object".to_string()),
+                    version: Some("remote-version".to_string()),
+                    content_hash: command
+                        .staged_content
+                        .as_ref()
+                        .map(|content| content.descriptor.content_hash.clone()),
+                    content_size_bytes: command
+                        .staged_content
+                        .as_ref()
+                        .map(|content| content.descriptor.length),
+                    kind: Some("file".to_string()),
+                    detail: "test mutation applied".to_string(),
+                },
+            ))
+        }
+
+        fn reconcile(
+            &mut self,
+            _command: &CloudFilesDfsMutationCommand,
+        ) -> Result<CloudFilesDfsMutationReconciliation, String> {
+            self.handoff.ensure_ready()?;
+            Ok(CloudFilesDfsMutationReconciliation::NotApplied)
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_probe_failure_precedes_host_session_open() {
+        let root = TestRoot::new("handoff-probe-failure");
+        let data_dir = root.data_dir();
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("test outbox");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let client = FakeMountedMutationDaemon {
+            store: store.clone(),
+            events: Arc::clone(&events),
+            probe_error: true,
+            commit_behavior: FakeCommitBehavior::Accept,
+            commit_observer: None,
+        };
+        assert!(
+            CloudFilesMountedMutationHandoff::open_with_client(
+                &data_dir,
+                "cloud-files:must-not-open",
+                client,
+            )
+            .is_err()
+        );
+        assert_eq!(&*events.lock().expect("events"), &["probe"]);
+        let session = store
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::CloudFiles,
+                "cloud-files:proof-no-session-opened",
+            )
+            .expect("failed Probe left no live host session");
+        session.close_clean().expect("close proof session");
+    }
+
+    #[test]
+    fn durable_prepare_failure_gates_before_service_entry() {
+        let root = TestRoot::new("handoff-prepare-failure");
+        let service = Arc::new(Mutex::new(0_u64));
+        let (handoff, _store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let oversized_operation_id =
+            "x".repeat(dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES.saturating_add(1));
+
+        let error = handoff
+            .run_captured_mutation(
+                &service,
+                &oversized_operation_id,
+                "cloud-files.create-file",
+                |service| {
+                    *service += 1;
+                    empty_mutation_report(Ok::<_, &'static str>(()))
+                },
+            )
+            .expect_err("invalid durable Prepare must fail closed");
+
+        assert!(error.contains("prepare durable Cloud Files mounted mutation"));
+        assert_eq!(*service.lock().expect("service"), 0);
+        assert_eq!(&*events.lock().expect("events"), &["probe"]);
+        assert!(handoff.ensure_ready().is_err());
+    }
+
+    #[test]
+    fn production_mounted_read_policy_never_escalates_stat_or_lstat_to_sync_path() {
+        let root = TestRoot::new("mounted-read-policy");
+        let local_node =
+            dfs::DfsNodeId::from_legacy_named("node_cloud_files_mounted_read").expect("local node");
+        let primary_node =
+            dfs::DfsNodeId::from_legacy_named("node_cloud_files_mounted_read_primary")
+                .expect("primary node");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let transport = MountedReadPolicyProbeTransport {
+            local_node_id: local_node,
+            primary_node_id: primary_node.clone(),
+            calls: Arc::clone(&calls),
+            incoming: VecDeque::new(),
+        };
+        let control_plane =
+            dfs::SharedDfsControlPlaneKvClient::new(sinomo_runtime::kv::InProcessKvStore::new());
+        let shard = dfs::DfsMetadataShardConfig {
+            file_system_id: dfs::sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: primary_node,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: dfs::DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        control_plane.with_client(|kv| {
+            dfs::DfsControlPlaneStore::new(kv)
+                .put_metadata_shard(&shard)
+                .expect("mounted-read authority shard")
+        });
+        let mut service = dfs::NetworkedDfsService::new(
+            transport,
+            dfs::LocalContentStore::new(root.0.join("content")).expect("mounted-read content"),
+        )
+        .with_control_plane(control_plane);
+
+        // This is the exact policy hook invoked by open_sifs_service after its
+        // Armed-window bootstrap and before the service can reach CFAPI.
+        configure_cloud_files_mounted_read_policy(&mut service);
+        assert!(
+            service
+                .posix_stat_distributed("/services/missing-stat.txt")
+                .is_err()
+        );
+        assert!(
+            service
+                .posix_lstat_distributed("/services/missing-lstat.txt")
+                .is_err()
+        );
+        assert_eq!(
+            calls.lock().expect("mounted read calls").as_slice(),
+            ["lookup-path", "lookup-path"],
+            "Cloud Files stat/lstat must never perform an unowned SyncPath ingest"
+        );
+    }
+
+    #[test]
+    fn mount_open_arms_before_service_and_commits_full_work_with_repairs() {
+        let root = TestRoot::new("mount-open-order");
+        let observer_store =
+            dfs::MountedSifsMutationOutboxStore::new(&root.data_dir()).expect("observer outbox");
+        let captured_at_commit = Arc::new(Mutex::new(None));
+        let observed_capture = Arc::clone(&captured_at_commit);
+        let registration_calls = Arc::new(AtomicU64::new(0));
+        let registration_calls_at_commit = Arc::clone(&registration_calls);
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            assert_eq!(
+                registration_calls_at_commit.load(Ordering::SeqCst),
+                0,
+                "registration and callbacks must remain unreachable before CommitApplied ACK"
+            );
+            let marker_id = observer_store
+                .pending_marker_ids()
+                .expect("pending mount-open marker")
+                .into_iter()
+                .next()
+                .expect("captured mount-open marker");
+            let marker = observer_store
+                .marker(&marker_id)
+                .expect("read mount-open marker")
+                .expect("mount-open marker exists");
+            let dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. } = marker.phase
+            else {
+                panic!("mount open must be captured before CommitApplied");
+            };
+            *observed_capture.lock().expect("captured work") = Some(captured_work);
+        });
+        let (handoff, store, events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+        let repair = mount_open_repair_record("mount-open");
+        let events_at_open = Arc::clone(&events);
+
+        let opened = handoff
+            .run_captured_mount_open(|| {
+                events_at_open
+                    .lock()
+                    .expect("events")
+                    .push("service-open".to_string());
+                Ok::<_, &'static str>((41_u64, vec![repair.clone()]))
+            })
+            .expect("captured mount open");
+        registration_calls.fetch_add(1, Ordering::SeqCst);
+        events
+            .lock()
+            .expect("events")
+            .push("registration".to_string());
+
+        assert_eq!(opened, 41);
+        assert_eq!(registration_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &[
+                "probe",
+                "arm",
+                "service-open",
+                "commit-applied",
+                "registration"
+            ]
+        );
+        let captured = captured_at_commit
+            .lock()
+            .expect("captured work")
+            .clone()
+            .expect("captured mount-open work");
+        assert_eq!(
+            captured.committed_work,
+            cloud_files_mount_open_committed_work()
+        );
+        assert_eq!(captured.committed_repair_records, vec![repair]);
+        assert_eq!(
+            store
+                .daemon_committed_work_latch()
+                .expect("daemon committed-work latch")
+                .committed_work,
+            cloud_files_mount_open_committed_work()
+        );
+        assert!(
+            store
+                .pending_marker_ids()
+                .expect("pending markers")
+                .is_empty()
+        );
+        handoff
+            .ensure_ready()
+            .expect("successful open remains ready");
+    }
+
+    #[test]
+    fn mount_open_construction_or_bootstrap_error_commits_unknown_and_fences_registration() {
+        let root = TestRoot::new("mount-open-error");
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let events_at_open = Arc::clone(&events);
+
+        let error = handoff
+            .run_captured_mount_open(|| {
+                events_at_open
+                    .lock()
+                    .expect("events")
+                    .push("service-bootstrap".to_string());
+                Err::<((), Vec<dfs::DfsRepairAttemptRecord>), _>(
+                    "simulated service bootstrap error",
+                )
+            })
+            .expect_err("service-open error must fail activation");
+
+        assert!(error.contains("simulated service bootstrap error"));
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "service-bootstrap", "commit-unknown"]
+        );
+        let pending = store.pending_marker_ids().expect("pending full recovery");
+        assert_eq!(pending.len(), 1);
+        let marker = store
+            .marker(&pending[0])
+            .expect("read mount-open error marker")
+            .expect("mount-open error marker exists");
+        let dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+            requires_full_recovery,
+            error_observation: Some(observation),
+            ..
+        } = marker.phase
+        else {
+            panic!("mount-open error must remain daemon-accepted full recovery");
+        };
+        assert!(requires_full_recovery);
+        assert_eq!(observation.error_code, CLOUD_FILES_MOUNT_OPEN_ERROR);
+        assert_eq!(
+            observation.captured_work.committed_work,
+            cloud_files_mount_open_committed_work()
+        );
+        assert!(
+            observation
+                .captured_work
+                .committed_repair_records
+                .is_empty()
+        );
+        let later_opened = AtomicBool::new(false);
+        assert!(
+            handoff
+                .run_captured_mount_open(|| {
+                    later_opened.store(true, Ordering::SeqCst);
+                    Ok::<_, &'static str>(((), Vec::new()))
+                })
+                .is_err()
+        );
+        assert!(!later_opened.load(Ordering::SeqCst));
+        assert!(handoff.ensure_ready().is_err());
+    }
+
+    #[test]
+    fn failed_or_lost_mount_open_commit_retains_recovery_and_prevents_registration() {
+        for (index, behavior) in [
+            FakeCommitBehavior::FailBeforeAccept,
+            FakeCommitBehavior::LoseResponseAfterAccept,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TestRoot::new(&format!("mount-open-commit-{index}"));
+            let observer_store = dfs::MountedSifsMutationOutboxStore::new(&root.data_dir())
+                .expect("observer outbox");
+            let observed_marker_id = Arc::new(Mutex::new(None));
+            let marker_at_commit = Arc::clone(&observed_marker_id);
+            let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                *marker_at_commit.lock().expect("marker ID") = observer_store
+                    .pending_marker_ids()
+                    .expect("pending mount-open marker")
+                    .into_iter()
+                    .next();
+            });
+            let (handoff, store, _events) = fake_handoff(&root, behavior, Some(observer));
+            let registration_calls = AtomicU64::new(0);
+
+            let open_result =
+                handoff.run_captured_mount_open(|| Ok::<_, &'static str>(((), Vec::new())));
+            if open_result.is_ok() {
+                registration_calls.fetch_add(1, Ordering::SeqCst);
+            }
+
+            assert!(open_result.is_err());
+            assert_eq!(registration_calls.load(Ordering::SeqCst), 0);
+            assert!(handoff.ensure_ready().is_err());
+            let marker_id = observed_marker_id
+                .lock()
+                .expect("marker ID")
+                .clone()
+                .expect("captured marker ID");
+            let marker = store
+                .marker(&marker_id)
+                .expect("read retained marker")
+                .expect("retained mount-open marker");
+            match behavior {
+                FakeCommitBehavior::FailBeforeAccept => assert!(matches!(
+                    marker.phase,
+                    dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+                )),
+                FakeCommitBehavior::LoseResponseAfterAccept => assert!(matches!(
+                    marker.phase,
+                    dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                        requires_full_recovery: false,
+                        ..
+                    }
+                )),
+                FakeCommitBehavior::Accept => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_mount_open_repair_capture_commits_unknown_and_fails_activation() {
+        let root = TestRoot::new("mount-open-repair-overflow");
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let repairs = vec![
+            mount_open_repair_record("overflow");
+            dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1
+        ];
+
+        let error = handoff
+            .run_captured_mount_open(|| Ok::<_, &'static str>(((), repairs)))
+            .expect_err("unrepresentable repair snapshot must fail activation");
+
+        assert!(error.contains("captured 65 repair records"));
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "commit-unknown"]
+        );
+        let pending = store.pending_marker_ids().expect("pending full recovery");
+        assert_eq!(pending.len(), 1);
+        let marker = store
+            .marker(&pending[0])
+            .expect("read overflow marker")
+            .expect("overflow marker exists");
+        assert!(matches!(
+            marker.phase,
+            dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                requires_full_recovery: true,
+                error_observation: Some(dfs::MountedSifsMutationErrorObservation {
+                    error_code,
+                    ..
+                }),
+                ..
+            } if error_code == CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID
+        ));
+    }
+
+    #[test]
+    fn mounted_mutation_arms_before_service_and_drops_service_lock_for_commit() {
+        let root = TestRoot::new("handoff-order");
+        let service = Arc::new(Mutex::new(()));
+        let service_for_commit = Arc::clone(&service);
+        let lock_was_free = Arc::new(AtomicBool::new(false));
+        let lock_was_free_at_commit = Arc::clone(&lock_was_free);
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            lock_was_free_at_commit.store(service_for_commit.try_lock().is_ok(), Ordering::SeqCst);
+        });
+        let (handoff, _store, events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+        let events_at_service = Arc::clone(&events);
+        assert_eq!(
+            handoff
+                .run_captured_mutation(
+                    &service,
+                    "cloud-operation-1",
+                    "cloud-files.create-file",
+                    move |_| {
+                        events_at_service
+                            .lock()
+                            .expect("events")
+                            .push("service-entry".to_string());
+                        empty_mutation_report(Ok::<_, &'static str>(7_u64))
+                    },
+                )
+                .expect("captured mutation"),
+            7
+        );
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "service-entry", "commit-applied"]
+        );
+        assert!(lock_was_free.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mounted_read_ingest_commits_inner_error_without_gating() {
+        let root = TestRoot::new("read-ingest-inner-error");
+        let service = Arc::new(Mutex::new(0_u64));
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let events_at_service = Arc::clone(&events);
+
+        let outcome = handoff
+            .run_captured_read_ingest(
+                &service,
+                "cloud-files.test-directory-refresh",
+                move |service| {
+                    *service += 1;
+                    events_at_service
+                        .lock()
+                        .expect("events")
+                        .push("service-entry".to_string());
+                    empty_mutation_report(Err::<(), _>("directory disappeared"))
+                },
+            )
+            .expect("read handoff itself succeeds");
+
+        assert_eq!(outcome, Err("directory disappeared"));
+        assert_eq!(*service.lock().expect("service"), 1);
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "service-entry", "commit-applied"]
+        );
+        assert!(
+            store
+                .pending_marker_ids()
+                .expect("pending marker IDs")
+                .is_empty(),
+            "acknowledged inner read errors leave no recovery marker"
+        );
+        handoff
+            .ensure_ready()
+            .expect("ordinary inner read error does not gate the mount");
+    }
+
+    #[test]
+    fn mounted_read_ingest_commit_failure_gates_later_service_entry() {
+        for (index, behavior) in [
+            FakeCommitBehavior::FailBeforeAccept,
+            FakeCommitBehavior::LoseResponseAfterAccept,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TestRoot::new(&format!("read-ingest-commit-fence-{index}"));
+            let service = Arc::new(Mutex::new(0_u64));
+            let (handoff, _store, _events) = fake_handoff(&root, behavior, None);
+
+            assert!(
+                handoff
+                    .run_captured_read_ingest(
+                        &service,
+                        "cloud-files.test-directory-refresh",
+                        |service| {
+                            *service += 1;
+                            empty_mutation_report(Ok::<_, &'static str>(()))
+                        },
+                    )
+                    .is_err()
+            );
+            assert!(
+                handoff
+                    .run_captured_read_ingest(
+                        &service,
+                        "cloud-files.test-directory-refresh",
+                        |service| {
+                            *service += 1;
+                            empty_mutation_report(Ok::<_, &'static str>(()))
+                        },
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                *service.lock().expect("service"),
+                1,
+                "a failed handoff fences the later read before service entry"
+            );
+            assert!(handoff.ensure_ready().is_err());
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_lane_blocks_later_service_entry_until_first_ack() {
+        let root = TestRoot::new("handoff-lane");
+        let service = Arc::new(Mutex::new(0_u64));
+        let observer_calls = Arc::new(AtomicUsize::new(0));
+        let first_commit_started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release_first_commit = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let observer_started = Arc::clone(&first_commit_started);
+        let observer_release = Arc::clone(&release_first_commit);
+        let observer_calls_inner = Arc::clone(&observer_calls);
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if observer_calls_inner.fetch_add(1, Ordering::SeqCst) == 0 {
+                let (started_lock, started_wake) = &*observer_started;
+                *started_lock.lock().expect("started lock") = true;
+                started_wake.notify_all();
+                let (release_lock, release_wake) = &*observer_release;
+                let mut released = release_lock.lock().expect("release lock");
+                while !*released {
+                    released = release_wake.wait(released).expect("release wait");
+                }
+            }
+        });
+        let (handoff, _store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+
+        let first_handoff = Arc::clone(&handoff);
+        let first_service = Arc::clone(&service);
+        let first = thread::spawn(move || {
+            first_handoff.run_captured_mutation(
+                &first_service,
+                "cloud-operation-a",
+                "cloud-files.create-file",
+                |service| {
+                    *service += 1;
+                    empty_mutation_report(Ok::<_, &'static str>(()))
+                },
+            )
+        });
+        let (started_lock, started_wake) = &*first_commit_started;
+        let mut started = started_lock.lock().expect("started lock");
+        while !*started {
+            started = started_wake.wait(started).expect("started wait");
+        }
+        drop(started);
+
+        let second_handoff = Arc::clone(&handoff);
+        let second_service = Arc::clone(&service);
+        let second = thread::spawn(move || {
+            second_handoff.run_captured_mutation(
+                &second_service,
+                "cloud-operation-b",
+                "cloud-files.rename",
+                |service| {
+                    *service += 1;
+                    empty_mutation_report(Ok::<_, &'static str>(()))
+                },
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(*service.lock().expect("service"), 1);
+        let (release_lock, release_wake) = &*release_first_commit;
+        *release_lock.lock().expect("release lock") = true;
+        release_wake.notify_all();
+        first.join().expect("first join").expect("first mutation");
+        second
+            .join()
+            .expect("second join")
+            .expect("second mutation");
+        assert_eq!(*service.lock().expect("service"), 2);
+    }
+
+    #[test]
+    fn failed_or_lost_commit_gates_every_later_mutation() {
+        for (index, behavior) in [
+            FakeCommitBehavior::FailBeforeAccept,
+            FakeCommitBehavior::LoseResponseAfterAccept,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TestRoot::new(&format!("handoff-commit-fence-{index}"));
+            let service = Arc::new(Mutex::new(0_u64));
+            let (handoff, _store, _events) = fake_handoff(&root, behavior, None);
+            assert!(
+                handoff
+                    .run_captured_mutation(
+                        &service,
+                        "cloud-operation-a",
+                        "cloud-files.create-file",
+                        |service| {
+                            *service += 1;
+                            empty_mutation_report(Ok::<_, &'static str>(()))
+                        },
+                    )
+                    .is_err()
+            );
+            assert!(
+                handoff
+                    .run_captured_mutation(
+                        &service,
+                        "cloud-operation-b",
+                        "cloud-files.rename",
+                        |service| {
+                            *service += 1;
+                            empty_mutation_report(Ok::<_, &'static str>(()))
+                        },
+                    )
+                    .is_err()
+            );
+            assert_eq!(*service.lock().expect("service"), 1);
+            assert!(handoff.ensure_ready().is_err());
+        }
+    }
+
+    #[test]
+    fn failed_or_lost_commit_cannot_advance_queue_or_local_completion() {
+        for (index, behavior) in [
+            FakeCommitBehavior::FailBeforeAccept,
+            FakeCommitBehavior::LoseResponseAfterAccept,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root = TestRoot::new(&format!("handoff-queue-fence-{index}"));
+            let (handoff, _store, _events) = fake_handoff(&root, behavior, None);
+            let mut state =
+                CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                    .expect("writable state");
+            let operation = state
+                .enqueue_capture(create_capture(
+                    &format!("commit-failure-capture-{index}"),
+                    b"durable bytes",
+                ))
+                .expect("enqueue operation");
+            let operation_id = operation.request.operation_id.clone();
+            let mut adapter = HandoffBackedTestAdapter {
+                handoff,
+                service: Arc::new(Mutex::new(0)),
+            };
+            let mut effects = FakeEffects::default();
+            let progress = crate::sync_executor::execute_cloud_files_operation(
+                &mut state.queue,
+                &operation_id,
+                &mut adapter,
+                &mut effects,
+            )
+            .expect("executor durably retains ambiguity");
+            assert!(matches!(
+                progress,
+                CloudFilesSyncExecutionProgress::AwaitingReconciliation { .. }
+            ));
+            assert_eq!(
+                state
+                    .queue()
+                    .operation(&operation_id)
+                    .expect("retained operation")
+                    .status,
+                CloudFilesLocalOperationStatus::Retrying
+            );
+            assert_eq!(effects.completions, 0);
+            assert!(adapter.handoff.ensure_ready().is_err());
+        }
+    }
+
+    #[test]
+    fn host_session_close_waits_for_mutation_ack_and_lane_release() {
+        let root = TestRoot::new("handoff-close-order");
+        let service = Arc::new(Mutex::new(()));
+        let commit_started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let release_commit = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let observer_started = Arc::clone(&commit_started);
+        let observer_release = Arc::clone(&release_commit);
+        let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let (started_lock, started_wake) = &*observer_started;
+            *started_lock.lock().expect("started lock") = true;
+            started_wake.notify_all();
+            let (release_lock, release_wake) = &*observer_release;
+            let mut released = release_lock.lock().expect("release lock");
+            while !*released {
+                released = release_wake.wait(released).expect("release wait");
+            }
+        });
+        let (handoff, store, _events) =
+            fake_handoff(&root, FakeCommitBehavior::Accept, Some(observer));
+        let mutation_handoff = Arc::clone(&handoff);
+        let mutation_service = Arc::clone(&service);
+        let mutation = thread::spawn(move || {
+            mutation_handoff.run_captured_mutation(
+                &mutation_service,
+                "cloud-operation-before-close",
+                "cloud-files.create-directory",
+                |_| empty_mutation_report(Ok::<_, &'static str>(())),
+            )
+        });
+        let (started_lock, started_wake) = &*commit_started;
+        let mut started = started_lock.lock().expect("started lock");
+        while !*started {
+            started = started_wake.wait(started).expect("started wait");
+        }
+        drop(started);
+
+        let close_handoff = Arc::clone(&handoff);
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        let close = thread::spawn(move || {
+            let result = close_handoff.close_clean();
+            closed_sender.send(()).expect("close signal");
+            result
+        });
+        assert!(matches!(
+            closed_receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        let (release_lock, release_wake) = &*release_commit;
+        *release_lock.lock().expect("release lock") = true;
+        release_wake.notify_all();
+        mutation
+            .join()
+            .expect("mutation join")
+            .expect("mutation acknowledged");
+        close.join().expect("close join").expect("clean close");
+        closed_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close completed after mutation");
+        let replacement = store
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::CloudFiles,
+                "cloud-files:replacement-after-clean-close",
+            )
+            .expect("clean close released session liveness");
+        replacement.close_clean().expect("close replacement");
+    }
+
+    #[test]
+    fn every_service_error_is_unknown_and_requires_full_recovery() {
+        let root = TestRoot::new("handoff-service-error");
+        let service = Arc::new(Mutex::new(0_u64));
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let error = handoff
+            .run_captured_mutation(
+                &service,
+                "cloud-operation-error",
+                "cloud-files.rmdir",
+                |service| {
+                    *service += 1;
+                    empty_mutation_report(Err::<(), _>("service returned conflict"))
+                },
+            )
+            .expect_err("service Err is never accepted as a conflict/no-write fact");
+        assert!(error.contains("after service entry"));
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "commit-unknown"]
+        );
+        let pending = store.pending_marker_ids().expect("pending marker IDs");
+        assert_eq!(pending.len(), 1);
+        let marker = store
+            .marker(&pending[0])
+            .expect("read marker")
+            .expect("marker exists");
+        assert!(matches!(
+            marker.phase,
+            dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                requires_full_recovery: true,
+                error_observation: Some(_),
+                ..
+            }
+        ));
+        assert!(handoff.ensure_ready().is_err());
+    }
+
+    #[test]
+    fn mounted_mutation_labels_cover_every_writable_cloud_operation() {
+        assert_eq!(
+            [
+                CloudFilesLocalOperationKind::CreateFile,
+                CloudFilesLocalOperationKind::CreateDirectory,
+                CloudFilesLocalOperationKind::ReplaceFile,
+                CloudFilesLocalOperationKind::DeleteFile,
+                CloudFilesLocalOperationKind::DeleteDirectory,
+                CloudFilesLocalOperationKind::Rename,
+            ]
+            .map(|kind| cloud_files_mounted_mutation_label(&kind)),
+            [
+                "cloud-files.create-file",
+                "cloud-files.create-directory",
+                "cloud-files.replace-file",
+                "cloud-files.unlink",
+                "cloud-files.rmdir",
+                "cloud-files.rename",
+            ]
+        );
     }
 
     fn expected_object() -> CloudFilesExpectedObjectState {

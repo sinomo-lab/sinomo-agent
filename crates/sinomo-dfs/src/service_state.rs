@@ -474,6 +474,10 @@ pub struct NetworkedDfsService<T> {
     pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
     pub(crate) recent_namespace_freshness_syncs:
         BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
+    /// Whether a failed read-only authority lookup may fall back to applying
+    /// the primary's journal locally. Mounted clients disable this and bracket
+    /// their explicit directory refreshes with a durable host handoff.
+    pub(crate) implicit_read_replica_ingest_enabled: bool,
     pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
     pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
     pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,
@@ -529,7 +533,8 @@ pub struct DfsMessageProcessResult {
 /// metadata may already be committed when response journal construction or
 /// delivery fails. The daemon consumes these coalesced bits before unwrapping
 /// an operation outcome, so every durable edge retains an owner.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
 pub struct DfsCommittedWork {
     pub publish_metadata: bool,
     pub repair_maintenance: bool,

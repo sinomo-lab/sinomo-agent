@@ -197,6 +197,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn should_attempt_read_freshness_sync(&mut self, shard: &DfsMetadataShardConfig) -> bool {
+        if !self.implicit_read_replica_ingest_enabled {
+            return false;
+        }
         let now = Instant::now();
         self.recent_namespace_freshness_syncs
             .retain(|_, attempted_at| {

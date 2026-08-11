@@ -18,6 +18,7 @@ use crate::{
     sifs_file_system_id,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sinomo_core::cluster::DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT;
 use sinomo_core::kv::{
     InProcessKvStore, KvCompare, KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse,
 };
@@ -31,10 +32,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 const DFS_KV_PREFIX: &str = "/dfs";
 const METADATA_HEAD_WATERMARK_PUBLISH_RETRIES: usize = 4;
 const METADATA_OPERATION_FLOOR_PUBLISH_RETRIES: usize = 4;
+const METADATA_SHARD_AUTHORITY_READ_RETRIES: usize = 4;
 const METADATA_MEMBERSHIP_HANDOFF_RETRIES: usize = 4;
 const PLACEMENT_RECONCILIATION_QUEUE_SCHEMA_VERSION: u32 = 1;
 const PLACEMENT_RECONCILIATION_ACTIVITY_INDEX_SCHEMA_VERSION: u32 = 1;
@@ -69,6 +72,22 @@ fn metadata_operation_authority_view_error_is_retryable(error: &KvError) -> bool
                 && detail.contains("retry the read")
         }
         _ => false,
+    }
+}
+
+fn metadata_shard_authority_read_deadline(operation_deadline: Option<Instant>) -> Instant {
+    let started = Instant::now();
+    let authority_deadline = started
+        .checked_add(DEFAULT_CLUSTER_CONTROL_PLANE_RAFT_APPEND_TIMEOUT)
+        .unwrap_or(started);
+    operation_deadline
+        .map(|deadline| deadline.min(authority_deadline))
+        .unwrap_or(authority_deadline)
+}
+
+fn metadata_shard_authority_deadline_error() -> KvError {
+    KvError::AuthorityUnavailable {
+        detail: "metadata shard authority read deadline elapsed".to_string(),
     }
 }
 
@@ -1102,6 +1121,23 @@ pub trait DfsControlPlaneKvClient: std::fmt::Debug + Send {
         self.get_consistent(keys)
     }
 
+    /// Establish one authoritative exact-key-set view before the caller's
+    /// absolute operation deadline.
+    ///
+    /// Snapshot-backed compatibility clients complete locally and may rely on
+    /// this preflight. Clients which can block on transport must override this
+    /// method and enforce `deadline` throughout the underlying request.
+    fn get_authoritative_consistent_before(
+        &mut self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        if Instant::now() >= deadline {
+            return Err(metadata_shard_authority_deadline_error());
+        }
+        self.get_authoritative_consistent(keys)
+    }
+
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError>;
 
     /// Establish one authoritative, complete view of a bounded prefix.
@@ -1179,6 +1215,19 @@ pub trait AsyncDfsControlPlaneKvClient: std::fmt::Debug + Send {
             self.refresh_latest_async().await?;
             self.get_consistent_async(keys).await
         })
+    }
+
+    /// Async counterpart of
+    /// [`DfsControlPlaneKvClient::get_authoritative_consistent_before`].
+    fn get_authoritative_consistent_before_async<'a>(
+        &'a mut self,
+        keys: Vec<String>,
+        deadline: Instant,
+    ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        if Instant::now() >= deadline {
+            return Box::pin(async { Err(metadata_shard_authority_deadline_error()) });
+        }
+        self.get_authoritative_consistent_async(keys)
     }
 
     fn range_prefix_async<'a>(
@@ -1301,6 +1350,19 @@ where
                 detail: "control-plane KV client lock poisoned".to_string(),
             })?
             .get_authoritative_consistent(keys)
+    }
+
+    fn get_authoritative_consistent_before(
+        &mut self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.inner
+            .lock()
+            .map_err(|_| KvError::Serialization {
+                detail: "control-plane KV client lock poisoned".to_string(),
+            })?
+            .get_authoritative_consistent_before(keys, deadline)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
@@ -3360,43 +3422,50 @@ impl<'a> DfsControlPlaneStore<'a> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, KvError> {
+        self.metadata_shard_authority_is_current_before(expected, None)
+    }
+
+    /// Validate one shard assignment before the caller's existing absolute
+    /// operation deadline. When no caller deadline exists, the normal
+    /// control-plane Raft budget bounds the complete retry sequence.
+    pub fn metadata_shard_authority_is_current_before(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        operation_deadline: Option<Instant>,
+    ) -> Result<bool, KvError> {
         let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
         let requested_keys = [key, handoff_key];
-        let entries = self.kv.get_authoritative_consistent(&requested_keys)?;
-        if entries.len() != requested_keys.len() {
-            return Err(KvError::Serialization {
-                detail: format!(
-                    "consistent metadata-shard authority read returned {} entries for {} exact keys",
-                    entries.len(),
-                    requested_keys.len(),
-                ),
-            });
-        }
-        for (requested_key, entry) in requested_keys.iter().zip(&entries) {
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.key != *requested_key)
+        let deadline = metadata_shard_authority_read_deadline(operation_deadline);
+        for attempt in 0..METADATA_SHARD_AUTHORITY_READ_RETRIES {
+            if Instant::now() >= deadline {
+                return Err(metadata_shard_authority_deadline_error());
+            }
+            match self
+                .kv
+                .get_authoritative_consistent_before(&requested_keys, deadline)
             {
-                return Err(KvError::Serialization {
-                    detail: format!(
-                        "consistent metadata-shard authority read returned an out-of-order entry for exact key {requested_key:?}"
-                    ),
-                });
+                Ok(entries) => {
+                    return metadata_shard_authority_entries_are_current(
+                        expected,
+                        &requested_keys,
+                        entries,
+                    );
+                }
+                Err(error)
+                    if metadata_operation_authority_view_error_is_retryable(&error)
+                        && attempt + 1 < METADATA_SHARD_AUTHORITY_READ_RETRIES =>
+                {
+                    // Every authoritative exact-set call starts a fresh client
+                    // generation but inherits this one absolute deadline.
+                    // Replay only transient authority-view failures; semantic
+                    // rejection and storage/codec errors fail closed.
+                }
+                Err(error) => return Err(error),
             }
         }
-        let mut entries = entries.into_iter();
-        let Some(entry) = entries.next().flatten() else {
-            return Ok(false);
-        };
-        if entry.decode::<DfsMetadataShardConfig>()? != *expected {
-            return Ok(false);
-        }
-        if entries.next().flatten().is_some() {
-            return Ok(false);
-        }
-        Ok(true)
+        unreachable!("metadata shard authority retry loop always returns")
     }
 
     /// Return the unchanged shard for an idempotent request, but fail closed
@@ -3451,6 +3520,45 @@ impl<'a> DfsControlPlaneStore<'a> {
         };
         entry.decode().map(Some)
     }
+}
+
+fn metadata_shard_authority_entries_are_current(
+    expected: &DfsMetadataShardConfig,
+    requested_keys: &[String],
+    entries: Vec<Option<KvEntry>>,
+) -> Result<bool, KvError> {
+    if entries.len() != requested_keys.len() {
+        return Err(KvError::Serialization {
+            detail: format!(
+                "consistent metadata-shard authority read returned {} entries for {} exact keys",
+                entries.len(),
+                requested_keys.len(),
+            ),
+        });
+    }
+    for (requested_key, entry) in requested_keys.iter().zip(&entries) {
+        if entry
+            .as_ref()
+            .is_some_and(|entry| entry.key != *requested_key)
+        {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "consistent metadata-shard authority read returned an out-of-order entry for exact key {requested_key:?}"
+                ),
+            });
+        }
+    }
+    let mut entries = entries.into_iter();
+    let Some(entry) = entries.next().flatten() else {
+        return Ok(false);
+    };
+    if entry.decode::<DfsMetadataShardConfig>()? != *expected {
+        return Ok(false);
+    }
+    if entries.next().flatten().is_some() {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 pub struct DfsControlPlaneAsyncStore<'a> {
@@ -4224,46 +4332,50 @@ impl<'a> DfsControlPlaneAsyncStore<'a> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, KvError> {
+        self.metadata_shard_authority_is_current_before(expected, None)
+            .await
+    }
+
+    /// Async deadline-preserving counterpart of
+    /// [`DfsControlPlaneStore::metadata_shard_authority_is_current_before`].
+    pub async fn metadata_shard_authority_is_current_before(
+        &mut self,
+        expected: &DfsMetadataShardConfig,
+        operation_deadline: Option<Instant>,
+    ) -> Result<bool, KvError> {
         let key = metadata_shard_key(&expected.file_system_id, &expected.shard_id);
         let handoff_key =
             metadata_shard_membership_handoff_key(&expected.file_system_id, &expected.shard_id);
         let requested_keys = vec![key, handoff_key];
-        let entries = self
-            .kv
-            .get_authoritative_consistent_async(requested_keys.clone())
-            .await?;
-        if entries.len() != requested_keys.len() {
-            return Err(KvError::Serialization {
-                detail: format!(
-                    "consistent metadata-shard authority read returned {} entries for {} exact keys",
-                    entries.len(),
-                    requested_keys.len(),
-                ),
-            });
-        }
-        for (requested_key, entry) in requested_keys.iter().zip(&entries) {
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.key != *requested_key)
+        let deadline = metadata_shard_authority_read_deadline(operation_deadline);
+        for attempt in 0..METADATA_SHARD_AUTHORITY_READ_RETRIES {
+            if Instant::now() >= deadline {
+                return Err(metadata_shard_authority_deadline_error());
+            }
+            match self
+                .kv
+                .get_authoritative_consistent_before_async(requested_keys.clone(), deadline)
+                .await
             {
-                return Err(KvError::Serialization {
-                    detail: format!(
-                        "consistent metadata-shard authority read returned an out-of-order entry for exact key {requested_key:?}"
-                    ),
-                });
+                Ok(entries) => {
+                    return metadata_shard_authority_entries_are_current(
+                        expected,
+                        &requested_keys,
+                        entries,
+                    );
+                }
+                Err(error)
+                    if metadata_operation_authority_view_error_is_retryable(&error)
+                        && attempt + 1 < METADATA_SHARD_AUTHORITY_READ_RETRIES =>
+                {
+                    // Match the synchronous operation-bound retry contract:
+                    // every fresh exact-key-set attempt consumes the remaining
+                    // portion of the same absolute deadline.
+                }
+                Err(error) => return Err(error),
             }
         }
-        let mut entries = entries.into_iter();
-        let Some(entry) = entries.next().flatten() else {
-            return Ok(false);
-        };
-        if entry.decode::<DfsMetadataShardConfig>()? != *expected {
-            return Ok(false);
-        }
-        if entries.next().flatten().is_some() {
-            return Ok(false);
-        }
-        Ok(true)
+        unreachable!("async metadata shard authority retry loop always returns")
     }
 
     /// Async counterpart of [`DfsControlPlaneStore::transfer_metadata_shard_primary`].
@@ -5431,6 +5543,7 @@ fn metadata_hash_range_width(start_inclusive: u64, end_exclusive: u64) -> u128 {
 mod tests {
     use super::*;
     use crate::{DfsNodeAdvertisement, DfsPlacementReconciliationState, DfsPlacementScope};
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A client whose generic refresh and point-read paths are deliberately
@@ -5443,6 +5556,8 @@ mod tests {
         coherent_observation_calls: AtomicUsize,
         authoritative_exact_set_calls: AtomicUsize,
         requested_exact_sets: Mutex<Vec<Vec<String>>>,
+        authoritative_deadlines: Mutex<Vec<Instant>>,
+        authoritative_errors: Mutex<VecDeque<KvError>>,
     }
 
     impl ExactAuthorityOnlyKv {
@@ -5453,6 +5568,8 @@ mod tests {
                 coherent_observation_calls: AtomicUsize::new(0),
                 authoritative_exact_set_calls: AtomicUsize::new(0),
                 requested_exact_sets: Mutex::new(Vec::new()),
+                authoritative_deadlines: Mutex::new(Vec::new()),
+                authoritative_errors: Mutex::new(VecDeque::new()),
             }
         }
 
@@ -5473,6 +5590,14 @@ mod tests {
                 .lock()
                 .expect("exact authority requests")
                 .push(keys.to_vec());
+            if let Some(error) = self
+                .authoritative_errors
+                .lock()
+                .expect("scripted exact authority errors")
+                .pop_front()
+            {
+                return Err(error);
+            }
             Ok(keys
                 .iter()
                 .map(|key| self.inner.get(key).cloned())
@@ -5500,6 +5625,18 @@ mod tests {
             &mut self,
             keys: &[String],
         ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.authoritative_exact_set(keys)
+        }
+
+        fn get_authoritative_consistent_before(
+            &mut self,
+            keys: &[String],
+            deadline: Instant,
+        ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.authoritative_deadlines
+                .lock()
+                .expect("exact authority deadlines")
+                .push(deadline);
             self.authoritative_exact_set(keys)
         }
 
@@ -5542,6 +5679,19 @@ mod tests {
             &'a mut self,
             keys: Vec<String>,
         ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+            let result = self.authoritative_exact_set(&keys);
+            Box::pin(async move { result })
+        }
+
+        fn get_authoritative_consistent_before_async<'a>(
+            &'a mut self,
+            keys: Vec<String>,
+            deadline: Instant,
+        ) -> DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+            self.authoritative_deadlines
+                .lock()
+                .expect("exact authority deadlines")
+                .push(deadline);
             let result = self.authoritative_exact_set(&keys);
             Box::pin(async move { result })
         }
@@ -8808,6 +8958,166 @@ mod tests {
         assert_one_exact_authority_read(&client, &shard);
     }
 
+    #[test]
+    fn metadata_shard_authority_retries_transient_exact_set_failures() {
+        let (mut client, shard) = exact_authority_test_fixture("sync-exact-authority-retry");
+        client
+            .authoritative_errors
+            .lock()
+            .expect("scripted exact authority errors")
+            .extend([
+                KvError::AuthorityUnavailable {
+                    detail: "temporary exact authority loss".to_string(),
+                },
+                KvError::Io {
+                    path: "test-cluster-authoritative-view".to_string(),
+                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                        .to_string(),
+                },
+            ]);
+
+        assert!(
+            DfsControlPlaneStore::new(&mut client)
+                .metadata_shard_authority_is_current(&shard)
+                .expect("transient exact authority failures must settle")
+        );
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            3
+        );
+        assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(client.coherent_observation_calls.load(Ordering::SeqCst), 0);
+        let deadlines = client
+            .authoritative_deadlines
+            .lock()
+            .expect("exact authority deadlines");
+        assert_eq!(deadlines.len(), 3);
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
+    }
+
+    #[test]
+    fn metadata_shard_authority_expired_deadline_starts_no_exact_read() {
+        let (mut client, shard) = exact_authority_test_fixture("sync-exact-authority-expired");
+        let expired = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .expect("expired authority deadline");
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut client)
+                .metadata_shard_authority_is_current_before(&shard, Some(expired)),
+            Err(KvError::AuthorityUnavailable { detail })
+                if detail.contains("deadline elapsed")
+        ));
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            0
+        );
+        assert!(
+            client
+                .authoritative_deadlines
+                .lock()
+                .expect("exact authority deadlines")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn metadata_shard_authority_semantic_rejection_does_not_retry() {
+        let (mut stale_client, stale_shard) =
+            exact_authority_test_fixture("sync-exact-authority-stale");
+        let successor = DfsMetadataShardConfig {
+            epoch: stale_shard.epoch.saturating_add(1),
+            ..stale_shard.clone()
+        };
+        DfsControlPlaneStore::new(&mut stale_client.inner)
+            .put_metadata_shard(&successor)
+            .expect("install successor shard");
+        assert!(
+            !DfsControlPlaneStore::new(&mut stale_client)
+                .metadata_shard_authority_is_current(&stale_shard)
+                .expect("stale assignment is a semantic rejection")
+        );
+        assert_eq!(
+            stale_client
+                .authoritative_exact_set_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+
+        let (mut handoff_client, handoff_shard) =
+            exact_authority_test_fixture("sync-exact-authority-handoff");
+        handoff_client
+            .inner
+            .put(
+                metadata_shard_membership_handoff_key(
+                    &handoff_shard.file_system_id,
+                    &handoff_shard.shard_id,
+                ),
+                vec![1],
+                None,
+            )
+            .expect("install handoff marker");
+        assert!(
+            !DfsControlPlaneStore::new(&mut handoff_client)
+                .metadata_shard_authority_is_current(&handoff_shard)
+                .expect("pending handoff is a semantic rejection")
+        );
+        assert_eq!(
+            handoff_client
+                .authoritative_exact_set_calls
+                .load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn metadata_shard_authority_does_not_retry_terminal_io() {
+        let (mut client, shard) = exact_authority_test_fixture("sync-exact-authority-terminal-io");
+        let terminal = KvError::Io {
+            path: "test-disk".to_string(),
+            detail: "permission denied".to_string(),
+        };
+        client
+            .authoritative_errors
+            .lock()
+            .expect("scripted exact authority errors")
+            .push_back(terminal.clone());
+
+        assert_eq!(
+            DfsControlPlaneStore::new(&mut client)
+                .metadata_shard_authority_is_current(&shard)
+                .expect_err("ordinary IO must remain terminal"),
+            terminal
+        );
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            1
+        );
+    }
+
+    #[test]
+    fn metadata_shard_authority_bounds_transient_exact_set_retries() {
+        let (mut client, shard) = exact_authority_test_fixture("sync-exact-authority-exhausted");
+        client
+            .authoritative_errors
+            .lock()
+            .expect("scripted exact authority errors")
+            .extend((0..METADATA_SHARD_AUTHORITY_READ_RETRIES).map(|_| {
+                KvError::AuthorityUnavailable {
+                    detail: "temporary exact authority loss".to_string(),
+                }
+            }));
+
+        assert!(matches!(
+            DfsControlPlaneStore::new(&mut client).metadata_shard_authority_is_current(&shard),
+            Err(KvError::AuthorityUnavailable { .. })
+        ));
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            METADATA_SHARD_AUTHORITY_READ_RETRIES
+        );
+    }
+
     #[tokio::test]
     async fn async_metadata_shard_authority_uses_one_exact_set_without_full_snapshot_refresh() {
         let (mut client, shard) = exact_authority_test_fixture("async-exact-authority");
@@ -8818,6 +9128,37 @@ mod tests {
                 .expect("async exact operation-bound authority validation")
         );
         assert_one_exact_authority_read(&client, &shard);
+    }
+
+    #[tokio::test]
+    async fn async_metadata_shard_authority_retries_transient_exact_set_failure() {
+        let (mut client, shard) = exact_authority_test_fixture("async-exact-authority-retry");
+        client
+            .authoritative_errors
+            .lock()
+            .expect("scripted exact authority errors")
+            .push_back(KvError::AuthorityUnavailable {
+                detail: "temporary async exact authority loss".to_string(),
+            });
+
+        assert!(
+            DfsControlPlaneAsyncStore::new(&mut client)
+                .metadata_shard_authority_is_current(&shard)
+                .await
+                .expect("async transient exact authority failure must settle")
+        );
+        assert_eq!(
+            client.authoritative_exact_set_calls.load(Ordering::SeqCst),
+            2
+        );
+        assert_eq!(client.refresh_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(client.coherent_observation_calls.load(Ordering::SeqCst), 0);
+        let deadlines = client
+            .authoritative_deadlines
+            .lock()
+            .expect("exact authority deadlines");
+        assert_eq!(deadlines.len(), 2);
+        assert!(deadlines.iter().all(|deadline| *deadline == deadlines[0]));
     }
 
     #[test]

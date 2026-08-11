@@ -1510,6 +1510,17 @@ pub(crate) fn sifs_mount_supervisor_service_hook(
     })
 }
 
+fn retire_after_exit_status_persisted<P, R>(persist_status: P, retire: R) -> Result<(), String>
+where
+    P: FnOnce() -> Result<(), String>,
+    R: FnOnce() -> Result<(), String>,
+{
+    persist_status().map_err(|error| {
+        format!("persist mount exit status before retiring the adapter: {error}")
+    })?;
+    retire()
+}
+
 fn run_mount_supervisor(
     data_dir: &SinomoDataDir,
     daemon_paths: &DaemonPaths,
@@ -1878,21 +1889,52 @@ fn run_mount_supervisor(
                 } else {
                     MountRetirementReason::ProviderRestart
                 };
-                let exit_error = (!mount_active).then(|| {
-                    mount
-                        .status(daemon_pid, restart_count)
-                        .last_error
-                        .unwrap_or_else(|| {
-                            "mount adapter exited while the mount remained enabled".to_string()
-                        })
+                let exit_status = (!mount_active).then(|| {
+                    let mut status = mount.status(daemon_pid, restart_count);
+                    if status.phase != SifsMountRuntimePhase::Error {
+                        status = status_error(
+                            mount.config(),
+                            Some(mount.mount_point()),
+                            daemon_pid,
+                            restart_count,
+                            "mount adapter exited while the mount remained enabled",
+                        );
+                    }
+                    status
                 });
-                if let Err(error) = retire_active_mount(
-                    data_dir,
-                    &mut active,
-                    &mount_cancellation,
-                    &mut pending_cloud_unregister,
-                    retirement_reason,
-                ) {
+                let exit_error = exit_status
+                    .as_ref()
+                    .and_then(|status| status.last_error.clone());
+                let retirement = match exit_status {
+                    Some(status) => retire_after_exit_status_persisted(
+                        || {
+                            publish_status_before_retirement(
+                                &store,
+                                data_dir,
+                                &observed_status,
+                                &mut last_persisted_status,
+                                status,
+                            )
+                        },
+                        || {
+                            retire_active_mount(
+                                data_dir,
+                                &mut active,
+                                &mount_cancellation,
+                                &mut pending_cloud_unregister,
+                                retirement_reason,
+                            )
+                        },
+                    ),
+                    None => retire_active_mount(
+                        data_dir,
+                        &mut active,
+                        &mount_cancellation,
+                        &mut pending_cloud_unregister,
+                        retirement_reason,
+                    ),
+                };
+                if let Err(error) = retirement {
                     publish_status(
                         &store,
                         data_dir,
@@ -2168,6 +2210,30 @@ fn publish_status(
             .map(|_| ())
             .map_err(|error| error.to_string())
     });
+}
+
+fn publish_status_before_retirement(
+    store: &ConfigStore,
+    data_dir: &SinomoDataDir,
+    observed_status: &RwLock<SifsMountRuntimeStatus>,
+    last_persisted_status: &mut Option<SifsMountRuntimeStatus>,
+    status: SifsMountRuntimeStatus,
+) -> Result<(), String> {
+    let mut persistence_error = None;
+    publish_status_with(observed_status, last_persisted_status, status, |status| {
+        store
+            .set_typed(
+                data_dir,
+                None,
+                SIFS_MOUNT_STATUS_CONFIG_KEY,
+                status,
+                ConfigWriteTarget::Local,
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .inspect_err(|error| persistence_error = Some(error.clone()))
+    });
+    persistence_error.map_or(Ok(()), Err)
 }
 
 fn publish_status_with<F>(
@@ -2639,13 +2705,14 @@ impl ActiveMount {
     }
 
     fn status(&mut self, daemon_pid: u32, restart_count: u64) -> SifsMountRuntimeStatus {
-        status_for_config(
+        unix_fuse_mount_status(
             &self.config,
-            Some(&self.mount_point),
+            &self.mount_point,
             daemon_pid,
             restart_count,
-            SifsMountRuntimePhase::Mounted,
-            "SIFS is mounted through Unix FUSE",
+            self.handle
+                .as_ref()
+                .and_then(sinomo_dfs_fuse::DfsFuseMountHandle::fatal_error),
         )
     }
 
@@ -2661,6 +2728,27 @@ impl ActiveMount {
             self.stop_error = Some(error.clone());
             error
         })
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
+fn unix_fuse_mount_status(
+    config: &SifsMountConfig,
+    mount_point: &Path,
+    daemon_pid: u32,
+    restart_count: u64,
+    fatal_error: Option<String>,
+) -> SifsMountRuntimeStatus {
+    match fatal_error {
+        Some(error) => status_error(config, Some(mount_point), daemon_pid, restart_count, error),
+        None => status_for_config(
+            config,
+            Some(mount_point),
+            daemon_pid,
+            restart_count,
+            SifsMountRuntimePhase::Mounted,
+            "SIFS is mounted through Unix FUSE",
+        ),
     }
 }
 
@@ -4153,6 +4241,65 @@ mod tests {
         }
         assert_eq!(status.phase, SifsMountRuntimePhase::Error);
         assert!(!mount_runtime_confirms_start(&status));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
+    #[test]
+    fn fatal_fuse_health_is_reported_as_error_before_worker_join() {
+        let config = SifsMountConfig {
+            enabled: true,
+            read_only: false,
+            ..SifsMountConfig::default()
+        };
+        let status = unix_fuse_mount_status(
+            &config,
+            Path::new("/home/ix/sinomo"),
+            41,
+            3,
+            Some("mounted mutation requires durable recovery".to_string()),
+        );
+        assert_eq!(status.phase, SifsMountRuntimePhase::Error);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("mounted mutation requires durable recovery")
+        );
+        assert!(!mount_runtime_confirms_start(&status));
+    }
+
+    #[test]
+    fn mount_exit_status_is_persisted_before_retirement() {
+        let events = std::cell::RefCell::new(Vec::new());
+
+        retire_after_exit_status_persisted(
+            || {
+                events.borrow_mut().push("persist-error");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("retire-adapter");
+                Ok(())
+            },
+        )
+        .expect("persisted exit status permits retirement");
+
+        assert_eq!(events.into_inner(), vec!["persist-error", "retire-adapter"]);
+    }
+
+    #[test]
+    fn mount_exit_status_persistence_failure_blocks_retirement() {
+        let retired = std::cell::Cell::new(false);
+
+        let error = retire_after_exit_status_persisted(
+            || Err("simulated status store failure".to_string()),
+            || {
+                retired.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("unpersisted fatal status must retain the adapter");
+
+        assert!(error.contains("simulated status store failure"));
+        assert!(!retired.get());
     }
 
     #[test]

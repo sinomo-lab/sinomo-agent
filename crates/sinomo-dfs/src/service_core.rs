@@ -64,6 +64,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             local_metadata_journal_cursors: BTreeMap::new(),
             metadata_replication_cursors: BTreeMap::new(),
             recent_namespace_freshness_syncs: BTreeMap::new(),
+            implicit_read_replica_ingest_enabled: true,
             pending_metadata_replications: BTreeMap::new(),
             pending_metadata_authority_probes: BTreeMap::new(),
             metadata_authority_probe_results: BTreeMap::new(),
@@ -189,6 +190,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn set_cancellation(&mut self, cancellation: Option<DfsCancellationFlag>) {
         self.cancellation = cancellation;
+    }
+
+    /// Keep ordinary mounted reads non-mutating. Explicit directory refreshes
+    /// may still replay replica journals, but their adapters must own the
+    /// crash-safe mounted-mutation handoff around that call.
+    pub fn disable_implicit_read_replica_ingest(&mut self) {
+        self.implicit_read_replica_ingest_enabled = false;
+        self.recent_namespace_freshness_syncs.clear();
     }
 
     /// Add a cancellation source without replacing one already installed by
@@ -403,6 +412,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             content,
             cross_shard_namespace_locks,
             metadata_replication_cursors,
+            implicit_read_replica_ingest_enabled,
             pending_namespace_request_recovery_cursor,
             committed_work_tracker,
             repair_retry_tick,
@@ -420,6 +430,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // recovery collapses its fully hydrated service back to lazy state.
         service.cross_shard_namespace_locks = cross_shard_namespace_locks;
         service.metadata_replication_cursors = metadata_replication_cursors;
+        service.implicit_read_replica_ingest_enabled = implicit_read_replica_ingest_enabled;
         // This cursor is tiny but provides bounded-scan fairness across routine
         // maintenance ticks. Restarting at the first durable page after every
         // lazy rebuild could starve later locally authoritative requests behind

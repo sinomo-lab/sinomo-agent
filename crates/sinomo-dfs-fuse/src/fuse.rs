@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -37,6 +37,7 @@ const FUSE_CREATE_RACE_RETRY_ROUNDS: usize = 4;
 const MIN_FUSE_READ_WORKERS: usize = 4;
 const MAX_FUSE_READ_WORKERS: usize = 16;
 const FUSE_READ_QUEUE_DEPTH_PER_WORKER: usize = 4;
+const FUSE_FATAL_UNMOUNT_TIMEOUT: Duration = Duration::from_secs(5);
 // Bound acknowledged-but-not-yet-published data per descriptor. Ordinary
 // Linux FUSE writes arrive as much smaller kernel chunks, so this keeps a
 // sequential transfer to one canonical DFS publication without allowing an
@@ -45,6 +46,997 @@ const MAX_DIRTY_WRITE_BYTES_PER_HANDLE: usize = 64 * 1024 * 1024;
 static NEXT_MOUNT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 type SifsService = dfs::MountedSifsService;
 type FuseReadJob = Box<dyn FnOnce() + Send + 'static>;
+
+#[derive(Debug, Default)]
+struct FuseMountHealthState {
+    fatal_error: Option<String>,
+    unmount_error: Option<String>,
+    unmount_completed: bool,
+}
+
+/// Shared fatal lifecycle edge between FUSE callbacks and the owning mount
+/// handle. A mounted-mutation ambiguity cancels DFS work immediately and
+/// signals a pre-started helper worker, so even a foreground `mount2` cannot
+/// remain alive forever in a gated-but-reported-healthy state.
+pub(crate) struct FuseMountHealth {
+    state: Arc<Mutex<FuseMountHealthState>>,
+    unmount_completed: Arc<Condvar>,
+    cancellation: dfs::DfsCancellationFlag,
+    fatal_unmount: SyncSender<()>,
+}
+
+impl std::fmt::Debug for FuseMountHealth {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FuseMountHealth")
+            .field("fatal_error", &self.fatal_error())
+            .finish_non_exhaustive()
+    }
+}
+
+impl FuseMountHealth {
+    pub(crate) fn new(
+        mount_point: PathBuf,
+        mount_helper: PathBuf,
+        cancellation: dfs::DfsCancellationFlag,
+    ) -> io::Result<Arc<Self>> {
+        let state = Arc::new(Mutex::new(FuseMountHealthState::default()));
+        let unmount_completed = Arc::new(Condvar::new());
+        let (fatal_unmount, receiver) = mpsc::sync_channel(1);
+        let worker_state = Arc::clone(&state);
+        let worker_unmount_completed = Arc::clone(&unmount_completed);
+        thread::Builder::new()
+            .name("sinomo-fuse-fatal-unmount".to_string())
+            .spawn(move || {
+                if receiver.recv().is_err() {
+                    return;
+                }
+                let result = run_fuse_fatal_unmount(&mount_helper, &mount_point);
+                let mut state = worker_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Err(error) = result {
+                    state.unmount_error = Some(error);
+                }
+                state.unmount_completed = true;
+                drop(state);
+                worker_unmount_completed.notify_all();
+            })?;
+        Ok(Arc::new(Self {
+            state,
+            unmount_completed,
+            cancellation,
+            fatal_unmount,
+        }))
+    }
+
+    fn fail(&self, detail: impl Into<String>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fatal_error.is_some() {
+            return;
+        }
+        state.fatal_error = Some(detail.into());
+        drop(state);
+        self.cancellation.cancel();
+        if let Err(error) = self.fatal_unmount.try_send(()) {
+            if matches!(error, mpsc::TrySendError::Full(())) {
+                return;
+            }
+            let detail = "fatal FUSE unmount worker exited before the request".to_string();
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.unmount_error.get_or_insert(detail);
+            state.unmount_completed = true;
+            drop(state);
+            self.unmount_completed.notify_all();
+        }
+    }
+
+    pub(crate) fn fatal_error(&self) -> Option<String> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.fatal_error.as_ref().map(|fatal| {
+            state
+                .unmount_error
+                .as_ref()
+                .map_or_else(|| fatal.clone(), |error| format!("{fatal}; {error}"))
+        })
+    }
+
+    pub(crate) fn wait_for_fatal_unmount(
+        &self,
+        timeout: Duration,
+    ) -> std::result::Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.fatal_error.is_none() {
+            return Err("fatal FUSE unmount was not requested".to_string());
+        }
+        while !state.unmount_completed {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(format!(
+                    "fatal FUSE unmount did not complete within {timeout:?}"
+                ));
+            }
+            let (next, timed_out) = self
+                .unmount_completed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+            if timed_out.timed_out() && !state.unmount_completed {
+                return Err(format!(
+                    "fatal FUSE unmount did not complete within {timeout:?}"
+                ));
+            }
+        }
+        match state.unmount_error.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
+}
+
+fn run_fuse_fatal_unmount(
+    mount_helper: &Path,
+    mount_point: &Path,
+) -> std::result::Result<(), String> {
+    let mut child = Command::new(mount_helper)
+        .arg("-u")
+        .arg("-z")
+        .arg(mount_point)
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "start fatal FUSE unmount with {}: {error}",
+                mount_helper.display()
+            )
+        })?;
+    let deadline = Instant::now() + FUSE_FATAL_UNMOUNT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "fatal FUSE unmount with {} exited with {status}",
+                    mount_helper.display()
+                ));
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "fatal FUSE unmount with {} exceeded {:?}",
+                    mount_helper.display(),
+                    FUSE_FATAL_UNMOUNT_TIMEOUT
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "observe fatal FUSE unmount with {}: {error}",
+                    mount_helper.display()
+                ));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseMountedMutationOperation {
+    MountOpen,
+    BufferedWritePublication,
+    ImmediateWritePublication,
+    FileSync,
+    TruncateObject,
+    TruncatePath,
+    SetMode,
+    SetOwner,
+    SetSymlinkOwner,
+    SetTimes,
+    Mknod,
+    Mkdir,
+    Unlink,
+    Rmdir,
+    Symlink,
+    Rename,
+    Hardlink,
+    Create,
+    DirectorySync,
+    DirectoryRefresh,
+    AdvisoryLockAcquire,
+    AdvisoryLockQuery,
+    AdvisoryLockRenew,
+    AdvisoryLockConvert,
+    AdvisoryLockUnlock,
+    AdvisoryLockCancel,
+    AdvisoryLockClose,
+}
+
+impl FuseMountedMutationOperation {
+    #[cfg(test)]
+    const ALL: [Self; 27] = [
+        Self::MountOpen,
+        Self::BufferedWritePublication,
+        Self::ImmediateWritePublication,
+        Self::FileSync,
+        Self::TruncateObject,
+        Self::TruncatePath,
+        Self::SetMode,
+        Self::SetOwner,
+        Self::SetSymlinkOwner,
+        Self::SetTimes,
+        Self::Mknod,
+        Self::Mkdir,
+        Self::Unlink,
+        Self::Rmdir,
+        Self::Symlink,
+        Self::Rename,
+        Self::Hardlink,
+        Self::Create,
+        Self::DirectorySync,
+        Self::DirectoryRefresh,
+        Self::AdvisoryLockAcquire,
+        Self::AdvisoryLockQuery,
+        Self::AdvisoryLockRenew,
+        Self::AdvisoryLockConvert,
+        Self::AdvisoryLockUnlock,
+        Self::AdvisoryLockCancel,
+        Self::AdvisoryLockClose,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::MountOpen => "fuse.mount-open",
+            Self::BufferedWritePublication => "fuse.buffered-write-publication",
+            Self::ImmediateWritePublication => "fuse.immediate-write-publication",
+            Self::FileSync => "fuse.file-sync",
+            Self::TruncateObject => "fuse.truncate-object",
+            Self::TruncatePath => "fuse.truncate-path",
+            Self::SetMode => "fuse.set-mode",
+            Self::SetOwner => "fuse.set-owner",
+            Self::SetSymlinkOwner => "fuse.set-symlink-owner",
+            Self::SetTimes => "fuse.set-times",
+            Self::Mknod => "fuse.mknod",
+            Self::Mkdir => "fuse.mkdir",
+            Self::Unlink => "fuse.unlink",
+            Self::Rmdir => "fuse.rmdir",
+            Self::Symlink => "fuse.symlink",
+            Self::Rename => "fuse.rename",
+            Self::Hardlink => "fuse.hardlink",
+            Self::Create => "fuse.create",
+            Self::DirectorySync => "fuse.directory-sync",
+            Self::DirectoryRefresh => "fuse.directory-refresh",
+            Self::AdvisoryLockAcquire => "fuse.advisory-lock-acquire",
+            Self::AdvisoryLockQuery => "fuse.advisory-lock-query",
+            Self::AdvisoryLockRenew => "fuse.advisory-lock-renew",
+            Self::AdvisoryLockConvert => "fuse.advisory-lock-convert",
+            Self::AdvisoryLockUnlock => "fuse.advisory-lock-unlock",
+            Self::AdvisoryLockCancel => "fuse.advisory-lock-cancel",
+            Self::AdvisoryLockClose => "fuse.advisory-lock-close",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FuseMountedMutationError {
+    errno: libc::c_int,
+    error_code: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FuseMountedMutationPreflightError {
+    errno: libc::c_int,
+    proof_code: &'static str,
+}
+
+impl FuseMountedMutationError {
+    fn ambiguous(errno: libc::c_int, error_code: &'static str) -> Self {
+        Self { errno, error_code }
+    }
+}
+
+impl From<DfsPosixError> for FuseMountedMutationError {
+    fn from(error: DfsPosixError) -> Self {
+        let error_code = match &error {
+            DfsPosixError::NotFound { .. } => "dfs-posix-not-found",
+            DfsPosixError::AlreadyExists { .. } => "dfs-posix-already-exists",
+            DfsPosixError::NotDirectory { .. } => "dfs-posix-not-directory",
+            DfsPosixError::IsDirectory { .. } => "dfs-posix-is-directory",
+            DfsPosixError::NotSymlink { .. } => "dfs-posix-not-symlink",
+            DfsPosixError::MissingParent { .. } => "dfs-posix-missing-parent",
+            DfsPosixError::InvalidPath { .. } => "dfs-posix-invalid-path",
+            DfsPosixError::SymlinkContentPending { .. } => "dfs-posix-symlink-content-pending",
+            DfsPosixError::Conflict { .. } => "dfs-posix-conflict",
+            DfsPosixError::DirectoryNotEmpty { .. } => "dfs-posix-directory-not-empty",
+            DfsPosixError::PendingWrite { .. } => "dfs-posix-pending-write",
+            DfsPosixError::PartialBulkCommit { .. } => "dfs-posix-partial-bulk-commit",
+            DfsPosixError::Dfs(_) => "dfs-posix-dfs-error",
+            DfsPosixError::Metadata(_) => "dfs-posix-metadata-error",
+        };
+        let errno = errno_for_posix_error(error);
+        Self { errno, error_code }
+    }
+}
+
+trait FuseMountedMutationCoordinator {
+    type Admission<'a>
+    where
+        Self: 'a;
+    type Lease<'a>
+    where
+        Self: 'a;
+
+    fn admit(&self) -> std::result::Result<Self::Admission<'_>, ()>;
+    fn is_gated(&self) -> bool;
+    fn gate(&self);
+    fn gate_before_mount(&self);
+    fn retire_gated_session(&self) -> std::result::Result<(), ()>;
+    fn prepare(
+        &self,
+        operation: FuseMountedMutationOperation,
+        stable_operation_id: Option<String>,
+    ) -> std::result::Result<Self::Lease<'_>, ()>;
+    fn arm(
+        &self,
+        lease: &mut Self::Lease<'_>,
+    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()>;
+    fn persist_captured(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        captured_work: &dfs::MountedSifsMutationCapturedWork,
+    ) -> std::result::Result<(), ()>;
+    fn persist_unknown(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        observation: &dfs::MountedSifsMutationErrorObservation,
+    ) -> std::result::Result<(), ()>;
+    fn persist_proven_no_write(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> std::result::Result<(), ()>;
+    fn commit_captured(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        captured_work: &dfs::MountedSifsMutationCapturedWork,
+    ) -> std::result::Result<(), ()>;
+    fn commit_unknown(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        observation: &dfs::MountedSifsMutationErrorObservation,
+    ) -> std::result::Result<(), ()>;
+    fn commit_proven_no_write(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> std::result::Result<(), ()>;
+    fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()>;
+}
+
+#[derive(Debug)]
+struct FuseMountedMutationHandoff {
+    store: dfs::MountedSifsMutationOutboxStore,
+    session: Option<dfs::MountedSifsHostMountSessionLease>,
+    client: sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient,
+    mount_health: Arc<FuseMountHealth>,
+    gated: AtomicBool,
+    fatal_unmount_enabled: AtomicBool,
+    mutation_lane: Mutex<()>,
+}
+
+impl FuseMountedMutationHandoff {
+    fn enable_fatal_unmount(&self) {
+        self.fatal_unmount_enabled.store(true, Ordering::Release);
+    }
+
+    fn close_clean(&mut self) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        if session.close_clean().is_err() {
+            self.gate();
+        }
+    }
+
+    fn retire_gated_session(&self) -> std::result::Result<(), ()> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        session.close_clean_shared().map_err(|_| ())
+    }
+}
+
+impl Drop for FuseMountedMutationHandoff {
+    fn drop(&mut self) {
+        self.close_clean();
+    }
+}
+
+impl FuseMountedMutationCoordinator for FuseMountedMutationHandoff {
+    type Admission<'a> = MutexGuard<'a, ()>;
+    type Lease<'a> = dfs::MountedSifsMutationLease<'a>;
+
+    fn admit(&self) -> std::result::Result<Self::Admission<'_>, ()> {
+        self.mutation_lane.lock().map_err(|_| ())
+    }
+
+    fn is_gated(&self) -> bool {
+        self.gated.load(Ordering::Acquire)
+    }
+
+    fn gate(&self) {
+        self.gated.store(true, Ordering::Release);
+        if self.fatal_unmount_enabled.load(Ordering::Acquire) {
+            self.mount_health.fail(
+                "mounted DFS mutation became ambiguous; retiring the FUSE session for durable recovery",
+            );
+        }
+    }
+
+    fn gate_before_mount(&self) {
+        self.gated.store(true, Ordering::Release);
+    }
+
+    fn retire_gated_session(&self) -> std::result::Result<(), ()> {
+        FuseMountedMutationHandoff::retire_gated_session(self)
+    }
+
+    fn prepare(
+        &self,
+        operation: FuseMountedMutationOperation,
+        stable_operation_id: Option<String>,
+    ) -> std::result::Result<Self::Lease<'_>, ()> {
+        let session = self.session.as_ref().ok_or(())?;
+        self.store
+            .prepare(session, stable_operation_id, operation.label())
+            .map_err(|_| ())
+    }
+
+    fn arm(
+        &self,
+        lease: &mut Self::Lease<'_>,
+    ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        let marker = lease.marker();
+        self.client
+            .arm(
+                marker.marker_id.clone(),
+                marker.marker_nonce.clone(),
+                arm_request_id.clone(),
+            )
+            .map_err(|_| ())?;
+        Ok(arm_request_id)
+    }
+
+    fn persist_captured(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        captured_work: &dfs::MountedSifsMutationCapturedWork,
+    ) -> std::result::Result<(), ()> {
+        lease
+            .record_captured_success(arm_request_id, captured_work.clone())
+            .map_err(|_| ())
+    }
+
+    fn persist_unknown(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        observation: &dfs::MountedSifsMutationErrorObservation,
+    ) -> std::result::Result<(), ()> {
+        lease
+            .record_unknown_after_error(arm_request_id, observation.clone())
+            .map_err(|_| ())
+    }
+
+    fn persist_proven_no_write(
+        &self,
+        lease: &mut Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> std::result::Result<(), ()> {
+        lease
+            .record_proven_no_write(arm_request_id, proof_code)
+            .map_err(|_| ())
+    }
+
+    fn commit_captured(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        captured_work: &dfs::MountedSifsMutationCapturedWork,
+    ) -> std::result::Result<(), ()> {
+        let marker = lease.marker();
+        self.client
+            .commit_applied(
+                marker.marker_id.clone(),
+                marker.marker_nonce.clone(),
+                arm_request_id.clone(),
+                captured_work.clone(),
+            )
+            .map(drop)
+            .map_err(|_| ())
+    }
+
+    fn commit_unknown(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        observation: &dfs::MountedSifsMutationErrorObservation,
+    ) -> std::result::Result<(), ()> {
+        let marker = lease.marker();
+        self.client
+            .commit_unknown(
+                marker.marker_id.clone(),
+                marker.marker_nonce.clone(),
+                arm_request_id.clone(),
+                observation.clone(),
+            )
+            .map(drop)
+            .map_err(|_| ())
+    }
+
+    fn commit_proven_no_write(
+        &self,
+        lease: &Self::Lease<'_>,
+        arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+        proof_code: &'static str,
+    ) -> std::result::Result<(), ()> {
+        let marker = lease.marker();
+        self.client
+            .prove_no_write(
+                marker.marker_id.clone(),
+                marker.marker_nonce.clone(),
+                arm_request_id.clone(),
+                proof_code,
+            )
+            .map(drop)
+            .map_err(|_| ())
+    }
+
+    fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()> {
+        lease.release_after_daemon_ack().map_err(|_| ())
+    }
+}
+
+fn fuse_mounted_mutation_handoff_required(clustered: bool, _read_only: bool) -> bool {
+    // A distributed directory read can synchronously ingest a primary's
+    // journal into this node's durable replica. Read-only mounts therefore
+    // need the same crash-safe handoff even though user-visible mutations are
+    // rejected before service entry.
+    clustered
+}
+
+fn prepare_fuse_clustered_mount_handoff_with<C, H, E>(
+    client: C,
+    probe: impl FnOnce(&C) -> std::result::Result<(), E>,
+    open_host_session: impl FnOnce(C) -> std::result::Result<H, E>,
+) -> std::result::Result<H, E> {
+    // Probe is the daemon readiness boundary. Publishing the host session
+    // before that ACK could leave a mount-owned lease behind for a daemon that
+    // never proved it can accept recovery work.
+    probe(&client)?;
+    open_host_session(client)
+}
+
+fn fail_mounted_mutation<C: FuseMountedMutationCoordinator, R>(
+    coordinator: &C,
+) -> std::result::Result<R, libc::c_int> {
+    coordinator.gate();
+    Err(libc::EIO)
+}
+
+fn finish_proven_no_write<C: FuseMountedMutationCoordinator>(
+    coordinator: &C,
+    mut lease: C::Lease<'_>,
+    arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+    proof_code: &'static str,
+) -> std::result::Result<(), libc::c_int> {
+    if coordinator
+        .persist_proven_no_write(&mut lease, arm_request_id, proof_code)
+        .and_then(|_| coordinator.commit_proven_no_write(&lease, arm_request_id, proof_code))
+        .and_then(|_| coordinator.release_after_daemon_ack(lease))
+        .is_err()
+    {
+        return fail_mounted_mutation(coordinator);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum FuseMountOpenHandoffError<E> {
+    Service(E),
+    Handoff {
+        detail: &'static str,
+        service_error: Option<E>,
+    },
+}
+
+fn fuse_mount_open_committed_work() -> dfs::DfsCommittedWork {
+    // Metadata-backend construction can finish durable recovery before a
+    // service-local tracker exists. Mount activation therefore transfers every
+    // coalesced ownership edge, even when the opened service did not observe a
+    // new edge itself. These bits are monotonic wakeups, so the conservative
+    // handoff is safe and keeps constructor recovery daemon-owned.
+    dfs::DfsCommittedWork {
+        publish_metadata: true,
+        repair_maintenance: true,
+        namespace_maintenance: true,
+        metadata_replica_progress: true,
+        metadata_materialization: true,
+    }
+}
+
+fn finish_fuse_mount_open_unknown<C: FuseMountedMutationCoordinator>(
+    coordinator: &C,
+    mut lease: C::Lease<'_>,
+    arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+    error_code: &'static str,
+) -> std::result::Result<(), ()> {
+    // The service may not have been returned, so its repair inventory is not
+    // available. Full daemon recovery is the evidence-preserving fallback.
+    let captured_work =
+        dfs::MountedSifsMutationCapturedWork::new(fuse_mount_open_committed_work(), Vec::new())
+            .map_err(|_| ())?;
+    let observation =
+        dfs::MountedSifsMutationErrorObservation::new(captured_work, error_code).map_err(|_| ())?;
+    coordinator
+        .persist_unknown(&mut lease, arm_request_id, &observation)
+        .and_then(|_| coordinator.commit_unknown(&lease, arm_request_id, &observation))
+        .and_then(|_| coordinator.release_after_daemon_ack(lease))
+}
+
+fn run_fuse_clustered_mount_open_with<C, R, E>(
+    coordinator: &C,
+    open_service: impl FnOnce() -> std::result::Result<R, E>,
+    durable_repair_records: impl FnOnce(&R) -> Vec<dfs::DfsRepairAttemptRecord>,
+) -> std::result::Result<R, FuseMountOpenHandoffError<E>>
+where
+    C: FuseMountedMutationCoordinator,
+{
+    // Keep the same lane for mount activation and every later callback. No
+    // service/backend open may cross Prepare+Arm, and no callback can become
+    // visible until the daemon has durably accepted this first operation.
+    let _admission = match coordinator.admit() {
+        Ok(admission) => admission,
+        Err(()) => {
+            coordinator.gate_before_mount();
+            let _ = coordinator.retire_gated_session();
+            return Err(FuseMountOpenHandoffError::Handoff {
+                detail: "mounted DFS mount-open admission failed",
+                service_error: None,
+            });
+        }
+    };
+    if coordinator.is_gated() {
+        coordinator.gate_before_mount();
+        let _ = coordinator.retire_gated_session();
+        return Err(FuseMountOpenHandoffError::Handoff {
+            detail: "mounted DFS mount-open handoff was already gated",
+            service_error: None,
+        });
+    }
+    let mut lease = match coordinator.prepare(FuseMountedMutationOperation::MountOpen, None) {
+        Ok(lease) => lease,
+        Err(()) => {
+            coordinator.gate_before_mount();
+            let _ = coordinator.retire_gated_session();
+            return Err(FuseMountOpenHandoffError::Handoff {
+                detail: "mounted DFS mount-open Prepare failed",
+                service_error: None,
+            });
+        }
+    };
+    let arm_request_id = match coordinator.arm(&mut lease) {
+        Ok(arm_request_id) => arm_request_id,
+        Err(()) => {
+            coordinator.gate_before_mount();
+            let _ = coordinator.retire_gated_session();
+            return Err(FuseMountOpenHandoffError::Handoff {
+                detail: "mounted DFS mount-open Arm failed",
+                service_error: None,
+            });
+        }
+    };
+
+    let opened = match open_service() {
+        Ok(opened) => opened,
+        Err(service_error) => {
+            coordinator.gate_before_mount();
+            let accepted = finish_fuse_mount_open_unknown(
+                coordinator,
+                lease,
+                &arm_request_id,
+                "fuse-mount-open-service-error",
+            );
+            let retired = coordinator.retire_gated_session();
+            if accepted.is_err() || retired.is_err() {
+                return Err(FuseMountOpenHandoffError::Handoff {
+                    detail: "mounted DFS mount-open error recovery handoff failed",
+                    service_error: Some(service_error),
+                });
+            }
+            return Err(FuseMountOpenHandoffError::Service(service_error));
+        }
+    };
+
+    let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
+        fuse_mount_open_committed_work(),
+        durable_repair_records(&opened),
+    ) {
+        Ok(captured_work) => captured_work,
+        Err(_) => {
+            // An oversized or otherwise invalid exact inventory cannot be
+            // truncated. Retain an Unknown marker and require full recovery.
+            coordinator.gate_before_mount();
+            let accepted = finish_fuse_mount_open_unknown(
+                coordinator,
+                lease,
+                &arm_request_id,
+                "fuse-mount-open-capture-invalid",
+            );
+            let retired = coordinator.retire_gated_session();
+            return Err(FuseMountOpenHandoffError::Handoff {
+                detail: if accepted.is_ok() && retired.is_ok() {
+                    "mounted DFS mount-open repair inventory exceeded the durable handoff bound"
+                } else {
+                    "mounted DFS mount-open invalid-capture recovery handoff failed"
+                },
+                service_error: None,
+            });
+        }
+    };
+
+    if coordinator
+        .persist_captured(&mut lease, &arm_request_id, &captured_work)
+        .and_then(|_| coordinator.commit_captured(&lease, &arm_request_id, &captured_work))
+        .and_then(|_| coordinator.release_after_daemon_ack(lease))
+        .is_err()
+    {
+        coordinator.gate_before_mount();
+        let _ = coordinator.retire_gated_session();
+        return Err(FuseMountOpenHandoffError::Handoff {
+            detail: "mounted DFS mount-open committed-work handoff failed",
+            service_error: None,
+        });
+    }
+    Ok(opened)
+}
+
+fn run_fuse_mounted_mutation_with<C, S, R>(
+    coordinator: &C,
+    service: &Mutex<S>,
+    operation: FuseMountedMutationOperation,
+    mutation: impl FnOnce(
+        &mut S,
+    ) -> dfs::MountedSifsMutationReport<
+        std::result::Result<R, FuseMountedMutationError>,
+    >,
+) -> std::result::Result<R, libc::c_int>
+where
+    C: FuseMountedMutationCoordinator,
+{
+    run_fuse_mounted_mutation_with_lock(
+        coordinator,
+        service,
+        operation,
+        None,
+        |service| service.lock().map_err(|_| libc::EIO),
+        mutation,
+    )
+}
+
+fn run_fuse_mounted_mutation_with_lock<'service, C, S, R>(
+    coordinator: &C,
+    service: &'service Mutex<S>,
+    operation: FuseMountedMutationOperation,
+    stable_operation_id: Option<String>,
+    lock_service: impl FnOnce(
+        &'service Mutex<S>,
+    ) -> std::result::Result<MutexGuard<'service, S>, libc::c_int>,
+    mutation: impl FnOnce(
+        &mut S,
+    ) -> dfs::MountedSifsMutationReport<
+        std::result::Result<R, FuseMountedMutationError>,
+    >,
+) -> std::result::Result<R, libc::c_int>
+where
+    C: FuseMountedMutationCoordinator,
+{
+    run_fuse_mounted_mutation_with_lock_and_preflight(
+        coordinator,
+        service,
+        operation,
+        stable_operation_id,
+        lock_service,
+        |_| Ok(()),
+        mutation,
+    )
+}
+
+fn run_fuse_mounted_mutation_with_lock_and_preflight<'service, C, S, R>(
+    coordinator: &C,
+    service: &'service Mutex<S>,
+    operation: FuseMountedMutationOperation,
+    stable_operation_id: Option<String>,
+    lock_service: impl FnOnce(
+        &'service Mutex<S>,
+    ) -> std::result::Result<MutexGuard<'service, S>, libc::c_int>,
+    preflight: impl FnOnce(&mut S) -> std::result::Result<(), FuseMountedMutationPreflightError>,
+    mutation: impl FnOnce(
+        &mut S,
+    ) -> dfs::MountedSifsMutationReport<
+        std::result::Result<R, FuseMountedMutationError>,
+    >,
+) -> std::result::Result<R, libc::c_int>
+where
+    C: FuseMountedMutationCoordinator,
+{
+    // Admission remains held while the service lane is deliberately dropped
+    // for the daemon RPC. This prevents a later callback from crossing an
+    // ambiguity fence before the earlier handoff is durably acknowledged.
+    let _admission = match coordinator.admit() {
+        Ok(admission) => admission,
+        Err(()) => {
+            let result = fail_mounted_mutation(coordinator);
+            let _ = coordinator.retire_gated_session();
+            return result;
+        }
+    };
+    let result = (|| {
+        if coordinator.is_gated() {
+            return Err(libc::EIO);
+        }
+        let mut lease = match coordinator.prepare(operation, stable_operation_id) {
+            Ok(lease) => lease,
+            Err(()) => return fail_mounted_mutation(coordinator),
+        };
+        let arm_request_id = match coordinator.arm(&mut lease) {
+            Ok(arm_request_id) => arm_request_id,
+            Err(()) => return fail_mounted_mutation(coordinator),
+        };
+        let mut service = match lock_service(service) {
+            Ok(service) => service,
+            Err(errno) => {
+                if errno != libc::ETIMEDOUT {
+                    coordinator.gate();
+                }
+                if finish_proven_no_write(
+                    coordinator,
+                    lease,
+                    &arm_request_id,
+                    "fuse-service-lock-not-entered",
+                )
+                .is_err()
+                {
+                    return Err(libc::EIO);
+                }
+                return Err(errno);
+            }
+        };
+        // Another in-flight mutation can discover ambiguity while this operation
+        // waits for the serialized service lane. This Arm has not entered the
+        // service yet, so attest that exact no-write fact and stop here.
+        if coordinator.is_gated() {
+            drop(service);
+            let _ = finish_proven_no_write(
+                coordinator,
+                lease,
+                &arm_request_id,
+                "fuse-gated-before-service-entry",
+            );
+            return Err(libc::EIO);
+        }
+        if let Err(preflight) = preflight(&mut service) {
+            drop(service);
+            finish_proven_no_write(coordinator, lease, &arm_request_id, preflight.proof_code)?;
+            return Err(preflight.errno);
+        }
+        let report = mutation(&mut service);
+        // The main daemon can wait for disk, queue ownership, or network work.
+        // Never make that RPC while holding the mount-wide service lane.
+        drop(service);
+
+        let captured_work = match dfs::MountedSifsMutationCapturedWork::new(
+            report.committed_work,
+            report.committed_repair_records,
+        ) {
+            Ok(captured_work) => captured_work,
+            Err(_) => return fail_mounted_mutation(coordinator),
+        };
+        match report.outcome {
+            Ok(value) => {
+                if coordinator
+                    .persist_captured(&mut lease, &arm_request_id, &captured_work)
+                    .and_then(|_| {
+                        coordinator.commit_captured(&lease, &arm_request_id, &captured_work)
+                    })
+                    .and_then(|_| coordinator.release_after_daemon_ack(lease))
+                    .is_err()
+                {
+                    return fail_mounted_mutation(coordinator);
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                // An ordinary error after service entry is ambiguous even when its
+                // operation-local capture happens to be empty. Preserve exactly
+                // what was observed, hand it to the daemon, and fail closed for
+                // every later mutation on this mount.
+                coordinator.gate();
+                let observation = match dfs::MountedSifsMutationErrorObservation::new(
+                    captured_work,
+                    error.error_code,
+                ) {
+                    Ok(observation) => observation,
+                    Err(_) => return Err(libc::EIO),
+                };
+                if coordinator
+                    .persist_unknown(&mut lease, &arm_request_id, &observation)
+                    .and_then(|_| coordinator.commit_unknown(&lease, &arm_request_id, &observation))
+                    .and_then(|_| coordinator.release_after_daemon_ack(lease))
+                    .is_err()
+                {
+                    return Err(libc::EIO);
+                }
+                Err(error.errno)
+            }
+        }
+    })();
+    if coordinator.is_gated() && coordinator.retire_gated_session().is_err() {
+        return Err(libc::EIO);
+    }
+    result
+}
+
+fn run_fuse_service_mounted_mutation_with_lock_and_preflight<'service, R>(
+    handoff: Option<&FuseMountedMutationHandoff>,
+    service: &'service Mutex<SifsService>,
+    operation: FuseMountedMutationOperation,
+    stable_operation_id: Option<String>,
+    lock_service: impl FnOnce(
+        &'service Mutex<SifsService>,
+    )
+        -> std::result::Result<MutexGuard<'service, SifsService>, libc::c_int>,
+    preflight: impl FnOnce(
+        &mut SifsService,
+    ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
+    mutation: impl FnOnce(&mut SifsService) -> std::result::Result<R, FuseMountedMutationError>,
+) -> std::result::Result<R, libc::c_int> {
+    let Some(handoff) = handoff else {
+        let mut service = lock_service(service)?;
+        preflight(&mut service).map_err(|error| error.errno)?;
+        return mutation(&mut service).map_err(|error| error.errno);
+    };
+    run_fuse_mounted_mutation_with_lock_and_preflight(
+        handoff,
+        service,
+        operation,
+        stable_operation_id,
+        lock_service,
+        preflight,
+        |service| service.capture_mounted_mutation(mutation),
+    )
+}
 
 trait ReplyErrorExt {
     fn error_from_i32(self, error: libc::c_int);
@@ -170,10 +1162,26 @@ pub fn mount_sifs(mut options: DfsFuseMountOptions) -> Result<()> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
     let mount_helper = prepare_safe_fuse_mount(&mut options)?;
     let mount_point = options.mount_point.clone();
-    let fs = SifsFuseFileSystem::open(options.clone(), dfs::DfsCancellationFlag::new())?;
+    let cancellation = dfs::DfsCancellationFlag::new();
+    let mount_health = FuseMountHealth::new(
+        mount_point.clone(),
+        mount_helper.clone(),
+        cancellation.clone(),
+    )
+    .map_err(|source| DfsFuseError::Mount {
+        mount_point: mount_point.display().to_string(),
+        detail: format!("start fatal FUSE lifecycle worker: {source}"),
+    })?;
+    let fs = SifsFuseFileSystem::open(options.clone(), cancellation, Arc::clone(&mount_health))?;
     let mount_config = fuse_mount_config(&options, true);
-    fuser::mount2(fs, &mount_point, &mount_config)
-        .map_err(|source| map_mount_error(&mount_point, mount_helper.exists(), source))
+    let result = fuser::mount2(fs, &mount_point, &mount_config);
+    if let Some(detail) = mount_health.fatal_error() {
+        return Err(DfsFuseError::Mount {
+            mount_point: mount_point.display().to_string(),
+            detail,
+        });
+    }
+    result.map_err(|source| map_mount_error(&mount_point, mount_helper.exists(), source))
 }
 
 pub fn mount_sifs_background(
@@ -181,13 +1189,29 @@ pub fn mount_sifs_background(
     cancellation: dfs::DfsCancellationFlag,
 ) -> Result<DfsFuseMountHandle> {
     options.root_path = normalize_sifs_root(&options.root_path)?;
-    let _mount_helper = prepare_safe_fuse_mount(&mut options)?;
+    let mount_helper = prepare_safe_fuse_mount(&mut options)?;
     let mount_point = options.mount_point.clone();
-    let fs = SifsFuseFileSystem::open(options.clone(), cancellation.clone())?;
+    let mount_health =
+        FuseMountHealth::new(mount_point.clone(), mount_helper, cancellation.clone()).map_err(
+            |source| DfsFuseError::Mount {
+                mount_point: mount_point.display().to_string(),
+                detail: format!("start fatal FUSE lifecycle worker: {source}"),
+            },
+        )?;
+    let fs = SifsFuseFileSystem::open(
+        options.clone(),
+        cancellation.clone(),
+        Arc::clone(&mount_health),
+    )?;
     let mount_config = background_fuse_mount_config(&options, true);
     let session = fuser::spawn_mount2(fs, &mount_point, &mount_config)
         .map_err(|source| map_mount_error(&mount_point, true, source))?;
-    Ok(DfsFuseMountHandle::new(mount_point, session, cancellation))
+    Ok(DfsFuseMountHandle::new(
+        mount_point,
+        session,
+        cancellation,
+        mount_health,
+    ))
 }
 
 fn prepare_safe_fuse_mount(options: &mut DfsFuseMountOptions) -> Result<PathBuf> {
@@ -508,6 +1532,7 @@ fn map_mount_error(
 #[derive(Debug)]
 struct SifsFuseFileSystem {
     dfs: Arc<Mutex<SifsService>>,
+    mounted_mutation_handoff: Option<Arc<FuseMountedMutationHandoff>>,
     content_reads: dfs::MountedSifsContentReadContext,
     read_cancellation: dfs::DfsCancellationFlag,
     read_executor: FuseReadExecutor,
@@ -525,37 +1550,114 @@ impl SifsFuseFileSystem {
     fn open(
         options: DfsFuseMountOptions,
         read_cancellation: dfs::DfsCancellationFlag,
+        mount_health: Arc<FuseMountHealth>,
     ) -> Result<Self> {
         if read_cancellation.is_cancelled() {
             return Err(DfsFuseError::Dfs(
                 "SIFS FUSE mount was cancelled before open".to_string(),
             ));
         }
-        let data_dir = match options.data_dir {
+        let data_dir = match options.data_dir.as_ref() {
             Some(path) => SinomoDataDir::new(path),
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsFuseError::LocalData(source.to_string()))?,
         };
+        let clustered = sinomo_runtime::network::ClusterPaths::new(&data_dir)
+            .state
+            .exists();
+        let lock_mount_session_id = format!(
+            "fuse-{}-{}-{}",
+            std::process::id(),
+            system_time_to_nanos(SystemTime::now()),
+            NEXT_MOUNT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let mounted_mutation_client =
+            if fuse_mounted_mutation_handoff_required(clustered, options.read_only) {
+                let daemon = sinomo_runtime::api::DaemonApiClient::connect_for_paths(
+                    &sinomo_runtime::api::DaemonPaths::new(&data_dir),
+                )
+                .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+                let client = sinomo_runtime::api::DaemonDfsMountedMutationHandoffClient::new(
+                    data_dir.clone(),
+                    daemon.address().to_string(),
+                )
+                .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+                Some(client)
+            } else {
+                None
+            };
+        // A clustered backend open can finish interrupted durable commits or
+        // bootstrap/rebind shard state. Establish the host-session lease
+        // immediately after Probe, before constructing any writable DFS
+        // backend, so MountOpen can Arm around that entire crash window.
+        let mounted_mutation_handoff = match mounted_mutation_client {
+            Some(client) => Some(prepare_fuse_clustered_mount_handoff_with(
+                client,
+                |client| {
+                    client
+                        .probe()
+                        .map(drop)
+                        .map_err(|source| DfsFuseError::Dfs(source.to_string()))
+                },
+                |client| {
+                    let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+                        .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+                    let session = store
+                        .open_host_mount_session(
+                            dfs::MountedSifsMutationAdapter::Fuse,
+                            format!("fuse:{lock_mount_session_id}"),
+                        )
+                        .map_err(|source| DfsFuseError::Dfs(source.to_string()))?;
+                    Ok(FuseMountedMutationHandoff {
+                        store,
+                        session: Some(session),
+                        client,
+                        mount_health,
+                        gated: AtomicBool::new(false),
+                        fatal_unmount_enabled: AtomicBool::new(false),
+                        mutation_lane: Mutex::new(()),
+                    })
+                },
+            )?),
+            None => None,
+        };
         let dfs::OpenedMountedSifsService {
             service,
             replica_candidates,
-        } = if sinomo_runtime::network::ClusterPaths::new(&data_dir)
-            .state
-            .exists()
-        {
-            let peer_transport = Arc::new(
-                sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
-                    .map_err(|source| DfsFuseError::Dfs(source.to_string()))?,
-            );
-            let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> = peer_transport.clone();
-            let async_peer_transport: Arc<dyn dfs::AsyncDfsPeerTransport> = peer_transport;
-            dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
-                data_dir,
-                sync_peer_transport,
-                async_peer_transport,
-                Some(read_cancellation.clone()),
+        } = if clustered {
+            let handoff = mounted_mutation_handoff
+                .as_ref()
+                .expect("clustered FUSE mount established its mandatory handoff");
+            run_fuse_clustered_mount_open_with(
+                handoff,
+                || {
+                    let peer_transport = Arc::new(
+                        sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
+                            .map_err(|source| DfsFuseError::Dfs(source.to_string()))?,
+                    );
+                    let sync_peer_transport: Arc<dyn dfs::DfsPeerTransport> =
+                        peer_transport.clone();
+                    let async_peer_transport: Arc<dyn dfs::AsyncDfsPeerTransport> = peer_transport;
+                    dfs::open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation(
+                        data_dir.clone(),
+                        sync_peer_transport,
+                        async_peer_transport,
+                        Some(read_cancellation.clone()),
+                    )
+                    .map_err(|source| DfsFuseError::Dfs(source.to_string()))
+                },
+                |opened| opened.service.durable_repair_queue_records(),
             )
-            .map_err(|source| DfsFuseError::Dfs(source.to_string()))?
+            .map_err(|error| match error {
+                FuseMountOpenHandoffError::Service(source) => source,
+                FuseMountOpenHandoffError::Handoff {
+                    detail,
+                    service_error,
+                } => DfsFuseError::Dfs(service_error.map_or_else(
+                    || detail.to_string(),
+                    |source| format!("{source}; {detail}"),
+                )),
+            })?
         } else {
             // A standalone one-node data directory has no daemon-owned cluster
             // transport to share, so retain the local-only mounted service.
@@ -577,22 +1679,25 @@ impl SifsFuseFileSystem {
             .map_err(|source| DfsFuseError::Dfs(format!("start FUSE read workers: {source}")))?;
         let dfs = Arc::new(Mutex::new(service));
         let state = Arc::new(Mutex::new(FuseState::new(options.root_path.clone())));
-        let lock_mount_session_id = format!(
-            "fuse-{}-{}-{}",
-            std::process::id(),
-            system_time_to_nanos(SystemTime::now()),
-            NEXT_MOUNT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
-        );
+        let mounted_mutation_handoff = mounted_mutation_handoff.map(Arc::new);
         let lock_request_sequence = Arc::new(AtomicU64::new(1));
         let lock_renewer_stop = Arc::new(AtomicBool::new(false));
         spawn_lock_renewer(
             Arc::downgrade(&dfs),
             Arc::downgrade(&state),
+            mounted_mutation_handoff.as_ref().map(Arc::downgrade),
             lock_request_sequence.clone(),
             lock_renewer_stop.clone(),
         );
+        if let Some(handoff) = mounted_mutation_handoff.as_ref() {
+            // From this point onward a gated handoff belongs to a live FUSE
+            // filesystem lifecycle and must request fatal unmount. Every
+            // earlier failure only retires durable mount-open evidence.
+            handoff.enable_fatal_unmount();
+        }
         Ok(Self {
             dfs,
+            mounted_mutation_handoff,
             content_reads,
             read_cancellation,
             read_executor,
@@ -701,14 +1806,19 @@ impl SifsFuseFileSystem {
                 request_id: self.next_lock_request_id("io-budget-renew"),
                 token: held.grant.token.clone(),
             };
-            let response =
-                match run_advisory_lock_command(&self.dfs, &held.path, &held.object_id, command) {
-                    Ok(response) => response,
-                    Err(_) => {
-                        mark_fuse_lock_lost(&self.state, &key, &held.grant);
-                        return Err(libc::EIO);
-                    }
-                };
+            let response = match run_advisory_lock_command(
+                self.mounted_mutation_handoff.as_deref(),
+                &self.dfs,
+                &held.path,
+                &held.object_id,
+                command,
+            ) {
+                Ok(response) => response,
+                Err(_) => {
+                    mark_fuse_lock_lost(&self.state, &key, &held.grant);
+                    return Err(libc::EIO);
+                }
+            };
             let FuseLockCommandResult {
                 outcome,
                 local_lease_deadline,
@@ -745,7 +1855,29 @@ impl SifsFuseFileSystem {
     }
 
     fn lock_dfs(&self) -> std::result::Result<MutexGuard<'_, SifsService>, libc::c_int> {
+        if self
+            .mounted_mutation_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.is_gated())
+        {
+            return Err(libc::EIO);
+        }
         self.dfs.lock().map_err(|_| libc::EIO)
+    }
+
+    fn run_mounted_mutation<R>(
+        &self,
+        operation: FuseMountedMutationOperation,
+        mutation: impl FnOnce(&mut SifsService) -> std::result::Result<R, FuseMountedMutationError>,
+    ) -> std::result::Result<R, libc::c_int> {
+        let Some(handoff) = self.mounted_mutation_handoff.as_ref() else {
+            return self
+                .lock_dfs()
+                .and_then(|mut service| mutation(&mut service).map_err(|error| error.errno));
+        };
+        run_fuse_mounted_mutation_with(handoff.as_ref(), &self.dfs, operation, |service| {
+            service.capture_mounted_mutation(mutation)
+        })
     }
 
     fn write_options(&self) -> DfsWriteOptions {
@@ -755,6 +1887,12 @@ impl SifsFuseFileSystem {
     fn ensure_writable(&self) -> std::result::Result<(), libc::c_int> {
         if self.read_only {
             Err(libc::EROFS)
+        } else if self
+            .mounted_mutation_handoff
+            .as_ref()
+            .is_some_and(|handoff| handoff.is_gated())
+        {
+            Err(libc::EIO)
         } else {
             Ok(())
         }
@@ -834,20 +1972,26 @@ impl SifsFuseFileSystem {
     ) -> std::result::Result<dfs::DfsStat, libc::c_int> {
         debug_assert!(!publication.dirty.is_empty());
         let options = self.write_options();
-        let mut dfs = self.lock_dfs()?;
-        let mut latest = None;
-        for (&offset, bytes) in &publication.dirty.ranges {
-            latest = Some(
-                dfs.posix_write_file_at_for_object(
-                    &publication.object_id,
-                    offset,
-                    bytes,
-                    options.clone(),
-                )
-                .map_err(errno_for_posix_error)?,
-            );
-        }
-        latest.ok_or(libc::EIO)
+        self.run_mounted_mutation(
+            FuseMountedMutationOperation::BufferedWritePublication,
+            |dfs| {
+                let mut latest = None;
+                for (&offset, bytes) in &publication.dirty.ranges {
+                    latest = Some(
+                        dfs.posix_write_file_at_for_object(
+                            &publication.object_id,
+                            offset,
+                            bytes,
+                            options.clone(),
+                        )
+                        .map_err(FuseMountedMutationError::from)?,
+                    );
+                }
+                latest.ok_or_else(|| {
+                    FuseMountedMutationError::ambiguous(libc::EIO, "fuse-empty-dirty-publication")
+                })
+            },
+        )
     }
 
     fn commit_dirty_handles_for_path(
@@ -902,10 +2046,11 @@ impl SifsFuseFileSystem {
         };
         let target = self.current_file_sync_target_for_handle(fh, kind)?;
         self.ensure_handle_lock_budget(fh, None, LOCKED_IO_MIN_LEASE)?;
-        self.lock_dfs()?
-            .posix_sync_file_target(&target)
-            .map(drop)
-            .map_err(errno_for_posix_error)
+        self.run_mounted_mutation(FuseMountedMutationOperation::FileSync, |dfs| {
+            dfs.posix_sync_file_target(&target)
+                .map(drop)
+                .map_err(FuseMountedMutationError::from)
+        })
     }
 
     fn current_file_sync_target_for_handle(
@@ -967,7 +2112,15 @@ impl SifsFuseFileSystem {
             session_id: self.lock_session_id(lock_owner),
             mode,
         };
-        match run_advisory_lock_command(&self.dfs, &path, &object_id, command)?.outcome {
+        match run_advisory_lock_command(
+            self.mounted_mutation_handoff.as_deref(),
+            &self.dfs,
+            &path,
+            &object_id,
+            command,
+        )?
+        .outcome
+        {
             dfs::DfsAdvisoryLockOutcome::QueryResult { conflict } => Ok(conflict),
             outcome => Err(errno_for_unexpected_lock_outcome(&outcome)),
         }
@@ -1016,7 +2169,13 @@ impl SifsFuseFileSystem {
                     mode,
                 }
             };
-            match run_advisory_lock_command(&self.dfs, &path, &object_id, command) {
+            match run_advisory_lock_command(
+                self.mounted_mutation_handoff.as_deref(),
+                &self.dfs,
+                &path,
+                &object_id,
+                command,
+            ) {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Renewed { grant },
                     local_lease_deadline,
@@ -1136,6 +2295,7 @@ impl SifsFuseFileSystem {
             spawn_blocking_lock_waiter(
                 Arc::downgrade(&self.dfs),
                 Arc::downgrade(&self.state),
+                self.mounted_mutation_handoff.as_ref().map(Arc::downgrade),
                 self.lock_renewer_stop.clone(),
                 key,
                 command,
@@ -1144,7 +2304,13 @@ impl SifsFuseFileSystem {
             return;
         }
 
-        match run_advisory_lock_command(&self.dfs, &path, &object_id, command) {
+        match run_advisory_lock_command(
+            self.mounted_mutation_handoff.as_deref(),
+            &self.dfs,
+            &path,
+            &object_id,
+            command,
+        ) {
             Ok(FuseLockCommandResult {
                 outcome: dfs::DfsAdvisoryLockOutcome::Acquired { grant },
                 local_lease_deadline,
@@ -1219,7 +2385,13 @@ impl SifsFuseFileSystem {
                 request_id: self.next_lock_request_id("unlock"),
                 token: held.grant.token,
             };
-            match run_advisory_lock_command(&self.dfs, &path, &object_id, command) {
+            match run_advisory_lock_command(
+                self.mounted_mutation_handoff.as_deref(),
+                &self.dfs,
+                &path,
+                &object_id,
+                command,
+            ) {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Unlocked,
                     ..
@@ -1241,7 +2413,13 @@ impl SifsFuseFileSystem {
                 session_id: pending.session_id,
                 acquire_request_id: pending.acquire_request_id,
             };
-            match run_advisory_lock_command(&self.dfs, &path, &object_id, command) {
+            match run_advisory_lock_command(
+                self.mounted_mutation_handoff.as_deref(),
+                &self.dfs,
+                &path,
+                &object_id,
+                command,
+            ) {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Cancelled { .. },
                     ..
@@ -1310,7 +2488,13 @@ impl SifsFuseFileSystem {
                 session_id: pending.session_id,
                 acquire_request_id: pending.acquire_request_id,
             };
-            match run_advisory_lock_command(&self.dfs, &path, &object_id, cancel) {
+            match run_advisory_lock_command(
+                self.mounted_mutation_handoff.as_deref(),
+                &self.dfs,
+                &path,
+                &object_id,
+                cancel,
+            ) {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Cancelled { .. },
                     ..
@@ -1325,7 +2509,13 @@ impl SifsFuseFileSystem {
             request_id: self.next_lock_request_id("close"),
             session_id: self.lock_session_id(lock_owner),
         };
-        let result = run_advisory_lock_command(&self.dfs, &path, &object_id, command);
+        let result = run_advisory_lock_command(
+            self.mounted_mutation_handoff.as_deref(),
+            &self.dfs,
+            &path,
+            &object_id,
+            command,
+        );
         // Closing an fd must stop renewal even when the cluster is unavailable;
         // the server-side lease then guarantees bounded cleanup.
         let close_result = match result {
@@ -1475,18 +2665,23 @@ impl SifsFuseFileSystem {
         // The state snapshot above carries only stable identity. Do not hold
         // FuseState while content upload, metadata publication, or a sync
         // barrier waits on disk/network.
-        let stat = self
-            .lock_dfs()?
-            .posix_write_file_at_for_object(object_id, offset, data, self.write_options())
-            .map_err(errno_for_posix_error)?;
+        let write_options = self.write_options();
+        let stat = self.run_mounted_mutation(
+            FuseMountedMutationOperation::ImmediateWritePublication,
+            |dfs| {
+                dfs.posix_write_file_at_for_object(object_id, offset, data, write_options)
+                    .map_err(FuseMountedMutationError::from)
+            },
+        )?;
         self.refresh_opened_object_stats(object_id, &stat)?;
         if let Some(kind) = sync_mode.kind() {
             self.ensure_handle_lock_budget(fh, lock_owner, LOCKED_IO_MIN_LEASE)?;
             let target = self.current_file_sync_target_for_handle(fh, kind)?;
-            self.lock_dfs()?
-                .posix_sync_file_target(&target)
-                .map(drop)
-                .map_err(errno_for_posix_error)?;
+            self.run_mounted_mutation(FuseMountedMutationOperation::FileSync, |dfs| {
+                dfs.posix_sync_file_target(&target)
+                    .map(drop)
+                    .map_err(FuseMountedMutationError::from)
+            })?;
         }
         Ok(())
     }
@@ -1530,14 +2725,20 @@ impl SifsFuseFileSystem {
         if let Some(fh) = fh {
             self.ensure_handle_lock_budget(fh, None, LOCKED_IO_MIN_LEASE)?;
         }
-        let stat = if let Some(object_id) = object_id.as_ref() {
-            self.lock_dfs()?
-                .posix_truncate_file_for_object(object_id, size, self.write_options())
+        let write_options = self.write_options();
+        let operation = if object_id.is_some() {
+            FuseMountedMutationOperation::TruncateObject
         } else {
-            self.lock_dfs()?
-                .posix_truncate_file(&path, size, self.write_options())
-        }
-        .map_err(errno_for_posix_error)?;
+            FuseMountedMutationOperation::TruncatePath
+        };
+        let stat = self.run_mounted_mutation(operation, |dfs| {
+            if let Some(object_id) = object_id.as_ref() {
+                dfs.posix_truncate_file_for_object(object_id, size, write_options)
+            } else {
+                dfs.posix_truncate_file(&path, size, write_options)
+            }
+            .map_err(FuseMountedMutationError::from)
+        })?;
         self.refresh_opened_object_stats(&stat.object_id, &stat)?;
         if let Some(kind) = sync_mode.kind() {
             if let Some(fh) = fh {
@@ -1546,10 +2747,12 @@ impl SifsFuseFileSystem {
             let target = fh
                 .map(|fh| self.current_file_sync_target_for_handle(fh, kind))
                 .transpose()?;
-            self.lock_dfs()?
-                .posix_sync_file_target(target.as_ref().ok_or(libc::EIO)?)
-                .map(drop)
-                .map_err(errno_for_posix_error)?;
+            let target = target.as_ref().ok_or(libc::EIO)?;
+            self.run_mounted_mutation(FuseMountedMutationOperation::FileSync, |dfs| {
+                dfs.posix_sync_file_target(target)
+                    .map(drop)
+                    .map_err(FuseMountedMutationError::from)
+            })?;
         }
         Ok(())
     }
@@ -1565,6 +2768,7 @@ impl Filesystem for SifsFuseFileSystem {
     fn destroy(&mut self) {
         self.lock_renewer_stop.store(true, Ordering::Release);
         self.read_cancellation.cancel();
+        drop(self.mounted_mutation_handoff.take());
     }
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -1649,10 +2853,11 @@ impl Filesystem for SifsFuseFileSystem {
         if let Some(mode) = mode {
             result = result.and_then(|_| {
                 self.ensure_writable()?;
-                self.lock_dfs()?
-                    .posix_set_mode(&path, mode)
-                    .map(|_| ())
-                    .map_err(errno_for_posix_error)
+                self.run_mounted_mutation(FuseMountedMutationOperation::SetMode, |dfs| {
+                    dfs.posix_set_mode(&path, mode)
+                        .map(|_| ())
+                        .map_err(FuseMountedMutationError::from)
+                })
             });
         }
         if uid.is_some() || gid.is_some() {
@@ -1661,26 +2866,33 @@ impl Filesystem for SifsFuseFileSystem {
                 let current = self.stat_path(&path, false)?;
                 let uid = uid.unwrap_or(current.uid);
                 let gid = gid.unwrap_or(current.gid);
-                let mut dfs = self.lock_dfs()?;
-                let updated = if current.kind == DfsObjectKind::Symlink {
-                    dfs.posix_set_symlink_owner(&path, uid, gid)
+                let operation = if current.kind == DfsObjectKind::Symlink {
+                    FuseMountedMutationOperation::SetSymlinkOwner
                 } else {
-                    dfs.posix_set_owner(&path, uid, gid)
+                    FuseMountedMutationOperation::SetOwner
                 };
-                updated.map(|_| ()).map_err(errno_for_posix_error)
+                self.run_mounted_mutation(operation, |dfs| {
+                    let updated = if current.kind == DfsObjectKind::Symlink {
+                        dfs.posix_set_symlink_owner(&path, uid, gid)
+                    } else {
+                        dfs.posix_set_owner(&path, uid, gid)
+                    };
+                    updated.map(|_| ()).map_err(FuseMountedMutationError::from)
+                })
             });
         }
         if atime.is_some() || mtime.is_some() {
             result = result.and_then(|_| {
                 self.ensure_writable()?;
-                self.lock_dfs()?
-                    .posix_set_times(
+                self.run_mounted_mutation(FuseMountedMutationOperation::SetTimes, |dfs| {
+                    dfs.posix_set_times(
                         &path,
                         atime.map(time_or_now_to_nanos),
                         mtime.map(time_or_now_to_nanos),
                     )
                     .map(|_| ())
-                    .map_err(errno_for_posix_error)
+                    .map_err(FuseMountedMutationError::from)
+                })
             });
         }
         if let Err(errno) = result {
@@ -1730,10 +2942,11 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
-            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
-            dfs.posix_create_file_with_attrs(&path, self.write_options(), attrs)
-                .map_err(errno_for_posix_error)
+        let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+        let write_options = self.write_options();
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Mknod, |dfs| {
+            dfs.posix_create_file_with_attrs(&path, write_options, attrs)
+                .map_err(FuseMountedMutationError::from)
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
@@ -1758,10 +2971,10 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
-            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+        let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Mkdir, |dfs| {
             dfs.posix_mkdir_with_create_attrs(&path, attrs)
-                .map_err(errno_for_posix_error)
+                .map_err(FuseMountedMutationError::from)
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
@@ -1781,9 +2994,10 @@ impl Filesystem for SifsFuseFileSystem {
         if let Err(errno) = self.commit_dirty_handles_for_path(&path, false) {
             return reply.error_from_i32(errno);
         }
-        let result = self
-            .lock_dfs()
-            .and_then(|mut dfs| dfs.posix_unlink(&path).map_err(errno_for_posix_error));
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Unlink, |dfs| {
+            dfs.posix_unlink(&path)
+                .map_err(FuseMountedMutationError::from)
+        });
         match result {
             Ok(_) => {
                 if let Ok(mut state) = self.lock_state() {
@@ -1804,9 +3018,10 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self
-            .lock_dfs()
-            .and_then(|mut dfs| dfs.posix_rmdir(&path).map_err(errno_for_posix_error));
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Rmdir, |dfs| {
+            dfs.posix_rmdir(&path)
+                .map_err(FuseMountedMutationError::from)
+        });
         match result {
             Ok(_) => {
                 if let Ok(mut state) = self.lock_state() {
@@ -1837,10 +3052,11 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
-            let attrs = DfsPosixCreateAttrs::new(0o777, req.uid(), req.gid());
-            dfs.posix_symlink_with_create_attrs(target, &path, self.write_options(), attrs)
-                .map_err(errno_for_posix_error)
+        let attrs = DfsPosixCreateAttrs::new(0o777, req.uid(), req.gid());
+        let write_options = self.write_options();
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Symlink, |dfs| {
+            dfs.posix_symlink_with_create_attrs(target, &path, write_options, attrs)
+                .map_err(FuseMountedMutationError::from)
         });
         match result {
             Ok(stat) => self.reply_entry_for_path(reply, path, stat),
@@ -1883,9 +3099,10 @@ impl Filesystem for SifsFuseFileSystem {
         {
             return reply.error_from_i32(errno);
         }
-        let result = self
-            .lock_dfs()
-            .and_then(|mut dfs| dfs.posix_rename(&from, &to).map_err(errno_for_posix_error));
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Rename, |dfs| {
+            dfs.posix_rename(&from, &to)
+                .map_err(FuseMountedMutationError::from)
+        });
         match result {
             Ok(_) => {
                 if let Ok(mut state) = self.lock_state() {
@@ -1918,9 +3135,9 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Hardlink, |dfs| {
             dfs.posix_hardlink(&existing, &link_path)
-                .map_err(errno_for_posix_error)
+                .map_err(FuseMountedMutationError::from)
         });
         match result {
             Ok(stat) => match self.lock_state() {
@@ -1978,9 +3195,10 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let result = self.lock_dfs().and_then(|mut dfs| {
-            let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
-            create_file_for_fuse(&mut dfs, &path, self.write_options(), attrs, flags)
+        let attrs = DfsPosixCreateAttrs::new(created_mode(mode, umask), req.uid(), req.gid());
+        let write_options = self.write_options();
+        let result = self.run_mounted_mutation(FuseMountedMutationOperation::Create, |dfs| {
+            create_file_for_fuse(dfs, &path, write_options, attrs, flags)
         });
         match result {
             Ok(stat) => match self.lock_state() {
@@ -2185,11 +3403,12 @@ impl Filesystem for SifsFuseFileSystem {
             Ok(path) => path,
             Err(errno) => return reply.error_from_i32(errno),
         };
-        let children = match self.lock_dfs().and_then(|mut dfs| {
-            dfs.posix_list_dir_distributed(&path)
-                .map_err(errno_for_posix_error)
-        }) {
-            Ok(children) => children,
+        let children = match self
+            .run_mounted_mutation(FuseMountedMutationOperation::DirectoryRefresh, |dfs| {
+                Ok(dfs.posix_list_dir_distributed(&path))
+            }) {
+            Ok(Ok(children)) => children,
+            Ok(Err(error)) => return reply.error_from_i32(errno_for_posix_error(error)),
             Err(errno) => return reply.error_from_i32(errno),
         };
         let start = match usize::try_from(offset) {
@@ -2240,10 +3459,11 @@ impl Filesystem for SifsFuseFileSystem {
     ) {
         let ino = ino.0;
         let result = self.path_for_ino(ino).and_then(|path| {
-            self.lock_dfs()?
-                .posix_sync_directory(&path)
-                .map(drop)
-                .map_err(errno_for_posix_error)
+            self.run_mounted_mutation(FuseMountedMutationOperation::DirectorySync, |dfs| {
+                dfs.posix_sync_directory(&path)
+                    .map(drop)
+                    .map_err(FuseMountedMutationError::from)
+            })
         });
         match result {
             Ok(()) => reply.ok(),
@@ -3223,6 +4443,10 @@ impl Drop for SifsFuseFileSystem {
         // Field teardown drops the executor after this hook; cancellation must
         // be visible before it starts joining in-flight workers.
         self.read_cancellation.cancel();
+        // `destroy` is the ordinary mount-stop boundary. A failed mount setup
+        // can instead drop the filesystem directly, which is also a complete
+        // stop and must leave an orderly closed host-session marker.
+        drop(self.mounted_mutation_handoff.take());
     }
 }
 
@@ -3279,6 +4503,34 @@ fn conservative_local_lease_deadline(
         .and_then(|remaining| request_started_at.checked_add(remaining))
 }
 
+fn fuse_advisory_lock_mutation_operation(
+    command: &dfs::DfsAdvisoryLockCommand,
+) -> FuseMountedMutationOperation {
+    match command {
+        dfs::DfsAdvisoryLockCommand::Acquire { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockAcquire
+        }
+        dfs::DfsAdvisoryLockCommand::Query { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockQuery
+        }
+        dfs::DfsAdvisoryLockCommand::Renew { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockRenew
+        }
+        dfs::DfsAdvisoryLockCommand::Convert { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockConvert
+        }
+        dfs::DfsAdvisoryLockCommand::Unlock { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockUnlock
+        }
+        dfs::DfsAdvisoryLockCommand::Cancel { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockCancel
+        }
+        dfs::DfsAdvisoryLockCommand::Close { .. } => {
+            FuseMountedMutationOperation::AdvisoryLockClose
+        }
+    }
+}
+
 fn renamed_path(path: &str, from: &str, to: &str) -> Option<String> {
     if path == from {
         return Some(to.to_string());
@@ -3287,11 +4539,83 @@ fn renamed_path(path: &str, from: &str, to: &str) -> Option<String> {
     suffix.starts_with('/').then(|| format!("{to}{suffix}"))
 }
 
+fn upgrade_background_mounted_mutation_handoff(
+    handoff: &Option<Weak<FuseMountedMutationHandoff>>,
+) -> std::result::Result<Option<Arc<FuseMountedMutationHandoff>>, libc::c_int> {
+    match handoff {
+        Some(handoff) => handoff.upgrade().map(Some).ok_or(libc::EIO),
+        None => Ok(None),
+    }
+}
+
+fn preflight_blocking_lock_acquire(
+    state: &Arc<Mutex<FuseState>>,
+    key: &(dfs::DfsObjectId, u64),
+    acquire_request_id: &dfs::DfsAdvisoryLockRequestId,
+) -> std::result::Result<(), FuseMountedMutationPreflightError> {
+    let state = state
+        .lock()
+        .map_err(|_| FuseMountedMutationPreflightError {
+            errno: libc::EIO,
+            proof_code: "fuse-blocking-lock-state-unavailable-before-service-entry",
+        })?;
+    if state
+        .pending_locks
+        .get(key)
+        .is_some_and(|pending| &pending.acquire_request_id == acquire_request_id)
+    {
+        Ok(())
+    } else {
+        Err(FuseMountedMutationPreflightError {
+            errno: libc::EINTR,
+            proof_code: "fuse-blocking-lock-cancelled-before-service-entry",
+        })
+    }
+}
+
 fn run_advisory_lock_command(
+    handoff: Option<&FuseMountedMutationHandoff>,
     service: &Arc<Mutex<SifsService>>,
     path: &str,
     object_id: &dfs::DfsObjectId,
     command: dfs::DfsAdvisoryLockCommand,
+) -> std::result::Result<FuseLockCommandResult, libc::c_int> {
+    run_advisory_lock_command_with_preflight(handoff, service, path, object_id, command, |_| Ok(()))
+}
+
+fn run_advisory_lock_command_with_preflight(
+    handoff: Option<&FuseMountedMutationHandoff>,
+    service: &Arc<Mutex<SifsService>>,
+    path: &str,
+    object_id: &dfs::DfsObjectId,
+    command: dfs::DfsAdvisoryLockCommand,
+    preflight: impl FnOnce(
+        &mut SifsService,
+    ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
+) -> std::result::Result<FuseLockCommandResult, libc::c_int> {
+    let service_entry_timed_out = AtomicBool::new(false);
+    run_advisory_lock_command_with_preflight_and_entry_timeout(
+        handoff,
+        service,
+        path,
+        object_id,
+        command,
+        preflight,
+        &service_entry_timed_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_advisory_lock_command_with_preflight_and_entry_timeout(
+    handoff: Option<&FuseMountedMutationHandoff>,
+    service: &Arc<Mutex<SifsService>>,
+    path: &str,
+    object_id: &dfs::DfsObjectId,
+    command: dfs::DfsAdvisoryLockCommand,
+    preflight: impl FnOnce(
+        &mut SifsService,
+    ) -> std::result::Result<(), FuseMountedMutationPreflightError>,
+    service_entry_timed_out: &AtomicBool,
 ) -> std::result::Result<FuseLockCommandResult, libc::c_int> {
     // Anchor before the first attempt. The authority reports a relative
     // duration after it has durably settled the transition; projecting that
@@ -3301,19 +4625,34 @@ fn run_advisory_lock_command(
     let deadline = started_at
         .checked_add(FUSE_LOCK_RPC_TIMEOUT)
         .ok_or(libc::EIO)?;
-    let mut service = lock_service_until(service, deadline)?;
-    run_advisory_lock_command_with_service(
-        &mut service,
-        path,
-        object_id,
-        command,
-        started_at,
-        deadline,
+    let operation = fuse_advisory_lock_mutation_operation(&command);
+    let stable_operation_id = Some(command.request_id().0.clone());
+    run_fuse_service_mounted_mutation_with_lock_and_preflight(
+        handoff,
+        service.as_ref(),
+        operation,
+        stable_operation_id,
+        |service| match lock_service_until(service, deadline) {
+            Err(errno) if errno == libc::ETIMEDOUT => {
+                service_entry_timed_out.store(true, Ordering::Release);
+                Err(errno)
+            }
+            result => result,
+        },
+        preflight,
+        |service| {
+            run_advisory_lock_command_with_service(
+                service, path, object_id, command, started_at, deadline,
+            )
+            .map_err(|errno| {
+                FuseMountedMutationError::ambiguous(errno, "fuse-advisory-lock-command-error")
+            })
+        },
     )
 }
 
 fn lock_service_until<'a>(
-    service: &'a Arc<Mutex<SifsService>>,
+    service: &'a Mutex<SifsService>,
     deadline: Instant,
 ) -> std::result::Result<MutexGuard<'a, SifsService>, libc::c_int> {
     loop {
@@ -3382,6 +4721,7 @@ fn run_advisory_lock_command_with_service(
 fn spawn_blocking_lock_waiter(
     service: Weak<Mutex<SifsService>>,
     state: Weak<Mutex<FuseState>>,
+    handoff: Option<Weak<FuseMountedMutationHandoff>>,
     stop: Arc<AtomicBool>,
     key: (dfs::DfsObjectId, u64),
     command: dfs::DfsAdvisoryLockCommand,
@@ -3426,21 +4766,8 @@ fn spawn_blocking_lock_waiter(
                     .error_from_i32(libc::EIO);
                 return;
             };
-            let started_at = Instant::now();
-            let Some(deadline) = started_at.checked_add(FUSE_LOCK_RPC_TIMEOUT) else {
-                remove_pending_lock(&state, &key, &acquire_request_id);
-                reply
-                    .take()
-                    .expect("blocking lock reply")
-                    .error_from_i32(libc::EIO);
-                return;
-            };
-            let mut service_guard = match lock_service_until(&service_arc, deadline) {
-                Ok(service) => service,
-                Err(libc::ETIMEDOUT) => {
-                    thread::sleep(BLOCKING_LOCK_POLL_INTERVAL);
-                    continue;
-                }
+            let handoff_arc = match upgrade_background_mounted_mutation_handoff(&handoff) {
+                Ok(handoff) => handoff,
                 Err(errno) => {
                     remove_pending_lock(&state, &key, &acquire_request_id);
                     reply
@@ -3450,31 +4777,38 @@ fn spawn_blocking_lock_waiter(
                     return;
                 }
             };
-            // Cancel/close removes the pending marker before waiting for this
-            // serialized RPC lane. Recheck after acquiring it so an Acquire
-            // cannot be sent after cleanup has already linearized locally.
-            let still_pending = state_arc.lock().ok().is_some_and(|state| {
-                state
-                    .pending_locks
-                    .get(&key)
-                    .is_some_and(|pending| pending.acquire_request_id == acquire_request_id)
-            });
-            if !still_pending {
-                reply
-                    .take()
-                    .expect("blocking lock reply")
-                    .error_from_i32(libc::EINTR);
-                return;
-            }
-            let outcome = run_advisory_lock_command_with_service(
-                &mut service_guard,
+            let service_entry_timed_out = AtomicBool::new(false);
+            let state_for_preflight = Arc::clone(&state_arc);
+            let key_for_preflight = key.clone();
+            let request_for_preflight = acquire_request_id.clone();
+            let outcome = run_advisory_lock_command_with_preflight_and_entry_timeout(
+                handoff_arc.as_deref(),
+                &service_arc,
                 &current_pending.path,
                 &current_pending.object_id,
                 command.clone(),
-                started_at,
-                deadline,
+                move |_| {
+                    // Cancel/close removes the pending marker before waiting
+                    // for mutation admission. Recheck only after admission and
+                    // the service lane are both held so no first Acquire can
+                    // cross a locally linearized cancellation.
+                    preflight_blocking_lock_acquire(
+                        &state_for_preflight,
+                        &key_for_preflight,
+                        &request_for_preflight,
+                    )
+                },
+                &service_entry_timed_out,
             );
-            drop(service_guard);
+            if matches!(outcome, Err(errno) if errno == libc::ETIMEDOUT)
+                && service_entry_timed_out.load(Ordering::Acquire)
+            {
+                // Queueing behind an unrelated service call is a positive
+                // local no-entry fact, not ambiguity in the advisory-lock RPC.
+                // Keep the bounded waiter alive and try again later.
+                thread::sleep(BLOCKING_LOCK_POLL_INTERVAL);
+                continue;
+            }
             match outcome {
                 Ok(FuseLockCommandResult {
                     outcome: dfs::DfsAdvisoryLockOutcome::Acquired { grant },
@@ -3612,6 +4946,7 @@ fn remove_pending_lock(
 fn spawn_lock_renewer(
     service: Weak<Mutex<SifsService>>,
     state: Weak<Mutex<FuseState>>,
+    handoff: Option<Weak<FuseMountedMutationHandoff>>,
     request_sequence: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 ) {
@@ -3640,7 +4975,20 @@ fn spawn_lock_renewer(
                     request_id: next_lock_request_id(&request_sequence, "renew"),
                     token: held.grant.token.clone(),
                 };
-                match run_advisory_lock_command(&service, &held.path, &held.object_id, command) {
+                let handoff = match upgrade_background_mounted_mutation_handoff(&handoff) {
+                    Ok(handoff) => handoff,
+                    Err(_) => {
+                        mark_fuse_lock_lost(&state, &key, &held.grant);
+                        return;
+                    }
+                };
+                match run_advisory_lock_command(
+                    handoff.as_deref(),
+                    &service,
+                    &held.path,
+                    &held.object_id,
+                    command,
+                ) {
                     Ok(FuseLockCommandResult {
                         outcome: dfs::DfsAdvisoryLockOutcome::Renewed { grant },
                         local_lease_deadline,
@@ -3822,11 +5170,11 @@ fn create_file_for_fuse(
     options: DfsWriteOptions,
     attrs: DfsPosixCreateAttrs,
     flags: i32,
-) -> std::result::Result<dfs::DfsStat, libc::c_int> {
+) -> std::result::Result<dfs::DfsStat, FuseMountedMutationError> {
     if existing_file_create_action(flags) == ExistingFileCreateAction::Reject {
         return dfs
             .posix_create_file_with_attrs(path, options, attrs)
-            .map_err(errno_for_posix_error);
+            .map_err(FuseMountedMutationError::from);
     }
 
     let mut create_needed = true;
@@ -3835,16 +5183,22 @@ fn create_file_for_fuse(
             match dfs.posix_create_file_following_symlink_with_attrs(path, options.clone(), attrs) {
                 Ok(created) => return Ok(created),
                 Err(DfsPosixError::AlreadyExists { .. }) => create_needed = false,
-                Err(error) => return Err(errno_for_posix_error(error)),
+                Err(error) => return Err(FuseMountedMutationError::from(error)),
             }
         }
         match dfs.posix_stat_distributed(path) {
             Ok(existing) => {
                 if existing.kind == DfsObjectKind::Directory {
-                    return Err(libc::EISDIR);
+                    return Err(FuseMountedMutationError::ambiguous(
+                        libc::EISDIR,
+                        "fuse-create-existing-directory",
+                    ));
                 }
                 if existing.kind != DfsObjectKind::File {
-                    return Err(libc::EINVAL);
+                    return Err(FuseMountedMutationError::ambiguous(
+                        libc::EINVAL,
+                        "fuse-create-existing-non-file",
+                    ));
                 }
                 if existing_file_create_action(flags) == ExistingFileCreateAction::Truncate {
                     // The create attrs are ignored while this inode still
@@ -3852,7 +5206,7 @@ fn create_file_for_fuse(
                     // just before the truncating write recreates the path.
                     return dfs
                         .posix_write_file_with_create_attrs(path, &[], options.clone(), attrs)
-                        .map_err(errno_for_posix_error);
+                        .map_err(FuseMountedMutationError::from);
                 }
                 match dfs.posix_stat_distributed(path) {
                     Ok(confirmed) if confirmed.object_id == existing.object_id => {
@@ -3863,17 +5217,20 @@ fn create_file_for_fuse(
                         create_needed = true;
                         continue;
                     }
-                    Err(error) => return Err(errno_for_posix_error(error)),
+                    Err(error) => return Err(FuseMountedMutationError::from(error)),
                 }
             }
             Err(DfsPosixError::NotFound { .. }) => {
                 create_needed = true;
                 continue;
             }
-            Err(error) => return Err(errno_for_posix_error(error)),
+            Err(error) => return Err(FuseMountedMutationError::from(error)),
         }
     }
-    Err(libc::EAGAIN)
+    Err(FuseMountedMutationError::ambiguous(
+        libc::EAGAIN,
+        "fuse-create-race-retry-exhausted",
+    ))
 }
 
 fn fuse_write_replica_candidates(
@@ -3924,6 +5281,1192 @@ fn time_or_now_to_nanos(time: TimeOrNow) -> u64 {
 mod errno_tests {
     use super::*;
 
+    #[derive(Debug, Default)]
+    struct TestMountedMutationLease;
+
+    #[derive(Debug, Default)]
+    struct TestMountedMutationCoordinator {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        gated: AtomicBool,
+        mutation_lane: Mutex<()>,
+        fail_arm: AtomicBool,
+        fail_commit: AtomicBool,
+        service_lock: Option<Arc<Mutex<usize>>>,
+        commit_saw_service_lock_free: AtomicBool,
+        commit_block: Option<Arc<(Mutex<(bool, bool)>, std::sync::Condvar)>>,
+        captured_work: Mutex<Vec<dfs::MountedSifsMutationCapturedWork>>,
+        unknown_observations: Mutex<Vec<dfs::MountedSifsMutationErrorObservation>>,
+        prepared_operations: Mutex<Vec<(FuseMountedMutationOperation, Option<String>)>>,
+    }
+
+    impl TestMountedMutationCoordinator {
+        fn record(&self, event: &'static str) {
+            self.events.lock().expect("event lock").push(event);
+        }
+    }
+
+    impl FuseMountedMutationCoordinator for TestMountedMutationCoordinator {
+        type Admission<'a> = MutexGuard<'a, ()>;
+        type Lease<'a> = TestMountedMutationLease;
+
+        fn admit(&self) -> std::result::Result<Self::Admission<'_>, ()> {
+            self.mutation_lane.lock().map_err(|_| ())
+        }
+
+        fn is_gated(&self) -> bool {
+            self.gated.load(Ordering::Acquire)
+        }
+
+        fn gate(&self) {
+            self.record("gate");
+            self.gated.store(true, Ordering::Release);
+        }
+
+        fn gate_before_mount(&self) {
+            self.record("gate-before-mount");
+            self.gated.store(true, Ordering::Release);
+        }
+
+        fn retire_gated_session(&self) -> std::result::Result<(), ()> {
+            self.record("retire-gated-session");
+            Ok(())
+        }
+
+        fn prepare(
+            &self,
+            operation: FuseMountedMutationOperation,
+            stable_operation_id: Option<String>,
+        ) -> std::result::Result<Self::Lease<'_>, ()> {
+            self.record("prepare");
+            self.prepared_operations
+                .lock()
+                .expect("prepared operation lock")
+                .push((operation, stable_operation_id));
+            Ok(TestMountedMutationLease)
+        }
+
+        fn arm(
+            &self,
+            _lease: &mut Self::Lease<'_>,
+        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+            self.record("arm");
+            if self.fail_arm.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                self.record("arm-ack");
+                Ok(dfs::MountedSifsMutationArmRequestId::generate())
+            }
+        }
+
+        fn persist_captured(
+            &self,
+            _lease: &mut Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            captured_work: &dfs::MountedSifsMutationCapturedWork,
+        ) -> std::result::Result<(), ()> {
+            self.record("persist-captured");
+            self.captured_work
+                .lock()
+                .expect("captured work lock")
+                .push(captured_work.clone());
+            Ok(())
+        }
+
+        fn persist_unknown(
+            &self,
+            _lease: &mut Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            observation: &dfs::MountedSifsMutationErrorObservation,
+        ) -> std::result::Result<(), ()> {
+            self.record("persist-unknown");
+            self.unknown_observations
+                .lock()
+                .expect("observation lock")
+                .push(observation.clone());
+            Ok(())
+        }
+
+        fn persist_proven_no_write(
+            &self,
+            _lease: &mut Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            _proof_code: &'static str,
+        ) -> std::result::Result<(), ()> {
+            self.record("persist-proven-no-write");
+            Ok(())
+        }
+
+        fn commit_captured(
+            &self,
+            _lease: &Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            _captured_work: &dfs::MountedSifsMutationCapturedWork,
+        ) -> std::result::Result<(), ()> {
+            self.record("commit-captured");
+            if let Some(service_lock) = self.service_lock.as_ref() {
+                self.commit_saw_service_lock_free
+                    .store(service_lock.try_lock().is_ok(), Ordering::Release);
+            }
+            if let Some(block) = self.commit_block.as_ref() {
+                let (state, wake) = &**block;
+                let mut state = state.lock().expect("commit block lock");
+                state.0 = true;
+                wake.notify_all();
+                while !state.1 {
+                    state = wake.wait(state).expect("commit block wait");
+                }
+            }
+            if self.fail_commit.load(Ordering::Acquire) {
+                Err(())
+            } else {
+                self.record("commit-ack");
+                Ok(())
+            }
+        }
+
+        fn commit_unknown(
+            &self,
+            _lease: &Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            _observation: &dfs::MountedSifsMutationErrorObservation,
+        ) -> std::result::Result<(), ()> {
+            self.record("commit-unknown");
+            self.record("commit-ack");
+            Ok(())
+        }
+
+        fn commit_proven_no_write(
+            &self,
+            _lease: &Self::Lease<'_>,
+            _arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            _proof_code: &'static str,
+        ) -> std::result::Result<(), ()> {
+            self.record("commit-proven-no-write");
+            self.record("commit-ack");
+            Ok(())
+        }
+
+        fn release_after_daemon_ack(&self, _lease: Self::Lease<'_>) -> std::result::Result<(), ()> {
+            self.record("release");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestStoreMountOpenCoordinator {
+        store: dfs::MountedSifsMutationOutboxStore,
+        session: dfs::MountedSifsHostMountSessionLease,
+        gated: AtomicBool,
+        mutation_lane: Mutex<()>,
+    }
+
+    impl FuseMountedMutationCoordinator for TestStoreMountOpenCoordinator {
+        type Admission<'a> = MutexGuard<'a, ()>;
+        type Lease<'a> = dfs::MountedSifsMutationLease<'a>;
+
+        fn admit(&self) -> std::result::Result<Self::Admission<'_>, ()> {
+            self.mutation_lane.lock().map_err(|_| ())
+        }
+
+        fn is_gated(&self) -> bool {
+            self.gated.load(Ordering::Acquire)
+        }
+
+        fn gate(&self) {
+            self.gated.store(true, Ordering::Release);
+        }
+
+        fn gate_before_mount(&self) {
+            self.gated.store(true, Ordering::Release);
+        }
+
+        fn retire_gated_session(&self) -> std::result::Result<(), ()> {
+            self.session.close_clean_shared().map_err(|_| ())
+        }
+
+        fn prepare(
+            &self,
+            operation: FuseMountedMutationOperation,
+            stable_operation_id: Option<String>,
+        ) -> std::result::Result<Self::Lease<'_>, ()> {
+            self.store
+                .prepare(&self.session, stable_operation_id, operation.label())
+                .map_err(|_| ())
+        }
+
+        fn arm(
+            &self,
+            lease: &mut Self::Lease<'_>,
+        ) -> std::result::Result<dfs::MountedSifsMutationArmRequestId, ()> {
+            let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+            let marker = lease.marker();
+            self.store
+                .arm_live(&marker.marker_id, &marker.marker_nonce, &arm_request_id)
+                .map_err(|_| ())?;
+            Ok(arm_request_id)
+        }
+
+        fn persist_captured(
+            &self,
+            lease: &mut Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            captured_work: &dfs::MountedSifsMutationCapturedWork,
+        ) -> std::result::Result<(), ()> {
+            lease
+                .record_captured_success(arm_request_id, captured_work.clone())
+                .map_err(|_| ())
+        }
+
+        fn persist_unknown(
+            &self,
+            lease: &mut Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            observation: &dfs::MountedSifsMutationErrorObservation,
+        ) -> std::result::Result<(), ()> {
+            lease
+                .record_unknown_after_error(arm_request_id, observation.clone())
+                .map_err(|_| ())
+        }
+
+        fn persist_proven_no_write(
+            &self,
+            lease: &mut Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            proof_code: &'static str,
+        ) -> std::result::Result<(), ()> {
+            lease
+                .record_proven_no_write(arm_request_id, proof_code)
+                .map_err(|_| ())
+        }
+
+        fn commit_captured(
+            &self,
+            lease: &Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            captured_work: &dfs::MountedSifsMutationCapturedWork,
+        ) -> std::result::Result<(), ()> {
+            let marker = lease.marker();
+            self.store
+                .accept_captured_live(
+                    &marker.marker_id,
+                    &marker.marker_nonce,
+                    arm_request_id,
+                    captured_work,
+                )
+                .map(drop)
+                .map_err(|_| ())
+        }
+
+        fn commit_unknown(
+            &self,
+            lease: &Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            observation: &dfs::MountedSifsMutationErrorObservation,
+        ) -> std::result::Result<(), ()> {
+            let marker = lease.marker();
+            self.store
+                .accept_unknown_live(
+                    &marker.marker_id,
+                    &marker.marker_nonce,
+                    arm_request_id,
+                    observation,
+                )
+                .map(drop)
+                .map_err(|_| ())
+        }
+
+        fn commit_proven_no_write(
+            &self,
+            lease: &Self::Lease<'_>,
+            arm_request_id: &dfs::MountedSifsMutationArmRequestId,
+            proof_code: &'static str,
+        ) -> std::result::Result<(), ()> {
+            let marker = lease.marker();
+            self.store
+                .prove_no_write_live(
+                    &marker.marker_id,
+                    &marker.marker_nonce,
+                    arm_request_id,
+                    proof_code,
+                )
+                .map(drop)
+                .map_err(|_| ())
+        }
+
+        fn release_after_daemon_ack(&self, lease: Self::Lease<'_>) -> std::result::Result<(), ()> {
+            lease.release_after_daemon_ack().map_err(|_| ())
+        }
+    }
+
+    fn test_mutation_report<R>(
+        outcome: std::result::Result<R, FuseMountedMutationError>,
+        committed_work: dfs::DfsCommittedWork,
+    ) -> dfs::MountedSifsMutationReport<std::result::Result<R, FuseMountedMutationError>> {
+        dfs::MountedSifsMutationReport {
+            outcome,
+            committed_work,
+            committed_repair_records: Vec::new(),
+        }
+    }
+
+    fn test_mount_open_repair_record() -> dfs::DfsRepairAttemptRecord {
+        dfs::DfsRepairAttemptRecord {
+            intent_id: "fuse-mount-open-intent".to_string(),
+            object_id: test_object_id("fusemountopenobject"),
+            version: dfs::DfsVersion::from_legacy_named("fuse_mount_open_version")
+                .expect("test version"),
+            content_hash: "a".repeat(64),
+            missing_replica_node_id: dfs::DfsNodeId::from_legacy_named(
+                "node_fuse_mount_open_replica",
+            )
+            .expect("test node"),
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn every_durable_fuse_mutation_has_one_bounded_handoff_label() {
+        let labels = FuseMountedMutationOperation::ALL
+            .into_iter()
+            .map(FuseMountedMutationOperation::label)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(labels.len(), FuseMountedMutationOperation::ALL.len());
+        assert!(labels.iter().all(|label| label.starts_with("fuse.")));
+        assert!(
+            labels
+                .iter()
+                .all(|label| { label.len() <= dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES })
+        );
+    }
+
+    #[test]
+    fn clustered_mount_open_orders_probe_session_arm_service_and_daemon_ack() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_probe = Arc::clone(&events);
+        let events_for_session = Arc::clone(&events);
+        let coordinator = prepare_fuse_clustered_mount_handoff_with(
+            (),
+            move |_| {
+                events_for_probe.lock().expect("event lock").push("probe");
+                Ok::<_, ()>(())
+            },
+            move |_| {
+                events_for_session
+                    .lock()
+                    .expect("event lock")
+                    .push("session");
+                Ok::<_, ()>(TestMountedMutationCoordinator {
+                    events: Arc::clone(&events_for_session),
+                    ..TestMountedMutationCoordinator::default()
+                })
+            },
+        )
+        .expect("prepare test mount handoff");
+        let repair_record = test_mount_open_repair_record();
+        let repair_record_for_capture = repair_record.clone();
+        let service_open_events = Arc::clone(&events);
+        let repair_events = Arc::clone(&events);
+        let opened = run_fuse_clustered_mount_open_with(
+            &coordinator,
+            move || {
+                service_open_events
+                    .lock()
+                    .expect("event lock")
+                    .push("service-open-bootstrap");
+                Ok::<_, ()>(7usize)
+            },
+            move |_| {
+                repair_events
+                    .lock()
+                    .expect("event lock")
+                    .push("collect-repair-records");
+                vec![repair_record_for_capture]
+            },
+        )
+        .expect("mount-open handoff");
+
+        assert_eq!(opened, 7);
+        assert_eq!(
+            *events.lock().expect("event lock"),
+            [
+                "probe",
+                "session",
+                "prepare",
+                "arm",
+                "arm-ack",
+                "service-open-bootstrap",
+                "collect-repair-records",
+                "persist-captured",
+                "commit-captured",
+                "commit-ack",
+                "release",
+            ]
+        );
+        assert_eq!(
+            *coordinator
+                .prepared_operations
+                .lock()
+                .expect("prepared operation lock"),
+            [(FuseMountedMutationOperation::MountOpen, None)]
+        );
+        let captured = coordinator
+            .captured_work
+            .lock()
+            .expect("captured work lock");
+        assert_eq!(captured.len(), 1);
+        let work = &captured[0];
+        assert!(work.committed_work.publish_metadata);
+        assert!(work.committed_work.repair_maintenance);
+        assert!(work.committed_work.namespace_maintenance);
+        assert!(work.committed_work.metadata_replica_progress);
+        assert!(work.committed_work.metadata_materialization);
+        assert_eq!(work.committed_repair_records, [repair_record]);
+    }
+
+    #[test]
+    fn clustered_mount_open_error_persists_unknown_without_fatal_mount_gate() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let result = run_fuse_clustered_mount_open_with(
+            &coordinator,
+            || {
+                coordinator.record("service-open-bootstrap");
+                Err::<usize, _>("open-failed")
+            },
+            |_| Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FuseMountOpenHandoffError::Service("open-failed"))
+        ));
+        assert!(coordinator.is_gated());
+        assert_eq!(
+            *coordinator.events.lock().expect("event lock"),
+            [
+                "prepare",
+                "arm",
+                "arm-ack",
+                "service-open-bootstrap",
+                "gate-before-mount",
+                "persist-unknown",
+                "commit-unknown",
+                "commit-ack",
+                "release",
+                "retire-gated-session",
+            ]
+        );
+        let observations = coordinator
+            .unknown_observations
+            .lock()
+            .expect("observation lock");
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].error_code, "fuse-mount-open-service-error");
+        assert!(
+            observations[0]
+                .captured_work
+                .committed_work
+                .publish_metadata
+        );
+        assert!(
+            observations[0]
+                .captured_work
+                .committed_work
+                .metadata_materialization
+        );
+        assert!(
+            !coordinator
+                .events
+                .lock()
+                .expect("event lock")
+                .contains(&"gate"),
+            "pre-FUSE failures must not invoke the fatal mounted gate"
+        );
+    }
+
+    #[test]
+    fn clustered_mount_open_service_error_retains_full_recovery_marker() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-mount-open-error-marker");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("outbox");
+        let session = store
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::Fuse,
+                "fuse:test-mount-open-error",
+            )
+            .expect("host session");
+        let coordinator = TestStoreMountOpenCoordinator {
+            store: store.clone(),
+            session,
+            gated: AtomicBool::new(false),
+            mutation_lane: Mutex::new(()),
+        };
+
+        let result = run_fuse_clustered_mount_open_with(
+            &coordinator,
+            || Err::<usize, _>("service-open-error"),
+            |_| Vec::new(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(FuseMountOpenHandoffError::Service("service-open-error"))
+        ));
+        let status = store.status().expect("post-error status");
+        assert_eq!(status.pending_marker_count, 1);
+        assert_eq!(status.full_recovery_marker_count, 1);
+        let marker_ids = store
+            .recovery_candidate_marker_ids()
+            .expect("recovery candidates");
+        assert_eq!(marker_ids.len(), 1);
+        let marker = store
+            .marker(&marker_ids[0])
+            .expect("read marker")
+            .expect("retained marker");
+        assert_eq!(
+            marker.origin.operation,
+            FuseMountedMutationOperation::MountOpen.label()
+        );
+        assert!(matches!(
+            marker.phase,
+            dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+                requires_full_recovery: true,
+                error_observation: Some(observation),
+                ..
+            } if observation.error_code == "fuse-mount-open-service-error"
+        ));
+    }
+
+    #[test]
+    fn clustered_mount_open_oversized_repair_inventory_becomes_unknown() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let result = run_fuse_clustered_mount_open_with(
+            &coordinator,
+            || Ok::<_, ()>(()),
+            |_| {
+                vec![
+                    test_mount_open_repair_record();
+                    dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS + 1
+                ]
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(FuseMountOpenHandoffError::Handoff { .. })
+        ));
+        let events = coordinator.events.lock().expect("event lock");
+        assert!(events.contains(&"persist-unknown"));
+        assert!(events.contains(&"commit-unknown"));
+        assert!(events.contains(&"retire-gated-session"));
+        assert!(!events.contains(&"persist-captured"));
+        drop(events);
+        assert_eq!(
+            coordinator
+                .unknown_observations
+                .lock()
+                .expect("observation lock")[0]
+                .error_code,
+            "fuse-mount-open-capture-invalid"
+        );
+    }
+
+    #[test]
+    fn clustered_mount_open_crash_after_arm_retains_full_recovery_marker() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-mount-open-arm-crash");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let store = dfs::MountedSifsMutationOutboxStore::new(&data_dir).expect("outbox");
+        let session = store
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::Fuse,
+                "fuse:test-mount-open-crash",
+            )
+            .expect("host session");
+        let lease = store
+            .prepare(
+                &session,
+                None,
+                FuseMountedMutationOperation::MountOpen.label(),
+            )
+            .expect("prepare mount-open");
+        let marker_id = lease.marker().marker_id.clone();
+        let marker_nonce = lease.marker().marker_nonce.clone();
+        let arm_request_id = dfs::MountedSifsMutationArmRequestId::generate();
+        store
+            .arm_live(&marker_id, &marker_nonce, &arm_request_id)
+            .expect("arm mount-open");
+
+        // Simulate a hard process stop after backend entry but before capture:
+        // both liveness leases disappear without authoring a no-write proof.
+        drop(lease);
+        drop(session);
+
+        let status = store.status().expect("post-crash status");
+        assert_eq!(status.pending_marker_count, 1);
+        assert_eq!(status.full_recovery_marker_count, 1);
+        let marker = store
+            .marker(&marker_id)
+            .expect("read marker")
+            .expect("retained marker");
+        assert_eq!(
+            marker.origin.operation,
+            FuseMountedMutationOperation::MountOpen.label()
+        );
+        assert!(matches!(
+            marker.phase,
+            dfs::MountedSifsMutationOutboxPhase::Armed {
+                arm_request_id: current,
+            } if current == arm_request_id
+        ));
+    }
+
+    #[test]
+    fn every_advisory_lock_command_maps_to_its_durable_handoff_operation() {
+        let object_id = test_object_id("fusehandofflockobject");
+        let token = test_grant(
+            object_id,
+            "fuse-handoff-lock-grant",
+            dfs::DfsAdvisoryLockMode::Exclusive,
+        )
+        .token;
+        let session_id = dfs::DfsAdvisoryLockSessionId::new("fuse-handoff-lock-session");
+        let acquire_request_id = dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-acquire");
+        let commands = [
+            dfs::DfsAdvisoryLockCommand::Acquire {
+                request_id: acquire_request_id.clone(),
+                session_id: session_id.clone(),
+                mode: dfs::DfsAdvisoryLockMode::Exclusive,
+                blocking: true,
+                process_id: Some(42),
+            },
+            dfs::DfsAdvisoryLockCommand::Query {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-query"),
+                session_id: session_id.clone(),
+                mode: dfs::DfsAdvisoryLockMode::Exclusive,
+            },
+            dfs::DfsAdvisoryLockCommand::Renew {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-renew"),
+                token: token.clone(),
+            },
+            dfs::DfsAdvisoryLockCommand::Convert {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-convert"),
+                token: token.clone(),
+                mode: dfs::DfsAdvisoryLockMode::Shared,
+            },
+            dfs::DfsAdvisoryLockCommand::Unlock {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-unlock"),
+                token,
+            },
+            dfs::DfsAdvisoryLockCommand::Cancel {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-cancel"),
+                session_id: session_id.clone(),
+                acquire_request_id,
+            },
+            dfs::DfsAdvisoryLockCommand::Close {
+                request_id: dfs::DfsAdvisoryLockRequestId::new("fuse-handoff-lock-close"),
+                session_id,
+            },
+        ];
+        let expected = [
+            FuseMountedMutationOperation::AdvisoryLockAcquire,
+            FuseMountedMutationOperation::AdvisoryLockQuery,
+            FuseMountedMutationOperation::AdvisoryLockRenew,
+            FuseMountedMutationOperation::AdvisoryLockConvert,
+            FuseMountedMutationOperation::AdvisoryLockUnlock,
+            FuseMountedMutationOperation::AdvisoryLockCancel,
+            FuseMountedMutationOperation::AdvisoryLockClose,
+        ];
+
+        assert_eq!(
+            commands
+                .iter()
+                .map(fuse_advisory_lock_mutation_operation)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn foreground_advisory_lock_mutation_uses_the_acknowledged_handoff() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Mutex::new(0usize);
+        let result = run_fuse_mounted_mutation_with_lock(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::AdvisoryLockAcquire,
+            Some("fuse-foreground-lock-acquire".to_string()),
+            |service| service.lock().map_err(|_| libc::EIO),
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(*value), dfs::DfsCommittedWork::default())
+            },
+        );
+
+        assert_eq!(result, Ok(1));
+        assert_eq!(
+            *coordinator
+                .prepared_operations
+                .lock()
+                .expect("prepared operation lock"),
+            [(
+                FuseMountedMutationOperation::AdvisoryLockAcquire,
+                Some("fuse-foreground-lock-acquire".to_string()),
+            )]
+        );
+        assert_eq!(
+            *coordinator.events.lock().expect("event lock"),
+            [
+                "prepare",
+                "arm",
+                "arm-ack",
+                "persist-captured",
+                "commit-captured",
+                "commit-ack",
+                "release",
+            ]
+        );
+    }
+
+    #[test]
+    fn background_renewal_and_waiter_cancel_share_the_serialized_handoff() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Mutex::new(0usize);
+        let renewed = run_fuse_mounted_mutation_with_lock(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::AdvisoryLockRenew,
+            Some("fuse-background-lock-renew".to_string()),
+            |service| service.lock().map_err(|_| libc::EIO),
+            |value| {
+                *value += 1;
+                test_mutation_report(Ok(*value), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(renewed, Ok(1));
+
+        let waiter_state = Arc::new(Mutex::new(FuseState::new("/".to_string())));
+        let waiter_key = (test_object_id("fusecancelledwaiterobject"), 77);
+        let acquire_request_id =
+            dfs::DfsAdvisoryLockRequestId::new("fuse-cancelled-waiter-acquire");
+        let waiter_state_for_preflight = Arc::clone(&waiter_state);
+        let waiter_key_for_preflight = waiter_key.clone();
+        let request_for_preflight = acquire_request_id.clone();
+        let cancel_mutations = AtomicU64::new(0);
+        let cancelled: std::result::Result<(), libc::c_int> =
+            run_fuse_mounted_mutation_with_lock_and_preflight(
+                &coordinator,
+                &service,
+                FuseMountedMutationOperation::AdvisoryLockCancel,
+                Some("fuse-background-lock-cancel".to_string()),
+                |service| service.lock().map_err(|_| libc::EIO),
+                move |_| {
+                    preflight_blocking_lock_acquire(
+                        &waiter_state_for_preflight,
+                        &waiter_key_for_preflight,
+                        &request_for_preflight,
+                    )
+                },
+                |_| {
+                    cancel_mutations.fetch_add(1, Ordering::Relaxed);
+                    test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+                },
+            );
+
+        assert_eq!(cancelled, Err(libc::EINTR));
+        assert_eq!(cancel_mutations.load(Ordering::Relaxed), 0);
+        assert!(!coordinator.is_gated());
+        assert_eq!(
+            *coordinator
+                .prepared_operations
+                .lock()
+                .expect("prepared operation lock"),
+            [
+                (
+                    FuseMountedMutationOperation::AdvisoryLockRenew,
+                    Some("fuse-background-lock-renew".to_string()),
+                ),
+                (
+                    FuseMountedMutationOperation::AdvisoryLockCancel,
+                    Some("fuse-background-lock-cancel".to_string()),
+                ),
+            ]
+        );
+        let events = coordinator.events.lock().expect("event lock");
+        assert!(events.contains(&"persist-captured"));
+        assert!(events.contains(&"commit-captured"));
+        assert!(events.contains(&"persist-proven-no-write"));
+        assert!(events.contains(&"commit-proven-no-write"));
+        assert!(!events.contains(&"persist-unknown"));
+    }
+
+    #[test]
+    fn daemon_arm_ack_precedes_service_mutation() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        coordinator.fail_arm.store(true, Ordering::Release);
+        let service = Mutex::new(0usize);
+        let mutation_calls = AtomicU64::new(0);
+
+        let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |_| {
+                mutation_calls.fetch_add(1, Ordering::Relaxed);
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+
+        assert_eq!(result, Err(libc::EIO));
+        assert_eq!(mutation_calls.load(Ordering::Relaxed), 0);
+        assert!(coordinator.is_gated());
+        assert_eq!(
+            *coordinator.events.lock().expect("event lock"),
+            ["prepare", "arm", "gate", "retire-gated-session"]
+        );
+    }
+
+    #[test]
+    fn directory_refresh_read_error_commits_captured_work_without_gating() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Mutex::new(0usize);
+        let committed_work = dfs::DfsCommittedWork {
+            metadata_replica_progress: true,
+            ..dfs::DfsCommittedWork::default()
+        };
+        let result: std::result::Result<std::result::Result<(), DfsPosixError>, libc::c_int> =
+            run_fuse_mounted_mutation_with(
+                &coordinator,
+                &service,
+                FuseMountedMutationOperation::DirectoryRefresh,
+                |_| {
+                    test_mutation_report(
+                        Ok(Err(DfsPosixError::NotFound {
+                            path: "/missing".to_string(),
+                        })),
+                        committed_work,
+                    )
+                },
+            );
+
+        assert!(matches!(result, Ok(Err(DfsPosixError::NotFound { .. }))));
+        assert!(!coordinator.is_gated());
+        assert_eq!(
+            *coordinator.events.lock().expect("event lock"),
+            [
+                "prepare",
+                "arm",
+                "arm-ack",
+                "persist-captured",
+                "commit-captured",
+                "commit-ack",
+                "release",
+            ]
+        );
+        assert!(
+            coordinator
+                .unknown_observations
+                .lock()
+                .expect("observation lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn daemon_commit_runs_without_the_service_lock_and_before_success_returns() {
+        let service = Arc::new(Mutex::new(0usize));
+        let commit_block = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        let coordinator = Arc::new(TestMountedMutationCoordinator {
+            service_lock: Some(Arc::clone(&service)),
+            commit_block: Some(Arc::clone(&commit_block)),
+            ..TestMountedMutationCoordinator::default()
+        });
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let service_for_thread = Arc::clone(&service);
+        let coordinator_for_thread = Arc::clone(&coordinator);
+        let worker = thread::spawn(move || {
+            let result = run_fuse_mounted_mutation_with(
+                coordinator_for_thread.as_ref(),
+                service_for_thread.as_ref(),
+                FuseMountedMutationOperation::Rename,
+                |value| {
+                    *value += 1;
+                    test_mutation_report(Ok(7usize), dfs::DfsCommittedWork::default())
+                },
+            );
+            result_tx.send(result).expect("send result");
+        });
+        {
+            let (state, wake) = &*commit_block;
+            let mut state = state.lock().expect("commit block lock");
+            while !state.0 {
+                state = wake.wait(state).expect("commit entry wait");
+            }
+        }
+        assert!(
+            coordinator
+                .commit_saw_service_lock_free
+                .load(Ordering::Acquire)
+        );
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        {
+            let (state, wake) = &*commit_block;
+            let mut state = state.lock().expect("commit block lock");
+            state.1 = true;
+            wake.notify_all();
+        }
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(7)));
+        worker.join().expect("mutation worker");
+        let events = coordinator.events.lock().expect("event lock");
+        assert_eq!(
+            events.as_slice(),
+            [
+                "prepare",
+                "arm",
+                "arm-ack",
+                "persist-captured",
+                "commit-captured",
+                "commit-ack",
+                "release",
+            ]
+        );
+    }
+
+    #[test]
+    fn service_error_persists_unknown_with_exact_work_and_gates_later_mutations() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Mutex::new(0usize);
+        let committed_work = dfs::DfsCommittedWork {
+            publish_metadata: true,
+            ..dfs::DfsCommittedWork::default()
+        };
+        let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::ImmediateWritePublication,
+            |_| {
+                test_mutation_report(
+                    Err(FuseMountedMutationError {
+                        errno: libc::EAGAIN,
+                        error_code: "test-ambiguous-write",
+                    }),
+                    committed_work,
+                )
+            },
+        );
+        assert_eq!(result, Err(libc::EAGAIN));
+        assert!(coordinator.is_gated());
+        let observations = coordinator
+            .unknown_observations
+            .lock()
+            .expect("observation lock");
+        assert_eq!(observations.len(), 1);
+        assert!(
+            observations[0]
+                .captured_work
+                .committed_work
+                .publish_metadata
+        );
+        drop(observations);
+        let later_mutations = AtomicU64::new(0);
+        let later = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Mkdir,
+            |_| {
+                later_mutations.fetch_add(1, Ordering::Relaxed);
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(later, Err(libc::EIO));
+        assert_eq!(later_mutations.load(Ordering::Relaxed), 0);
+        let events = coordinator.events.lock().expect("event lock");
+        assert!(events.contains(&"persist-unknown"));
+        assert!(!events.contains(&"persist-captured"));
+    }
+
+    #[test]
+    fn empty_capture_service_error_is_still_unknown_not_a_no_write_proof() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Mutex::new(0usize);
+        let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::Unlink,
+            |_| {
+                test_mutation_report(
+                    Err(FuseMountedMutationError::from(DfsPosixError::NotFound {
+                        path: "/missing".to_string(),
+                    })),
+                    dfs::DfsCommittedWork::default(),
+                )
+            },
+        );
+
+        assert_eq!(result, Err(libc::ENOENT));
+        assert!(coordinator.is_gated());
+        let events = coordinator.events.lock().expect("event lock");
+        assert!(events.contains(&"persist-unknown"));
+        assert!(!events.contains(&"persist-proven-no-write"));
+    }
+
+    #[test]
+    fn failure_before_service_entry_attests_proven_no_write() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        let service = Arc::new(Mutex::new(0usize));
+        let service_to_poison = Arc::clone(&service);
+        assert!(
+            thread::spawn(move || {
+                let _service = service_to_poison.lock().expect("service lock");
+                panic!("poison service lane before mutation entry");
+            })
+            .join()
+            .is_err()
+        );
+        let mutation_calls = AtomicU64::new(0);
+        let result: std::result::Result<(), libc::c_int> = run_fuse_mounted_mutation_with(
+            &coordinator,
+            service.as_ref(),
+            FuseMountedMutationOperation::Mkdir,
+            |_| {
+                mutation_calls.fetch_add(1, Ordering::Relaxed);
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+
+        assert_eq!(result, Err(libc::EIO));
+        assert_eq!(mutation_calls.load(Ordering::Relaxed), 0);
+        let events = coordinator.events.lock().expect("event lock");
+        assert!(events.contains(&"persist-proven-no-write"));
+        assert!(events.contains(&"commit-proven-no-write"));
+        assert!(!events.contains(&"persist-unknown"));
+    }
+
+    #[test]
+    fn mutation_admission_stays_closed_until_the_prior_daemon_ack() {
+        let service = Arc::new(Mutex::new(0usize));
+        let commit_block = Arc::new((Mutex::new((false, false)), std::sync::Condvar::new()));
+        let coordinator = Arc::new(TestMountedMutationCoordinator {
+            fail_commit: AtomicBool::new(true),
+            commit_block: Some(Arc::clone(&commit_block)),
+            ..TestMountedMutationCoordinator::default()
+        });
+        let (first_tx, first_rx) = std::sync::mpsc::channel();
+        let first_service = Arc::clone(&service);
+        let first_coordinator = Arc::clone(&coordinator);
+        let first_worker = thread::spawn(move || {
+            let result = run_fuse_mounted_mutation_with(
+                first_coordinator.as_ref(),
+                first_service.as_ref(),
+                FuseMountedMutationOperation::SetMode,
+                |value| {
+                    *value += 1;
+                    test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+                },
+            );
+            first_tx.send(result).expect("send first result");
+        });
+        {
+            let (state, wake) = &*commit_block;
+            let mut state = state.lock().expect("commit block lock");
+            while !state.0 {
+                state = wake.wait(state).expect("commit entry wait");
+            }
+        }
+
+        let second_mutations = Arc::new(AtomicU64::new(0));
+        let (second_tx, second_rx) = std::sync::mpsc::channel();
+        let second_service = Arc::clone(&service);
+        let second_coordinator = Arc::clone(&coordinator);
+        let second_mutations_for_worker = Arc::clone(&second_mutations);
+        let second_worker = thread::spawn(move || {
+            let result = run_fuse_mounted_mutation_with(
+                second_coordinator.as_ref(),
+                second_service.as_ref(),
+                FuseMountedMutationOperation::SetTimes,
+                |value| {
+                    second_mutations_for_worker.fetch_add(1, Ordering::Relaxed);
+                    *value += 1;
+                    test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+                },
+            );
+            second_tx.send(result).expect("send second result");
+        });
+        assert!(matches!(
+            second_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(second_mutations.load(Ordering::Relaxed), 0);
+        assert_eq!(*service.lock().expect("service lock"), 1);
+
+        {
+            let (state, wake) = &*commit_block;
+            let mut state = state.lock().expect("commit block lock");
+            state.1 = true;
+            wake.notify_all();
+        }
+        assert_eq!(
+            first_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(libc::EIO))
+        );
+        assert_eq!(
+            second_rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Err(libc::EIO))
+        );
+        assert_eq!(second_mutations.load(Ordering::Relaxed), 0);
+        assert_eq!(*service.lock().expect("service lock"), 1);
+        first_worker.join().expect("first mutation worker");
+        second_worker.join().expect("second mutation worker");
+    }
+
+    #[test]
+    fn failed_commit_gates_the_mount_and_never_reports_success() {
+        let coordinator = TestMountedMutationCoordinator::default();
+        coordinator.fail_commit.store(true, Ordering::Release);
+        let service = Mutex::new(0usize);
+        let first = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::SetMode,
+            |_| test_mutation_report(Ok(()), dfs::DfsCommittedWork::default()),
+        );
+        assert_eq!(first, Err(libc::EIO));
+        assert!(coordinator.is_gated());
+        assert!(
+            !coordinator
+                .events
+                .lock()
+                .expect("event lock")
+                .contains(&"release")
+        );
+        let later_mutations = AtomicU64::new(0);
+        let second = run_fuse_mounted_mutation_with(
+            &coordinator,
+            &service,
+            FuseMountedMutationOperation::SetTimes,
+            |_| {
+                later_mutations.fetch_add(1, Ordering::Relaxed);
+                test_mutation_report(Ok(()), dfs::DfsCommittedWork::default())
+            },
+        );
+        assert_eq!(second, Err(libc::EIO));
+        assert_eq!(later_mutations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn every_clustered_mount_requires_the_mutation_handoff() {
+        assert!(fuse_mounted_mutation_handoff_required(true, false));
+        assert!(fuse_mounted_mutation_handoff_required(true, true));
+        assert!(!fuse_mounted_mutation_handoff_required(false, false));
+        assert!(!fuse_mounted_mutation_handoff_required(false, true));
+    }
+
     #[test]
     fn foreground_mount_rejects_unsafe_host_paths_before_opening_sifs() {
         for mount_point in ["/", "/etc/sinomo-unsafe-mount"] {
@@ -3953,6 +6496,108 @@ mod errno_tests {
             Some(helper)
         );
         assert!(fuse_mount_helper_on_path(None).is_none());
+    }
+
+    #[test]
+    fn fatal_mount_health_cancels_and_requests_one_exact_lazy_unmount() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-fatal-health");
+        let helper = root.join("fusermount3");
+        let invocation = root.join("invocation.txt");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
+                invocation.display()
+            ),
+        )
+        .expect("write helper fixture");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        let mount_point = root.join("mount");
+        std::fs::create_dir(&mount_point).expect("mount point");
+        let cancellation = dfs::DfsCancellationFlag::new();
+        let health = FuseMountHealth::new(mount_point.clone(), helper, cancellation.clone())
+            .expect("health worker");
+
+        health.fail("ambiguous mounted mutation");
+        health.fail("later error must not replace the first evidence");
+        health
+            .wait_for_fatal_unmount(Duration::from_secs(2))
+            .expect("lazy unmount completion");
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            health.fatal_error().as_deref(),
+            Some("ambiguous mounted mutation")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&invocation)
+                .expect("helper invocation")
+                .lines()
+                .collect::<Vec<_>>(),
+            vec!["-u", "-z", mount_point.to_str().expect("UTF-8 mount point")],
+            "the first fatal edge owns one exact lazy-unmount request"
+        );
+    }
+
+    #[test]
+    fn fatal_mount_retirement_waits_for_the_original_lazy_unmount_helper() {
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-fatal-health-delayed");
+        let helper = root.join("fusermount3");
+        let started = root.join("started");
+        let release = root.join("release");
+        std::fs::write(
+            &helper,
+            format!(
+                "#!/bin/sh\nprintf done > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .expect("write delayed helper fixture");
+        let mut permissions = std::fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).expect("make helper executable");
+        let mount_point = root.join("mount");
+        std::fs::create_dir(&mount_point).expect("mount point");
+        let cancellation = dfs::DfsCancellationFlag::new();
+        let health =
+            FuseMountHealth::new(mount_point, helper, cancellation).expect("health worker");
+
+        health.fail("ambiguous mounted mutation");
+        let started_deadline = Instant::now() + Duration::from_secs(2);
+        while !started.exists() && Instant::now() < started_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.exists(), "delayed helper must have started");
+        let waiter_health = Arc::clone(&health);
+        let (waiting_sender, waiting_receiver) = mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = mpsc::sync_channel(1);
+        let waiter = thread::spawn(move || {
+            waiting_sender.send(()).expect("report helper wait start");
+            finished_sender
+                .send(waiter_health.wait_for_fatal_unmount(Duration::from_secs(2)))
+                .expect("report helper wait result");
+        });
+
+        waiting_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("helper wait starts");
+        assert!(matches!(
+            finished_receiver.recv_timeout(Duration::from_millis(75)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        std::fs::write(&release, b"release").expect("release delayed helper");
+        finished_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("helper wait completion")
+            .expect("successful delayed helper");
+        waiter.join().expect("helper waiter");
     }
 
     #[cfg(target_os = "linux")]
@@ -4051,9 +6696,16 @@ mod errno_tests {
     fn pre_cancelled_mount_open_stops_before_touching_local_state() {
         let cancellation = dfs::DfsCancellationFlag::new();
         cancellation.cancel();
+        let health = FuseMountHealth::new(
+            PathBuf::from("/tmp/sinomo-pre-cancelled-mount"),
+            PathBuf::from("/bin/true"),
+            cancellation.clone(),
+        )
+        .expect("health worker");
         let error = SifsFuseFileSystem::open(
             DfsFuseMountOptions::new("/tmp/sinomo-pre-cancelled-mount"),
             cancellation,
+            health,
         )
         .expect_err("pre-cancelled mount must stop before open");
         assert!(error.to_string().contains("cancelled before open"));

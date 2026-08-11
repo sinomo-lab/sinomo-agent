@@ -203,11 +203,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
 
+        let operation_deadline = self.transport.operation_deadline();
         let certified = self
             .control_plane
             .as_mut()
             .map(|kv| {
-                DfsControlPlaneStore::new(kv.as_mut()).metadata_shard_authority_is_current(&shard)
+                DfsControlPlaneStore::new(kv.as_mut())
+                    .metadata_shard_authority_is_current_before(&shard, operation_deadline)
             })
             .transpose()?
             .unwrap_or(false);
@@ -464,20 +466,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         expected: &DfsMetadataShardConfig,
     ) -> Result<bool, DfsError> {
+        let operation_deadline = self.transport.operation_deadline();
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(false);
         };
-        let store = DfsControlPlaneStore::new(control_plane.as_mut());
-        let current = store
-            .get_metadata_shard(&expected.file_system_id, &expected.shard_id)
-            .map_err(DfsError::from)?;
-        if current.as_ref() != Some(expected) {
-            return Ok(false);
-        }
-        Ok(store
-            .get_metadata_shard_membership_handoff(&expected.file_system_id, &expected.shard_id)
-            .map_err(DfsError::from)?
-            .is_none())
+        DfsControlPlaneStore::new(control_plane.as_mut())
+            .metadata_shard_authority_is_current_before(expected, operation_deadline)
+            .map_err(DfsError::from)
     }
 
     /// Revalidate typed evidence immediately before the backend publication
@@ -2233,6 +2228,73 @@ mod authority_probe_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RetryExactAuthorityControlPlane {
+        inner: InProcessKvStore,
+        exact_read_calls: Arc<AtomicUsize>,
+        txn_calls: Arc<AtomicUsize>,
+        requested_exact_sets: Arc<Mutex<Vec<Vec<String>>>>,
+        exact_read_deadlines: Arc<Mutex<Vec<Instant>>>,
+        fail_exact_calls: BTreeSet<usize>,
+    }
+
+    impl DfsControlPlaneKvClient for RetryExactAuthorityControlPlane {
+        fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            Err(KvError::Io {
+                path: "test raw authority point read".to_string(),
+                detail: "post-prepare authority must use one coherent exact-key-set read"
+                    .to_string(),
+            })
+        }
+
+        fn get_authoritative_consistent(
+            &mut self,
+            keys: &[String],
+        ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            let call = self.exact_read_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.requested_exact_sets
+                .lock()
+                .expect("requested exact authority sets")
+                .push(keys.to_vec());
+            if self.fail_exact_calls.contains(&call) {
+                return Err(KvError::Io {
+                    path: "test-cluster-authoritative-view".to_string(),
+                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                        .to_string(),
+                });
+            }
+            Ok(keys
+                .iter()
+                .map(|key| self.inner.get(key).cloned())
+                .collect())
+        }
+
+        fn get_authoritative_consistent_before(
+            &mut self,
+            keys: &[String],
+            deadline: Instant,
+        ) -> Result<Vec<Option<KvEntry>>, KvError> {
+            self.exact_read_deadlines
+                .lock()
+                .expect("exact authority deadlines")
+                .push(deadline);
+            self.get_authoritative_consistent(keys)
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.inner.range_prefix(prefix)
+        }
+
+        fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+            self.inner.put(key, value, None)
+        }
+
+        fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            self.txn_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.txn(txn)
+        }
+    }
+
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
     }
@@ -3313,6 +3375,80 @@ mod authority_probe_tests {
             service
                 .validate_canonical_authorization(&authorization, &operation)
                 .expect("full-shard evidence remains subject to canonical revalidation"),
+        );
+    }
+
+    #[test]
+    fn full_shard_namespace_authority_retries_post_ack_and_publication_exact_reads() {
+        let replica = node("node_retry_exact_namespace_authority_replica");
+        let (mut service, object, _, shard, _, _) =
+            authority_fixture(ProbeBehavior::Accept, vec![replica]);
+        let (operation, prepared_batch) =
+            persisted_small_namespace_authority_fixture(&mut service, &object, &shard);
+        let mut inner = InProcessKvStore::new();
+        DfsControlPlaneStore::new(&mut inner)
+            .put_metadata_shard(&shard)
+            .expect("metadata shard");
+        let exact_read_calls = Arc::new(AtomicUsize::new(0));
+        let txn_calls = Arc::new(AtomicUsize::new(0));
+        let requested_exact_sets = Arc::new(Mutex::new(Vec::new()));
+        let exact_read_deadlines = Arc::new(Mutex::new(Vec::new()));
+        service.control_plane = Some(Box::new(RetryExactAuthorityControlPlane {
+            inner,
+            exact_read_calls: Arc::clone(&exact_read_calls),
+            txn_calls: Arc::clone(&txn_calls),
+            requested_exact_sets: Arc::clone(&requested_exact_sets),
+            exact_read_deadlines: Arc::clone(&exact_read_deadlines),
+            // After the local-owner certification below, the first exact read
+            // after full-shard acknowledgement and the first publication-bound
+            // read each hit one generation race.
+            fail_exact_calls: BTreeSet::from([2, 4]),
+        }));
+        let operation_deadline = Instant::now() + Duration::from_secs(2);
+        service.transport.operation_deadline = Some(operation_deadline);
+
+        assert_eq!(
+            service
+                .certified_local_metadata_owner_shard_for_object(&object)
+                .expect("local-owner authority before caller deadline"),
+            Some(shard.clone()),
+            "the pre-prepare local-owner certification uses the same deadline-aware fence"
+        );
+
+        let authorization = service
+            .authorize_metadata_shard_operation(&shard, &operation, &prepared_batch)
+            .expect("post-ack exact authority retry");
+        assert!(matches!(
+            authorization,
+            DfsCanonicalAuthorization::FullShard { .. }
+        ));
+        drop(
+            service
+                .validate_canonical_authorization(&authorization, &operation)
+                .expect("publication exact authority retry"),
+        );
+
+        assert_eq!(exact_read_calls.load(Ordering::SeqCst), 5);
+        assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            exact_read_deadlines
+                .lock()
+                .expect("exact authority deadlines")
+                .as_slice(),
+            &[operation_deadline; 5],
+            "owner certification, post-ACK, and publication retries must inherit one caller deadline"
+        );
+        let expected_keys = vec![
+            crate::metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+            crate::metadata_shard_membership_handoff_key(&shard.file_system_id, &shard.shard_id),
+        ];
+        assert!(
+            requested_exact_sets
+                .lock()
+                .expect("requested exact authority sets")
+                .iter()
+                .all(|keys| keys == &expected_keys),
+            "both authority phases must observe the shard and handoff coherently"
         );
     }
 

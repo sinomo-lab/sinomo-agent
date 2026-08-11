@@ -90,6 +90,10 @@ pub fn register_storage_paths(
             "durable DFS maintenance cursors, retry ledgers, and suppression records",
         ),
         (
+            "dfs/mounted-mutation-outbox",
+            "crash-safe host-mount mutation ambiguity markers, leases, and daemon handoff receipts",
+        ),
+        (
             "dfs/cloud-files-unregister-recovery",
             "content-addressed Cloud Files provider artifacts and retirement intents needed for crash-safe sync-root cleanup",
         ),
@@ -322,6 +326,9 @@ mod tests {
             "dfs/content/orphan-observations/ab/abcdef.sobj",
             "dfs/content/stats.sobj",
             "dfs/host-mount.lock",
+            "dfs/mounted-mutation-outbox/daemon-committed-work-latch.sobj",
+            "dfs/mounted-mutation-outbox/operations/01hxy6qa9k0t9vr4g9n8d3q5bf/state.sobj",
+            "dfs/mounted-mutation-outbox/sessions/01hxy6qa9k0t9vr4g9n8d3q5bf/lease.lock",
             "dfs/anti-entropy-cursors/sifs.sobj",
             "dfs/metadata/services/records/tables/materialized.slog",
             "dfs/metadata/users/journal/segments/00000000000000000001.slog",

@@ -1,14 +1,17 @@
 //! Typed client for the running daemon's control API.
 
 use crate::{
-    DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
-    DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonApiError,
-    DaemonLocalConnectivityReloadRequest, DaemonLocalConnectivityReloadResponse,
-    DaemonNetworkChunkMetricsResponse, DaemonObjectRpcForwardDeliveryState,
-    DaemonObjectRpcForwardRequest, DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus,
-    DaemonStatus, probe_daemon_status,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY, DAEMON_SHUTDOWN_ROUTE,
+    DAEMON_STATUS_ROUTE, DaemonApiError, DaemonDfsMountedMutationHandoffRequest,
+    DaemonDfsMountedMutationHandoffResponse, DaemonLocalConnectivityReloadRequest,
+    DaemonLocalConnectivityReloadResponse, DaemonNetworkChunkMetricsResponse,
+    DaemonObjectRpcForwardDeliveryState, DaemonObjectRpcForwardRequest,
+    DaemonObjectRpcForwardResponse, DaemonPaths, DaemonProbeStatus, DaemonStatus,
+    probe_daemon_status,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -43,6 +46,324 @@ use std::time::{Duration, Instant};
 
 /// How long daemon discovery waits for the status probe.
 pub const DAEMON_API_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Normal whole-call budget for the local mounted-mutation durability handoff.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest caller-selected whole-call budget. Every request retains an
+/// absolute deadline even while authenticated keepalives show transport
+/// progress.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Explicit local-command client used by separately supervised filesystem
+/// mount processes to transfer mutation ownership to the main daemon.
+///
+/// This client never discovers a data directory from the process environment:
+/// the mount supervisor must provide both the directory and the daemon address
+/// it launched against. Only a loopback address is accepted, so the durable
+/// marker protocol cannot be exposed as an ordinary routed cluster RPC.
+#[derive(Clone, Debug)]
+pub struct DaemonDfsMountedMutationHandoffClient {
+    data_dir: SinomoDataDir,
+    address: String,
+    timeout: Duration,
+}
+
+impl DaemonDfsMountedMutationHandoffClient {
+    pub fn new(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+    ) -> Result<Self, DaemonApiError> {
+        data_dir.ensure_root_layout()?;
+        let address = address.into();
+        if !sinomo_core::network::is_loopback_connect_address(&address) {
+            return Err(DaemonApiError::Network {
+                address,
+                detail:
+                    "mounted-mutation handoff requires an explicit main-daemon loopback address"
+                        .to_string(),
+            });
+        }
+        Ok(Self {
+            data_dir,
+            address,
+            timeout: DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,
+        })
+    }
+
+    /// Override the one whole-call budget while retaining a finite upper
+    /// bound. The same duration also bounds connection establishment and every
+    /// interval without stream progress.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, DaemonApiError> {
+        if timeout.is_zero() || timeout > DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT {
+            return Err(DaemonApiError::Parse {
+                detail: format!(
+                    "mounted-mutation handoff timeout must be greater than zero and no more than {:?}",
+                    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT
+                ),
+            });
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn data_dir(&self) -> &SinomoDataDir {
+        &self.data_dir
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn probe(&self) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::Probe)?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready,
+            None,
+            None,
+            0,
+        )
+    }
+
+    /// Durably arm a prepared marker. A successful return is the authoritative
+    /// fsynced precondition which permits the caller to enter the mutation.
+    pub fn arm(
+        &self,
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            0,
+        )
+    }
+
+    pub fn commit_applied(
+        &self,
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        captured_work: sinomo_dfs::MountedSifsMutationCapturedWork,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let expected_max_appended_repair_record_count =
+            captured_work.committed_repair_records.len();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            expected_max_appended_repair_record_count,
+        )
+    }
+
+    /// Preserve an ambiguous mutation error together with every exact work bit
+    /// and repair record captured before the error. This transition deliberately
+    /// has no convenience path which substitutes an empty capture.
+    pub fn commit_unknown(
+        &self,
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        observation: sinomo_dfs::MountedSifsMutationErrorObservation,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let expected_max_appended_repair_record_count =
+            observation.captured_work.committed_repair_records.len();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            observation,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            expected_max_appended_repair_record_count,
+        )
+    }
+
+    pub fn prove_no_write(
+        &self,
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        proof_code: impl Into<String>,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code: proof_code.into(),
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            0,
+        )
+    }
+
+    /// Abort only a marker whose mutation was positively never started. The
+    /// daemon rejects an armed or later marker rather than accepting an empty
+    /// work receipt.
+    pub fn abort_unstarted(
+        &self,
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+            marker_id,
+            marker_nonce,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            Some(&expected_marker_id),
+            None,
+            0,
+        )
+    }
+
+    fn call(
+        &self,
+        request: DaemonDfsMountedMutationHandoffRequest,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let call = daemon_dfs_mounted_mutation_handoff_call(&request)?;
+        let data_dir = self.data_dir.clone();
+        let address = self.address.clone();
+        let timeout = self.timeout;
+        block_on_daemon_client(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let deadline = daemon_api_overall_deadline(Some(timeout));
+            let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
+            run_daemon_api_with_overall_deadline(
+                "mounted-mutation main-daemon handoff",
+                deadline,
+                async move {
+                    call_daemon_address_rpc_async(data_dir, &address, call, options, &runtime)
+                        .await?
+                        .decode_body()
+                        .await
+                        .map_err(Into::into)
+                },
+            )
+            .await
+        })
+    }
+}
+
+fn daemon_dfs_mounted_mutation_handoff_options(
+    timeout: Duration,
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::network::ClusterObjectRpcOptions::new(
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )
+    .with_overall_timeout(timeout)
+    .with_destination_process_affinity(sinomo_core::network::DestinationProcessAffinity::MainDaemon)
+}
+
+fn daemon_dfs_mounted_mutation_handoff_call(
+    request: &DaemonDfsMountedMutationHandoffRequest,
+) -> Result<ObjectRpcCall, DaemonApiError> {
+    request
+        .validate()
+        .map_err(|detail| DaemonApiError::Parse { detail })?;
+    let replayable = ObjectRpcCall::encode_replayable_value(
+        DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+        DAEMON_RPC_CATEGORY,
+        request,
+    )?;
+    let encoded_bytes = replayable.encoded_value_bytes();
+    if encoded_bytes > DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff request is {encoded_bytes} encoded bytes; max is {DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES}"
+            ),
+        });
+    }
+    let mut call = replayable.call();
+    call.request = call.request.with_response_retry_safe();
+    if let Some(operation_id) = daemon_dfs_mounted_mutation_handoff_operation_id(request) {
+        call.request = call.request.with_operation_id(operation_id);
+    }
+    Ok(call)
+}
+
+fn daemon_dfs_mounted_mutation_handoff_operation_id(
+    request: &DaemonDfsMountedMutationHandoffRequest,
+) -> Option<&str> {
+    match request {
+        DaemonDfsMountedMutationHandoffRequest::Probe => None,
+        DaemonDfsMountedMutationHandoffRequest::Arm { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::CommitApplied { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::CommitUnknown { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::ProveNoWrite { arm_request_id, .. } => {
+            Some(arm_request_id.as_str())
+        }
+        DaemonDfsMountedMutationHandoffRequest::AbortUnstarted { marker_id, .. } => {
+            Some(marker_id.as_str())
+        }
+    }
+}
+
+fn validate_daemon_dfs_mounted_mutation_handoff_response(
+    response: DaemonDfsMountedMutationHandoffResponse,
+    expected_phase: crate::DaemonDfsMountedMutationHandoffPhase,
+    expected_marker_id: Option<&sinomo_core::Id>,
+    expected_arm_request_id: Option<&sinomo_core::Id>,
+    expected_max_appended_repair_record_count: usize,
+) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    if response.phase != expected_phase
+        || response.marker_id.as_ref() != expected_marker_id
+        || response.arm_request_id.as_ref() != expected_arm_request_id
+    {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff returned mismatched acknowledgement: phase={:?}, marker_id={:?}, arm_request_id={:?}",
+                response.phase, response.marker_id, response.arm_request_id
+            ),
+        });
+    }
+    if response.appended_repair_record_count > expected_max_appended_repair_record_count {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff acknowledgement reports {} appended repair records; this request supplied at most {}",
+                response.appended_repair_record_count, expected_max_appended_repair_record_count
+            ),
+        });
+    }
+    Ok(response)
+}
+
 /// Typed daemon API client: daemon discovery plus object RPC.
 #[derive(Clone, Debug)]
 pub struct DaemonApiClient {
@@ -2128,6 +2449,267 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn mounted_mutation_test_ids() -> (
+        sinomo_dfs::MountedSifsMutationMarkerId,
+        sinomo_dfs::MountedSifsMutationNonce,
+        sinomo_dfs::MountedSifsMutationArmRequestId,
+    ) {
+        (
+            sinomo_core::Id::derived("test.mounted-mutation.client.marker", b"marker"),
+            sinomo_core::Id::derived("test.mounted-mutation.client.nonce", b"nonce"),
+            sinomo_core::Id::derived("test.mounted-mutation.client.arm", b"arm"),
+        )
+    }
+
+    fn mounted_mutation_test_capture(
+        repair_records: Vec<sinomo_dfs::DfsRepairAttemptRecord>,
+    ) -> sinomo_dfs::MountedSifsMutationCapturedWork {
+        sinomo_dfs::MountedSifsMutationCapturedWork {
+            committed_work: sinomo_dfs::DfsCommittedWork {
+                publish_metadata: true,
+                ..sinomo_dfs::DfsCommittedWork::default()
+            },
+            committed_repair_records: repair_records,
+        }
+    }
+
+    fn mounted_mutation_test_repair_record(
+        last_error: Option<String>,
+    ) -> sinomo_dfs::DfsRepairAttemptRecord {
+        sinomo_dfs::DfsRepairAttemptRecord {
+            intent_id: "mounted-mutation-test-intent".to_string(),
+            object_id: sinomo_core::Id::derived("test.mounted-mutation.client.object", b"object"),
+            version: sinomo_core::Id::derived("test.mounted-mutation.client.version", b"version"),
+            content_hash: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            missing_replica_node_id: NodeId::from_legacy_named(
+                "node_mounted_mutation_client_missing_replica",
+            )
+            .expect("test node id"),
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error,
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_client_is_explicit_loopback_and_deadline_bounded() {
+        let (_root, data_dir) = test_channel_data_dir("api-mounted-mutation-client");
+        let client =
+            DaemonDfsMountedMutationHandoffClient::new(data_dir.clone(), "127.0.0.1:39393")
+                .expect("explicit loopback client");
+        assert_eq!(client.data_dir().root(), data_dir.root());
+        assert_eq!(client.address(), "127.0.0.1:39393");
+        assert_eq!(
+            client.timeout(),
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT
+        );
+
+        let timeout = Duration::from_millis(750);
+        let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
+        assert_eq!(options.overall_timeout(), Some(timeout));
+        assert_eq!(
+            options.destination_process_affinity(),
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon
+        );
+        assert!(client.clone().with_timeout(Duration::ZERO).is_err());
+        assert!(
+            client
+                .with_timeout(
+                    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT + Duration::from_nanos(1),
+                )
+                .is_err()
+        );
+
+        let error = DaemonDfsMountedMutationHandoffClient::new(data_dir, "10.0.0.20:39393")
+            .expect_err("remote handoff address must fail closed");
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn mounted_mutation_transitions_are_same_id_response_retry_safe() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let arm = DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+        };
+        let arm_call = daemon_dfs_mounted_mutation_handoff_call(&arm).expect("arm call");
+        assert_eq!(
+            arm_call.request.route,
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
+        );
+        assert_eq!(arm_call.request.category, DAEMON_RPC_CATEGORY);
+        assert!(arm_call.request.is_response_retry_safe());
+        assert_eq!(
+            arm_call.request.operation_id(),
+            Some(arm_request_id.as_str())
+        );
+
+        let commit = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            captured_work: mounted_mutation_test_capture(Vec::new()),
+        };
+        let commit_call = daemon_dfs_mounted_mutation_handoff_call(&commit).expect("commit call");
+        assert!(commit_call.request.is_response_retry_safe());
+        assert_eq!(
+            commit_call.request.operation_id(),
+            arm_call.request.operation_id(),
+            "arm and commit must retain the caller-stable arm request id"
+        );
+
+        let abort = DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+            marker_id: marker_id.clone(),
+            marker_nonce,
+        };
+        let abort_call = daemon_dfs_mounted_mutation_handoff_call(&abort).expect("abort call");
+        assert!(abort_call.request.is_response_retry_safe());
+        assert_eq!(abort_call.request.operation_id(), Some(marker_id.as_str()));
+
+        let probe = daemon_dfs_mounted_mutation_handoff_call(
+            &DaemonDfsMountedMutationHandoffRequest::Probe,
+        )
+        .expect("probe call");
+        assert!(probe.request.is_response_retry_safe());
+        assert_eq!(probe.request.operation_id(), None);
+    }
+
+    #[test]
+    fn mounted_mutation_client_rejects_oversized_semantic_and_encoded_payloads() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let record = mounted_mutation_test_repair_record(None);
+        let too_many = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            captured_work: mounted_mutation_test_capture(vec![
+                record;
+                sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+                    + 1
+            ]),
+        };
+        let error = daemon_dfs_mounted_mutation_handoff_call(&too_many)
+            .expect_err("repair-record cardinality limit");
+        assert!(error.to_string().contains("repair records"));
+
+        let large_record = mounted_mutation_test_repair_record(Some("e".repeat(10 * 1024)));
+        let oversized = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work: mounted_mutation_test_capture(vec![
+                large_record;
+                sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+            ]),
+        };
+        let error = daemon_dfs_mounted_mutation_handoff_call(&oversized)
+            .expect_err("encoded payload limit");
+        assert!(error.to_string().contains("encoded bytes"));
+        assert!(error.to_string().contains("max is"));
+    }
+
+    #[test]
+    fn mounted_mutation_response_requires_exact_acknowledgement_identity() {
+        let (marker_id, _marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let response = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            appended_repair_record_count: 0,
+        };
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response.clone(),
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&marker_id),
+            Some(&arm_request_id),
+            0,
+        )
+        .expect("matching arm acknowledgement");
+
+        let wrong_arm = sinomo_core::Id::derived("test.mounted-mutation.client.arm", b"wrong");
+        let error = validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&marker_id),
+            Some(&wrong_arm),
+            0,
+        )
+        .expect_err("mismatched arm acknowledgement");
+        assert!(error.to_string().contains("mismatched acknowledgement"));
+
+        let aborted = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: None,
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            appended_repair_record_count: 0,
+        };
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            aborted.clone(),
+            crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            Some(&marker_id),
+            None,
+            0,
+        )
+        .expect("abort acknowledgement echoes marker identity");
+
+        let missing_marker = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: None,
+            ..aborted
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                missing_marker,
+                crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+                Some(&marker_id),
+                None,
+                0,
+            )
+            .is_err(),
+            "every non-probe transition must echo its marker identity"
+        );
+
+        let impossible_arm_count = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            appended_repair_record_count: 1,
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                impossible_arm_count,
+                crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+                Some(&marker_id),
+                Some(&arm_request_id),
+                0,
+            )
+            .is_err(),
+            "non-commit acknowledgements must not claim appended repairs"
+        );
+
+        let excessive_commit_count = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            appended_repair_record_count: 2,
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                excessive_commit_count,
+                crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                Some(&marker_id),
+                Some(&arm_request_id),
+                1,
+            )
+            .is_err(),
+            "commit acknowledgement count must be bounded by supplied records"
+        );
+    }
 
     fn stalled_streamed_value_result(
         route: &str,

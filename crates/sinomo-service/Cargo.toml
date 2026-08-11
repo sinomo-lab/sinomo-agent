@@ -26,5 +26,6 @@ sinomo-node = { path = "../sinomo-node" }
 
 [dev-dependencies]
 serde.workspace = true
+sinomo-network = { path = "../sinomo-network", features = ["test-support"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }

@@ -73,8 +73,9 @@ use crate::registration_journal::{
     RegistrationRecoveryAction,
 };
 use crate::windows_sync::{
-    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesObjectProjection, CloudFilesWritableSyncState,
-    cloud_files_object_projection,
+    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesMountedMutationHandoff,
+    CloudFilesObjectProjection, CloudFilesWritableSyncState, cloud_files_object_projection,
+    configure_cloud_files_mounted_read_policy,
 };
 use crate::{
     DecodedCloudFilesPlaceholderIdentity, decode_placeholder_identity, encode_placeholder_identity,
@@ -598,6 +599,23 @@ fn mount_sifs_cloud_files_inner(
                 .to_string(),
         });
     }
+    // The main daemon must prove it can durably accept mounted mutations, and
+    // the Cloud Files host session must hold its liveness lease, before the
+    // sync root is registered or any callbacks can become provider-visible.
+    let mounted_mutation_handoff = Arc::new(
+        CloudFilesMountedMutationHandoff::open(
+            &data_dir,
+            format!(
+                "cloud-files:{}:{}",
+                request.sync_root.to_string_lossy(),
+                request.root_path
+            ),
+        )
+        .map_err(|detail| CloudFilesModuleError {
+            code: "mounted-mutation-handoff-unavailable".to_string(),
+            detail,
+        })?,
+    );
     let writable_state = CloudFilesWritableSyncState::open(
         &data_dir,
         request.sync_root.to_string_lossy(),
@@ -620,11 +638,21 @@ fn mount_sifs_cloud_files_inner(
     let recovered_registration = recover_registration_for_mount(&request, &data_dir)?;
     let existing_owned_root = matches!(&recovered_registration, RecoveredRegistration::Ready(_));
 
-    let opened = open_sifs_service(request.data_dir_root.clone())?;
+    let opened = mounted_mutation_handoff
+        .run_captured_mount_open(|| {
+            let opened = open_sifs_service(request.data_dir_root.clone())?;
+            let repair_records = opened.service.durable_repair_queue_records();
+            Ok::<_, CloudFilesModuleError>((opened, repair_records))
+        })
+        .map_err(|detail| CloudFilesModuleError {
+            code: "mounted-mutation-mount-open".to_string(),
+            detail,
+        })?;
     let shared_service = Arc::new(Mutex::new(opened.service));
     let materialized_directories = Arc::new(Mutex::new(BTreeSet::new()));
     let provider = Arc::new(CloudFilesProvider::new(
         Arc::clone(&shared_service),
+        Arc::clone(&mounted_mutation_handoff),
         request.sync_root.clone(),
         request.root_path.clone(),
         request.read_only,
@@ -651,6 +679,7 @@ fn mount_sifs_cloud_files_inner(
         writable_state,
         Arc::clone(&shared_service),
         write_options,
+        Arc::clone(&mounted_mutation_handoff),
         windows_adapter::WindowsWritableWorkerOptions {
             sync_root: request.sync_root.clone(),
             root_path: request.root_path.clone(),
@@ -783,6 +812,12 @@ fn mount_sifs_cloud_files_inner(
     writable_worker.stop_and_join()?;
     connection.disconnect()?;
     lifecycle.connected = false;
+    mounted_mutation_handoff
+        .close_clean()
+        .map_err(|detail| CloudFilesModuleError {
+            code: "mounted-mutation-session-close".to_string(),
+            detail,
+        })?;
     lifecycle.emit_disconnected();
     Ok(CloudFilesMountResponse {
         sync_root: request.sync_root,
@@ -1362,6 +1397,7 @@ fn decoded_identity_path(bytes: &[u8]) -> Result<String, NTSTATUS> {
 
 struct CloudFilesProvider {
     dfs: Arc<Mutex<SifsService>>,
+    mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
     mount_identity: String,
     sync_root: PathBuf,
     root_path: String,
@@ -1399,6 +1435,7 @@ impl Drop for CloudFilesCallbackRequest<'_> {
 impl CloudFilesProvider {
     fn new(
         dfs: Arc<Mutex<SifsService>>,
+        mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
         sync_root: PathBuf,
         root_path: String,
         read_only: bool,
@@ -1408,6 +1445,7 @@ impl CloudFilesProvider {
         let mount_identity = sync_root.to_string_lossy().into_owned();
         Self {
             dfs,
+            mounted_mutation_handoff,
             mount_identity,
             sync_root,
             root_path,
@@ -1516,15 +1554,28 @@ impl CloudFilesProvider {
         if self.request_is_cancelled(request_key) {
             return Err(STATUS_CANCELLED);
         }
-        let page = {
-            let mut dfs = self.lock_dfs()?;
-            dfs.posix_list_dir_distributed_page(
-                sifs_path,
-                after,
-                CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+        let page = self
+            .mounted_mutation_handoff
+            .run_captured_read_ingest(
+                &self.dfs,
+                "cloud-files.provider-placeholder-directory-page",
+                |dfs| {
+                    dfs.capture_mounted_mutation(|dfs| {
+                        dfs.posix_list_dir_distributed_page(
+                            sifs_path,
+                            after,
+                            CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+                        )
+                    })
+                },
             )
-            .map_err(ntstatus_for_posix_error)?
-        };
+            .map_err(|error| {
+                host_log(&format!(
+                    "Cloud Files placeholder directory refresh for `{sifs_path}` lost its durable handoff: {error}"
+                ));
+                STATUS_CLOUD_FILE_UNSUCCESSFUL
+            })?
+            .map_err(ntstatus_for_posix_error)?;
         let mut payloads = Vec::new();
         for child in page.entries {
             if self.request_is_cancelled(request_key) {
@@ -2789,9 +2840,10 @@ fn open_sifs_service(
     }
     let metadata = open_metadata_backend(&data_dir, &cluster_paths, control_plane.as_ref())?;
     let mut service = service
-        .with_boxed_metadata_backend(metadata)
+        .with_boxed_metadata_backend_lazy(metadata)
         .map_err(error("dfs"))?;
     service.bootstrap_distributed_sifs().map_err(error("dfs"))?;
+    configure_cloud_files_mounted_read_policy(&mut service);
     Ok(OpenedSifsService {
         service,
         replica_candidates,

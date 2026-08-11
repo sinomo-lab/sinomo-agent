@@ -69,8 +69,9 @@ use crate::windows_sync::{
     CloudFilesCapturedLocalChange, CloudFilesConcreteDfsAdapter,
     CloudFilesDfsServiceMutationBackend, CloudFilesDirectoryChange,
     CloudFilesDirectoryChangeAction, CloudFilesDirectoryChangePlan, CloudFilesFullScanSnapshot,
-    CloudFilesLocalCaptureRetries, CloudFilesLocalChangeAccelerator, CloudFilesNamespaceSource,
-    CloudFilesObjectProjection, CloudFilesOfflineCreatePlan, CloudFilesRenamePairingState,
+    CloudFilesLocalCaptureRetries, CloudFilesLocalChangeAccelerator,
+    CloudFilesMountedMutationHandoff, CloudFilesNamespaceSource, CloudFilesObjectProjection,
+    CloudFilesOfflineCreatePlan, CloudFilesRenamePairingState,
     CloudFilesSparsePlaceholderObservation, CloudFilesStartupConflictEvidence,
     CloudFilesStartupScanBatch, CloudFilesWindowsPlaceholderEffect, CloudFilesWritableSyncState,
     CloudFilesWritableSyncWorker, cloud_files_object_projection,
@@ -123,6 +124,7 @@ fn lock_service<T>(
 
 pub(super) struct WindowsDfsNamespaceSource<T> {
     service: Arc<Mutex<NetworkedDfsService<T>>>,
+    mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
     prepopulate_depth: u32,
     materialized_directories: Arc<Mutex<BTreeSet<String>>>,
     materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
@@ -132,12 +134,14 @@ pub(super) struct WindowsDfsNamespaceSource<T> {
 impl<T> WindowsDfsNamespaceSource<T> {
     pub(super) fn new(
         service: Arc<Mutex<NetworkedDfsService<T>>>,
+        mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
         prepopulate_depth: u32,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
     ) -> Self {
         Self {
             service,
+            mounted_mutation_handoff,
             prepopulate_depth,
             materialized_directories,
             materialization_audit_intents,
@@ -335,11 +339,28 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
             if plan.active_page.is_none()
                 && let Some(task) = plan.directories.pop_front()
             {
-                match lock_service(&self.service)?.posix_list_dir_distributed_page(
-                    &task.path,
-                    task.after.as_ref(),
-                    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
-                ) {
+                let page = self
+                    .mounted_mutation_handoff
+                    .run_captured_read_ingest(
+                        &self.service,
+                        "cloud-files.namespace-full-scan-directory-page",
+                        |service| {
+                            service.capture_mounted_mutation(|service| {
+                                service.posix_list_dir_distributed_page(
+                                    &task.path,
+                                    task.after.as_ref(),
+                                    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+                                )
+                            })
+                        },
+                    )
+                    .map_err(|error| {
+                        format!(
+                            "durably hand off Cloud Files namespace full-scan directory refresh for `{}`: {error}",
+                            task.path
+                        )
+                    })?;
+                match page {
                     Ok(page) => {
                         audited_materialized_directories.push(task.path.clone());
                         plan.active_page = Some(WindowsActiveDirectoryPage {
@@ -2813,6 +2834,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
     state: CloudFilesWritableSyncState,
     service: Arc<Mutex<NetworkedDfsService<T>>>,
     write_options: dfs::DfsWriteOptions,
+    mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
     options: WindowsWritableWorkerOptions,
 ) -> (ConcreteWindowsWritableWorker<T>, Arc<AtomicBool>) {
     let materialization_audit_intents = state.materialization_audit_intents();
@@ -2840,10 +2862,12 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
                 Arc::clone(&service),
                 write_options,
                 Arc::clone(&cancelled),
+                Arc::clone(&mounted_mutation_handoff),
             ),
         ),
         WindowsDfsNamespaceSource::new(
             Arc::clone(&service),
+            mounted_mutation_handoff,
             prepopulate_depth,
             materialized_directories,
             materialization_audit_intents,

@@ -12,7 +12,9 @@ mod paths;
 mod status;
 
 pub use client::{
-    DAEMON_API_PROBE_TIMEOUT, DaemonApiClient, DaemonDfsPeerTransport, RemoteConfigClient,
+    DAEMON_API_PROBE_TIMEOUT, DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,
+    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT, DaemonApiClient,
+    DaemonDfsMountedMutationHandoffClient, DaemonDfsPeerTransport, RemoteConfigClient,
     send_daemon_rpc, send_daemon_rpc_async, send_daemon_rpc_on_runtime, send_daemon_rpc_stream,
     send_daemon_rpc_stream_async, send_daemon_rpc_stream_from_data_dir_async,
     send_daemon_rpc_with_timeouts,
@@ -42,6 +44,18 @@ pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 pub const DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE: &str = "/daemon/shadow/shutdown-remote";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
 pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE: &str = "/daemon/dfs/repair-queue/recover";
+/// Main-daemon local-command route which durably owns work committed by a
+/// separately supervised FUSE or Cloud Files mount process.
+///
+/// The versioned route fails closed during a rolling upgrade: an older daemon
+/// cannot acknowledge an arm or commit while silently discarding its durable
+/// outbox preconditions.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE: &str =
+    "/daemon/dfs/mounted-mutation/handoff-v1";
+/// Maximum encoded request accepted by the mounted-mutation handoff client.
+/// Keep this no larger than the durable outbox state which receives it.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES: usize =
+    sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES;
 pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT: &str =
     "acknowledge-explicit-full-metadata-repair-queue-recovery";
 pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
@@ -1138,6 +1152,117 @@ pub struct DaemonDfsRepairQueueRecoveryResponse {
     pub remaining_queued_repairs: usize,
 }
 
+/// One transition in the mounted-mutation durable handoff protocol.
+///
+/// `Arm` must be acknowledged before the adapter enters the filesystem
+/// mutation. After that point an error without a positive no-write proof is
+/// represented by `CommitUnknown`; it must never be collapsed into an empty
+/// `CommitApplied` receipt.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum DaemonDfsMountedMutationHandoffRequest {
+    Probe,
+    Arm {
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+    },
+    CommitApplied {
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        captured_work: sinomo_dfs::MountedSifsMutationCapturedWork,
+    },
+    CommitUnknown {
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        observation: sinomo_dfs::MountedSifsMutationErrorObservation,
+    },
+    ProveNoWrite {
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+        arm_request_id: sinomo_dfs::MountedSifsMutationArmRequestId,
+        proof_code: String,
+    },
+    /// Abort a prepared marker only when the adapter has not yet entered the
+    /// mutation. The daemon rejects this transition from `Armed` or later.
+    AbortUnstarted {
+        marker_id: sinomo_dfs::MountedSifsMutationMarkerId,
+        marker_nonce: sinomo_dfs::MountedSifsMutationNonce,
+    },
+}
+
+impl DaemonDfsMountedMutationHandoffRequest {
+    /// Validate semantic cardinality and label bounds shared by client and
+    /// daemon implementations. The client separately checks the exact encoded
+    /// request size before any bytes are sent.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Probe | Self::Arm { .. } | Self::AbortUnstarted { .. } => Ok(()),
+            Self::CommitApplied { captured_work, .. } => {
+                validate_daemon_dfs_mounted_mutation_captured_work(captured_work)
+            }
+            Self::CommitUnknown { observation, .. } => {
+                validate_daemon_dfs_mounted_mutation_captured_work(&observation.captured_work)?;
+                validate_daemon_dfs_mounted_mutation_label("error_code", &observation.error_code)
+            }
+            Self::ProveNoWrite { proof_code, .. } => {
+                validate_daemon_dfs_mounted_mutation_label("proof_code", proof_code)
+            }
+        }
+    }
+}
+
+fn validate_daemon_dfs_mounted_mutation_captured_work(
+    captured_work: &sinomo_dfs::MountedSifsMutationCapturedWork,
+) -> Result<(), String> {
+    let observed = captured_work.committed_repair_records.len();
+    if observed > sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS {
+        return Err(format!(
+            "mounted-mutation handoff contains {observed} repair records; max is {}",
+            sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+        ));
+    }
+    Ok(())
+}
+
+fn validate_daemon_dfs_mounted_mutation_label(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("mounted-mutation handoff {field} cannot be empty"));
+    }
+    let observed = value.len();
+    if observed > sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES {
+        return Err(format!(
+            "mounted-mutation handoff {field} is {observed} bytes; max is {}",
+            sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES
+        ));
+    }
+    Ok(())
+}
+
+/// Durable phase returned by the main daemon after one handoff transition.
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DaemonDfsMountedMutationHandoffPhase {
+    Ready,
+    Armed,
+    DaemonAccepted,
+    ProvenNoWrite,
+    AbortedUnstarted,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+pub struct DaemonDfsMountedMutationHandoffResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker_id: Option<sinomo_dfs::MountedSifsMutationMarkerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arm_request_id: Option<sinomo_dfs::MountedSifsMutationArmRequestId>,
+    pub phase: DaemonDfsMountedMutationHandoffPhase,
+    #[serde(default)]
+    pub appended_repair_record_count: usize,
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonLocalConnectivityReloadRequest;
 
@@ -1147,6 +1272,145 @@ pub struct DaemonLocalConnectivityReloadResponse;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mounted_mutation_test_ids() -> (
+        sinomo_dfs::MountedSifsMutationMarkerId,
+        sinomo_dfs::MountedSifsMutationNonce,
+        sinomo_dfs::MountedSifsMutationArmRequestId,
+    ) {
+        (
+            sinomo_core::Id::derived("test.mounted-mutation.marker", b"marker"),
+            sinomo_core::Id::derived("test.mounted-mutation.nonce", b"nonce"),
+            sinomo_core::Id::derived("test.mounted-mutation.arm", b"arm"),
+        )
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_wire_is_versioned_and_typed() {
+        assert_eq!(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            "/daemon/dfs/mounted-mutation/handoff-v1"
+        );
+        assert_eq!(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+            sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES
+        );
+
+        let probe = serde_json::to_value(DaemonDfsMountedMutationHandoffRequest::Probe)
+            .expect("encode probe");
+        assert_eq!(probe, serde_json::json!({ "operation": "probe" }));
+
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let arm = serde_json::to_value(DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce,
+            arm_request_id: arm_request_id.clone(),
+        })
+        .expect("encode arm");
+        assert_eq!(arm["operation"], "arm");
+        assert_eq!(arm["marker_id"], marker_id.as_str());
+        assert_eq!(arm["arm_request_id"], arm_request_id.as_str());
+
+        let response = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id),
+            arm_request_id: Some(arm_request_id),
+            phase: DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            appended_repair_record_count: 2,
+        };
+        let encoded = serde_json::to_value(&response).expect("encode response");
+        assert_eq!(encoded["phase"], "daemon-accepted");
+        assert_eq!(encoded["appended_repair_record_count"], 2);
+        assert_eq!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffResponse>(encoded)
+                .expect("decode response"),
+            response
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_error_never_decodes_as_an_empty_applied_capture() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let captured_work = sinomo_dfs::MountedSifsMutationCapturedWork {
+            committed_work: sinomo_dfs::DfsCommittedWork::default(),
+            committed_repair_records: Vec::new(),
+        };
+        let unknown = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            observation: sinomo_dfs::MountedSifsMutationErrorObservation {
+                captured_work,
+                error_code: "backend-returned-error-after-entry".to_string(),
+            },
+        };
+        let encoded = serde_json::to_value(&unknown).expect("encode unknown result");
+        assert_eq!(encoded["operation"], "commit-unknown");
+        assert!(encoded.get("observation").is_some());
+        assert!(encoded.get("captured_work").is_none());
+        assert_eq!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffRequest>(encoded)
+                .expect("decode unknown result"),
+            unknown
+        );
+        let wire = sinomo_core::network::SinomoObjectCodec::network_frame()
+            .encode(&unknown)
+            .expect("encode SOBJ request value");
+        assert!(wire.len() <= DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            sinomo_core::network::SinomoObjectCodec::network_frame()
+                .decode::<DaemonDfsMountedMutationHandoffRequest>(&wire)
+                .expect("decode SOBJ request value"),
+            unknown
+        );
+
+        let ambiguous_legacy = serde_json::json!({
+            "operation": "commit",
+            "marker_id": marker_id,
+            "marker_nonce": marker_nonce,
+            "arm_request_id": arm_request_id
+        });
+        assert!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffRequest>(ambiguous_legacy)
+                .is_err(),
+            "an unclassified error must not decode as an empty applied capture"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_validates_bounded_labels() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let empty_proof = DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            proof_code: String::new(),
+        };
+        let error = empty_proof.validate().expect_err("empty proof code");
+        assert!(error.contains("proof_code cannot be empty"));
+
+        let empty_error = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            observation: sinomo_dfs::MountedSifsMutationErrorObservation {
+                captured_work: sinomo_dfs::MountedSifsMutationCapturedWork::default(),
+                error_code: String::new(),
+            },
+        };
+        let error = empty_error.validate().expect_err("empty error code");
+        assert!(error.contains("error_code cannot be empty"));
+
+        let request = DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code: "x"
+                .repeat(sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES.saturating_add(1)),
+        };
+        let error = request.validate().expect_err("oversized proof code");
+        assert!(error.contains("proof_code"));
+        assert!(error.contains("max is"));
+    }
 
     #[test]
     fn dfs_subscription_covers_namespace_and_placement_events() {

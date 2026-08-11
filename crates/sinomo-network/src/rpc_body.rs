@@ -1872,6 +1872,17 @@ impl ObjectRpcIncomingBody {
         self.role == ObjectRpcBodyRole::Attachment && !self.is_empty()
     }
 
+    /// Marks a synthetic incoming body as the ordinary streamed request value.
+    ///
+    /// Production callers receive this role only from authenticated transport
+    /// framing. This test-support seam lets sibling crates exercise their
+    /// pre-decode admission checks without opening a network listener.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_test_streamed_value_role(self) -> Self {
+        self.with_role(ObjectRpcBodyRole::Value)
+    }
+
     pub(crate) fn with_role(mut self, role: ObjectRpcBodyRole) -> Self {
         self.role = if self.is_empty() {
             ObjectRpcBodyRole::None

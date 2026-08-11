@@ -11,6 +11,9 @@ use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(all(unix, feature = "fuse"))]
+const FUSE_FATAL_UNMOUNT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(6);
+
+#[cfg(all(unix, feature = "fuse"))]
 mod fuse;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -89,16 +92,20 @@ pub struct DfsFuseLinuxPreflight {
 /// Owns a nonblocking SIFS FUSE mount.
 ///
 /// The resolved mount root remains valid for as long as this handle is kept
-/// alive. Dropping the handle closes the background FUSE session and unmounts
-/// the filesystem. Owner-only mounts intentionally avoid FUSE `auto_unmount`,
-/// because fuser implements that option by implicitly requesting
-/// `allow_other`; the owning session still guarantees orderly unmounting.
-#[must_use = "dropping the SIFS mount handle immediately unmounts the filesystem"]
+/// alive. Dropping a healthy handle closes the background FUSE session and
+/// unmounts the filesystem. A fatally fenced mount has already requested a
+/// lazy detach and its potentially blocked worker is reaped asynchronously.
+/// Owner-only mounts intentionally avoid FUSE `auto_unmount`, because fuser
+/// implements that option by implicitly requesting `allow_other`; the owning
+/// session still guarantees orderly unmounting.
+#[must_use = "dropping the SIFS mount handle retires the filesystem"]
 pub struct DfsFuseMountHandle {
     mount_root: PathBuf,
     cancellation: sinomo_runtime::dfs::DfsCancellationFlag,
     #[cfg(all(unix, feature = "fuse"))]
     session: Option<fuser::BackgroundSession>,
+    #[cfg(all(unix, feature = "fuse"))]
+    health: std::sync::Arc<fuse::FuseMountHealth>,
 }
 
 impl DfsFuseMountHandle {
@@ -112,13 +119,31 @@ impl DfsFuseMountHandle {
     pub fn is_active(&self) -> bool {
         #[cfg(all(unix, feature = "fuse"))]
         {
-            self.session
-                .as_ref()
-                .is_some_and(|session| !session.guard.is_finished())
+            self.health.fatal_error().is_none()
+                && self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| !session.guard.is_finished())
         }
         #[cfg(not(all(unix, feature = "fuse")))]
         {
             false
+        }
+    }
+
+    /// Fatal adapter error which caused this mount to retire, if any.
+    ///
+    /// Mounted-mutation ambiguity is reported here as soon as it is durably
+    /// fenced, before the asynchronous helper and FUSE worker have necessarily
+    /// completed their teardown.
+    pub fn fatal_error(&self) -> Option<String> {
+        #[cfg(all(unix, feature = "fuse"))]
+        {
+            self.health.fatal_error()
+        }
+        #[cfg(not(all(unix, feature = "fuse")))]
+        {
+            None
         }
     }
 
@@ -139,22 +164,53 @@ impl DfsFuseMountHandle {
         self.cancellation.cancel();
     }
 
-    /// Requests cooperative shutdown, unmounts, and joins the FUSE worker.
+    /// Requests cooperative shutdown and retires the FUSE session.
     ///
-    /// Long-lived supervisors should prefer this over plain drop when they
-    /// need a confirmed shutdown boundary and an actionable unmount error.
+    /// Healthy sessions are unmounted and joined synchronously. Fatally fenced
+    /// sessions first require bounded confirmation from their original lazy
+    /// unmount helper, then reap a still-live worker asynchronously. Long-lived
+    /// supervisors should prefer this over plain drop when they need an
+    /// actionable unmount error.
     pub fn shutdown(self) -> Result<()> {
         self.request_shutdown();
         #[cfg(all(unix, feature = "fuse"))]
         {
             let mut handle = self;
             if let Some(session) = handle.session.take() {
-                session
-                    .umount_and_join()
-                    .map_err(|source| DfsFuseError::Mount {
+                let fatal_retirement = handle.health.fatal_error().is_some();
+                if fatal_retirement
+                    && let Err(detail) = handle
+                        .health
+                        .wait_for_fatal_unmount(FUSE_FATAL_UNMOUNT_CONFIRM_TIMEOUT)
+                {
+                    // Keep the old session and its mount identity alive. A
+                    // second unmount could race the original helper and target
+                    // a replacement mounted at the same path.
+                    std::mem::forget(session);
+                    return Err(DfsFuseError::Mount {
                         mount_point: handle.mount_root.display().to_string(),
-                        detail: format!("failed to shut down background mount: {source}"),
-                    })?;
+                        detail: format!(
+                            "fatal FUSE unmount was not confirmed before retirement: {detail}"
+                        ),
+                    });
+                }
+                match fuse_session_shutdown_mode(fatal_retirement, session.guard.is_finished()) {
+                    FuseSessionShutdownMode::CleanUnmountAndJoin => session
+                        .umount_and_join()
+                        .map_err(|source| DfsFuseError::Mount {
+                            mount_point: handle.mount_root.display().to_string(),
+                            detail: format!("failed to shut down background mount: {source}"),
+                        })?,
+                    FuseSessionShutdownMode::JoinFinishedFatal => {
+                        session.join().map_err(|source| DfsFuseError::Mount {
+                            mount_point: handle.mount_root.display().to_string(),
+                            detail: format!("failed to join retired background mount: {source}"),
+                        })?
+                    }
+                    FuseSessionShutdownMode::DetachFatalJoin => {
+                        detach_fatal_background_session(session);
+                    }
+                }
             }
         }
         Ok(())
@@ -165,11 +221,13 @@ impl DfsFuseMountHandle {
         mount_root: PathBuf,
         session: fuser::BackgroundSession,
         cancellation: sinomo_runtime::dfs::DfsCancellationFlag,
+        health: std::sync::Arc<fuse::FuseMountHealth>,
     ) -> Self {
         Self {
             mount_root,
             cancellation,
             session: Some(session),
+            health,
         }
     }
 }
@@ -180,6 +238,7 @@ impl fmt::Debug for DfsFuseMountHandle {
             .debug_struct("DfsFuseMountHandle")
             .field("mount_root", &self.mount_root)
             .field("active", &self.is_active())
+            .field("fatal_error", &self.fatal_error())
             .finish_non_exhaustive()
     }
 }
@@ -193,10 +252,94 @@ impl Drop for DfsFuseMountHandle {
         self.cancellation.cancel();
         #[cfg(all(unix, feature = "fuse"))]
         {
-            // fuser's BackgroundSession owns the mount object. Dropping it
-            // first initiates unmount while the rest of this handle is still
-            // intact.
-            drop(self.session.take());
+            if let Some(session) = self.session.take() {
+                if self.health.fatal_error().is_some() {
+                    if self
+                        .health
+                        .wait_for_fatal_unmount(FUSE_FATAL_UNMOUNT_CONFIRM_TIMEOUT)
+                        .is_ok()
+                    {
+                        // The callback-side lifecycle helper owns the completed
+                        // lazy detach. Reap only the old worker, never issue
+                        // another path-based unmount which could race a
+                        // replacement mount.
+                        detach_fatal_background_session(session);
+                    } else {
+                        // Drop cannot report a failed helper. Retain the fenced
+                        // old session so no late path teardown can affect a
+                        // replacement in this process.
+                        std::mem::forget(session);
+                    }
+                } else {
+                    // fuser's BackgroundSession owns the mount object. Dropping
+                    // it first initiates unmount while the rest of this handle
+                    // is still intact.
+                    drop(session);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "fuse"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FuseSessionShutdownMode {
+    CleanUnmountAndJoin,
+    JoinFinishedFatal,
+    DetachFatalJoin,
+}
+
+#[cfg(all(unix, feature = "fuse"))]
+fn fuse_session_shutdown_mode(
+    fatal_retirement: bool,
+    worker_finished: bool,
+) -> FuseSessionShutdownMode {
+    match (fatal_retirement, worker_finished) {
+        (false, _) => FuseSessionShutdownMode::CleanUnmountAndJoin,
+        (true, true) => FuseSessionShutdownMode::JoinFinishedFatal,
+        (true, false) => FuseSessionShutdownMode::DetachFatalJoin,
+    }
+}
+
+#[cfg(all(unix, feature = "fuse"))]
+fn detach_fatal_background_session(session: fuser::BackgroundSession) {
+    let _accepted = detach_fatal_retirement(session, |session| {
+        // The fatal lifecycle helper owns the one path-based lazy detach. Join
+        // only: BackgroundSession's mount object is then released after this
+        // old FUSE worker exits, when its device identifies it as detached.
+        let _ = session.join();
+    });
+}
+
+#[cfg(all(unix, feature = "fuse"))]
+fn detach_fatal_retirement<T, F>(resource: T, retire: F) -> bool
+where
+    T: Send + 'static,
+    F: FnOnce(T) + Send + 'static,
+{
+    // Start the reaper before transferring ownership. If the host cannot
+    // create a thread, deliberately retain the already-fenced resource for the
+    // rest of this process instead of synchronously dropping it and risking a
+    // second path-based unmount.
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::Builder::new()
+        .name("sinomo-fuse-retired-session".to_string())
+        .spawn(move || {
+            if let Ok(resource) = receiver.recv() {
+                retire(resource);
+            }
+        });
+    let Ok(worker) = worker else {
+        std::mem::forget(resource);
+        return false;
+    };
+    drop(worker);
+    match sender.try_send(resource) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::TrySendError::Full(resource))
+        | Err(std::sync::mpsc::TrySendError::Disconnected(resource)) => {
+            std::mem::forget(resource);
+            false
         }
     }
 }
@@ -546,11 +689,65 @@ mod tests {
             cancellation: cancellation.clone(),
             #[cfg(all(unix, feature = "fuse"))]
             session: None,
+            #[cfg(all(unix, feature = "fuse"))]
+            health: fuse::FuseMountHealth::new(
+                PathBuf::from("/tmp/sinomo-inactive-test-mount"),
+                PathBuf::from("/bin/true"),
+                cancellation.clone(),
+            )
+            .expect("test mount health"),
         };
 
         handle.shutdown().expect("inactive handle shutdown");
 
         assert!(cancellation.is_cancelled());
+    }
+
+    #[cfg(all(unix, feature = "fuse"))]
+    #[test]
+    fn fatal_shutdown_policy_never_issues_a_second_unmount() {
+        assert_eq!(
+            fuse_session_shutdown_mode(false, false),
+            FuseSessionShutdownMode::CleanUnmountAndJoin
+        );
+        assert_eq!(
+            fuse_session_shutdown_mode(false, true),
+            FuseSessionShutdownMode::CleanUnmountAndJoin
+        );
+        assert_eq!(
+            fuse_session_shutdown_mode(true, true),
+            FuseSessionShutdownMode::JoinFinishedFatal
+        );
+        assert_eq!(
+            fuse_session_shutdown_mode(true, false),
+            FuseSessionShutdownMode::DetachFatalJoin
+        );
+    }
+
+    #[cfg(all(unix, feature = "fuse"))]
+    #[test]
+    fn fatal_retirement_returns_before_a_retained_worker_reference_is_released() {
+        let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+        let (finished_sender, finished_receiver) = std::sync::mpsc::sync_channel(1);
+
+        assert!(detach_fatal_retirement((), move |()| {
+            started_sender.send(()).expect("report reaper start");
+            release_receiver.recv().expect("release retained reference");
+            finished_sender.send(()).expect("report reaper completion");
+        }));
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached reaper starts");
+        assert!(matches!(
+            finished_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        release_sender.send(()).expect("release detached reaper");
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached reaper completes after release");
     }
 
     #[cfg(all(unix, feature = "fuse"))]

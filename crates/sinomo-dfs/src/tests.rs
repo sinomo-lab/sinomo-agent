@@ -47641,6 +47641,183 @@ fn sifs_non_replica_routed_create_is_listed_after_blocking_write() {
 }
 
 #[test]
+fn mounted_read_policy_does_not_escalate_lookup_failure_to_sync_path() {
+    fn read_service(
+        root: &Path,
+        name: &str,
+        local_node: &NodeId,
+        primary_node: &NodeId,
+        control_plane: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    ) -> (
+        NetworkedDfsService<DfsNodeTransport>,
+        Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_sender = Arc::clone(&calls);
+        let local_for_sender = local_node.clone();
+        let primary_for_sender = primary_node.clone();
+        let sender: DfsMessageSender = Arc::new(move |target, command, _timeout| {
+            assert_eq!(target, &primary_for_sender);
+            let DfsNetworkMessage::NamespaceRequest(namespace) = &command.routed_message.message
+            else {
+                return Err(DfsPeerTransportError::new(format!(
+                    "unexpected mounted-read fallback command: {:?}",
+                    command.routed_message.message
+                )));
+            };
+            let label = match &namespace.operation {
+                DfsNamespaceOperation::LookupPath { .. } => "lookup-path",
+                DfsNamespaceOperation::SyncPath { .. } => "sync-path",
+                operation => {
+                    return Err(DfsPeerTransportError::new(format!(
+                        "unexpected mounted-read namespace operation: {operation:?}"
+                    )));
+                }
+            };
+            calls_for_sender
+                .lock()
+                .expect("mounted read calls")
+                .push(label);
+            Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: vec![build_dfs_routed_message(
+                    &primary_for_sender,
+                    &local_for_sender,
+                    command.routed_message.frame_id.saturating_add(1),
+                    command.routed_message.message_id.saturating_add(1),
+                    DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                        request_id: namespace.request_id.clone(),
+                        result: DfsNamespaceResult::Rejected {
+                            reason: "injected authoritative lookup failure".to_string(),
+                            posix_error: None,
+                            current_primary_node_id: None,
+                        },
+                        synced_path_object: None,
+                        synced_path_objects: Vec::new(),
+                        metadata_journal_batches: Vec::new(),
+                        metadata_journal_has_more: None,
+                        posix_coordination_result: None,
+                    }),
+                )],
+            })
+        });
+        let transport = DfsNodeTransport::with_message_sender_for_nodes(
+            local_node.clone(),
+            vec![primary_node.clone()],
+            Duration::from_millis(100),
+            sender,
+        );
+        let service = NetworkedDfsService::new(
+            transport,
+            LocalContentStore::new(root.join(name).join("content"))
+                .expect("mounted-read content store"),
+        )
+        .with_control_plane(control_plane);
+        (service, calls)
+    }
+
+    let root = temp_root("mounted-read-no-implicit-sync-path");
+    let local_node =
+        NodeId::from_legacy_named("node_mounted_read_no_implicit_sync").expect("local node");
+    let primary_node = NodeId::from_legacy_named("node_mounted_read_no_implicit_sync_primary")
+        .expect("primary node");
+    let authority_shard = test_routed_authority_shard(&primary_node, 1);
+    let control_plane = test_routed_authority_control_plane(&authority_shard);
+
+    let (mut ordinary, ordinary_calls) = read_service(
+        &root,
+        "ordinary",
+        &local_node,
+        &primary_node,
+        control_plane.clone(),
+    );
+    assert!(
+        ordinary
+            .posix_stat_distributed("/services/missing.txt")
+            .is_err()
+    );
+    assert_eq!(
+        ordinary_calls
+            .lock()
+            .expect("ordinary read calls")
+            .as_slice(),
+        ["lookup-path", "sync-path"],
+        "the ordinary compatibility policy should exercise the fallback this test fences"
+    );
+
+    let (mut mounted, mounted_calls) =
+        read_service(&root, "mounted", &local_node, &primary_node, control_plane);
+    mounted.disable_implicit_read_replica_ingest();
+    assert!(
+        mounted
+            .posix_stat_distributed("/services/missing.txt")
+            .is_err()
+    );
+    assert_eq!(
+        mounted_calls.lock().expect("mounted read calls").as_slice(),
+        ["lookup-path"],
+        "a mounted read must not turn an authority lookup failure into an unowned durable SyncPath apply"
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn sifs_non_replica_directory_pull_captures_durable_replica_progress() {
+    let cluster = sifs_outsider_cluster("sifs-outsider-directory-pull-capture");
+    let SifsPosixCluster {
+        root,
+        primary_node,
+        mut primary,
+        mut observer,
+        ..
+    } = cluster;
+
+    let dir = "/users/pulled-directory";
+    let path = "/users/pulled-directory/remote.txt";
+    primary.posix_mkdir_all(dir).expect("primary directory");
+    primary
+        .posix_write_file(
+            path,
+            b"remote directory entry",
+            DfsWriteOptions::replicated_eventual(vec![primary_node]),
+        )
+        .expect("primary file");
+
+    let stop_primary = Arc::new(AtomicBool::new(false));
+    let primary_stop = Arc::clone(&stop_primary);
+    let primary_thread = std::thread::spawn(move || {
+        while !primary_stop.load(Ordering::SeqCst) {
+            primary.process_incoming().expect("primary pump");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        primary
+    });
+
+    observer.disable_implicit_read_replica_ingest();
+    let listed =
+        observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
+    let entries = listed.outcome.expect("outsider pulls directory journal");
+    assert!(entries.iter().any(|entry| entry.path == path));
+    assert!(
+        listed.committed_work.metadata_replica_progress,
+        "a non-replica SyncPath pull must retain its durable replica-progress edge"
+    );
+    let settled =
+        observer.capture_mounted_mutation(|service| service.posix_list_dir_distributed(dir));
+    let settled_entries = settled.outcome.expect("settled outsider directory pull");
+    assert!(settled_entries.iter().any(|entry| entry.path == path));
+    assert!(
+        !settled.committed_work.metadata_replica_progress,
+        "an explicit directory pull with no newly applied entries must not report replica progress"
+    );
+
+    stop_primary.store(true, Ordering::SeqCst);
+    primary_thread.join().expect("primary thread");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn sifs_non_replica_node_reads_converge_via_sync_pulls() {
     let cluster = sifs_outsider_cluster("sifs-outsider-sync-pull-reads");
     let SifsPosixCluster {

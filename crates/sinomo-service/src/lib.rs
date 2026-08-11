@@ -263,6 +263,54 @@ impl ServiceContext {
         Ok(request.decode_body()?)
     }
 
+    /// Decodes an ordinary typed request only when its encoded value is within
+    /// `max_bytes`.
+    ///
+    /// Inline values are rejected from the request head before deserialization.
+    /// Stream-native values must declare their total length, and that declaration
+    /// is checked before the incremental decoder reads or allocates. A semantic
+    /// attachment is independent of the typed request head and remains available
+    /// through [`Self::take_request_body`].
+    pub async fn decode_request_body_bounded<T>(
+        &mut self,
+        request: &ObjectRpcRequest,
+        max_bytes: usize,
+    ) -> Result<T, ServiceError>
+    where
+        T: serde::de::DeserializeOwned + Send + 'static,
+    {
+        let actual_bytes = if self.request_body.is_streamed_value() {
+            let declared_bytes = self.request_body.total_bytes().ok_or_else(|| {
+                ServiceError::Network(NetworkError::Serialization {
+                    detail: "bounded incremental SOBJ decoding requires a declared body length"
+                        .to_string(),
+                })
+            })?;
+            let declared_max = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+            if declared_bytes > declared_max {
+                return Err(ServiceError::Network(NetworkError::FrameTooLarge {
+                    actual_bytes: usize::try_from(declared_bytes).unwrap_or(usize::MAX),
+                    max_bytes,
+                }));
+            }
+            usize::try_from(declared_bytes).map_err(|_| {
+                ServiceError::Network(NetworkError::FrameTooLarge {
+                    actual_bytes: usize::MAX,
+                    max_bytes,
+                })
+            })?
+        } else {
+            request.body.len()
+        };
+        if actual_bytes > max_bytes {
+            return Err(ServiceError::Network(NetworkError::FrameTooLarge {
+                actual_bytes,
+                max_bytes,
+            }));
+        }
+        self.decode_request_body(request).await
+    }
+
     async fn materialize_request_value(
         &mut self,
         request: &mut ObjectRpcRequest,
@@ -1206,6 +1254,256 @@ mod tests {
             ObjectRpcIncomingBody::default(),
             Box::new(sink),
         )
+    }
+
+    static BOUNDED_DECODE_ATTEMPTS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct CountedDecodeValue<const COUNTER: usize>(Vec<u8>);
+
+    impl<const COUNTER: usize> serde::Serialize for CountedDecodeValue<COUNTER> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            self.0.serialize(serializer)
+        }
+    }
+
+    impl<'de, const COUNTER: usize> serde::Deserialize<'de> for CountedDecodeValue<COUNTER> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            BOUNDED_DECODE_ATTEMPTS[COUNTER].fetch_add(1, Ordering::SeqCst);
+            Vec::<u8>::deserialize(deserializer).map(Self)
+        }
+    }
+
+    struct BoundedDecodeService {
+        max_bytes: usize,
+        mutation_count: Arc<AtomicUsize>,
+    }
+
+    impl Service for BoundedDecodeService {
+        fn name(&self) -> &'static str {
+            "bounded-decode"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/test/bounded-decode"]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![
+                ServiceRoute::new("/test/bounded-decode", "bounded-decode")
+                    .with_request_body_mode(ServiceBodyMode::Optional),
+            ]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            let max_bytes = self.max_bytes;
+            let mutation_count = Arc::clone(&self.mutation_count);
+            Box::pin(async move {
+                let decoded: CountedDecodeValue<0> =
+                    ctx.decode_request_body_bounded(&request, max_bytes).await?;
+                mutation_count.fetch_add(1, Ordering::SeqCst);
+                ctx.respond_value("/test/bounded-decode", decoded.0.len())?;
+                Ok(ServiceDisposition::Continue)
+            })
+        }
+    }
+
+    async fn dispatch_bounded_decode(
+        request: ObjectRpcRequest,
+        request_body: ObjectRpcIncomingBody,
+        max_bytes: usize,
+        mutation_count: Arc<AtomicUsize>,
+    ) -> Result<ServiceDisposition, ServiceError> {
+        let registry = ServiceRegistry::builder()
+            .register(BoundedDecodeService {
+                max_bytes,
+                mutation_count,
+            })
+            .build();
+        let context = ServiceContext::new(
+            test_data_dir(),
+            None,
+            ServiceSigner::Local,
+            request_body,
+            Box::new(CollectingSink::default()),
+        );
+        registry.dispatch(context, request).await
+    }
+
+    #[tokio::test]
+    async fn bounded_request_decode_checks_inline_and_streamed_lengths_before_handler_mutation() {
+        let value = CountedDecodeValue::<0>(vec![0x5a; 257]);
+        let inline =
+            ObjectRpcRequest::encode_body("/test/bounded-decode", "bounded-decode", &value)
+                .expect("encode bounded request");
+        let exact_bytes = inline.body.len();
+        assert!(exact_bytes > 1);
+
+        let mutations = Arc::new(AtomicUsize::new(0));
+        BOUNDED_DECODE_ATTEMPTS[0].store(0, Ordering::SeqCst);
+        assert_eq!(
+            dispatch_bounded_decode(
+                inline.clone(),
+                ObjectRpcIncomingBody::default(),
+                exact_bytes,
+                Arc::clone(&mutations),
+            )
+            .await
+            .expect("decode exact-limit inline value"),
+            ServiceDisposition::Continue,
+        );
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 1);
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            dispatch_bounded_decode(
+                inline.clone(),
+                ObjectRpcIncomingBody::default(),
+                exact_bytes + 1,
+                Arc::clone(&mutations),
+            )
+            .await
+            .expect("decode ordinary under-limit inline value"),
+            ServiceDisposition::Continue,
+        );
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 2);
+        assert_eq!(mutations.load(Ordering::SeqCst), 2);
+
+        mutations.store(0, Ordering::SeqCst);
+        BOUNDED_DECODE_ATTEMPTS[0].store(0, Ordering::SeqCst);
+        let error = dispatch_bounded_decode(
+            inline.clone(),
+            ObjectRpcIncomingBody::default(),
+            exact_bytes - 1,
+            Arc::clone(&mutations),
+        )
+        .await
+        .expect_err("reject oversized inline value");
+        assert!(matches!(
+            error,
+            ServiceError::Network(NetworkError::FrameTooLarge {
+                actual_bytes,
+                max_bytes,
+            }) if actual_bytes == exact_bytes && max_bytes == exact_bytes - 1
+        ));
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+
+        BOUNDED_DECODE_ATTEMPTS[0].store(0, Ordering::SeqCst);
+        let streamed_head = ObjectRpcRequest::from_encoded_body(
+            "/test/bounded-decode",
+            "bounded-decode",
+            Vec::new(),
+        );
+        assert_eq!(
+            dispatch_bounded_decode(
+                streamed_head.clone(),
+                ObjectRpcIncomingBody::bytes(inline.body.clone()).with_test_streamed_value_role(),
+                exact_bytes,
+                Arc::clone(&mutations),
+            )
+            .await
+            .expect("decode exact-limit streamed value"),
+            ServiceDisposition::Continue,
+        );
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 1);
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+        mutations.store(0, Ordering::SeqCst);
+        BOUNDED_DECODE_ATTEMPTS[0].store(0, Ordering::SeqCst);
+        let (_sender, declared_oversized) =
+            ObjectRpcIncomingBody::test_channel(Some((exact_bytes + 1) as u64), 1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch_bounded_decode(
+                streamed_head,
+                declared_oversized.with_test_streamed_value_role(),
+                exact_bytes,
+                Arc::clone(&mutations),
+            ),
+        )
+        .await
+        .expect("declared-length rejection must not await a streamed chunk")
+        .expect_err("reject oversized streamed declaration");
+        assert!(matches!(
+            error,
+            ServiceError::Network(NetworkError::FrameTooLarge {
+                actual_bytes,
+                max_bytes,
+            }) if actual_bytes == exact_bytes + 1 && max_bytes == exact_bytes
+        ));
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+
+        let (_sender, undeclared) = ObjectRpcIncomingBody::test_channel(None, 1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            dispatch_bounded_decode(
+                ObjectRpcRequest::from_encoded_body(
+                    "/test/bounded-decode",
+                    "bounded-decode",
+                    Vec::new(),
+                ),
+                undeclared.with_test_streamed_value_role(),
+                exact_bytes,
+                Arc::clone(&mutations),
+            ),
+        )
+        .await
+        .expect("missing-length rejection must not await a streamed chunk")
+        .expect_err("reject streamed value without a declared length");
+        assert!(matches!(
+            error,
+            ServiceError::Network(NetworkError::Serialization { detail })
+                if detail.contains("requires a declared body length")
+        ));
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[0].load(Ordering::SeqCst), 0);
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_request_decode_leaves_semantic_attachment_available() {
+        let expected = CountedDecodeValue::<1>(vec![0x2c; 33]);
+        let request = ObjectRpcRequest::encode_body(
+            "/test/bounded-attachment",
+            "bounded-attachment",
+            &expected,
+        )
+        .expect("encode bounded attachment head");
+        let max_bytes = request.body.len();
+        let attachment = vec![0x7d; max_bytes + 17];
+        let mut context = ServiceContext::new(
+            test_data_dir(),
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::bytes(attachment.clone()),
+            Box::new(CollectingSink::default()),
+        );
+
+        BOUNDED_DECODE_ATTEMPTS[1].store(0, Ordering::SeqCst);
+        assert_eq!(
+            context
+                .decode_request_body_bounded::<CountedDecodeValue<1>>(&request, max_bytes)
+                .await
+                .expect("decode typed head beside attachment"),
+            expected,
+        );
+        assert_eq!(BOUNDED_DECODE_ATTEMPTS[1].load(Ordering::SeqCst), 1);
+        assert!(context.has_request_attachment());
+        assert_eq!(
+            context
+                .take_request_body()
+                .collect_to_vec(attachment.len())
+                .await
+                .expect("collect preserved attachment"),
+            attachment,
+        );
     }
 
     #[tokio::test]

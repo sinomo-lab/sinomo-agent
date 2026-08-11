@@ -94,18 +94,33 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             batch,
         )?;
         if let Some(backend) = self.metadata_backend.as_mut() {
-            if let Err(error) = backend.apply_journal_batch_with_replica_permit(&permit, batch) {
-                let reason = error.to_string();
-                if metadata_journal_rejection_allows_snapshot_repair(&reason) {
-                    self.request_metadata_snapshot_repair_from_primary(
-                        primary_node_id,
-                        &batch.shard_id,
-                        batch.next_after_sequence,
-                        reason,
-                    )?;
-                    return Ok(());
-                }
-                return Err(error.into());
+            let applied_entries =
+                match backend.apply_journal_batch_with_replica_permit(&permit, batch) {
+                    Ok(applied_entries) => applied_entries,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        if metadata_journal_rejection_allows_snapshot_repair(&reason) {
+                            self.request_metadata_snapshot_repair_from_primary(
+                                primary_node_id,
+                                &batch.shard_id,
+                                batch.next_after_sequence,
+                                reason,
+                            )?;
+                            return Ok(());
+                        }
+                        return Err(error.into());
+                    }
+                };
+            // Routed reads and write responses can advance this process's
+            // durable replica directly, outside the ordinary inbound journal
+            // handler. Retain the same daemon-owned progress edge before the
+            // later fallible service-state hydration so mounted callers can
+            // hand it off even when that later step fails.
+            if applied_entries > 0 {
+                self.record_message_committed_work(DfsMessageCommittedWork {
+                    metadata_replica_progress: true,
+                    ..DfsMessageCommittedWork::default()
+                });
             }
         }
         self.apply_metadata_journal_batch_to_service_state(batch)?;

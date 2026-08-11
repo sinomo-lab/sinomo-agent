@@ -2273,6 +2273,7 @@ fn daemon_dfs_maintenance_completion_decision(
     observed_at: Instant,
     observed_at_unix_nanos: u64,
     work: Option<DaemonDfsPendingMaintenanceWork>,
+    committed_edge_latched: bool,
 ) -> DaemonDfsMaintenanceProbeDecision {
     let mut decision =
         daemon_dfs_maintenance_probe_decision(observed_at, observed_at_unix_nanos, work);
@@ -2293,6 +2294,15 @@ fn daemon_dfs_maintenance_completion_decision(
             // node into a short-cadence maintenance loop.
             decision.immediate_continuation = false;
         }
+    }
+    if committed_edge_latched {
+        // A notification received while the completed pass was running owns a
+        // newer bounded attempt independently of both that pass's result and
+        // the bounded classifier. In particular, the classifier deliberately
+        // does not inventory pending metadata writes, so an idle result cannot
+        // consume this committed edge.
+        decision.trigger_maintenance = true;
+        decision.immediate_continuation = true;
     }
     decision
 }
@@ -2687,15 +2697,13 @@ async fn run_daemon_background_maintenance_loop(
                             None
                         }
                     };
-                    let mut decision = daemon_dfs_maintenance_completion_decision(
+                    let decision = daemon_dfs_maintenance_completion_decision(
                         outcome,
                         Instant::now(),
                         daemon_dfs_now_unix_nanos(),
                         work,
+                        committed_edge_latched,
                     );
-                    if committed_edge_latched && decision.trigger_maintenance {
-                        decision.immediate_continuation = true;
-                    }
                     dfs_triggered_maintenance_requested = decision.trigger_maintenance;
                     dfs_immediate_continuation_requested = decision.immediate_continuation;
                     next_dfs_maintenance_probe = decision.next_probe_at;
@@ -9349,11 +9357,50 @@ mod tests {
             observed_at,
             1_000_000_000,
             Some(DaemonDfsPendingMaintenanceWork::default()),
+            false,
         );
 
         assert!(!decision.trigger_maintenance);
         assert!(!decision.immediate_continuation);
         assert_eq!(decision.next_probe_at, None);
+    }
+
+    #[test]
+    fn completed_dfs_idle_followup_preserves_committed_edge_latched_during_active_pass() {
+        let observed_at = Instant::now();
+        let startup_not_before = observed_at
+            .checked_add(Duration::from_secs(60))
+            .expect("startup deadline");
+        let decision = daemon_dfs_maintenance_completion_decision(
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false,
+            },
+            observed_at,
+            1_000_000_000,
+            Some(DaemonDfsPendingMaintenanceWork::default()),
+            true,
+        );
+
+        assert!(
+            decision.trigger_maintenance,
+            "an idle bounded classifier must not consume a committed edge received during the active pass"
+        );
+        assert!(
+            decision.immediate_continuation,
+            "the newer committed edge owns an immediate follow-up pass"
+        );
+        assert_eq!(decision.next_probe_at, None);
+        assert_eq!(
+            daemon_dfs_maintenance_due_in(
+                observed_at,
+                startup_not_before,
+                observed_at,
+                decision.trigger_maintenance,
+                decision.immediate_continuation,
+            ),
+            Some(Duration::ZERO),
+            "the latched edge must bypass startup phasing and the ordinary maintenance interval"
+        );
     }
 
     #[test]
@@ -9364,6 +9411,7 @@ mod tests {
             observed_at,
             1_000_000_000,
             Some(DaemonDfsPendingMaintenanceWork::default()),
+            false,
         );
 
         assert!(
@@ -9385,6 +9433,7 @@ mod tests {
                 pending_write_count: 1,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
+            false,
         );
 
         assert!(decision.trigger_maintenance);
@@ -9415,6 +9464,7 @@ mod tests {
                 pending_namespace_job_count: 1,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
+            false,
         );
 
         assert!(decision.trigger_maintenance);
@@ -9445,6 +9495,7 @@ mod tests {
                 pending_write_count: 1,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
+            false,
         );
 
         assert!(decision.trigger_maintenance);
@@ -9477,6 +9528,7 @@ mod tests {
                 pending_namespace_job_count: 1,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
+            false,
         );
 
         assert!(decision.trigger_maintenance);
@@ -9541,6 +9593,7 @@ mod tests {
                 pending_write_count: 1,
                 ..DaemonDfsPendingMaintenanceWork::default()
             }),
+            false,
         );
         let deferred_last = observed_at
             .checked_sub(

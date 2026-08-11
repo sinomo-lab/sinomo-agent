@@ -14,18 +14,59 @@ use sinomo_core::node::NodeId;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::node_transport::collect_dfs_incoming_body_sync;
 use crate::{
-    AsyncDfsPeerTransport, DfsControlPlaneKvClient, DfsError, DfsNamespaceChangeBatch,
-    DfsNamespaceChangeCursor, DfsNodeAdvertisement, DfsNodeId, DfsNodeTransport,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture,
-    DfsPosixError, NetworkedDfsService, cluster_dfs_peer_node_ids, content_services_prefix,
-    fallback_dfs_node_id, open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
+    AsyncDfsPeerTransport, DfsCommittedWork, DfsControlPlaneKvClient, DfsError,
+    DfsMessageTransport, DfsNamespaceChangeBatch, DfsNamespaceChangeCursor, DfsNodeAdvertisement,
+    DfsNodeId, DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
+    DfsPeerTransportFuture, DfsPosixError, DfsRepairAttemptRecord, NetworkedDfsService,
+    cluster_dfs_peer_node_ids, content_services_prefix, fallback_dfs_node_id,
+    open_cluster_dfs_service_with_peer_transports_for_nodes_lazy,
 };
 
 pub type MountedSifsService = NetworkedDfsService<DfsNodeTransport>;
+
+/// Outcome plus the exact durable work produced by one mounted mutation.
+///
+/// Mounted adapters use this public seam instead of reaching into the
+/// served-message implementation. The outcome is deliberately generic so an
+/// adapter always receives the committed-work receipt even when its operation
+/// returns an error after a durable metadata edge.
+#[derive(Debug)]
+pub struct MountedSifsMutationReport<R> {
+    pub outcome: R,
+    pub committed_work: DfsCommittedWork,
+    /// Exact zero-attempt repair queue entries created by this mutation.
+    ///
+    /// This is a delta, not a snapshot of the service's accumulated repair
+    /// inventory. A daemon handoff can therefore append it idempotently
+    /// without replacing retry/backoff state owned by maintenance.
+    pub committed_repair_records: Vec<DfsRepairAttemptRecord>,
+}
+
+impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Capture every durable edge produced by one direct mounted mutation.
+    ///
+    /// An already-installed [`crate::DfsCommittedWorkTracker`] remains in
+    /// place and continues to receive the same edges. This method consumes
+    /// only the operation-local receipt and repair-job delta that it begins.
+    pub fn capture_mounted_mutation<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> MountedSifsMutationReport<R> {
+        self.begin_message_committed_work();
+        let outcome = operation(self);
+        let committed_work = self.take_message_committed_work();
+        let committed_repair_records = self.take_message_committed_repair_queue_records();
+        MountedSifsMutationReport {
+            outcome,
+            committed_work,
+            committed_repair_records,
+        }
+    }
+}
 
 const MOUNTED_SIFS_AUTHORITATIVE_SCOPE_CACHE_MAX_ENTRIES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES;
@@ -34,6 +75,12 @@ const MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_ENTRIES: usize =
 const MOUNTED_SIFS_AUTHORITATIVE_PROJECTION_MAX_PAYLOAD_BYTES: usize =
     sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES;
 const MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS: usize = 8;
+
+fn mounted_sifs_authority_deadline_error() -> KvError {
+    KvError::AuthorityUnavailable {
+        detail: "metadata shard authority read deadline elapsed".to_string(),
+    }
+}
 
 /// Read-only content capability detached from mounted DFS authority state.
 ///
@@ -315,6 +362,11 @@ fn open_mounted_sifs_service_from_context(
                 message: other.to_string(),
             },
         })?;
+    // LookupPath is already a read-only authoritative query. Do not let an
+    // eligible transient failure silently escalate a mounted stat/read into a
+    // durable SyncPath apply outside the adapter's handoff. Directory listing
+    // remains the explicit replaying read surface and is bracketed by adapters.
+    service.disable_implicit_read_replica_ingest();
     Ok(OpenedMountedSifsService {
         service,
         replica_candidates,
@@ -421,6 +473,69 @@ mod tests {
     use std::time::Duration;
 
     #[derive(Debug)]
+    struct MountedCaptureTransport {
+        local_node_id: NodeId,
+    }
+
+    impl crate::DfsTransportIdentity for MountedCaptureTransport {
+        fn local_node_id(&self) -> &NodeId {
+            &self.local_node_id
+        }
+    }
+
+    impl DfsMessageTransport for MountedCaptureTransport {
+        fn send_routed_call(
+            &mut self,
+            target_node_id: &NodeId,
+            _call: crate::DfsRoutedCall,
+        ) -> Result<(), NetworkError> {
+            Err(NetworkError::UnknownNode {
+                node_id: target_node_id.clone(),
+            })
+        }
+
+        fn drain_incoming_messages(
+            &mut self,
+        ) -> Result<Vec<crate::DfsRoutedMessage>, NetworkError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_capture_returns_error_receipt_and_preserves_outer_tracker() {
+        let root = sinomo_testdir::TestDir::new("sinomo-mounted-mutation-capture");
+        let local_node =
+            NodeId::from_legacy_named("node_mounted_mutation_capture").expect("local node");
+        let content =
+            crate::LocalContentStore::new(root.path().join("content")).expect("content store");
+        let mut service = NetworkedDfsService::new(
+            MountedCaptureTransport {
+                local_node_id: local_node,
+            },
+            content,
+        );
+        let tracker = crate::DfsCommittedWorkTracker::new();
+        service.set_committed_work_tracker(tracker.clone());
+
+        let report = service.capture_mounted_mutation(|service| {
+            service.record_message_committed_work(DfsCommittedWork {
+                publish_metadata: true,
+                namespace_maintenance: true,
+                ..DfsCommittedWork::default()
+            });
+            Err::<(), _>("after-commit")
+        });
+
+        assert_eq!(report.outcome, Err("after-commit"));
+        assert!(report.committed_work.publish_metadata);
+        assert!(report.committed_work.namespace_maintenance);
+        assert!(report.committed_repair_records.is_empty());
+        let outer = tracker.take();
+        assert!(outer.publish_metadata);
+        assert!(outer.namespace_maintenance);
+    }
+
+    #[derive(Debug)]
     struct RecordingMountedPeerTransport {
         targets: std::sync::Mutex<Vec<NodeId>>,
     }
@@ -515,6 +630,7 @@ mod tests {
         succeeded: bool,
         fault: MountedTxnResponseFault,
         routes: Mutex<Vec<String>>,
+        options: Mutex<Vec<DfsObjectRpcSendOptions>>,
         authoritative_entry_calls: AtomicUsize,
         exact_set_keys: Mutex<Vec<String>>,
     }
@@ -526,6 +642,7 @@ mod tests {
                 succeeded,
                 fault,
                 routes: Mutex::new(Vec::new()),
+                options: Mutex::new(Vec::new()),
                 authoritative_entry_calls: AtomicUsize::new(0),
                 exact_set_keys: Mutex::new(Vec::new()),
             }
@@ -552,6 +669,10 @@ mod tests {
         fn routes(&self) -> Vec<String> {
             self.routes.lock().expect("routes").clone()
         }
+
+        fn options(&self) -> Vec<DfsObjectRpcSendOptions> {
+            self.options.lock().expect("options").clone()
+        }
     }
 
     impl DfsPeerTransport for ScriptedMountedKvTransport {
@@ -559,9 +680,10 @@ mod tests {
             &self,
             target_node_id: &NodeId,
             call: ObjectRpcCall,
-            _options: DfsObjectRpcSendOptions,
+            options: DfsObjectRpcSendOptions,
         ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
             assert_eq!(target_node_id, &self.local_node_id);
+            self.options.lock().expect("options").push(options);
             let route = call.request.route.clone();
             self.routes.lock().expect("routes").push(route.clone());
             let request = crate::node_transport::materialize_dfs_value_call_sync(
@@ -1810,6 +1932,72 @@ mod tests {
     }
 
     #[test]
+    fn mounted_authority_absolute_deadline_bounds_dispatch_and_fallback() {
+        let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-authority-deadline");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let local_node =
+            NodeId::from_legacy_named("node_mounted_sifs_authority_deadline").expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(
+                "cluster_mounted_sifs_authority_deadline",
+            )
+            .expect("cluster id"),
+            "mounted SIFS authority deadline",
+            local_node.clone(),
+            "local",
+            "public-key",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let transport = Arc::new(ScriptedMountedKvTransport::new(
+            local_node,
+            true,
+            MountedTxnResponseFault::UnknownExactSetRoute,
+        ));
+        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
+        let mut client =
+            MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths, peer_transport);
+        let keys = vec!["/dfs/deadline/key".to_string()];
+
+        let error = client
+            .get_authoritative_consistent_before(
+                &keys,
+                Instant::now()
+                    .checked_sub(Duration::from_millis(1))
+                    .expect("past instant"),
+            )
+            .expect_err("expired deadline must reject before dispatch");
+        assert!(error.to_string().contains("deadline elapsed"));
+        assert!(transport.routes().is_empty());
+
+        let budget = Duration::from_secs(2);
+        client
+            .get_authoritative_consistent_before(&keys, Instant::now() + budget)
+            .expect("deadline-bounded exact read with mixed-version fallback");
+        assert_eq!(
+            transport.routes(),
+            vec![
+                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
+                sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_SNAPSHOT_ROUTE.to_string(),
+            ]
+        );
+        let options = transport.options();
+        assert_eq!(options.len(), 2);
+        assert!(options.iter().all(|options| {
+            options
+                .overall_timeout
+                .is_some_and(|remaining| !remaining.is_zero() && remaining <= budget)
+        }));
+        assert!(
+            options[1].overall_timeout <= options[0].overall_timeout,
+            "fallback must consume the original absolute deadline"
+        );
+    }
+
+    #[test]
     fn mounted_authority_rejects_entries_outside_the_requested_scope() {
         let root = sinomo_testdir::TestDir::new("sinomo-mounted-sifs-authority-containment");
         let data_dir = SinomoDataDir::new(&root);
@@ -2934,7 +3122,7 @@ impl MountedSifsControlPlaneKvClient {
         expected_route: &str,
         max_response_bytes: usize,
     ) -> Result<ObjectRpcResponse, KvError> {
-        self.call_local_kv_rpc_raw(call, expected_route, max_response_bytes)
+        self.call_local_kv_rpc_raw(call, expected_route, max_response_bytes, None)
             .map_err(|source| self.kv_error(source))
     }
 
@@ -2943,14 +3131,32 @@ impl MountedSifsControlPlaneKvClient {
         call: ObjectRpcCall,
         expected_route: &str,
         max_response_bytes: usize,
+        deadline: Option<Instant>,
     ) -> Result<ObjectRpcResponse, DfsPeerTransportError> {
         let state = sinomo_core::cluster::read_cluster_state_without_kv(&self.cluster_paths)
             .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
-        let result = self.peer_transport.call_object_rpc(
-            &state.local_node_id,
-            call,
-            DfsObjectRpcSendOptions::default(),
-        )?;
+        // Compute the remaining budget immediately before transport dispatch;
+        // reading local cluster state and any preceding mixed-version attempt
+        // consumes the same absolute operation deadline.
+        let options = match deadline {
+            Some(deadline) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    return Err(DfsPeerTransportError::new(
+                        "metadata shard authority read deadline elapsed",
+                    ));
+                };
+                if remaining.is_zero() {
+                    return Err(DfsPeerTransportError::new(
+                        "metadata shard authority read deadline elapsed",
+                    ));
+                }
+                DfsObjectRpcSendOptions::default().with_overall_timeout(remaining)
+            }
+            None => DfsObjectRpcSendOptions::default(),
+        };
+        let result = self
+            .peer_transport
+            .call_object_rpc(&state.local_node_id, call, options)?;
         let response = mounted_sifs_value_response_from_rpc_result(result, max_response_bytes)?;
         if response.route != expected_route {
             return Err(DfsPeerTransportError::new(format!(
@@ -3009,6 +3215,24 @@ impl MountedSifsControlPlaneKvClient {
         keys: &[String],
         minimum_revision: KvRevision,
     ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+        self.fetch_authoritative_entries_with_deadline(keys, minimum_revision, None)
+    }
+
+    fn fetch_authoritative_entries_before(
+        &self,
+        keys: &[String],
+        minimum_revision: KvRevision,
+        deadline: Instant,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+        self.fetch_authoritative_entries_with_deadline(keys, minimum_revision, Some(deadline))
+    }
+
+    fn fetch_authoritative_entries_with_deadline(
+        &self,
+        keys: &[String],
+        minimum_revision: KvRevision,
+        deadline: Option<Instant>,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
         let minimum_revision = self.authoritative_read_minimum_revision(Some(minimum_revision))?;
         sinomo_core::kv::validate_cluster_kv_authoritative_entries_request_keys(keys)?;
         let route = sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE;
@@ -3025,6 +3249,7 @@ impl MountedSifsControlPlaneKvClient {
             route,
             sinomo_core::kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_MAX_PAYLOAD_BYTES
                 .saturating_add(1024 * 1024),
+            deadline,
         ) {
             Ok(response) => response,
             Err(error) if error.is_unknown_route(route) => {
@@ -3043,6 +3268,7 @@ impl MountedSifsControlPlaneKvClient {
                         snapshot_route,
                         (sinomo_core::kv::MAX_CLUSTER_KV_RAFT_SNAPSHOT_BYTES as usize)
                             .saturating_add(1024 * 1024),
+                        deadline,
                     )
                     .map_err(|source| self.kv_error(source))?;
                 let snapshot = sinomo_core::kv::decode_cluster_kv_authoritative_snapshot_rpc_body(
@@ -3269,6 +3495,25 @@ impl MountedSifsControlPlaneKvClient {
         &self,
         keys: &[String],
     ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.read_authoritative_entries_consistently_with_deadline(keys, None)
+    }
+
+    fn read_authoritative_entries_consistently_before(
+        &self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        self.read_authoritative_entries_consistently_with_deadline(keys, Some(deadline))
+    }
+
+    fn read_authoritative_entries_consistently_with_deadline(
+        &self,
+        keys: &[String],
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(mounted_sifs_authority_deadline_error());
+        }
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -3289,6 +3534,9 @@ impl MountedSifsControlPlaneKvClient {
         }
 
         for _ in 0..MOUNTED_SIFS_AUTHORITATIVE_REPLAN_MAX_ATTEMPTS {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(mounted_sifs_authority_deadline_error());
+            }
             let (generation, minimum_revision) = {
                 let cache = self
                     .snapshot
@@ -3303,7 +3551,12 @@ impl MountedSifsControlPlaneKvClient {
                 (generation, cache.snapshot.revision)
             };
 
-            let read = self.fetch_authoritative_entries(keys, minimum_revision)?;
+            let read = match deadline {
+                Some(deadline) => {
+                    self.fetch_authoritative_entries_before(keys, minimum_revision, deadline)?
+                }
+                None => self.fetch_authoritative_entries(keys, minimum_revision)?,
+            };
             if !self.merge_authoritative_entries_at_one_revision(keys, &read, generation)? {
                 continue;
             }
@@ -3450,6 +3703,20 @@ impl DfsControlPlaneKvClient for MountedSifsControlPlaneKvClient {
         // must not import the complete cluster KV snapshot first.
         self.begin_authoritative_refresh_generation()?;
         self.read_authoritative_entries_consistently(keys)
+    }
+
+    fn get_authoritative_consistent_before(
+        &mut self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        if Instant::now() >= deadline {
+            return Err(mounted_sifs_authority_deadline_error());
+        }
+        // The exact deadline covers generation reset, every replan, the
+        // primary exact-set route, and its mixed-version snapshot fallback.
+        self.begin_authoritative_refresh_generation()?;
+        self.read_authoritative_entries_consistently_before(keys, deadline)
     }
 
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {

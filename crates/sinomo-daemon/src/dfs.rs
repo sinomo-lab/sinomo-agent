@@ -56,6 +56,8 @@ use sinomo_dfs::{
     metadata_shard_membership_handoff_proof_key, read_dfs_repair_attempt_snapshot,
     read_local_dfs_metadata_shard_write_freeze,
 };
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -99,6 +101,7 @@ const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_sec
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+const DAEMON_DFS_MOUNTED_MUTATION_REPROBE_INTERVAL: Duration = Duration::from_secs(5);
 const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
 const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_MAX: Duration = Duration::from_secs(60);
@@ -1576,6 +1579,10 @@ static DAEMON_DFS_TEST_REPAIR_MAINTENANCE_EDGE_REQUESTS: OnceLock<Mutex<BTreeMap
 static DAEMON_DFS_TEST_MESSAGE_COMMITTED_EDGE_HOOKS: OnceLock<
     Mutex<BTreeMap<String, Arc<DaemonDfsMessageCommittedEdgeTestHook>>>,
 > = OnceLock::new();
+#[cfg(test)]
+static DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST: OnceLock<
+    Mutex<BTreeSet<PathBuf>>,
+> = OnceLock::new();
 static DAEMON_DFS_MUTATION_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<DaemonDfsMutationScheduler>>>,
 > = OnceLock::new();
@@ -1699,6 +1706,11 @@ pub(crate) struct DaemonDfsPendingMaintenanceWork {
     pub metadata_replica_lag_count: usize,
     pub pending_local_membership_handoff_count: usize,
     pub completed_local_primary_handoff_rebind_count: usize,
+    pub mounted_mutation_live_count: usize,
+    pub mounted_mutation_recoverable_exact_count: usize,
+    pub mounted_mutation_recoverable_full_count: usize,
+    pub mounted_mutation_overflow_count: usize,
+    pub next_mounted_mutation_reprobe_unix_nanos: Option<u64>,
 }
 
 impl DaemonDfsPendingMaintenanceWork {
@@ -1712,6 +1724,8 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.metadata_replica_lag_count > 0
             || self.pending_local_membership_handoff_count > 0
             || self.completed_local_primary_handoff_rebind_count > 0
+            || self.mounted_mutation_recoverable_exact_count > 0
+            || self.mounted_mutation_recoverable_full_count > 0
             || self.due_time_based_maintenance_count > 0
     }
 
@@ -1728,6 +1742,8 @@ impl DaemonDfsPendingMaintenanceWork {
             || self.actionable_placement_reconciliation_count > 0
             || self.pending_local_membership_handoff_count > 0
             || self.completed_local_primary_handoff_rebind_count > 0
+            || self.mounted_mutation_recoverable_exact_count > 0
+            || self.mounted_mutation_recoverable_full_count > 0
             || self.due_repair_attempt_count > 0
             || self.unattempted_repair_count > 0
             || self.due_time_based_maintenance_count > 0
@@ -1737,6 +1753,7 @@ impl DaemonDfsPendingMaintenanceWork {
         self.next_repair_retry_unix_nanos
             .into_iter()
             .chain(self.next_time_based_maintenance_unix_nanos)
+            .chain(self.next_mounted_mutation_reprobe_unix_nanos)
             .min()
     }
 
@@ -1959,6 +1976,13 @@ impl DaemonDfsAuthoritativeProjection {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+enum DaemonDfsTestAuthoritativeExactSetOutcome {
+    Error(KvError),
+    Entries(Vec<Option<KvEntry>>),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonDfsControlPlaneKvClient {
     cluster_paths: ClusterPaths,
@@ -1988,6 +2012,11 @@ pub(crate) struct DaemonDfsControlPlaneKvClient {
     authoritative_exact_set_calls: Arc<AtomicUsize>,
     #[cfg(test)]
     authoritative_prefix_calls: Arc<AtomicUsize>,
+    #[cfg(test)]
+    authoritative_exact_set_deadlines: Arc<Mutex<Vec<Instant>>>,
+    #[cfg(test)]
+    authoritative_exact_set_outcomes:
+        Arc<Mutex<VecDeque<DaemonDfsTestAuthoritativeExactSetOutcome>>>,
 }
 
 impl DaemonDfsControlPlaneKvClient {
@@ -2010,6 +2039,10 @@ impl DaemonDfsControlPlaneKvClient {
             authoritative_exact_set_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_prefix_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            authoritative_exact_set_deadlines: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            authoritative_exact_set_outcomes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -2035,6 +2068,10 @@ impl DaemonDfsControlPlaneKvClient {
             authoritative_exact_set_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             authoritative_prefix_calls: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            authoritative_exact_set_deadlines: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            authoritative_exact_set_outcomes: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -2210,9 +2247,17 @@ impl DaemonDfsControlPlaneKvClient {
     }
 
     fn daemon_error(&self, source: DaemonError) -> KvError {
-        KvError::Io {
-            path: self.cluster_paths.root.display().to_string(),
-            detail: source.to_string(),
+        match source {
+            // ClusterReadOnly is the daemon boundary for a temporarily
+            // unavailable authoritative Raft view (including local admission
+            // busy with no accepted forwarding target). Preserve that typed
+            // classification so DFS can retry an exact authority read without
+            // also retrying unrelated filesystem I/O.
+            DaemonError::ClusterReadOnly { detail } => KvError::AuthorityUnavailable { detail },
+            source => KvError::Io {
+                path: self.cluster_paths.root.display().to_string(),
+                detail: source.to_string(),
+            },
         }
     }
 
@@ -2411,6 +2456,25 @@ impl DaemonDfsControlPlaneKvClient {
         Ok(true)
     }
 
+    #[cfg(test)]
+    fn take_test_authoritative_exact_set_outcome(
+        &self,
+        deadline: Instant,
+    ) -> Option<Result<Vec<Option<KvEntry>>, KvError>> {
+        self.authoritative_exact_set_deadlines
+            .lock()
+            .expect("test authoritative exact-set deadlines")
+            .push(deadline);
+        self.authoritative_exact_set_outcomes
+            .lock()
+            .expect("test authoritative exact-set outcomes")
+            .pop_front()
+            .map(|outcome| match outcome {
+                DaemonDfsTestAuthoritativeExactSetOutcome::Error(error) => Err(error),
+                DaemonDfsTestAuthoritativeExactSetOutcome::Entries(entries) => Ok(entries),
+            })
+    }
+
     fn fetch_authoritative_entries(
         &self,
         keys: &[String],
@@ -2426,6 +2490,27 @@ impl DaemonDfsControlPlaneKvClient {
             keys.to_vec(),
             true,
             &self.runtime,
+        )
+        .map_err(|source| self.daemon_error(source))
+    }
+
+    fn fetch_authoritative_entries_before(
+        &self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+        #[cfg(test)]
+        {
+            self.authoritative_exact_set_calls
+                .fetch_add(1, Ordering::SeqCst);
+            record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
+        }
+        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime_before_deadline(
+            &self.cluster_paths,
+            keys.to_vec(),
+            true,
+            &self.runtime,
+            deadline,
         )
         .map_err(|source| self.daemon_error(source))
     }
@@ -2464,6 +2549,28 @@ impl DaemonDfsControlPlaneKvClient {
             keys,
             true,
             &self.runtime,
+        )
+        .await
+        .map_err(|source| self.daemon_error(source))
+    }
+
+    async fn fetch_authoritative_entries_before_async(
+        &self,
+        keys: Vec<String>,
+        deadline: Instant,
+    ) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<KvEntry>>>, KvError> {
+        #[cfg(test)]
+        {
+            self.authoritative_exact_set_calls
+                .fetch_add(1, Ordering::SeqCst);
+            record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
+        }
+        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
+            &self.cluster_paths,
+            keys,
+            true,
+            &self.runtime,
+            deadline,
         )
         .await
         .map_err(|source| self.daemon_error(source))
@@ -2782,6 +2889,36 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
         Err(self.superseded_authority_error("operation-bound exact-key set"))
     }
 
+    fn get_authoritative_consistent_before(
+        &mut self,
+        keys: &[String],
+        deadline: Instant,
+    ) -> Result<Vec<Option<KvEntry>>, KvError> {
+        if Instant::now() >= deadline {
+            return Err(KvError::AuthorityUnavailable {
+                detail: "metadata shard authority read deadline elapsed".to_string(),
+            });
+        }
+        self.begin_authoritative_generation()?;
+        #[cfg(test)]
+        if let Some(result) = self.take_test_authoritative_exact_set_outcome(deadline) {
+            return result;
+        }
+        for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+            if Instant::now() >= deadline {
+                return Err(KvError::AuthorityUnavailable {
+                    detail: "metadata shard authority read deadline elapsed".to_string(),
+                });
+            }
+            let (generation, _minimum_revision, _) = self.entries_read_plan(keys)?;
+            let read = self.fetch_authoritative_entries_before(keys, deadline)?;
+            if self.merge_authoritative_entries(generation, keys, &read)? {
+                return Ok(read.value);
+            }
+        }
+        Err(self.superseded_authority_error("operation-bound exact-key set"))
+    }
+
     fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
         for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
             let retained = self.retained_metadata_authority_covers_prefix(prefix);
@@ -2946,6 +3083,43 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
             for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
                 let (generation, _minimum_revision, _) = self.entries_read_plan(&keys)?;
                 let read = self.fetch_authoritative_entries_async(keys.clone()).await?;
+                if self.merge_authoritative_entries(generation, &keys, &read)? {
+                    return Ok(read.value);
+                }
+            }
+            Err(self.superseded_authority_error("operation-bound exact-key set"))
+        })
+    }
+
+    fn get_authoritative_consistent_before_async<'a>(
+        &'a mut self,
+        keys: Vec<String>,
+        deadline: Instant,
+    ) -> sinomo_dfs::DfsControlPlaneKvFuture<'a, Vec<Option<KvEntry>>> {
+        if Instant::now() >= deadline {
+            return Box::pin(async {
+                Err(KvError::AuthorityUnavailable {
+                    detail: "metadata shard authority read deadline elapsed".to_string(),
+                })
+            });
+        }
+        let generation_result = self.begin_authoritative_generation();
+        Box::pin(async move {
+            generation_result?;
+            #[cfg(test)]
+            if let Some(result) = self.take_test_authoritative_exact_set_outcome(deadline) {
+                return result;
+            }
+            for _ in 0..DAEMON_DFS_AUTHORITY_PROJECTION_REPLAN_MAX_ATTEMPTS {
+                if Instant::now() >= deadline {
+                    return Err(KvError::AuthorityUnavailable {
+                        detail: "metadata shard authority read deadline elapsed".to_string(),
+                    });
+                }
+                let (generation, _minimum_revision, _) = self.entries_read_plan(&keys)?;
+                let read = self
+                    .fetch_authoritative_entries_before_async(keys.clone(), deadline)
+                    .await?;
                 if self.merge_authoritative_entries(generation, &keys, &read)? {
                     return Ok(read.value);
                 }
@@ -4803,6 +4977,7 @@ fn daemon_dfs_pending_work_from_records(
         metadata_replica_lag_count,
         pending_local_membership_handoff_count,
         completed_local_primary_handoff_rebind_count: 0,
+        ..DaemonDfsPendingMaintenanceWork::default()
     }
 }
 
@@ -5243,6 +5418,275 @@ fn persist_daemon_dfs_repair_queue_records(
     Ok(appended)
 }
 
+fn daemon_dfs_mounted_mutation_protocol_error(detail: impl Into<String>) -> DaemonError {
+    DaemonError::Parse {
+        detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+fn fail_next_daemon_dfs_mounted_mutation_after_repair_persist(data_dir: &SinomoDataDir) {
+    DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .expect("mounted-mutation crash-cut hooks")
+        .insert(data_dir.root());
+}
+
+#[cfg(test)]
+fn inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(
+    data_dir: &SinomoDataDir,
+) -> Result<(), DaemonError> {
+    let should_fail = DAEMON_DFS_TEST_MOUNTED_MUTATION_FAIL_AFTER_REPAIR_PERSIST
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .expect("mounted-mutation crash-cut hooks")
+        .remove(&data_dir.root());
+    if should_fail {
+        return Err(DaemonError::Io {
+            path: data_dir.root().display().to_string(),
+            detail: "injected mounted-mutation crash after repair queue persistence".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn require_daemon_dfs_mounted_mutation_marker_identity(
+    marker: &sinomo_dfs::MountedSifsMutationOutboxMarker,
+    marker_id: &sinomo_dfs::MountedSifsMutationMarkerId,
+    marker_nonce: &sinomo_dfs::MountedSifsMutationNonce,
+) -> Result<(), DaemonError> {
+    if marker.schema_version != sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION
+        || &marker.marker_id != marker_id
+        || &marker.marker_nonce != marker_nonce
+    {
+        return Err(daemon_dfs_mounted_mutation_protocol_error(
+            "mounted-mutation marker identity or schema does not match",
+        ));
+    }
+    Ok(())
+}
+
+fn require_daemon_dfs_mounted_mutation_captured_marker(
+    store: &sinomo_dfs::MountedSifsMutationOutboxStore,
+    marker_id: &sinomo_dfs::MountedSifsMutationMarkerId,
+    marker_nonce: &sinomo_dfs::MountedSifsMutationNonce,
+    arm_request_id: &sinomo_dfs::MountedSifsMutationArmRequestId,
+    captured_work: &sinomo_dfs::MountedSifsMutationCapturedWork,
+    error_observation: Option<&sinomo_dfs::MountedSifsMutationErrorObservation>,
+) -> Result<(), DaemonError> {
+    let marker = store.marker(marker_id)?.ok_or_else(|| {
+        daemon_dfs_mounted_mutation_protocol_error(format!(
+            "unknown mounted-mutation marker {marker_id}"
+        ))
+    })?;
+    require_daemon_dfs_mounted_mutation_marker_identity(&marker, marker_id, marker_nonce)?;
+    let matches = match &marker.phase {
+        sinomo_dfs::MountedSifsMutationOutboxPhase::Captured {
+            arm_request_id: current_arm,
+            captured_work: current_work,
+        } => {
+            error_observation.is_none()
+                && current_arm == arm_request_id
+                && current_work == captured_work
+        }
+        sinomo_dfs::MountedSifsMutationOutboxPhase::UnknownAfterError {
+            arm_request_id: current_arm,
+            observation,
+        } => {
+            error_observation.is_some_and(|expected| expected == observation)
+                && current_arm == arm_request_id
+                && &observation.captured_work == captured_work
+        }
+        sinomo_dfs::MountedSifsMutationOutboxPhase::DaemonAccepted {
+            arm_request_id: current_arm,
+            captured_work: current_work,
+            requires_full_recovery: current_requires_full_recovery,
+            error_observation: current_error_observation,
+        } => {
+            current_arm == arm_request_id
+                && current_work == captured_work
+                && current_requires_full_recovery == &error_observation.is_some()
+                && current_error_observation.as_ref() == error_observation
+        }
+        _ => false,
+    };
+    if !matches {
+        return Err(daemon_dfs_mounted_mutation_protocol_error(
+            "mounted-mutation report does not match the exact fsynced marker phase and payload",
+        ));
+    }
+    Ok(())
+}
+
+/// Main-daemon endpoint for the crash-safe mounted-filesystem mutation
+/// handoff. Only Arm authors a precondition. Every post-mutation request first
+/// attests the adapter's exact fsynced marker phase and payload.
+pub(crate) fn handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    traceparent: Option<String>,
+    request: crate::DaemonDfsMountedMutationHandoffRequest,
+) -> Result<crate::DaemonDfsMountedMutationHandoffResponse, DaemonError> {
+    if crate::daemon_paths_are_shadow(paths) {
+        return Err(daemon_dfs_mounted_mutation_protocol_error(
+            "mounted-mutation durability handoff is owned only by the main daemon",
+        ));
+    }
+    request
+        .validate()
+        .map_err(daemon_dfs_mounted_mutation_protocol_error)?;
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)?;
+    match request {
+        crate::DaemonDfsMountedMutationHandoffRequest::Probe => {
+            // Opening and classifying the bounded outbox is the readiness
+            // proof; a corrupt or unavailable durability root fails closed.
+            let status = store.status()?;
+            if status.pending_marker_count > 0 || status.requires_full_recovery() {
+                return Err(daemon_dfs_mounted_mutation_protocol_error(format!(
+                    "mounted-mutation handoff is not ready: pending={}, live={}, exact_recovery={}, full_recovery={}, unproven={}, malformed={}, overflow={}, directory_scan_overflow={}",
+                    status.pending_marker_count,
+                    status.live_marker_count,
+                    status.exact_recovery_marker_count,
+                    status.full_recovery_marker_count,
+                    status.unproven_session_marker_count,
+                    status.malformed_marker_count,
+                    status.marker_limit_exceeded,
+                    status.directory_scan_limit_exceeded,
+                )));
+            }
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: None,
+                arm_request_id: None,
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::Ready,
+                appended_repair_record_count: 0,
+            })
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+        } => {
+            store.arm_live(&marker_id, &marker_nonce, &arm_request_id)?;
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: Some(marker_id),
+                arm_request_id: Some(arm_request_id),
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+                appended_repair_record_count: 0,
+            })
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work,
+        } => {
+            require_daemon_dfs_mounted_mutation_captured_marker(
+                &store,
+                &marker_id,
+                &marker_nonce,
+                &arm_request_id,
+                &captured_work,
+                None,
+            )?;
+            let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
+                &data_dir,
+                captured_work.committed_repair_records.clone(),
+            )?;
+            #[cfg(test)]
+            inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
+            store.accept_captured_live(
+                &marker_id,
+                &marker_nonce,
+                &arm_request_id,
+                &captured_work,
+            )?;
+            emit_daemon_dfs_committed_edges(
+                &data_dir,
+                &cluster_paths,
+                &DfsMessageExecutionScope::GlobalExclusive,
+                runtime,
+                traceparent,
+                captured_work.committed_work,
+                &[],
+            );
+            notify_daemon_dfs_maintenance_work();
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: Some(marker_id),
+                arm_request_id: Some(arm_request_id),
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                appended_repair_record_count,
+            })
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            observation,
+        } => {
+            require_daemon_dfs_mounted_mutation_captured_marker(
+                &store,
+                &marker_id,
+                &marker_nonce,
+                &arm_request_id,
+                &observation.captured_work,
+                Some(&observation),
+            )?;
+            let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
+                &data_dir,
+                observation.captured_work.committed_repair_records.clone(),
+            )?;
+            #[cfg(test)]
+            inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
+            store.accept_unknown_live(&marker_id, &marker_nonce, &arm_request_id, &observation)?;
+            emit_daemon_dfs_committed_edges(
+                &data_dir,
+                &cluster_paths,
+                &DfsMessageExecutionScope::GlobalExclusive,
+                runtime,
+                traceparent,
+                observation.captured_work.committed_work,
+                &[],
+            );
+            notify_daemon_dfs_maintenance_work();
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: Some(marker_id),
+                arm_request_id: Some(arm_request_id),
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                appended_repair_record_count,
+            })
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code,
+        } => {
+            store.prove_no_write_live(&marker_id, &marker_nonce, &arm_request_id, &proof_code)?;
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: Some(marker_id),
+                arm_request_id: Some(arm_request_id),
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
+                appended_repair_record_count: 0,
+            })
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+            marker_id,
+            marker_nonce,
+        } => {
+            store.abort_unstarted_live(&marker_id, &marker_nonce)?;
+            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                marker_id: Some(marker_id),
+                arm_request_id: None,
+                phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+                appended_repair_record_count: 0,
+            })
+        }
+    }
+}
+
 fn daemon_dfs_completed_promoted_primary_handoff_matches(
     local_node_id: &NodeId,
     active: &DfsMetadataShardConfig,
@@ -5332,16 +5776,53 @@ fn daemon_dfs_completed_local_primary_handoff_rebind_count(
 /// not open a DFS metadata backend, enumerate object/shard indexes, or inspect
 /// content. Full metadata reconstruction belongs to explicit disaster
 /// recovery, not to the automatic scheduler.
+fn daemon_dfs_mounted_mutation_pending_work(
+    data_dir: &SinomoDataDir,
+    now_unix_nanos: u64,
+) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
+    let status = sinomo_dfs::MountedSifsMutationOutboxStore::new(data_dir)?.status()?;
+    let overflow_count = status
+        .pending_marker_count
+        .saturating_sub(sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS)
+        .saturating_add(usize::from(status.directory_scan_limit_exceeded));
+    let blocked_marker_count = status
+        .live_marker_count
+        .saturating_add(status.deferred_live_session_marker_count)
+        .saturating_add(status.unproven_session_marker_count)
+        .saturating_add(status.malformed_marker_count)
+        .saturating_add(overflow_count);
+    let next_mounted_mutation_reprobe_unix_nanos = (blocked_marker_count > 0).then(|| {
+        now_unix_nanos.saturating_add(
+            DAEMON_DFS_MOUNTED_MUTATION_REPROBE_INTERVAL
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    });
+    Ok(DaemonDfsPendingMaintenanceWork {
+        mounted_mutation_live_count: status
+            .live_marker_count
+            .saturating_add(status.deferred_live_session_marker_count),
+        mounted_mutation_recoverable_exact_count: status.exact_recovery_marker_count,
+        mounted_mutation_recoverable_full_count: status.full_recovery_marker_count,
+        mounted_mutation_overflow_count: overflow_count,
+        next_mounted_mutation_reprobe_unix_nanos,
+        deferred_work_count: blocked_marker_count,
+        ..DaemonDfsPendingMaintenanceWork::default()
+    })
+}
+
 fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(
     paths: &DaemonPaths,
     authority_entries: &[KvEntry],
 ) -> Result<DaemonDfsPendingMaintenanceWork, DaemonError> {
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
     let cluster_paths = ClusterPaths::new(&data_dir);
-    if !cluster_paths.state.exists() {
-        return Ok(DaemonDfsPendingMaintenanceWork::default());
-    }
     let now_unix_nanos = daemon_dfs_now_unix_nanos();
+    let mounted_mutation_work =
+        daemon_dfs_mounted_mutation_pending_work(&data_dir, now_unix_nanos)?;
+    if !cluster_paths.state.exists() {
+        return Ok(mounted_mutation_work);
+    }
     let repair_attempt_records =
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records)
@@ -5412,6 +5893,15 @@ fn daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(
         actionable_placement_reconciliation_count,
         pending_local_membership_handoff_count,
         completed_local_primary_handoff_rebind_count,
+        deferred_work_count: mounted_mutation_work.deferred_work_count,
+        mounted_mutation_live_count: mounted_mutation_work.mounted_mutation_live_count,
+        mounted_mutation_recoverable_exact_count: mounted_mutation_work
+            .mounted_mutation_recoverable_exact_count,
+        mounted_mutation_recoverable_full_count: mounted_mutation_work
+            .mounted_mutation_recoverable_full_count,
+        mounted_mutation_overflow_count: mounted_mutation_work.mounted_mutation_overflow_count,
+        next_mounted_mutation_reprobe_unix_nanos: mounted_mutation_work
+            .next_mounted_mutation_reprobe_unix_nanos,
         ..DaemonDfsPendingMaintenanceWork::default()
     })
 }
@@ -5423,7 +5913,7 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work_on_runtime(
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
     let cluster_paths = ClusterPaths::new(&data_dir);
     if !cluster_paths.state.exists() {
-        return Ok(DaemonDfsPendingMaintenanceWork::default());
+        return daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(paths, &[]);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let authority = daemon_dfs_metadata_authority_generation_for_identity(
@@ -10190,6 +10680,182 @@ enum DaemonDfsMaintenanceKind {
     },
 }
 
+#[derive(Debug, Default)]
+struct DaemonDfsMountedMutationRecoveryBatch {
+    claims: Vec<sinomo_dfs::MountedSifsMutationRecoveryClaim>,
+    corrupt_claims: Vec<sinomo_dfs::MountedSifsMutationCorruptRecoveryClaim>,
+    requires_full_recovery: bool,
+}
+
+fn daemon_dfs_mounted_mutation_captured_work(
+    marker: &sinomo_dfs::MountedSifsMutationOutboxMarker,
+) -> Option<&sinomo_dfs::MountedSifsMutationCapturedWork> {
+    match &marker.phase {
+        sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { captured_work, .. }
+        | sinomo_dfs::MountedSifsMutationOutboxPhase::DaemonAccepted { captured_work, .. } => {
+            Some(captured_work)
+        }
+        sinomo_dfs::MountedSifsMutationOutboxPhase::UnknownAfterError { observation, .. } => {
+            Some(&observation.captured_work)
+        }
+        _ => None,
+    }
+}
+
+fn daemon_dfs_all_mounted_mutation_committed_work() -> DfsMessageCommittedWork {
+    DfsMessageCommittedWork {
+        publish_metadata: true,
+        repair_maintenance: true,
+        namespace_maintenance: true,
+        metadata_replica_progress: true,
+        metadata_materialization: true,
+    }
+}
+
+/// Replay the daemon-owned monotonic mounted-mutation latch once while the
+/// main daemon is starting. The latch never clears, so a crash during this
+/// replay merely causes the next daemon generation to schedule the same
+/// idempotent owners again.
+pub(crate) fn replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<(), DaemonError> {
+    if crate::daemon_paths_are_shadow(paths) {
+        return Ok(());
+    }
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(());
+    }
+    let latch = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)?
+        .daemon_committed_work_latch()?;
+    if latch.generation == 0 {
+        return Ok(());
+    }
+    let mut committed_work = latch.committed_work;
+    // A mounted adapter cannot retain the exact resident replica shard across
+    // daemon handoff. Default reconciliation is the global durable consumer
+    // for either replica-progress or materialization work on startup.
+    committed_work.metadata_replica_progress |= committed_work.metadata_materialization;
+    let edges = emit_daemon_dfs_committed_edges(
+        &data_dir,
+        &cluster_paths,
+        &DfsMessageExecutionScope::GlobalExclusive,
+        runtime,
+        None,
+        committed_work,
+        &[],
+    );
+    if committed_work.metadata_replica_progress && !edges.replica_progress {
+        // `invalidate_*` is conditional on a currently established dynamic
+        // subscription. The startup latch is stronger: publish one retained
+        // local generation even when reconciliation has not subscribed yet.
+        notify_daemon_default_dfs_reconciliation_replica_progress(&cluster_paths);
+    }
+    Ok(())
+}
+
+fn prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+) -> Result<DaemonDfsMountedMutationRecoveryBatch, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    if !cluster_paths.state.exists() {
+        return Ok(DaemonDfsMountedMutationRecoveryBatch::default());
+    }
+    let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)?;
+    let candidate_ids = store.recovery_candidate_marker_ids()?;
+    let mut batch = DaemonDfsMountedMutationRecoveryBatch::default();
+    for marker_id in candidate_ids {
+        if let Some(claim) = store.try_claim_corrupt_recovery(&marker_id)? {
+            batch.requires_full_recovery = true;
+            batch.corrupt_claims.push(claim);
+            continue;
+        }
+        let Some(claim) = store.try_claim_recovery(&marker_id)? else {
+            continue;
+        };
+        let recovery_kind = claim.recovery_kind();
+        if let Some(captured_work) = daemon_dfs_mounted_mutation_captured_work(claim.marker()) {
+            persist_daemon_dfs_repair_queue_records(
+                &data_dir,
+                captured_work.committed_repair_records.clone(),
+            )?;
+            store.retain_daemon_committed_work(captured_work.committed_work)?;
+            emit_daemon_dfs_committed_edges(
+                &data_dir,
+                &cluster_paths,
+                &DfsMessageExecutionScope::GlobalExclusive,
+                runtime,
+                None,
+                captured_work.committed_work,
+                &[],
+            );
+        }
+        batch.requires_full_recovery |=
+            recovery_kind == sinomo_dfs::MountedSifsMutationRecoveryKind::Full;
+        batch.claims.push(claim);
+    }
+    if batch.requires_full_recovery {
+        // The original mutation report may be missing or corrupt. Retain and
+        // schedule every bounded daemon owner before the explicit recovery
+        // pass; the latch is constant-size and monotonic, so this conservative
+        // replay survives another crash without guessing which edge was lost.
+        let committed_work = daemon_dfs_all_mounted_mutation_committed_work();
+        store.retain_daemon_committed_work(committed_work)?;
+        emit_daemon_dfs_committed_edges(
+            &data_dir,
+            &cluster_paths,
+            &DfsMessageExecutionScope::GlobalExclusive,
+            runtime,
+            None,
+            committed_work,
+            &[],
+        );
+    }
+    Ok(batch)
+}
+
+fn complete_daemon_dfs_mounted_mutation_recovery(
+    batch: DaemonDfsMountedMutationRecoveryBatch,
+    outcome: DaemonDfsMaintenanceTickOutcome,
+) -> Result<(), DaemonError> {
+    if !matches!(
+        outcome,
+        DaemonDfsMaintenanceTickOutcome::Completed {
+            reached_limit: false
+        }
+    ) {
+        return Ok(());
+    }
+    let completed_at_unix_nanos = daemon_dfs_now_unix_nanos().max(1);
+    for claim in batch.claims {
+        let full_recovery_completed =
+            claim.recovery_kind() == sinomo_dfs::MountedSifsMutationRecoveryKind::Full;
+        claim.terminalize(sinomo_dfs::MountedSifsMutationRecoveryReceipt {
+            repair_queue_durable: true,
+            metadata_publish_durably_owned: true,
+            maintenance_durably_owned: true,
+            metadata_replica_progress_durably_owned: true,
+            full_recovery_completed,
+            completed_at_unix_nanos,
+        })?;
+    }
+    for claim in batch.corrupt_claims {
+        claim.terminalize(sinomo_dfs::MountedSifsMutationRecoveryReceipt {
+            repair_queue_durable: true,
+            metadata_publish_durably_owned: true,
+            maintenance_durably_owned: true,
+            metadata_replica_progress_durably_owned: true,
+            full_recovery_completed: true,
+            completed_at_unix_nanos,
+        })?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum DaemonDfsMaintenancePreemptionOutcome<T> {
     Finished(T),
@@ -10235,12 +10901,21 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
-    run_daemon_dfs_maintenance_tick_kind_on_runtime(
-        paths,
-        runtime,
-        DaemonDfsMaintenanceKind::Routine,
-    )
-    .await
+    let mounted_mutation_recovery =
+        prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
+    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery {
+        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+            content_gc_requested: false,
+            content_reservation_reconciliation_requested: false,
+            commit_promotion_recovery_requested: false,
+        }
+    } else {
+        DaemonDfsMaintenanceKind::Routine
+    };
+    let outcome =
+        run_daemon_dfs_maintenance_tick_kind_on_runtime(paths, runtime, maintenance_kind).await?;
+    complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
+    Ok(outcome)
 }
 
 pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
@@ -10253,6 +10928,8 @@ pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
         data_root = %data_dir.root().display(),
         "operator requested explicit full-metadata DFS repair queue recovery"
     );
+    let mounted_mutation_recovery =
+        prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
     let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
         paths,
         runtime,
@@ -10263,6 +10940,7 @@ pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
         },
     )
     .await?;
+    complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
     let remaining_queued_repairs =
         read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
             .map(|snapshot| snapshot.records.len())
@@ -10387,10 +11065,10 @@ async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
         &[],
     );
     let outcome = match maintenance_result {
-        DaemonDfsMaintenancePreemptionOutcome::Finished(result) => {
-            let reached_limit = result?;
-            DaemonDfsMaintenanceTickOutcome::Completed { reached_limit }
-        }
+        DaemonDfsMaintenancePreemptionOutcome::Finished(result) => match result? {
+            Some(reached_limit) => DaemonDfsMaintenanceTickOutcome::Completed { reached_limit },
+            None => DaemonDfsMaintenanceTickOutcome::Deferred,
+        },
         DaemonDfsMaintenancePreemptionOutcome::ForegroundWaiting => {
             DaemonDfsMaintenanceTickOutcome::Deferred
         }
@@ -10418,7 +11096,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
-) -> Result<bool, DaemonError> {
+) -> Result<Option<bool>, DaemonError> {
     // The scheduler's retained read-only image is useful between probes, but a
     // broad writable generation will decode the same tables. Release it first
     // so accumulated metadata does not double peak RSS during recovery.
@@ -10663,7 +11341,10 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     }
     let report = maintenance_result?;
     let Some(report) = report else {
-        return Ok(false);
+        // A cancellable hydrate which yields no report did not complete a
+        // durable owner pass. Surface it as Deferred so mounted-mutation
+        // recovery claims remain non-terminal.
+        return Ok(None);
     };
     let reached_limit = daemon_dfs_maintenance_report_reached_limit(&report);
     let observations = sinomo_dfs::dfs_maintenance_tick_observations(&report);
@@ -10689,7 +11370,7 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     for line in observations.notice_lines {
         tracing::warn!("sinomo daemon {line}");
     }
-    Ok(reached_limit)
+    Ok(Some(reached_limit))
 }
 
 /// Whether this pass itself proved that it stopped with bounded, immediately
@@ -11750,6 +12431,920 @@ mod tests {
             Arc::as_ptr(&peer_transport) as *const (),
             Arc::as_ptr(&async_peer_transport) as *const (),
             "blocking and async DFS calls must reuse one peer transport adapter"
+        );
+    }
+
+    fn mounted_mutation_test_repair_record(label: &str) -> DfsRepairAttemptRecord {
+        DfsRepairAttemptRecord {
+            intent_id: format!("mounted-mutation-{label}"),
+            object_id: sinomo_core::Id::derived(
+                "test.daemon.mounted-mutation.object",
+                label.as_bytes(),
+            ),
+            version: sinomo_core::Id::derived(
+                "test.daemon.mounted-mutation.version",
+                label.as_bytes(),
+            ),
+            content_hash: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            missing_replica_node_id: NodeId::from_legacy_named(format!(
+                "node_mounted_mutation_{label}"
+            ))
+            .expect("mounted-mutation repair node"),
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_is_exact_idempotent_and_queue_first() {
+        let root = temp_root("mounted-mutation-handoff-exact");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-handoff-exact");
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let session = store
+            .open_host_mount_session(sinomo_dfs::MountedSifsMutationAdapter::Fuse, "/mnt/sinomo")
+            .expect("mount session");
+        let mut mutation = store
+            .prepare(&session, Some("create-1".to_string()), "create")
+            .expect("prepare mutation");
+        let marker_id = mutation.marker().marker_id.clone();
+        let marker_nonce = mutation.marker().marker_nonce.clone();
+        let arm_request_id = sinomo_core::Id::generate();
+        let arm_request = crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+        };
+        let first_arm = handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            arm_request.clone(),
+        )
+        .expect("first Arm");
+        assert_eq!(
+            first_arm.phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed
+        );
+        assert_eq!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                arm_request,
+            )
+            .expect("same Arm retry"),
+            first_arm
+        );
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+                    marker_id: marker_id.clone(),
+                    marker_nonce: marker_nonce.clone(),
+                    arm_request_id: sinomo_core::Id::generate(),
+                },
+            )
+            .is_err(),
+            "a different Arm request identity must conflict"
+        );
+
+        let repair = mounted_mutation_test_repair_record("queue-first");
+        let captured_work = sinomo_dfs::MountedSifsMutationCapturedWork::new(
+            sinomo_dfs::DfsCommittedWork {
+                repair_maintenance: true,
+                ..sinomo_dfs::DfsCommittedWork::default()
+            },
+            vec![repair.clone()],
+        )
+        .expect("captured work");
+        mutation
+            .record_captured_success(&arm_request_id, captured_work.clone())
+            .expect("persist adapter capture");
+        let commit_request = crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            captured_work: captured_work.clone(),
+        };
+        fail_next_daemon_dfs_mounted_mutation_after_repair_persist(&data_dir);
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                commit_request.clone(),
+            )
+            .is_err(),
+            "injected crash cut must happen before DaemonAccepted"
+        );
+        assert!(matches!(
+            store
+                .marker(&marker_id)
+                .expect("marker after crash cut")
+                .expect("marker")
+                .phase,
+            sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+        ));
+        assert_eq!(
+            LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data_dir))
+                .view()
+                .expect("repair queue after crash cut")
+                .records,
+            vec![repair],
+            "the exact repair delta must be fsynced before daemon acceptance"
+        );
+        assert_eq!(
+            store
+                .daemon_committed_work_latch()
+                .expect("latch after queue-only crash cut")
+                .generation,
+            0,
+            "the injected cut is before the separately fsynced committed-work latch"
+        );
+
+        let commit = handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            commit_request.clone(),
+        )
+        .expect("retry commit");
+        assert_eq!(
+            commit.phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted
+        );
+        assert_eq!(commit.marker_id.as_ref(), Some(&marker_id));
+        assert_eq!(commit.arm_request_id.as_ref(), Some(&arm_request_id));
+        assert_eq!(commit.appended_repair_record_count, 0);
+        let accepted_latch = store
+            .daemon_committed_work_latch()
+            .expect("accepted committed-work latch");
+        assert_eq!(accepted_latch.generation, 1);
+        assert!(accepted_latch.committed_work.repair_maintenance);
+        assert_eq!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                commit_request,
+            )
+            .expect("idempotent commit retry")
+            .appended_repair_record_count,
+            0
+        );
+        assert_eq!(
+            store
+                .daemon_committed_work_latch()
+                .expect("idempotent retry latch")
+                .generation,
+            accepted_latch.generation,
+            "an exact accepted retry must not create a second latch generation"
+        );
+        let conflicting = sinomo_dfs::MountedSifsMutationCapturedWork::new(
+            sinomo_dfs::DfsCommittedWork {
+                namespace_maintenance: true,
+                ..captured_work.committed_work
+            },
+            captured_work.committed_repair_records.clone(),
+        )
+        .expect("conflicting capture");
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+                    marker_id,
+                    marker_nonce,
+                    arm_request_id,
+                    captured_work: conflicting,
+                },
+            )
+            .is_err(),
+            "accepted capture must not admit a different retry payload"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_requires_adapter_proof_and_exact_unknown_error() {
+        let root = temp_root("mounted-mutation-handoff-proof");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-handoff-proof");
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let session = store
+            .open_host_mount_session(
+                sinomo_dfs::MountedSifsMutationAdapter::CloudFiles,
+                "sync-root",
+            )
+            .expect("mount session");
+
+        let mut no_write = store
+            .prepare(&session, Some("unlink-1".to_string()), "unlink")
+            .expect("prepare no-write mutation");
+        let no_write_id = no_write.marker().marker_id.clone();
+        let no_write_nonce = no_write.marker().marker_nonce.clone();
+        let no_write_arm = sinomo_core::Id::generate();
+        handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+                marker_id: no_write_id.clone(),
+                marker_nonce: no_write_nonce.clone(),
+                arm_request_id: no_write_arm.clone(),
+            },
+        )
+        .expect("arm no-write mutation");
+        let prove_request = crate::DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id: no_write_id.clone(),
+            marker_nonce: no_write_nonce,
+            arm_request_id: no_write_arm.clone(),
+            proof_code: "backend-proved-not-entered".to_string(),
+        };
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                prove_request.clone(),
+            )
+            .is_err(),
+            "daemon must not author adapter no-write evidence"
+        );
+        no_write
+            .record_proven_no_write(&no_write_arm, "backend-proved-not-entered")
+            .expect("persist adapter no-write proof");
+        let proof = handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            prove_request,
+        )
+        .expect("attest exact no-write proof");
+        assert_eq!(proof.marker_id.as_ref(), Some(&no_write_id));
+        assert_eq!(
+            proof.phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite
+        );
+
+        let mut unknown = store
+            .prepare(&session, Some("rename-1".to_string()), "rename")
+            .expect("prepare unknown mutation");
+        let unknown_id = unknown.marker().marker_id.clone();
+        let unknown_nonce = unknown.marker().marker_nonce.clone();
+        let unknown_arm = sinomo_core::Id::generate();
+        handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+                marker_id: unknown_id.clone(),
+                marker_nonce: unknown_nonce.clone(),
+                arm_request_id: unknown_arm.clone(),
+            },
+        )
+        .expect("arm unknown mutation");
+        let observation = sinomo_dfs::MountedSifsMutationErrorObservation::new(
+            sinomo_dfs::MountedSifsMutationCapturedWork::default(),
+            "possibly-applied",
+        )
+        .expect("unknown observation");
+        unknown
+            .record_unknown_after_error(&unknown_arm, observation.clone())
+            .expect("persist unknown observation");
+        handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+            &paths,
+            runtime.handle(),
+            None,
+            crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+                marker_id: unknown_id.clone(),
+                marker_nonce: unknown_nonce.clone(),
+                arm_request_id: unknown_arm.clone(),
+                observation: observation.clone(),
+            },
+        )
+        .expect("accept exact unknown observation");
+        let conflicting_observation = sinomo_dfs::MountedSifsMutationErrorObservation::new(
+            observation.captured_work,
+            "different-error",
+        )
+        .expect("conflicting observation");
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+                    marker_id: unknown_id,
+                    marker_nonce: unknown_nonce,
+                    arm_request_id: unknown_arm,
+                    observation: conflicting_observation,
+                },
+            )
+            .is_err(),
+            "unknown-error retries must preserve the exact fsynced observation"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_classifier_fences_live_work_and_recovery_retains_bounded_passes() {
+        let root = temp_root("mounted-mutation-classifier-recovery");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-classifier-recovery");
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let session = store
+            .open_host_mount_session(sinomo_dfs::MountedSifsMutationAdapter::Fuse, "/mnt/sinomo")
+            .expect("mount session");
+        let mut mutation = store
+            .prepare(&session, Some("mkdir-1".to_string()), "mkdir")
+            .expect("prepare mutation");
+        let marker_id = mutation.marker().marker_id.clone();
+        let arm_request_id = sinomo_core::Id::generate();
+
+        let live = daemon_dfs_mounted_mutation_pending_work(&data_dir, 100)
+            .expect("live mounted-mutation projection");
+        assert_eq!(live.mounted_mutation_live_count, 1);
+        assert_eq!(live.mounted_mutation_recoverable_exact_count, 0);
+        assert_eq!(live.mounted_mutation_recoverable_full_count, 0);
+        assert_eq!(live.deferred_work_count, 1);
+        assert!(live.next_mounted_mutation_reprobe_unix_nanos.is_some());
+        assert_eq!(
+            daemon_dfs_pending_reactive_maintenance_work_on_runtime(&paths, runtime.handle())
+                .expect("production startup classifier")
+                .mounted_mutation_live_count,
+            1,
+            "the production startup probe must see outbox work before cluster state exists"
+        );
+
+        store
+            .arm_live(&marker_id, &mutation.marker().marker_nonce, &arm_request_id)
+            .expect("arm exact recovery marker");
+        mutation
+            .record_captured_success(
+                &arm_request_id,
+                sinomo_dfs::MountedSifsMutationCapturedWork::default(),
+            )
+            .expect("capture exact work");
+        drop(mutation);
+        let exact = daemon_dfs_mounted_mutation_pending_work(&data_dir, 200)
+            .expect("exact mounted-mutation projection");
+        assert_eq!(exact.mounted_mutation_live_count, 0);
+        assert_eq!(exact.mounted_mutation_recoverable_exact_count, 1);
+        assert!(exact.should_trigger_background_maintenance());
+
+        let claim = store
+            .try_claim_recovery(&marker_id)
+            .expect("claim exact marker")
+            .expect("exact recovery claim");
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: vec![claim],
+                corrupt_claims: Vec::new(),
+                requires_full_recovery: false,
+            },
+            DaemonDfsMaintenanceTickOutcome::Deferred,
+        )
+        .expect("retain deferred marker");
+        assert!(matches!(
+            store
+                .marker(&marker_id)
+                .expect("marker")
+                .expect("marker")
+                .phase,
+            sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+        ));
+
+        let claim = store
+            .try_claim_recovery(&marker_id)
+            .expect("reclaim exact marker")
+            .expect("exact recovery claim");
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: vec![claim],
+                corrupt_claims: Vec::new(),
+                requires_full_recovery: false,
+            },
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: true,
+            },
+        )
+        .expect("retain bounded marker");
+        assert!(matches!(
+            store
+                .marker(&marker_id)
+                .expect("marker")
+                .expect("marker")
+                .phase,
+            sinomo_dfs::MountedSifsMutationOutboxPhase::Captured { .. }
+        ));
+
+        let claim = store
+            .try_claim_recovery(&marker_id)
+            .expect("reclaim exact marker after limit")
+            .expect("exact recovery claim");
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: vec![claim],
+                corrupt_claims: Vec::new(),
+                requires_full_recovery: false,
+            },
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false,
+            },
+        )
+        .expect("terminalize completed marker");
+        assert_eq!(
+            store
+                .status()
+                .expect("terminal status")
+                .pending_marker_count,
+            0
+        );
+        assert_eq!(
+            store
+                .daemon_committed_work_latch()
+                .expect("exact recovery latch")
+                .generation,
+            1,
+            "terminalization must retain a durable daemon ownership generation"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_classifier_reports_pending_overflow_without_unbounded_scan_results() {
+        let root = temp_root("mounted-mutation-classifier-overflow");
+        let data_dir = SinomoDataDir::new(root.path());
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let session = store
+            .open_host_mount_session(
+                sinomo_dfs::MountedSifsMutationAdapter::CloudFiles,
+                "sync-root",
+            )
+            .expect("mount session");
+        let mut live_mutations = Vec::new();
+        for index in 0..sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS {
+            live_mutations.push(
+                store
+                    .prepare(&session, Some(format!("write-{index}")), "write")
+                    .expect("prepare bounded marker"),
+            );
+        }
+        let corrupt_id = sinomo_core::Id::generate();
+        let corrupt_dir = store.root().join("operations").join(corrupt_id.as_str());
+        fs::create_dir(&corrupt_dir).expect("create overflow operation");
+        fs::write(corrupt_dir.join("state.sobj"), b"not-a-sobj")
+            .expect("write corrupt overflow state");
+        fs::write(corrupt_dir.join("lease.lock"), b"").expect("write overflow lease");
+
+        let pending = daemon_dfs_mounted_mutation_pending_work(&data_dir, 300)
+            .expect("bounded overflow projection");
+        assert_eq!(pending.mounted_mutation_overflow_count, 1);
+        assert!(pending.mounted_mutation_live_count <= 64);
+        assert!(pending.deferred_work_count > 0);
+        assert!(pending.next_mounted_mutation_reprobe_unix_nanos.is_some());
+        drop(live_mutations);
+    }
+
+    #[test]
+    fn mounted_mutation_main_startup_replays_the_durable_latch_once() {
+        let root = temp_root("mounted-mutation-startup-latch-replay");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let local =
+            NodeId::from_legacy_named("node_mounted_mutation_startup_replay").expect("local node");
+        write_test_cluster_state_with_members(root.path(), &local, Vec::new());
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let retained = store
+            .retain_daemon_committed_work(DfsMessageCommittedWork {
+                publish_metadata: true,
+                repair_maintenance: true,
+                namespace_maintenance: true,
+                metadata_replica_progress: true,
+                metadata_materialization: true,
+            })
+            .expect("retain startup latch");
+        let reconciliation_wake = daemon_default_dfs_reconciliation_wake(&cluster_paths)
+            .expect("default DFS reconciliation wake");
+        let initial_reconciliation_generation = *reconciliation_wake.generation_tx.borrow();
+        let initial_repair_edges = daemon_dfs_repair_maintenance_edge_request_count(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-startup-latch-replay");
+
+        replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(&paths, runtime.handle())
+            .expect("replay startup latch");
+
+        assert_eq!(
+            store
+                .daemon_committed_work_latch()
+                .expect("replayed latch")
+                .generation,
+            retained.generation,
+            "startup replay must not destructively clear or rewrite the latch"
+        );
+        assert!(
+            daemon_dfs_repair_maintenance_edge_request_count(&data_dir) > initial_repair_edges,
+            "startup replay must restore the maintenance owner"
+        );
+        assert_ne!(
+            *reconciliation_wake.generation_tx.borrow(),
+            initial_reconciliation_generation,
+            "startup replay must restore default-reconciliation ownership"
+        );
+        assert!(
+            daemon_dfs_metadata_publish_discovery_is_active(&data_dir.root()),
+            "startup replay must retain a metadata publisher discovery lane"
+        );
+
+        let replayed_repair_edges = daemon_dfs_repair_maintenance_edge_request_count(&data_dir);
+        replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
+            &crate::shadow_daemon_paths_from_data_dir(&data_dir),
+            runtime.handle(),
+        )
+        .expect("shadow replay is a no-op");
+        assert_eq!(
+            daemon_dfs_repair_maintenance_edge_request_count(&data_dir),
+            replayed_repair_edges,
+            "a shadow daemon must never replay main-owned mounted work"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_full_recovery_never_claims_a_live_mount_session() {
+        let root = temp_root("mounted-mutation-full-recovery-fence");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-full-recovery-fence");
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        assert_eq!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .expect("empty outbox is ready")
+            .phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready
+        );
+        let session = store
+            .open_host_mount_session(sinomo_dfs::MountedSifsMutationAdapter::Fuse, "/mnt/sinomo")
+            .expect("mount session");
+        let marker_id = {
+            let mutation = store
+                .prepare(&session, Some("unlink-unknown".to_string()), "unlink")
+                .expect("prepare ambiguous marker");
+            mutation.marker().marker_id.clone()
+        };
+        assert!(
+            store
+                .try_claim_recovery(&marker_id)
+                .expect("live-session claim probe")
+                .is_none(),
+            "an orphan operation lock must not override the live external mount session"
+        );
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .is_err(),
+            "a new mount must not start while an ambiguity marker is pending"
+        );
+        let live = daemon_dfs_mounted_mutation_pending_work(&data_dir, 400)
+            .expect("live-session classifier");
+        assert_eq!(live.mounted_mutation_recoverable_full_count, 0);
+        assert_eq!(live.mounted_mutation_live_count, 1);
+
+        drop(session);
+        let dead = daemon_dfs_mounted_mutation_pending_work(&data_dir, 500)
+            .expect("dead-session classifier");
+        assert_eq!(dead.mounted_mutation_recoverable_full_count, 1);
+        assert!(dead.should_trigger_background_maintenance());
+        let claim = store
+            .try_claim_recovery(&marker_id)
+            .expect("dead-session claim")
+            .expect("full recovery claim");
+        assert_eq!(
+            claim.recovery_kind(),
+            sinomo_dfs::MountedSifsMutationRecoveryKind::Full
+        );
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: vec![claim],
+                corrupt_claims: Vec::new(),
+                requires_full_recovery: true,
+            },
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false,
+            },
+        )
+        .expect("terminalize full recovery marker");
+        assert_eq!(
+            store
+                .status()
+                .expect("terminal status")
+                .pending_marker_count,
+            0
+        );
+        let latch = store
+            .daemon_committed_work_latch()
+            .expect("full recovery latch");
+        assert!(latch.committed_work.publish_metadata);
+        assert!(latch.committed_work.repair_maintenance);
+        assert!(latch.committed_work.namespace_maintenance);
+        assert!(latch.committed_work.metadata_replica_progress);
+        assert!(latch.committed_work.metadata_materialization);
+        assert_eq!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .expect("completed recovery restores readiness")
+            .phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_corrupt_recovery_requires_a_completed_full_pass() {
+        let root = temp_root("mounted-mutation-corrupt-full-recovery");
+        let data_dir = SinomoDataDir::new(root.path());
+        let paths = DaemonPaths::new(&data_dir);
+        let runtime = daemon_test_runtime("mounted-mutation-corrupt-full-recovery");
+        let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)
+            .expect("mounted-mutation outbox");
+        let marker_id = sinomo_core::Id::generate();
+        let directory = store.root().join("operations").join(marker_id.as_str());
+        fs::create_dir(&directory).expect("create corrupt operation");
+        fs::write(directory.join("state.sobj"), b"not-a-sobj").expect("write corrupt state");
+        fs::write(directory.join("lease.lock"), b"").expect("write orphan lease");
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .is_err(),
+            "Probe must fail closed on corrupt work"
+        );
+
+        let claim = store
+            .try_claim_corrupt_recovery(&marker_id)
+            .expect("claim corrupt marker")
+            .expect("corrupt recovery claim");
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: Vec::new(),
+                corrupt_claims: vec![claim],
+                requires_full_recovery: true,
+            },
+            DaemonDfsMaintenanceTickOutcome::Deferred,
+        )
+        .expect("retain corrupt marker after deferred pass");
+        assert!(directory.is_dir());
+
+        let claim = store
+            .try_claim_corrupt_recovery(&marker_id)
+            .expect("reclaim corrupt marker")
+            .expect("corrupt recovery claim");
+        complete_daemon_dfs_mounted_mutation_recovery(
+            DaemonDfsMountedMutationRecoveryBatch {
+                claims: Vec::new(),
+                corrupt_claims: vec![claim],
+                requires_full_recovery: true,
+            },
+            DaemonDfsMaintenanceTickOutcome::Completed {
+                reached_limit: false,
+            },
+        )
+        .expect("terminalize corrupt marker after full pass");
+        assert_eq!(
+            store
+                .status()
+                .expect("recovered status")
+                .pending_marker_count,
+            0
+        );
+        let latch = store
+            .daemon_committed_work_latch()
+            .expect("corrupt recovery latch");
+        assert!(latch.committed_work.publish_metadata);
+        assert!(latch.committed_work.repair_maintenance);
+        assert!(latch.committed_work.namespace_maintenance);
+        assert!(latch.committed_work.metadata_replica_progress);
+        assert!(latch.committed_work.metadata_materialization);
+        assert_eq!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .expect("full recovery restores readiness")
+            .phase,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready
+        );
+    }
+
+    #[test]
+    fn daemon_dfs_control_plane_preserves_temporary_authority_unavailability() {
+        let root = temp_root("daemon-dfs-control-plane-authority-unavailable");
+        let data_dir = SinomoDataDir::new(root.path());
+        let runtime = daemon_test_runtime("daemon-dfs-control-plane-authority-unavailable");
+        let client = DaemonDfsControlPlaneKvClient::new_on_runtime(
+            &ClusterPaths::new(&data_dir),
+            runtime.handle(),
+        );
+        let detail = "local Raft admission is busy and no authority accepted the forwarded exact-key-set read";
+
+        assert_eq!(
+            client.daemon_error(DaemonError::ClusterReadOnly {
+                detail: detail.to_string(),
+            }),
+            KvError::AuthorityUnavailable {
+                detail: detail.to_string(),
+            },
+            "a transient authoritative-view failure must remain retryable across the daemon adapter"
+        );
+        assert!(matches!(
+            client.daemon_error(DaemonError::Io {
+                path: "/permission-denied".to_string(),
+                detail: "permission denied".to_string(),
+            }),
+            KvError::Io { detail, .. } if detail.contains("permission denied")
+        ));
+    }
+
+    #[test]
+    fn daemon_metadata_authority_retries_preserve_one_absolute_deadline() {
+        fn shard_entry(shard: &DfsMetadataShardConfig) -> KvEntry {
+            KvEntry {
+                key: metadata_shard_key(&shard.file_system_id, &shard.shard_id),
+                value: sinomo_core::kv::encode_kv_value(shard).expect("encode shard"),
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(1),
+                version: KvVersion(1),
+                lease_id: None,
+            }
+        }
+
+        fn scripted_client(
+            name: &str,
+        ) -> (
+            DaemonDfsControlPlaneKvClient,
+            tokio::runtime::Runtime,
+            DfsMetadataShardConfig,
+        ) {
+            let root = temp_root(name);
+            let data_dir = SinomoDataDir::new(root.path());
+            let runtime = daemon_test_runtime(name);
+            let shard = DfsMetadataShardConfig {
+                file_system_id: sinomo_dfs::sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: NodeId::from_legacy_named(format!(
+                    "node_{}",
+                    name.replace('-', "_")
+                ))
+                .expect("node"),
+                replica_node_ids: Vec::new(),
+                epoch: 7,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
+                default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            };
+            (
+                DaemonDfsControlPlaneKvClient::new_on_runtime(
+                    &ClusterPaths::new(&data_dir),
+                    runtime.handle(),
+                ),
+                runtime,
+                shard,
+            )
+        }
+
+        let (mut sync_client, _sync_runtime, sync_shard) =
+            scripted_client("daemon-authority-sync-absolute-deadline");
+        sync_client
+            .authoritative_exact_set_outcomes
+            .lock()
+            .expect("script sync authority outcomes")
+            .extend([
+                DaemonDfsTestAuthoritativeExactSetOutcome::Error(KvError::AuthorityUnavailable {
+                    detail: "temporary authority loss".to_string(),
+                }),
+                DaemonDfsTestAuthoritativeExactSetOutcome::Error(KvError::Io {
+                    path: "test authority generation".to_string(),
+                    detail: "resident Raft view changed after ReadIndex quorum; retry the read"
+                        .to_string(),
+                }),
+                DaemonDfsTestAuthoritativeExactSetOutcome::Entries(vec![
+                    Some(shard_entry(&sync_shard)),
+                    None,
+                ]),
+            ]);
+        let sync_deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            sinomo_dfs::DfsControlPlaneStore::new(&mut sync_client)
+                .metadata_shard_authority_is_current_before(&sync_shard, Some(sync_deadline),)
+                .expect("sync authority retry before caller deadline")
+        );
+        assert_eq!(
+            sync_client
+                .authoritative_exact_set_deadlines
+                .lock()
+                .expect("sync authority deadlines")
+                .as_slice(),
+            &[sync_deadline; 3],
+            "sync retries must not restart the daemon's 30-second read budget"
+        );
+
+        let (mut async_client, async_runtime, async_shard) =
+            scripted_client("daemon-authority-async-absolute-deadline");
+        async_client
+            .authoritative_exact_set_outcomes
+            .lock()
+            .expect("script async authority outcomes")
+            .extend([
+                DaemonDfsTestAuthoritativeExactSetOutcome::Error(KvError::AuthorityUnavailable {
+                    detail: "temporary async authority loss".to_string(),
+                }),
+                DaemonDfsTestAuthoritativeExactSetOutcome::Entries(vec![
+                    Some(shard_entry(&async_shard)),
+                    None,
+                ]),
+            ]);
+        let async_deadline = Instant::now() + Duration::from_secs(1);
+        assert!(
+            async_runtime
+                .block_on(
+                    sinomo_dfs::DfsControlPlaneAsyncStore::new(&mut async_client)
+                        .metadata_shard_authority_is_current_before(
+                            &async_shard,
+                            Some(async_deadline),
+                        ),
+                )
+                .expect("async authority retry before caller deadline")
+        );
+        assert_eq!(
+            async_client
+                .authoritative_exact_set_deadlines
+                .lock()
+                .expect("async authority deadlines")
+                .as_slice(),
+            &[async_deadline; 2],
+            "async retries must not restart the daemon's 30-second read budget"
+        );
+
+        let (mut expired_client, _expired_runtime, expired_shard) =
+            scripted_client("daemon-authority-expired-deadline");
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("expired deadline");
+        let keys = vec![
+            metadata_shard_key(&expired_shard.file_system_id, &expired_shard.shard_id),
+            sinomo_dfs::metadata_shard_membership_handoff_key(
+                &expired_shard.file_system_id,
+                &expired_shard.shard_id,
+            ),
+        ];
+        assert!(matches!(
+            sinomo_dfs::DfsControlPlaneKvClient::get_authoritative_consistent_before(
+                &mut expired_client,
+                &keys,
+                expired,
+            ),
+            Err(KvError::AuthorityUnavailable { detail })
+                if detail.contains("deadline elapsed")
+        ));
+        assert!(
+            expired_client
+                .authoritative_exact_set_deadlines
+                .lock()
+                .expect("expired authority deadlines")
+                .is_empty(),
+            "an expired caller budget must not start an exact authority read"
         );
     }
 

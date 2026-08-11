@@ -56,6 +56,7 @@ mod metadata_visible_commit;
 mod model;
 mod module_surface;
 mod mount_config;
+mod mounted_mutation_outbox;
 mod mounted_sifs;
 mod namespace;
 mod namespace_change_feed;
@@ -426,9 +427,23 @@ pub use mount_config::{
     SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
     SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_status_config_definition,
 };
+pub use mounted_mutation_outbox::{
+    MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS,
+    MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES,
+    MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION, MountedSifsHostMountSessionId,
+    MountedSifsHostMountSessionLease, MountedSifsHostMountSessionMarker,
+    MountedSifsHostMountSessionPhase, MountedSifsMutationAdapter, MountedSifsMutationArmRequestId,
+    MountedSifsMutationCapturedWork, MountedSifsMutationCommittedWorkLatch,
+    MountedSifsMutationCorruptRecoveryClaim, MountedSifsMutationCorruptRecoveryReceipt,
+    MountedSifsMutationErrorObservation, MountedSifsMutationLease, MountedSifsMutationMarkerId,
+    MountedSifsMutationNonce, MountedSifsMutationOrigin, MountedSifsMutationOutboxMarker,
+    MountedSifsMutationOutboxPhase, MountedSifsMutationOutboxStatus,
+    MountedSifsMutationOutboxStore, MountedSifsMutationRecoveryClaim,
+    MountedSifsMutationRecoveryKind, MountedSifsMutationRecoveryReceipt,
+};
 pub use mounted_sifs::{
-    MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsService,
-    OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
+    MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsMutationReport,
+    MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
     open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
     open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,

@@ -7114,7 +7114,7 @@ mod tests {
     }
 
     #[test]
-    fn writable_backend_defers_bootstrap_until_first_mutation() {
+    fn writable_backend_defers_clustered_bootstrap_attempt_until_first_mutation() {
         let root = temp_sifs_data_dir("deferred-mutation-bootstrap");
         let data_dir = SinomoDataDir::new(&root);
         seed_observation_cluster(&data_dir);
@@ -7129,15 +7129,21 @@ mod tests {
             "opening a writable backend must stay observational"
         );
 
-        backend
+        let error = backend
             .create_dir_all("/services/deferred-bootstrap")
-            .expect("first mutation bootstraps SIFS authority");
+            .expect_err("clustered mutation must fail closed without the local daemon");
+        assert!(
+            error.contains("cannot prepare SIFS mutation authority")
+                && error.contains("daemon is not running"),
+            "{error}"
+        );
         assert_eq!(
             *backend
                 .mutation_bootstrapped
                 .lock()
                 .expect("mutation bootstrap state"),
-            Some(true)
+            Some(false),
+            "failed authority bootstrap must remain retryable"
         );
 
         let read_only =
