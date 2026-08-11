@@ -90,6 +90,15 @@ pub fn upsert_member_endpoint(
     {
         if *existing == endpoint {
             changed
+        } else if let Some(prefer_incoming) =
+            cluster_endpoint_iroh_relay_replacement_preference(existing, &endpoint)
+        {
+            if prefer_incoming {
+                *existing = endpoint;
+                true
+            } else {
+                changed
+            }
         } else if cluster_endpoint_stable_eq(existing, &endpoint) {
             changed
         } else if cluster_endpoint_route_differs_only_by_discovery_source(existing, &endpoint) {
@@ -169,6 +178,11 @@ fn cluster_endpoint_duplicate_replacement_is_preferred(
     existing: &ClusterEndpointRecord,
     incoming: &ClusterEndpointRecord,
 ) -> bool {
+    if let Some(prefer_incoming) =
+        cluster_endpoint_iroh_relay_replacement_preference(existing, incoming)
+    {
+        return prefer_incoming;
+    }
     match (
         cluster_endpoint_module_url_identity(existing),
         cluster_endpoint_module_url_identity(incoming),
@@ -180,6 +194,48 @@ fn cluster_endpoint_duplicate_replacement_is_preferred(
         }
         _ => false,
     }
+}
+
+/// Resolves only the legacy Iroh key-only versus relay-bearing case. A live
+/// relay route is usable outside the endpoint's private network, while the
+/// key-only form is retained cluster state that the Iroh module no longer
+/// advertises. Relay-to-relay changes deliberately have no preference here so
+/// the ordinary same-id upsert path can install relay rotations.
+fn cluster_endpoint_iroh_relay_replacement_preference(
+    existing: &ClusterEndpointRecord,
+    incoming: &ClusterEndpointRecord,
+) -> Option<bool> {
+    if existing.transport != ClusterTransportKind::Iroh
+        || incoming.transport != ClusterTransportKind::Iroh
+    {
+        return None;
+    }
+    let existing_identity = cluster_endpoint_module_url_identity(existing)?;
+    let incoming_identity = cluster_endpoint_module_url_identity(incoming)?;
+    if existing_identity != incoming_identity || !existing_identity.starts_with("iroh://") {
+        return None;
+    }
+    match (
+        cluster_endpoint_iroh_has_relay(existing),
+        cluster_endpoint_iroh_has_relay(incoming),
+    ) {
+        (true, false) => Some(false),
+        (false, true) => Some(true),
+        _ => None,
+    }
+}
+
+fn cluster_endpoint_iroh_has_relay(endpoint: &ClusterEndpointRecord) -> bool {
+    let Some((_, query)) = endpoint.address.split_once('?') else {
+        return false;
+    };
+    let query = query
+        .split_once('#')
+        .map_or(query, |(query, _fragment)| query);
+    query.split('&').any(|part| {
+        part.strip_prefix("relay=")
+            .is_some_and(|relay| !relay.trim().is_empty())
+    })
 }
 
 pub fn cluster_endpoint_module_url_identity(endpoint: &ClusterEndpointRecord) -> Option<String> {
@@ -200,5 +256,181 @@ fn cluster_endpoint_module_url_rank(endpoint: &ClusterEndpointRecord) -> u8 {
         1
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_member(node_id: &NodeId) -> ClusterMemberRecord {
+        ClusterMemberRecord::local_voter(
+            ClusterId::from_legacy_named("cluster_endpoint_relay_preference").expect("cluster"),
+            node_id.clone(),
+            "relay preference",
+            "node-public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        )
+    }
+
+    fn test_iroh_endpoint(
+        endpoint_id: ClusterEndpointId,
+        node_id: &NodeId,
+        address: &str,
+    ) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id,
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::Iroh,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: if address.contains("?relay=") {
+                ClusterEndpointPrivacy::Relayed
+            } else {
+                ClusterEndpointPrivacy::InternetDirect
+            },
+            priority: 90,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    fn test_non_iroh_module_endpoint(
+        endpoint_id: &str,
+        node_id: &NodeId,
+        address: &str,
+    ) -> ClusterEndpointRecord {
+        ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::from_legacy_named(endpoint_id).expect("endpoint"),
+            node_id: node_id.clone(),
+            transport: ClusterTransportKind::HttpsRelay,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Rendezvous,
+            privacy: ClusterEndpointPrivacy::Relayed,
+            priority: 90,
+            last_observed_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn same_id_iroh_relay_survives_incoming_key_only_record() {
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_preserve").expect("node");
+        let endpoint_id =
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_relay_preserve").expect("endpoint");
+        let relay = test_iroh_endpoint(
+            endpoint_id.clone(),
+            &node_id,
+            "iroh://public-key?relay=https://relay-a.example/",
+        );
+        let key_only = test_iroh_endpoint(endpoint_id, &node_id, "iroh://public-key");
+        let mut member = test_member(&node_id);
+        member.endpoints.push(relay.clone());
+
+        assert!(!upsert_member_endpoint(&mut member, key_only));
+        assert_eq!(member.endpoints, vec![relay]);
+    }
+
+    #[test]
+    fn same_id_iroh_relay_replaces_key_only_record() {
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_upgrade").expect("node");
+        let endpoint_id =
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_relay_upgrade").expect("endpoint");
+        let key_only = test_iroh_endpoint(endpoint_id.clone(), &node_id, "iroh://public-key");
+        let relay = test_iroh_endpoint(
+            endpoint_id,
+            &node_id,
+            "iroh://public-key?relay=https://relay-a.example/",
+        );
+        let mut member = test_member(&node_id);
+        member.endpoints.push(key_only);
+
+        assert!(upsert_member_endpoint(&mut member, relay.clone()));
+        assert_eq!(member.endpoints, vec![relay]);
+    }
+
+    #[test]
+    fn same_id_iroh_relay_rotation_uses_incoming_record() {
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_rotation").expect("node");
+        let endpoint_id =
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_relay_rotation").expect("endpoint");
+        let relay_a = test_iroh_endpoint(
+            endpoint_id.clone(),
+            &node_id,
+            "iroh://public-key?relay=https://relay-a.example/",
+        );
+        let relay_b = test_iroh_endpoint(
+            endpoint_id,
+            &node_id,
+            "iroh://public-key?relay=https://relay-b.example/",
+        );
+        let mut member = test_member(&node_id);
+        member.endpoints.push(relay_a);
+
+        assert!(upsert_member_endpoint(&mut member, relay_b.clone()));
+        assert_eq!(member.endpoints, vec![relay_b]);
+    }
+
+    #[test]
+    fn duplicate_iroh_ids_collapse_to_relay_in_either_order() {
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_cleanup").expect("node");
+        let key_only = test_iroh_endpoint(
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_key_only").expect("endpoint"),
+            &node_id,
+            "iroh://public-key",
+        );
+        let relay = test_iroh_endpoint(
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_relay").expect("endpoint"),
+            &node_id,
+            "iroh://public-key?relay=https://relay-a.example/",
+        );
+
+        for endpoints in [
+            vec![key_only.clone(), relay.clone()],
+            vec![relay.clone(), key_only.clone()],
+        ] {
+            let mut member = test_member(&node_id);
+            member.endpoints = endpoints;
+
+            assert!(cleanup_member_endpoint_duplicates(&mut member));
+            assert_eq!(member.endpoints, vec![relay.clone()]);
+        }
+    }
+
+    #[test]
+    fn iroh_relay_query_after_direct_address_and_before_fragment_is_detected() {
+        let node_id = NodeId::from_legacy_named("node_iroh_relay_query_parser").expect("node");
+        let endpoint = test_iroh_endpoint(
+            ClusterEndpointId::from_legacy_named("endpoint_iroh_relay_query_parser")
+                .expect("endpoint"),
+            &node_id,
+            "iroh://public-key?direct=10.14.5.15:21353&relay=https://relay.example/#metadata",
+        );
+
+        assert!(cluster_endpoint_iroh_has_relay(&endpoint));
+    }
+
+    #[test]
+    fn non_iroh_module_urls_still_prefer_bare_record() {
+        let node_id = NodeId::from_legacy_named("node_non_iroh_module_cleanup").expect("node");
+        let qualified = test_non_iroh_module_endpoint(
+            "endpoint_non_iroh_qualified",
+            &node_id,
+            "module://public-key?route=relay",
+        );
+        let bare = test_non_iroh_module_endpoint(
+            "endpoint_non_iroh_bare",
+            &node_id,
+            "module://public-key",
+        );
+
+        for endpoints in [
+            vec![qualified.clone(), bare.clone()],
+            vec![bare.clone(), qualified.clone()],
+        ] {
+            let mut member = test_member(&node_id);
+            member.endpoints = endpoints;
+
+            assert!(cleanup_member_endpoint_duplicates(&mut member));
+            assert_eq!(member.endpoints, vec![bare.clone()]);
+        }
     }
 }

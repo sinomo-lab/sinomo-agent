@@ -11,8 +11,8 @@ use sinomo_kv::{CLUSTER_KV_RANGE_PREFIX_MAX_ENTRIES, KvSnapshot};
 use sinomo_network::ClusterNetworkInfoRecord;
 use sinomo_network::ClusterPaths;
 use sinomo_network::NetworkError;
-use sinomo_network::cleanup_member_endpoint_duplicates;
 use sinomo_network::{ClusterConnectivityRecord, cluster_network_record_live};
+use sinomo_network::{cleanup_member_endpoint_duplicates, upsert_member_endpoint};
 use sinomo_node::{ClusterCapabilityPolicyRecord, NodeId};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -340,13 +340,7 @@ pub fn read_cluster_members_from_snapshot(
             member.allowed_capabilities = policy.allowed_capabilities.clone();
         }
         for endpoint in read_cluster_member_endpoints_from_snapshot(&snapshot, &member.node_id)? {
-            if !member
-                .endpoints
-                .iter()
-                .any(|candidate| candidate.endpoint_id == endpoint.endpoint_id)
-            {
-                member.endpoints.push(endpoint);
-            }
+            upsert_member_endpoint(member, endpoint);
         }
         cleanup_member_endpoint_duplicates(member);
     }
@@ -851,6 +845,50 @@ mod tests {
 
         let endpoints = read_cluster_endpoints_from_snapshot(&snapshot).expect("read endpoints");
         assert_eq!(endpoints.get(&node_id), Some(&vec![public]));
+    }
+
+    #[test]
+    fn keyed_iroh_relay_upgrades_same_id_embedded_key_only_record() {
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let cluster_id = ClusterId::from_legacy_named("cluster_kv_read_model_iroh_relay_upgrade")
+            .expect("cluster");
+        let node_id =
+            NodeId::from_legacy_named("node_kv_read_model_iroh_relay_upgrade").expect("node");
+        let relay = test_iroh_main_endpoint(&node_id, "windows-public-key");
+        let mut key_only = relay.clone();
+        key_only.address = "iroh://windows-public-key".to_string();
+        key_only.privacy = ClusterEndpointPrivacy::InternetDirect;
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            node_id.clone(),
+            "windows",
+            "pk-windows",
+            now,
+        );
+        member.endpoints = vec![key_only];
+
+        let mut store = InProcessKvStore::new();
+        store
+            .put_serde(cluster_member_key(&node_id), &member, None)
+            .expect("put member");
+        store
+            .put_serde(cluster_endpoint_key(&node_id, &relay), &relay, None)
+            .expect("put relay endpoint");
+        let snapshot = store.try_snapshot().expect("snapshot");
+
+        let members = read_cluster_members_from_snapshot(&snapshot).expect("read members");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].endpoints, vec![relay.clone()]);
+
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(
+            "kv-read-model-iroh-relay-upgrade",
+        ));
+        let projection = read_cluster_directory_projection(&paths, Arc::new(snapshot))
+            .expect("directory projection");
+        let (members, endpoints) = projection.current_routing_records();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].endpoints, vec![relay.clone()]);
+        assert_eq!(endpoints, vec![relay]);
     }
 
     #[test]
