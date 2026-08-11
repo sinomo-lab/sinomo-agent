@@ -2101,7 +2101,7 @@ impl HeldLeaseLock {
                 path: path.to_path_buf(),
                 held: true,
             })),
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+            Err(source) if fs2_lock_is_contended(&source) => {
                 unregister_process_lock(path);
                 Ok(None)
             }
@@ -2179,8 +2179,21 @@ fn lock_liveness(path: &Path) -> Result<LeaseLiveness, DfsError> {
             let _ = FileExt::unlock(&file);
             Ok(LeaseLiveness::Dead)
         }
-        Err(source) if source.kind() == io::ErrorKind::WouldBlock => Ok(LeaseLiveness::Live),
+        Err(source) if fs2_lock_is_contended(&source) => Ok(LeaseLiveness::Live),
         Err(_) => Ok(LeaseLiveness::Unproven),
+    }
+}
+
+/// `fs2` exposes the platform's canonical nonblocking-lock contention error.
+/// Windows reports `ERROR_LOCK_VIOLATION` (33), which Rust does not classify as
+/// [`io::ErrorKind::WouldBlock`]. Compare the raw platform code when available
+/// so DLL/EXE boundaries can prove lease liveness without broadening every
+/// `Uncategorized` error into a contention result.
+fn fs2_lock_is_contended(source: &io::Error) -> bool {
+    let contended = fs2::lock_contended_error();
+    match (source.raw_os_error(), contended.raw_os_error()) {
+        (Some(source), Some(contended)) => source == contended,
+        _ => source.kind() == contended.kind(),
     }
 }
 
@@ -2195,7 +2208,7 @@ fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<Fi
     loop {
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => return Ok(file),
-            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+            Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
                 if now >= deadline {
                     return Err(outbox_error(format!(
@@ -2818,6 +2831,60 @@ mod tests {
         drop(
             lock_file_exclusive_with_timeout(&state_lock_path, Duration::ZERO)
                 .expect("state lock succeeds after release"),
+        );
+    }
+
+    #[test]
+    fn external_fs2_lock_contention_is_live_and_bounded() {
+        let root = sinomo_testdir::TestDir::new("mounted-mutation-external-lock-contention");
+        let lock_path = root.join("external.lock");
+        let held = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("create external lock");
+        FileExt::try_lock_exclusive(&held).expect("hold external lock");
+
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("open external lock probe");
+        let contention = FileExt::try_lock_exclusive(&probe).expect_err("lock is contended");
+        assert!(
+            fs2_lock_is_contended(&contention),
+            "the platform's canonical fs2 contention error must be recognized"
+        );
+        assert_eq!(
+            lock_liveness(&lock_path).expect("external lock liveness"),
+            LeaseLiveness::Live
+        );
+        assert!(
+            HeldLeaseLock::try_acquire_existing(&lock_path)
+                .expect("try external lock")
+                .is_none(),
+            "a contended external lease must remain owned by its current holder"
+        );
+        let timeout = lock_file_exclusive_with_timeout(&lock_path, Duration::ZERO)
+            .expect_err("contended lock must time out");
+        assert!(
+            timeout
+                .to_string()
+                .contains("timed out acquiring mounted-mutation outbox lock"),
+            "contention must take the bounded retry path: {timeout}"
+        );
+
+        drop(probe);
+        drop(held);
+        assert_eq!(
+            lock_liveness(&lock_path).expect("released external lock liveness"),
+            LeaseLiveness::Dead
+        );
+        drop(
+            HeldLeaseLock::try_acquire_existing(&lock_path)
+                .expect("acquire released external lock")
+                .expect("released external lease is available"),
         );
     }
 
