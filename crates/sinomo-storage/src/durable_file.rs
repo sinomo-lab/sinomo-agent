@@ -442,10 +442,36 @@ pub fn truncate_open_file_and_sync(
     offset: u64,
     sync: DurableFileSync,
 ) -> Result<(), DurableFileError> {
-    file.set_len(offset)
-        .and_then(|()| file.seek(SeekFrom::Start(offset)).map(|_| ()))
-        .map_err(|source| io_error(path.display(), source))?;
-    sync_file(file, path, sync)
+    match file.set_len(offset) {
+        Ok(()) => {
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|source| io_error(path.display(), source))?;
+            sync_file(file, path, sync)
+        }
+        #[cfg(windows)]
+        Err(source) if source.kind() == io::ErrorKind::PermissionDenied => {
+            // A Windows append handle may carry FILE_APPEND_DATA without the
+            // FILE_WRITE_DATA right required by SetEndOfFile, even when the
+            // Rust OpenOptions also requested write access. Reopen the same
+            // shared file for truncation, durably sync that handle, then
+            // reposition the long-lived append/read handle.
+            let mut truncator = OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|source| io_error(path.display(), source))?;
+            truncator
+                .set_len(offset)
+                .map_err(|source| io_error(path.display(), source))?;
+            truncator
+                .seek(SeekFrom::Start(offset))
+                .map_err(|source| io_error(path.display(), source))?;
+            sync_file(&mut truncator, path, sync)?;
+            file.seek(SeekFrom::Start(offset))
+                .map_err(|source| io_error(path.display(), source))?;
+            Ok(())
+        }
+        Err(source) => Err(io_error(path.display(), source)),
+    }
 }
 
 pub fn truncate_file_and_sync(
@@ -2036,6 +2062,26 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn append_handle_can_be_durably_truncated() {
+        let root = sinomo_testdir::TestDir::new("storage-append-truncate");
+        let path = root.join("records.slog");
+        let mut append = open_file_for_append(&path).expect("open append");
+        append.file.write_all(b"first-second").expect("append");
+        truncate_open_file_and_sync(&mut append.file, &path, 5, DurableFileSync::All)
+            .expect("truncate append handle");
+        append
+            .file
+            .write_all(b"-third")
+            .expect("append after truncate");
+        append.file.sync_all().expect("sync appended bytes");
+        drop(append);
+        assert_eq!(
+            fs::read(&path).expect("read truncated file"),
+            b"first-third"
         );
     }
 
