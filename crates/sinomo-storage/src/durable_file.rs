@@ -409,6 +409,7 @@ pub fn open_file_for_append_with_options(
     match OpenOptions::new()
         .create_new(true)
         .read(true)
+        .write(true)
         .append(true)
         .open(path)
     {
@@ -423,6 +424,7 @@ pub fn open_file_for_append_with_options(
         }
         Err(source) if source.kind() == io::ErrorKind::AlreadyExists => OpenOptions::new()
             .read(true)
+            .write(true)
             .append(true)
             .open(path)
             .map(|file| DurableAppendFile {
