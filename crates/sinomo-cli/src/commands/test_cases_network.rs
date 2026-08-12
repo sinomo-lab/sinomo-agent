@@ -70,6 +70,11 @@ const MAX_BENCHMARK_CONCURRENCY: usize = 1_024;
 const MAX_BENCHMARK_TIMEOUT_MS: u64 = 300_000;
 const MAX_PREPARED_NETWORK_PING_JOBS: usize = 100_000;
 const MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+// Debug builds of the stream-native signed routing path exceed Tokio's 2 MiB
+// default worker stack even for one bodyless request. Keep the benchmark's
+// private runtime bounded and self-contained instead of requiring operators to
+// set RUST_MIN_STACK for the cluster acceptance suite.
+const NETWORK_PING_RUNTIME_THREAD_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NetworkPingPayloadMode {
@@ -893,6 +898,7 @@ fn run_network_ping_with_defaults(
     let runtime_worker_threads = network_ping_runtime_worker_threads(concurrency_limit);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads)
+        .thread_stack_size(NETWORK_PING_RUNTIME_THREAD_STACK_BYTES)
         .enable_all()
         .build()
         .map_err(|source| {
