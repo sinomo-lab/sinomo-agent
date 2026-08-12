@@ -4498,8 +4498,21 @@ pub(crate) fn inspect_cursor_only_reconciliation_state(
                 raw_files.insert(name, bytes);
             }
             RECONCILIATION_LOCK_FILE if metadata.file_type().is_file() => {
-                let bytes = read_bounded_plain_file(&path, 0, "cursor-only reconciliation lock")?;
-                raw_files.insert(name, bytes);
+                // Windows byte-range locks are mandatory for I/O issued through
+                // another handle, even in the process that owns the lock.  The
+                // exclusive handle above is the authority for this file, so do
+                // not reopen it merely to prove that the canonical lock image is
+                // empty.
+                let lock_metadata = reconciliation_lock
+                    .metadata()
+                    .map_err(io_error("inspect locked cursor-only reconciliation lock"))?;
+                if lock_metadata.len() != 0 {
+                    return Err(reconcile_error(
+                        "cursor-recovery-reconciliation-lock",
+                        "reconciliation lock file is not empty",
+                    ));
+                }
+                raw_files.insert(name, Vec::new());
                 saw_lock = true;
             }
             MATERIALIZATION_AUDIT_INTENTS_FILE if metadata.file_type().is_file() => {
