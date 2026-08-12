@@ -1609,6 +1609,29 @@ mod windows_file {
                 "Windows path contains a NUL code unit",
             ));
         }
+        const BACKSLASH: u16 = b'\\' as u16;
+        const COLON: u16 = b':' as u16;
+        const QUESTION: u16 = b'?' as u16;
+        const DOT: u16 = b'.' as u16;
+        let already_device_path = wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH])
+            || wide.starts_with(&[BACKSLASH, BACKSLASH, DOT, BACKSLASH]);
+        if !already_device_path && wide.len() >= 3 && wide[1] == COLON && wide[2] == BACKSLASH {
+            wide.splice(0..0, [BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]);
+        } else if !already_device_path && wide.starts_with(&[BACKSLASH, BACKSLASH]) {
+            wide.splice(
+                0..2,
+                [
+                    BACKSLASH,
+                    BACKSLASH,
+                    QUESTION,
+                    BACKSLASH,
+                    b'U' as u16,
+                    b'N' as u16,
+                    b'C' as u16,
+                    BACKSLASH,
+                ],
+            );
+        }
         wide.push(0);
         Ok(wide)
     }
@@ -2083,6 +2106,26 @@ mod tests {
             fs::read(&path).expect("read truncated file"),
             b"first-third"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_supports_extended_length_temporary_paths() {
+        let root = sinomo_testdir::TestDir::new("storage-windows-long-atomic");
+        let parent = root.join("x".repeat(150));
+        fs::create_dir_all(&parent).expect("create bounded parent");
+        let path = parent.join("materialization-audit-intents.sobj");
+        write_file_atomic(
+            &path,
+            b"durable",
+            DurableAtomicFileOptions::new(
+                "materialization-audit-intents.sobj",
+                "cloud-files-materialization-audits",
+            )
+            .sync_all(),
+        )
+        .expect("replace through extended-length temporary path");
+        assert_eq!(fs::read(path).expect("read installed file"), b"durable");
     }
 
     #[test]
