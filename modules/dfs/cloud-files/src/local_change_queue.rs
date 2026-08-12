@@ -1389,6 +1389,35 @@ impl CloudFilesLocalChangeQueue {
     }
 }
 
+/// Read-only admission check for a brand-new v3 registration. `open` is not
+/// usable here because it creates directories, repairs torn tails, and
+/// requeues ambiguous operations. Any pre-existing exact scope is retained as
+/// evidence and therefore blocks Fresh activation for a separate migration or
+/// operator decision.
+pub(crate) fn fresh_local_change_scope_is_absent(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+) -> Result<bool, CloudFilesLocalChangeQueueError> {
+    if mount.trim().is_empty() {
+        return Err(queue_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(root)?;
+    let scope = data_dir
+        .module_runtime_dir()
+        .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(QUEUE_DIR)
+        .join(mount_scope_directory(mount, &root)?);
+    match fs::symlink_metadata(&scope) {
+        Ok(_) => Ok(false),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(io_error("inspect Cloud Files local-change scope")(source)),
+    }
+}
+
 fn stage_reader_in_blobs_dir<R: Read>(
     blobs_dir: &Path,
     mut reader: R,
@@ -1658,6 +1687,34 @@ mod tests {
     fn queue(root: &TestRoot) -> CloudFilesLocalChangeQueue {
         CloudFilesLocalChangeQueue::open(&root.data_dir(), "mount-a", "/services")
             .expect("open queue")
+    }
+
+    #[test]
+    fn fresh_scope_probe_is_read_only_and_rejects_even_an_empty_scope() {
+        let root = TestRoot::new("fresh-scope-probe");
+        let data_dir = root.data_dir();
+        let queue_root = data_dir
+            .module_runtime_dir()
+            .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .join(QUEUE_DIR);
+
+        assert!(
+            fresh_local_change_scope_is_absent(&data_dir, "mount-a", "/services")
+                .expect("probe absent scope")
+        );
+        assert!(
+            !queue_root.exists(),
+            "read-only Fresh admission must not create queue directories"
+        );
+
+        let scope = queue_root
+            .join(mount_scope_directory("mount-a", "/services").expect("exact queue scope name"));
+        fs::create_dir_all(&scope).expect("empty retained queue scope");
+        assert!(
+            !fresh_local_change_scope_is_absent(&data_dir, "mount-a", "/services")
+                .expect("probe retained scope")
+        );
+        assert!(scope.exists(), "probe must retain existing evidence");
     }
 
     #[test]

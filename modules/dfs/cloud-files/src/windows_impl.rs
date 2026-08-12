@@ -5,6 +5,7 @@ use std::ffi::{OsStr, c_void};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -17,6 +18,7 @@ use sinomo_dfs_cloud_files_api::{
     CloudFilesFetchDataError, CloudFilesLocalChangeSyncMode, CloudFilesLocalChangeSyncStatus,
     CloudFilesModuleError, CloudFilesModuleEvent, CloudFilesMountLifecycleEvent,
     CloudFilesMountRequest, CloudFilesMountResponse, CloudFilesPlaceholderIdentity,
+    CloudFilesPreserveStateUnregisterOutcome, CloudFilesPreserveStateUnregisterResponse,
     CloudFilesRegistrationReceipt, CloudFilesStaleIdentityReason,
     CloudFilesStalePlaceholderIdentity, CloudFilesUnregisterRequest, CloudFilesUnregisterResponse,
     SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
@@ -59,21 +61,22 @@ use windows::Win32::Storage::CloudFilters::{
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-    FILE_ATTRIBUTE_READONLY, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING,
+    MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
 };
 use windows::core::{GUID, HRESULT, PCWSTR};
 
 use crate::namespace_reconciler::CloudFilesMaterializationAuditIntentStore;
 use crate::registration_journal::{
-    REGISTRATION_IDENTITY_MAX_BYTES, RegistrationJournal, RegistrationPhase,
-    RegistrationRecoveryAction,
+    REGISTRATION_IDENTITY_MAX_BYTES, RegistrationJournal, RegistrationOwnershipDisposition,
+    RegistrationPhase, RegistrationRecoveryAction,
 };
 use crate::windows_sync::{
     CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesMountedMutationHandoff,
     CloudFilesObjectProjection, CloudFilesWritableSyncState, cloud_files_object_projection,
-    configure_cloud_files_mounted_read_policy,
+    configure_cloud_files_mounted_read_policy, fresh_writable_scopes_are_absent,
 };
 use crate::{
     DecodedCloudFilesPlaceholderIdentity, decode_placeholder_identity, encode_placeholder_identity,
@@ -369,12 +372,27 @@ impl Drop for CloudFilesConnection {
 #[derive(Debug)]
 enum RecoveredRegistration {
     Fresh,
-    Ready(Box<RegistrationJournal>),
+    Owned {
+        journal: Box<RegistrationJournal>,
+        registration_present: bool,
+    },
+}
+
+struct RecoveredUnregister {
+    was_registered: bool,
+    ownership: RegistrationOwnershipDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnregisterPolicy {
+    Release,
+    PreserveState,
 }
 
 struct RegistrationActivation {
     data_dir: SinomoDataDir,
     journal: RegistrationJournal,
+    state_owned: bool,
     armed: bool,
 }
 
@@ -427,10 +445,11 @@ impl RegistrationLease {
 }
 
 impl RegistrationActivation {
-    fn new(data_dir: SinomoDataDir, journal: RegistrationJournal) -> Self {
+    fn new(data_dir: SinomoDataDir, journal: RegistrationJournal, state_owned: bool) -> Self {
         Self {
             data_dir,
             journal,
+            state_owned,
             armed: true,
         }
     }
@@ -443,9 +462,26 @@ impl RegistrationActivation {
         &mut self,
         request: &CloudFilesMountRequest,
     ) -> Result<(), CloudFilesModuleError> {
-        self.journal.phase = RegistrationPhase::Registered;
+        if !self.state_owned {
+            self.journal.phase = RegistrationPhase::Registered;
+        }
         self.journal.provider_version = request.provider_version.clone();
+        // From the first attempt to persist Registered onward, a failed or
+        // ambiguous write must retain ownership. The on-disk outcome may be
+        // Registered even when the atomic-write call reports failure.
+        self.state_owned = true;
         persist_registration_journal(&self.data_dir, &self.journal)
+    }
+
+    fn mark_state_owned(
+        &mut self,
+        request: &CloudFilesMountRequest,
+    ) -> Result<(), CloudFilesModuleError> {
+        self.journal.phase = RegistrationPhase::StateOwned;
+        self.journal.provider_version = request.provider_version.clone();
+        self.state_owned = true;
+        persist_registration_journal(&self.data_dir, &self.journal)?;
+        Ok(())
     }
 
     fn mark_ready(
@@ -453,16 +489,16 @@ impl RegistrationActivation {
         request: &CloudFilesMountRequest,
     ) -> Result<(), CloudFilesModuleError> {
         // The stable receipt means that the whole provider is ready, not merely
-        // that CfRegisterSyncRoot returned. Keep the journal at Registered until
-        // the receipt is durable so a crash in between is recovered as rollback.
-        persist_registration_receipt(request, &self.data_dir)?;
+        // that CfRegisterSyncRoot returned. Keep the journal at StateOwned until
+        // the receipt is durable so a crash cannot surrender writable state.
+        persist_registration_receipt(request, &self.journal, &self.data_dir)?;
         self.journal.phase = RegistrationPhase::Ready;
         self.journal.provider_version = request.provider_version.clone();
         persist_registration_journal(&self.data_dir, &self.journal)
     }
 
     fn rollback(&mut self) -> Result<(), CloudFilesModuleError> {
-        rollback_owned_registration(&self.data_dir, &self.journal)?;
+        rollback_activation_registration(&self.data_dir, &self.journal, self.state_owned)?;
         self.armed = false;
         Ok(())
     }
@@ -475,9 +511,15 @@ impl RegistrationActivation {
         match self.rollback() {
             Ok(()) => {
                 lifecycle.registered = false;
-                error.detail.push_str(
-                    "; nonce-owned Cloud Files registration rolled back and verified absent",
-                );
+                if self.state_owned {
+                    error.detail.push_str(
+                        "; nonce-owned Cloud Files registration rolled back and verified absent while durable state ownership was retained",
+                    );
+                } else {
+                    error.detail.push_str(
+                        "; nonce-owned Cloud Files registration rolled back and verified absent",
+                    );
+                }
             }
             Err(rollback_error) => {
                 error.detail.push_str(&format!(
@@ -517,6 +559,72 @@ fn with_cleanup_result(
             .push_str(&format!("; {action} failed: {cleanup_error}"));
     }
     error
+}
+
+fn activate_registration_before_writable_effects_with<
+    A,
+    R,
+    FRegister,
+    FRegistered,
+    FRecheck,
+    FOwned,
+    FEffects,
+>(
+    activation: &mut A,
+    register: FRegister,
+    mark_registered: FRegistered,
+    recheck_fresh_boundary: FRecheck,
+    mark_state_owned: FOwned,
+    effects: FEffects,
+) -> Result<R, CloudFilesModuleError>
+where
+    FRegister: FnOnce(&A) -> Result<(), CloudFilesModuleError>,
+    FRegistered: FnOnce(&mut A) -> Result<(), CloudFilesModuleError>,
+    FRecheck: FnOnce(&A) -> Result<(), CloudFilesModuleError>,
+    FOwned: FnOnce(&mut A) -> Result<(), CloudFilesModuleError>,
+    FEffects: FnOnce() -> Result<R, CloudFilesModuleError>,
+{
+    register(activation)?;
+    mark_registered(activation)?;
+    recheck_fresh_boundary(activation)?;
+    mark_state_owned(activation)?;
+    effects()
+}
+
+fn verify_fresh_state_owned_boundary_with<FEmpty, FScopes, FFileId>(
+    fresh: bool,
+    sync_root: &Path,
+    expected_file_id: u64,
+    ensure_empty: FEmpty,
+    scopes_are_absent: FScopes,
+    current_file_id: FFileId,
+) -> Result<(), CloudFilesModuleError>
+where
+    FEmpty: FnOnce() -> Result<(), CloudFilesModuleError>,
+    FScopes: FnOnce() -> Result<bool, CloudFilesModuleError>,
+    FFileId: FnOnce() -> Result<u64, CloudFilesModuleError>,
+{
+    if !fresh {
+        return Ok(());
+    }
+    ensure_empty()?;
+    if !scopes_are_absent()? {
+        return Err(CloudFilesModuleError {
+            code: "unowned-sync-root-state-not-pristine".to_string(),
+            detail: "Fresh Cloud Files activation found a queue or reconciliation scope created before durable StateOwned; refusing to open or reinterpret it"
+                .to_string(),
+        });
+    }
+    if current_file_id()? != expected_file_id {
+        return Err(CloudFilesModuleError {
+            code: "sync-root-file-id-changed".to_string(),
+            detail: format!(
+                "Cloud Files sync root {} changed between registration and durable state ownership",
+                sync_root.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 pub fn mount_sifs_cloud_files(
@@ -565,9 +673,10 @@ fn unregister_sifs_cloud_files_inner(
     lifecycle.root_path.clone_from(&request.root_path);
     let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
     let _registration_lease = RegistrationLease::acquire(&data_dir)?;
-    let was_registered = recover_registration_for_unregister(&request, &data_dir)?;
+    let recovered =
+        recover_registration_for_unregister(&request, &data_dir, UnregisterPolicy::Release)?;
     lifecycle.registered = false;
-    let detail = if was_registered {
+    let detail = if recovered.was_registered {
         "Cloud Files sync root unregistered after nonce-bound ownership verification".to_string()
     } else {
         "Cloud Files sync root was already unregistered".to_string()
@@ -576,9 +685,68 @@ fn unregister_sifs_cloud_files_inner(
     Ok(CloudFilesUnregisterResponse {
         sync_root: request.sync_root,
         root_path: request.root_path,
-        was_registered,
+        was_registered: recovered.was_registered,
         detail,
     })
+}
+
+pub fn unregister_sifs_cloud_files_preserving_state(
+    mut request: CloudFilesUnregisterRequest,
+) -> Result<CloudFilesPreserveStateUnregisterResponse, CloudFilesModuleError> {
+    let mut lifecycle = MountLifecycleState::for_unregister(&request);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        request.root_path = normalize_sifs_root(&request.root_path)?;
+        lifecycle.root_path.clone_from(&request.root_path);
+        let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
+        let _registration_lease = RegistrationLease::acquire(&data_dir)?;
+        let recovered = recover_registration_for_unregister(
+            &request,
+            &data_dir,
+            UnregisterPolicy::PreserveState,
+        )?;
+        lifecycle.registered = false;
+        let outcome = match recovered.ownership {
+            RegistrationOwnershipDisposition::Retain => {
+                CloudFilesPreserveStateUnregisterOutcome::Retained
+            }
+            RegistrationOwnershipDisposition::Release => {
+                CloudFilesPreserveStateUnregisterOutcome::Released
+            }
+        };
+        let detail = match (outcome, recovered.was_registered) {
+            (CloudFilesPreserveStateUnregisterOutcome::Retained, true) => {
+                "Cloud Files sync root unregistered while exact durable state ownership was retained"
+            }
+            (CloudFilesPreserveStateUnregisterOutcome::Retained, false) => {
+                "Cloud Files sync root was already absent and exact durable state ownership remains retained"
+            }
+            (CloudFilesPreserveStateUnregisterOutcome::Released, true) => {
+                "Cloud Files sync root unregistered before writable state ownership was established"
+            }
+            (CloudFilesPreserveStateUnregisterOutcome::Released, false) => {
+                "Cloud Files sync root was absent before writable state ownership was established"
+            }
+        }
+        .to_string();
+        lifecycle.emit_unregistered(detail.clone());
+        Ok(CloudFilesPreserveStateUnregisterResponse {
+            sync_root: request.sync_root,
+            root_path: request.root_path,
+            was_registered: recovered.was_registered,
+            outcome,
+            detail,
+        })
+    }))
+    .unwrap_or_else(|_| {
+        Err(CloudFilesModuleError {
+            code: "unregister-panic".to_string(),
+            detail: "Cloud Files state-preserving unregistration panicked".to_string(),
+        })
+    });
+    if let Err(error) = &result {
+        lifecycle.emit_failed(error);
+    }
+    result
 }
 
 fn mount_sifs_cloud_files_inner(
@@ -597,55 +765,125 @@ fn mount_sifs_cloud_files_inner(
                 .to_string(),
         });
     }
-    // The main daemon must prove it can durably accept mounted mutations, and
-    // the Cloud Files host session must hold its liveness lease, before the
-    // sync root is registered or any callbacks can become provider-visible.
-    let mounted_mutation_handoff = Arc::new(
-        CloudFilesMountedMutationHandoff::open(
-            &data_dir,
-            format!(
-                "cloud-files:{}:{}",
-                request.sync_root.to_string_lossy(),
-                request.root_path
-            ),
-        )
-        .map_err(|detail| CloudFilesModuleError {
-            code: "mounted-mutation-handoff-unavailable".to_string(),
-            detail,
-        })?,
-    );
-    let writable_state = CloudFilesWritableSyncState::open(
-        &data_dir,
-        request.sync_root.to_string_lossy(),
-        request.root_path.clone(),
-    )
-    .map_err(|error| CloudFilesModuleError {
-        code: error.code.to_string(),
-        detail: error.detail,
-    })?;
-    lifecycle.local_change_sync = writable_state.status();
-    let materialization_audit_intents = writable_state.materialization_audit_intents();
-    fs::create_dir_all(&request.sync_root).map_err(|source| CloudFilesModuleError {
-        code: "sync-root-create".to_string(),
-        detail: format!(
-            "create Cloud Files sync root {}: {source}",
-            request.sync_root.display()
-        ),
-    })?;
-
     let recovered_registration = recover_registration_for_mount(&request, &data_dir)?;
-    let existing_owned_root = matches!(&recovered_registration, RecoveredRegistration::Ready(_));
-
-    let opened = mounted_mutation_handoff
-        .run_captured_mount_open(|| {
-            let opened = open_sifs_service(request.data_dir_root.clone())?;
-            let repair_records = opened.service.durable_repair_queue_records();
-            Ok::<_, CloudFilesModuleError>((opened, repair_records))
-        })
-        .map_err(|detail| CloudFilesModuleError {
-            code: "mounted-mutation-mount-open".to_string(),
-            detail,
+    let existing_owned_root =
+        matches!(&recovered_registration, RecoveredRegistration::Owned { .. });
+    let existing_registration = matches!(
+        &recovered_registration,
+        RecoveredRegistration::Owned {
+            registration_present: true,
+            ..
+        }
+    );
+    if !existing_owned_root {
+        fs::create_dir_all(&request.sync_root).map_err(|source| CloudFilesModuleError {
+            code: "sync-root-create".to_string(),
+            detail: format!(
+                "create Cloud Files sync root {}: {source}",
+                request.sync_root.display()
+            ),
         })?;
+        verify_fresh_registration_absent(&request)?;
+        ensure_new_sync_root_is_empty(&request.sync_root)?;
+        let scopes_absent = fresh_writable_scopes_are_absent(
+            &data_dir,
+            &request.sync_root.to_string_lossy(),
+            &request.root_path,
+        )
+        .map_err(|error| CloudFilesModuleError {
+            code: error.code.to_string(),
+            detail: error.detail,
+        })?;
+        if !scopes_absent {
+            return Err(CloudFilesModuleError {
+                code: "unowned-sync-root-state-not-pristine".to_string(),
+                detail: "new or unowned Cloud Files activation found a pre-existing exact queue or reconciliation scope; refusing to open, repair, or reinterpret retained state without verified registration ownership"
+                    .to_string(),
+            });
+        }
+    }
+    let (journal, state_owned) =
+        prepare_registration_activation(&request, &data_dir, recovered_registration)?;
+    let mut activation = RegistrationActivation::new(data_dir.clone(), journal, state_owned);
+    let opened_effects = activate_registration_before_writable_effects_with(
+        &mut activation,
+        |activation| register_sync_root(&request, activation.journal(), existing_registration),
+        |activation| activation.mark_registered(&request),
+        |activation| {
+            verify_fresh_state_owned_boundary_with(
+                !existing_owned_root,
+                &request.sync_root,
+                activation.journal().sync_root_file_id,
+                || ensure_new_sync_root_is_empty(&request.sync_root),
+                || {
+                    fresh_writable_scopes_are_absent(
+                        &data_dir,
+                        &request.sync_root.to_string_lossy(),
+                        &request.root_path,
+                    )
+                    .map_err(|error| CloudFilesModuleError {
+                        code: error.code.to_string(),
+                        detail: error.detail,
+                    })
+                },
+                || sync_root_file_index(&request.sync_root),
+            )
+        },
+        |activation| activation.mark_state_owned(&request),
+        || {
+            lifecycle.registered = true;
+            lifecycle.emit_registered();
+            // Every constructor below can create, repair, migrate, or commit
+            // durable writable state and is therefore inside the StateOwned
+            // effect closure.
+            let mounted_mutation_handoff = Arc::new(
+                CloudFilesMountedMutationHandoff::open(
+                    &data_dir,
+                    format!(
+                        "cloud-files:{}:{}",
+                        request.sync_root.to_string_lossy(),
+                        request.root_path
+                    ),
+                )
+                .map_err(|detail| CloudFilesModuleError {
+                    code: "mounted-mutation-handoff-unavailable".to_string(),
+                    detail,
+                })?,
+            );
+            let writable_state = CloudFilesWritableSyncState::open(
+                &data_dir,
+                request.sync_root.to_string_lossy(),
+                request.root_path.clone(),
+            )
+            .map_err(|error| CloudFilesModuleError {
+                code: error.code.to_string(),
+                detail: error.detail,
+            })?;
+            lifecycle.local_change_sync = writable_state.status();
+            let materialization_audit_intents = writable_state.materialization_audit_intents();
+            let opened = mounted_mutation_handoff
+                .run_captured_mount_open(|| {
+                    let opened = open_sifs_service(request.data_dir_root.clone())?;
+                    let repair_records = opened.service.durable_repair_queue_records();
+                    Ok::<_, CloudFilesModuleError>((opened, repair_records))
+                })
+                .map_err(|detail| CloudFilesModuleError {
+                    code: "mounted-mutation-mount-open".to_string(),
+                    detail,
+                })?;
+            Ok((
+                mounted_mutation_handoff,
+                writable_state,
+                materialization_audit_intents,
+                opened,
+            ))
+        },
+    );
+    let (mounted_mutation_handoff, writable_state, materialization_audit_intents, opened) =
+        match opened_effects {
+            Ok(opened) => opened,
+            Err(error) => return Err(activation.fail(error, lifecycle)),
+        };
     let shared_service = Arc::new(Mutex::new(opened.service));
     let materialized_directories = Arc::new(Mutex::new(BTreeSet::new()));
     let provider = Arc::new(CloudFilesProvider::new(
@@ -657,20 +895,6 @@ fn mount_sifs_cloud_files_inner(
         Arc::clone(&materialized_directories),
         materialization_audit_intents,
     ));
-    if !existing_owned_root {
-        ensure_new_sync_root_is_empty(&request.sync_root)?;
-        ensure_new_sync_root_state_is_pristine(&writable_state)?;
-    }
-    let journal = prepare_registration_activation(&request, &data_dir, recovered_registration)?;
-    let mut activation = RegistrationActivation::new(data_dir.clone(), journal);
-    if let Err(error) = register_sync_root(&request, activation.journal(), existing_owned_root) {
-        return Err(activation.fail(error, lifecycle));
-    }
-    if let Err(error) = activation.mark_registered(&request) {
-        return Err(activation.fail(error, lifecycle));
-    }
-    lifecycle.registered = true;
-    lifecycle.emit_registered();
 
     let write_options = dfs::DfsWriteOptions::replicated_eventual(opened.replica_candidates);
     let (mut writable_worker, writable_worker_cancelled) = windows_adapter::build_writable_worker(
@@ -2133,11 +2357,15 @@ fn load_registration_receipt(
 
 fn persist_registration_receipt(
     request: &CloudFilesMountRequest,
+    journal: &RegistrationJournal,
     data_dir: &SinomoDataDir,
 ) -> Result<(), CloudFilesModuleError> {
     let path = registration_receipt_path(data_dir);
     let receipt = CloudFilesRegistrationReceipt {
         interface_version: SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string(),
+        registration_identity_interface_version: (journal.interface_version
+            != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION)
+            .then(|| journal.interface_version.clone()),
         sync_root: request.sync_root.clone(),
         root_path: request.root_path.clone(),
         provider_name: request.provider_name.clone(),
@@ -2357,7 +2585,9 @@ fn verify_registration_receipt(
     };
     if !matches!(
         receipt.interface_version.as_str(),
-        "sinomo.dfs.cloud-files.v1" | SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+        sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V1
+            | sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+            | SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
     ) || receipt.sync_root != request.sync_root
         || receipt.root_path != request.root_path
         || receipt.provider_name != request.provider_name
@@ -2398,40 +2628,52 @@ fn recover_registration_for_mount(
     data_dir: &SinomoDataDir,
 ) -> Result<RecoveredRegistration, CloudFilesModuleError> {
     if let Some(journal) = load_registration_journal(data_dir)? {
+        validate_owned_sync_root_physical_identity_with(
+            &journal.sync_root,
+            journal.sync_root_file_id,
+            || ensure_owned_sync_root_is_plain_directory(&journal.sync_root),
+            || sync_root_file_index(&journal.sync_root),
+        )?;
         let observed = query_registered_sync_root(&journal.sync_root)?;
         if let Some(observed) = observed.as_ref() {
             verify_journal_registration_ownership(&journal, observed)?;
         }
         let receipt_result = load_registration_receipt(&registration_receipt_path(data_dir));
-        if let Ok(Some(receipt)) = receipt_result.as_ref()
-            && !journal.matches_receipt(receipt)
-        {
-            return Err(CloudFilesModuleError {
-                code: "registration-artifact-mismatch".to_string(),
-                detail: format!(
-                    "refusing recovery for {}: durable receipt and nonce journal identify different registrations",
-                    journal.sync_root.display()
-                ),
-            });
-        }
-        let receipt_verified = receipt_result
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .is_some_and(|receipt| journal.matches_receipt(receipt));
-        match journal.recovery_action(observed.is_some(), receipt_verified) {
-            RegistrationRecoveryAction::ReuseReadyRegistration => {
+        let receipt = receipt_result.as_ref().map_err(Clone::clone)?;
+        let ownership_evidence_verified =
+            journal.mount_ownership_evidence_verified(receipt.as_ref())?;
+        match journal.recovery_action(observed.is_some(), ownership_evidence_verified) {
+            RegistrationRecoveryAction::ReuseOwnedRegistration => {
                 if !journal.matches_mount_request(request) {
                     return Err(CloudFilesModuleError {
                         code: "registration-journal-mismatch".to_string(),
                         detail: format!(
-                            "ready Cloud Files registration for {} does not match requested mount {}; explicitly unregister the retained root first",
+                            "owned Cloud Files registration for {} does not match requested mount {}; explicitly unregister the retained root first",
                             journal.sync_root.display(),
                             request.sync_root.display()
                         ),
                     });
                 }
-                return Ok(RecoveredRegistration::Ready(Box::new(journal)));
+                return Ok(RecoveredRegistration::Owned {
+                    journal: Box::new(journal),
+                    registration_present: true,
+                });
+            }
+            RegistrationRecoveryAction::ReuseOwnedState => {
+                if !journal.matches_mount_request(request) {
+                    return Err(CloudFilesModuleError {
+                        code: "registration-journal-mismatch".to_string(),
+                        detail: format!(
+                            "retained Cloud Files state ownership for {} does not match requested mount {}; explicitly unregister the retained root first",
+                            journal.sync_root.display(),
+                            request.sync_root.display()
+                        ),
+                    });
+                }
+                return Ok(RecoveredRegistration::Owned {
+                    journal: Box::new(journal),
+                    registration_present: false,
+                });
             }
             RegistrationRecoveryAction::RollBackRegistration => {
                 rollback_owned_registration(data_dir, &journal)?;
@@ -2449,6 +2691,23 @@ fn recover_registration_for_mount(
     }
 
     recover_legacy_receipt_before_mount(request, data_dir)?;
+    match fs::symlink_metadata(&request.sync_root) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            // No journal, no receipt, and no physical root: the Fresh path may
+            // create the directory only after this read-only recovery pass.
+            return Ok(RecoveredRegistration::Fresh);
+        }
+        Ok(_) => {}
+        Err(source) => {
+            return Err(CloudFilesModuleError {
+                code: "sync-root-inspect".to_string(),
+                detail: format!(
+                    "inspect prospective Cloud Files sync root {}: {source}",
+                    request.sync_root.display()
+                ),
+            });
+        }
+    }
     if let Some(observed) = query_registered_sync_root(&request.sync_root)? {
         return Err(CloudFilesModuleError {
             code: "sync-root-ownership-unverifiable".to_string(),
@@ -2462,6 +2721,22 @@ fn recover_registration_for_mount(
     Ok(RecoveredRegistration::Fresh)
 }
 
+fn verify_fresh_registration_absent(
+    request: &CloudFilesMountRequest,
+) -> Result<(), CloudFilesModuleError> {
+    if let Some(observed) = query_registered_sync_root(&request.sync_root)? {
+        return Err(CloudFilesModuleError {
+            code: "sync-root-ownership-unverifiable".to_string(),
+            detail: format!(
+                "refusing Fresh activation for existing Cloud Files root {} without a matching nonce journal; observed provider `{}`",
+                request.sync_root.display(),
+                observed.provider_name
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn recover_legacy_receipt_before_mount(
     request: &CloudFilesMountRequest,
     data_dir: &SinomoDataDir,
@@ -2472,8 +2747,13 @@ fn recover_legacy_receipt_before_mount(
     };
     let observed = query_registered_sync_root(&receipt.sync_root)?;
     let Some(observed) = observed else {
-        remove_registration_receipt(&receipt_path)?;
-        return Ok(());
+        return Err(CloudFilesModuleError {
+            code: "legacy-registration-artifacts-require-cleanup".to_string(),
+            detail: format!(
+                "durable Cloud Files receipt {} remains without a nonce journal; refusing Fresh activation until explicit cleanup resolves it",
+                receipt_path.display()
+            ),
+        });
     };
     let legacy_request = CloudFilesUnregisterRequest {
         sync_root: receipt.sync_root.clone(),
@@ -2494,7 +2774,8 @@ fn recover_legacy_receipt_before_mount(
 fn recover_registration_for_unregister(
     request: &CloudFilesUnregisterRequest,
     data_dir: &SinomoDataDir,
-) -> Result<bool, CloudFilesModuleError> {
+    policy: UnregisterPolicy,
+) -> Result<RecoveredUnregister, CloudFilesModuleError> {
     if let Some(journal) = load_registration_journal(data_dir)? {
         if !journal.matches_unregister_request(request) {
             return Err(CloudFilesModuleError {
@@ -2506,10 +2787,51 @@ fn recover_registration_for_unregister(
                 ),
             });
         }
+        let ownership = match policy {
+            UnregisterPolicy::Release => RegistrationOwnershipDisposition::Release,
+            UnregisterPolicy::PreserveState => {
+                registration_ownership_disposition(data_dir, &journal)?
+            }
+        };
         let was_registered = unregister_journal_owned_registration(&journal)?;
         verify_registration_absent(&journal.sync_root)?;
-        clear_registration_artifacts(data_dir)?;
-        return Ok(was_registered);
+        match ownership {
+            RegistrationOwnershipDisposition::Release => clear_registration_artifacts(data_dir)?,
+            RegistrationOwnershipDisposition::Retain => {
+                let mut retained = journal;
+                retained.phase = RegistrationPhase::StateOwned;
+                persist_registration_journal(data_dir, &retained)?;
+            }
+        }
+        return Ok(RecoveredUnregister {
+            was_registered,
+            ownership,
+        });
+    }
+
+    if policy == UnregisterPolicy::PreserveState {
+        let receipt_path = registration_receipt_path(data_dir);
+        let receipt = load_registration_receipt(&receipt_path)?;
+        let observed = query_registered_sync_root_if_path_exists(
+            &request.sync_root,
+            query_registered_sync_root,
+        )?;
+        if receipt.is_none() && observed.is_none() {
+            // This is the only journal-free replay-safe success. A prior v3
+            // Prepared attempt may have proved there were no artifacts at all;
+            // returning Released again must not create or delete anything.
+            return Ok(RecoveredUnregister {
+                was_registered: false,
+                ownership: RegistrationOwnershipDisposition::Release,
+            });
+        }
+        return Err(CloudFilesModuleError {
+            code: "registration-journal-missing".to_string(),
+            detail: format!(
+                "refusing state-preserving unregister for {} without a nonce-bound registration journal while a receipt or CFAPI registration still exists",
+                request.sync_root.display(),
+            ),
+        });
     }
 
     let receipt_path = registration_receipt_path(data_dir);
@@ -2519,39 +2841,74 @@ fn recover_registration_for_unregister(
     }
     let Some(observed) = query_registered_sync_root(&request.sync_root)? else {
         remove_registration_receipt(&receipt_path)?;
-        return Ok(false);
+        return Ok(RecoveredUnregister {
+            was_registered: false,
+            ownership: RegistrationOwnershipDisposition::Release,
+        });
     };
     verify_registration_ownership(request, receipt.as_ref(), &observed)?;
     unregister_sync_root_after_verification(&request.sync_root)?;
     verify_registration_absent(&request.sync_root)?;
     remove_registration_receipt(&receipt_path)?;
-    Ok(true)
+    Ok(RecoveredUnregister {
+        was_registered: true,
+        ownership: RegistrationOwnershipDisposition::Release,
+    })
+}
+
+fn query_registered_sync_root_if_path_exists<F>(
+    sync_root: &Path,
+    query: F,
+) -> Result<Option<RegisteredSyncRootInfo>, CloudFilesModuleError>
+where
+    F: FnOnce(&Path) -> Result<Option<RegisteredSyncRootInfo>, CloudFilesModuleError>,
+{
+    match fs::symlink_metadata(sync_root) {
+        Ok(_) => query(sync_root),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CloudFilesModuleError {
+            code: "sync-root-inspect".to_string(),
+            detail: format!(
+                "inspect journal-free Cloud Files sync root {} before unregister replay: {source}",
+                sync_root.display()
+            ),
+        }),
+    }
 }
 
 fn prepare_registration_activation(
     request: &CloudFilesMountRequest,
     data_dir: &SinomoDataDir,
     recovered: RecoveredRegistration,
-) -> Result<RegistrationJournal, CloudFilesModuleError> {
-    let mut journal = match recovered {
+) -> Result<(RegistrationJournal, bool), CloudFilesModuleError> {
+    let (mut journal, state_owned) = match recovered {
         RecoveredRegistration::Fresh => {
             let nonce = GUID::new().map_err(|source| CloudFilesModuleError {
                 code: "registration-nonce-generate".to_string(),
                 detail: format!("generate unguessable Cloud Files registration nonce: {source}"),
             })?;
-            RegistrationJournal::prepared(
-                request,
-                CLOUD_FILES_PROVIDER_ID_TEXT,
-                format!("{:032x}", nonce.to_u128()),
-                sync_root_file_index(&request.sync_root)?,
-            )?
+            (
+                RegistrationJournal::prepared(
+                    request,
+                    CLOUD_FILES_PROVIDER_ID_TEXT,
+                    format!("{:032x}", nonce.to_u128()),
+                    sync_root_file_index(&request.sync_root)?,
+                )?,
+                false,
+            )
         }
-        RecoveredRegistration::Ready(journal) => *journal,
+        RecoveredRegistration::Owned { journal, .. } => (*journal, true),
     };
-    journal.phase = RegistrationPhase::Prepared;
+    if state_owned {
+        // A reactivation must prove health again, but never surrender the
+        // durable boundary that already owns queue/reconciliation state.
+        journal.phase = RegistrationPhase::StateOwned;
+    } else {
+        journal.phase = RegistrationPhase::Prepared;
+    }
     journal.provider_version = request.provider_version.clone();
     persist_registration_journal(data_dir, &journal)?;
-    Ok(journal)
+    Ok((journal, state_owned))
 }
 
 fn register_sync_root(
@@ -2657,6 +3014,15 @@ fn unregister_journal_owned_registration(
     Ok(true)
 }
 
+fn registration_ownership_disposition(
+    data_dir: &SinomoDataDir,
+    journal: &RegistrationJournal,
+) -> Result<RegistrationOwnershipDisposition, CloudFilesModuleError> {
+    let receipt = load_registration_receipt(&registration_receipt_path(data_dir))?;
+    let current_sync_root_file_id = sync_root_file_index(&journal.sync_root)?;
+    journal.state_preservation_disposition(receipt.as_ref(), Some(current_sync_root_file_id))
+}
+
 fn unregister_sync_root_after_verification(sync_root: &Path) -> Result<(), CloudFilesModuleError> {
     let sync_root_wide = wide_path(sync_root);
     if let Err(source) = unsafe { CfUnregisterSyncRoot(PCWSTR(sync_root_wide.as_ptr())) } {
@@ -2697,6 +3063,21 @@ fn rollback_owned_registration(
     clear_registration_artifacts(data_dir)
 }
 
+fn rollback_activation_registration(
+    data_dir: &SinomoDataDir,
+    journal: &RegistrationJournal,
+    state_owned: bool,
+) -> Result<(), CloudFilesModuleError> {
+    if !state_owned {
+        return rollback_owned_registration(data_dir, journal);
+    }
+    unregister_journal_owned_registration(journal)?;
+    verify_registration_absent(&journal.sync_root)?;
+    let mut retained = journal.clone();
+    retained.phase = RegistrationPhase::StateOwned;
+    persist_registration_journal(data_dir, &retained)
+}
+
 fn clear_registration_artifacts(data_dir: &SinomoDataDir) -> Result<(), CloudFilesModuleError> {
     let receipt_path = registration_receipt_path(data_dir);
     remove_registration_receipt(&receipt_path)?;
@@ -2731,6 +3112,7 @@ fn clear_registration_artifacts(data_dir: &SinomoDataDir) -> Result<(), CloudFil
 }
 
 fn ensure_new_sync_root_is_empty(sync_root: &Path) -> Result<(), CloudFilesModuleError> {
+    ensure_sync_root_is_plain_directory(sync_root, "new or unowned")?;
     let mut entries = fs::read_dir(sync_root).map_err(|source| CloudFilesModuleError {
         code: "sync-root-read".to_string(),
         detail: format!(
@@ -2758,20 +3140,53 @@ fn ensure_new_sync_root_is_empty(sync_root: &Path) -> Result<(), CloudFilesModul
     Ok(())
 }
 
-fn ensure_new_sync_root_state_is_pristine(
-    state: &CloudFilesWritableSyncState,
+fn ensure_owned_sync_root_is_plain_directory(
+    sync_root: &Path,
 ) -> Result<(), CloudFilesModuleError> {
-    let has_queue_history = state.queue().operations().next().is_some();
-    let reconciler = state.reconciler();
-    if has_queue_history
-        || !reconciler.manifest().is_empty()
-        || !reconciler.cursors().is_empty()
-        || reconciler.conflict_count() != 0
-    {
+    ensure_sync_root_is_plain_directory(sync_root, "owned")
+}
+
+fn validate_owned_sync_root_physical_identity_with<FPlain, FFileId>(
+    sync_root: &Path,
+    expected_file_id: u64,
+    ensure_plain: FPlain,
+    current_file_id: FFileId,
+) -> Result<(), CloudFilesModuleError>
+where
+    FPlain: FnOnce() -> Result<(), CloudFilesModuleError>,
+    FFileId: FnOnce() -> Result<u64, CloudFilesModuleError>,
+{
+    ensure_plain()?;
+    if current_file_id()? != expected_file_id {
         return Err(CloudFilesModuleError {
-            code: "unowned-sync-root-state-not-pristine".to_string(),
-            detail: "new or unowned Cloud Files activation found durable queue/manifest/cursor/conflict history; refusing to reinterpret retained state without a verified registration receipt"
-                .to_string(),
+            code: "sync-root-file-id-changed".to_string(),
+            detail: format!(
+                "refusing recovery for {} because its stable file ID changed",
+                sync_root.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn ensure_sync_root_is_plain_directory(
+    sync_root: &Path,
+    ownership: &str,
+) -> Result<(), CloudFilesModuleError> {
+    let metadata = fs::symlink_metadata(sync_root).map_err(|source| CloudFilesModuleError {
+        code: "sync-root-inspect".to_string(),
+        detail: format!(
+            "inspect {ownership} Cloud Files sync root {}: {source}",
+            sync_root.display()
+        ),
+    })?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(CloudFilesModuleError {
+            code: "unowned-sync-root-not-plain-directory".to_string(),
+            detail: format!(
+                "{ownership} Cloud Files sync root {} must be a non-reparse directory",
+                sync_root.display(),
+            ),
         });
     }
     Ok(())
@@ -3705,6 +4120,150 @@ mod tests {
         assert_eq!(error.code, "unowned-sync-root-not-empty");
         assert!(error.detail.contains("preexisting.txt"));
         let _ = fs::remove_dir_all(data_root);
+    }
+
+    #[test]
+    fn journal_free_preserve_replay_releases_a_missing_root_without_cfapi_query() {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let sync_root = std::env::temp_dir().join(format!(
+            "sinomo-cloud-files-missing-preserve-replay-{}-{suffix}",
+            std::process::id()
+        ));
+        assert!(!sync_root.exists());
+        let queried = std::cell::Cell::new(false);
+
+        let observed = query_registered_sync_root_if_path_exists(&sync_root, |_| {
+            queried.set(true);
+            Err(CloudFilesModuleError {
+                code: "unexpected-cfapi-query".to_string(),
+                detail: "missing physical root must settle before CfGetSyncRootInfoByPath"
+                    .to_string(),
+            })
+        })
+        .expect("missing journal-free root is registration-absent");
+
+        assert!(observed.is_none());
+        assert!(!queried.get());
+        assert!(!sync_root.exists());
+    }
+
+    #[test]
+    fn fresh_activation_opens_no_writable_effect_before_state_owned() {
+        #[derive(Default)]
+        struct Activation {
+            registered: bool,
+            state_owned: bool,
+        }
+
+        for failure in ["entry", "scope", "file-id"] {
+            let effects = std::cell::Cell::new(0usize);
+            let mut activation = Activation::default();
+            let error = activate_registration_before_writable_effects_with(
+                &mut activation,
+                |_| Ok(()),
+                |activation| {
+                    activation.registered = true;
+                    Ok(())
+                },
+                |_| {
+                    verify_fresh_state_owned_boundary_with(
+                        true,
+                        Path::new(r"C:\SinomoSIFS"),
+                        42,
+                        || {
+                            if failure == "entry" {
+                                Err(CloudFilesModuleError {
+                                    code: "unowned-sync-root-not-empty".to_string(),
+                                    detail: "injected entry".to_string(),
+                                })
+                            } else {
+                                Ok(())
+                            }
+                        },
+                        || Ok(failure != "scope"),
+                        || Ok(if failure == "file-id" { 43 } else { 42 }),
+                    )
+                },
+                |activation| {
+                    activation.state_owned = true;
+                    Ok(())
+                },
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("every injected Fresh race must fail closed");
+
+            assert!(activation.registered, "{failure}");
+            assert!(!activation.state_owned, "{failure}");
+            assert_eq!(effects.get(), 0, "{failure}");
+            assert!(matches!(
+                error.code.as_str(),
+                "unowned-sync-root-not-empty"
+                    | "unowned-sync-root-state-not-pristine"
+                    | "sync-root-file-id-changed"
+            ));
+        }
+
+        let effects = std::cell::Cell::new(0usize);
+        let mut activation = Activation::default();
+        activate_registration_before_writable_effects_with(
+            &mut activation,
+            |_| Ok(()),
+            |activation| {
+                activation.registered = true;
+                Ok(())
+            },
+            |_| Ok(()),
+            |activation| {
+                activation.state_owned = true;
+                Ok(())
+            },
+            || {
+                effects.set(effects.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("effects begin only after StateOwned");
+        assert!(activation.state_owned);
+        assert_eq!(effects.get(), 1);
+    }
+
+    #[test]
+    fn owned_recovery_rejects_missing_reparse_or_replaced_root_identity() {
+        let root = Path::new(r"C:\SinomoSIFS");
+        for (expected_code, plain_result, observed_file_id) in [
+            (
+                "sync-root-inspect",
+                Err(CloudFilesModuleError {
+                    code: "sync-root-inspect".to_string(),
+                    detail: "missing owned root".to_string(),
+                }),
+                42,
+            ),
+            (
+                "unowned-sync-root-not-plain-directory",
+                Err(CloudFilesModuleError {
+                    code: "unowned-sync-root-not-plain-directory".to_string(),
+                    detail: "reparse point".to_string(),
+                }),
+                42,
+            ),
+            ("sync-root-file-id-changed", Ok(()), 43),
+        ] {
+            let error = validate_owned_sync_root_physical_identity_with(
+                root,
+                42,
+                || plain_result,
+                || Ok(observed_file_id),
+            )
+            .expect_err("changed owned physical identity must block recovery");
+            assert_eq!(error.code, expected_code);
+        }
     }
 
     #[test]

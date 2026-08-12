@@ -28,7 +28,7 @@ use crate::local_change_queue::{
     CloudFilesLocalChangeQueue, CloudFilesLocalChangeQueueError, CloudFilesLocalOperation,
     CloudFilesLocalOperationKind, CloudFilesLocalOperationPreconditions,
     CloudFilesLocalOperationRequest, CloudFilesLocalOperationStatus,
-    CloudFilesRemoteMutationEvidence, CloudFilesStagedContent,
+    CloudFilesRemoteMutationEvidence, CloudFilesStagedContent, fresh_local_change_scope_is_absent,
 };
 use crate::namespace_reconciler::{
     CloudFilesLocalPathState, CloudFilesMaterializationAuditIntentStore, CloudFilesNamespaceAction,
@@ -36,7 +36,7 @@ use crate::namespace_reconciler::{
     CloudFilesNamespaceFeedBatch, CloudFilesNamespaceFeedEvent, CloudFilesNamespaceProvenance,
     CloudFilesNamespaceReconcileError, CloudFilesNamespaceReconcileProgress,
     CloudFilesNamespaceReconciler, CloudFilesNamespaceSuppression,
-    CloudFilesReconciledManifestEntry,
+    CloudFilesReconciledManifestEntry, fresh_reconciliation_scope_is_absent,
 };
 #[cfg(test)]
 use crate::sync_executor::CloudFilesLocalCompletionOutcome;
@@ -60,6 +60,20 @@ const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
 const CLOUD_FILES_MOUNT_OPEN_ERROR: &str = "cloud-files-mount-open-error";
 const CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID: &str = "cloud-files-mount-open-capture-invalid";
+
+/// Strictly read-only admission for a Fresh v3 registration. The mutable store
+/// constructors are deliberately not called until a nonce journal owns their
+/// effects. Any exact pre-existing scope is retained and fails closed.
+pub(crate) fn fresh_writable_scopes_are_absent(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+) -> Result<bool, CloudFilesWindowsSyncError> {
+    if !fresh_local_change_scope_is_absent(data_dir, mount, root).map_err(queue_error)? {
+        return Ok(false);
+    }
+    fresh_reconciliation_scope_is_absent(data_dir, mount, root).map_err(reconcile_error)
+}
 
 /// Apply the mounted-reader policy used by the production Cloud Files service.
 /// Explicit directory refresh remains handoff-wrapped, but stat/lstat must not
@@ -1945,8 +1959,8 @@ fn validate_mutation_command(command: &CloudFilesDfsMutationCommand) -> Result<(
     }
 }
 
-/// Durable queue and reconciliation state opened before any Windows sync-root
-/// registration or callback connection.
+/// Durable queue and reconciliation state opened only after the Windows layer
+/// has persisted StateOwned for this exact sync root.
 pub struct CloudFilesWritableSyncState {
     mount: String,
     root: String,

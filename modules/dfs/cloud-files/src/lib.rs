@@ -17,7 +17,10 @@ use sinomo_dfs_cloud_files_api::{
 use sinomo_dfs_cloud_files_api::{
     CloudFilesModuleError, CloudFilesModuleRequest, CloudFilesModuleResponse,
     SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-    SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION, SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+    SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+    SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+    SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+    SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
 };
 use sinomo_module_api::{
     NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
@@ -274,9 +277,11 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
         supported_operations: vec![
             SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION.to_string(),
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string(),
         ],
         capabilities: vec![
             "dfs.sifs.cloud-files.unregister-sync-root".to_string(),
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY.to_string(),
             "dfs.sifs.cloud-files.lifecycle-status".to_string(),
             "dfs.sifs.cloud-files.writable-sync-v2".to_string(),
         ],
@@ -306,6 +311,7 @@ fn invoke_unchecked(
 fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
     if request.operation != SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION
         && request.operation != SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+        && request.operation != SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
     {
         return NativeModuleResponse::Error(native_error_response(
             "unsupported-operation",
@@ -336,6 +342,13 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
             CloudFilesModuleRequest::Unregister(request),
         ) => match unregister_sifs_cloud_files(request) {
             Ok(response) => CloudFilesModuleResponse::Unregistered(response),
+            Err(error) => CloudFilesModuleResponse::Error(error),
+        },
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudFilesModuleRequest::PreserveStateUnregister(request),
+        ) => match unregister_sifs_cloud_files_preserving_state(request) {
+            Ok(response) => CloudFilesModuleResponse::StatePreservingUnregistered(response),
             Err(error) => CloudFilesModuleResponse::Error(error),
         },
         _ => CloudFilesModuleResponse::Error(CloudFilesModuleError {
@@ -373,6 +386,16 @@ fn unregister_sifs_cloud_files(
     windows_impl::unregister_sifs_cloud_files(request)
 }
 
+#[cfg(windows)]
+fn unregister_sifs_cloud_files_preserving_state(
+    request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
+) -> Result<
+    sinomo_dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse,
+    CloudFilesModuleError,
+> {
+    windows_impl::unregister_sifs_cloud_files_preserving_state(request)
+}
+
 #[cfg(not(windows))]
 fn mount_sifs_cloud_files(
     request: sinomo_dfs_cloud_files_api::CloudFilesMountRequest,
@@ -388,6 +411,19 @@ fn mount_sifs_cloud_files(
 fn unregister_sifs_cloud_files(
     _request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
 ) -> Result<sinomo_dfs_cloud_files_api::CloudFilesUnregisterResponse, CloudFilesModuleError> {
+    Err(CloudFilesModuleError {
+        code: "unsupported-platform".to_string(),
+        detail: "Windows Cloud Files support is only available in Windows builds".to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn unregister_sifs_cloud_files_preserving_state(
+    _request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
+) -> Result<
+    sinomo_dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse,
+    CloudFilesModuleError,
+> {
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files support is only available in Windows builds".to_string(),
@@ -536,8 +572,18 @@ mod tests {
         );
         assert!(
             descriptor
+                .supported_operations
+                .contains(&SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string())
+        );
+        assert!(
+            descriptor
                 .capabilities
                 .contains(&"dfs.sifs.cloud-files.unregister-sync-root".to_string())
+        );
+        assert!(
+            descriptor
+                .capabilities
+                .contains(&SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY.to_string())
         );
         assert!(
             descriptor
@@ -559,6 +605,49 @@ mod tests {
                 .capabilities
                 .contains(&"dfs.sifs.write".to_string())
         );
+    }
+
+    #[test]
+    fn operation_payload_cross_pairs_fail_before_platform_dispatch() {
+        let mount = CloudFilesModuleRequest::Mount(
+            sinomo_dfs_cloud_files_api::CloudFilesMountRequest::new("C:\\SinomoSIFS"),
+        );
+        let unregister_request =
+            sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest::new("C:\\SinomoSIFS");
+        let unregister = CloudFilesModuleRequest::Unregister(unregister_request.clone());
+        let preserve = CloudFilesModuleRequest::PreserveStateUnregister(unregister_request);
+        let cases = [
+            (SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION, unregister.clone()),
+            (SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION, preserve.clone()),
+            (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, mount.clone()),
+            (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, preserve),
+            (
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+                mount,
+            ),
+            (
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+                unregister,
+            ),
+        ];
+
+        for (operation, payload) in cases {
+            let response = invoke_cloud_files_operation(NativeModuleInvocationRequest {
+                operation: operation.to_string(),
+                payload_sobj: encode_sobj(&payload).expect("encode mismatched request"),
+                request_body: None,
+                response_body_path: None,
+            });
+            let NativeModuleResponse::Invocation(response) = response else {
+                panic!("mismatched typed payload should return an invocation response");
+            };
+            let decoded = decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
+                .expect("decode mismatch response");
+            let CloudFilesModuleResponse::Error(error) = decoded else {
+                panic!("cross-paired operation and payload must be rejected");
+            };
+            assert_eq!(error.code, "operation-payload-mismatch");
+        }
     }
 
     #[test]

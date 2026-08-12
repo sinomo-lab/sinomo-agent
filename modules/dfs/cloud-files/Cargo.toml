@@ -13,7 +13,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.dfs.cloud-files"
-interface-version = "sinomo.dfs.cloud-files.v2"
+interface-version = "sinomo.dfs.cloud-files.v3"
 cache-key = "module/dfs/cloud-files"
 source = "rollout:modules/dfs/cloud-files"
 platforms = ["windows"]

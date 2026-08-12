@@ -2321,6 +2321,34 @@ impl CloudFilesNamespaceReconciler {
     }
 }
 
+/// Read-only Fresh-activation admission check. Opening this scope can create
+/// state, remove abandoned stages, repair journals, or migrate legacy
+/// manifests, so v3 first proves the exact mount/root directory does not exist
+/// and establishes ownership before calling `open`.
+pub(crate) fn fresh_reconciliation_scope_is_absent(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    if mount.trim().is_empty() {
+        return Err(reconcile_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(root)?;
+    let scope = data_dir
+        .module_runtime_dir()
+        .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(RECONCILIATION_DIR)
+        .join(mount_scope_directory(mount, &root)?);
+    match fs::symlink_metadata(&scope) {
+        Ok(_) => Ok(false),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(source) => Err(io_error("inspect namespace reconciliation scope")(source)),
+    }
+}
+
 fn suppression_action_matches_manifest(
     action: &CloudFilesNamespaceAction,
     manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
@@ -2982,6 +3010,35 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn fresh_scope_probe_is_read_only_and_rejects_even_an_empty_scope() {
+        let root = TestRoot::new("fresh-scope-probe");
+        let data_dir = root.data_dir();
+        let reconciliation_root = data_dir
+            .module_runtime_dir()
+            .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .join(RECONCILIATION_DIR);
+
+        assert!(
+            fresh_reconciliation_scope_is_absent(&data_dir, "mount-a", "/services")
+                .expect("probe absent scope")
+        );
+        assert!(
+            !reconciliation_root.exists(),
+            "read-only Fresh admission must not create reconciliation directories"
+        );
+
+        let scope = reconciliation_root.join(
+            mount_scope_directory("mount-a", "/services").expect("exact reconciliation scope name"),
+        );
+        fs::create_dir_all(&scope).expect("empty retained reconciliation scope");
+        assert!(
+            !fresh_reconciliation_scope_is_absent(&data_dir, "mount-a", "/services")
+                .expect("probe retained scope")
+        );
+        assert!(scope.exists(), "probe must retain existing evidence");
     }
 
     #[derive(Default)]

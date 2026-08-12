@@ -9,10 +9,20 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub const SINOMO_DFS_CLOUD_FILES_MODULE_ID: &str = "module.dfs.cloud-files";
-pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION: &str = "sinomo.dfs.cloud-files.v2";
+pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_V1: &str = "sinomo.dfs.cloud-files.v1";
+pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_V2: &str = "sinomo.dfs.cloud-files.v2";
+pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION: &str = "sinomo.dfs.cloud-files.v3";
 pub const SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME: &str = "Sinomo SIFS";
 pub const SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION: &str = "sifs.cloud-files.mount";
 pub const SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION: &str = "sifs.cloud-files.unregister";
+/// v3-only operation which unregisters CFAPI while retaining exact durable
+/// ownership of the same mount/root state. Keeping this distinct from the
+/// legacy unregister operation prevents a v2 provider from silently decoding
+/// an unknown serde field and destructively releasing retained state.
+pub const SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION: &str =
+    "sifs.cloud-files.unregister-preserve-state";
+pub const SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY: &str =
+    "dfs.sifs.cloud-files.unregister-preserve-state";
 pub const CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE: &str = "writable-sync-unsupported";
 pub const CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE: &str =
     "writable-sync-contract-not-ready";
@@ -596,6 +606,7 @@ impl CloudFilesMountLifecycleEvent {
 pub enum CloudFilesModuleRequest {
     Mount(CloudFilesMountRequest),
     Unregister(CloudFilesUnregisterRequest),
+    PreserveStateUnregister(CloudFilesUnregisterRequest),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -625,10 +636,24 @@ impl CloudFilesUnregisterRequest {
 /// runtime directory before exposing a persistent registration.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CloudFilesRegistrationReceipt {
+    /// Interface of the exact native provider which owns cleanup/recovery.
     pub interface_version: String,
+    /// Interface encoded into the nonce-bound CFAPI registration identity.
+    /// Absent legacy data defaults to `interface_version`. A v3 provider which
+    /// adopts an exact v2 identity records v2 here without rewriting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_identity_interface_version: Option<String>,
     pub sync_root: PathBuf,
     pub root_path: String,
     pub provider_name: String,
+}
+
+impl CloudFilesRegistrationReceipt {
+    pub fn registration_identity_interface_version(&self) -> &str {
+        self.registration_identity_interface_version
+            .as_deref()
+            .unwrap_or(&self.interface_version)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -697,6 +722,7 @@ impl CloudFilesMountRequest {
 pub enum CloudFilesModuleResponse {
     Mounted(CloudFilesMountResponse),
     Unregistered(CloudFilesUnregisterResponse),
+    StatePreservingUnregistered(CloudFilesPreserveStateUnregisterResponse),
     Error(CloudFilesModuleError),
 }
 
@@ -717,6 +743,29 @@ pub struct CloudFilesUnregisterResponse {
     /// intentionally idempotent for restart-safe disable/path-change cleanup.
     pub was_registered: bool,
     pub detail: String,
+}
+
+/// v3-only success response for the distinct state-preserving unregister
+/// operation. The typed variant itself is the retention claim: it is emitted
+/// only after exact journal/file-ID verification, CFAPI absence, and durable
+/// normalization to an owned-absent phase.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesPreserveStateUnregisterResponse {
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub was_registered: bool,
+    pub outcome: CloudFilesPreserveStateUnregisterOutcome,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CloudFilesPreserveStateUnregisterOutcome {
+    /// Exact durable state ownership remains and CFAPI absence was verified.
+    Retained,
+    /// No writable state could have been created, so registration artifacts
+    /// were safely released instead of manufacturing ownership.
+    Released,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1017,5 +1066,22 @@ mod tests {
             detail: "already unregistered".to_string(),
         };
         assert!(!response.was_registered);
+    }
+
+    #[test]
+    fn preserved_unregister_is_a_distinct_v3_operation_and_typed_response() {
+        assert_eq!(
+            SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            "sinomo.dfs.cloud-files.v3"
+        );
+        assert_ne!(
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+        );
+        let request = CloudFilesUnregisterRequest::new("C:\\SinomoSIFS");
+        assert_eq!(
+            CloudFilesModuleRequest::PreserveStateUnregister(request.clone()),
+            CloudFilesModuleRequest::PreserveStateUnregister(request)
+        );
     }
 }

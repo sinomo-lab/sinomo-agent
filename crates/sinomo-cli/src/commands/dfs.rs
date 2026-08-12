@@ -2510,6 +2510,13 @@ pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliE
 }
 
 fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliError> {
+    #[cfg(windows)]
+    if options.foreground {
+        return Err(CliError::Parse {
+            detail: "Windows Cloud Files foreground mounts are unsupported because only the managed supervisor durably pins registration ownership and state-preserving cleanup; use `sinomo dfs mount --background ...` with the main daemon"
+                .to_string(),
+        });
+    }
     let data_dir = match options.data_dir.clone() {
         Some(path) => SinomoDataDir::new(path),
         None => SinomoDataDir::from_env_or_home()?,
@@ -2547,7 +2554,7 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
             .map_err(|detail| CliError::Parse { detail })?;
     #[cfg(windows)]
     {
-        run_dfs_cloud_files_mount_command(options)
+        unreachable!("Windows foreground mounts are rejected before data-dir or lease effects")
     }
     #[cfg(all(not(windows), feature = "dfs-fuse"))]
     {
@@ -2613,6 +2620,7 @@ mod dfs_mount_tests {
         query_live_dfs_mount_status, run_dfs_mount_command,
     };
     use sinomo_runtime::dfs::{SifsMountConfig, SifsMountRuntimePhase, SifsMountRuntimeStatus};
+    #[cfg(not(windows))]
     use sinomo_runtime::local::SinomoDataDir;
 
     struct FakeMountSupervisorControl {
@@ -2720,6 +2728,7 @@ mod dfs_mount_tests {
         assert_eq!(control.config_writes.borrow().as_slice(), &[expected]);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn foreground_mount_is_rejected_before_platform_side_effect_when_lease_is_owned() {
         let temp = sinomo_testdir::TestDir::new("sinomo-cli-foreground-mount-lease");
@@ -2752,135 +2761,34 @@ mod dfs_mount_tests {
             "lease rejection must happen before the platform mount creates its mount point"
         );
     }
-}
 
-#[cfg(windows)]
-fn run_dfs_cloud_files_mount_command(options: DfsHostMountOptions) -> Result<(), CliError> {
-    use sinomo_runtime::dfs_cloud_files_api::{
-        CloudFilesModuleRequest, CloudFilesModuleResponse, CloudFilesMountRequest,
-        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-    };
-    use sinomo_runtime::module::{
-        ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
-    };
-    use sinomo_runtime::module_api::{
-        NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
-        encode_sobj,
-    };
+    #[cfg(windows)]
+    #[test]
+    fn windows_foreground_mount_is_rejected_before_data_or_mount_effects() {
+        let temp = sinomo_testdir::TestDir::new("sinomo-cli-windows-foreground-rejected");
+        let data_root = temp.path().join("missing-parent").join("data");
+        let mount_point = temp.path().join("mount");
 
-    if options.allow_other {
-        return Err(CliError::Parse {
-            detail: "`--allow-other` is only supported by the Unix FUSE backend".to_string(),
-        });
-    }
-    let data_dir = match options.data_dir.clone() {
-        Some(path) => SinomoDataDir::new(path),
-        None => SinomoDataDir::from_env_or_home()?,
-    };
-    data_dir.ensure_root_layout()?;
-    let data_dir_root = data_dir.root();
-    let module_id =
-        ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID).map_err(|source| {
-            CliError::Parse {
-                detail: format!("invalid Cloud Files module id: {source}"),
-            }
-        })?;
-    let state = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
-        .map_err(|source| CliError::Parse {
-            detail: format!("read Cloud Files native module loader state: {source}"),
-        })?
-        .ok_or_else(|| CliError::Parse {
-            detail: format!(
-                "Cloud Files native module is not active; run `sinomo install` or activate `{SINOMO_DFS_CLOUD_FILES_MODULE_ID}`"
-            ),
-        })?;
-    if state.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
-        return Err(CliError::Parse {
-            detail: format!(
-                "Cloud Files native module interface mismatch: expected {}, got {}",
-                SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, state.interface_version
-            ),
-        });
-    }
-    let library_path = native_module_cache_path(
-        &data_dir_root,
-        &state.cache_key,
-        &state.content_hash,
-        &state.library_name,
-    );
-    let module = unsafe {
-        NativeModule::load_process_resident_from_content_addressed_path(
-            &library_path,
-            &state.content_hash,
-        )
-    }
-    .map_err(|source| CliError::Parse {
-        detail: format!("load Cloud Files native module: {source}"),
-    })?;
-    let request = CloudFilesMountRequest {
-        sync_root: options.mount_point,
-        root_path: options.root_path,
-        data_dir_root: Some(data_dir_root),
-        read_only: options.read_only,
-        sync_local_changes: options.sync_local_changes,
-        provider_name: "Sinomo SIFS".to_string(),
-        provider_version: env!("CARGO_PKG_VERSION").to_string(),
-        prepopulate_depth: 0,
-        connect: options.foreground,
-        max_run_seconds: None,
-    };
-    let payload_sobj = encode_sobj(&CloudFilesModuleRequest::Mount(request)).map_err(|source| {
-        CliError::Parse {
-            detail: format!("encode Cloud Files mount request: {source}"),
-        }
-    })?;
-    let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
-        operation: SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
-        payload_sobj,
-        request_body: None,
-        response_body_path: None,
-    });
-    match module
-        .invoke(&native_request)
-        .map_err(|source| CliError::Parse {
-            detail: format!("invoke Cloud Files native module: {source}"),
-        })? {
-        NativeModuleResponse::Invocation(response)
-            if response.operation == SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION =>
-        {
-            match decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj).map_err(
-                |source| CliError::Parse {
-                    detail: format!("decode Cloud Files mount response: {source}"),
-                },
-            )? {
-                CloudFilesModuleResponse::Mounted(response) => {
-                    println!(
-                        "SIFS Cloud Files sync root {} -> {} ({})",
-                        response.sync_root.display(),
-                        response.root_path,
-                        response.detail
-                    );
-                    Ok(())
-                }
-                CloudFilesModuleResponse::Unregistered(response) => Err(CliError::Parse {
-                    detail: format!(
-                        "Cloud Files mount returned an unexpected unregister response for {}: {}",
-                        response.sync_root.display(),
-                        response.detail
-                    ),
-                }),
-                CloudFilesModuleResponse::Error(error) => Err(CliError::Parse {
-                    detail: format!("Cloud Files mount failed: {}: {}", error.code, error.detail),
-                }),
-            }
-        }
-        NativeModuleResponse::Error(error) => Err(CliError::Parse {
-            detail: format!("Cloud Files mount failed: {}: {}", error.code, error.detail),
-        }),
-        other => Err(CliError::Parse {
-            detail: format!("unexpected Cloud Files native module response: {other:?}"),
-        }),
+        let error = run_dfs_mount_command(DfsMountOptions::Mount(DfsHostMountOptions {
+            mount_point: mount_point.clone(),
+            root_path: "/".to_string(),
+            data_dir: Some(data_root.clone()),
+            read_only: false,
+            allow_other: false,
+            foreground: true,
+            sync_local_changes: true,
+        }))
+        .expect_err("Windows foreground mount must delegate to the managed supervisor");
+
+        assert!(error.to_string().contains("managed supervisor"));
+        assert!(
+            !data_root.exists(),
+            "rejection must precede data-dir creation"
+        );
+        assert!(
+            !mount_point.exists(),
+            "rejection must precede root creation"
+        );
     }
 }
 

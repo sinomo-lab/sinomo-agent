@@ -38,9 +38,11 @@ const MOUNT_START_RETRY_MAX: Duration = Duration::from_secs(30);
 #[cfg(any(windows, test))]
 const PENDING_CLOUD_UNREGISTER_FILE: &str = "cloud-files-unregister.pending.sobj";
 #[cfg(any(windows, test))]
-const PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION: u16 = 1;
+const PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION: u16 = 2;
 #[cfg(any(windows, test))]
 const STAGED_CLOUD_REGISTRATION_FILE: &str = "cloud-files-registration.staged.sobj";
+#[cfg(any(windows, test))]
+const STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION: u16 = 3;
 #[cfg(any(windows, test))]
 const CLOUD_UNREGISTER_RECOVERY_DIR: &str = "cloud-files-unregister-recovery";
 #[cfg(any(windows, test))]
@@ -94,7 +96,7 @@ enum MountRetirementReason {
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 impl MountRetirementReason {
     fn requires_cloud_unregister(self) -> bool {
-        matches!(self, Self::ExplicitDisable | Self::RegistrationReplacement)
+        self == Self::ExplicitDisable
     }
 }
 
@@ -126,6 +128,27 @@ struct PendingCloudUnregisterRecord {
     operation: String,
     payload_sobj: Vec<u8>,
     module: CloudFilesModuleProvenance,
+    /// Exact deployed-v2 provider which may have created writable state before
+    /// its registration journal. A preserve replay carrying this origin may
+    /// settle only with a typed Retained outcome from the exact v3 provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    legacy_prejournal_origin: Option<CloudFilesModuleProvenance>,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum StagedCloudRegistrationState {
+    MayBeRegistered,
+    RetainedAbsent,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StagedCloudRegistrationRecord {
+    schema_version: u16,
+    state: StagedCloudRegistrationState,
+    recovery: PendingCloudUnregisterRecord,
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -184,6 +207,7 @@ fn pending_unregister_for_transition(reason: MountRetirementReason) -> bool {
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn drive_pending_cloud_unregister_with<F>(
     pending: &mut Option<PendingCloudUnregister>,
     now: Instant,
@@ -233,6 +257,30 @@ where
     drive_pending_cloud_unregister_with(pending, now, unregister)
 }
 
+fn stop_after_failed_cloud_retirement_preparation_with<FStop, FUnregister, FStart>(
+    preparation_error: String,
+    stop: FStop,
+    unregister: FUnregister,
+    start_replacement: FStart,
+) -> Result<(), String>
+where
+    FStop: FnOnce() -> Result<(), String>,
+    FUnregister: FnOnce() -> Result<(), String>,
+    FStart: FnOnce() -> Result<(), String>,
+{
+    // Keep forbidden effects owned by this ordering seam so callers cannot
+    // accidentally run them while handling a preparation failure.
+    let _forbidden_effects = (unregister, start_replacement);
+    match stop() {
+        Ok(()) => Err(format!(
+            "{preparation_error}; the active Cloud Files provider was stopped and all registration ownership evidence remains pinned"
+        )),
+        Err(stop_error) => Err(format!(
+            "{preparation_error}; additionally failed to stop the active Cloud Files provider: {stop_error}"
+        )),
+    }
+}
+
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 fn cloud_unregister_request(
     data_dir: &SinomoDataDir,
@@ -248,25 +296,323 @@ fn cloud_unregister_request(
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloudUnregisterPolicy {
+    Release,
+    PreserveState,
+}
+
+#[cfg(any(windows, test))]
+fn provider_supports_state_preserving_unregister(
+    interface_version: &str,
+    supported_operations: &[String],
+    capabilities: &[String],
+) -> bool {
+    interface_version
+        == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+        && supported_operations.iter().any(|operation| {
+            operation
+                == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        })
+        && capabilities.iter().any(|capability| {
+            capability
+                == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY
+        })
+}
+
+#[cfg(any(windows, test))]
+fn admit_cloud_files_provider_before_effect_with<R, FEffect>(
+    provenance: &CloudFilesModuleProvenance,
+    descriptor: &sinomo_runtime::module_api::NativeModuleDescriptor,
+    required_operation: &str,
+    require_preserve_capability: bool,
+    effect: FEffect,
+) -> Result<R, String>
+where
+    FEffect: FnOnce() -> Result<R, String>,
+{
+    validate_cloud_files_provider_descriptor(provenance, descriptor, required_operation)?;
+    if require_preserve_capability
+        && !provider_supports_state_preserving_unregister(
+            &descriptor.interface_version,
+            &descriptor.supported_operations,
+            &descriptor.capabilities,
+        )
+    {
+        return Err(
+            "Cloud Files provider lacks the required v3 preserve-state capability".to_string(),
+        );
+    }
+    effect()
+}
+
+#[cfg(any(windows, test))]
+fn validate_cloud_files_provider_descriptor(
+    provenance: &CloudFilesModuleProvenance,
+    descriptor: &sinomo_runtime::module_api::NativeModuleDescriptor,
+    required_operation: &str,
+) -> Result<(), String> {
+    use sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
+    use sinomo_runtime::module::ModuleId;
+    use sinomo_runtime::module_api::NativeModuleBackend;
+
+    let descriptor_module_id = ModuleId::from_legacy_named(&descriptor.module_id)
+        .map_err(|error| format!("invalid loaded Cloud Files descriptor module id: {error}"))?;
+
+    if descriptor.module_id != SINOMO_DFS_CLOUD_FILES_MODULE_ID
+        || descriptor_module_id != provenance.module_id
+        || descriptor.backend != NativeModuleBackend::NativeDylib
+        || descriptor.interface_version != provenance.interface_version
+        || descriptor.native_abi_version != provenance.native_abi_version
+        || descriptor.platform_triple != provenance.platform_triple
+    {
+        return Err(format!(
+            "loaded Cloud Files descriptor does not match durable provenance: descriptor {} / {} / ABI {} / {}, provenance {} / {} / ABI {} / {}",
+            descriptor.module_id,
+            descriptor.interface_version,
+            descriptor.native_abi_version,
+            descriptor.platform_triple,
+            provenance.module_id,
+            provenance.interface_version,
+            provenance.native_abi_version,
+            provenance.platform_triple,
+        ));
+    }
+    if !descriptor
+        .supported_operations
+        .iter()
+        .any(|operation| operation == required_operation)
+    {
+        return Err(format!(
+            "Cloud Files provider {} does not advertise required operation {}",
+            descriptor.interface_version, required_operation
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn pending_cloud_unregister_record_with_policy(
+    request: sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest,
+    module: CloudFilesModuleProvenance,
+    policy: CloudUnregisterPolicy,
+) -> Result<PendingCloudUnregisterRecord, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+    };
+    if policy == CloudUnregisterPolicy::PreserveState
+        && module.interface_version
+            != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+    {
+        return Err(format!(
+            "Cloud Files provider interface {} does not support state-preserving unregister",
+            module.interface_version
+        ));
+    }
+    let (operation, payload) = match policy {
+        CloudUnregisterPolicy::Release => (
+            SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+            CloudFilesModuleRequest::Unregister(request.clone()),
+        ),
+        CloudUnregisterPolicy::PreserveState => (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudFilesModuleRequest::PreserveStateUnregister(request.clone()),
+        ),
+    };
+    let payload_sobj = sinomo_runtime::module_api::encode_sobj(&payload)
+        .map_err(|error| format!("encode durable Cloud Files unregister descriptor: {error}"))?;
+    Ok(PendingCloudUnregisterRecord {
+        schema_version: PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION,
+        request,
+        operation: operation.to_string(),
+        payload_sobj,
+        module,
+        legacy_prejournal_origin: None,
+    })
+}
+
+#[cfg(any(windows, test))]
 fn pending_cloud_unregister_record(
     request: sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest,
     module: CloudFilesModuleProvenance,
 ) -> Result<PendingCloudUnregisterRecord, String> {
-    use sinomo_runtime::dfs_cloud_files_api::{
-        CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
-    };
+    pending_cloud_unregister_record_with_policy(request, module, CloudUnregisterPolicy::Release)
+}
 
-    let payload_sobj = sinomo_runtime::module_api::encode_sobj(
-        &CloudFilesModuleRequest::Unregister(request.clone()),
-    )
-    .map_err(|error| format!("encode durable Cloud Files unregister descriptor: {error}"))?;
-    Ok(PendingCloudUnregisterRecord {
-        schema_version: PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION,
-        request,
-        operation: SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION.to_string(),
-        payload_sobj,
-        module,
+#[cfg(any(windows, test))]
+fn same_cloud_registration_recovery_identity(
+    left: &PendingCloudUnregisterRecord,
+    right: &PendingCloudUnregisterRecord,
+) -> bool {
+    same_cloud_registration_base_identity(left, right)
+        && left.module == right.module
+        && left.legacy_prejournal_origin == right.legacy_prejournal_origin
+}
+
+#[cfg(any(windows, test))]
+fn same_cloud_registration_base_identity(
+    left: &PendingCloudUnregisterRecord,
+    right: &PendingCloudUnregisterRecord,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.request.sync_root == right.request.sync_root
+        && left.request.root_path == right.request.root_path
+        && left.request.data_dir_root == right.request.data_dir_root
+        && left.request.provider_name == right.request.provider_name
+}
+
+#[cfg(any(windows, test))]
+fn policy_neutral_cloud_registration_recovery(
+    record: &PendingCloudUnregisterRecord,
+) -> Result<PendingCloudUnregisterRecord, String> {
+    let mut normalized = pending_cloud_unregister_record_with_policy(
+        record.request.clone(),
+        record.module.clone(),
+        CloudUnregisterPolicy::Release,
+    )?;
+    normalized.legacy_prejournal_origin = record.legacy_prejournal_origin.clone();
+    Ok(normalized)
+}
+
+#[cfg(any(windows, test))]
+fn staged_cloud_registration_record(
+    recovery: &PendingCloudUnregisterRecord,
+    state: StagedCloudRegistrationState,
+) -> Result<StagedCloudRegistrationRecord, String> {
+    Ok(StagedCloudRegistrationRecord {
+        schema_version: STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION,
+        state,
+        recovery: policy_neutral_cloud_registration_recovery(recovery)?,
     })
+}
+
+#[cfg(any(windows, test))]
+fn staged_state_after_unregister_response(
+    record: &PendingCloudUnregisterRecord,
+    _staged: &StagedCloudRegistrationRecord,
+    response: &CloudUnregisterCompletion,
+) -> Result<Option<StagedCloudRegistrationState>, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesPreserveStateUnregisterOutcome,
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+    };
+    match (record.operation.as_str(), response) {
+        (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, CloudUnregisterCompletion::Released(_)) => {
+            Ok(None)
+        }
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudUnregisterCompletion::StatePreserved(response),
+        ) if response.outcome == CloudFilesPreserveStateUnregisterOutcome::Retained => {
+            Ok(Some(StagedCloudRegistrationState::RetainedAbsent))
+        }
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudUnregisterCompletion::StatePreserved(response),
+        ) if response.outcome == CloudFilesPreserveStateUnregisterOutcome::Released
+            && record.legacy_prejournal_origin.is_some() =>
+        {
+            Err("legacy Cloud Files pre-journal risk cannot accept a Released preserve response; exact stage, provider, and pending intent remain pinned"
+                .to_string())
+        }
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudUnregisterCompletion::StatePreserved(_),
+        ) => Ok(None),
+        _ => Err("Cloud Files unregister operation and typed response do not match".to_string()),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn finalize_cloud_unregister_completion_with<F>(
+    data_dir: &SinomoDataDir,
+    pending: &PendingCloudUnregisterRecord,
+    staged: &StagedCloudRegistrationRecord,
+    response: &CloudUnregisterCompletion,
+    after_first_durable_step: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    if !same_cloud_registration_recovery_identity(&staged.recovery, pending) {
+        return Err(
+            "pending Cloud Files unregister no longer matches its staged ownership identity"
+                .to_string(),
+        );
+    }
+    let next_state = staged_state_after_unregister_response(pending, staged, response)?;
+    if next_state == Some(StagedCloudRegistrationState::RetainedAbsent) {
+        let mut retained = staged_cloud_registration_record(
+            pending,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )?;
+        // A typed Retained response proves that the module found or normalized
+        // its exact journal to StateOwned. Legacy pre-journal ambiguity is now
+        // discharged; the original v2 provider is no longer cleanup authority.
+        retained.recovery.legacy_prejournal_origin = None;
+        replace_staged_cloud_registration_record(data_dir, staged, &retained)?;
+        after_first_durable_step()?;
+        clear_pending_cloud_unregister_record(data_dir, pending)?;
+        remove_discharged_legacy_recovery_module(data_dir, pending);
+    } else {
+        // Released is replay-idempotent only because the module proved journal,
+        // receipt, and CFAPI absence. Clear pending first: a crash then leaves a
+        // staged MayBeRegistered record which safely reconstructs the attempt.
+        clear_pending_cloud_unregister_record(data_dir, pending)?;
+        after_first_durable_step()?;
+        clear_staged_cloud_registration_record(data_dir, pending)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn remove_discharged_legacy_recovery_module(
+    data_dir: &SinomoDataDir,
+    record: &PendingCloudUnregisterRecord,
+) {
+    let Some(origin) = record.legacy_prejournal_origin.as_ref() else {
+        return;
+    };
+    if origin == &record.module {
+        return;
+    }
+    if let Err(error) = remove_cloud_unregister_recovery_module(data_dir, origin) {
+        tracing::warn!(
+            "Cloud Files retained-state transition completed but its discharged legacy provider could not be removed: {error}"
+        );
+    }
+}
+
+#[cfg(any(windows, test))]
+fn finish_already_applied_retained_completion(
+    data_dir: &SinomoDataDir,
+    pending: &PendingCloudUnregisterRecord,
+    staged: &StagedCloudRegistrationRecord,
+) -> Result<bool, String> {
+    if staged.state != StagedCloudRegistrationState::RetainedAbsent
+        || staged.recovery.legacy_prejournal_origin.is_some()
+        || pending.legacy_prejournal_origin.is_none()
+        || !same_cloud_registration_base_identity(&staged.recovery, pending)
+        || staged.recovery.module != pending.module
+        || pending.operation
+            != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+    {
+        return Ok(false);
+    }
+    // Crash after fsyncing the typed Retained transition but before clearing
+    // the pending intent. RetainedAbsent is the durable completion proof.
+    clear_pending_cloud_unregister_record(data_dir, pending)?;
+    remove_discharged_legacy_recovery_module(data_dir, pending);
+    Ok(true)
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CloudUnregisterCompletion {
+    Released(sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterResponse),
+    StatePreserved(sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse),
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -498,55 +844,6 @@ fn persist_recovery_file_if_absent(
 }
 
 #[cfg(windows)]
-fn staged_cloud_unregister_provenances(
-    data_dir: &SinomoDataDir,
-) -> Result<Vec<CloudFilesModuleProvenance>, String> {
-    let root = data_dir.dfs_dir().join(CLOUD_UNREGISTER_RECOVERY_DIR);
-    let entries = match std::fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "read Cloud Files unregister recovery directory {}: {error}",
-                root.display()
-            ));
-        }
-    };
-    let mut provenances = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            format!(
-                "read Cloud Files unregister recovery entry under {}: {error}",
-                root.display()
-            )
-        })?;
-        let path = entry.path().join(CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE);
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(provenance) =
-            sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleProvenance>(&bytes)
-        else {
-            tracing::warn!(
-                "ignored malformed staged Cloud Files cleanup provenance {}",
-                path.display()
-            );
-            continue;
-        };
-        match verify_cloud_unregister_recovery_module(data_dir, &provenance) {
-            Ok(_) => provenances.push(provenance),
-            Err(error) => tracing::warn!("ignored invalid staged Cloud Files provider: {error}"),
-        }
-    }
-    provenances.sort_by(|left, right| {
-        left.interface_version
-            .cmp(&right.interface_version)
-            .then(left.content_hash.cmp(&right.content_hash))
-    });
-    Ok(provenances)
-}
-
-#[cfg(windows)]
 fn ensure_cloud_unregister_recovery_module(
     data_dir: &SinomoDataDir,
     provenance: &CloudFilesModuleProvenance,
@@ -621,8 +918,19 @@ fn validate_pending_cloud_unregister_record(
     data_dir: &SinomoDataDir,
     record: &PendingCloudUnregisterRecord,
 ) -> Result<(), String> {
+    validate_cloud_unregister_record(data_dir, record, false)
+}
+
+#[cfg(any(windows, test))]
+fn validate_cloud_unregister_record(
+    data_dir: &SinomoDataDir,
+    record: &PendingCloudUnregisterRecord,
+    allow_policy_neutral_legacy_origin: bool,
+) -> Result<(), String> {
     use sinomo_runtime::dfs_cloud_files_api::{
-        CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+        SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
         SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
     };
     use sinomo_runtime::module::ModuleId;
@@ -633,11 +941,24 @@ fn validate_pending_cloud_unregister_record(
             record.schema_version, PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION
         ));
     }
-    if record.operation != SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION {
+    if !matches!(
+        record.operation.as_str(),
+        SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+            | SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+    ) {
         return Err(format!(
             "pending Cloud Files unregister operation mismatch: expected {}, got {}",
             SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, record.operation
         ));
+    }
+    if record.legacy_prejournal_origin.is_some()
+        && !allow_policy_neutral_legacy_origin
+        && record.operation != SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+    {
+        return Err(
+            "pending Cloud Files unregister with legacy pre-journal origin must use the distinct v3 preserve-state operation"
+                .to_string(),
+        );
     }
     let expected_module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
         .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
@@ -657,18 +978,65 @@ fn validate_pending_cloud_unregister_record(
             data_dir.root().display()
         ));
     }
-    match sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleRequest>(&record.payload_sobj)
-        .map_err(|error| format!("decode durable Cloud Files unregister descriptor: {error}"))?
-    {
-        CloudFilesModuleRequest::Unregister(request) if request == record.request => Ok(()),
-        CloudFilesModuleRequest::Unregister(_) => Err(
-            "durable Cloud Files unregister descriptor does not match its recorded identity"
+    let payload =
+        sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleRequest>(&record.payload_sobj)
+            .map_err(|error| {
+                format!("decode durable Cloud Files unregister descriptor: {error}")
+            })?;
+    match (record.operation.as_str(), payload) {
+        (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, CloudFilesModuleRequest::Unregister(request))
+            if request == record.request => Ok(()),
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudFilesModuleRequest::PreserveStateUnregister(request),
+        ) if request == record.request
+            && record.module.interface_version == SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION => Ok(()),
+        _ => Err(
+            "durable Cloud Files unregister operation, payload, provider capability, or recorded identity does not match"
                 .to_string(),
         ),
-        CloudFilesModuleRequest::Mount(_) => {
-            Err("durable Cloud Files unregister descriptor contains a mount request".to_string())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn validate_legacy_staged_cloud_registration_record(
+    data_dir: &SinomoDataDir,
+    record: &PendingCloudUnregisterRecord,
+) -> Result<(), String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+        SINOMO_DFS_CLOUD_FILES_MODULE_ID, SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+    };
+    use sinomo_runtime::module::ModuleId;
+
+    let expected_module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+    if record.schema_version != 1
+        || record.operation != SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+        || record.module.module_id != expected_module_id
+        || record.module.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+        || record.request.data_dir_root.as_ref() != Some(&data_dir.root())
+        || record.legacy_prejournal_origin.is_some()
+    {
+        return Err(
+            "legacy staged Cloud Files descriptor has invalid schema, operation, provider, or data-directory provenance"
+                .to_string(),
+        );
+    }
+    match sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleRequest>(&record.payload_sobj)
+        .map_err(|error| format!("decode legacy staged Cloud Files payload: {error}"))?
+    {
+        CloudFilesModuleRequest::Unregister(request) if request == record.request => {}
+        _ => {
+            return Err(
+                "legacy staged Cloud Files operation and payload identity do not match".to_string(),
+            );
         }
     }
+    verify_cloud_unregister_recovery_module(data_dir, &record.module).map_err(|error| {
+        format!("legacy staged Cloud Files provider is not self-contained: {error}")
+    })?;
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -686,12 +1054,19 @@ fn load_pending_cloud_unregister_record(
             ));
         }
     };
-    let record = sinomo_runtime::module_api::decode_sobj(&bytes).map_err(|error| {
-        format!(
-            "decode pending Cloud Files unregister {}: {error}",
-            path.display()
-        )
-    })?;
+    let record: PendingCloudUnregisterRecord = sinomo_runtime::module_api::decode_sobj(&bytes)
+        .map_err(|error| {
+            format!(
+                "decode pending Cloud Files unregister {}: {error}",
+                path.display()
+            )
+        })?;
+    if record.schema_version != PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION {
+        return Err(format!(
+            "legacy pending Cloud Files unregister schema {} is policy-ambiguous and will not be replayed automatically",
+            record.schema_version
+        ));
+    }
     validate_pending_cloud_unregister_record(data_dir, &record)?;
     Ok(Some(record))
 }
@@ -699,7 +1074,7 @@ fn load_pending_cloud_unregister_record(
 #[cfg(any(windows, test))]
 fn load_staged_cloud_registration_record(
     data_dir: &SinomoDataDir,
-) -> Result<Option<PendingCloudUnregisterRecord>, String> {
+) -> Result<Option<StagedCloudRegistrationRecord>, String> {
     let path = staged_cloud_registration_path(data_dir);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -711,88 +1086,162 @@ fn load_staged_cloud_registration_record(
             ));
         }
     };
-    let record = sinomo_runtime::module_api::decode_sobj(&bytes).map_err(|error| {
-        format!(
-            "decode staged Cloud Files registration recovery {}: {error}",
-            path.display()
-        )
-    })?;
-    validate_pending_cloud_unregister_record(data_dir, &record)?;
-    Ok(Some(record))
+    if let Ok(record) =
+        sinomo_runtime::module_api::decode_sobj::<StagedCloudRegistrationRecord>(&bytes)
+    {
+        validate_staged_cloud_registration_record(data_dir, &record)?;
+        return Ok(Some(record));
+    }
+    let legacy = sinomo_runtime::module_api::decode_sobj::<PendingCloudUnregisterRecord>(&bytes)
+        .map_err(|error| {
+            format!(
+                "decode staged Cloud Files registration recovery {}: {error}",
+                path.display()
+            )
+        })?;
+    validate_legacy_staged_cloud_registration_record(data_dir, &legacy)?;
+    // A legacy staged descriptor is identity/provenance evidence, never an
+    // authorization to replay its ambiguous destructive operation.
+    let legacy_origin = legacy.module.clone();
+    let mut recovery = pending_cloud_unregister_record(legacy.request, legacy.module)?;
+    recovery.legacy_prejournal_origin = Some(legacy_origin);
+    let migrated = StagedCloudRegistrationRecord {
+        schema_version: STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION,
+        state: StagedCloudRegistrationState::MayBeRegistered,
+        recovery,
+    };
+    validate_staged_cloud_registration_record(data_dir, &migrated)?;
+    Ok(Some(migrated))
+}
+
+#[cfg(any(windows, test))]
+fn validate_staged_cloud_registration_record(
+    data_dir: &SinomoDataDir,
+    record: &StagedCloudRegistrationRecord,
+) -> Result<(), String> {
+    if record.schema_version != STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported staged Cloud Files registration schema {}; expected {}",
+            record.schema_version, STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION
+        ));
+    }
+    validate_cloud_unregister_record(data_dir, &record.recovery, true)?;
+    if record.recovery.operation
+        != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+    {
+        return Err(
+            "staged Cloud Files registration recovery must remain cleanup-policy neutral"
+                .to_string(),
+        );
+    }
+    if let Some(legacy_provider) = record.recovery.legacy_prejournal_origin.as_ref() {
+        if record.state != StagedCloudRegistrationState::MayBeRegistered
+            || legacy_provider.interface_version
+                != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+            || !matches!(
+                record.recovery.module.interface_version.as_str(),
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+                    | sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+            )
+        {
+            return Err(
+                "legacy Cloud Files pre-journal risk must remain MayBeRegistered with original v2 provenance until v3 Ready proof"
+                    .to_string(),
+            );
+        }
+        if record.recovery.module.interface_version
+            == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+            && &record.recovery.module != legacy_provider
+        {
+            return Err(
+                "legacy Cloud Files pre-journal origin does not exactly match the pre-upgrade v2 recovery provider"
+                    .to_string(),
+            );
+        }
+    }
+    verify_cloud_unregister_recovery_module(data_dir, &record.recovery.module).map_err(
+        |error| format!("staged Cloud Files registration recovery is not self-contained: {error}"),
+    )?;
+    if let Some(origin) = record.recovery.legacy_prejournal_origin.as_ref() {
+        verify_cloud_unregister_recovery_module(data_dir, origin).map_err(|error| {
+            format!("legacy Cloud Files pre-journal provider is not self-contained: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
 fn persist_staged_cloud_registration_record(
     data_dir: &SinomoDataDir,
-    record: &PendingCloudUnregisterRecord,
+    record: &StagedCloudRegistrationRecord,
 ) -> Result<(), String> {
-    validate_pending_cloud_unregister_record(data_dir, record)?;
-    verify_cloud_unregister_recovery_module(data_dir, &record.module).map_err(|error| {
-        format!("staged Cloud Files registration recovery is not self-contained: {error}")
-    })?;
+    validate_staged_cloud_registration_record(data_dir, record)?;
     let path = staged_cloud_registration_path(data_dir);
     if let Some(existing) = load_staged_cloud_registration_record(data_dir)? {
-        return if existing == *record {
-            Ok(())
-        } else {
-            Err(format!(
-                "refusing to replace staged Cloud Files registration recovery {} for {} -> {} before verified cleanup",
-                path.display(),
-                existing.request.sync_root.display(),
-                existing.request.root_path
-            ))
-        };
+        if existing == *record {
+            return Ok(());
+        }
+        return Err(format!(
+            "refusing generic Cloud Files staged-state transition at {}; use the explicit compare-and-swap lifecycle transition",
+            path.display()
+        ));
     }
-    let parent = path.parent().ok_or_else(|| {
+    let bytes = sinomo_runtime::module_api::encode_sobj(record)
+        .map_err(|error| format!("encode staged Cloud Files registration recovery: {error}"))?;
+    sinomo_runtime::storage::durable_file::write_file_atomic(
+        &path,
+        &bytes,
+        sinomo_runtime::storage::durable_file::DurableAtomicFileOptions::new(
+            STAGED_CLOUD_REGISTRATION_FILE,
+            "cloud-files-registration-state",
+        )
+        .sync_all(),
+    )
+    .map_err(|error| {
         format!(
-            "staged Cloud Files registration recovery path {} has no parent",
+            "persist staged Cloud Files registration recovery {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(any(windows, test))]
+fn replace_staged_cloud_registration_record(
+    data_dir: &SinomoDataDir,
+    expected: &StagedCloudRegistrationRecord,
+    replacement: &StagedCloudRegistrationRecord,
+) -> Result<(), String> {
+    validate_staged_cloud_registration_record(data_dir, replacement)?;
+    let path = staged_cloud_registration_path(data_dir);
+    let existing = load_staged_cloud_registration_record(data_dir)?.ok_or_else(|| {
+        format!(
+            "cannot transition missing staged Cloud Files registration {}",
             path.display()
         )
     })?;
-    std::fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "create staged Cloud Files registration recovery directory {}: {error}",
-            parent.display()
-        )
-    })?;
-    let bytes = sinomo_runtime::module_api::encode_sobj(record)
-        .map_err(|error| format!("encode staged Cloud Files registration recovery: {error}"))?;
-    let temporary = parent.join(format!(
-        ".{STAGED_CLOUD_REGISTRATION_FILE}.{}.{}.tmp",
-        std::process::id(),
-        OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary)
-            .map_err(|error| {
-                format!(
-                    "create staged Cloud Files registration recovery temporary file {}: {error}",
-                    temporary.display()
-                )
-            })?;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|error| {
-                format!(
-                    "persist staged Cloud Files registration recovery temporary file {}: {error}",
-                    temporary.display()
-                )
-            })?;
-        std::fs::rename(&temporary, &path).map_err(|error| {
-            format!(
-                "commit staged Cloud Files registration recovery {}: {error}",
-                path.display()
-            )
-        })?;
-        sync_pending_cloud_unregister_directory(parent)
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    if existing != *expected {
+        return Err(format!(
+            "refusing changed staged Cloud Files registration transition {}",
+            path.display()
+        ));
     }
-    write_result
+    let bytes = sinomo_runtime::module_api::encode_sobj(replacement)
+        .map_err(|error| format!("encode staged Cloud Files registration transition: {error}"))?;
+    sinomo_runtime::storage::durable_file::write_file_atomic(
+        &path,
+        &bytes,
+        sinomo_runtime::storage::durable_file::DurableAtomicFileOptions::new(
+            STAGED_CLOUD_REGISTRATION_FILE,
+            "cloud-files-registration-transition",
+        )
+        .sync_all(),
+    )
+    .map_err(|error| {
+        format!(
+            "transition staged Cloud Files registration {}: {error}",
+            path.display()
+        )
+    })
 }
 
 #[cfg(any(windows, test))]
@@ -806,6 +1255,13 @@ fn persist_pending_cloud_unregister_record(
             "pending Cloud Files unregister is not self-contained in durable recovery storage: {error}"
         )
     })?;
+    if let Some(origin) = record.legacy_prejournal_origin.as_ref() {
+        verify_cloud_unregister_recovery_module(data_dir, origin).map_err(|error| {
+            format!(
+                "pending Cloud Files unregister lost its exact legacy pre-journal provider: {error}"
+            )
+        })?;
+    }
     let path = pending_cloud_unregister_path(data_dir);
     if let Some(existing) = load_pending_cloud_unregister_record(data_dir)? {
         return if existing == *record {
@@ -907,9 +1363,9 @@ fn clear_staged_cloud_registration_record(
     let Some(existing) = load_staged_cloud_registration_record(data_dir)? else {
         return Ok(());
     };
-    if existing != *expected {
+    if !same_cloud_registration_recovery_identity(&existing.recovery, expected) {
         return Err(format!(
-            "refusing to clear changed staged Cloud Files registration recovery {}",
+            "refusing to clear staged Cloud Files registration recovery with changed ownership identity {}",
             path.display()
         ));
     }
@@ -942,7 +1398,7 @@ fn sync_pending_cloud_unregister_directory(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn cloud_files_registration_receipt_path(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir
         .module_runtime_dir()
@@ -950,7 +1406,7 @@ fn cloud_files_registration_receipt_path(data_dir: &SinomoDataDir) -> PathBuf {
         .join(CLOUD_FILES_REGISTRATION_RECEIPT_FILE)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn load_cloud_files_registration_receipt(
     data_dir: &SinomoDataDir,
 ) -> Result<Option<sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt>, String> {
@@ -975,69 +1431,12 @@ fn load_cloud_files_registration_receipt(
         })
 }
 
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn select_cloud_unregister_module_provenance(
-    receipt: &sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt,
-    active: Option<&sinomo_runtime::module::NativeDylibModuleLoaderState>,
-    staged: &[CloudFilesModuleProvenance],
-    cached: &[sinomo_runtime::module::NativeDylibModuleCacheEntry],
-) -> Result<CloudFilesModuleProvenance, String> {
-    use sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
-    use sinomo_runtime::module::{ModuleId, NATIVE_DYLIB_HOST_ABI_VERSION};
-
-    let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
-        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-    if let Some(state) = active
-        && state.module_id == module_id
-        && state.interface_version == receipt.interface_version
-        && state.native_abi_version == NATIVE_DYLIB_HOST_ABI_VERSION
-    {
-        return Ok(CloudFilesModuleProvenance::from_loader_state(state));
-    }
-
-    if let Some(provenance) = staged
-        .iter()
-        .filter(|provenance| {
-            provenance.module_id == module_id
-                && provenance.interface_version == receipt.interface_version
-                && provenance.native_abi_version == NATIVE_DYLIB_HOST_ABI_VERSION
-                && active.is_none_or(|state| provenance.platform_triple == state.platform_triple)
-        })
-        .min_by(|left, right| left.content_hash.cmp(&right.content_hash))
-    {
-        return Ok(provenance.clone());
-    }
-
-    cached
-        .iter()
-        .filter(|entry| {
-            entry.module_id == module_id
-                && entry.interface_version == receipt.interface_version
-                && entry.native_abi_version == NATIVE_DYLIB_HOST_ABI_VERSION
-                && active.is_none_or(|state| entry.platform_triple == state.platform_triple)
-        })
-        .min_by(|left, right| {
-            left.content_hash
-                .cmp(&right.content_hash)
-                .then(left.cache_key.cmp(&right.cache_key))
-                .then(left.library_path.cmp(&right.library_path))
-        })
-        .map(CloudFilesModuleProvenance::from_cache_entry)
-        .ok_or_else(|| {
-            format!(
-                "no cached {SINOMO_DFS_CLOUD_FILES_MODULE_ID} provider with interface {} can clean up the durable registration; restore or install a compatible content-addressed module artifact",
-                receipt.interface_version
-            )
-        })
-}
-
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn registration_receipt_matches_config(
     receipt: &sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt,
     config: &SifsMountConfig,
 ) -> Result<bool, String> {
-    if !config.enabled
-        || receipt.root_path != config.root_path
+    if receipt.root_path != config.root_path
         || receipt.provider_name
             != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
     {
@@ -1055,8 +1454,7 @@ fn registration_request_matches_config(
     request: &sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest,
     config: &SifsMountConfig,
 ) -> Result<bool, String> {
-    if !config.enabled
-        || request.root_path != config.root_path
+    if request.root_path != config.root_path
         || request.provider_name
             != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
     {
@@ -1078,17 +1476,146 @@ fn recover_pending_cloud_unregister_from_staged_with(
     let Some(record) = load_staged_cloud_registration_record(data_dir)? else {
         return Ok(None);
     };
-    verify_cloud_unregister_recovery_module(data_dir, &record.module).map_err(|error| {
-        format!(
-            "staged Cloud Files registration cannot be recovered by its exact provider: {error}"
-        )
-    })?;
-    let registration_is_current = registration_request_matches_config(&record.request, config)?;
-    let provider_is_current = active_module.is_none_or(|active| active == &record.module);
-    if registration_is_current && provider_is_current {
-        return Ok(None);
+    verify_cloud_unregister_recovery_module(data_dir, &record.recovery.module).map_err(
+        |error| {
+            format!(
+                "staged Cloud Files registration cannot be recovered by its exact provider: {error}"
+            )
+        },
+    )?;
+    let registration_is_current =
+        registration_request_matches_config(&record.recovery.request, config)?;
+    let provider_is_current = active_module.is_none_or(|active| active == &record.recovery.module);
+    if registration_is_current && (provider_is_current || !config.enabled) {
+        if config.enabled {
+            if record.state == StagedCloudRegistrationState::RetainedAbsent {
+                let may_be_registered = StagedCloudRegistrationRecord {
+                    state: StagedCloudRegistrationState::MayBeRegistered,
+                    ..record.clone()
+                };
+                replace_staged_cloud_registration_record(data_dir, &record, &may_be_registered)?;
+            }
+            return Ok(None);
+        }
+        if record.state == StagedCloudRegistrationState::RetainedAbsent {
+            return Ok(None);
+        }
+        if record.recovery.legacy_prejournal_origin.is_some()
+            && record.recovery.module.interface_version
+                == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+        {
+            return Err(format!(
+                "Cloud Files disable is blocked for {}: deployed v2 may have created writable state before its nonce journal, and no v3 Ready proof has normalized that risk",
+                record.recovery.request.sync_root.display()
+            ));
+        }
+        let mut pending = pending_cloud_unregister_record_with_policy(
+            record.recovery.request,
+            record.recovery.module,
+            CloudUnregisterPolicy::PreserveState,
+        )?;
+        pending.legacy_prejournal_origin = record.recovery.legacy_prejournal_origin;
+        return Ok(Some(pending));
     }
-    Ok(Some(record))
+    Err(format!(
+        "Cloud Files registration replacement is blocked: retained registration {} -> {} belongs to provider {}, not the configured identity/provider",
+        record.recovery.request.sync_root.display(),
+        record.recovery.request.root_path,
+        record.recovery.module.content_hash
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn legacy_staged_provider_upgrade_record(
+    record: &StagedCloudRegistrationRecord,
+    v3_provider: CloudFilesModuleProvenance,
+) -> Result<StagedCloudRegistrationRecord, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        SINOMO_DFS_CLOUD_FILES_INTERFACE_V2, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+    };
+
+    let origin = record
+        .recovery
+        .legacy_prejournal_origin
+        .as_ref()
+        .ok_or_else(|| "legacy Cloud Files adoption has no exact v2 origin".to_string())?;
+    if record.state != StagedCloudRegistrationState::MayBeRegistered
+        || record.recovery.module != *origin
+        || origin.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+        || v3_provider.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+    {
+        return Err(
+            "legacy Cloud Files adoption requires an exact MayBeRegistered v2 origin and a current v3 provider"
+                .to_string(),
+        );
+    }
+    let mut recovery =
+        pending_cloud_unregister_record(record.recovery.request.clone(), v3_provider)?;
+    recovery.legacy_prejournal_origin = Some(origin.clone());
+    Ok(StagedCloudRegistrationRecord {
+        schema_version: STAGED_CLOUD_REGISTRATION_SCHEMA_VERSION,
+        state: StagedCloudRegistrationState::MayBeRegistered,
+        recovery,
+    })
+}
+
+#[cfg(windows)]
+fn upgrade_legacy_staged_provider(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+    record: StagedCloudRegistrationRecord,
+    active: &sinomo_runtime::module::NativeDylibModuleLoaderState,
+) -> Result<StagedCloudRegistrationRecord, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        SINOMO_DFS_CLOUD_FILES_INTERFACE_V2, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+    };
+    use sinomo_runtime::module::{NativeModule, native_module_cache_path};
+
+    let Some(origin) = record.recovery.legacy_prejournal_origin.as_ref() else {
+        return Ok(record);
+    };
+    if record.recovery.module.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_V2 {
+        return Ok(record);
+    }
+    if origin != &record.recovery.module {
+        return Err(
+            "legacy Cloud Files pre-journal origin does not match its exact v2 recovery provider"
+                .to_string(),
+        );
+    }
+    if !registration_request_matches_config(&record.recovery.request, config)? {
+        return Ok(record);
+    }
+    if active.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
+        return Err(format!(
+            "active Cloud Files provider interface {} cannot adopt legacy v2 ownership",
+            active.interface_version
+        ));
+    }
+    let provenance = CloudFilesModuleProvenance::from_loader_state(active);
+    let source = native_module_cache_path(
+        &data_dir.root(),
+        &active.cache_key,
+        &active.content_hash,
+        &active.library_name,
+    );
+    let module =
+        unsafe { NativeModule::load_from_content_addressed_path(&source, &active.content_hash) }
+            .map_err(|error| {
+                format!("load v3 Cloud Files provider for legacy adoption: {error}")
+            })?;
+    admit_cloud_files_provider_before_effect_with(
+        &provenance,
+        module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        true,
+        || stage_cloud_unregister_recovery_module(data_dir, &provenance, &source).map(|_| ()),
+    )?;
+    drop(module);
+    let upgraded = legacy_staged_provider_upgrade_record(&record, provenance)?;
+    replace_staged_cloud_registration_record(data_dir, &record, &upgraded)?;
+    Ok(upgraded)
 }
 
 #[cfg(windows)]
@@ -1101,59 +1628,61 @@ fn recover_pending_cloud_unregister_from_staged(
     let Some(record) = load_staged_cloud_registration_record(data_dir)? else {
         return Ok(None);
     };
-    ensure_cloud_unregister_recovery_module(data_dir, &record.module)?;
-    let module_id = ModuleId::from_legacy_named(
-        sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-    )
-    .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-    let active = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
-        .map_err(|error| format!("read Cloud Files module state for staged recovery: {error}"))?
-        .as_ref()
-        .map(CloudFilesModuleProvenance::from_loader_state);
-    recover_pending_cloud_unregister_from_staged_with(data_dir, config, active.as_ref())
-}
-
-#[cfg(windows)]
-fn recover_pending_cloud_unregister_from_receipt(
-    data_dir: &SinomoDataDir,
-    config: &SifsMountConfig,
-) -> Result<Option<PendingCloudUnregisterRecord>, String> {
-    use sinomo_runtime::dfs_cloud_files_api::CloudFilesModuleRequest;
-    use sinomo_runtime::module::{
-        ModuleId, read_native_dylib_module_cache_entries, read_native_dylib_module_loader_state,
-    };
-
-    let Some(receipt) = load_cloud_files_registration_receipt(data_dir)? else {
-        return Ok(None);
-    };
-    if registration_receipt_matches_config(&receipt, config)? {
-        return Ok(None);
+    ensure_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
+    if !config.enabled
+        && record.recovery.module.interface_version
+            == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+    {
+        // Consent-driven cleanup is bound to the exact pinned stage. A missing,
+        // corrupt, or newly selected loader is neither evidence nor authority
+        // for this already-staged v3 registration and must not block disable.
+        return recover_pending_cloud_unregister_from_staged_with(data_dir, config, None);
     }
     let module_id = ModuleId::from_legacy_named(
         sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
     )
     .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-    let data_dir_root = data_dir.root();
-    let active = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
-        .map_err(|error| format!("read Cloud Files module state for cleanup: {error}"))?;
-    let cached = read_native_dylib_module_cache_entries(&data_dir_root)
-        .map_err(|error| format!("read Cloud Files module cache for cleanup: {error}"))?;
-    let staged = staged_cloud_unregister_provenances(data_dir)?;
-    let module =
-        select_cloud_unregister_module_provenance(&receipt, active.as_ref(), &staged, &cached)?;
-    ensure_cloud_unregister_recovery_module(data_dir, &module)?;
-    let request = sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
-        sync_root: receipt.sync_root,
-        root_path: receipt.root_path,
-        data_dir_root: Some(data_dir_root),
-        provider_name: receipt.provider_name,
+    let active_state = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
+        .map_err(|error| format!("read Cloud Files module state for staged recovery: {error}"))?;
+    if let Some(active) = active_state.as_ref() {
+        upgrade_legacy_staged_provider(data_dir, config, record, active)?;
+    }
+    let active = active_state
+        .as_ref()
+        .map(CloudFilesModuleProvenance::from_loader_state);
+    recover_pending_cloud_unregister_from_staged_with(data_dir, config, active.as_ref())
+}
+
+#[cfg(any(windows, test))]
+fn recover_pending_cloud_unregister_from_receipt(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+) -> Result<Option<PendingCloudUnregisterRecord>, String> {
+    // A valid staged record is the authoritative ownership/provenance state.
+    // In particular, RetainedAbsent is a settled disabled state: consulting
+    // the receipt again would synthesize a second unregister on every poll.
+    if load_staged_cloud_registration_record(data_dir)?.is_some() {
+        return Ok(None);
+    }
+    let Some(receipt) = load_cloud_files_registration_receipt(data_dir)? else {
+        return Ok(None);
     };
-    let record = pending_cloud_unregister_record(request, module)?;
-    debug_assert!(matches!(
-        sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleRequest>(&record.payload_sobj),
-        Ok(CloudFilesModuleRequest::Unregister(_))
-    ));
-    Ok(Some(record))
+    let receipt_matches = registration_receipt_matches_config(&receipt, config)?;
+    if receipt_matches && config.enabled {
+        return Ok(None);
+    }
+    if !receipt_matches {
+        return Err(format!(
+            "Cloud Files registration replacement is blocked: durable receipt {} -> {} does not match the configured identity",
+            receipt.sync_root.display(),
+            receipt.root_path
+        ));
+    }
+    Err(format!(
+        "Cloud Files registration receipt for {} -> {} has no pinned staged provider/nonce journal; refusing to synthesize a state-preserving unregister",
+        receipt.sync_root.display(),
+        receipt.root_path
+    ))
 }
 
 /// Process-wide host-mount ownership for one node-local Sinomo data directory.
@@ -1557,20 +2086,22 @@ fn run_mount_supervisor(
                         pending_unregister_recovery_loaded = true;
                     }
                     Err(error) => {
+                        let mut blocked = status_error(
+                            &SifsMountConfig::default(),
+                            None,
+                            daemon_pid,
+                            restart_count,
+                            format!(
+                                "recover pending Windows Cloud Files unregister before mount startup: {error}"
+                            ),
+                        );
+                        blocked.unregister_pending = true;
                         publish_status(
                             &store,
                             data_dir,
                             &observed_status,
                             &mut last_persisted_status,
-                            status_error(
-                                &SifsMountConfig::default(),
-                                None,
-                                daemon_pid,
-                                restart_count,
-                                format!(
-                                    "recover pending Windows Cloud Files unregister before mount startup: {error}"
-                                ),
-                            ),
+                            blocked,
                         );
                         supervisor_wait(&shutdown);
                         continue;
@@ -2630,8 +3161,10 @@ fn retire_active_mount(
         return Err("a previous Cloud Files unregister is still pending".to_string());
     }
     #[cfg(windows)]
-    if pending_unregister_for_transition(reason)
-        && let Some(mount) = active.as_ref()
+    if matches!(
+        reason,
+        MountRetirementReason::ExplicitDisable | MountRetirementReason::RegistrationReplacement
+    ) && let Some(mount) = active.as_ref()
     {
         let retired = RetiredMount {
             config: mount.config().clone(),
@@ -2639,37 +3172,94 @@ fn retire_active_mount(
             lease: Some(Arc::clone(&mount.lease)),
             module_provenance: mount.module_provenance.clone(),
         };
-        let expected_record = pending_cloud_unregister_record(
-            cloud_unregister_request(data_dir, &retired),
-            retired.module_provenance.clone(),
-        )?;
-        let record = match load_staged_cloud_registration_record(data_dir)? {
-            Some(staged) if staged == expected_record => staged,
-            Some(staged) => {
+        let preparation = (|| {
+            let mut expected_record = pending_cloud_unregister_record_with_policy(
+                cloud_unregister_request(data_dir, &retired),
+                retired.module_provenance.clone(),
+                CloudUnregisterPolicy::Release,
+            )?;
+            let existing_stage = load_staged_cloud_registration_record(data_dir)?;
+            match existing_stage.as_ref() {
+                Some(staged) => {
+                    expected_record.legacy_prejournal_origin =
+                        staged.recovery.legacy_prejournal_origin.clone();
+                    if !same_cloud_registration_recovery_identity(
+                        &staged.recovery,
+                        &expected_record,
+                    ) {
+                        return Err(format!(
+                            "staged Cloud Files registration recovery identifies {} -> {} with provider {}, but the active mount identifies {} -> {} with provider {}; ownership remains pinned",
+                            staged.recovery.request.sync_root.display(),
+                            staged.recovery.request.root_path,
+                            staged.recovery.module.content_hash,
+                            expected_record.request.sync_root.display(),
+                            expected_record.request.root_path,
+                            expected_record.module.content_hash
+                        ));
+                    }
+                }
+                None => {
+                    if reason == MountRetirementReason::RegistrationReplacement {
+                        return Err(
+                            "Cloud Files registration replacement found no exact staged old-provider ownership; stopping the active host while leaving all other evidence untouched"
+                                .to_string(),
+                        );
+                    }
+                    let staged = staged_cloud_registration_record(
+                        &expected_record,
+                        StagedCloudRegistrationState::MayBeRegistered,
+                    )?;
+                    persist_staged_cloud_registration_record(data_dir, &staged)?;
+                }
+            }
+            if reason == MountRetirementReason::RegistrationReplacement {
+                return Err(
+                    "Cloud Files registration replacement is blocked until an explicit release-if-quiescent operation is available; retained old registration ownership was not altered"
+                        .to_string(),
+                );
+            }
+            ensure_cloud_unregister_recovery_module(data_dir, &expected_record.module)?;
+            if expected_record.module.interface_version
+                != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+            {
                 return Err(format!(
-                    "staged Cloud Files registration recovery identifies {} -> {} with provider {}, but the active mount identifies {} -> {} with provider {}; refusing retirement until exact ownership is resolved",
-                    staged.request.sync_root.display(),
-                    staged.request.root_path,
-                    staged.module.content_hash,
-                    expected_record.request.sync_root.display(),
-                    expected_record.request.root_path,
-                    expected_record.module.content_hash
+                    "Cloud Files provider interface {} cannot preserve state during disable; registration and durable ownership remain retained",
+                    expected_record.module.interface_version
                 ));
             }
-            None => {
-                persist_staged_cloud_registration_record(data_dir, &expected_record)?;
-                expected_record
+            let mut record = pending_cloud_unregister_record_with_policy(
+                expected_record.request,
+                expected_record.module,
+                CloudUnregisterPolicy::PreserveState,
+            )?;
+            record.legacy_prejournal_origin = expected_record.legacy_prejournal_origin;
+            // Write the exact preserve-state intent before stopping. A crash
+            // after this point is replayable but cannot race the live worker.
+            persist_pending_cloud_unregister_record(data_dir, &record)?;
+            Ok(record)
+        })();
+
+        match preparation {
+            Ok(record) => {
+                *pending_unregister = Some(PendingCloudUnregister::new(record, retired.lease));
+                return stop_then_drive_pending_cloud_unregister_with(
+                    pending_unregister,
+                    Instant::now(),
+                    || stop_active_mount(active, mount_cancellation),
+                    |pending| complete_pending_cloud_unregister(data_dir, pending),
+                );
             }
-        };
-        ensure_cloud_unregister_recovery_module(data_dir, &record.module)?;
-        persist_pending_cloud_unregister_record(data_dir, &record)?;
-        *pending_unregister = Some(PendingCloudUnregister::new(record, retired.lease));
-        return stop_then_drive_pending_cloud_unregister_with(
-            pending_unregister,
-            Instant::now(),
-            || stop_active_mount(active, mount_cancellation),
-            |pending| complete_pending_cloud_unregister(data_dir, pending),
-        );
+            Err(preparation_error) => {
+                // Consent revocation always attempts a clean disconnect even
+                // when provenance/persistence cannot prepare a safe cleanup.
+                return stop_after_failed_cloud_retirement_preparation_with(
+                    preparation_error,
+                    || stop_active_mount(active, mount_cancellation),
+                    || Err("blocked Cloud Files retirement cannot invoke unregister".to_string()),
+                    || Err("blocked Cloud Files retirement cannot start a replacement".to_string()),
+                );
+            }
+        }
     }
     let retired = stop_active_mount_with_identity(active, mount_cancellation)?;
     #[cfg(not(windows))]
@@ -3191,9 +3781,6 @@ fn start_platform_mount(
         &state.library_name,
     );
     let module_provenance = CloudFilesModuleProvenance::from_loader_state(&state);
-    stage_cloud_unregister_recovery_module(data_dir, &module_provenance, &library_path).map_err(
-        |error| format!("stage durable Cloud Files unregister provider before mount: {error}"),
-    )?;
     let module = unsafe {
         NativeModule::load_process_resident_from_content_addressed_path(
             &library_path,
@@ -3201,6 +3788,19 @@ fn start_platform_mount(
         )
     }
     .map_err(|error| format!("load Cloud Files native module: {error}"))?;
+    admit_cloud_files_provider_before_effect_with(
+        &module_provenance,
+        module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        true,
+        || {
+            stage_cloud_unregister_recovery_module(data_dir, &module_provenance, &library_path)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("stage durable Cloud Files unregister provider before mount: {error}")
+                })
+        },
+    )?;
     let request = CloudFilesMountRequest {
         sync_root: mount_point.to_path_buf(),
         root_path: config.root_path.clone(),
@@ -3213,7 +3813,7 @@ fn start_platform_mount(
         connect: true,
         max_run_seconds: None,
     };
-    let recovery_record = pending_cloud_unregister_record(
+    let recovery_record = pending_cloud_unregister_record_with_policy(
         sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
             sync_root: request.sync_root.clone(),
             root_path: request.root_path.clone(),
@@ -3221,8 +3821,42 @@ fn start_platform_mount(
             provider_name: request.provider_name.clone(),
         },
         module_provenance.clone(),
+        CloudUnregisterPolicy::Release,
     )?;
-    persist_staged_cloud_registration_record(data_dir, &recovery_record).map_err(|error| {
+    let staged_recovery = staged_cloud_registration_record(
+        &recovery_record,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    match load_staged_cloud_registration_record(data_dir)? {
+        None => persist_staged_cloud_registration_record(data_dir, &staged_recovery),
+        Some(existing) if existing == staged_recovery => Ok(()),
+        Some(existing)
+            if existing.state == StagedCloudRegistrationState::MayBeRegistered
+                && existing.recovery.request == staged_recovery.recovery.request
+                && existing.recovery.legacy_prejournal_origin.as_ref()
+                    == Some(&existing.recovery.module)
+                && existing.recovery.module.interface_version
+                    == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2 =>
+        {
+            let upgraded =
+                legacy_staged_provider_upgrade_record(&existing, module_provenance.clone())?;
+            replace_staged_cloud_registration_record(data_dir, &existing, &upgraded)
+        }
+        Some(existing)
+            if existing.state == StagedCloudRegistrationState::MayBeRegistered
+                && existing.recovery.request == staged_recovery.recovery.request
+                && existing.recovery.module == staged_recovery.recovery.module
+                && existing.recovery.legacy_prejournal_origin.is_some() =>
+        {
+            // Crash after the atomic v2-origin -> v3-provider upgrade. Keep the
+            // exact origin and provider record unchanged across retries.
+            Ok(())
+        }
+        Some(_) => Err(
+            "existing staged Cloud Files ownership cannot be replaced by mount startup".to_string(),
+        ),
+    }
+    .map_err(|error| {
         format!("persist exact Cloud Files registration recovery before mount invocation: {error}")
     })?;
     let payload_sobj = encode_sobj(&CloudFilesModuleRequest::Mount(request))
@@ -3262,6 +3896,10 @@ fn start_platform_mount(
                             CloudFilesModuleResponse::Mounted(_) => Ok(()),
                             CloudFilesModuleResponse::Unregistered(_) => Err(
                                 "Cloud Files provider returned an unregister response to a mount request"
+                                    .to_string(),
+                            ),
+                            CloudFilesModuleResponse::StatePreservingUnregistered(_) => Err(
+                                "Cloud Files provider returned a state-preserving unregister response to a mount request"
                                     .to_string(),
                             ),
                             CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
@@ -3322,10 +3960,30 @@ fn complete_pending_cloud_unregister(
         pending.lease = Some(Arc::new(SifsMountLease::try_acquire(data_dir, &owner)?));
     }
     ensure_cloud_unregister_recovery_module(data_dir, &pending.record.module)?;
-    unregister_pending_cloud_mount(data_dir, &pending.record)?;
-    clear_staged_cloud_registration_record(data_dir, &pending.record)?;
-    clear_pending_cloud_unregister_record(data_dir, &pending.record)?;
-    if let Err(error) = remove_cloud_unregister_recovery_module(data_dir, &pending.record.module) {
+    let staged = load_staged_cloud_registration_record(data_dir)?.ok_or_else(|| {
+        "pending Cloud Files unregister has no authoritative staged ownership record".to_string()
+    })?;
+    if finish_already_applied_retained_completion(data_dir, &pending.record, &staged)? {
+        return Ok(());
+    }
+    if !same_cloud_registration_recovery_identity(&staged.recovery, &pending.record) {
+        return Err(
+            "pending Cloud Files unregister no longer matches its staged ownership identity"
+                .to_string(),
+        );
+    }
+    let response = unregister_pending_cloud_mount(data_dir, &pending.record)?;
+    finalize_cloud_unregister_completion_with(
+        data_dir,
+        &pending.record,
+        &staged,
+        &response,
+        || Ok(()),
+    )?;
+    if matches!(response, CloudUnregisterCompletion::Released(_))
+        && let Err(error) =
+            remove_cloud_unregister_recovery_module(data_dir, &pending.record.module)
+    {
         tracing::warn!(
             "Cloud Files unregister completed but its staged recovery provider could not be removed: {error}"
         );
@@ -3337,9 +3995,10 @@ fn complete_pending_cloud_unregister(
 fn unregister_pending_cloud_mount(
     data_dir: &SinomoDataDir,
     record: &PendingCloudUnregisterRecord,
-) -> Result<(), String> {
+) -> Result<CloudUnregisterCompletion, String> {
     use sinomo_runtime::dfs_cloud_files_api::{
-        CloudFilesModuleResponse, SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+        CloudFilesModuleResponse, SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
     };
     use sinomo_runtime::module::NativeModule;
     use sinomo_runtime::module_api::{
@@ -3365,21 +4024,28 @@ fn unregister_pending_cloud_mount(
     });
     let expected_sync_root = &record.request.sync_root;
     let expected_root_path = &record.request.root_path;
-    match module
-        .invoke(&native_request)
-        .map_err(|error| format!("invoke Cloud Files unregister: {error}"))?
-    {
-        NativeModuleResponse::Invocation(response)
-            if response.operation == SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION =>
-        {
+    let native_response = admit_cloud_files_provider_before_effect_with(
+        &record.module,
+        module.descriptor(),
+        &record.operation,
+        record.operation == SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        || {
+            module
+                .invoke(&native_request)
+                .map_err(|error| format!("invoke Cloud Files unregister: {error}"))
+        },
+    )?;
+    match native_response {
+        NativeModuleResponse::Invocation(response) if response.operation == record.operation => {
             match decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
                 .map_err(|error| format!("decode Cloud Files unregister response: {error}"))?
             {
                 CloudFilesModuleResponse::Unregistered(response)
-                    if response.sync_root == *expected_sync_root
+                    if record.operation == SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+                        && response.sync_root == *expected_sync_root
                         && response.root_path == *expected_root_path =>
                 {
-                    Ok(())
+                    Ok(CloudUnregisterCompletion::Released(response))
                 }
                 CloudFilesModuleResponse::Unregistered(response) => Err(format!(
                     "Cloud Files unregister response identity mismatch: expected {} -> {}, got {} -> {}",
@@ -3390,6 +4056,18 @@ fn unregister_pending_cloud_mount(
                 )),
                 CloudFilesModuleResponse::Mounted(_) => Err(
                     "Cloud Files module returned a mount response to an unregister request"
+                        .to_string(),
+                ),
+                CloudFilesModuleResponse::StatePreservingUnregistered(response)
+                    if record.operation
+                        == SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+                        && response.sync_root == *expected_sync_root
+                        && response.root_path == *expected_root_path =>
+                {
+                    Ok(CloudUnregisterCompletion::StatePreserved(response))
+                }
+                CloudFilesModuleResponse::StatePreservingUnregistered(_) => Err(
+                    "Cloud Files state-preserving unregister response identity/operation mismatch"
                         .to_string(),
                 ),
                 CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
@@ -3494,14 +4172,52 @@ mod tests {
         }
     }
 
+    fn module_descriptor_fixture(
+        provenance: &CloudFilesModuleProvenance,
+    ) -> sinomo_runtime::module_api::NativeModuleDescriptor {
+        use sinomo_runtime::dfs_cloud_files_api::{
+            SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+        };
+        sinomo_runtime::module_api::NativeModuleDescriptor {
+            module_id: sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID
+                .to_string(),
+            module_version: "test".to_string(),
+            owner: "test".to_string(),
+            native_abi_version: provenance.native_abi_version,
+            backend: sinomo_runtime::module_api::NativeModuleBackend::NativeDylib,
+            interface_version: provenance.interface_version.clone(),
+            platform_triple: provenance.platform_triple.clone(),
+            supported_operations: vec![
+                SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
+                SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION.to_string(),
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string(),
+            ],
+            capabilities: vec![
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY.to_string(),
+            ],
+            surfaces: Default::default(),
+        }
+    }
+
     fn pending_record_fixture(data_dir: &SinomoDataDir) -> PendingCloudUnregisterRecord {
-        let retired = retired_mount_fixture();
-        let provider_bytes = b"deterministic fake Cloud Files recovery provider";
-        let provider_hash = sinomo_runtime::module::native_module_content_hash(provider_bytes);
-        let provenance = module_provenance_fixture(
+        pending_record_fixture_with_interface(
+            data_dir,
             sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
-            &provider_hash,
-        );
+            b"deterministic fake Cloud Files recovery provider",
+        )
+    }
+
+    fn pending_record_fixture_with_interface(
+        data_dir: &SinomoDataDir,
+        interface_version: &str,
+        provider_bytes: &[u8],
+    ) -> PendingCloudUnregisterRecord {
+        let retired = retired_mount_fixture();
+        let provider_hash = sinomo_runtime::module::native_module_content_hash(provider_bytes);
+        let provenance = module_provenance_fixture(interface_version, &provider_hash);
         let source = data_dir.root().join("fixture-cloud-files-provider.dll");
         std::fs::create_dir_all(data_dir.root()).expect("fixture data directory");
         std::fs::write(&source, provider_bytes).expect("fixture provider source");
@@ -3532,6 +4248,13 @@ mod tests {
         .expect("staged registration recovery record")
     }
 
+    fn may_be_registered_stage(
+        recovery: &PendingCloudUnregisterRecord,
+    ) -> StagedCloudRegistrationRecord {
+        staged_cloud_registration_record(recovery, StagedCloudRegistrationState::MayBeRegistered)
+            .expect("MayBeRegistered staged record")
+    }
+
     fn windows_mount_config(mount_point: &Path, root_path: &str) -> SifsMountConfig {
         SifsMountConfig {
             enabled: true,
@@ -3545,16 +4268,11 @@ mod tests {
 
     #[test]
     fn cloud_unregister_transition_policy_distinguishes_explicit_retirement() {
+        assert!(pending_unregister_for_transition(
+            MountRetirementReason::ExplicitDisable
+        ));
         for reason in [
-            MountRetirementReason::ExplicitDisable,
             MountRetirementReason::RegistrationReplacement,
-        ] {
-            assert!(
-                pending_unregister_for_transition(reason),
-                "{reason:?} must unregister the retired registration"
-            );
-        }
-        for reason in [
             MountRetirementReason::ConfigurationRestart,
             MountRetirementReason::InvalidConfiguration,
             MountRetirementReason::ConfigurationUnavailable,
@@ -3578,6 +4296,589 @@ mod tests {
         let mut new_mount = old.clone();
         new_mount.mount_point = "C:\\Sinomo\\Replacement".to_string();
         assert!(cloud_registration_identity_changed(&old, &new_mount));
+    }
+
+    #[test]
+    fn legacy_unregister_payload_defaults_to_releasing_ownership() {
+        #[derive(serde::Serialize)]
+        struct LegacyCloudFilesUnregisterRequest {
+            sync_root: PathBuf,
+            root_path: String,
+            data_dir_root: Option<PathBuf>,
+            provider_name: String,
+        }
+
+        let legacy = LegacyCloudFilesUnregisterRequest {
+            sync_root: "C:\\SinomoSIFS".into(),
+            root_path: "/services".to_string(),
+            data_dir_root: Some("C:\\Users\\test\\.sinomo".into()),
+            provider_name: "Sinomo SIFS".to_string(),
+        };
+        let bytes =
+            sinomo_runtime::module_api::encode_sobj(&legacy).expect("encode legacy unregister");
+        let decoded = sinomo_runtime::module_api::decode_sobj::<
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest,
+        >(&bytes)
+        .expect("decode legacy unregister");
+
+        assert_eq!(decoded.sync_root, legacy.sync_root);
+        assert_eq!(decoded.root_path, legacy.root_path);
+        assert_eq!(decoded.data_dir_root, legacy.data_dir_root);
+        assert_eq!(decoded.provider_name, legacy.provider_name);
+        assert_eq!(
+            sinomo_runtime::module_api::encode_sobj(&decoded)
+                .expect("re-encode compatible unregister"),
+            bytes
+        );
+    }
+
+    #[test]
+    fn legacy_staged_descriptor_decodes_as_policy_neutral_may_be_registered() {
+        let temp = TestDir::new("sifs-cloud-legacy-staged-state");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mut legacy = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+            b"deterministic deployed v2 Cloud Files provider",
+        );
+        legacy.schema_version = 1;
+        let legacy_provider = legacy.module.clone();
+        let path = staged_cloud_registration_path(&data_dir);
+        std::fs::create_dir_all(path.parent().expect("staged parent")).expect("staged dir");
+        std::fs::write(
+            &path,
+            sinomo_runtime::module_api::encode_sobj(&legacy).expect("legacy staged bytes"),
+        )
+        .expect("legacy staged descriptor");
+
+        let decoded = load_staged_cloud_registration_record(&data_dir)
+            .expect("decode legacy stage")
+            .expect("legacy stage present");
+
+        assert_eq!(decoded.state, StagedCloudRegistrationState::MayBeRegistered);
+        assert_eq!(
+            decoded.recovery.operation,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+        );
+        assert_eq!(
+            decoded.recovery.schema_version,
+            PENDING_CLOUD_UNREGISTER_SCHEMA_VERSION
+        );
+        assert_eq!(decoded.recovery.request, legacy.request);
+        assert_eq!(decoded.recovery.module, legacy_provider);
+        assert_eq!(
+            decoded.recovery.legacy_prejournal_origin,
+            Some(legacy_provider)
+        );
+    }
+
+    #[test]
+    fn malformed_legacy_staged_descriptors_remain_byte_exact_and_blocked() {
+        use sinomo_runtime::dfs_cloud_files_api::{
+            CloudFilesModuleRequest, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        };
+        use sinomo_runtime::module::ModuleId;
+
+        fn assert_rejected<F>(label: &str, mutate: F)
+        where
+            F: FnOnce(&mut PendingCloudUnregisterRecord, &SinomoDataDir),
+        {
+            let temp = TestDir::new("sifs-cloud-malformed-legacy-stage");
+            let data_dir = SinomoDataDir::new(temp.path().join(label));
+            let mut legacy = pending_record_fixture_with_interface(
+                &data_dir,
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+                label.as_bytes(),
+            );
+            legacy.schema_version = 1;
+            mutate(&mut legacy, &data_dir);
+            let path = staged_cloud_registration_path(&data_dir);
+            std::fs::create_dir_all(path.parent().expect("staged parent"))
+                .expect("staged directory");
+            let bytes =
+                sinomo_runtime::module_api::encode_sobj(&legacy).expect("malformed legacy bytes");
+            std::fs::write(&path, &bytes).expect("malformed legacy stage");
+
+            load_staged_cloud_registration_record(&data_dir)
+                .expect_err("malformed legacy stage must fail closed");
+            assert_eq!(
+                std::fs::read(&path).expect("blocked legacy evidence"),
+                bytes,
+                "{label} must not rewrite blocked evidence"
+            );
+        }
+
+        assert_rejected("operation", |record, _| {
+            record.operation =
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string();
+        });
+        assert_rejected("module", |record, _| {
+            record.module.module_id =
+                ModuleId::from_legacy_named("module.dfs.other").expect("other module id");
+        });
+        assert_rejected("interface", |record, _| {
+            record.module.interface_version = SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string();
+        });
+        assert_rejected("data-dir", |record, _| {
+            record.request.data_dir_root = Some(PathBuf::from("C:\\OtherData"));
+        });
+        assert_rejected("payload", |record, _| {
+            let mut request = record.request.clone();
+            request.root_path = "/different".to_string();
+            record.payload_sobj = sinomo_runtime::module_api::encode_sobj(
+                &CloudFilesModuleRequest::Unregister(request),
+            )
+            .expect("mismatched legacy payload");
+        });
+        assert_rejected("provider", |record, data_dir| {
+            let library = cloud_unregister_recovery_variant_dir(data_dir, &record.module)
+                .expect("recovery variant")
+                .join(&record.module.library_name);
+            std::fs::remove_file(library).expect("remove exact legacy provider");
+        });
+    }
+
+    #[test]
+    fn legacy_stage_cas_pins_v3_and_preserves_exact_v2_origin_across_restart() {
+        let temp = TestDir::new("sifs-cloud-legacy-stage-cas");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mut legacy = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+            b"legacy-stage-cas-v2-provider",
+        );
+        legacy.schema_version = 1;
+        let legacy_origin = legacy.module.clone();
+        let v3 = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            b"legacy-stage-cas-v3-provider",
+        );
+        let path = staged_cloud_registration_path(&data_dir);
+        std::fs::create_dir_all(path.parent().expect("staged parent")).expect("staged dir");
+        let legacy_bytes =
+            sinomo_runtime::module_api::encode_sobj(&legacy).expect("legacy stage bytes");
+        std::fs::write(&path, &legacy_bytes).expect("legacy stage");
+        let migrated = load_staged_cloud_registration_record(&data_dir)
+            .expect("load legacy stage")
+            .expect("legacy stage present");
+
+        let effects = std::cell::Cell::new(0usize);
+        let mut rejected_descriptor = module_descriptor_fixture(&v3.module);
+        rejected_descriptor.capabilities.clear();
+        admit_cloud_files_provider_before_effect_with(
+            &v3.module,
+            &rejected_descriptor,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            true,
+            || {
+                effects.set(effects.get() + 1);
+                let upgraded =
+                    legacy_staged_provider_upgrade_record(&migrated, v3.module.clone())?;
+                replace_staged_cloud_registration_record(&data_dir, &migrated, &upgraded)
+            },
+        )
+        .expect_err("descriptor failure must precede adoption CAS or invocation");
+        assert_eq!(effects.get(), 0);
+        assert_eq!(
+            std::fs::read(&path).expect("stage after descriptor rejection"),
+            legacy_bytes,
+            "descriptor rejection leaves the legacy stage byte exact"
+        );
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("no pending cleanup")
+                .is_none()
+        );
+
+        assert!(
+            legacy_staged_provider_upgrade_record(&migrated, legacy_origin.clone()).is_err(),
+            "a non-v3 replacement cannot discharge or rewrite legacy risk"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("stage after failed upgrade"),
+            legacy_bytes,
+            "failed validation leaves deployed stage bytes untouched"
+        );
+
+        let upgraded = legacy_staged_provider_upgrade_record(&migrated, v3.module.clone())
+            .expect("build exact v3 adoption transition");
+        replace_staged_cloud_registration_record(&data_dir, &migrated, &upgraded)
+            .expect("atomic v2-origin to v3-provider transition");
+        let restarted = load_staged_cloud_registration_record(&data_dir)
+            .expect("restart load")
+            .expect("upgraded stage present");
+        assert_eq!(restarted, upgraded);
+        assert_eq!(restarted.recovery.module, v3.module);
+        assert_eq!(
+            restarted.recovery.legacy_prejournal_origin,
+            Some(legacy_origin)
+        );
+    }
+
+    #[test]
+    fn legacy_schema_one_pending_unregister_is_blocked_without_replay_or_clear() {
+        let temp = TestDir::new("sifs-cloud-legacy-pending-blocked");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mut legacy = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+            b"deterministic legacy pending Cloud Files provider",
+        );
+        legacy.schema_version = 1;
+        let path = pending_cloud_unregister_path(&data_dir);
+        std::fs::create_dir_all(path.parent().expect("pending parent")).expect("pending dir");
+        std::fs::write(
+            &path,
+            sinomo_runtime::module_api::encode_sobj(&legacy).expect("legacy pending bytes"),
+        )
+        .expect("legacy pending record");
+
+        let error = load_pending_cloud_unregister_record(&data_dir)
+            .expect_err("ambiguous legacy pending record must block");
+        assert!(error.contains("policy-ambiguous"));
+        assert!(path.exists(), "blocked evidence must remain durable");
+    }
+
+    #[test]
+    fn descriptor_and_preserve_capability_are_bound_before_native_invocation() {
+        use sinomo_runtime::dfs_cloud_files_api::{
+            SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        };
+
+        let provenance = module_provenance_fixture(
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            "descriptor-hash",
+        );
+        let descriptor = module_descriptor_fixture(&provenance);
+        let effects = std::cell::Cell::new(0usize);
+        admit_cloud_files_provider_before_effect_with(
+            &provenance,
+            &descriptor,
+            SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+            true,
+            || {
+                effects.set(effects.get() + 1);
+                Ok(())
+            },
+        )
+        .expect("matching mount descriptor admits its first effect");
+        assert_eq!(effects.get(), 1);
+        assert!(provider_supports_state_preserving_unregister(
+            &descriptor.interface_version,
+            &descriptor.supported_operations,
+            &descriptor.capabilities,
+        ));
+
+        let mut missing_capability = descriptor.clone();
+        missing_capability.capabilities.clear();
+        assert!(!provider_supports_state_preserving_unregister(
+            &missing_capability.interface_version,
+            &missing_capability.supported_operations,
+            &missing_capability.capabilities,
+        ));
+        assert!(
+            admit_cloud_files_provider_before_effect_with(
+                &provenance,
+                &missing_capability,
+                SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+                true,
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+
+        let mut missing_operation = descriptor.clone();
+        missing_operation.supported_operations.retain(|operation| {
+            operation != SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        });
+        assert!(!provider_supports_state_preserving_unregister(
+            &missing_operation.interface_version,
+            &missing_operation.supported_operations,
+            &missing_operation.capabilities,
+        ));
+        assert!(
+            admit_cloud_files_provider_before_effect_with(
+                &provenance,
+                &missing_operation,
+                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+                true,
+                || {
+                    effects.set(effects.get() + 1);
+                    Ok(())
+                },
+            )
+            .is_err()
+        );
+
+        for mismatched in [
+            {
+                let mut value = descriptor.clone();
+                value.module_id = "module.dfs.other".to_string();
+                value
+            },
+            {
+                let mut value = descriptor.clone();
+                value.interface_version =
+                    sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+                        .to_string();
+                value
+            },
+            {
+                let mut value = descriptor.clone();
+                value.native_abi_version = value.native_abi_version.saturating_add(1);
+                value
+            },
+            {
+                let mut value = descriptor.clone();
+                value.platform_triple = "different-platform".to_string();
+                value
+            },
+        ] {
+            assert!(
+                admit_cloud_files_provider_before_effect_with(
+                    &provenance,
+                    &mismatched,
+                    SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+                    true,
+                    || {
+                        effects.set(effects.get() + 1);
+                        Ok(())
+                    },
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            effects.get(),
+            1,
+            "descriptor or capability failure must precede staging or invocation"
+        );
+    }
+
+    #[test]
+    fn retained_absent_stage_is_stable_while_disabled_and_armed_before_enable() {
+        let temp = TestDir::new("sifs-cloud-retained-absent-state");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let retained = staged_cloud_registration_record(
+            &recovery,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )
+        .expect("retained stage");
+        persist_staged_cloud_registration_record(&data_dir, &retained).expect("persist retained");
+        let mut config = windows_mount_config(&mount_point, "/root");
+        config.enabled = false;
+
+        assert!(
+            recover_pending_cloud_unregister_from_staged_with(
+                &data_dir,
+                &config,
+                Some(&recovery.module),
+            )
+            .expect("disabled retained recovery")
+            .is_none()
+        );
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir).expect("disabled stage"),
+            Some(retained.clone())
+        );
+        let receipt = sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt {
+            interface_version:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    .to_string(),
+            registration_identity_interface_version: None,
+            sync_root: mount_point.clone(),
+            root_path: "/root".to_string(),
+            provider_name:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                    .to_string(),
+        };
+        let receipt_path = cloud_files_registration_receipt_path(&data_dir);
+        std::fs::create_dir_all(receipt_path.parent().expect("receipt parent"))
+            .expect("receipt directory");
+        std::fs::write(
+            &receipt_path,
+            sinomo_runtime::module_api::encode_sobj(&receipt).expect("receipt bytes"),
+        )
+        .expect("matching retained receipt");
+        for _ in 0..2 {
+            assert!(
+                recover_pending_cloud_unregister_from_receipt(&data_dir, &config)
+                    .expect("settled stage suppresses receipt fallback")
+                    .is_none()
+            );
+            assert!(
+                load_pending_cloud_unregister_record(&data_dir)
+                    .expect("no repeated cleanup intent")
+                    .is_none()
+            );
+            assert_eq!(
+                load_staged_cloud_registration_record(&data_dir).expect("stable retained stage"),
+                Some(retained.clone())
+            );
+        }
+
+        config.enabled = true;
+        assert!(
+            recover_pending_cloud_unregister_from_staged_with(
+                &data_dir,
+                &config,
+                Some(&recovery.module),
+            )
+            .expect("enable retained recovery")
+            .is_none()
+        );
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir)
+                .expect("stage armed before mount")
+                .expect("stage retained")
+                .state,
+            StagedCloudRegistrationState::MayBeRegistered
+        );
+    }
+
+    #[test]
+    fn disabled_v3_cleanup_uses_pinned_stage_when_selected_loader_differs() {
+        let temp = TestDir::new("sifs-cloud-disabled-pinned-provider");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let staged = may_be_registered_stage(&recovery);
+        persist_staged_cloud_registration_record(&data_dir, &staged).expect("persist old stage");
+        let mut selected = recovery.module.clone();
+        selected.content_hash = "different-selected-v3-provider".to_string();
+        let mut disabled = windows_mount_config(&mount_point, "/root");
+        disabled.enabled = false;
+
+        let pending = recover_pending_cloud_unregister_from_staged_with(
+            &data_dir,
+            &disabled,
+            Some(&selected),
+        )
+        .expect("pinned provider remains cleanup authority")
+        .expect("disabled stage requires cleanup");
+
+        assert_eq!(pending.module, recovery.module);
+        assert_eq!(
+            pending.operation,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        );
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir).expect("stage remains exact"),
+            Some(staged)
+        );
+    }
+
+    #[test]
+    fn retained_stage_identity_or_provider_change_blocks_without_altering_ownership() {
+        let temp = TestDir::new("sifs-cloud-retained-replacement");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let retained = staged_cloud_registration_record(
+            &recovery,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )
+        .expect("retained stage");
+        persist_staged_cloud_registration_record(&data_dir, &retained).expect("persist retained");
+
+        let changed = windows_mount_config(&mount_point, "/replacement");
+        let error = recover_pending_cloud_unregister_from_staged_with(
+            &data_dir,
+            &changed,
+            Some(&recovery.module),
+        )
+        .expect_err("changed identity must remain blocked");
+        assert!(error.contains("registration replacement is blocked"));
+
+        let mut other_module = recovery.module.clone();
+        other_module.content_hash = "different-provider".to_string();
+        let error = recover_pending_cloud_unregister_from_staged_with(
+            &data_dir,
+            &windows_mount_config(&mount_point, "/root"),
+            Some(&other_module),
+        )
+        .expect_err("changed provider must remain blocked");
+        assert!(error.contains("registration replacement is blocked"));
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir).expect("retained stage"),
+            Some(retained)
+        );
+    }
+
+    #[test]
+    fn retained_unregister_response_requires_the_distinct_preserve_operation() {
+        use sinomo_runtime::dfs_cloud_files_api::{
+            CloudFilesPreserveStateUnregisterOutcome, CloudFilesPreserveStateUnregisterResponse,
+        };
+
+        let temp = TestDir::new("sifs-cloud-typed-retained-response");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let release = pending_record_fixture(&data_dir);
+        let preserve = pending_cloud_unregister_record_with_policy(
+            release.request.clone(),
+            release.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )
+        .expect("preserve descriptor");
+        let response =
+            CloudUnregisterCompletion::StatePreserved(CloudFilesPreserveStateUnregisterResponse {
+                sync_root: preserve.request.sync_root.clone(),
+                root_path: preserve.request.root_path.clone(),
+                was_registered: true,
+                outcome: CloudFilesPreserveStateUnregisterOutcome::Retained,
+                detail: "retained".to_string(),
+            });
+        let release_stage = may_be_registered_stage(&release);
+        let preserve_stage = may_be_registered_stage(&preserve);
+
+        assert!(
+            staged_state_after_unregister_response(&release, &release_stage, &response).is_err()
+        );
+        assert_eq!(
+            staged_state_after_unregister_response(&preserve, &preserve_stage, &response)
+                .expect("conditional retain"),
+            Some(StagedCloudRegistrationState::RetainedAbsent)
+        );
+    }
+
+    #[test]
+    fn disabled_config_retains_receipt_only_for_the_same_mount_identity() {
+        let temp = TestDir::new("sifs-cloud-disabled-receipt-identity");
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let mut config = windows_mount_config(&mount_point, "/root");
+        config.enabled = false;
+        let receipt = sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt {
+            interface_version:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    .to_string(),
+            registration_identity_interface_version: None,
+            sync_root: mount_point,
+            root_path: "/root".to_string(),
+            provider_name:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                    .to_string(),
+        };
+
+        assert!(
+            registration_receipt_matches_config(&receipt, &config).expect("same disabled identity")
+        );
+        config.root_path = "/replacement".to_string();
+        assert!(
+            !registration_receipt_matches_config(&receipt, &config)
+                .expect("changed disabled identity")
+        );
     }
 
     #[test]
@@ -3700,6 +5001,79 @@ mod tests {
     }
 
     #[test]
+    fn blocked_replacement_stops_once_without_unregister_or_ownership_mutation() {
+        let temp = TestDir::new("sifs-cloud-blocked-replacement-stop");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let staged = may_be_registered_stage(&recovery);
+        persist_staged_cloud_registration_record(&data_dir, &staged).expect("old exact stage");
+        let stop_calls = std::cell::Cell::new(0);
+        let unregister_calls = std::cell::Cell::new(0);
+        let start_calls = std::cell::Cell::new(0);
+
+        let error = stop_after_failed_cloud_retirement_preparation_with(
+            "Cloud Files registration replacement is blocked".to_string(),
+            || {
+                stop_calls.set(stop_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                unregister_calls.set(unregister_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                start_calls.set(start_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("replacement remains blocked after clean disconnect");
+
+        assert!(error.contains("provider was stopped"));
+        assert_eq!(stop_calls.get(), 1);
+        assert_eq!(unregister_calls.get(), 0);
+        assert_eq!(start_calls.get(), 0);
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir).expect("old stage remains"),
+            Some(staged)
+        );
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("replacement never creates pending cleanup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cleanup_preparation_error_still_attempts_one_clean_stop() {
+        let stop_calls = std::cell::Cell::new(0);
+        let unregister_calls = std::cell::Cell::new(0);
+        let start_calls = std::cell::Cell::new(0);
+        let error = stop_after_failed_cloud_retirement_preparation_with(
+            "exact cleanup provider could not be pinned".to_string(),
+            || {
+                stop_calls.set(stop_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                unregister_calls.set(unregister_calls.get() + 1);
+                Ok(())
+            },
+            || {
+                start_calls.set(start_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .expect_err("preparation failure remains blocked");
+
+        assert_eq!(stop_calls.get(), 1);
+        assert_eq!(unregister_calls.get(), 0);
+        assert_eq!(start_calls.get(), 0);
+        assert!(error.contains("ownership evidence remains pinned"));
+    }
+
+    #[test]
     fn pending_unregister_survives_crash_after_stop_and_holds_lease_until_clear() {
         let temp = TestDir::new("sifs-cloud-unregister-crash-recovery");
         let data_dir = SinomoDataDir::new(temp.path().join("data"));
@@ -3755,13 +5129,14 @@ mod tests {
     }
 
     #[test]
-    fn crash_before_lifecycle_event_with_disabled_config_promotes_staged_recovery() {
+    fn pre_ready_crash_uses_conditional_preserve_and_can_finish_as_released() {
         let temp = TestDir::new("sifs-cloud-registration-pre-event-disabled");
         let data_dir = SinomoDataDir::new(temp.path().join("data"));
         let mount_point = temp.path().join("old-mount");
         std::fs::create_dir_all(&mount_point).expect("old mount point");
         let record = staged_record_fixture(&data_dir, &mount_point, "/old-root");
-        persist_staged_cloud_registration_record(&data_dir, &record)
+        let staged = may_be_registered_stage(&record);
+        persist_staged_cloud_registration_record(&data_dir, &staged)
             .expect("persist recovery before module invocation");
         assert!(
             !data_dir
@@ -3780,43 +5155,142 @@ mod tests {
             Some(&record.module),
         )
         .expect("recover staged registration")
-        .expect("disabled config must promote cleanup");
-        assert_eq!(recovered, record);
+        .expect("disabled config must promote conditional cleanup");
+        assert_eq!(
+            recovered.operation,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        );
+        assert!(same_cloud_registration_recovery_identity(
+            &recovered, &record
+        ));
         persist_pending_cloud_unregister_record(&data_dir, &recovered)
             .expect("persist promoted cleanup before host effect");
 
-        let mut pending = Some(PendingCloudUnregister::new(recovered.clone(), None));
-        drive_pending_cloud_unregister_with(&mut pending, Instant::now(), |pending| {
-            pending.lease = Some(Arc::new(
-                SifsMountLease::try_acquire(&data_dir, "pre-event crash cleanup")
-                    .expect("cleanup lease"),
-            ));
-            assert!(
-                SifsMountLease::try_acquire(&data_dir, "replacement while cleanup pending")
-                    .is_err(),
-                "cleanup keeps the mount lease until exact unregister is verified"
-            );
-            assert_eq!(
-                load_staged_cloud_registration_record(&data_dir)?,
-                Some(recovered.clone())
-            );
-            assert!(
-                verify_cloud_unregister_recovery_module(&data_dir, &recovered.module).is_ok(),
-                "the exact provider remains pinned through cleanup"
-            );
-            clear_staged_cloud_registration_record(&data_dir, &recovered)?;
-            clear_pending_cloud_unregister_record(&data_dir, &recovered)
-        })
-        .expect("verified idempotent unregister cleanup");
+        let response = CloudUnregisterCompletion::StatePreserved(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse {
+                sync_root: recovered.request.sync_root.clone(),
+                root_path: recovered.request.root_path.clone(),
+                was_registered: false,
+                outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Released,
+                detail: "journal, receipt, and CFAPI registration were absent".to_string(),
+            },
+        );
+        let error = finalize_cloud_unregister_completion_with(
+            &data_dir,
+            &recovered,
+            &staged,
+            &response,
+            || Err("simulated crash after first durable completion step".to_string()),
+        )
+        .expect_err("simulate crash after pending clear");
+        assert!(error.contains("simulated crash"));
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("pending cut state")
+                .is_none(),
+            "Released clears pending before touching the authoritative stage"
+        );
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir).expect("stage cut state"),
+            Some(staged.clone())
+        );
 
-        assert!(pending.is_none());
+        let replay = recover_pending_cloud_unregister_from_staged_with(
+            &data_dir,
+            &disabled,
+            Some(&record.module),
+        )
+        .expect("reconstruct released cleanup after crash")
+        .expect("staged record reconstructs cleanup");
+        persist_pending_cloud_unregister_record(&data_dir, &replay)
+            .expect("re-persist replay intent");
+        finalize_cloud_unregister_completion_with(
+            &data_dir,
+            &replay,
+            &staged,
+            &response,
+            || Ok(()),
+        )
+        .expect("replayed Released completion clears stage after pending");
+
         assert!(
             load_staged_cloud_registration_record(&data_dir)
                 .expect("staged recovery after cleanup")
                 .is_none()
         );
-        SifsMountLease::try_acquire(&data_dir, "replacement after verified cleanup")
-            .expect("verified cleanup releases the mount lease");
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("pending recovery after cleanup")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_completion_cut_clears_pending_then_retires_only_legacy_provider() {
+        let temp = TestDir::new("sifs-cloud-retained-origin-cut");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let v2 = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
+            b"retained-cut-v2-provider",
+        );
+        let v3 = pending_record_fixture_with_interface(
+            &data_dir,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            b"retained-cut-v3-provider",
+        );
+        let mut pending = pending_cloud_unregister_record_with_policy(
+            v3.request.clone(),
+            v3.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )
+        .expect("v3 preserve intent");
+        pending.legacy_prejournal_origin = Some(v2.module.clone());
+        let staged = may_be_registered_stage(&pending);
+        persist_staged_cloud_registration_record(&data_dir, &staged)
+            .expect("stage adopted v3 provider and exact v2 origin");
+        persist_pending_cloud_unregister_record(&data_dir, &pending)
+            .expect("persist retain-required cleanup");
+        let response = CloudUnregisterCompletion::StatePreserved(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse {
+                sync_root: pending.request.sync_root.clone(),
+                root_path: pending.request.root_path.clone(),
+                was_registered: false,
+                outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Retained,
+                detail: "journal normalized to StateOwned".to_string(),
+            },
+        );
+
+        finalize_cloud_unregister_completion_with(&data_dir, &pending, &staged, &response, || {
+            Err("simulated crash after RetainedAbsent fsync".to_string())
+        })
+        .expect_err("simulate response-loss cut");
+        let retained = load_staged_cloud_registration_record(&data_dir)
+            .expect("load retained cut state")
+            .expect("retained stage exists");
+        assert_eq!(retained.state, StagedCloudRegistrationState::RetainedAbsent);
+        assert!(retained.recovery.legacy_prejournal_origin.is_none());
+        assert_eq!(
+            load_pending_cloud_unregister_record(&data_dir).expect("pending cut state"),
+            Some(pending.clone())
+        );
+        assert!(
+            finish_already_applied_retained_completion(&data_dir, &pending, &retained)
+                .expect("finish already-applied Retained")
+        );
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("pending after retained replay")
+                .is_none()
+        );
+        assert!(
+            verify_cloud_unregister_recovery_module(&data_dir, &pending.module).is_ok(),
+            "current v3 cleanup authority remains pinned"
+        );
+        assert!(
+            verify_cloud_unregister_recovery_module(&data_dir, &v2.module).is_err(),
+            "discharged v2 artifact is removed only after stage and pending settle"
+        );
     }
 
     #[test]
@@ -3826,7 +5300,8 @@ mod tests {
         let mount_point = temp.path().join("old-mount");
         std::fs::create_dir_all(&mount_point).expect("old mount point");
         let record = staged_record_fixture(&data_dir, &mount_point, "/old-root");
-        persist_staged_cloud_registration_record(&data_dir, &record)
+        let staged = may_be_registered_stage(&record);
+        persist_staged_cloud_registration_record(&data_dir, &staged)
             .expect("persist exact staged recovery");
         remove_cloud_unregister_recovery_module(&data_dir, &record.module)
             .expect("simulate unavailable exact provider");
@@ -3840,12 +5315,11 @@ mod tests {
         )
         .expect_err("missing exact provider must block cleanup and replacement");
 
-        assert!(error.contains("cannot be recovered by its exact provider"));
-        assert_eq!(
-            load_staged_cloud_registration_record(&data_dir)
-                .expect("staged ownership remains durable"),
-            Some(record)
+        assert!(
+            error.contains("not self-contained")
+                || error.contains("cannot be recovered by its exact provider")
         );
+        assert!(staged_cloud_registration_path(&data_dir).exists());
     }
 
     #[test]
@@ -3857,44 +5331,43 @@ mod tests {
         std::fs::create_dir_all(&old_mount).expect("old mount point");
         std::fs::create_dir_all(&new_mount).expect("new mount point");
         let old_record = staged_record_fixture(&data_dir, &old_mount, "/old-root");
-        persist_staged_cloud_registration_record(&data_dir, &old_record)
+        let old_staged = may_be_registered_stage(&old_record);
+        persist_staged_cloud_registration_record(&data_dir, &old_staged)
             .expect("persist old recovery descriptor");
 
         let replacement_config = windows_mount_config(&new_mount, "/new-root");
-        let recovered = recover_pending_cloud_unregister_from_staged_with(
+        let error = recover_pending_cloud_unregister_from_staged_with(
             &data_dir,
             &replacement_config,
             Some(&old_record.module),
         )
-        .expect("recover path replacement")
-        .expect("path replacement must clean the old root first");
-        persist_pending_cloud_unregister_record(&data_dir, &recovered)
-            .expect("persist exact old cleanup");
+        .expect_err("path replacement must remain blocked");
+        assert!(error.contains("registration replacement is blocked"));
 
         let replacement_record = pending_cloud_unregister_record(
             sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
                 sync_root: new_mount,
                 root_path: "/new-root".to_string(),
                 data_dir_root: Some(data_dir.root()),
-                provider_name: recovered.request.provider_name.clone(),
+                provider_name: old_record.request.provider_name.clone(),
             },
-            recovered.module.clone(),
+            old_record.module.clone(),
         )
         .expect("replacement descriptor");
-        let error = persist_staged_cloud_registration_record(&data_dir, &replacement_record)
+        let replacement_staged = may_be_registered_stage(&replacement_record);
+        let error = persist_staged_cloud_registration_record(&data_dir, &replacement_staged)
             .expect_err("replacement must not discard old staged ownership");
-        assert!(error.contains("before verified cleanup"));
+        assert!(error.contains("explicit compare-and-swap"));
         assert_eq!(
             load_staged_cloud_registration_record(&data_dir).expect("retained old staged record"),
-            Some(old_record)
+            Some(old_staged)
         );
 
-        clear_staged_cloud_registration_record(&data_dir, &recovered)
-            .expect("clear old stage after simulated verified unregister");
-        clear_pending_cloud_unregister_record(&data_dir, &recovered)
-            .expect("clear promoted cleanup after simulated verified unregister");
-        persist_staged_cloud_registration_record(&data_dir, &replacement_record)
-            .expect("replacement may stage only after cleanup");
+        assert!(
+            load_pending_cloud_unregister_record(&data_dir)
+                .expect("no replacement pending effect")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3904,7 +5377,8 @@ mod tests {
         let mount_point = temp.path().join("mount");
         std::fs::create_dir_all(&mount_point).expect("mount point");
         let record = staged_record_fixture(&data_dir, &mount_point, "/root");
-        persist_staged_cloud_registration_record(&data_dir, &record)
+        let staged = may_be_registered_stage(&record);
+        persist_staged_cloud_registration_record(&data_dir, &staged)
             .expect("persist exact recovery descriptor");
 
         assert!(
@@ -3920,7 +5394,7 @@ mod tests {
         assert_eq!(
             load_staged_cloud_registration_record(&data_dir)
                 .expect("staged descriptor remains pinned"),
-            Some(record)
+            Some(staged)
         );
     }
 
@@ -3945,61 +5419,6 @@ mod tests {
             load_pending_cloud_unregister_record(&data_dir).expect("load retained cleanup"),
             Some(original)
         );
-    }
-
-    #[test]
-    fn interface_upgrade_cleanup_selects_staged_registration_interface() {
-        use sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt;
-        use sinomo_runtime::module::{NativeDylibModuleCacheEntry, NativeDylibModuleLoaderState};
-
-        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(
-            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-        )
-        .expect("Cloud Files module id");
-        let active_upgrade = NativeDylibModuleLoaderState {
-            module_id: module_id.clone(),
-            artifact_id: None,
-            content_hash: "provider-v2".to_string(),
-            cache_key: "cloud-files-cache".to_string(),
-            library_name: "sinomo_dfs_cloud_files.dll".to_string(),
-            platform_triple: "x86_64-pc-windows-gnu".to_string(),
-            native_abi_version: sinomo_runtime::module::NATIVE_DYLIB_HOST_ABI_VERSION,
-            interface_version:
-                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
-                    .to_string(),
-            activated_at: "2026-08-10T00:00:00Z".to_string(),
-            source: "test upgrade".to_string(),
-        };
-        let cached_v1 = NativeDylibModuleCacheEntry {
-            module_id,
-            content_hash: "provider-v1".to_string(),
-            cache_key: "cloud-files-cache".to_string(),
-            library_name: "sinomo_dfs_cloud_files.dll".to_string(),
-            platform_triple: "x86_64-pc-windows-gnu".to_string(),
-            native_abi_version: sinomo_runtime::module::NATIVE_DYLIB_HOST_ABI_VERSION,
-            interface_version: "sinomo.dfs.cloud-files.v1".to_string(),
-            library_path: PathBuf::from("cache/provider-v1/sinomo_dfs_cloud_files.dll"),
-        };
-        let receipt = CloudFilesRegistrationReceipt {
-            interface_version: "sinomo.dfs.cloud-files.v1".to_string(),
-            sync_root: PathBuf::from("C:\\Sinomo\\Old"),
-            root_path: "/old-root".to_string(),
-            provider_name:
-                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
-                    .to_string(),
-        };
-        let staged_v1 = CloudFilesModuleProvenance::from_cache_entry(&cached_v1);
-
-        let selected = select_cloud_unregister_module_provenance(
-            &receipt,
-            Some(&active_upgrade),
-            &[staged_v1],
-            &[],
-        )
-        .expect("old interface remains cleanup-compatible");
-        assert_eq!(selected.content_hash, "provider-v1");
-        assert_eq!(selected.interface_version, receipt.interface_version);
-        assert_ne!(selected.content_hash, active_upgrade.content_hash);
     }
 
     #[test]
