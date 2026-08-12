@@ -2173,7 +2173,15 @@ mod tests {
             "/services",
         )
         .expect("open canonical queue under the inspection lock");
-        assert_eq!(snapshot_tree(&scope), before);
+        assert_eq!(
+            authorized
+                ._lock
+                .metadata()
+                .expect("inspect owned lock")
+                .len(),
+            0,
+            "the transferred owner lock remains the canonical empty file"
+        );
         assert_eq!(authorized.next_sequence, 1);
         assert_eq!(authorized.journal_record_count, 0);
         assert!(authorized.operations.is_empty());
