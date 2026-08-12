@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, mpsc};
@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use sinomo_runtime::config::{ConfigRegistry, ConfigStore, ConfigWriteTarget};
 use sinomo_runtime::daemon::{DaemonApiClient, DaemonPaths, DaemonServiceRegistryHook};
 use sinomo_runtime::dfs::{
-    SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_STATUS_CONFIG_KEY, SIFS_MOUNT_STATUS_ROUTE, SifsMountConfig,
-    SifsMountPlatform, SifsMountRuntimePhase, SifsMountRuntimeStatus, SifsMountStatusRequest,
-    SifsMountStatusResponse, SifsMountWritebackMode, sifs_mount_config_definition,
-    sifs_mount_status_config_definition,
+    SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE, SIFS_MOUNT_STATUS_CONFIG_KEY,
+    SIFS_MOUNT_STATUS_ROUTE, SifsMountConfig, SifsMountCursorOnlyRecoveryRequest,
+    SifsMountCursorOnlyRecoveryResponse, SifsMountPlatform, SifsMountRuntimePhase,
+    SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
+    SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_status_config_definition,
 };
 #[cfg(any(windows, test))]
 use sinomo_runtime::dfs::{
@@ -49,6 +50,34 @@ const CLOUD_UNREGISTER_RECOVERY_DIR: &str = "cloud-files-unregister-recovery";
 const CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE: &str = "provenance.sobj";
 #[cfg(any(windows, test))]
 const CLOUD_FILES_REGISTRATION_RECEIPT_FILE: &str = "registration.sobj";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_REGISTRATION_JOURNAL_FILE: &str = "registration-journal.sobj";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE: &str = "cursor-recovery-control.sobj";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_FILE: &str = "cloud-files-cursor-recovery.sobj";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_FILE: &str =
+    "cloud-files-cursor-recovery-provider.sobj";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_STAGED_TEMP_FILE: &str =
+    ".cloud-files-registration.staged.sobj.cursor-recovery-next";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_PENDING_TEMP_FILE: &str =
+    ".cloud-files-unregister.pending.sobj.cursor-recovery-next";
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION: u16 = 1;
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES: u64 = 20 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES: u64 = 128 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES: u64 = 160 * 1024 * 1024;
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_HOST_LOCK_MAX_BYTES: u64 = 64 * 1024;
+#[cfg(any(windows, test))]
+const CLOUD_FILES_CURSOR_RECOVERY_HOST_TOKEN_DOMAIN: &str =
+    "sinomo.dfs.cloud-files.cursor-only-recovery.host.v1";
 #[cfg(windows)]
 const MOUNT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 // Give the worker enough time to consume its own bounded mount-stop timeout
@@ -64,7 +93,13 @@ struct SifsMountSupervisorInner {
     status: Arc<RwLock<SifsMountRuntimeStatus>>,
     shutdown: Arc<AtomicBool>,
     mount_cancellation: Arc<Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>>,
+    cursor_recovery: mpsc::SyncSender<SifsMountCursorRecoveryControl>,
     worker: Mutex<Option<SifsMountSupervisorWorker>>,
+}
+
+struct SifsMountCursorRecoveryControl {
+    request: SifsMountCursorOnlyRecoveryRequest,
+    response: mpsc::SyncSender<Result<SifsMountCursorOnlyRecoveryResponse, String>>,
 }
 
 struct SifsMountSupervisorWorker {
@@ -151,6 +186,74 @@ struct StagedCloudRegistrationRecord {
     recovery: PendingCloudUnregisterRecord,
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum HostCursorRecoveryPhase {
+    Requested,
+    ModuleApplied,
+    AdoptedRetained,
+    ArmedAwaitingReady,
+    ReadyObserved,
+    ActiveObserved,
+    AuthorityFinalized,
+    PreservedRetained,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct HostCursorRecoveryMarker {
+    schema_version: u16,
+    disabled_config: SifsMountConfig,
+    module: CloudFilesModuleProvenance,
+    identity: sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity,
+    outer_token: String,
+    inner_token: String,
+    recovery_id: String,
+    inspection: sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    applied: Option<sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ready_artifacts_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preserved_artifacts_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    active_module_marker_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_module_marker_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_registration_artifacts_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_artifacts_fingerprint: Option<String>,
+    /// Monotonic disable/re-enable generation. Initial adoption is cycle zero;
+    /// every forward PreserveState successor increments it exactly once.
+    #[serde(default)]
+    recovery_cycle: u64,
+    /// Exact opaque native `PreservedStateOwned` successor for cycles after
+    /// the initial adoption. The host carries but never interprets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    native_successor_fingerprint: Option<String>,
+    phase: HostCursorRecoveryPhase,
+}
+
+/// The first durable host effect for cursor recovery. Keeping the exact
+/// provider bytes and the complete Requested authorization in one canonical
+/// object makes the cache-loss and marker-publication cuts independently
+/// replayable without trusting whichever loader happens to be active later.
+#[cfg(any(windows, test))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct HostCursorRecoveryProviderBundle {
+    schema_version: u16,
+    requested: HostCursorRecoveryMarker,
+    provider_bytes: Vec<u8>,
+}
+
+#[cfg(any(windows, test))]
+struct HostCursorRecoveryArtifactSnapshot<T> {
+    value: Option<T>,
+    temporary: bool,
+}
+
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[derive(Debug)]
 struct PendingCloudUnregister {
@@ -159,6 +262,19 @@ struct PendingCloudUnregister {
     retry_delay: Duration,
     next_attempt_at: Option<Instant>,
     last_error: Option<String>,
+}
+
+#[cfg(any(windows, test))]
+struct PendingCloudUnregisterArtifactSnapshot {
+    value: Option<PendingCloudUnregisterRecord>,
+    current_present: bool,
+    temporary_present: bool,
+}
+
+#[cfg(any(windows, test))]
+struct CursorRecoveryStagedArtifactSnapshot {
+    current: Option<StagedCloudRegistrationRecord>,
+    temporary: Option<StagedCloudRegistrationRecord>,
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
@@ -292,6 +408,19 @@ fn cloud_unregister_request(
         data_dir_root: Some(data_dir.root()),
         provider_name: sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
             .to_string(),
+        cursor_recovery: None,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_context(
+    marker: &HostCursorRecoveryMarker,
+) -> sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+    sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+        recovery_id: marker.recovery_id.clone(),
+        recovery_token: marker.inner_token.clone(),
+        recovery_cycle: marker.recovery_cycle,
+        native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
     }
 }
 
@@ -325,23 +454,25 @@ fn admit_cloud_files_provider_before_effect_with<R, FEffect>(
     provenance: &CloudFilesModuleProvenance,
     descriptor: &sinomo_runtime::module_api::NativeModuleDescriptor,
     required_operation: &str,
-    require_preserve_capability: bool,
+    required_capability: Option<&str>,
     effect: FEffect,
 ) -> Result<R, String>
 where
     FEffect: FnOnce() -> Result<R, String>,
 {
     validate_cloud_files_provider_descriptor(provenance, descriptor, required_operation)?;
-    if require_preserve_capability
-        && !provider_supports_state_preserving_unregister(
-            &descriptor.interface_version,
-            &descriptor.supported_operations,
-            &descriptor.capabilities,
-        )
-    {
-        return Err(
-            "Cloud Files provider lacks the required v3 preserve-state capability".to_string(),
-        );
+    if let Some(required_capability) = required_capability {
+        if descriptor.interface_version
+            != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+            || !descriptor
+                .capabilities
+                .iter()
+                .any(|capability| capability == required_capability)
+        {
+            return Err(format!(
+                "Cloud Files provider lacks required capability {required_capability}"
+            ));
+        }
     }
     effect()
 }
@@ -488,6 +619,49 @@ fn staged_cloud_registration_record(
 }
 
 #[cfg(any(windows, test))]
+fn staged_cursor_recovery_successor_record(
+    pending: &PendingCloudUnregisterRecord,
+    response: &sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse,
+) -> Result<StagedCloudRegistrationRecord, String> {
+    let current = pending.request.cursor_recovery.as_ref().ok_or_else(|| {
+        "cursor-recovery Retained response requires a context-bound pending intent".to_string()
+    })?;
+    let next = response.cursor_recovery.as_ref().ok_or_else(|| {
+        "cursor-recovery Retained response omitted its native successor context".to_string()
+    })?;
+    let valid_successor_fingerprint =
+        next.native_successor_fingerprint
+            .as_deref()
+            .is_some_and(|value| {
+                value.strip_prefix("blake3:").is_some_and(|hex| {
+                    hex.len() == 64
+                        && hex
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                })
+            });
+    if current.recovery_id != next.recovery_id
+        || current.recovery_token != next.recovery_token
+        || current
+            .recovery_cycle
+            .checked_add(1)
+            .is_none_or(|cycle| cycle != next.recovery_cycle)
+        || !valid_successor_fingerprint
+    {
+        return Err(
+            "cursor-recovery Retained response is not the exact next-cycle native successor"
+                .to_string(),
+        );
+    }
+    let mut successor = pending.clone();
+    successor.request.cursor_recovery = Some(next.clone());
+    let mut retained =
+        staged_cloud_registration_record(&successor, StagedCloudRegistrationState::RetainedAbsent)?;
+    retained.recovery.legacy_prejournal_origin = None;
+    Ok(retained)
+}
+
+#[cfg(any(windows, test))]
 fn staged_state_after_unregister_response(
     record: &PendingCloudUnregisterRecord,
     _staged: &StagedCloudRegistrationRecord,
@@ -507,6 +681,15 @@ fn staged_state_after_unregister_response(
             CloudUnregisterCompletion::StatePreserved(response),
         ) if response.outcome == CloudFilesPreserveStateUnregisterOutcome::Retained => {
             Ok(Some(StagedCloudRegistrationState::RetainedAbsent))
+        }
+        (
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            CloudUnregisterCompletion::StatePreserved(response),
+        ) if response.outcome == CloudFilesPreserveStateUnregisterOutcome::Released
+            && record.request.cursor_recovery.is_some() =>
+        {
+            Err("cursor-bound PreserveState may only complete with the exact Retained successor"
+                .to_string())
         }
         (
             SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
@@ -544,16 +727,28 @@ where
     }
     let next_state = staged_state_after_unregister_response(pending, staged, response)?;
     if next_state == Some(StagedCloudRegistrationState::RetainedAbsent) {
-        let mut retained = staged_cloud_registration_record(
-            pending,
-            StagedCloudRegistrationState::RetainedAbsent,
-        )?;
+        let mut retained = match response {
+            CloudUnregisterCompletion::StatePreserved(response)
+                if pending.request.cursor_recovery.is_some() =>
+            {
+                staged_cursor_recovery_successor_record(pending, response)?
+            }
+            _ => staged_cloud_registration_record(
+                pending,
+                StagedCloudRegistrationState::RetainedAbsent,
+            )?,
+        };
         // A typed Retained response proves that the module found or normalized
         // its exact journal to StateOwned. Legacy pre-journal ambiguity is now
         // discharged; the original v2 provider is no longer cleanup authority.
         retained.recovery.legacy_prejournal_origin = None;
-        replace_staged_cloud_registration_record(data_dir, staged, &retained)?;
+        if pending.request.cursor_recovery.is_some() {
+            transition_or_promote_cursor_recovery_staged_record(data_dir, staged, &retained)?;
+        } else {
+            replace_staged_cloud_registration_record(data_dir, staged, &retained)?;
+        }
         after_first_durable_step()?;
+        advance_host_cursor_recovery_preserved_successor(data_dir, pending, &retained)?;
         clear_pending_cloud_unregister_record(data_dir, pending)?;
         remove_discharged_legacy_recovery_module(data_dir, pending);
     } else {
@@ -591,21 +786,173 @@ fn finish_already_applied_retained_completion(
     pending: &PendingCloudUnregisterRecord,
     staged: &StagedCloudRegistrationRecord,
 ) -> Result<bool, String> {
+    if !is_already_applied_retained_completion(pending, staged) {
+        return Ok(false);
+    }
+    // Crash after fsyncing the typed Retained transition but before clearing
+    // the pending intent. RetainedAbsent is the durable completion proof.
+    advance_host_cursor_recovery_preserved_successor(data_dir, pending, staged)?;
+    clear_pending_cloud_unregister_record(data_dir, pending)?;
+    remove_discharged_legacy_recovery_module(data_dir, pending);
+    Ok(true)
+}
+
+#[cfg(any(windows, test))]
+fn is_already_applied_retained_completion(
+    pending: &PendingCloudUnregisterRecord,
+    staged: &StagedCloudRegistrationRecord,
+) -> bool {
+    let legacy_successor = staged.recovery.legacy_prejournal_origin.is_none()
+        && pending.legacy_prejournal_origin.is_some();
+    let cursor_successor = match (
+        pending.request.cursor_recovery.as_ref(),
+        staged.recovery.request.cursor_recovery.as_ref(),
+    ) {
+        (Some(current), Some(next)) => {
+            current.recovery_id == next.recovery_id
+                && current.recovery_token == next.recovery_token
+                && current
+                    .recovery_cycle
+                    .checked_add(1)
+                    .is_some_and(|cycle| cycle == next.recovery_cycle)
+        }
+        _ => false,
+    };
     if staged.state != StagedCloudRegistrationState::RetainedAbsent
-        || staged.recovery.legacy_prejournal_origin.is_some()
-        || pending.legacy_prejournal_origin.is_none()
+        || (!legacy_successor && !cursor_successor)
         || !same_cloud_registration_base_identity(&staged.recovery, pending)
         || staged.recovery.module != pending.module
         || pending.operation
             != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
     {
-        return Ok(false);
+        return false;
     }
-    // Crash after fsyncing the typed Retained transition but before clearing
-    // the pending intent. RetainedAbsent is the durable completion proof.
-    clear_pending_cloud_unregister_record(data_dir, pending)?;
-    remove_discharged_legacy_recovery_module(data_dir, pending);
-    Ok(true)
+    true
+}
+
+#[cfg(any(windows, test))]
+fn advance_host_cursor_recovery_preserved_successor(
+    data_dir: &SinomoDataDir,
+    pending: &PendingCloudUnregisterRecord,
+    retained: &StagedCloudRegistrationRecord,
+) -> Result<(), String> {
+    let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    let Some(mut marker) = marker_snapshot.value else {
+        if pending.request.cursor_recovery.is_some() {
+            return Err(
+                "cursor-recovery retained successor lost its durable host authorization"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    };
+    let pending_context = pending.request.cursor_recovery.as_ref().ok_or_else(|| {
+        "host cursor-recovery preserve successor lacks its pending cycle context".to_string()
+    })?;
+    let retained_context = retained
+        .recovery
+        .request
+        .cursor_recovery
+        .as_ref()
+        .ok_or_else(|| {
+            "host cursor-recovery retained successor lacks its native cycle context".to_string()
+        })?;
+    let exact_context_identity = pending_context.recovery_id == marker.recovery_id
+        && pending_context.recovery_token == marker.inner_token
+        && retained_context.recovery_id == marker.recovery_id
+        && retained_context.recovery_token == marker.inner_token
+        && pending_context
+            .recovery_cycle
+            .checked_add(1)
+            .is_some_and(|cycle| cycle == retained_context.recovery_cycle);
+    if retained.state != StagedCloudRegistrationState::RetainedAbsent
+        || retained.recovery.module != marker.module
+        || retained.recovery.request.sync_root != marker.identity.sync_root
+        || retained.recovery.request.root_path != marker.identity.root_path
+        || retained.recovery.request.data_dir_root.as_ref()
+            != Some(&marker.identity.data_dir_root)
+        || retained.recovery.request.provider_name != marker.identity.provider_name
+        || !same_cloud_registration_base_identity(&retained.recovery, pending)
+        || pending.operation
+            != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        || !exact_context_identity
+    {
+        return Err(
+            "RetainedAbsent cursor-recovery successor does not match the exact host authorization"
+                .to_string(),
+        );
+    }
+    let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    if bundle_snapshot.temporary {
+        return Err(
+            "cursor-recovery preserve successor found an unpromoted provider bundle".to_string(),
+        );
+    }
+    let bundle = bundle_snapshot.value.as_ref().ok_or_else(|| {
+        "cursor-recovery preserve successor lost its provider authorization bundle".to_string()
+    })?;
+    validate_host_cursor_recovery_bundle_link(&marker, bundle)?;
+    let fingerprint = cloud_files_preserved_artifacts_fingerprint(data_dir)?;
+    if marker.phase == HostCursorRecoveryPhase::PreservedRetained {
+        if marker.recovery_cycle != retained_context.recovery_cycle
+            || pending_context
+                .recovery_cycle
+                .checked_add(1)
+                .is_none_or(|cycle| cycle != marker.recovery_cycle)
+            || marker.native_successor_fingerprint != retained_context.native_successor_fingerprint
+            || marker.preserved_artifacts_fingerprint.as_ref() != Some(&fingerprint)
+        {
+            return Err(
+                "preserved cursor-recovery successor changed before pending cleanup".to_string(),
+            );
+        }
+        if marker_snapshot.temporary {
+            promote_host_cursor_recovery_marker(data_dir, &marker)?;
+        }
+        return Ok(());
+    }
+    if marker_snapshot.temporary {
+        return Err(
+            "cursor-recovery preserve found a non-PreservedRetained host successor temp"
+                .to_string(),
+        );
+    }
+    if !matches!(
+        marker.phase,
+        HostCursorRecoveryPhase::ArmedAwaitingReady
+            | HostCursorRecoveryPhase::ReadyObserved
+            | HostCursorRecoveryPhase::ActiveObserved
+    ) {
+        return Err(format!(
+            "cursor recovery {} cannot enter PreservedRetained from {:?}",
+            marker.recovery_id, marker.phase
+        ));
+    }
+    if pending_context.recovery_cycle != marker.recovery_cycle
+        || retained_context.recovery_cycle
+            != marker
+                .recovery_cycle
+                .checked_add(1)
+                .ok_or_else(|| "cursor-recovery preserve cycle overflowed".to_string())?
+        || retained_context.native_successor_fingerprint.is_none()
+    {
+        return Err(
+            "Retained cursor-recovery response is not the exact native cycle successor".to_string(),
+        );
+    }
+    marker.phase = HostCursorRecoveryPhase::PreservedRetained;
+    marker.ready_artifacts_fingerprint = None;
+    marker.preserved_artifacts_fingerprint = Some(fingerprint);
+    marker.active_module_marker_fingerprint = None;
+    marker.completion_module_marker_fingerprint = None;
+    marker.completion_registration_artifacts_fingerprint = None;
+    marker.completed_artifacts_fingerprint = None;
+    marker.native_successor_fingerprint = retained_context.native_successor_fingerprint.clone();
+    marker.recovery_cycle = marker
+        .recovery_cycle
+        .checked_add(1)
+        .ok_or_else(|| "cursor-recovery preserve cycle overflowed".to_string())?;
+    persist_host_cursor_recovery_marker(data_dir, &marker)
 }
 
 #[cfg(any(windows, test))]
@@ -641,13 +988,116 @@ impl CloudFilesModuleProvenance {
         }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     fn matches_cache_entry(
         &self,
         entry: &sinomo_runtime::module::NativeDylibModuleCacheEntry,
     ) -> bool {
         self == &Self::from_cache_entry(entry)
     }
+}
+
+#[cfg(any(windows, test))]
+fn hash_host_cursor_recovery_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_provenance_fingerprint(
+    provenance: &CloudFilesModuleProvenance,
+) -> Result<String, String> {
+    let encoded = sinomo_runtime::module_api::encode_sobj(provenance)
+        .map_err(|error| format!("encode Cloud Files provider provenance: {error}"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.provider-provenance.v1\0");
+    hash_host_cursor_recovery_field(&mut hasher, &encoded);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+fn disabled_mount_config_fingerprint(config: &SifsMountConfig) -> Result<String, String> {
+    if config.enabled {
+        return Err("cursor recovery requires a disabled mount configuration".to_string());
+    }
+    let encoded = sinomo_runtime::module_api::encode_sobj(config)
+        .map_err(|error| format!("encode disabled mount configuration: {error}"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.disabled-config.v1\0");
+    hash_host_cursor_recovery_field(&mut hasher, &encoded);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_outer_token(
+    config: &SifsMountConfig,
+    provenance: &CloudFilesModuleProvenance,
+    host_lock_bytes: &[u8],
+    identity: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity,
+    inspection: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection,
+) -> Result<String, String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CLOUD_FILES_CURSOR_RECOVERY_HOST_TOKEN_DOMAIN.as_bytes());
+    hasher.update(&[0]);
+    for bytes in [
+        sinomo_runtime::module_api::encode_sobj(config)
+            .map_err(|error| format!("encode token config: {error}"))?,
+        sinomo_runtime::module_api::encode_sobj(provenance)
+            .map_err(|error| format!("encode token provenance: {error}"))?,
+        sinomo_runtime::module_api::encode_sobj(identity)
+            .map_err(|error| format!("encode token identity: {error}"))?,
+        sinomo_runtime::module_api::encode_sobj(inspection)
+            .map_err(|error| format!("encode token inspection: {error}"))?,
+    ] {
+        hash_host_cursor_recovery_field(&mut hasher, &bytes);
+    }
+    hash_host_cursor_recovery_field(&mut hasher, inspection.recovery_token.as_bytes());
+    hash_host_cursor_recovery_field(&mut hasher, host_lock_bytes);
+    // Domain-bind the exact negative host topology observed while the
+    // pre-existing mount lock is held. Fresh inspection has already proven
+    // each path physically absent with symlink_metadata.
+    for absent in [
+        PENDING_CLOUD_UNREGISTER_FILE,
+        CLOUD_FILES_CURSOR_RECOVERY_PENDING_TEMP_FILE,
+        STAGED_CLOUD_REGISTRATION_FILE,
+        CLOUD_FILES_CURSOR_RECOVERY_STAGED_TEMP_FILE,
+        CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_FILE,
+        ".cloud-files-cursor-recovery.sobj.cursor-recovery-host-next",
+        CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_FILE,
+        ".cloud-files-cursor-recovery-provider.sobj.cursor-recovery-provider-next",
+        CLOUD_FILES_REGISTRATION_RECEIPT_FILE,
+        CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+        CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        CLOUD_UNREGISTER_RECOVERY_DIR,
+    ] {
+        hash_host_cursor_recovery_field(&mut hasher, absent.as_bytes());
+        hash_host_cursor_recovery_field(&mut hasher, b"physically-absent");
+    }
+    // Bind the exact directory-enumeration predicate proved by
+    // require_fresh_host_cursor_recovery_absence. A future predicate change is
+    // therefore a token-domain change rather than an implicit weakening.
+    let forbidden_dfs_crash_patterns = [
+        ".cloud-files-registration.staged.sobj.",
+        ".cloud-files-unregister.pending.sobj.",
+        ".cloud-files-cursor-recovery",
+    ];
+    hash_host_cursor_recovery_field(&mut hasher, b"no-unclassified-dfs-crash-evidence.v1");
+    hash_host_cursor_recovery_field(
+        &mut hasher,
+        &(forbidden_dfs_crash_patterns.len() as u64).to_le_bytes(),
+    );
+    for pattern in forbidden_dfs_crash_patterns {
+        hash_host_cursor_recovery_field(&mut hasher, pattern.as_bytes());
+    }
+    Ok(format!("v1:blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+fn deterministic_host_cursor_recovery_id(outer_token: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-only-recovery.host-id.v1\0");
+    hash_host_cursor_recovery_field(&mut hasher, outer_token.as_bytes());
+    format!("cursor-recovery-{}", hasher.finalize().to_hex())
 }
 
 #[cfg(any(windows, test))]
@@ -786,6 +1236,244 @@ fn stage_cloud_unregister_recovery_module(
 }
 
 #[cfg(any(windows, test))]
+fn cursor_recovery_pin_temp_path(path: &Path) -> Result<PathBuf, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cursor-recovery pin path {} has no parent", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "cursor-recovery pin path {} has no file name",
+                path.display()
+            )
+        })?;
+    Ok(parent.join(format!(".{name}.cursor-recovery-pin-next")))
+}
+
+#[cfg(any(windows, test))]
+fn persist_exact_cursor_recovery_pin_file(
+    path: &Path,
+    expected: &[u8],
+    maximum_bytes: u64,
+    label: &str,
+) -> Result<(), String> {
+    if expected.len() as u64 > maximum_bytes {
+        return Err(format!("{label} exceeds its {maximum_bytes}-byte bound"));
+    }
+    let temporary = cursor_recovery_pin_temp_path(path)?;
+    let current = read_bounded_plain_host_file(path, maximum_bytes, label)?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        maximum_bytes,
+        &format!("{label} temporary file"),
+    )?;
+    if current.as_deref().is_some_and(|bytes| bytes != expected)
+        || staged.as_deref().is_some_and(|bytes| bytes != expected)
+    {
+        return Err(format!(
+            "cursor-recovery pin {} contains changed or unrecognized bytes",
+            path.display()
+        ));
+    }
+    match (current.is_some(), staged.is_some()) {
+        (true, false) => return Ok(()),
+        (true, true) => {
+            std::fs::remove_file(&temporary).map_err(|error| {
+                format!(
+                    "clear exact replayed {label} temporary file {}: {error}",
+                    temporary.display()
+                )
+            })?;
+            if let Some(parent) = path.parent() {
+                sync_pending_cloud_unregister_directory(parent)?;
+            }
+            return Ok(());
+        }
+        (false, true) => {
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, path)
+                .map_err(|error| format!("promote exact {label} {}: {error}", path.display()))?;
+            if let Some(parent) = path.parent() {
+                sync_pending_cloud_unregister_directory(parent)?;
+            }
+            return Ok(());
+        }
+        (false, false) => {}
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "create exact {label} temporary file {}: {error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(expected)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist exact {label} temporary file {}: {error}",
+                temporary.display()
+            )
+        })?;
+    if let Some(parent) = path.parent() {
+        sync_pending_cloud_unregister_directory(parent)?;
+    }
+    sinomo_runtime::storage::durable_file::replace_file(&temporary, path)
+        .map_err(|error| format!("commit exact {label} {}: {error}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        sync_pending_cloud_unregister_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_cursor_recovery_pin_topology(
+    data_dir: &SinomoDataDir,
+    provenance: &CloudFilesModuleProvenance,
+    allow_temps: bool,
+) -> Result<(), String> {
+    let recovery_root = data_dir.dfs_dir().join(CLOUD_UNREGISTER_RECOVERY_DIR);
+    ensure_plain_existing_host_path(&recovery_root, true, "cursor-recovery provider root")?;
+    let variant = cloud_unregister_recovery_variant_dir(data_dir, provenance)?;
+    let expected_variant = variant
+        .file_name()
+        .ok_or_else(|| "cursor-recovery provider variant has no name".to_string())?;
+    let mut root_entries = std::fs::read_dir(&recovery_root)
+        .map_err(|error| format!("enumerate cursor-recovery provider root: {error}"))?;
+    let only = root_entries
+        .next()
+        .transpose()
+        .map_err(|error| format!("enumerate cursor-recovery provider root: {error}"))?
+        .ok_or_else(|| "cursor-recovery provider root is empty".to_string())?;
+    if only.file_name() != expected_variant || root_entries.next().is_some() {
+        return Err(
+            "cursor-recovery provider root contains another provider or unknown topology"
+                .to_string(),
+        );
+    }
+    ensure_plain_existing_host_path(&variant, true, "cursor-recovery provider variant")?;
+    let library_temp = cursor_recovery_pin_temp_path(&variant.join(&provenance.library_name))?;
+    let provenance_temp =
+        cursor_recovery_pin_temp_path(&variant.join(CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE))?;
+    let mut allowed = vec![
+        provenance.library_name.clone(),
+        CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE.to_string(),
+    ];
+    if allow_temps {
+        allowed.push(
+            library_temp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "cursor-recovery provider library temp name is invalid".to_string())?
+                .to_string(),
+        );
+        allowed.push(
+            provenance_temp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    "cursor-recovery provider provenance temp name is invalid".to_string()
+                })?
+                .to_string(),
+        );
+    }
+    let mut observed = Vec::new();
+    for entry in std::fs::read_dir(&variant)
+        .map_err(|error| format!("enumerate cursor-recovery provider variant: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("read provider variant entry: {error}"))?;
+        ensure_plain_existing_host_path(&entry.path(), false, "cursor-recovery provider entry")?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "cursor-recovery provider entry name is not UTF-8".to_string())?;
+        if !allowed.contains(&name) {
+            return Err(format!(
+                "cursor-recovery provider variant contains unknown entry {name}"
+            ));
+        }
+        observed.push(name);
+    }
+    observed.sort();
+    observed.dedup();
+    if !allow_temps {
+        let mut expected = vec![
+            provenance.library_name.clone(),
+            CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE.to_string(),
+        ];
+        expected.sort();
+        if observed != expected {
+            return Err("cursor-recovery provider variant is incomplete".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn materialize_cursor_recovery_provider_bundle(
+    data_dir: &SinomoDataDir,
+    bundle: &HostCursorRecoveryProviderBundle,
+) -> Result<PathBuf, String> {
+    validate_host_cursor_recovery_marker(&bundle.requested)?;
+    if sinomo_runtime::module::native_module_content_hash(&bundle.provider_bytes)
+        != bundle.requested.module.content_hash
+    {
+        return Err("cursor-recovery provider bundle bytes changed".to_string());
+    }
+    let recovery_root = data_dir.dfs_dir().join(CLOUD_UNREGISTER_RECOVERY_DIR);
+    if let Err(error) = std::fs::symlink_metadata(&recovery_root) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("inspect cursor-recovery provider root: {error}"));
+        }
+        std::fs::create_dir(&recovery_root)
+            .map_err(|error| format!("create cursor-recovery provider root: {error}"))?;
+        sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+    } else {
+        ensure_plain_existing_host_path(&recovery_root, true, "cursor-recovery provider root")?;
+    }
+    let variant = cloud_unregister_recovery_variant_dir(data_dir, &bundle.requested.module)?;
+    if let Err(error) = std::fs::symlink_metadata(&variant) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(format!("inspect cursor-recovery provider variant: {error}"));
+        }
+        if std::fs::read_dir(&recovery_root)
+            .map_err(|error| format!("enumerate cursor-recovery provider root: {error}"))?
+            .next()
+            .is_some()
+        {
+            return Err(
+                "cursor-recovery provider root already contains another variant".to_string(),
+            );
+        }
+        std::fs::create_dir(&variant)
+            .map_err(|error| format!("create cursor-recovery provider variant: {error}"))?;
+        sync_pending_cloud_unregister_directory(&recovery_root)?;
+    } else {
+        validate_cursor_recovery_pin_topology(data_dir, &bundle.requested.module, true)?;
+    }
+    let provenance_bytes = sinomo_runtime::module_api::encode_sobj(&bundle.requested.module)
+        .map_err(|error| format!("encode cursor-recovery provider provenance: {error}"))?;
+    persist_exact_cursor_recovery_pin_file(
+        &variant.join(&bundle.requested.module.library_name),
+        &bundle.provider_bytes,
+        CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES,
+        "cursor-recovery provider library",
+    )?;
+    persist_exact_cursor_recovery_pin_file(
+        &variant.join(CLOUD_UNREGISTER_RECOVERY_PROVENANCE_FILE),
+        &provenance_bytes,
+        64 * 1024,
+        "cursor-recovery provider provenance",
+    )?;
+    validate_cursor_recovery_pin_topology(data_dir, &bundle.requested.module, false)?;
+    verify_cloud_unregister_recovery_module(data_dir, &bundle.requested.module)
+}
+
+#[cfg(any(windows, test))]
 fn persist_recovery_file_if_absent(
     path: &Path,
     bytes: &[u8],
@@ -843,7 +1531,7 @@ fn persist_recovery_file_if_absent(
     write_result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn ensure_cloud_unregister_recovery_module(
     data_dir: &SinomoDataDir,
     provenance: &CloudFilesModuleProvenance,
@@ -911,6 +1599,1093 @@ fn pending_cloud_unregister_path(data_dir: &SinomoDataDir) -> PathBuf {
 #[cfg(any(windows, test))]
 fn staged_cloud_registration_path(data_dir: &SinomoDataDir) -> PathBuf {
     data_dir.dfs_dir().join(STAGED_CLOUD_REGISTRATION_FILE)
+}
+
+#[cfg(any(windows, test))]
+fn cursor_recovery_staged_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join(CLOUD_FILES_CURSOR_RECOVERY_STAGED_TEMP_FILE)
+}
+
+#[cfg(any(windows, test))]
+fn cursor_recovery_pending_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join(CLOUD_FILES_CURSOR_RECOVERY_PENDING_TEMP_FILE)
+}
+
+#[cfg(any(windows, test))]
+fn require_cursor_recovery_pending_intent_absent(
+    data_dir: &SinomoDataDir,
+    boundary: &str,
+) -> Result<(), String> {
+    require_physically_absent(
+        &pending_cloud_unregister_path(data_dir),
+        &format!("pending Cloud Files unregister at {boundary}"),
+    )?;
+    require_physically_absent(
+        &cursor_recovery_pending_temp_path(data_dir),
+        &format!("pending Cloud Files cursor-recovery temporary intent at {boundary}"),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_marker_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join(CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_FILE)
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_marker_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_dir().join(format!(
+        ".{CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_FILE}.cursor-recovery-host-next"
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_provider_bundle_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join(CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_FILE)
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_provider_bundle_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir.dfs_dir().join(format!(
+        ".{CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_FILE}.cursor-recovery-provider-next"
+    ))
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_module_runtime_path(data_dir: &SinomoDataDir, file_name: &str) -> PathBuf {
+    data_dir
+        .module_runtime_dir()
+        .join(sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(file_name)
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_cursor_recovery_module_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cloud_files_module_runtime_path(
+        data_dir,
+        ".cursor-recovery-control.sobj.cursor-recovery-marker-next",
+    )
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_registration_journal_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cloud_files_module_runtime_path(
+        data_dir,
+        ".registration-journal.sobj.registration-journal-next",
+    )
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_registration_receipt_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cloud_files_module_runtime_path(data_dir, ".registration.sobj.registration-receipt-next")
+}
+
+#[cfg(any(windows, test))]
+fn require_physically_absent(path: &Path, label: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {label} {}: {error}", path.display())),
+        Ok(_) => Err(format!(
+            "{label} {} must be physically absent (including dangling links and reparse points)",
+            path.display()
+        )),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn require_fresh_host_cursor_recovery_absence(data_dir: &SinomoDataDir) -> Result<(), String> {
+    for (path, label) in [
+        (
+            pending_cloud_unregister_path(data_dir),
+            "pending Cloud Files unregister",
+        ),
+        (
+            data_dir
+                .dfs_dir()
+                .join(CLOUD_FILES_CURSOR_RECOVERY_PENDING_TEMP_FILE),
+            "pending Cloud Files cursor-recovery temporary intent",
+        ),
+        (
+            staged_cloud_registration_path(data_dir),
+            "staged Cloud Files ownership",
+        ),
+        (
+            host_cursor_recovery_marker_path(data_dir),
+            "host cursor-recovery marker",
+        ),
+        (
+            host_cursor_recovery_marker_temp_path(data_dir),
+            "host cursor-recovery temporary marker",
+        ),
+        (
+            host_cursor_recovery_provider_bundle_path(data_dir),
+            "host cursor-recovery provider bundle",
+        ),
+        (
+            host_cursor_recovery_provider_bundle_temp_path(data_dir),
+            "host cursor-recovery provider temporary bundle",
+        ),
+        (
+            data_dir.dfs_dir().join(CLOUD_UNREGISTER_RECOVERY_DIR),
+            "Cloud Files unregister recovery tree",
+        ),
+        (
+            cloud_files_registration_receipt_path(data_dir),
+            "Cloud Files registration receipt",
+        ),
+        (
+            cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            "Cloud Files registration journal",
+        ),
+        (
+            cloud_files_module_runtime_path(
+                data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ),
+            "module cursor-recovery marker",
+        ),
+    ] {
+        require_physically_absent(&path, label)?;
+    }
+    let dfs_dir = data_dir.dfs_dir();
+    let entries = std::fs::read_dir(&dfs_dir)
+        .map_err(|error| format!("enumerate DFS directory {}: {error}", dfs_dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read DFS directory entry: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "DFS directory contains a non-UTF-8 entry".to_string())?;
+        let staged_prefix = format!(".{STAGED_CLOUD_REGISTRATION_FILE}.");
+        let pending_prefix = format!(".{PENDING_CLOUD_UNREGISTER_FILE}.");
+        if name == CLOUD_FILES_CURSOR_RECOVERY_STAGED_TEMP_FILE
+            || name.starts_with(&staged_prefix)
+            || name.starts_with(&pending_prefix)
+            || name.starts_with(".cloud-files-cursor-recovery")
+        {
+            return Err(format!(
+                "fresh cursor recovery found unclassified DFS crash evidence `{name}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn read_bounded_plain_host_file(
+    path: &Path,
+    maximum_bytes: u64,
+    label: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("inspect {label} {}: {error}", path.display())),
+    };
+    ensure_plain_existing_host_path(path, false, label)?;
+    if metadata.len() > maximum_bytes {
+        return Err(format!(
+            "{label} {} is {} bytes; maximum is {maximum_bytes}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(false)
+        .read(true)
+        .open(path)
+        .map_err(|error| format!("open {label} {}: {error}", path.display()))?;
+    let handle_length = file
+        .metadata()
+        .map_err(|error| format!("inspect open {label} {}: {error}", path.display()))?
+        .len();
+    if handle_length != metadata.len() || handle_length > maximum_bytes {
+        return Err(format!(
+            "{label} {} changed while it was inspected",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(handle_length as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("read {label} {}: {error}", path.display()))?;
+    if bytes.len() as u64 != handle_length {
+        return Err(format!(
+            "{label} {} changed while it was read",
+            path.display()
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(any(windows, test))]
+fn decode_host_cursor_recovery_provider_bundle(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<HostCursorRecoveryProviderBundle, String> {
+    if bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES {
+        return Err(format!(
+            "host cursor-recovery provider bundle {} exceeds {} bytes",
+            path.display(),
+            CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES
+        ));
+    }
+    let bundle: HostCursorRecoveryProviderBundle = sinomo_runtime::module_api::decode_sobj(bytes)
+        .map_err(|error| {
+        format!(
+            "decode host cursor-recovery provider bundle {}: {error}",
+            path.display()
+        )
+    })?;
+    let canonical = sinomo_runtime::module_api::encode_sobj(&bundle)
+        .map_err(|error| format!("re-encode cursor-recovery provider bundle: {error}"))?;
+    if canonical != bytes {
+        return Err(format!(
+            "host cursor-recovery provider bundle {} is not canonical",
+            path.display()
+        ));
+    }
+    validate_host_cursor_recovery_marker(&bundle.requested)?;
+    if bundle.schema_version != CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION
+        || bundle.requested.phase != HostCursorRecoveryPhase::Requested
+        || bundle.requested.applied.is_some()
+        || bundle.provider_bytes.is_empty()
+        || bundle.provider_bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES
+        || sinomo_runtime::module::native_module_content_hash(&bundle.provider_bytes)
+            != bundle.requested.module.content_hash
+    {
+        return Err(
+            "host cursor-recovery provider bundle does not exactly bind its Requested authorization and provider bytes"
+                .to_string(),
+        );
+    }
+    Ok(bundle)
+}
+
+#[cfg(any(windows, test))]
+fn inspect_host_cursor_recovery_provider_bundle_for_resume(
+    data_dir: &SinomoDataDir,
+) -> Result<HostCursorRecoveryArtifactSnapshot<HostCursorRecoveryProviderBundle>, String> {
+    let path = host_cursor_recovery_provider_bundle_path(data_dir);
+    let temporary = host_cursor_recovery_provider_bundle_temp_path(data_dir);
+    let current = read_bounded_plain_host_file(
+        &path,
+        CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES,
+        "host cursor-recovery provider bundle",
+    )?
+    .map(|bytes| decode_host_cursor_recovery_provider_bundle(&path, &bytes))
+    .transpose()?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES,
+        "host cursor-recovery provider temporary bundle",
+    )?
+    .map(|bytes| decode_host_cursor_recovery_provider_bundle(&temporary, &bytes))
+    .transpose()?;
+    match (current, staged) {
+        (None, None) => Ok(HostCursorRecoveryArtifactSnapshot {
+            value: None,
+            temporary: false,
+        }),
+        (Some(current), None) => Ok(HostCursorRecoveryArtifactSnapshot {
+            value: Some(current),
+            temporary: false,
+        }),
+        (None, Some(staged)) => Ok(HostCursorRecoveryArtifactSnapshot {
+            value: Some(staged),
+            temporary: true,
+        }),
+        (Some(_), Some(_)) => Err(
+            "both final and temporary cursor-recovery provider bundles exist; refusing ambiguous replay"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn promote_host_cursor_recovery_provider_bundle(
+    data_dir: &SinomoDataDir,
+    expected: &HostCursorRecoveryProviderBundle,
+) -> Result<(), String> {
+    let snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    if snapshot.value.as_ref() != Some(expected) {
+        return Err("cursor-recovery provider bundle changed before promotion".to_string());
+    }
+    if snapshot.temporary {
+        sinomo_runtime::storage::durable_file::replace_file(
+            &host_cursor_recovery_provider_bundle_temp_path(data_dir),
+            &host_cursor_recovery_provider_bundle_path(data_dir),
+        )
+        .map_err(|error| format!("promote cursor-recovery provider bundle: {error}"))?;
+        sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+    }
+
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn persist_host_cursor_recovery_provider_bundle(
+    data_dir: &SinomoDataDir,
+    bundle: &HostCursorRecoveryProviderBundle,
+) -> Result<(), String> {
+    validate_host_cursor_recovery_marker(&bundle.requested)?;
+    let snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    if let Some(existing) = snapshot.value {
+        return if existing == *bundle {
+            promote_host_cursor_recovery_provider_bundle(data_dir, bundle)
+        } else {
+            Err(
+                "durable cursor-recovery provider bundle belongs to another authorization"
+                    .to_string(),
+            )
+        };
+    }
+    let bytes = sinomo_runtime::module_api::encode_sobj(bundle)
+        .map_err(|error| format!("encode cursor-recovery provider bundle: {error}"))?;
+    if bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES {
+        return Err(format!(
+            "cursor-recovery provider bundle is {} bytes; maximum is {}",
+            bytes.len(),
+            CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_BUNDLE_MAX_BYTES
+        ));
+    }
+    // Decode our exact durable image before making it the first host effect, so
+    // eligibility can never succeed for an authorization that cannot replay.
+    let temporary = host_cursor_recovery_provider_bundle_temp_path(data_dir);
+    let expected = decode_host_cursor_recovery_provider_bundle(&temporary, &bytes)?;
+    if expected != *bundle {
+        return Err("cursor-recovery provider bundle failed canonical round-trip".to_string());
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "create cursor-recovery provider temporary bundle {}: {error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist cursor-recovery provider temporary bundle {}: {error}",
+                temporary.display()
+            )
+        })?;
+    sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+    promote_host_cursor_recovery_provider_bundle(data_dir, bundle)?;
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn decode_host_cursor_recovery_marker(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<HostCursorRecoveryMarker, String> {
+    if bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES {
+        return Err(format!(
+            "host cursor-recovery marker {} exceeds {} bytes",
+            path.display(),
+            CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES
+        ));
+    }
+    let marker: HostCursorRecoveryMarker =
+        sinomo_runtime::module_api::decode_sobj(bytes).map_err(|error| {
+            format!(
+                "decode host cursor-recovery marker {}: {error}",
+                path.display()
+            )
+        })?;
+    let canonical = sinomo_runtime::module_api::encode_sobj(&marker)
+        .map_err(|error| format!("re-encode host cursor-recovery marker: {error}"))?;
+    if canonical != bytes {
+        return Err(format!(
+            "host cursor-recovery marker {} is not canonical",
+            path.display()
+        ));
+    }
+    validate_host_cursor_recovery_marker(&marker)?;
+    Ok(marker)
+}
+
+#[cfg(any(windows, test))]
+fn load_host_cursor_recovery_marker_strict(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<HostCursorRecoveryMarker>, String> {
+    let path = host_cursor_recovery_marker_path(data_dir);
+    require_physically_absent(
+        &host_cursor_recovery_marker_temp_path(data_dir),
+        "host cursor-recovery temporary marker",
+    )?;
+    let Some(bytes) = read_bounded_plain_host_file(
+        &path,
+        CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES,
+        "host cursor-recovery marker",
+    )?
+    else {
+        return Ok(None);
+    };
+    decode_host_cursor_recovery_marker(&path, &bytes).map(Some)
+}
+
+#[cfg(any(windows, test))]
+fn inspect_host_cursor_recovery_marker_for_resume(
+    data_dir: &SinomoDataDir,
+) -> Result<HostCursorRecoveryArtifactSnapshot<HostCursorRecoveryMarker>, String> {
+    let path = host_cursor_recovery_marker_path(data_dir);
+    let temporary = host_cursor_recovery_marker_temp_path(data_dir);
+    let current = read_bounded_plain_host_file(
+        &path,
+        CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES,
+        "host cursor-recovery marker",
+    )?
+    .map(|bytes| decode_host_cursor_recovery_marker(&path, &bytes))
+    .transpose()?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES,
+        "host cursor-recovery temporary marker",
+    )?
+    .map(|bytes| decode_host_cursor_recovery_marker(&temporary, &bytes))
+    .transpose()?;
+    let Some(staged) = staged else {
+        return Ok(HostCursorRecoveryArtifactSnapshot {
+            value: current,
+            temporary: false,
+        });
+    };
+    if let Some(current) = current.as_ref() {
+        validate_host_cursor_recovery_transition(current, &staged)?;
+    } else if staged.phase != HostCursorRecoveryPhase::Requested || staged.applied.is_some() {
+        return Err(
+            "initial host cursor-recovery temporary marker is not the exact Requested authorization"
+                .to_string(),
+        );
+    }
+    Ok(HostCursorRecoveryArtifactSnapshot {
+        value: Some(staged),
+        temporary: true,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn promote_host_cursor_recovery_marker(
+    data_dir: &SinomoDataDir,
+    expected: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    let snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    if snapshot.value.as_ref() != Some(expected) {
+        return Err("host cursor-recovery marker changed before promotion".to_string());
+    }
+    if snapshot.temporary {
+        sinomo_runtime::storage::durable_file::replace_file(
+            &host_cursor_recovery_marker_temp_path(data_dir),
+            &host_cursor_recovery_marker_path(data_dir),
+        )
+        .map_err(|error| format!("promote exact host cursor-recovery marker: {error}"))?;
+        sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn persist_host_cursor_recovery_marker(
+    data_dir: &SinomoDataDir,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    let snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    if let Some(current) = snapshot.value.as_ref() {
+        if snapshot.temporary {
+            if current != marker {
+                return Err(
+                    "host cursor-recovery marker retry does not match the exact durable temporary successor"
+                        .to_string(),
+                );
+            }
+            return promote_host_cursor_recovery_marker(data_dir, marker);
+        }
+        if current == marker {
+            return Ok(());
+        }
+        validate_host_cursor_recovery_transition(current, marker)?;
+    } else {
+        if marker.phase != HostCursorRecoveryPhase::Requested || marker.applied.is_some() {
+            return Err(
+                "initial host cursor-recovery marker must be the exact Requested authorization"
+                    .to_string(),
+            );
+        }
+    }
+    stage_host_cursor_recovery_marker(data_dir, marker)?;
+    commit_staged_host_cursor_recovery_marker(data_dir)
+}
+
+#[cfg(any(windows, test))]
+fn stage_host_cursor_recovery_marker(
+    data_dir: &SinomoDataDir,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    validate_host_cursor_recovery_marker(marker)?;
+    let bytes = sinomo_runtime::module_api::encode_sobj(marker)
+        .map_err(|error| format!("encode host cursor-recovery marker: {error}"))?;
+    if bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES {
+        return Err(format!(
+            "host cursor-recovery marker is {} bytes; maximum is {}",
+            bytes.len(),
+            CLOUD_FILES_CURSOR_RECOVERY_HOST_MARKER_MAX_BYTES
+        ));
+    }
+    let temporary = host_cursor_recovery_marker_temp_path(data_dir);
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "clear stale cursor-recovery marker staging path {}: {error}",
+                temporary.display()
+            ));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|error| {
+            format!(
+                "create host cursor-recovery temporary marker {}: {error}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| {
+            format!(
+                "persist host cursor-recovery temporary marker {}: {error}",
+                temporary.display()
+            )
+        })?;
+    sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+}
+
+#[cfg(any(windows, test))]
+fn commit_staged_host_cursor_recovery_marker(data_dir: &SinomoDataDir) -> Result<(), String> {
+    let path = host_cursor_recovery_marker_path(data_dir);
+    let temporary = host_cursor_recovery_marker_temp_path(data_dir);
+    sinomo_runtime::storage::durable_file::replace_file(&temporary, &path).map_err(|error| {
+        format!(
+            "commit host cursor-recovery marker {}: {error}",
+            path.display()
+        )
+    })?;
+    sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+}
+
+#[cfg(any(windows, test))]
+fn host_cursor_recovery_phase_ordinal(phase: HostCursorRecoveryPhase) -> u8 {
+    match phase {
+        HostCursorRecoveryPhase::Requested => 0,
+        HostCursorRecoveryPhase::ModuleApplied => 1,
+        HostCursorRecoveryPhase::AdoptedRetained => 2,
+        HostCursorRecoveryPhase::ArmedAwaitingReady => 3,
+        HostCursorRecoveryPhase::ReadyObserved => 4,
+        HostCursorRecoveryPhase::ActiveObserved => 5,
+        HostCursorRecoveryPhase::AuthorityFinalized => 6,
+        HostCursorRecoveryPhase::PreservedRetained => 7,
+    }
+}
+
+#[cfg(any(windows, test))]
+fn same_host_cursor_recovery_identity(
+    left: &HostCursorRecoveryMarker,
+    right: &HostCursorRecoveryMarker,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.disabled_config == right.disabled_config
+        && left.module == right.module
+        && left.identity == right.identity
+        && left.outer_token == right.outer_token
+        && left.inner_token == right.inner_token
+        && left.recovery_id == right.recovery_id
+        && left.inspection == right.inspection
+}
+
+#[cfg(any(windows, test))]
+fn same_host_cursor_recovery_callback_authority(
+    left: &HostCursorRecoveryMarker,
+    right: &HostCursorRecoveryMarker,
+) -> bool {
+    same_host_cursor_recovery_identity(left, right)
+        && left.recovery_cycle == right.recovery_cycle
+        && left.native_successor_fingerprint == right.native_successor_fingerprint
+}
+
+#[cfg(any(windows, test))]
+fn validate_host_cursor_recovery_transition(
+    current: &HostCursorRecoveryMarker,
+    next: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    let phase_transition = if current.phase == next.phase {
+        current.recovery_cycle == next.recovery_cycle
+    } else {
+        match (current.phase, next.phase) {
+            (HostCursorRecoveryPhase::Requested, HostCursorRecoveryPhase::ModuleApplied)
+            | (HostCursorRecoveryPhase::ModuleApplied, HostCursorRecoveryPhase::AdoptedRetained)
+            | (
+                HostCursorRecoveryPhase::AdoptedRetained,
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+            )
+            | (
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+                HostCursorRecoveryPhase::ReadyObserved,
+            )
+            | (HostCursorRecoveryPhase::ReadyObserved, HostCursorRecoveryPhase::ActiveObserved)
+            | (
+                HostCursorRecoveryPhase::ActiveObserved,
+                HostCursorRecoveryPhase::AuthorityFinalized,
+            )
+            | (
+                HostCursorRecoveryPhase::PreservedRetained,
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+            ) => current.recovery_cycle == next.recovery_cycle,
+            (
+                HostCursorRecoveryPhase::ArmedAwaitingReady
+                | HostCursorRecoveryPhase::ReadyObserved
+                | HostCursorRecoveryPhase::ActiveObserved,
+                HostCursorRecoveryPhase::PreservedRetained,
+            ) => current
+                .recovery_cycle
+                .checked_add(1)
+                .is_some_and(|cycle| cycle == next.recovery_cycle),
+            _ => false,
+        }
+    };
+    if !same_host_cursor_recovery_identity(current, next) || !phase_transition {
+        return Err(
+            "host cursor-recovery temporary marker is not an exact same-or-next phase transition"
+                .to_string(),
+        );
+    }
+    let successor_proof_transition = if next.phase == HostCursorRecoveryPhase::PreservedRetained
+        && current.phase != HostCursorRecoveryPhase::PreservedRetained
+    {
+        next.native_successor_fingerprint
+            .as_deref()
+            .is_some_and(valid_canonical_blake3_fingerprint)
+    } else {
+        current.native_successor_fingerprint == next.native_successor_fingerprint
+    };
+    if !successor_proof_transition {
+        return Err(
+            "host cursor-recovery transition changed its native cycle commitment".to_string(),
+        );
+    }
+    let artifact_transition = if current.phase == next.phase {
+        current.ready_artifacts_fingerprint == next.ready_artifacts_fingerprint
+            && current.preserved_artifacts_fingerprint == next.preserved_artifacts_fingerprint
+            && current.active_module_marker_fingerprint == next.active_module_marker_fingerprint
+            && current.completion_module_marker_fingerprint
+                == next.completion_module_marker_fingerprint
+            && current.completion_registration_artifacts_fingerprint
+                == next.completion_registration_artifacts_fingerprint
+            && (current.completed_artifacts_fingerprint == next.completed_artifacts_fingerprint
+                || (current.phase == HostCursorRecoveryPhase::AuthorityFinalized
+                    && current.completed_artifacts_fingerprint.is_none()
+                    && next
+                        .completed_artifacts_fingerprint
+                        .as_deref()
+                        .is_some_and(valid_blake3_fingerprint)))
+    } else {
+        match (current.phase, next.phase) {
+            (
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+                HostCursorRecoveryPhase::ReadyObserved,
+            ) => {
+                current.ready_artifacts_fingerprint.is_none()
+                    && next.ready_artifacts_fingerprint.is_some()
+                    && (current.preserved_artifacts_fingerprint.is_none()
+                        || current.recovery_cycle > 0)
+                    && next.preserved_artifacts_fingerprint.is_none()
+                    && current.active_module_marker_fingerprint.is_none()
+                    && next.active_module_marker_fingerprint.is_none()
+                    && current.completion_module_marker_fingerprint.is_none()
+                    && next.completion_module_marker_fingerprint.is_none()
+                    && current
+                        .completion_registration_artifacts_fingerprint
+                        .is_none()
+                    && next.completion_registration_artifacts_fingerprint.is_none()
+                    && current.completed_artifacts_fingerprint.is_none()
+                    && next.completed_artifacts_fingerprint.is_none()
+            }
+            (HostCursorRecoveryPhase::ReadyObserved, HostCursorRecoveryPhase::ActiveObserved) => {
+                current.ready_artifacts_fingerprint == next.ready_artifacts_fingerprint
+                    && current.preserved_artifacts_fingerprint.is_none()
+                    && next.preserved_artifacts_fingerprint.is_none()
+                    && current.active_module_marker_fingerprint.is_none()
+                    && next.active_module_marker_fingerprint.is_some()
+                    && current.completion_module_marker_fingerprint.is_none()
+                    && next.completion_module_marker_fingerprint.is_none()
+                    && current
+                        .completion_registration_artifacts_fingerprint
+                        .is_none()
+                    && next.completion_registration_artifacts_fingerprint.is_none()
+                    && current.completed_artifacts_fingerprint.is_none()
+                    && next.completed_artifacts_fingerprint.is_none()
+            }
+            (
+                HostCursorRecoveryPhase::ActiveObserved,
+                HostCursorRecoveryPhase::AuthorityFinalized,
+            ) => {
+                current.ready_artifacts_fingerprint == next.ready_artifacts_fingerprint
+                    && current.preserved_artifacts_fingerprint.is_none()
+                    && next.preserved_artifacts_fingerprint.is_none()
+                    && current.active_module_marker_fingerprint
+                        == next.active_module_marker_fingerprint
+                    && current.completion_module_marker_fingerprint.is_none()
+                    && next.completion_module_marker_fingerprint.is_some()
+                    && current
+                        .completion_registration_artifacts_fingerprint
+                        .is_none()
+                    && next
+                        .completion_registration_artifacts_fingerprint
+                        .as_deref()
+                        .is_some_and(valid_blake3_fingerprint)
+                    && current.completed_artifacts_fingerprint.is_none()
+                    && next.completed_artifacts_fingerprint.is_none()
+            }
+            (
+                HostCursorRecoveryPhase::ArmedAwaitingReady
+                | HostCursorRecoveryPhase::ReadyObserved
+                | HostCursorRecoveryPhase::ActiveObserved,
+                HostCursorRecoveryPhase::PreservedRetained,
+            ) => {
+                next.ready_artifacts_fingerprint.is_none()
+                    && current.preserved_artifacts_fingerprint.is_none()
+                    && next.preserved_artifacts_fingerprint.is_some()
+                    && next.active_module_marker_fingerprint.is_none()
+                    && next.completion_module_marker_fingerprint.is_none()
+                    && next.completion_registration_artifacts_fingerprint.is_none()
+                    && next.completed_artifacts_fingerprint.is_none()
+            }
+            (
+                HostCursorRecoveryPhase::PreservedRetained,
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+            ) => {
+                next.ready_artifacts_fingerprint.is_none()
+                    && current.preserved_artifacts_fingerprint.is_some()
+                    && next.preserved_artifacts_fingerprint
+                        == current.preserved_artifacts_fingerprint
+                    && current.active_module_marker_fingerprint.is_none()
+                    && next.active_module_marker_fingerprint.is_none()
+                    && current.completion_module_marker_fingerprint.is_none()
+                    && next.completion_module_marker_fingerprint.is_none()
+                    && current
+                        .completion_registration_artifacts_fingerprint
+                        .is_none()
+                    && next.completion_registration_artifacts_fingerprint.is_none()
+                    && current.completed_artifacts_fingerprint.is_none()
+                    && next.completed_artifacts_fingerprint.is_none()
+            }
+            _ => {
+                current.ready_artifacts_fingerprint == next.ready_artifacts_fingerprint
+                    && current.preserved_artifacts_fingerprint
+                        == next.preserved_artifacts_fingerprint
+                    && current.active_module_marker_fingerprint
+                        == next.active_module_marker_fingerprint
+                    && current.completion_module_marker_fingerprint
+                        == next.completion_module_marker_fingerprint
+                    && current.completion_registration_artifacts_fingerprint
+                        == next.completion_registration_artifacts_fingerprint
+                    && current.completed_artifacts_fingerprint
+                        == next.completed_artifacts_fingerprint
+            }
+        }
+    };
+    if !artifact_transition {
+        return Err(
+            "host cursor-recovery transition changed or discarded its phase-bound artifact fingerprint"
+                .to_string(),
+        );
+    }
+    match (&current.applied, &next.applied, current.phase, next.phase) {
+        (None, None, HostCursorRecoveryPhase::Requested, HostCursorRecoveryPhase::Requested)
+        | (
+            None,
+            Some(_),
+            HostCursorRecoveryPhase::Requested,
+            HostCursorRecoveryPhase::ModuleApplied,
+        ) => Ok(()),
+        (Some(current), Some(next), _, _) if current == next => Ok(()),
+        _ => Err(
+            "host cursor-recovery transition changed or discarded its exact module result"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn validate_host_cursor_recovery_marker(marker: &HostCursorRecoveryMarker) -> Result<(), String> {
+    let expected_mount_point =
+        lexical_absolute_path(&expand_mount_point(&marker.disabled_config.mount_point)?)?;
+    if marker.schema_version != CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION
+        || marker.disabled_config.enabled
+        || !valid_v1_blake3_token(&marker.outer_token)
+        || !valid_v1_blake3_token(&marker.inner_token)
+        || !valid_blake3_fingerprint(&marker.inspection.raw_state_fingerprint)
+        || marker.inner_token != marker.inspection.recovery_token
+        || marker.recovery_id.trim().is_empty()
+        || marker.identity.enabled
+        || marker.identity.sync_root != expected_mount_point
+        || marker.identity.root_path != marker.disabled_config.root_path
+        || marker.identity.data_dir_root.as_os_str().is_empty()
+        || marker.identity.provider_name
+            != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+        || marker.identity.provider_version != env!("CARGO_PKG_VERSION")
+        || marker.identity.read_only != marker.disabled_config.read_only
+        || marker.identity.allow_other != marker.disabled_config.allow_other
+        || marker.identity.sync_local_changes != marker.disabled_config.sync_local_changes
+        || marker.identity.prepopulate_depth != 0
+        || !marker.identity.connect
+        || marker.identity.max_run_seconds.is_some()
+        || marker.identity.disabled_config_fingerprint
+            != disabled_mount_config_fingerprint(&marker.disabled_config)?
+        || marker.identity.sync_root != marker.inspection.sync_root
+        || marker.identity.root_path != marker.inspection.root_path
+        || marker.identity.provider_provenance_fingerprint
+            != cloud_files_provenance_fingerprint(&marker.module)?
+        || matches!(
+            marker.phase,
+            HostCursorRecoveryPhase::Requested
+                | HostCursorRecoveryPhase::ModuleApplied
+                | HostCursorRecoveryPhase::AdoptedRetained
+        ) && marker.recovery_cycle != 0
+        || (marker.recovery_cycle == 0 && marker.native_successor_fingerprint.is_some())
+        || (marker.recovery_cycle > 0
+            && marker
+                .native_successor_fingerprint
+                .as_deref()
+                .is_none_or(|value| !valid_canonical_blake3_fingerprint(value)))
+        || match marker.phase {
+            HostCursorRecoveryPhase::Requested
+            | HostCursorRecoveryPhase::ModuleApplied
+            | HostCursorRecoveryPhase::AdoptedRetained => {
+                marker.ready_artifacts_fingerprint.is_some()
+                    || marker.preserved_artifacts_fingerprint.is_some()
+                    || marker.active_module_marker_fingerprint.is_some()
+                    || marker.completion_module_marker_fingerprint.is_some()
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .is_some()
+                    || marker.completed_artifacts_fingerprint.is_some()
+            }
+            HostCursorRecoveryPhase::ArmedAwaitingReady => {
+                marker.ready_artifacts_fingerprint.is_some()
+                    || if marker.recovery_cycle == 0 {
+                        marker.preserved_artifacts_fingerprint.is_some()
+                    } else {
+                        marker
+                            .preserved_artifacts_fingerprint
+                            .as_deref()
+                            .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    }
+                    || marker.active_module_marker_fingerprint.is_some()
+                    || marker.completion_module_marker_fingerprint.is_some()
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .is_some()
+                    || marker.completed_artifacts_fingerprint.is_some()
+            }
+            HostCursorRecoveryPhase::ReadyObserved => {
+                marker
+                    .ready_artifacts_fingerprint
+                    .as_deref()
+                    .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker.preserved_artifacts_fingerprint.is_some()
+                    || marker.active_module_marker_fingerprint.is_some()
+                    || marker.completion_module_marker_fingerprint.is_some()
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .is_some()
+                    || marker.completed_artifacts_fingerprint.is_some()
+            }
+            HostCursorRecoveryPhase::ActiveObserved => {
+                marker
+                    .ready_artifacts_fingerprint
+                    .as_deref()
+                    .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker.preserved_artifacts_fingerprint.is_some()
+                    || marker
+                        .active_module_marker_fingerprint
+                        .as_deref()
+                        .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker.completion_module_marker_fingerprint.is_some()
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .is_some()
+                    || marker.completed_artifacts_fingerprint.is_some()
+            }
+            HostCursorRecoveryPhase::AuthorityFinalized => {
+                marker
+                    .ready_artifacts_fingerprint
+                    .as_deref()
+                    .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker.preserved_artifacts_fingerprint.is_some()
+                    || marker
+                        .active_module_marker_fingerprint
+                        .as_deref()
+                        .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker
+                        .completion_module_marker_fingerprint
+                        .as_deref()
+                        .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .as_deref()
+                        .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker
+                        .completed_artifacts_fingerprint
+                        .as_deref()
+                        .is_some_and(|value| !valid_blake3_fingerprint(value))
+            }
+            HostCursorRecoveryPhase::PreservedRetained => {
+                marker.ready_artifacts_fingerprint.is_some()
+                    || marker
+                        .preserved_artifacts_fingerprint
+                        .as_deref()
+                        .is_none_or(|value| !valid_blake3_fingerprint(value))
+                    || marker.active_module_marker_fingerprint.is_some()
+                    || marker.completion_module_marker_fingerprint.is_some()
+                    || marker
+                        .completion_registration_artifacts_fingerprint
+                        .is_some()
+                    || marker.completed_artifacts_fingerprint.is_some()
+            }
+        }
+    {
+        return Err("host cursor-recovery marker invariants do not match".to_string());
+    }
+    if matches!(
+        marker.phase,
+        HostCursorRecoveryPhase::ModuleApplied
+            | HostCursorRecoveryPhase::AdoptedRetained
+            | HostCursorRecoveryPhase::ArmedAwaitingReady
+            | HostCursorRecoveryPhase::ReadyObserved
+            | HostCursorRecoveryPhase::ActiveObserved
+            | HostCursorRecoveryPhase::AuthorityFinalized
+            | HostCursorRecoveryPhase::PreservedRetained
+    ) && marker.applied.as_ref().is_none_or(|applied| {
+        applied.recovery_id != marker.recovery_id
+            || applied.recovery_token != marker.inner_token
+            || applied.sync_root != marker.identity.sync_root
+            || applied.root_path != marker.identity.root_path
+            || applied.sync_root_file_id != marker.inspection.sync_root_file_id
+            || applied.cursor_count_cleared != marker.inspection.cursor_count
+            || applied.schema_version
+                != sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+    }) {
+        return Err(
+            "host cursor-recovery applied result does not match its durable authorization"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn requested_host_cursor_recovery_marker(
+    marker: &HostCursorRecoveryMarker,
+) -> HostCursorRecoveryMarker {
+    let mut requested = marker.clone();
+    requested.phase = HostCursorRecoveryPhase::Requested;
+    requested.applied = None;
+    requested.ready_artifacts_fingerprint = None;
+    requested.preserved_artifacts_fingerprint = None;
+    requested.active_module_marker_fingerprint = None;
+    requested.completion_module_marker_fingerprint = None;
+    requested.completion_registration_artifacts_fingerprint = None;
+    requested.completed_artifacts_fingerprint = None;
+    requested.recovery_cycle = 0;
+    requested.native_successor_fingerprint = None;
+    requested
+}
+
+#[cfg(any(windows, test))]
+fn validate_host_cursor_recovery_bundle_link(
+    marker: &HostCursorRecoveryMarker,
+    bundle: &HostCursorRecoveryProviderBundle,
+) -> Result<(), String> {
+    if bundle.requested != requested_host_cursor_recovery_marker(marker) {
+        return Err(
+            "cursor-recovery provider bundle does not bind the exact immutable host authorization"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn validate_current_host_cursor_recovery_authority(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+    host_lock_bytes: &[u8],
+    expected_token: &str,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    validate_host_cursor_recovery_marker(marker)?;
+    if marker.outer_token != expected_token
+        || marker.disabled_config != *config
+        || marker.identity.data_dir_root != data_dir.root()
+        || marker.recovery_id != deterministic_host_cursor_recovery_id(expected_token)
+    {
+        return Err(
+            "durable cursor recovery belongs to another token, data directory, or config"
+                .to_string(),
+        );
+    }
+    let recomputed = host_cursor_recovery_outer_token(
+        &marker.disabled_config,
+        &marker.module,
+        host_lock_bytes,
+        &marker.identity,
+        &marker.inspection,
+    )?;
+    if recomputed != marker.outer_token {
+        return Err(
+            "current host lock bytes no longer match the authorized recovery token".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn valid_blake3_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("blake3:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+#[cfg(any(windows, test))]
+fn valid_canonical_blake3_fingerprint(value: &str) -> bool {
+    value.strip_prefix("blake3:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+#[cfg(any(windows, test))]
+fn valid_v1_blake3_token(value: &str) -> bool {
+    value
+        .strip_prefix("v1:blake3:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 #[cfg(any(windows, test))]
@@ -1040,18 +2815,34 @@ fn validate_legacy_staged_cloud_registration_record(
 }
 
 #[cfg(any(windows, test))]
-fn load_pending_cloud_unregister_record(
+fn inspect_pending_cloud_unregister_record(
     data_dir: &SinomoDataDir,
-) -> Result<Option<PendingCloudUnregisterRecord>, String> {
+) -> Result<PendingCloudUnregisterArtifactSnapshot, String> {
     let path = pending_cloud_unregister_path(data_dir);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "read pending Cloud Files unregister {}: {error}",
-                path.display()
-            ));
+    let temporary = cursor_recovery_pending_temp_path(data_dir);
+    let current =
+        read_bounded_plain_host_file(&path, 1024 * 1024, "pending Cloud Files unregister")?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        1024 * 1024,
+        "pending Cloud Files cursor-recovery temporary intent",
+    )?;
+    let (bytes, current_present, temporary_present) = match (current, staged) {
+        (None, None) => {
+            return Ok(PendingCloudUnregisterArtifactSnapshot {
+                value: None,
+                current_present: false,
+                temporary_present: false,
+            });
+        }
+        (Some(current), None) => (current, true, false),
+        (None, Some(staged)) => (staged, false, true),
+        (Some(current), Some(staged)) if current == staged => (current, true, true),
+        (Some(_), Some(_)) => {
+            return Err(
+                "pending Cloud Files current/temporary cursor-recovery evidence is ambiguous"
+                    .to_string(),
+            );
         }
     };
     let record: PendingCloudUnregisterRecord = sinomo_runtime::module_api::decode_sobj(&bytes)
@@ -1068,7 +2859,69 @@ fn load_pending_cloud_unregister_record(
         ));
     }
     validate_pending_cloud_unregister_record(data_dir, &record)?;
-    Ok(Some(record))
+    if sinomo_runtime::module_api::encode_sobj(&record)
+        .map_err(|error| format!("encode canonical pending Cloud Files unregister: {error}"))?
+        != bytes
+    {
+        return Err("pending Cloud Files unregister is noncanonical".to_string());
+    }
+    if temporary_present && record.request.cursor_recovery.is_none() {
+        return Err(
+            "ordinary pending intent cannot own the cursor-recovery temporary path".to_string(),
+        );
+    }
+    Ok(PendingCloudUnregisterArtifactSnapshot {
+        value: Some(record),
+        current_present,
+        temporary_present,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn load_pending_cloud_unregister_record(
+    data_dir: &SinomoDataDir,
+) -> Result<Option<PendingCloudUnregisterRecord>, String> {
+    // This loader is deliberately read-only. A cursor-recovery temporary file
+    // is the durable disable linearization point, but it may be promoted only
+    // after the exact host marker, provider bundle, staged ownership, config,
+    // and pre-existing lease have been authenticated together.
+    Ok(inspect_pending_cloud_unregister_record(data_dir)?.value)
+}
+
+#[cfg(any(windows, test))]
+fn promote_cursor_recovery_pending_intent(
+    data_dir: &SinomoDataDir,
+    expected: &PendingCloudUnregisterRecord,
+) -> Result<(), String> {
+    if expected.request.cursor_recovery.is_none() {
+        return Err("ordinary pending intent cannot use cursor-recovery promotion".to_string());
+    }
+    let snapshot = inspect_pending_cloud_unregister_record(data_dir)?;
+    if snapshot.value.as_ref() != Some(expected) {
+        return Err(
+            "cursor-recovery pending intent changed before authority-bound promotion".to_string(),
+        );
+    }
+    let path = pending_cloud_unregister_path(data_dir);
+    let temporary = cursor_recovery_pending_temp_path(data_dir);
+    match (snapshot.current_present, snapshot.temporary_present) {
+        (true, false) => Ok(()),
+        (false, true) => {
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                .map_err(|error| format!("promote cursor-recovery pending intent: {error}"))?;
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+        }
+        (true, true) => {
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(&temporary)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("remove redundant cursor-recovery pending intent: {error}")
+                })
+        }
+        (false, false) => {
+            Err("cursor-recovery pending intent disappeared before promotion".to_string())
+        }
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -1112,6 +2965,52 @@ fn load_staged_cloud_registration_record(
     };
     validate_staged_cloud_registration_record(data_dir, &migrated)?;
     Ok(Some(migrated))
+}
+
+#[cfg(any(windows, test))]
+fn inspect_cursor_recovery_staged_record_snapshot(
+    data_dir: &SinomoDataDir,
+) -> Result<CursorRecoveryStagedArtifactSnapshot, String> {
+    fn decode(
+        data_dir: &SinomoDataDir,
+        path: &Path,
+        bytes: Option<Vec<u8>>,
+        label: &str,
+    ) -> Result<Option<StagedCloudRegistrationRecord>, String> {
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let record: StagedCloudRegistrationRecord = sinomo_runtime::module_api::decode_sobj(&bytes)
+            .map_err(|error| format!("decode {label} {}: {error}", path.display()))?;
+        validate_staged_cloud_registration_record(data_dir, &record)?;
+        if sinomo_runtime::module_api::encode_sobj(&record)
+            .map_err(|error| format!("encode canonical {label}: {error}"))?
+            != bytes
+        {
+            return Err(format!("{label} {} is noncanonical", path.display()));
+        }
+        Ok(Some(record))
+    }
+
+    let path = staged_cloud_registration_path(data_dir);
+    let temporary_path = cursor_recovery_staged_temp_path(data_dir);
+    let current = decode(
+        data_dir,
+        &path,
+        read_bounded_plain_host_file(&path, 1024 * 1024, "cursor-recovery staged ownership")?,
+        "cursor-recovery staged ownership",
+    )?;
+    let temporary = decode(
+        data_dir,
+        &temporary_path,
+        read_bounded_plain_host_file(
+            &temporary_path,
+            1024 * 1024,
+            "cursor-recovery staged ownership temporary file",
+        )?,
+        "cursor-recovery staged ownership temporary file",
+    )?;
+    Ok(CursorRecoveryStagedArtifactSnapshot { current, temporary })
 }
 
 #[cfg(any(windows, test))]
@@ -1206,6 +3105,147 @@ fn persist_staged_cloud_registration_record(
 }
 
 #[cfg(any(windows, test))]
+fn persist_or_promote_cursor_recovery_staged_record(
+    data_dir: &SinomoDataDir,
+    expected: &StagedCloudRegistrationRecord,
+) -> Result<(), String> {
+    validate_staged_cloud_registration_record(data_dir, expected)?;
+    let path = staged_cloud_registration_path(data_dir);
+    let temporary = cursor_recovery_staged_temp_path(data_dir);
+    let expected_bytes = sinomo_runtime::module_api::encode_sobj(expected)
+        .map_err(|error| format!("encode cursor-recovery staged ownership: {error}"))?;
+    let current =
+        read_bounded_plain_host_file(&path, 1024 * 1024, "cursor-recovery staged ownership")?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        1024 * 1024,
+        "cursor-recovery staged ownership temporary file",
+    )?;
+    match (current.as_deref(), staged.as_deref()) {
+        (Some(current), None) if current == expected_bytes => Ok(()),
+        (None, Some(staged)) if staged == expected_bytes => {
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                .map_err(|error| format!("promote cursor-recovery staged ownership: {error}"))?;
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+        }
+        (Some(current), Some(staged)) if current == expected_bytes && staged == expected_bytes => {
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+                &temporary,
+            )
+            .map_err(|error| {
+                format!("remove redundant cursor-recovery staged temporary file: {error}")
+            })?;
+            Ok(())
+        }
+        (None, None) => {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|error| {
+                    format!(
+                        "create cursor-recovery staged temporary file {}: {error}",
+                        temporary.display()
+                    )
+                })?;
+            file.write_all(&expected_bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "persist cursor-recovery staged temporary file {}: {error}",
+                        temporary.display()
+                    )
+                })?;
+            drop(file);
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                .map_err(|error| format!("commit cursor-recovery staged ownership: {error}"))?;
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+        }
+        _ => Err(
+            "cursor-recovery staged current/temporary snapshot is changed, torn, or ambiguous"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn transition_or_promote_cursor_recovery_staged_record(
+    data_dir: &SinomoDataDir,
+    predecessor: &StagedCloudRegistrationRecord,
+    expected: &StagedCloudRegistrationRecord,
+) -> Result<(), String> {
+    validate_staged_cloud_registration_record(data_dir, predecessor)?;
+    validate_staged_cloud_registration_record(data_dir, expected)?;
+    if predecessor == expected {
+        return persist_or_promote_cursor_recovery_staged_record(data_dir, expected);
+    }
+    let path = staged_cloud_registration_path(data_dir);
+    let temporary = cursor_recovery_staged_temp_path(data_dir);
+    let predecessor_bytes = sinomo_runtime::module_api::encode_sobj(predecessor)
+        .map_err(|error| format!("encode cursor-recovery staged predecessor: {error}"))?;
+    let expected_bytes = sinomo_runtime::module_api::encode_sobj(expected)
+        .map_err(|error| format!("encode cursor-recovery staged successor: {error}"))?;
+    let current =
+        read_bounded_plain_host_file(&path, 1024 * 1024, "cursor-recovery staged ownership")?;
+    let staged = read_bounded_plain_host_file(
+        &temporary,
+        1024 * 1024,
+        "cursor-recovery staged ownership temporary file",
+    )?;
+    match (current.as_deref(), staged.as_deref()) {
+        (Some(current), None) if current == expected_bytes => Ok(()),
+        (Some(current), Some(staged))
+            if current == expected_bytes && staged == expected_bytes =>
+        {
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+                &temporary,
+            )
+            .map_err(|error| {
+                format!("remove redundant cursor-recovery staged successor: {error}")
+            })?;
+            Ok(())
+        }
+        (Some(current), Some(staged))
+            if current == predecessor_bytes && staged == expected_bytes =>
+        {
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                .map_err(|error| format!("promote cursor-recovery staged successor: {error}"))?;
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+        }
+        (Some(current), None) if current == predecessor_bytes => {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(|error| {
+                    format!(
+                        "create cursor-recovery staged successor {}: {error}",
+                        temporary.display()
+                    )
+                })?;
+            file.write_all(&expected_bytes)
+                .and_then(|_| file.sync_all())
+                .map_err(|error| {
+                    format!(
+                        "persist cursor-recovery staged successor {}: {error}",
+                        temporary.display()
+                    )
+                })?;
+            drop(file);
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
+            sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                .map_err(|error| format!("promote cursor-recovery staged successor: {error}"))?;
+            sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())
+        }
+        _ => Err(
+            "cursor-recovery staged successor does not match its exact retained predecessor/current bytes"
+                .to_string(),
+        ),
+    }
+}
+
+#[cfg(any(windows, test))]
 fn replace_staged_cloud_registration_record(
     data_dir: &SinomoDataDir,
     expected: &StagedCloudRegistrationRecord,
@@ -1263,7 +3303,9 @@ fn persist_pending_cloud_unregister_record(
         })?;
     }
     let path = pending_cloud_unregister_path(data_dir);
-    if let Some(existing) = load_pending_cloud_unregister_record(data_dir)? {
+    if record.request.cursor_recovery.is_none()
+        && let Some(existing) = load_pending_cloud_unregister_record(data_dir)?
+    {
         return if existing == *record {
             Ok(())
         } else {
@@ -1289,6 +3331,65 @@ fn persist_pending_cloud_unregister_record(
     })?;
     let bytes = sinomo_runtime::module_api::encode_sobj(record)
         .map_err(|error| format!("encode pending Cloud Files unregister: {error}"))?;
+    if record.request.cursor_recovery.is_some() {
+        let temporary = cursor_recovery_pending_temp_path(data_dir);
+        let current = read_bounded_plain_host_file(
+            &path,
+            1024 * 1024,
+            "pending Cloud Files cursor-recovery intent",
+        )?;
+        let staged = read_bounded_plain_host_file(
+            &temporary,
+            1024 * 1024,
+            "pending Cloud Files cursor-recovery temporary intent",
+        )?;
+        return match (current.as_deref(), staged.as_deref()) {
+            (Some(current), None) if current == bytes => Ok(()),
+            (None, Some(staged)) if staged == bytes => {
+                sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                    .map_err(|error| format!("promote cursor-recovery pending intent: {error}"))?;
+                sync_pending_cloud_unregister_directory(parent)
+            }
+            (Some(current), Some(staged)) if current == bytes && staged == bytes => {
+                sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+                    &temporary,
+                )
+                .map_err(|error| {
+                    format!("remove redundant cursor-recovery pending intent: {error}")
+                })?;
+                Ok(())
+            }
+            (None, None) => {
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&temporary)
+                    .map_err(|error| {
+                        format!(
+                            "create cursor-recovery pending temporary file {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+                file.write_all(&bytes)
+                    .and_then(|_| file.sync_all())
+                    .map_err(|error| {
+                        format!(
+                            "persist cursor-recovery pending temporary file {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+                drop(file);
+                sync_pending_cloud_unregister_directory(parent)?;
+                sinomo_runtime::storage::durable_file::replace_file(&temporary, &path)
+                    .map_err(|error| format!("commit cursor-recovery pending intent: {error}"))?;
+                sync_pending_cloud_unregister_directory(parent)
+            }
+            _ => Err(
+                "cursor-recovery pending current/temporary snapshot changed or is ambiguous"
+                    .to_string(),
+            ),
+        };
+    }
     let temporary = parent.join(format!(
         ".{PENDING_CLOUD_UNREGISTER_FILE}.{}.{}.tmp",
         std::process::id(),
@@ -1432,6 +3533,384 @@ fn load_cloud_files_registration_receipt(
 }
 
 #[cfg(any(windows, test))]
+fn cloud_files_ready_artifacts_fingerprint(data_dir: &SinomoDataDir) -> Result<String, String> {
+    let receipt_path = cloud_files_registration_receipt_path(data_dir);
+    let journal_path =
+        cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE);
+    let receipt =
+        read_bounded_plain_host_file(&receipt_path, 64 * 1024, "Cloud Files Ready receipt")?
+            .ok_or_else(|| "Cloud Files Ready receipt is absent".to_string())?;
+    let decoded_receipt: sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt =
+        sinomo_runtime::module_api::decode_sobj(&receipt)
+            .map_err(|error| format!("decode Cloud Files Ready receipt: {error}"))?;
+    if sinomo_runtime::module_api::encode_sobj(&decoded_receipt)
+        .map_err(|error| format!("re-encode Cloud Files Ready receipt: {error}"))?
+        != receipt
+    {
+        return Err("Cloud Files Ready receipt is not canonical".to_string());
+    }
+    let journal = read_bounded_plain_host_file(
+        &journal_path,
+        1024 * 1024,
+        "Cloud Files Ready registration journal",
+    )?
+    .ok_or_else(|| "Cloud Files Ready registration journal is absent".to_string())?;
+    // The journal schema is module-owned; the host binds its exact canonical
+    // raw bytes and the module independently performs typed canonical
+    // validation before the acknowledged event can be emitted.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.cloud-files.cursor-recovery.ready-artifacts.v1\0");
+    for (label, bytes) in [
+        (b"receipt".as_slice(), receipt.as_slice()),
+        (b"journal".as_slice(), journal.as_slice()),
+    ] {
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_ready_artifacts_fingerprint_from_raw(receipt: &[u8], journal: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.cloud-files.cursor-recovery.ready-artifacts.v1\0");
+    for (label, bytes) in [
+        (b"receipt".as_slice(), receipt),
+        (b"journal".as_slice(), journal),
+    ] {
+        hasher.update(&(label.len() as u64).to_le_bytes());
+        hasher.update(label);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_completed_registration_artifacts_fingerprint_from_raw(
+    receipt: &[u8],
+    journal: &[u8],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.completed-registration.v1\0");
+    for (label, bytes) in [
+        (b"receipt".as_slice(), receipt),
+        (b"journal".as_slice(), journal),
+    ] {
+        hash_host_cursor_recovery_field(&mut hasher, label);
+        hash_host_cursor_recovery_field(&mut hasher, bytes);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_completed_registration_artifacts_fingerprint(
+    data_dir: &SinomoDataDir,
+) -> Result<String, String> {
+    let receipt = read_bounded_plain_host_file(
+        &cloud_files_registration_receipt_path(data_dir),
+        64 * 1024,
+        "completed Cloud Files Ready receipt",
+    )?
+    .ok_or_else(|| "completed Cloud Files Ready receipt is absent".to_string())?;
+    let journal = read_bounded_plain_host_file(
+        &cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+        1024 * 1024,
+        "completed ordinary Cloud Files Ready journal",
+    )?
+    .ok_or_else(|| "completed ordinary Cloud Files Ready journal is absent".to_string())?;
+    Ok(cloud_files_completed_registration_artifacts_fingerprint_from_raw(&receipt, &journal))
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_completed_artifacts_fingerprint(
+    data_dir: &SinomoDataDir,
+    stage: &StagedCloudRegistrationRecord,
+) -> Result<String, String> {
+    let registration = cloud_files_completed_registration_artifacts_fingerprint(data_dir)?;
+    let stage_bytes = sinomo_runtime::module_api::encode_sobj(stage)
+        .map_err(|error| format!("encode normalized Cloud Files stage: {error}"))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.completed-artifacts.v1\0");
+    hash_host_cursor_recovery_field(&mut hasher, registration.as_bytes());
+    hash_host_cursor_recovery_field(&mut hasher, &stage_bytes);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_module_marker_raw_fingerprint(data_dir: &SinomoDataDir) -> Result<String, String> {
+    let bytes = read_bounded_plain_host_file(
+        &cloud_files_module_runtime_path(data_dir, CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE),
+        1024 * 1024,
+        "Cloud Files cursor-recovery module marker",
+    )?
+    .ok_or_else(|| "Cloud Files cursor-recovery module marker is absent".to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.module-marker.v1\0");
+    hash_host_cursor_recovery_field(&mut hasher, &bytes);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
+struct AuthorityFinalizedCompletionCut {
+    cursor_stage: StagedCloudRegistrationRecord,
+    ordinary_stage: StagedCloudRegistrationRecord,
+    registration_normalized: bool,
+    stage_normalized: bool,
+}
+
+#[cfg(any(windows, test))]
+fn validate_authority_finalized_completion_cut(
+    data_dir: &SinomoDataDir,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<AuthorityFinalizedCompletionCut, String> {
+    if marker.phase != HostCursorRecoveryPhase::AuthorityFinalized {
+        return Err("terminal completion cut requires AuthorityFinalized host state".to_string());
+    }
+    require_cursor_recovery_pending_intent_absent(data_dir, "AuthorityFinalized completion")?;
+    require_physically_absent(
+        &cloud_files_cursor_recovery_module_temp_path(data_dir),
+        "AuthorityFinalized module cursor-recovery temporary marker",
+    )?;
+    if cloud_files_module_marker_raw_fingerprint(data_dir)?
+        != marker
+            .completion_module_marker_fingerprint
+            .as_deref()
+            .ok_or_else(|| "AuthorityFinalized marker lacks its native marker proof".to_string())?
+    {
+        return Err("AuthorityFinalized module marker proof changed".to_string());
+    }
+    require_physically_absent(
+        &cloud_files_registration_receipt_temp_path(data_dir),
+        "AuthorityFinalized registration receipt temporary file",
+    )?;
+    let receipt = read_bounded_plain_host_file(
+        &cloud_files_registration_receipt_path(data_dir),
+        64 * 1024,
+        "AuthorityFinalized registration receipt",
+    )?
+    .ok_or_else(|| "AuthorityFinalized registration receipt is absent".to_string())?;
+    let decoded_receipt: sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt =
+        sinomo_runtime::module_api::decode_sobj(&receipt)
+            .map_err(|error| format!("decode AuthorityFinalized receipt: {error}"))?;
+    if sinomo_runtime::module_api::encode_sobj(&decoded_receipt)
+        .map_err(|error| format!("re-encode AuthorityFinalized receipt: {error}"))?
+        != receipt
+    {
+        return Err("AuthorityFinalized receipt is noncanonical".to_string());
+    }
+    let journal_path =
+        cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE);
+    let journal = read_bounded_plain_host_file(
+        &journal_path,
+        1024 * 1024,
+        "AuthorityFinalized registration journal",
+    )?
+    .ok_or_else(|| "AuthorityFinalized registration journal is absent".to_string())?;
+    let journal_temp = read_bounded_plain_host_file(
+        &cloud_files_registration_journal_temp_path(data_dir),
+        1024 * 1024,
+        "AuthorityFinalized registration journal temporary file",
+    )?;
+    let ready_current = cloud_files_ready_artifacts_fingerprint_from_raw(&receipt, &journal)
+        == marker
+            .ready_artifacts_fingerprint
+            .as_deref()
+            .ok_or_else(|| "AuthorityFinalized marker lacks its Ready proof".to_string())?;
+    let completed_expected = marker
+        .completion_registration_artifacts_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            "AuthorityFinalized marker lacks its normalized registration proof".to_string()
+        })?;
+    let completed_current =
+        cloud_files_completed_registration_artifacts_fingerprint_from_raw(&receipt, &journal)
+            == completed_expected;
+    let completed_temp = journal_temp.as_ref().is_some_and(|temporary| {
+        cloud_files_completed_registration_artifacts_fingerprint_from_raw(&receipt, temporary)
+            == completed_expected
+    });
+    let registration_normalized = match journal_temp.as_ref() {
+        None if completed_current => true,
+        None if ready_current => false,
+        Some(_temporary) if ready_current && completed_temp => false,
+        Some(temporary) if completed_current && temporary == &journal => false,
+        _ => {
+            return Err(
+                "AuthorityFinalized registration current/temporary cut is not an exact normalization predecessor or successor"
+                    .to_string(),
+            );
+        }
+    };
+
+    let cursor_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            data_dir_root: Some(marker.identity.data_dir_root.clone()),
+            provider_name: marker.identity.provider_name.clone(),
+            cursor_recovery: Some(host_cursor_recovery_context(marker)),
+        },
+        marker.module.clone(),
+        CloudUnregisterPolicy::PreserveState,
+    )?;
+    let cursor_stage = staged_cloud_registration_record(
+        &cursor_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    let ordinary_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            cursor_recovery: None,
+            ..cursor_recovery.request.clone()
+        },
+        marker.module.clone(),
+        CloudUnregisterPolicy::Release,
+    )?;
+    let ordinary_stage = staged_cloud_registration_record(
+        &ordinary_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+    let cursor_current = staged.current.as_ref() == Some(&cursor_stage);
+    let ordinary_current = staged.current.as_ref() == Some(&ordinary_stage);
+    let ordinary_temp = staged.temporary.as_ref() == Some(&ordinary_stage);
+    let cursor_temp = staged.temporary.as_ref() == Some(&cursor_stage);
+    let exact_stage_cut = if !registration_normalized {
+        cursor_current && staged.temporary.is_none()
+    } else if marker.completed_artifacts_fingerprint.is_some() {
+        ordinary_current && staged.temporary.is_none()
+    } else {
+        (cursor_current && (staged.temporary.is_none() || ordinary_temp))
+            || (ordinary_current && (staged.temporary.is_none() || ordinary_temp))
+    };
+    if !exact_stage_cut || cursor_temp {
+        return Err(
+            "AuthorityFinalized staged current/temporary cut is not an exact normalization predecessor or successor"
+                .to_string(),
+        );
+    }
+    let stage_normalized = ordinary_current && staged.temporary.is_none();
+    if let Some(completed) = marker.completed_artifacts_fingerprint.as_ref() {
+        if !registration_normalized
+            || !stage_normalized
+            || completed != &cloud_files_completed_artifacts_fingerprint(data_dir, &ordinary_stage)?
+        {
+            return Err("AuthorityFinalized completed artifact proof changed".to_string());
+        }
+    }
+    Ok(AuthorityFinalizedCompletionCut {
+        cursor_stage,
+        ordinary_stage,
+        registration_normalized,
+        stage_normalized,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn validate_authority_finalized_released_cut(
+    data_dir: &SinomoDataDir,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<(), String> {
+    if marker.phase != HostCursorRecoveryPhase::AuthorityFinalized {
+        return Err("released completion cut requires AuthorityFinalized host state".to_string());
+    }
+    require_cursor_recovery_pending_intent_absent(data_dir, "released AuthorityFinalized")?;
+    require_physically_absent(
+        &cloud_files_module_runtime_path(data_dir, CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE),
+        "released module cursor-recovery marker",
+    )?;
+    require_physically_absent(
+        &cloud_files_cursor_recovery_module_temp_path(data_dir),
+        "released module cursor-recovery temporary marker",
+    )?;
+    require_physically_absent(
+        &cloud_files_registration_journal_temp_path(data_dir),
+        "released registration journal temporary file",
+    )?;
+    require_physically_absent(
+        &cloud_files_registration_receipt_temp_path(data_dir),
+        "released registration receipt temporary file",
+    )?;
+    let ordinary_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            data_dir_root: Some(marker.identity.data_dir_root.clone()),
+            provider_name: marker.identity.provider_name.clone(),
+            cursor_recovery: None,
+        },
+        marker.module.clone(),
+        CloudUnregisterPolicy::Release,
+    )?;
+    let ordinary_stage = staged_cloud_registration_record(
+        &ordinary_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+    let completed_registration =
+        cloud_files_completed_registration_artifacts_fingerprint(data_dir)?;
+    if marker
+        .completion_registration_artifacts_fingerprint
+        .as_deref()
+        != Some(&completed_registration)
+        || staged.current.as_ref() != Some(&ordinary_stage)
+        || staged.temporary.is_some()
+        || marker.completed_artifacts_fingerprint.as_ref()
+            != Some(&cloud_files_completed_artifacts_fingerprint(
+                data_dir,
+                &ordinary_stage,
+            )?)
+    {
+        return Err("released AuthorityFinalized artifacts changed".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn cloud_files_preserved_artifacts_fingerprint(data_dir: &SinomoDataDir) -> Result<String, String> {
+    let receipt_path = cloud_files_registration_receipt_path(data_dir);
+    let journal_path =
+        cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE);
+    let receipt =
+        read_bounded_plain_host_file(&receipt_path, 64 * 1024, "Cloud Files preserved receipt")?;
+    if let Some(receipt) = receipt.as_ref() {
+        let decoded: sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt =
+            sinomo_runtime::module_api::decode_sobj(receipt)
+                .map_err(|error| format!("decode Cloud Files preserved receipt: {error}"))?;
+        if sinomo_runtime::module_api::encode_sobj(&decoded)
+            .map_err(|error| format!("re-encode Cloud Files preserved receipt: {error}"))?
+            != *receipt
+        {
+            return Err("Cloud Files preserved receipt is not canonical".to_string());
+        }
+    }
+    let journal = read_bounded_plain_host_file(
+        &journal_path,
+        1024 * 1024,
+        "Cloud Files preserved StateOwned registration journal",
+    )?
+    .ok_or_else(|| "Cloud Files preserved StateOwned journal is absent".to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.cloud-files.cursor-recovery.preserved-artifacts.v1\0");
+    match receipt.as_ref() {
+        Some(bytes) => {
+            hasher.update(b"receipt-present\0");
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        None => {
+            hasher.update(b"receipt-absent\0");
+        }
+    }
+    hasher.update(b"journal\0");
+    hasher.update(&(journal.len() as u64).to_le_bytes());
+    hasher.update(&journal);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+#[cfg(any(windows, test))]
 fn registration_receipt_matches_config(
     receipt: &sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt,
     config: &SifsMountConfig,
@@ -1493,7 +3972,11 @@ fn recover_pending_cloud_unregister_from_staged_with(
                     state: StagedCloudRegistrationState::MayBeRegistered,
                     ..record.clone()
                 };
-                replace_staged_cloud_registration_record(data_dir, &record, &may_be_registered)?;
+                transition_or_promote_cursor_recovery_staged_record(
+                    data_dir,
+                    &record,
+                    &may_be_registered,
+                )?;
             }
             return Ok(None);
         }
@@ -1609,7 +4092,9 @@ fn upgrade_legacy_staged_provider(
         &provenance,
         module.descriptor(),
         SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
-        true,
+        Some(
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+        ),
         || stage_cloud_unregister_recovery_module(data_dir, &provenance, &source).map(|_| ()),
     )?;
     drop(module);
@@ -1626,18 +4111,68 @@ fn recover_pending_cloud_unregister_from_staged(
     use sinomo_runtime::module::{ModuleId, read_native_dylib_module_loader_state};
 
     let Some(record) = load_staged_cloud_registration_record(data_dir)? else {
+        require_physically_absent(
+            &cursor_recovery_staged_temp_path(data_dir),
+            "orphan deterministic staged Cloud Files successor",
+        )?;
         return Ok(None);
     };
-    ensure_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
-    if !config.enabled
-        && record.recovery.module.interface_version
-            == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+    if record.recovery.module.interface_version
+        == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+        && record.recovery.legacy_prejournal_origin.is_none()
     {
-        // Consent-driven cleanup is bound to the exact pinned stage. A missing,
-        // corrupt, or newly selected loader is neither evidence nor authority
-        // for this already-staged v3 registration and must not block disable.
+        if record.recovery.request.cursor_recovery.is_some() {
+            return Err(
+                "cursor-context staged ownership exists without its host authorization".to_string(),
+            );
+        }
+        if !registration_request_matches_config(&record.recovery.request, config)? {
+            return Err(
+                "ordinary staged Cloud Files ownership does not match the exact configured registration"
+                    .to_string(),
+            );
+        }
+        let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+        let may_be_registered = StagedCloudRegistrationRecord {
+            state: StagedCloudRegistrationState::MayBeRegistered,
+            ..record.clone()
+        };
+        let exact_enable_successor = record.state == StagedCloudRegistrationState::RetainedAbsent
+            && staged.current.as_ref() == Some(&record)
+            && staged.temporary.as_ref() == Some(&may_be_registered);
+        if staged.current.as_ref() != Some(&record)
+            || staged
+                .temporary
+                .as_ref()
+                .is_some_and(|temporary| temporary != &record)
+        {
+            if !exact_enable_successor {
+                return Err(
+                    "ordinary staged Cloud Files current/temporary authority is changed or impossible"
+                        .to_string(),
+                );
+            }
+        }
+        verify_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
+        if staged.temporary.as_ref() == Some(&record) {
+            persist_or_promote_cursor_recovery_staged_record(data_dir, &record)?;
+        } else if exact_enable_successor {
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &record,
+                &may_be_registered,
+            )?;
+        }
+        // A canonical v3 stage is the provider-selection authority for both
+        // enabled restart and disabled Preserve(None). Loader drift cannot
+        // replace it and a missing/tampered pin has no fallback.
         return recover_pending_cloud_unregister_from_staged_with(data_dir, config, None);
     }
+    require_physically_absent(
+        &cursor_recovery_staged_temp_path(data_dir),
+        "legacy staged Cloud Files deterministic successor",
+    )?;
+    ensure_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
     let module_id = ModuleId::from_legacy_named(
         sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
     )
@@ -1694,6 +4229,7 @@ fn recover_pending_cloud_unregister_from_receipt(
 pub(crate) struct SifsMountLease {
     file: File,
     path: PathBuf,
+    cursor_recovery_bytes: Option<Vec<u8>>,
 }
 
 impl SifsMountLease {
@@ -1726,9 +4262,77 @@ impl SifsMountLease {
             ));
         }
 
-        let mut lease = Self { file, path };
+        let mut lease = Self {
+            file,
+            path,
+            cursor_recovery_bytes: None,
+        };
         lease.write_owner(owner)?;
         Ok(lease)
+    }
+
+    #[cfg(any(windows, test))]
+    fn try_acquire_existing_for_cursor_recovery(
+        data_dir: &SinomoDataDir,
+    ) -> Result<(Self, Vec<u8>), String> {
+        let data_root = data_dir.root();
+        let lock_dir = data_dir.dfs_dir();
+        ensure_plain_existing_host_path(&data_root, true, "Sinomo data directory")?;
+        ensure_plain_existing_host_path(&lock_dir, true, "DFS runtime directory")?;
+        let path = lock_dir.join("host-mount.lock");
+        ensure_plain_existing_host_path(&path, false, "SIFS host-mount lease")?;
+        let mut file = OpenOptions::new()
+            .create(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|error| {
+                format!(
+                    "open pre-existing SIFS host-mount lease {} without creating it: {error}",
+                    path.display()
+                )
+            })?;
+        try_lock_mount_lease_file(&file).map_err(|error| {
+            format!(
+                "SIFS host-mount lease {} is unavailable; a foreground or managed mount may be active: {error}",
+                path.display()
+            )
+        })?;
+        let length = file
+            .metadata()
+            .map_err(|error| format!("inspect SIFS host-mount lease {}: {error}", path.display()))?
+            .len();
+        if length > CLOUD_FILES_CURSOR_RECOVERY_HOST_LOCK_MAX_BYTES {
+            let _ = unlock_mount_lease_file(&file);
+            return Err(format!(
+                "SIFS host-mount lease {} is {length} bytes; maximum recovery evidence size is {CLOUD_FILES_CURSOR_RECOVERY_HOST_LOCK_MAX_BYTES}",
+                path.display()
+            ));
+        }
+        let mut bytes = Vec::with_capacity(length as usize);
+        if let Err(error) = file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+        {
+            let _ = unlock_mount_lease_file(&file);
+            return Err(format!(
+                "read SIFS host-mount lease {} without rewriting it: {error}",
+                path.display()
+            ));
+        }
+        Ok((
+            Self {
+                file,
+                path,
+                cursor_recovery_bytes: Some(bytes.clone()),
+            },
+            bytes,
+        ))
+    }
+
+    #[cfg(any(windows, test))]
+    fn cursor_recovery_bytes(&self) -> Option<&[u8]> {
+        self.cursor_recovery_bytes.as_deref()
     }
 
     fn write_owner(&mut self, owner: &str) -> Result<(), String> {
@@ -1755,6 +4359,42 @@ impl SifsMountLease {
                 )
             })
     }
+}
+
+#[cfg(any(windows, test))]
+fn ensure_plain_existing_host_path(
+    path: &Path,
+    expected_directory: bool,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect {label} {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || (expected_directory && !metadata.is_dir())
+        || (!expected_directory && !metadata.is_file())
+    {
+        return Err(format!(
+            "{label} {} must be a plain {}",
+            path.display(),
+            if expected_directory {
+                "directory"
+            } else {
+                "file"
+            }
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{label} {} is a Windows reparse point",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Drop for SifsMountLease {
@@ -1935,6 +4575,7 @@ impl SifsMountSupervisorService {
         let worker_status = Arc::clone(&status);
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_mount_cancellation = Arc::clone(&mount_cancellation);
+        let (cursor_recovery, worker_cursor_recovery) = mpsc::sync_channel(1);
         let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("sinomo-sifs-mount".to_string())
@@ -1946,6 +4587,7 @@ impl SifsMountSupervisorService {
                     worker_status,
                     worker_shutdown,
                     worker_mount_cancellation,
+                    worker_cursor_recovery,
                 );
                 let _ = stopped_tx.send(());
             })
@@ -1955,6 +4597,7 @@ impl SifsMountSupervisorService {
                 status,
                 shutdown,
                 mount_cancellation,
+                cursor_recovery,
                 worker: Mutex::new(Some(SifsMountSupervisorWorker {
                     thread: Some(thread),
                     stopped: stopped_rx,
@@ -2011,16 +4654,42 @@ impl Service for SifsMountSupervisorService {
     }
 
     fn routes(&self) -> &'static [&'static str] {
-        &[SIFS_MOUNT_STATUS_ROUTE]
+        &[
+            SIFS_MOUNT_STATUS_ROUTE,
+            SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE,
+        ]
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let status = self.status();
+        let cursor_recovery = self.inner.cursor_recovery.clone();
         Box::pin(async move {
             match request.route.as_str() {
                 SIFS_MOUNT_STATUS_ROUTE => {
                     let _: SifsMountStatusRequest = ctx.decode_request_body(&request).await?;
                     ctx.respond_value(SIFS_MOUNT_STATUS_ROUTE, SifsMountStatusResponse { status })?;
+                }
+                SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE => {
+                    let command: SifsMountCursorOnlyRecoveryRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let (response_tx, response_rx) = mpsc::sync_channel(1);
+                    cursor_recovery
+                        .send(SifsMountCursorRecoveryControl {
+                            request: command,
+                            response: response_tx,
+                        })
+                        .map_err(|_| {
+                            ServiceError::Service("SIFS mount supervisor stopped".to_string())
+                        })?;
+                    let response = response_rx
+                        .recv_timeout(Duration::from_secs(60))
+                        .map_err(|_| {
+                            ServiceError::Service(
+                                "SIFS cursor recovery supervisor response timed out".to_string(),
+                            )
+                        })?
+                        .map_err(ServiceError::Service)?;
+                    ctx.respond_value(SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE, response)?;
                 }
                 other => return Err(ServiceError::UnknownRoute(other.to_string())),
             }
@@ -2057,6 +4726,7 @@ fn run_mount_supervisor(
     observed_status: Arc<RwLock<SifsMountRuntimeStatus>>,
     shutdown: Arc<AtomicBool>,
     mount_cancellation: Arc<Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>>,
+    cursor_recovery: mpsc::Receiver<SifsMountCursorRecoveryControl>,
 ) {
     let store = match sifs_mount_config_store() {
         Ok(store) => store,
@@ -2076,6 +4746,17 @@ fn run_mount_supervisor(
     #[cfg(windows)]
     let mut pending_unregister_recovery_loaded = false;
     while !shutdown.load(Ordering::SeqCst) {
+        if let Ok(command) = cursor_recovery.try_recv() {
+            let result = handle_cursor_recovery_control_serialized(
+                data_dir,
+                &store,
+                active.as_ref(),
+                pending_cloud_unregister.as_ref(),
+                &command.request,
+            );
+            let _ = command.response.send(result);
+            continue;
+        }
         #[cfg(windows)]
         {
             if !pending_unregister_recovery_loaded {
@@ -2222,7 +4903,114 @@ fn run_mount_supervisor(
 
         #[cfg(windows)]
         if active.is_none() {
-            match recover_pending_cloud_unregister_from_staged(data_dir, &config) {
+            match resume_active_observed_host_cursor_recovery_cleanup(data_dir, &config) {
+                Ok(true) => {
+                    // Cleanup is a standalone serialized supervisor turn. Do
+                    // not start a mount in the same turn after removing the
+                    // durable provider-selection marker.
+                    supervisor_wait(&shutdown);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    publish_status(
+                        &store,
+                        data_dir,
+                        &observed_status,
+                        &mut last_persisted_status,
+                        status_error(
+                            &config,
+                            None,
+                            daemon_pid,
+                            restart_count,
+                            format!("resume completed cursor-recovery cleanup: {error}"),
+                        ),
+                    );
+                    supervisor_wait(&shutdown);
+                    continue;
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        let (cursor_recovery_host_owned, mut cursor_recovery_enable_lease) = if active.is_none() {
+            match admit_host_cursor_recovery_enable(data_dir, &config) {
+                Ok(admission) => admission,
+                Err(error) => {
+                    publish_status(
+                        &store,
+                        data_dir,
+                        &observed_status,
+                        &mut last_persisted_status,
+                        status_error(
+                            &config,
+                            None,
+                            daemon_pid,
+                            restart_count,
+                            format!("admit cursor-recovery mount enable: {error}"),
+                        ),
+                    );
+                    supervisor_wait(&shutdown);
+                    continue;
+                }
+            }
+        } else {
+            (false, None)
+        };
+        #[cfg(not(windows))]
+        let cursor_recovery_host_owned = false;
+        #[cfg(not(windows))]
+        let mut cursor_recovery_enable_lease: Option<SifsMountLease> = None;
+        #[cfg(windows)]
+        let cursor_recovery_completion_committed = cursor_recovery_host_owned
+            && load_host_cursor_recovery_marker_strict(data_dir)
+                .ok()
+                .flatten()
+                .is_some_and(|marker| marker.phase == HostCursorRecoveryPhase::AuthorityFinalized);
+        #[cfg(not(windows))]
+        let cursor_recovery_completion_committed = false;
+
+        #[cfg(windows)]
+        if active.is_none()
+            && (!cursor_recovery_host_owned
+                || (!config.enabled && !cursor_recovery_completion_committed))
+        {
+            let cursor_recovery_module = if cursor_recovery_host_owned {
+                match load_host_cursor_recovery_marker_strict(data_dir) {
+                    Ok(Some(marker)) => Some(marker.module),
+                    Ok(None) => None,
+                    Err(error) => {
+                        publish_status(
+                            &store,
+                            data_dir,
+                            &observed_status,
+                            &mut last_persisted_status,
+                            status_error(
+                                &config,
+                                None,
+                                daemon_pid,
+                                restart_count,
+                                format!(
+                                    "load pinned cursor-recovery provider for disable: {error}"
+                                ),
+                            ),
+                        );
+                        supervisor_wait(&shutdown);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let staged_recovery = match cursor_recovery_module.as_ref() {
+                Some(module) => recover_pending_cloud_unregister_from_staged_with(
+                    data_dir,
+                    &config,
+                    Some(module),
+                ),
+                None => recover_pending_cloud_unregister_from_staged(data_dir, &config),
+            };
+            match staged_recovery {
                 Ok(Some(record)) => {
                     if let Err(error) = persist_pending_cloud_unregister_record(data_dir, &record) {
                         publish_status(
@@ -2243,7 +5031,12 @@ fn run_mount_supervisor(
                         supervisor_wait(&shutdown);
                         continue;
                     }
-                    pending_cloud_unregister = Some(PendingCloudUnregister::new(record, None));
+                    let lease = if cursor_recovery_host_owned {
+                        cursor_recovery_enable_lease.take().map(Arc::new)
+                    } else {
+                        None
+                    };
+                    pending_cloud_unregister = Some(PendingCloudUnregister::new(record, lease));
                     continue;
                 }
                 Ok(None) => {}
@@ -2314,7 +5107,7 @@ fn run_mount_supervisor(
             }
         }
 
-        if !config.enabled {
+        if !config.enabled && !cursor_recovery_completion_committed {
             start_retry.clear();
             if let Err(error) = retire_active_mount(
                 data_dir,
@@ -2573,16 +5366,20 @@ fn run_mount_supervisor(
                 ),
             );
             let owner = format!("managed supervisor mount {}", mount_point.display());
-            let start_result = SifsMountLease::try_acquire(data_dir, &owner).and_then(|lease| {
-                start_platform_mount(
-                    data_dir,
-                    &config,
-                    &mount_point,
-                    Arc::clone(&shutdown),
-                    &mount_cancellation,
-                    lease,
-                )
-            });
+            let start_result = cursor_recovery_enable_lease
+                .take()
+                .map(Ok)
+                .unwrap_or_else(|| SifsMountLease::try_acquire(data_dir, &owner))
+                .and_then(|lease| {
+                    start_platform_mount(
+                        data_dir,
+                        &config,
+                        &mount_point,
+                        Arc::clone(&shutdown),
+                        &mount_cancellation,
+                        lease,
+                    )
+                });
             match start_result {
                 Ok(mount) => {
                     active = Some(mount);
@@ -2666,6 +5463,793 @@ fn run_mount_supervisor(
             ),
         );
     }
+}
+
+#[cfg(not(windows))]
+fn handle_cursor_recovery_control_serialized(
+    _data_dir: &SinomoDataDir,
+    _store: &ConfigStore,
+    _active: Option<&ActiveMount>,
+    _pending: Option<&PendingCloudUnregister>,
+    _request: &SifsMountCursorOnlyRecoveryRequest,
+) -> Result<SifsMountCursorOnlyRecoveryResponse, String> {
+    Err("cursor-only state recovery is supported only by Windows Cloud Files".to_string())
+}
+
+#[cfg(windows)]
+fn handle_cursor_recovery_control_serialized(
+    data_dir: &SinomoDataDir,
+    store: &ConfigStore,
+    active: Option<&ActiveMount>,
+    pending: Option<&PendingCloudUnregister>,
+    request: &SifsMountCursorOnlyRecoveryRequest,
+) -> Result<SifsMountCursorOnlyRecoveryResponse, String> {
+    match request {
+        SifsMountCursorOnlyRecoveryRequest::Inspect => {
+            inspect_cursor_recovery_control_serialized(data_dir, store, active, pending)
+        }
+        SifsMountCursorOnlyRecoveryRequest::Apply {
+            expected_token,
+            acknowledge_authoritative_full_reconciliation,
+        } => apply_cursor_recovery_control_serialized(
+            data_dir,
+            store,
+            active,
+            pending,
+            expected_token,
+            *acknowledge_authoritative_full_reconciliation,
+        ),
+    }
+}
+
+#[cfg(windows)]
+struct LoadedCursorRecoveryProvider {
+    module: sinomo_runtime::module::NativeModule,
+    provenance: CloudFilesModuleProvenance,
+    source_path: PathBuf,
+}
+
+#[cfg(windows)]
+fn load_cursor_recovery_provider(
+    data_dir: &SinomoDataDir,
+) -> Result<LoadedCursorRecoveryProvider, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+    };
+    use sinomo_runtime::module::{
+        ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
+    };
+    let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+    let state = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
+        .map_err(|error| format!("read Cloud Files module loader state: {error}"))?
+        .ok_or_else(|| "Cloud Files module is not active".to_string())?;
+    if state.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
+        return Err(format!(
+            "cursor recovery requires Cloud Files interface {SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION}; active interface is {}",
+            state.interface_version
+        ));
+    }
+    let path = native_module_cache_path(
+        &data_dir.root(),
+        &state.cache_key,
+        &state.content_hash,
+        &state.library_name,
+    );
+    let module = unsafe {
+        NativeModule::load_process_resident_from_content_addressed_path(&path, &state.content_hash)
+    }
+    .map_err(|error| format!("load Cloud Files cursor-recovery provider: {error}"))?;
+    Ok(LoadedCursorRecoveryProvider {
+        provenance: CloudFilesModuleProvenance::from_loader_state(&state),
+        module,
+        source_path: path,
+    })
+}
+
+#[cfg(windows)]
+fn load_pinned_cursor_recovery_provider(
+    data_dir: &SinomoDataDir,
+    provenance: &CloudFilesModuleProvenance,
+) -> Result<LoadedCursorRecoveryProvider, String> {
+    use sinomo_runtime::module::NativeModule;
+    let source_path = resolve_cloud_unregister_module_path(data_dir, provenance)?;
+    let module = unsafe {
+        NativeModule::load_process_resident_from_content_addressed_path(
+            &source_path,
+            &provenance.content_hash,
+        )
+    }
+    .map_err(|error| format!("load pinned Cloud Files cursor-recovery provider: {error}"))?;
+    Ok(LoadedCursorRecoveryProvider {
+        module,
+        provenance: provenance.clone(),
+        source_path,
+    })
+}
+
+#[cfg(windows)]
+fn exact_disabled_cursor_recovery_config(
+    data_dir: &SinomoDataDir,
+    store: &ConfigStore,
+    active: Option<&ActiveMount>,
+    pending: Option<&PendingCloudUnregister>,
+) -> Result<(SifsMountConfig, PathBuf), String> {
+    if active.is_some() || pending.is_some() {
+        return Err(
+            "cursor recovery requires no active mount and no in-memory unregister intent"
+                .to_string(),
+        );
+    }
+    let config: SifsMountConfig = store
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| format!("read cursor-recovery mount configuration: {error}"))?;
+    if config.enabled {
+        return Err("disable the managed SIFS mount before cursor recovery".to_string());
+    }
+    let mount_point = validate_mount_config(data_dir, &config)?;
+    Ok((config, mount_point))
+}
+
+#[cfg(windows)]
+fn cursor_recovery_module_identity(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+    mount_point: PathBuf,
+    provenance: &CloudFilesModuleProvenance,
+) -> Result<sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION, SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME,
+    };
+    Ok(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            enabled: false,
+            sync_root: mount_point,
+            root_path: config.root_path.clone(),
+            data_dir_root: data_dir.root(),
+            provider_name: SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME.to_string(),
+            provider_version: env!("CARGO_PKG_VERSION").to_string(),
+            read_only: config.read_only,
+            allow_other: config.allow_other,
+            sync_local_changes: config.sync_local_changes,
+            prepopulate_depth: 0,
+            connect: true,
+            max_run_seconds: None,
+            disabled_config_fingerprint: disabled_mount_config_fingerprint(config)?,
+            provider_provenance_fingerprint: cloud_files_provenance_fingerprint(provenance)?,
+        },
+    )
+}
+
+#[cfg(windows)]
+fn invoke_cursor_recovery_inspect(
+    provider: &LoadedCursorRecoveryProvider,
+    identity: sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity,
+) -> Result<sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesCursorOnlyRecoveryInspectRequest, CloudFilesModuleRequest,
+        CloudFilesModuleResponse, SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
+    };
+    use sinomo_runtime::module_api::{
+        NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
+        encode_sobj,
+    };
+    let payload_sobj = encode_sobj(&CloudFilesModuleRequest::InspectCursorOnlyRecovery(
+        CloudFilesCursorOnlyRecoveryInspectRequest { identity },
+    ))
+    .map_err(|error| format!("encode Cloud Files cursor-recovery inspection: {error}"))?;
+    let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+        operation: SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION.to_string(),
+        payload_sobj,
+        request_body: None,
+        response_body_path: None,
+    });
+    let response = admit_cloud_files_provider_before_effect_with(
+        &provider.provenance,
+        provider.module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
+        Some(SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY),
+        || {
+            provider
+                .module
+                .invoke(&request)
+                .map_err(|error| format!("invoke Cloud Files cursor-recovery inspection: {error}"))
+        },
+    )?;
+    match response {
+        NativeModuleResponse::Invocation(response)
+            if response.operation
+                == SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION =>
+        {
+            match decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
+                .map_err(|error| format!("decode cursor-recovery inspection response: {error}"))?
+            {
+                CloudFilesModuleResponse::CursorOnlyRecoveryInspected(inspection) => Ok(inspection),
+                CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
+                other => Err(format!(
+                    "Cloud Files cursor-recovery inspect returned a cross-paired response: {other:?}"
+                )),
+            }
+        }
+        NativeModuleResponse::Error(error) => Err(format!("{}: {}", error.code, error.detail)),
+        other => Err(format!(
+            "unexpected Cloud Files cursor-recovery inspect response: {other:?}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn invoke_cursor_recovery_apply(
+    provider: &LoadedCursorRecoveryProvider,
+    marker: &HostCursorRecoveryMarker,
+) -> Result<sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        CloudFilesCursorOnlyRecoveryApplyRequest, CloudFilesModuleRequest,
+        CloudFilesModuleResponse, SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
+    };
+    use sinomo_runtime::module_api::{
+        NativeModuleInvocationRequest, NativeModuleRequest, NativeModuleResponse, decode_sobj,
+        encode_sobj,
+    };
+    let payload_sobj = encode_sobj(&CloudFilesModuleRequest::ApplyCursorOnlyRecovery(
+        CloudFilesCursorOnlyRecoveryApplyRequest {
+            identity: marker.identity.clone(),
+            expected_token: marker.inner_token.clone(),
+            recovery_id: marker.recovery_id.clone(),
+            acknowledge_authoritative_full_reconciliation: true,
+        },
+    ))
+    .map_err(|error| format!("encode Cloud Files cursor-recovery apply: {error}"))?;
+    let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
+        operation: SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION.to_string(),
+        payload_sobj,
+        request_body: None,
+        response_body_path: None,
+    });
+    let response = admit_cloud_files_provider_before_effect_with(
+        &provider.provenance,
+        provider.module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
+        Some(SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY),
+        || {
+            provider
+                .module
+                .invoke(&request)
+                .map_err(|error| format!("invoke Cloud Files cursor-recovery apply: {error}"))
+        },
+    )?;
+    match response {
+        NativeModuleResponse::Invocation(response)
+            if response.operation
+                == SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION =>
+        {
+            match decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
+                .map_err(|error| format!("decode cursor-recovery apply response: {error}"))?
+            {
+                CloudFilesModuleResponse::CursorOnlyRecoveryApplied(applied) => Ok(applied),
+                CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
+                other => Err(format!(
+                    "Cloud Files cursor-recovery apply returned a cross-paired response: {other:?}"
+                )),
+            }
+        }
+        NativeModuleResponse::Error(error) => Err(format!("{}: {}", error.code, error.detail)),
+        other => Err(format!(
+            "unexpected Cloud Files cursor-recovery apply response: {other:?}"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn inspect_cursor_recovery_control_serialized(
+    data_dir: &SinomoDataDir,
+    store: &ConfigStore,
+    active: Option<&ActiveMount>,
+    pending: Option<&PendingCloudUnregister>,
+) -> Result<SifsMountCursorOnlyRecoveryResponse, String> {
+    let (config, mount_point) =
+        exact_disabled_cursor_recovery_config(data_dir, store, active, pending)?;
+    let (_lease, host_lock_bytes) =
+        SifsMountLease::try_acquire_existing_for_cursor_recovery(data_dir)?;
+    require_fresh_host_cursor_recovery_absence(data_dir)?;
+    let provider = load_cursor_recovery_provider(data_dir)?;
+    let identity =
+        cursor_recovery_module_identity(data_dir, &config, mount_point, &provider.provenance)?;
+    let inspection = invoke_cursor_recovery_inspect(&provider, identity.clone())?;
+    // Recheck host-private absence after the read-only module inspection while
+    // the same pre-existing host lock remains held.
+    require_fresh_host_cursor_recovery_absence(data_dir)?;
+    let token = host_cursor_recovery_outer_token(
+        &config,
+        &provider.provenance,
+        &host_lock_bytes,
+        &identity,
+        &inspection,
+    )?;
+    Ok(SifsMountCursorOnlyRecoveryResponse::Inspected {
+        recovery_token: token,
+        raw_state_fingerprint: inspection.raw_state_fingerprint,
+        sync_root_file_id: inspection.sync_root_file_id,
+        cursor_count: inspection.cursor_count,
+        provider_content_hash: provider.provenance.content_hash,
+        provider_interface_version: provider.provenance.interface_version,
+        detail: inspection.detail,
+    })
+}
+
+#[cfg(windows)]
+fn apply_cursor_recovery_control_serialized(
+    data_dir: &SinomoDataDir,
+    store: &ConfigStore,
+    active: Option<&ActiveMount>,
+    pending: Option<&PendingCloudUnregister>,
+    expected_token: &str,
+    acknowledged: bool,
+) -> Result<SifsMountCursorOnlyRecoveryResponse, String> {
+    if expected_token.trim().is_empty() || !acknowledged {
+        return Err(
+            "apply requires the exact inspection token and explicit authoritative reconciliation acknowledgement"
+                .to_string(),
+        );
+    }
+    let (config, mount_point) =
+        exact_disabled_cursor_recovery_config(data_dir, store, active, pending)?;
+    let (_lease, host_lock_bytes) =
+        SifsMountLease::try_acquire_existing_for_cursor_recovery(data_dir)?;
+    let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    let (mut marker, provider) = if let Some(marker) = marker_snapshot.value {
+        validate_current_host_cursor_recovery_authority(
+            data_dir,
+            &config,
+            &host_lock_bytes,
+            expected_token,
+            &marker,
+        )?;
+        let bundle = bundle_snapshot.value.ok_or_else(|| {
+            "durable cursor-recovery marker lost its first-effect provider bundle".to_string()
+        })?;
+        validate_host_cursor_recovery_bundle_link(&marker, &bundle)?;
+        // All authorization and current-lock checks precede replay mutations.
+        promote_host_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        materialize_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        promote_host_cursor_recovery_marker(data_dir, &marker)?;
+        let provider = load_pinned_cursor_recovery_provider(data_dir, &marker.module)?;
+        (marker, provider)
+    } else if let Some(bundle) = bundle_snapshot.value {
+        let marker = bundle.requested.clone();
+        validate_current_host_cursor_recovery_authority(
+            data_dir,
+            &config,
+            &host_lock_bytes,
+            expected_token,
+            &marker,
+        )?;
+        // A crash after the first durable bundle but before marker creation is
+        // replayed from its exact bytes, independently of loader/cache drift.
+        promote_host_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        materialize_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        persist_host_cursor_recovery_marker(data_dir, &marker)?;
+        let provider = load_pinned_cursor_recovery_provider(data_dir, &marker.module)?;
+        (marker, provider)
+    } else {
+        require_fresh_host_cursor_recovery_absence(data_dir)?;
+        let provider = load_cursor_recovery_provider(data_dir)?;
+        let identity =
+            cursor_recovery_module_identity(data_dir, &config, mount_point, &provider.provenance)?;
+        let inspection = invoke_cursor_recovery_inspect(&provider, identity.clone())?;
+        require_fresh_host_cursor_recovery_absence(data_dir)?;
+        let observed_token = host_cursor_recovery_outer_token(
+            &config,
+            &provider.provenance,
+            &host_lock_bytes,
+            &identity,
+            &inspection,
+        )?;
+        if observed_token != expected_token {
+            return Err(
+                "cursor-recovery token no longer matches the exact disabled snapshot".to_string(),
+            );
+        }
+        // Consent/config must still be byte-for-byte the inspected disabled
+        // snapshot immediately before the first durable host effect.
+        let current: SifsMountConfig = store
+            .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+            .map_err(|error| {
+                format!("revalidate disabled config before cursor-recovery authorization: {error}")
+            })?;
+        if current != config || current.enabled {
+            return Err(
+                "mount configuration changed before cursor-recovery authorization".to_string(),
+            );
+        }
+        require_fresh_host_cursor_recovery_absence(data_dir)?;
+        let marker = HostCursorRecoveryMarker {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            disabled_config: config.clone(),
+            module: provider.provenance.clone(),
+            identity,
+            outer_token: observed_token.clone(),
+            inner_token: inspection.recovery_token.clone(),
+            recovery_id: deterministic_host_cursor_recovery_id(&observed_token),
+            inspection,
+            applied: None,
+            ready_artifacts_fingerprint: None,
+            preserved_artifacts_fingerprint: None,
+            active_module_marker_fingerprint: None,
+            completion_module_marker_fingerprint: None,
+            completion_registration_artifacts_fingerprint: None,
+            completed_artifacts_fingerprint: None,
+            recovery_cycle: 0,
+            native_successor_fingerprint: None,
+            phase: HostCursorRecoveryPhase::Requested,
+        };
+        let provider_bytes = read_bounded_plain_host_file(
+            &provider.source_path,
+            CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES,
+            "selected cursor-recovery provider",
+        )?
+        .ok_or_else(|| "selected cursor-recovery provider disappeared".to_string())?;
+        let bundle = HostCursorRecoveryProviderBundle {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            requested: marker.clone(),
+            provider_bytes,
+        };
+        // This single canonical bundle is the first durable host effect.
+        persist_host_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        materialize_cursor_recovery_provider_bundle(data_dir, &bundle)?;
+        persist_host_cursor_recovery_marker(data_dir, &marker)?;
+        let pinned = load_pinned_cursor_recovery_provider(data_dir, &marker.module)?;
+        (marker, pinned)
+    };
+    let current: SifsMountConfig = store
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| format!("revalidate disabled cursor-recovery config: {error}"))?;
+    if current != marker.disabled_config || current.enabled {
+        return Err(
+            "mount configuration or local consent changed after cursor-recovery authorization"
+                .to_string(),
+        );
+    }
+    if marker.phase == HostCursorRecoveryPhase::Requested {
+        let applied = invoke_cursor_recovery_apply(&provider, &marker)?;
+        marker.applied = Some(applied);
+        marker.phase = HostCursorRecoveryPhase::ModuleApplied;
+        persist_host_cursor_recovery_marker(data_dir, &marker)?;
+    }
+    if marker.phase == HostCursorRecoveryPhase::ModuleApplied {
+        let current: SifsMountConfig = store
+            .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+            .map_err(|error| {
+                format!("revalidate cursor-recovery consent before adoption: {error}")
+            })?;
+        if current != marker.disabled_config || current.enabled {
+            return Err(
+                "mount configuration changed after module adoption; retained ownership remains pinned"
+                    .to_string(),
+            );
+        }
+        require_physically_absent(
+            &pending_cloud_unregister_path(data_dir),
+            "pending Cloud Files unregister",
+        )?;
+        require_physically_absent(
+            &cloud_files_registration_receipt_path(data_dir),
+            "Cloud Files registration receipt",
+        )?;
+        let recovery = pending_cloud_unregister_record_with_policy(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                data_dir_root: Some(marker.identity.data_dir_root.clone()),
+                provider_name: marker.identity.provider_name.clone(),
+                cursor_recovery: Some(
+                    sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                        recovery_id: marker.recovery_id.clone(),
+                        recovery_token: marker.inner_token.clone(),
+                        recovery_cycle: marker.recovery_cycle,
+                        native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+                    },
+                ),
+            },
+            marker.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )?;
+        let retained = staged_cloud_registration_record(
+            &recovery,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )?;
+        match load_staged_cloud_registration_record(data_dir)? {
+            None => persist_or_promote_cursor_recovery_staged_record(data_dir, &retained)?,
+            Some(existing) if existing == retained => {
+                persist_or_promote_cursor_recovery_staged_record(data_dir, &retained)?;
+            }
+            Some(_) => {
+                return Err(
+                    "module-applied cursor recovery found changed staged ownership".to_string(),
+                );
+            }
+        }
+        marker.phase = HostCursorRecoveryPhase::AdoptedRetained;
+        persist_host_cursor_recovery_marker(data_dir, &marker)?;
+    }
+    let applied = marker
+        .applied
+        .as_ref()
+        .ok_or_else(|| "durable recovery has no matching module apply result".to_string())?;
+    Ok(SifsMountCursorOnlyRecoveryResponse::Applied {
+        recovery_id: marker.recovery_id.clone(),
+        recovery_token: marker.outer_token.clone(),
+        sync_root_file_id: applied.sync_root_file_id,
+        cursor_count_cleared: applied.cursor_count_cleared,
+        detail: "cursor state is adopted and retained while the mount remains disabled; explicitly enable the exact same configuration to run the gated authoritative reconciliation"
+            .to_string(),
+    })
+}
+
+#[cfg(windows)]
+fn admit_host_cursor_recovery_enable(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+) -> Result<(bool, Option<SifsMountLease>), String> {
+    let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    let Some(mut marker) = marker_snapshot.value else {
+        if bundle_snapshot.value.is_some() {
+            return Err(
+                "cursor-recovery provider authorization exists without its host marker; retry the exact disabled Apply before enabling"
+                    .to_string(),
+            );
+        }
+        return Ok((false, None));
+    };
+    if !matches!(
+        marker.phase,
+        HostCursorRecoveryPhase::AdoptedRetained
+            | HostCursorRecoveryPhase::ArmedAwaitingReady
+            | HostCursorRecoveryPhase::ReadyObserved
+            | HostCursorRecoveryPhase::ActiveObserved
+            | HostCursorRecoveryPhase::AuthorityFinalized
+            | HostCursorRecoveryPhase::PreservedRetained
+    ) {
+        return Err(format!(
+            "cursor recovery {} is {:?}, not adopted and ready for mount admission",
+            marker.recovery_id, marker.phase
+        ));
+    }
+    let mut expected_enabled = marker.disabled_config.clone();
+    expected_enabled.enabled = true;
+    let disabled_admission = !config.enabled;
+    if disabled_admission && config != &marker.disabled_config {
+        return Err(
+            "disabled mount configuration drifted from cursor-recovery authorization".to_string(),
+        );
+    }
+    if !disabled_admission && config != &expected_enabled {
+        return Err(
+            "cursor-recovery mount enable must change only enabled=false to enabled=true"
+                .to_string(),
+        );
+    }
+    let (lease, host_lock_bytes) =
+        SifsMountLease::try_acquire_existing_for_cursor_recovery(data_dir)?;
+    validate_current_host_cursor_recovery_authority(
+        data_dir,
+        &marker.disabled_config,
+        &host_lock_bytes,
+        &marker.outer_token,
+        &marker,
+    )?;
+    if load_pending_cloud_unregister_record(data_dir)?.is_some() {
+        return Err("cursor-recovery enable found a pending unregister intent".to_string());
+    }
+    let bundle = match bundle_snapshot.value {
+        Some(bundle) => {
+            validate_host_cursor_recovery_bundle_link(&marker, &bundle)?;
+            Some(bundle)
+        }
+        _ => {
+            return Err(
+                "cursor-recovery enable lost its durable provider authorization bundle".to_string(),
+            );
+        }
+    };
+    let staged_snapshot = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+    let expected_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            data_dir_root: Some(marker.identity.data_dir_root.clone()),
+            provider_name: marker.identity.provider_name.clone(),
+            cursor_recovery: Some(
+                sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                    recovery_id: marker.recovery_id.clone(),
+                    recovery_token: marker.inner_token.clone(),
+                    recovery_cycle: marker.recovery_cycle,
+                    native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+                },
+            ),
+        },
+        marker.module.clone(),
+        CloudUnregisterPolicy::PreserveState,
+    )?;
+    let expected_retained = staged_cloud_registration_record(
+        &expected_recovery,
+        StagedCloudRegistrationState::RetainedAbsent,
+    )?;
+    let expected_may_be_registered = staged_cloud_registration_record(
+        &expected_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    if marker.phase == HostCursorRecoveryPhase::AuthorityFinalized {
+        if bundle_snapshot.temporary {
+            return Err(
+                "AuthorityFinalized completion found an unpromoted provider bundle".to_string(),
+            );
+        }
+        let bundle = bundle.as_ref().ok_or_else(|| {
+            "AuthorityFinalized completion lost its durable provider bundle".to_string()
+        })?;
+        let completion = validate_authority_finalized_completion_cut(data_dir, &marker)?;
+        if completion.registration_normalized && !completion.stage_normalized {
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &completion.cursor_stage,
+                &completion.ordinary_stage,
+            )?;
+        }
+        materialize_cursor_recovery_provider_bundle(data_dir, bundle)?;
+        promote_host_cursor_recovery_marker(data_dir, &marker)?;
+        return Ok((true, Some(lease)));
+    }
+    if matches!(
+        marker.phase,
+        HostCursorRecoveryPhase::ReadyObserved | HostCursorRecoveryPhase::ActiveObserved
+    ) {
+        if marker.ready_artifacts_fingerprint.as_ref()
+            != Some(&cloud_files_ready_artifacts_fingerprint(data_dir)?)
+        {
+            return Err(
+                "cursor-recovery enable found changed Ready receipt/journal bytes".to_string(),
+            );
+        }
+    } else if marker.phase == HostCursorRecoveryPhase::PreservedRetained
+        && marker.preserved_artifacts_fingerprint.as_ref()
+            != Some(&cloud_files_preserved_artifacts_fingerprint(data_dir)?)
+    {
+        return Err(
+            "cursor-recovery enable found changed preserved StateOwned journal/receipt bytes"
+                .to_string(),
+        );
+    }
+    let retained_current = staged_snapshot.current.as_ref() == Some(&expected_retained);
+    let armed_current = staged_snapshot.current.as_ref() == Some(&expected_may_be_registered);
+    let retained_temp = staged_snapshot.temporary.as_ref() == Some(&expected_retained);
+    let armed_temp = staged_snapshot.temporary.as_ref() == Some(&expected_may_be_registered);
+    let exact_stage_cut = match marker.phase {
+        HostCursorRecoveryPhase::AdoptedRetained | HostCursorRecoveryPhase::PreservedRetained => {
+            retained_current && (staged_snapshot.temporary.is_none() || retained_temp)
+        }
+        HostCursorRecoveryPhase::ArmedAwaitingReady => {
+            (retained_current
+                && (staged_snapshot.temporary.is_none() || retained_temp || armed_temp))
+                || (armed_current && (staged_snapshot.temporary.is_none() || armed_temp))
+        }
+        HostCursorRecoveryPhase::ReadyObserved | HostCursorRecoveryPhase::ActiveObserved => {
+            armed_current && (staged_snapshot.temporary.is_none() || armed_temp)
+        }
+        _ => false,
+    };
+    if !exact_stage_cut {
+        return Err(format!(
+            "cursor-recovery enable found an impossible {:?} host/staged current+temporary ordering",
+            marker.phase
+        ));
+    }
+    if disabled_admission {
+        // Disabled admission still consumes only exact replayable host/bundle
+        // temps under the pre-existing lease. It never arms or starts a worker;
+        // Armed/Ready/Active are left for the pinned PreserveState turn, while
+        // Adopted/Preserved RetainedAbsent are already parked.
+        if let Some(bundle) = bundle.as_ref() {
+            promote_host_cursor_recovery_provider_bundle(data_dir, bundle)?;
+            materialize_cursor_recovery_provider_bundle(data_dir, bundle)?;
+        }
+        promote_host_cursor_recovery_marker(data_dir, &marker)?;
+        if marker.phase == HostCursorRecoveryPhase::ArmedAwaitingReady && retained_current {
+            if retained_temp {
+                persist_or_promote_cursor_recovery_staged_record(data_dir, &expected_retained)?;
+            }
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &expected_retained,
+                &expected_may_be_registered,
+            )?;
+        }
+        return Ok((true, Some(lease)));
+    }
+    // Every read-only authority, config, and staged-ownership check above must
+    // succeed before resuming first-effect artifacts or advancing the host
+    // phase. Loader state is intentionally irrelevant after authorization.
+    if let Some(bundle) = bundle.as_ref() {
+        promote_host_cursor_recovery_provider_bundle(data_dir, bundle)?;
+        materialize_cursor_recovery_provider_bundle(data_dir, bundle)?;
+    }
+    promote_host_cursor_recovery_marker(data_dir, &marker)?;
+    let provider = load_pinned_cursor_recovery_provider(data_dir, &marker.module)?;
+    use sinomo_runtime::dfs_cloud_files_api::{
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+    };
+    admit_cloud_files_provider_before_effect_with(
+        &provider.provenance,
+        provider.module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        Some(SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY),
+        || Ok(()),
+    )?;
+    for capability in [
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+        SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+    ] {
+        if !provider
+            .module
+            .descriptor()
+            .capabilities
+            .iter()
+            .any(|candidate| candidate == capability)
+        {
+            return Err(format!(
+                "pinned cursor-recovery provider lacks required capability {capability}"
+            ));
+        }
+    }
+    let current: SifsMountConfig = sifs_mount_config_store()?
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| format!("revalidate cursor-recovery consent before arming: {error}"))?;
+    if current != expected_enabled {
+        return Err("mount configuration changed before cursor-recovery arming".to_string());
+    }
+    if matches!(
+        marker.phase,
+        HostCursorRecoveryPhase::AdoptedRetained | HostCursorRecoveryPhase::PreservedRetained
+    ) {
+        if marker.phase == HostCursorRecoveryPhase::AdoptedRetained {
+            require_physically_absent(
+                &cloud_files_registration_receipt_path(data_dir),
+                "pre-enable Cloud Files registration receipt",
+            )?;
+        }
+        marker.phase = HostCursorRecoveryPhase::ArmedAwaitingReady;
+        persist_host_cursor_recovery_marker(data_dir, &marker)?;
+    }
+    let current: SifsMountConfig = sifs_mount_config_store()?
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| {
+            format!(
+                "revalidate cursor-recovery consent before staged ownership transition: {error}"
+            )
+        })?;
+    if current != expected_enabled {
+        return Err(
+            "mount configuration changed after cursor-recovery arming and before staged ownership transition"
+                .to_string(),
+        );
+    }
+    if retained_temp {
+        persist_or_promote_cursor_recovery_staged_record(data_dir, &expected_retained)?;
+    }
+    transition_or_promote_cursor_recovery_staged_record(
+        data_dir,
+        &expected_retained,
+        &expected_may_be_registered,
+    )?;
+    Ok((true, Some(lease)))
 }
 
 fn supervisor_wait(shutdown: &AtomicBool) {
@@ -3161,11 +6745,91 @@ fn retire_active_mount(
         return Err("a previous Cloud Files unregister is still pending".to_string());
     }
     #[cfg(windows)]
+    let authority_finalized_worker_finished = if let Some(mount) = active.as_ref() {
+        let operation_fence = Arc::clone(&mount.operation_fence);
+        let _operation = operation_fence.lock().map_err(|_| {
+            "cursor-recovery operation fence is poisoned during terminal retirement".to_string()
+        })?;
+        let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+        if let Some(marker) = marker_snapshot.value.as_ref()
+            && marker.phase == HostCursorRecoveryPhase::AuthorityFinalized
+        {
+            if marker.module != mount.module_provenance
+                || marker.identity.sync_root != mount.mount_point
+                || marker.identity.root_path != mount.config.root_path
+                || marker.identity.data_dir_root != data_dir.root()
+            {
+                return Err(
+                    "active mount no longer matches its irreversible AuthorityFinalized recovery"
+                        .to_string(),
+                );
+            }
+            let bundle_snapshot =
+                inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+            if bundle_snapshot.temporary {
+                return Err(
+                    "AuthorityFinalized retirement found an unpromoted provider bundle".to_string(),
+                );
+            }
+            let module_marker_path = cloud_files_module_runtime_path(
+                data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            );
+            match std::fs::symlink_metadata(&module_marker_path) {
+                Ok(_) => {
+                    let bundle = bundle_snapshot.value.as_ref().ok_or_else(|| {
+                        "AuthorityFinalized retirement lost its durable provider bundle".to_string()
+                    })?;
+                    validate_host_cursor_recovery_bundle_link(marker, bundle)?;
+                    validate_authority_finalized_completion_cut(data_dir, marker)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if let Some(bundle) = bundle_snapshot.value.as_ref() {
+                        validate_host_cursor_recovery_bundle_link(marker, bundle)?;
+                    }
+                    validate_authority_finalized_released_cut(data_dir, marker)?;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "inspect AuthorityFinalized native marker during retirement: {error}"
+                    ));
+                }
+            }
+            if marker_snapshot.temporary {
+                promote_host_cursor_recovery_marker(data_dir, marker)?;
+            }
+            Some(
+                mount.finished_result.is_some()
+                    || mount
+                        .thread
+                        .as_ref()
+                        .is_none_or(|thread| thread.is_finished()),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    if let Some(worker_finished) = authority_finalized_worker_finished {
+        if !worker_finished {
+            // AF is the irreversible winner. A live provider remains parked
+            // and its callback completes normalization/authority release.
+            return Ok(());
+        }
+        // The fence was released above. Retire a failed/exited provider with
+        // no U/Preserve transition so the next turn can reacquire the exact
+        // existing lease and resume pinned AF completion.
+        return stop_active_mount(active, mount_cancellation);
+    }
+    #[cfg(windows)]
     if matches!(
         reason,
         MountRetirementReason::ExplicitDisable | MountRetirementReason::RegistrationReplacement
     ) && let Some(mount) = active.as_ref()
     {
+        let operation_fence = Arc::clone(&mount.operation_fence);
         let retired = RetiredMount {
             config: mount.config().clone(),
             mount_point: mount.mount_point().to_path_buf(),
@@ -3173,8 +6837,59 @@ fn retire_active_mount(
             module_provenance: mount.module_provenance.clone(),
         };
         let preparation = (|| {
+            let _operation = operation_fence.lock().map_err(|_| {
+                "cursor-recovery operation fence is poisoned during retirement".to_string()
+            })?;
+            if reason == MountRetirementReason::ExplicitDisable {
+                let mut expected_disabled = retired.config.clone();
+                expected_disabled.enabled = false;
+                let observed: SifsMountConfig = sifs_mount_config_store()?
+                    .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+                    .map_err(|error| {
+                        format!("revalidate disabled mount consent under retirement fence: {error}")
+                    })?;
+                if observed != expected_disabled {
+                    return Err(
+                        "mount configuration changed before durable PreserveState intent"
+                            .to_string(),
+                    );
+                }
+            }
+            let host_recovery = load_host_cursor_recovery_marker_strict(data_dir)?;
+            let mut unregister_request = cloud_unregister_request(data_dir, &retired);
+            if let Some(marker) = host_recovery.as_ref() {
+                if marker.module != retired.module_provenance
+                    || marker.identity.sync_root != retired.mount_point
+                    || marker.identity.root_path != retired.config.root_path
+                    || marker.identity.data_dir_root != data_dir.root()
+                    || !matches!(
+                        marker.phase,
+                        HostCursorRecoveryPhase::ArmedAwaitingReady
+                            | HostCursorRecoveryPhase::ReadyObserved
+                            | HostCursorRecoveryPhase::ActiveObserved
+                    )
+                {
+                    return Err(
+                        "active mount no longer matches its exact cursor-recovery retirement authority"
+                            .to_string(),
+                    );
+                }
+                let bundle_snapshot =
+                    inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+                if bundle_snapshot.temporary {
+                    return Err(
+                        "cursor-recovery retirement found an unpromoted provider bundle"
+                            .to_string(),
+                    );
+                }
+                let bundle = bundle_snapshot.value.as_ref().ok_or_else(|| {
+                    "cursor-recovery retirement lost its durable provider bundle".to_string()
+                })?;
+                validate_host_cursor_recovery_bundle_link(marker, bundle)?;
+                unregister_request.cursor_recovery = Some(host_cursor_recovery_context(marker));
+            }
             let mut expected_record = pending_cloud_unregister_record_with_policy(
-                cloud_unregister_request(data_dir, &retired),
+                unregister_request,
                 retired.module_provenance.clone(),
                 CloudUnregisterPolicy::Release,
             )?;
@@ -3233,6 +6948,27 @@ fn retire_active_mount(
                 CloudUnregisterPolicy::PreserveState,
             )?;
             record.legacy_prejournal_origin = expected_record.legacy_prejournal_origin;
+            if host_recovery.is_some() {
+                let expected_stage = staged_cloud_registration_record(
+                    &record,
+                    StagedCloudRegistrationState::MayBeRegistered,
+                )?;
+                let stage_snapshot = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+                if stage_snapshot.current.as_ref() != Some(&expected_stage)
+                    || stage_snapshot
+                        .temporary
+                        .as_ref()
+                        .is_some_and(|temporary| temporary != &expected_stage)
+                {
+                    return Err(
+                        "cursor-recovery retirement lost its exact full-context MayBeRegistered stage"
+                            .to_string(),
+                    );
+                }
+                if stage_snapshot.temporary.is_some() {
+                    persist_or_promote_cursor_recovery_staged_record(data_dir, &expected_stage)?;
+                }
+            }
             // Write the exact preserve-state intent before stopping. A crash
             // after this point is replayable but cannot race the live worker.
             persist_pending_cloud_unregister_record(data_dir, &record)?;
@@ -3429,6 +7165,11 @@ struct ActiveMount {
     provider_interface_version: String,
     module_provenance: CloudFilesModuleProvenance,
     lease: Arc<SifsMountLease>,
+    /// Serializes provider-thread recovery acknowledgements with the
+    /// supervisor's durable retirement intent. It is deliberately not held
+    /// while stopping/joining the provider, because callbacks may still need
+    /// to finish before the worker can exit.
+    operation_fence: Arc<Mutex<()>>,
     last_health_generation: u64,
     last_health_observed: Option<Instant>,
     last_health_observed_at: Option<String>,
@@ -3706,21 +7447,672 @@ struct CloudFilesSupervisorCallbacks {
     cancel: Arc<AtomicBool>,
     supervisor_shutdown: Arc<AtomicBool>,
     events: mpsc::SyncSender<sinomo_runtime::dfs_cloud_files_api::CloudFilesMountLifecycleEvent>,
+    data_dir: SinomoDataDir,
+    cursor_recovery: Option<HostCursorRecoveryMarker>,
+    operation_fence: Arc<Mutex<()>>,
 }
 
 #[cfg(windows)]
-impl sinomo_runtime::module::NativeModuleHostCallbacks for CloudFilesSupervisorCallbacks {
-    fn output_payload(&self, payload_sobj: &[u8]) {
+impl CloudFilesSupervisorCallbacks {
+    fn handle_output(&self, payload_sobj: &[u8]) -> bool {
         use sinomo_runtime::dfs_cloud_files_api::CloudFilesModuleEvent;
 
         match sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleEvent>(payload_sobj) {
             Ok(CloudFilesModuleEvent::MountLifecycle(event)) => {
                 let _ = self.events.try_send(event);
+                true
+            }
+            Ok(CloudFilesModuleEvent::CursorRecoveryReadyObserved(request)) => {
+                let Some(expected) = self.cursor_recovery.as_ref() else {
+                    tracing::error!(
+                        "rejected cursor-recovery ReadyObserved request from an ordinary mount"
+                    );
+                    return false;
+                };
+                let _operation = match self.operation_fence.lock() {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        tracing::error!("cursor-recovery operation fence is poisoned at Ready");
+                        return false;
+                    }
+                };
+                match acknowledge_host_cursor_recovery_ready_observed(
+                    &self.data_dir,
+                    expected,
+                    &request,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            "failed durable cursor-recovery ReadyObserved acknowledgement: {error}"
+                        );
+                        false
+                    }
+                }
+            }
+            Ok(CloudFilesModuleEvent::CursorRecoveryActiveObserved(request)) => {
+                let Some(expected) = self.cursor_recovery.as_ref() else {
+                    tracing::error!(
+                        "rejected cursor-recovery ActiveObserved request from an ordinary mount"
+                    );
+                    return false;
+                };
+                let _operation = match self.operation_fence.lock() {
+                    Ok(operation) => operation,
+                    Err(_) => {
+                        tracing::error!("cursor-recovery operation fence is poisoned at Active");
+                        return false;
+                    }
+                };
+                match acknowledge_host_cursor_recovery_active_observed(
+                    &self.data_dir,
+                    expected,
+                    &request,
+                    &self.cancel,
+                    &self.supervisor_shutdown,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::error!(
+                            "failed durable cursor-recovery ActiveObserved acknowledgement: {error}"
+                        );
+                        false
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!("ignored malformed Cloud Files lifecycle output: {error}");
+                false
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn acknowledge_host_cursor_recovery_active_observed(
+    data_dir: &SinomoDataDir,
+    expected: &HostCursorRecoveryMarker,
+    request: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest,
+    cancel: &AtomicBool,
+    supervisor_shutdown: &AtomicBool,
+) -> Result<(), String> {
+    use sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION;
+    if request.schema_version != CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+        || request.recovery_id != expected.recovery_id
+        || request.recovery_token != expected.inner_token
+        || request.sync_root != expected.identity.sync_root
+        || request.root_path != expected.identity.root_path
+        || request.sync_root_file_id != expected.inspection.sync_root_file_id
+        || request.recovery_cycle != expected.recovery_cycle
+        || !valid_canonical_blake3_fingerprint(&request.module_marker_fingerprint)
+        || !valid_canonical_blake3_fingerprint(
+            &request.completed_registration_artifacts_fingerprint,
+        )
+    {
+        return Err(
+            "ActiveObserved request does not match the exact captured host authorization"
+                .to_string(),
+        );
+    }
+
+    let cursor_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: expected.identity.sync_root.clone(),
+            root_path: expected.identity.root_path.clone(),
+            data_dir_root: Some(expected.identity.data_dir_root.clone()),
+            provider_name: expected.identity.provider_name.clone(),
+            cursor_recovery: Some(
+                sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                    recovery_id: expected.recovery_id.clone(),
+                    recovery_token: expected.inner_token.clone(),
+                    recovery_cycle: expected.recovery_cycle,
+                    native_successor_fingerprint: expected.native_successor_fingerprint.clone(),
+                },
+            ),
+        },
+        expected.module.clone(),
+        CloudUnregisterPolicy::PreserveState,
+    )?;
+    let cursor_stage = staged_cloud_registration_record(
+        &cursor_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    let ordinary_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            cursor_recovery: None,
+            ..cursor_recovery.request.clone()
+        },
+        expected.module.clone(),
+        CloudUnregisterPolicy::Release,
+    )?;
+    let ordinary_stage = staged_cloud_registration_record(
+        &ordinary_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+
+    let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    let Some(mut current) = marker_snapshot.value else {
+        require_physically_absent(
+            &host_cursor_recovery_provider_bundle_path(data_dir),
+            "completed cursor-recovery provider bundle",
+        )?;
+        require_physically_absent(
+            &host_cursor_recovery_provider_bundle_temp_path(data_dir),
+            "completed cursor-recovery provider temporary bundle",
+        )?;
+        require_physically_absent(
+            &cloud_files_module_runtime_path(
+                data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ),
+            "completed module cursor-recovery marker",
+        )?;
+        require_physically_absent(
+            &cloud_files_cursor_recovery_module_temp_path(data_dir),
+            "completed module cursor-recovery temporary marker",
+        )?;
+        require_physically_absent(
+            &cloud_files_registration_journal_temp_path(data_dir),
+            "completed registration journal temporary file",
+        )?;
+        require_physically_absent(
+            &cloud_files_registration_receipt_temp_path(data_dir),
+            "completed registration receipt temporary file",
+        )?;
+        let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+        if cloud_files_completed_registration_artifacts_fingerprint(data_dir)?
+            != request.completed_registration_artifacts_fingerprint
+            || expected.completion_module_marker_fingerprint.as_deref()
+                != Some(&request.module_marker_fingerprint)
+            || staged.current.as_ref() != Some(&ordinary_stage)
+            || staged.temporary.is_some()
+        {
+            return Err(
+                "completed ActiveObserved replay changed its ordinary artifacts".to_string(),
+            );
+        }
+        let mut enabled = expected.disabled_config.clone();
+        enabled.enabled = true;
+        let observed: SifsMountConfig = sifs_mount_config_store()?
+            .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+            .map_err(|error| format!("revalidate completed cursor-recovery config: {error}"))?;
+        if observed == expected.disabled_config || supervisor_shutdown.load(Ordering::SeqCst) {
+            cancel.store(true, Ordering::SeqCst);
+        } else if observed != enabled {
+            return Err("completed cursor-recovery configuration changed".to_string());
+        }
+        return Ok(());
+    };
+    if !same_host_cursor_recovery_callback_authority(&current, expected)
+        || !matches!(
+            current.phase,
+            HostCursorRecoveryPhase::ReadyObserved
+                | HostCursorRecoveryPhase::ActiveObserved
+                | HostCursorRecoveryPhase::AuthorityFinalized
+        )
+    {
+        return Err("ActiveObserved host marker is not an exact callback successor".to_string());
+    }
+    let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    if bundle_snapshot.temporary {
+        return Err("ActiveObserved found an unpromoted provider bundle".to_string());
+    }
+    if let Some(bundle) = bundle_snapshot.value.as_ref() {
+        validate_host_cursor_recovery_bundle_link(&current, bundle)?;
+    }
+
+    let module_marker_path =
+        cloud_files_module_runtime_path(data_dir, CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE);
+    let module_marker_present = std::fs::symlink_metadata(&module_marker_path)
+        .map(|_| true)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error: std::io::Error| {
+            format!("inspect module cursor-recovery marker: {error}")
+        })?;
+    require_physically_absent(
+        &cloud_files_cursor_recovery_module_temp_path(data_dir),
+        "module cursor-recovery temporary marker at ActiveObserved",
+    )?;
+    let module_fingerprint = module_marker_present
+        .then(|| cloud_files_module_marker_raw_fingerprint(data_dir))
+        .transpose()?;
+    if matches!(
+        current.phase,
+        HostCursorRecoveryPhase::ReadyObserved | HostCursorRecoveryPhase::ActiveObserved
+    ) {
+        require_physically_absent(
+            &cloud_files_registration_journal_temp_path(data_dir),
+            "terminal predecessor registration journal temporary file",
+        )?;
+        require_physically_absent(
+            &cloud_files_registration_receipt_temp_path(data_dir),
+            "terminal predecessor registration receipt temporary file",
+        )?;
+        let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+        if staged.current.as_ref() != Some(&cursor_stage) || staged.temporary.is_some() {
+            return Err(
+                "terminal predecessor lacks its exact cursor stage with no temporary successor"
+                    .to_string(),
+            );
+        }
+    }
+    let mut expected_enabled = current.disabled_config.clone();
+    expected_enabled.enabled = true;
+    let observed: SifsMountConfig = sifs_mount_config_store()?
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| {
+            format!("revalidate cursor-recovery consent before ActiveObserved: {error}")
+        })?;
+    let consent_disabled = observed == current.disabled_config;
+    if observed != expected_enabled && !consent_disabled {
+        return Err(
+            "mount configuration was replaced before durable cursor-recovery ActiveObserved"
+                .to_string(),
+        );
+    }
+    match current.phase {
+        HostCursorRecoveryPhase::ReadyObserved => {
+            require_cursor_recovery_pending_intent_absent(data_dir, "NamespaceFinalized")?;
+            if bundle_snapshot.value.is_none()
+                || consent_disabled
+                || module_fingerprint.as_deref() != Some(&request.module_marker_fingerprint)
+                || current.ready_artifacts_fingerprint.as_ref()
+                    != Some(&cloud_files_ready_artifacts_fingerprint(data_dir)?)
+            {
+                return Err(
+                    "NamespaceFinalized ActiveObserved lost enabled consent or exact artifacts"
+                        .to_string(),
+                );
+            }
+            current.active_module_marker_fingerprint = module_fingerprint;
+            current.phase = HostCursorRecoveryPhase::ActiveObserved;
+            persist_host_cursor_recovery_marker(data_dir, &current)
+        }
+        HostCursorRecoveryPhase::ActiveObserved => {
+            require_cursor_recovery_pending_intent_absent(data_dir, "CompletionAuthorized")?;
+            if bundle_snapshot.value.is_none()
+                || module_fingerprint.as_deref() != Some(&request.module_marker_fingerprint)
+                || current.ready_artifacts_fingerprint.as_ref()
+                    != Some(&cloud_files_ready_artifacts_fingerprint(data_dir)?)
+            {
+                return Err(
+                    "CompletionAuthorized ActiveObserved lacks its exact enabled predecessor"
+                        .to_string(),
+                );
+            }
+            if current.active_module_marker_fingerprint.as_deref()
+                == Some(&request.module_marker_fingerprint)
+            {
+                if marker_snapshot.temporary {
+                    promote_host_cursor_recovery_marker(data_dir, &current)?;
+                }
+                return Ok(());
+            }
+            if consent_disabled {
+                return Err(
+                    "CompletionAuthorized cannot linearize after disabled consent won".to_string(),
+                );
+            }
+            current.completion_module_marker_fingerprint = module_fingerprint;
+            current.completion_registration_artifacts_fingerprint =
+                Some(request.completed_registration_artifacts_fingerprint.clone());
+            current.phase = HostCursorRecoveryPhase::AuthorityFinalized;
+            persist_host_cursor_recovery_marker(data_dir, &current)
+        }
+        HostCursorRecoveryPhase::AuthorityFinalized if module_marker_present => {
+            let completion_cut = validate_authority_finalized_completion_cut(data_dir, &current)?;
+            if bundle_snapshot.value.is_none()
+                || current.completion_module_marker_fingerprint.as_deref()
+                    != module_fingerprint.as_deref()
+                || current.completion_module_marker_fingerprint.as_deref()
+                    != Some(&request.module_marker_fingerprint)
+                || current
+                    .completion_registration_artifacts_fingerprint
+                    .as_deref()
+                    != Some(&request.completed_registration_artifacts_fingerprint)
+            {
+                return Err("AuthorityFinalized native completion proof changed".to_string());
+            }
+            let completed_registration =
+                cloud_files_completed_registration_artifacts_fingerprint(data_dir)?;
+            if completed_registration != request.completed_registration_artifacts_fingerprint {
+                // Exact replay of the AF acknowledgement before native journal
+                // normalization. The recovery Ready fingerprint must still be
+                // unchanged and the cursor-context stage must remain final.
+                if current.ready_artifacts_fingerprint.as_ref()
+                    != Some(&cloud_files_ready_artifacts_fingerprint(data_dir)?)
+                    || load_staged_cloud_registration_record(data_dir)?.as_ref()
+                        != Some(&cursor_stage)
+                {
+                    return Err(
+                        "AuthorityFinalized predecessor artifacts changed before normalization"
+                            .to_string(),
+                    );
+                }
+                if marker_snapshot.temporary {
+                    promote_host_cursor_recovery_marker(data_dir, &current)?;
+                }
+                return Ok(());
+            }
+            if !completion_cut.registration_normalized {
+                return Err(
+                    "AuthorityFinalized host cannot normalize staged ownership before its registration journal"
+                        .to_string(),
+                );
+            }
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &cursor_stage,
+                &ordinary_stage,
+            )?;
+            let completed = cloud_files_completed_artifacts_fingerprint(data_dir, &ordinary_stage)?;
+            if let Some(expected) = current.completed_artifacts_fingerprint.as_ref()
+                && expected != &completed
+            {
+                return Err("normalized completion artifacts changed".to_string());
+            }
+            if current.completed_artifacts_fingerprint.is_none() {
+                current.completed_artifacts_fingerprint = Some(completed);
+                persist_host_cursor_recovery_marker(data_dir, &current)?;
+            } else if marker_snapshot.temporary {
+                promote_host_cursor_recovery_marker(data_dir, &current)?;
+            }
+            Ok(())
+        }
+        HostCursorRecoveryPhase::AuthorityFinalized => {
+            require_physically_absent(
+                &cloud_files_cursor_recovery_module_temp_path(data_dir),
+                "completed module cursor-recovery temporary marker",
+            )?;
+            require_cursor_recovery_pending_intent_absent(data_dir, "final completion")?;
+            require_physically_absent(
+                &cloud_files_registration_journal_temp_path(data_dir),
+                "completed registration journal temporary file",
+            )?;
+            require_physically_absent(
+                &cloud_files_registration_receipt_temp_path(data_dir),
+                "completed registration receipt temporary file",
+            )?;
+            let completed_registration =
+                cloud_files_completed_registration_artifacts_fingerprint(data_dir)?;
+            let staged = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+            if completed_registration != request.completed_registration_artifacts_fingerprint
+                || current.completion_module_marker_fingerprint.as_deref()
+                    != Some(&request.module_marker_fingerprint)
+                || current
+                    .completion_registration_artifacts_fingerprint
+                    .as_deref()
+                    != Some(&completed_registration)
+                || staged.current.as_ref() != Some(&ordinary_stage)
+                || staged.temporary.is_some()
+                || current.completed_artifacts_fingerprint.as_ref()
+                    != Some(&cloud_files_completed_artifacts_fingerprint(
+                        data_dir,
+                        &ordinary_stage,
+                    )?)
+            {
+                return Err(
+                    "final completion artifacts changed before authority release".to_string(),
+                );
+            }
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+                &host_cursor_recovery_provider_bundle_path(data_dir),
+            )
+            .map_err(|error| {
+                format!("remove completed cursor-recovery provider bundle: {error}")
+            })?;
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+                &host_cursor_recovery_marker_path(data_dir),
+            )
+            .map_err(|error| format!("remove completed host cursor-recovery marker: {error}"))?;
+            if consent_disabled || supervisor_shutdown.load(Ordering::SeqCst) {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        _ => Err("ActiveObserved host phase is not a terminal successor".to_string()),
+    }
+}
+
+#[cfg(windows)]
+fn resume_active_observed_host_cursor_recovery_cleanup(
+    data_dir: &SinomoDataDir,
+    config: &SifsMountConfig,
+) -> Result<bool, String> {
+    let snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+    let Some(marker) = snapshot.value else {
+        return Ok(false);
+    };
+    if marker.phase != HostCursorRecoveryPhase::AuthorityFinalized {
+        return Ok(false);
+    }
+    let (_lease, host_lock_bytes) =
+        SifsMountLease::try_acquire_existing_for_cursor_recovery(data_dir)?;
+    validate_current_host_cursor_recovery_authority(
+        data_dir,
+        &marker.disabled_config,
+        &host_lock_bytes,
+        &marker.outer_token,
+        &marker,
+    )?;
+    let mut enabled = marker.disabled_config.clone();
+    enabled.enabled = true;
+    let config_is_enabled = config == &enabled;
+    let config_is_disabled = config == &marker.disabled_config;
+    if !config_is_enabled && !config_is_disabled {
+        return Err(
+            "AuthorityFinalized cleanup found configuration drift from its exact enabled/disabled snapshot"
+                .to_string(),
+        );
+    }
+    require_cursor_recovery_pending_intent_absent(data_dir, "AuthorityFinalized cleanup")?;
+    require_physically_absent(
+        &cloud_files_cursor_recovery_module_temp_path(data_dir),
+        "AuthorityFinalized module cursor-recovery temporary marker",
+    )?;
+    let module_marker_path =
+        cloud_files_module_runtime_path(data_dir, CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE);
+    let module_marker_present = std::fs::symlink_metadata(&module_marker_path)
+        .map(|_| true)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        })
+        .map_err(|error: std::io::Error| {
+            format!("inspect AuthorityFinalized native marker: {error}")
+        })?;
+    if module_marker_present {
+        validate_authority_finalized_completion_cut(data_dir, &marker)?;
+        // Exact CA remains native-owned. Defer to the pinned completion mount;
+        // only N-absent cuts are host-only cleanup below.
+        return Ok(false);
+    }
+    require_physically_absent(
+        &module_marker_path,
+        "completed module cursor-recovery marker",
+    )?;
+    require_physically_absent(
+        &cloud_files_registration_journal_temp_path(data_dir),
+        "completed registration journal temporary file",
+    )?;
+    require_physically_absent(
+        &cloud_files_registration_receipt_temp_path(data_dir),
+        "completed registration receipt temporary file",
+    )?;
+    validate_authority_finalized_released_cut(data_dir, &marker)?;
+    let ordinary_recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            data_dir_root: Some(marker.identity.data_dir_root.clone()),
+            provider_name: marker.identity.provider_name.clone(),
+            cursor_recovery: None,
+        },
+        marker.module.clone(),
+        CloudUnregisterPolicy::Release,
+    )?;
+    let ordinary_stage = staged_cloud_registration_record(
+        &ordinary_recovery,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    if load_staged_cloud_registration_record(data_dir)?.as_ref() != Some(&ordinary_stage)
+        || marker
+            .completion_registration_artifacts_fingerprint
+            .as_ref()
+            != Some(&cloud_files_completed_registration_artifacts_fingerprint(
+                data_dir,
+            )?)
+        || marker.completed_artifacts_fingerprint.as_ref()
+            != Some(&cloud_files_completed_artifacts_fingerprint(
+                data_dir,
+                &ordinary_stage,
+            )?)
+    {
+        return Err("AuthorityFinalized cleanup changed its completed artifacts".to_string());
+    }
+    let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+    if bundle_snapshot.temporary {
+        return Err("AuthorityFinalized cleanup found an unpromoted provider bundle".to_string());
+    }
+    if let Some(bundle) = bundle_snapshot.value.as_ref() {
+        validate_host_cursor_recovery_bundle_link(&marker, bundle)?;
+        sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+            &host_cursor_recovery_provider_bundle_path(data_dir),
+        )
+        .map_err(|error| format!("remove completed cursor-recovery provider bundle: {error}"))?;
+    }
+    if snapshot.temporary {
+        promote_host_cursor_recovery_marker(data_dir, &marker)?;
+    }
+    sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(
+        &host_cursor_recovery_marker_path(data_dir),
+    )
+    .map_err(|error| format!("remove completed host cursor-recovery marker: {error}"))?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn acknowledge_host_cursor_recovery_ready_observed(
+    data_dir: &SinomoDataDir,
+    expected: &HostCursorRecoveryMarker,
+    request: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryReadyObservedRequest,
+) -> Result<(), String> {
+    use sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION;
+    let mut current = load_host_cursor_recovery_marker_strict(data_dir)?.ok_or_else(|| {
+        "host cursor-recovery marker disappeared before ReadyObserved".to_string()
+    })?;
+    if !same_host_cursor_recovery_callback_authority(&current, expected)
+        || !matches!(
+            current.phase,
+            HostCursorRecoveryPhase::ArmedAwaitingReady
+                | HostCursorRecoveryPhase::ReadyObserved
+                | HostCursorRecoveryPhase::ActiveObserved
+        )
+        || request.schema_version != CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+        || request.recovery_id != current.recovery_id
+        || request.recovery_token != current.inner_token
+        || request.sync_root != current.identity.sync_root
+        || request.root_path != current.identity.root_path
+        || request.sync_root_file_id != current.inspection.sync_root_file_id
+        || request.recovery_cycle != current.recovery_cycle
+    {
+        return Err(
+            "ReadyObserved request does not match the exact armed host authorization".to_string(),
+        );
+    }
+    let mut enabled = current.disabled_config.clone();
+    enabled.enabled = true;
+    let store = sifs_mount_config_store()?;
+    let observed: SifsMountConfig = store
+        .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+        .map_err(|error| format!("revalidate cursor-recovery consent at Ready: {error}"))?;
+    if observed != enabled {
+        return Err(
+            "mount consent or configuration changed before ReadyObserved durability".to_string(),
+        );
+    }
+    require_cursor_recovery_pending_intent_absent(data_dir, "ReadyObserved")?;
+    let recovery = pending_cloud_unregister_record_with_policy(
+        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+            sync_root: current.identity.sync_root.clone(),
+            root_path: current.identity.root_path.clone(),
+            data_dir_root: Some(current.identity.data_dir_root.clone()),
+            provider_name: current.identity.provider_name.clone(),
+            cursor_recovery: Some(
+                sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                    recovery_id: current.recovery_id.clone(),
+                    recovery_token: current.inner_token.clone(),
+                    recovery_cycle: current.recovery_cycle,
+                    native_successor_fingerprint: current.native_successor_fingerprint.clone(),
+                },
+            ),
+        },
+        current.module.clone(),
+        CloudUnregisterPolicy::PreserveState,
+    )?;
+    let expected_stage =
+        staged_cloud_registration_record(&recovery, StagedCloudRegistrationState::MayBeRegistered)?;
+    if load_staged_cloud_registration_record(data_dir)?.as_ref() != Some(&expected_stage) {
+        return Err("ReadyObserved requires exact MayBeRegistered staged ownership".to_string());
+    }
+    for (path, label) in [
+        (
+            cloud_files_registration_receipt_path(data_dir),
+            "Cloud Files Ready receipt",
+        ),
+        (
+            cloud_files_module_runtime_path(data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            "Cloud Files Ready journal",
+        ),
+        (
+            cloud_files_module_runtime_path(
+                data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ),
+            "Cloud Files Ready recovery marker",
+        ),
+    ] {
+        ensure_plain_existing_host_path(&path, false, label)?;
+    }
+    let artifacts_fingerprint = cloud_files_ready_artifacts_fingerprint(data_dir)?;
+    if matches!(
+        current.phase,
+        HostCursorRecoveryPhase::ReadyObserved | HostCursorRecoveryPhase::ActiveObserved
+    ) && let Some(expected_fingerprint) = current.ready_artifacts_fingerprint.as_ref()
+    {
+        if expected_fingerprint != &artifacts_fingerprint {
+            return Err(
+                "ReadyObserved durable receipt/journal bytes changed before acknowledgement"
+                    .to_string(),
+            );
+        }
+    }
+    if current.phase == HostCursorRecoveryPhase::ArmedAwaitingReady {
+        current.ready_artifacts_fingerprint = Some(artifacts_fingerprint);
+        current.preserved_artifacts_fingerprint = None;
+        current.phase = HostCursorRecoveryPhase::ReadyObserved;
+        persist_host_cursor_recovery_marker(data_dir, &current)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+impl sinomo_runtime::module::NativeModuleHostCallbacks for CloudFilesSupervisorCallbacks {
+    fn output_payload(&self, payload_sobj: &[u8]) {
+        let _ = self.handle_output(payload_sobj);
+    }
+
+    fn output_payload_status(&self, payload_sobj: &[u8]) -> bool {
+        self.handle_output(payload_sobj)
     }
 
     fn log(&self, message: &[u8]) {
@@ -3758,33 +8150,143 @@ fn start_platform_mount(
         encode_sobj,
     };
 
-    let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
-        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
     let data_dir_root = data_dir.root();
-    let state = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
-        .map_err(|error| format!("read Cloud Files module loader state: {error}"))?
-        .ok_or_else(|| {
-            format!(
-                "Cloud Files module is not active; install or activate {SINOMO_DFS_CLOUD_FILES_MODULE_ID}"
-            )
-        })?;
-    if state.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
-        return Err(format!(
-            "Cloud Files module interface mismatch: expected {}, got {}",
-            SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, state.interface_version
-        ));
-    }
-    let library_path = native_module_cache_path(
-        &data_dir_root,
-        &state.cache_key,
-        &state.content_hash,
-        &state.library_name,
-    );
-    let module_provenance = CloudFilesModuleProvenance::from_loader_state(&state);
+    let host_cursor_recovery = load_host_cursor_recovery_marker_strict(data_dir)?;
+    let ordinary_staged_provider = if host_cursor_recovery.is_none() {
+        match load_staged_cloud_registration_record(data_dir)? {
+            None => {
+                require_physically_absent(
+                    &cursor_recovery_staged_temp_path(data_dir),
+                    "orphan deterministic staged Cloud Files successor",
+                )?;
+                None
+            }
+            Some(record)
+                if record.recovery.module.interface_version
+                    == SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    && record.recovery.legacy_prejournal_origin.is_none() =>
+            {
+                if record.state != StagedCloudRegistrationState::MayBeRegistered
+                    || record.recovery.request.cursor_recovery.is_some()
+                    || !registration_request_matches_config(&record.recovery.request, config)?
+                {
+                    return Err(
+                        "canonical ordinary staged ownership is not an exact MayBeRegistered authority for this mount"
+                            .to_string(),
+                    );
+                }
+                let snapshot = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+                if snapshot.current.as_ref() != Some(&record)
+                    || snapshot
+                        .temporary
+                        .as_ref()
+                        .is_some_and(|temporary| temporary != &record)
+                {
+                    return Err(
+                        "canonical ordinary staged ownership has a changed deterministic successor"
+                            .to_string(),
+                    );
+                }
+                if snapshot.temporary.is_some() {
+                    persist_or_promote_cursor_recovery_staged_record(data_dir, &record)?;
+                }
+                let library =
+                    verify_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
+                Some((record.recovery.module, library))
+            }
+            Some(record) => {
+                require_physically_absent(
+                    &cursor_recovery_staged_temp_path(data_dir),
+                    "legacy staged Cloud Files deterministic successor",
+                )?;
+                if record.recovery.request.cursor_recovery.is_some() {
+                    return Err(
+                        "cursor-context staged ownership exists without its host authorization"
+                            .to_string(),
+                    );
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let has_ordinary_staged_provider = ordinary_staged_provider.is_some();
+    let (module_provenance, library_path) = if let Some(marker) = host_cursor_recovery.as_ref() {
+        if !matches!(
+            marker.phase,
+            HostCursorRecoveryPhase::ArmedAwaitingReady
+                | HostCursorRecoveryPhase::ReadyObserved
+                | HostCursorRecoveryPhase::ActiveObserved
+                | HostCursorRecoveryPhase::AuthorityFinalized
+        ) {
+            return Err(format!(
+                "cursor recovery {} is {:?}, not armed for provider mount",
+                marker.recovery_id, marker.phase
+            ));
+        }
+        let mut exact_enabled = marker.disabled_config.clone();
+        exact_enabled.enabled = true;
+        let exact_completion_config = marker.phase == HostCursorRecoveryPhase::AuthorityFinalized
+            && (config == &exact_enabled || config == &marker.disabled_config);
+        if (!exact_completion_config && config != &exact_enabled)
+            || marker.identity.data_dir_root != data_dir_root
+            || marker.identity.sync_root != mount_point
+        {
+            return Err(
+                "cursor-recovery mount no longer matches its exact authorized config and data directory"
+                    .to_string(),
+            );
+        }
+        let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+        if bundle_snapshot.temporary {
+            return Err(
+                "cursor-recovery provider bundle was not durably promoted before mount".to_string(),
+            );
+        }
+        let bundle = bundle_snapshot
+            .value
+            .ok_or_else(|| "cursor-recovery mount lost its durable provider bundle".to_string())?;
+        validate_host_cursor_recovery_bundle_link(marker, &bundle)?;
+        if marker.phase == HostCursorRecoveryPhase::AuthorityFinalized {
+            validate_authority_finalized_completion_cut(data_dir, marker)?;
+        }
+        (
+            marker.module.clone(),
+            verify_cloud_unregister_recovery_module(data_dir, &marker.module)?,
+        )
+    } else if let Some(authority) = ordinary_staged_provider {
+        authority
+    } else {
+        let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+        let state = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
+            .map_err(|error| format!("read Cloud Files module loader state: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "Cloud Files module is not active; install or activate {SINOMO_DFS_CLOUD_FILES_MODULE_ID}"
+                )
+            })?;
+        if state.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
+            return Err(format!(
+                "Cloud Files module interface mismatch: expected {}, got {}",
+                SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, state.interface_version
+            ));
+        }
+        (
+            CloudFilesModuleProvenance::from_loader_state(&state),
+            native_module_cache_path(
+                &data_dir_root,
+                &state.cache_key,
+                &state.content_hash,
+                &state.library_name,
+            ),
+        )
+    };
     let module = unsafe {
         NativeModule::load_process_resident_from_content_addressed_path(
             &library_path,
-            &state.content_hash,
+            &module_provenance.content_hash,
         )
     }
     .map_err(|error| format!("load Cloud Files native module: {error}"))?;
@@ -3792,15 +8294,38 @@ fn start_platform_mount(
         &module_provenance,
         module.descriptor(),
         SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-        true,
+        Some(
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+        ),
         || {
-            stage_cloud_unregister_recovery_module(data_dir, &module_provenance, &library_path)
-                .map(|_| ())
-                .map_err(|error| {
-                    format!("stage durable Cloud Files unregister provider before mount: {error}")
-                })
+            if host_cursor_recovery.is_some() || has_ordinary_staged_provider {
+                verify_cloud_unregister_recovery_module(data_dir, &module_provenance).map(|_| ())
+            } else {
+                stage_cloud_unregister_recovery_module(data_dir, &module_provenance, &library_path)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("stage durable Cloud Files unregister provider before mount: {error}")
+                    })
+            }
         },
     )?;
+    if host_cursor_recovery.is_some() {
+        for capability in [
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+        ] {
+            if !module
+                .descriptor()
+                .capabilities
+                .iter()
+                .any(|candidate| candidate == capability)
+            {
+                return Err(format!(
+                    "pinned cursor-recovery mount provider lacks required capability {capability}"
+                ));
+            }
+        }
+    }
     let request = CloudFilesMountRequest {
         sync_root: mount_point.to_path_buf(),
         root_path: config.root_path.clone(),
@@ -3812,49 +8337,107 @@ fn start_platform_mount(
         prepopulate_depth: 0,
         connect: true,
         max_run_seconds: None,
+        cursor_recovery: host_cursor_recovery.as_ref().map(|marker| {
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                recovery_id: marker.recovery_id.clone(),
+                recovery_token: marker.inner_token.clone(),
+                recovery_cycle: marker.recovery_cycle,
+                native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+            }
+        }),
     };
+    if host_cursor_recovery.is_some() {
+        let current: SifsMountConfig = sifs_mount_config_store()?
+            .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
+            .map_err(|error| {
+                format!("revalidate cursor-recovery config before mount effect: {error}")
+            })?;
+        if current != *config {
+            return Err(
+                "mount configuration changed after cursor-recovery admission and before staged/native effects"
+                    .to_string(),
+            );
+        }
+    }
     let recovery_record = pending_cloud_unregister_record_with_policy(
         sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
             sync_root: request.sync_root.clone(),
             root_path: request.root_path.clone(),
             data_dir_root: request.data_dir_root.clone(),
             provider_name: request.provider_name.clone(),
+            cursor_recovery: host_cursor_recovery.as_ref().map(|marker| {
+                sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                    recovery_id: marker.recovery_id.clone(),
+                    recovery_token: marker.inner_token.clone(),
+                    recovery_cycle: marker.recovery_cycle,
+                    native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+                }
+            }),
         },
         module_provenance.clone(),
-        CloudUnregisterPolicy::Release,
+        if host_cursor_recovery.is_some() {
+            CloudUnregisterPolicy::PreserveState
+        } else {
+            CloudUnregisterPolicy::Release
+        },
     )?;
     let staged_recovery = staged_cloud_registration_record(
         &recovery_record,
         StagedCloudRegistrationState::MayBeRegistered,
     )?;
-    match load_staged_cloud_registration_record(data_dir)? {
-        None => persist_staged_cloud_registration_record(data_dir, &staged_recovery),
-        Some(existing) if existing == staged_recovery => Ok(()),
-        Some(existing)
-            if existing.state == StagedCloudRegistrationState::MayBeRegistered
-                && existing.recovery.request == staged_recovery.recovery.request
-                && existing.recovery.legacy_prejournal_origin.as_ref()
-                    == Some(&existing.recovery.module)
-                && existing.recovery.module.interface_version
-                    == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2 =>
-        {
-            let upgraded =
-                legacy_staged_provider_upgrade_record(&existing, module_provenance.clone())?;
-            replace_staged_cloud_registration_record(data_dir, &existing, &upgraded)
+    if host_cursor_recovery.is_some() {
+        if host_cursor_recovery.as_ref().is_some_and(|marker| {
+            marker.phase == HostCursorRecoveryPhase::AuthorityFinalized
+        }) {
+            validate_authority_finalized_completion_cut(
+                data_dir,
+                host_cursor_recovery
+                    .as_ref()
+                    .expect("checked terminal completion marker"),
+            )
+            .map(|_| ())
+        } else {
+            let retained = staged_cloud_registration_record(
+                &recovery_record,
+                StagedCloudRegistrationState::RetainedAbsent,
+            )?;
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &retained,
+                &staged_recovery,
+            )
         }
-        Some(existing)
-            if existing.state == StagedCloudRegistrationState::MayBeRegistered
-                && existing.recovery.request == staged_recovery.recovery.request
-                && existing.recovery.module == staged_recovery.recovery.module
-                && existing.recovery.legacy_prejournal_origin.is_some() =>
-        {
-            // Crash after the atomic v2-origin -> v3-provider upgrade. Keep the
-            // exact origin and provider record unchanged across retries.
-            Ok(())
+    } else {
+        match load_staged_cloud_registration_record(data_dir)? {
+            None => persist_staged_cloud_registration_record(data_dir, &staged_recovery),
+            Some(existing) if existing == staged_recovery => Ok(()),
+            Some(existing)
+                if existing.state == StagedCloudRegistrationState::MayBeRegistered
+                    && existing.recovery.request == staged_recovery.recovery.request
+                    && existing.recovery.legacy_prejournal_origin.as_ref()
+                        == Some(&existing.recovery.module)
+                    && existing.recovery.module.interface_version
+                        == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2 =>
+            {
+                let upgraded =
+                    legacy_staged_provider_upgrade_record(&existing, module_provenance.clone())?;
+                replace_staged_cloud_registration_record(data_dir, &existing, &upgraded)
+            }
+            Some(existing)
+                if existing.state == StagedCloudRegistrationState::MayBeRegistered
+                    && existing.recovery.request == staged_recovery.recovery.request
+                    && existing.recovery.module == staged_recovery.recovery.module
+                    && existing.recovery.legacy_prejournal_origin.is_some() =>
+            {
+                // Crash after the atomic v2-origin -> v3-provider upgrade. Keep the
+                // exact origin and provider record unchanged across retries.
+                Ok(())
+            }
+            Some(_) => Err(
+                "existing staged Cloud Files ownership cannot be replaced by mount startup"
+                    .to_string(),
+            ),
         }
-        Some(_) => Err(
-            "existing staged Cloud Files ownership cannot be replaced by mount startup".to_string(),
-        ),
     }
     .map_err(|error| {
         format!("persist exact Cloud Files registration recovery before mount invocation: {error}")
@@ -3868,12 +8451,16 @@ fn start_platform_mount(
         response_body_path: None,
     });
     let cancel = Arc::new(AtomicBool::new(false));
+    let operation_fence = Arc::new(Mutex::new(()));
     let (event_tx, event_rx) = mpsc::sync_channel(32);
     let callbacks: Arc<dyn sinomo_runtime::module::NativeModuleHostCallbacks> =
         Arc::new(CloudFilesSupervisorCallbacks {
             cancel: Arc::clone(&cancel),
             supervisor_shutdown,
             events: event_tx,
+            data_dir: data_dir.clone(),
+            cursor_recovery: host_cursor_recovery.clone(),
+            operation_fence: Arc::clone(&operation_fence),
         });
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
     let lease = Arc::new(lease);
@@ -3902,6 +8489,11 @@ fn start_platform_mount(
                                 "Cloud Files provider returned a state-preserving unregister response to a mount request"
                                     .to_string(),
                             ),
+                            CloudFilesModuleResponse::CursorOnlyRecoveryInspected(_)
+                            | CloudFilesModuleResponse::CursorOnlyRecoveryApplied(_) => Err(
+                                "Cloud Files provider returned a cursor-recovery response to a mount request"
+                                    .to_string(),
+                            ),
                             CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
                         }
                     }
@@ -3924,10 +8516,11 @@ fn start_platform_mount(
         thread: Some(thread),
         lifecycle: None,
         finished_result: None,
-        provider_content_hash: state.content_hash,
-        provider_interface_version: state.interface_version,
+        provider_content_hash: module_provenance.content_hash.clone(),
+        provider_interface_version: module_provenance.interface_version.clone(),
         module_provenance,
         lease,
+        operation_fence,
         last_health_generation: 0,
         last_health_observed: None,
         last_health_observed_at: None,
@@ -3953,22 +8546,198 @@ fn complete_pending_cloud_unregister(
     pending: &mut PendingCloudUnregister,
 ) -> Result<(), String> {
     if pending.lease.is_none() {
-        let owner = format!(
-            "pending Cloud Files unregister {}",
-            pending.record.request.sync_root.display()
-        );
-        pending.lease = Some(Arc::new(SifsMountLease::try_acquire(data_dir, &owner)?));
+        if pending.record.request.cursor_recovery.is_some() {
+            let (lease, _) = SifsMountLease::try_acquire_existing_for_cursor_recovery(data_dir)?;
+            pending.lease = Some(Arc::new(lease));
+        } else {
+            let owner = format!(
+                "pending Cloud Files unregister {}",
+                pending.record.request.sync_root.display()
+            );
+            pending.lease = Some(Arc::new(SifsMountLease::try_acquire(data_dir, &owner)?));
+        }
     }
-    ensure_cloud_unregister_recovery_module(data_dir, &pending.record.module)?;
-    let staged = load_staged_cloud_registration_record(data_dir)?.ok_or_else(|| {
+    if pending.record.request.cursor_recovery.is_none() {
+        ensure_cloud_unregister_recovery_module(data_dir, &pending.record.module)?;
+    }
+    let staged_snapshot = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
+    let staged = staged_snapshot.current.ok_or_else(|| {
         "pending Cloud Files unregister has no authoritative staged ownership record".to_string()
     })?;
+    if let Some(context) = pending.record.request.cursor_recovery.as_ref() {
+        let marker_snapshot = inspect_host_cursor_recovery_marker_for_resume(data_dir)?;
+        let marker = marker_snapshot.value.ok_or_else(|| {
+            "cursor-recovery pending replay lost its durable host marker".to_string()
+        })?;
+        let lease_bytes = pending
+            .lease
+            .as_ref()
+            .and_then(|lease| lease.cursor_recovery_bytes())
+            .ok_or_else(|| {
+                "cursor-recovery pending replay did not retain the existing host lease bytes"
+                    .to_string()
+            })?;
+        validate_current_host_cursor_recovery_authority(
+            data_dir,
+            &marker.disabled_config,
+            lease_bytes,
+            &marker.outer_token,
+            &marker,
+        )?;
+        let preserved_artifacts_match = marker.phase == HostCursorRecoveryPhase::PreservedRetained
+            && marker.preserved_artifacts_fingerprint.as_ref()
+                == Some(&cloud_files_preserved_artifacts_fingerprint(data_dir)?);
+        if marker_snapshot.temporary && !preserved_artifacts_match {
+            return Err(
+                "durable pending intent found an impossible predecessor host-marker temp"
+                    .to_string(),
+            );
+        }
+        let predecessor_authority = !marker_snapshot.temporary
+            && context == &host_cursor_recovery_context(&marker)
+            && matches!(
+                marker.phase,
+                HostCursorRecoveryPhase::ArmedAwaitingReady
+                    | HostCursorRecoveryPhase::ReadyObserved
+                    | HostCursorRecoveryPhase::ActiveObserved
+            );
+        let successor_authority = marker.phase == HostCursorRecoveryPhase::PreservedRetained
+            && context.recovery_id == marker.recovery_id
+            && context.recovery_token == marker.inner_token
+            && context
+                .recovery_cycle
+                .checked_add(1)
+                .is_some_and(|cycle| cycle == marker.recovery_cycle)
+            && preserved_artifacts_match;
+        if !predecessor_authority && !successor_authority {
+            return Err(
+                "cursor-recovery pending replay does not match its exact host cycle authority"
+                    .to_string(),
+            );
+        }
+        if pending.record.module != marker.module
+            || pending.record.request.sync_root != marker.identity.sync_root
+            || pending.record.request.root_path != marker.identity.root_path
+            || pending.record.request.data_dir_root.as_ref()
+                != Some(&marker.identity.data_dir_root)
+            || pending.record.request.provider_name != marker.identity.provider_name
+            || pending.record.operation
+                != sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        {
+            return Err(
+                "cursor-recovery pending replay changed its exact host identity, provider, or operation"
+                    .to_string(),
+            );
+        }
+        let expected_stage = staged_cloud_registration_record(
+            &pending.record,
+            StagedCloudRegistrationState::MayBeRegistered,
+        )?;
+        let current_is_predecessor = staged == expected_stage;
+        let current_is_successor = is_already_applied_retained_completion(&pending.record, &staged);
+        let temporary_is_redundant_predecessor = staged_snapshot
+            .temporary
+            .as_ref()
+            .is_some_and(|temporary| temporary == &expected_stage);
+        let temporary_is_successor = staged_snapshot.temporary.as_ref().is_some_and(|temporary| {
+            is_already_applied_retained_completion(&pending.record, temporary)
+        });
+        let exact_predecessor_host_cut = predecessor_authority
+            && ((current_is_successor
+                && (staged_snapshot.temporary.is_none()
+                    || staged_snapshot.temporary.as_ref() == Some(&staged)))
+                || (current_is_predecessor
+                    && (staged_snapshot.temporary.is_none()
+                        || temporary_is_redundant_predecessor
+                        || temporary_is_successor)));
+        let exact_successor_host_cut = successor_authority
+            && current_is_successor
+            && staged.recovery.request.cursor_recovery.as_ref()
+                == Some(&host_cursor_recovery_context(&marker))
+            && (staged_snapshot.temporary.is_none()
+                || staged_snapshot.temporary.as_ref() == Some(&staged));
+        if !exact_predecessor_host_cut && !exact_successor_host_cut {
+            return Err(
+                "cursor-recovery pending replay found an impossible staged predecessor/successor cut"
+                    .to_string(),
+            );
+        }
+        let bundle_snapshot = inspect_host_cursor_recovery_provider_bundle_for_resume(data_dir)?;
+        if bundle_snapshot.temporary {
+            return Err(
+                "cursor-recovery pending replay found an unpromoted provider bundle".to_string(),
+            );
+        }
+        let bundle = bundle_snapshot
+            .value
+            .as_ref()
+            .ok_or_else(|| "cursor-recovery pending replay lost its provider bundle".to_string())?;
+        validate_host_cursor_recovery_bundle_link(&marker, bundle)?;
+        if marker_snapshot.temporary {
+            promote_host_cursor_recovery_marker(data_dir, &marker)?;
+        }
+        materialize_cursor_recovery_provider_bundle(data_dir, bundle)?;
+        verify_cloud_unregister_recovery_module(data_dir, &pending.record.module)
+            .map_err(|error| format!("verify cursor-recovery pending provider pin: {error}"))?;
+        promote_cursor_recovery_pending_intent(data_dir, &pending.record)?;
+        if current_is_successor {
+            if let Some(temporary) = staged_snapshot.temporary.as_ref() {
+                if temporary != &staged {
+                    return Err(
+                        "RetainedAbsent completion has changed staged temporary evidence"
+                            .to_string(),
+                    );
+                }
+                persist_or_promote_cursor_recovery_staged_record(data_dir, &staged)?;
+            }
+            finish_already_applied_retained_completion(data_dir, &pending.record, &staged)?;
+            return Ok(());
+        }
+        if temporary_is_successor {
+            let temporary = staged_snapshot
+                .temporary
+                .as_ref()
+                .expect("classified RetainedAbsent temporary successor");
+            transition_or_promote_cursor_recovery_staged_record(data_dir, &staged, temporary)?;
+            finish_already_applied_retained_completion(data_dir, &pending.record, temporary)?;
+            return Ok(());
+        }
+        if !predecessor_authority {
+            return Err(
+                "PreservedRetained host authority lacks its exact RetainedAbsent successor"
+                    .to_string(),
+            );
+        }
+        if staged != expected_stage
+            || staged_snapshot
+                .temporary
+                .as_ref()
+                .is_some_and(|temporary| temporary != &expected_stage)
+        {
+            return Err(
+                "cursor-recovery pending replay lacks its exact full-context MayBeRegistered predecessor"
+                    .to_string(),
+            );
+        }
+        if staged_snapshot.temporary.is_some() {
+            persist_or_promote_cursor_recovery_staged_record(data_dir, &expected_stage)?;
+        }
+    } else if staged_snapshot.temporary.is_some() {
+        return Err(
+            "ordinary pending unregister found cursor-recovery staged temporary evidence"
+                .to_string(),
+        );
+    }
     if finish_already_applied_retained_completion(data_dir, &pending.record, &staged)? {
         return Ok(());
     }
-    if !same_cloud_registration_recovery_identity(&staged.recovery, &pending.record) {
+    let exact_may_be_registered = staged_cloud_registration_record(
+        &pending.record,
+        StagedCloudRegistrationState::MayBeRegistered,
+    )?;
+    if staged != exact_may_be_registered {
         return Err(
-            "pending Cloud Files unregister no longer matches its staged ownership identity"
+            "pending Cloud Files unregister no longer matches its exact MayBeRegistered staged ownership"
                 .to_string(),
         );
     }
@@ -4028,7 +8797,9 @@ fn unregister_pending_cloud_mount(
         &record.module,
         module.descriptor(),
         &record.operation,
-        record.operation == SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+        (record.operation == SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION).then_some(
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+        ),
         || {
             module
                 .invoke(&native_request)
@@ -4068,6 +8839,11 @@ fn unregister_pending_cloud_mount(
                 }
                 CloudFilesModuleResponse::StatePreservingUnregistered(_) => Err(
                     "Cloud Files state-preserving unregister response identity/operation mismatch"
+                        .to_string(),
+                ),
+                CloudFilesModuleResponse::CursorOnlyRecoveryInspected(_)
+                | CloudFilesModuleResponse::CursorOnlyRecoveryApplied(_) => Err(
+                    "Cloud Files module returned a cursor-recovery response to an unregister request"
                         .to_string(),
                 ),
                 CloudFilesModuleResponse::Error(error) => Err(error.to_string()),
@@ -4242,6 +9018,7 @@ mod tests {
                 provider_name:
                     sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
                         .to_string(),
+                cursor_recovery: None,
             },
             base.module,
         )
@@ -4263,6 +9040,1095 @@ mod tests {
             read_only: false,
             allow_other: false,
             sync_local_changes: true,
+        }
+    }
+
+    fn host_cursor_recovery_marker_fixture(
+        data_dir: &SinomoDataDir,
+        mount_point: &Path,
+        phase: HostCursorRecoveryPhase,
+    ) -> HostCursorRecoveryMarker {
+        let mut disabled = windows_mount_config(mount_point, "/root");
+        disabled.enabled = false;
+        let module = module_provenance_fixture(
+            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            &format!("blake3:{}", "a".repeat(64)),
+        );
+        let inner_token = format!("v1:blake3:{}", "b".repeat(64));
+        let recovery_id = "cursor-recovery-host-fixture".to_string();
+        let identity = sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version:
+                sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            enabled: false,
+            sync_root: mount_point.to_path_buf(),
+            root_path: "/root".to_string(),
+            data_dir_root: data_dir.root(),
+            provider_name:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                    .to_string(),
+            provider_version: env!("CARGO_PKG_VERSION").to_string(),
+            read_only: false,
+            allow_other: false,
+            sync_local_changes: true,
+            prepopulate_depth: 0,
+            connect: true,
+            max_run_seconds: None,
+            disabled_config_fingerprint: disabled_mount_config_fingerprint(&disabled)
+                .expect("config fingerprint"),
+            provider_provenance_fingerprint: cloud_files_provenance_fingerprint(&module)
+                .expect("provider fingerprint"),
+        };
+        let inspection =
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection {
+                schema_version:
+                    sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+                sync_root: mount_point.to_path_buf(),
+                root_path: "/root".to_string(),
+                sync_root_file_id: 41,
+                cursor_count: 3,
+                raw_state_fingerprint: format!("blake3:{}", "c".repeat(64)),
+                recovery_token: inner_token.clone(),
+                detail: "fixture".to_string(),
+            };
+        let applied = sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied {
+            schema_version:
+                sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            sync_root: mount_point.to_path_buf(),
+            root_path: "/root".to_string(),
+            sync_root_file_id: 41,
+            cursor_count_cleared: 3,
+            recovery_id: recovery_id.clone(),
+            recovery_token: inner_token.clone(),
+            detail: "fixture".to_string(),
+        };
+        HostCursorRecoveryMarker {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            disabled_config: disabled,
+            module,
+            identity,
+            outer_token: format!("v1:blake3:{}", "d".repeat(64)),
+            inner_token,
+            recovery_id,
+            inspection,
+            applied: Some(applied),
+            ready_artifacts_fingerprint: matches!(
+                phase,
+                HostCursorRecoveryPhase::ReadyObserved
+                    | HostCursorRecoveryPhase::ActiveObserved
+                    | HostCursorRecoveryPhase::AuthorityFinalized
+            )
+            .then(|| format!("blake3:{}", "e".repeat(64))),
+            preserved_artifacts_fingerprint: (phase == HostCursorRecoveryPhase::PreservedRetained)
+                .then(|| format!("blake3:{}", "f".repeat(64))),
+            active_module_marker_fingerprint: matches!(
+                phase,
+                HostCursorRecoveryPhase::ActiveObserved
+                    | HostCursorRecoveryPhase::AuthorityFinalized
+            )
+            .then(|| format!("blake3:{}", "1".repeat(64))),
+            completion_module_marker_fingerprint: (phase
+                == HostCursorRecoveryPhase::AuthorityFinalized)
+                .then(|| format!("blake3:{}", "2".repeat(64))),
+            completion_registration_artifacts_fingerprint: (phase
+                == HostCursorRecoveryPhase::AuthorityFinalized)
+                .then(|| format!("blake3:{}", "4".repeat(64))),
+            completed_artifacts_fingerprint: None,
+            recovery_cycle: u64::from(phase == HostCursorRecoveryPhase::PreservedRetained),
+            native_successor_fingerprint: (phase == HostCursorRecoveryPhase::PreservedRetained)
+                .then(|| format!("blake3:{}", "3".repeat(64))),
+            phase,
+        }
+    }
+
+    #[cfg(windows)]
+    struct HostTerminalFixture {
+        data_dir: SinomoDataDir,
+        marker: HostCursorRecoveryMarker,
+        active_request:
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest,
+        cursor_stage: StagedCloudRegistrationRecord,
+        ordinary_stage: StagedCloudRegistrationRecord,
+        ordinary_journal: Vec<u8>,
+    }
+
+    #[cfg(windows)]
+    fn host_terminal_fixture(temp: &TestDir) -> HostTerminalFixture {
+        use sinomo_runtime::dfs_cloud_files_api::{
+            CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            CloudFilesCursorRecoveryActiveObservedRequest, CloudFilesCursorRecoveryContext,
+            CloudFilesRegistrationReceipt,
+        };
+
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("terminal fixture mount point");
+        let pinned = pending_record_fixture(&data_dir);
+        let provider_path = verify_cloud_unregister_recovery_module(&data_dir, &pinned.module)
+            .expect("terminal fixture provider");
+        let provider_bytes = std::fs::read(provider_path).expect("terminal fixture provider bytes");
+        let seed = SifsMountLease::try_acquire(&data_dir, "terminal fixture seed")
+            .expect("terminal fixture seed lease");
+        let lock_bytes =
+            std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
+        drop(seed);
+
+        let mut marker = host_cursor_recovery_marker_fixture(
+            &data_dir,
+            &mount_point,
+            HostCursorRecoveryPhase::ReadyObserved,
+        );
+        marker.module = pinned.module;
+        marker.identity.provider_provenance_fingerprint =
+            cloud_files_provenance_fingerprint(&marker.module).expect("provider fingerprint");
+        marker.outer_token = host_cursor_recovery_outer_token(
+            &marker.disabled_config,
+            &marker.module,
+            &lock_bytes,
+            &marker.identity,
+            &marker.inspection,
+        )
+        .expect("terminal outer token");
+        marker.recovery_id = deterministic_host_cursor_recovery_id(&marker.outer_token);
+        marker
+            .applied
+            .as_mut()
+            .expect("terminal applied fixture")
+            .recovery_id = marker.recovery_id.clone();
+
+        let cursor_recovery = pending_cloud_unregister_record_with_policy(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                data_dir_root: Some(marker.identity.data_dir_root.clone()),
+                provider_name: marker.identity.provider_name.clone(),
+                cursor_recovery: Some(CloudFilesCursorRecoveryContext {
+                    recovery_id: marker.recovery_id.clone(),
+                    recovery_token: marker.inner_token.clone(),
+                    recovery_cycle: marker.recovery_cycle,
+                    native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+                }),
+            },
+            marker.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )
+        .expect("terminal cursor recovery record");
+        let cursor_stage = staged_cloud_registration_record(
+            &cursor_recovery,
+            StagedCloudRegistrationState::MayBeRegistered,
+        )
+        .expect("terminal cursor stage");
+        let ordinary_recovery = pending_cloud_unregister_record_with_policy(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                cursor_recovery: None,
+                ..cursor_recovery.request.clone()
+            },
+            marker.module.clone(),
+            CloudUnregisterPolicy::Release,
+        )
+        .expect("terminal ordinary recovery record");
+        let ordinary_stage = staged_cloud_registration_record(
+            &ordinary_recovery,
+            StagedCloudRegistrationState::MayBeRegistered,
+        )
+        .expect("terminal ordinary stage");
+
+        let receipt = sinomo_runtime::module_api::encode_sobj(&CloudFilesRegistrationReceipt {
+            interface_version:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    .to_string(),
+            registration_identity_interface_version: None,
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            provider_name: marker.identity.provider_name.clone(),
+        })
+        .expect("terminal receipt bytes");
+        let recovery_journal = b"canonical-recovery-ready-journal".to_vec();
+        let ordinary_journal = b"canonical-ordinary-ready-journal".to_vec();
+        marker.ready_artifacts_fingerprint = Some(
+            cloud_files_ready_artifacts_fingerprint_from_raw(&receipt, &recovery_journal),
+        );
+
+        let bundle = HostCursorRecoveryProviderBundle {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            requested: requested_host_cursor_recovery_marker(&marker),
+            provider_bytes,
+        };
+        persist_host_cursor_recovery_provider_bundle(&data_dir, &bundle)
+            .expect("terminal provider bundle");
+        stage_host_cursor_recovery_marker(&data_dir, &marker).expect("terminal host marker");
+        commit_staged_host_cursor_recovery_marker(&data_dir).expect("commit terminal host marker");
+        persist_or_promote_cursor_recovery_staged_record(&data_dir, &cursor_stage)
+            .expect("terminal cursor stage");
+        let runtime = cloud_files_module_runtime_path(&data_dir, "fixture");
+        std::fs::create_dir_all(runtime.parent().expect("terminal runtime parent"))
+            .expect("terminal runtime");
+        std::fs::write(cloud_files_registration_receipt_path(&data_dir), &receipt)
+            .expect("terminal receipt");
+        std::fs::write(
+            cloud_files_module_runtime_path(&data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            &recovery_journal,
+        )
+        .expect("terminal recovery journal");
+        let module_marker = b"canonical-native-namespace-finalized-marker".to_vec();
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ),
+            &module_marker,
+        )
+        .expect("terminal native marker");
+        configure_managed_sifs_mount(
+            &data_dir,
+            &SifsMountConfig {
+                enabled: true,
+                ..marker.disabled_config.clone()
+            },
+        )
+        .expect("terminal enabled config");
+
+        let module_marker_fingerprint =
+            cloud_files_module_marker_raw_fingerprint(&data_dir).expect("module fingerprint");
+        let completed_registration_artifacts_fingerprint =
+            cloud_files_completed_registration_artifacts_fingerprint_from_raw(
+                &receipt,
+                &ordinary_journal,
+            );
+        let active_request = CloudFilesCursorRecoveryActiveObservedRequest {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            recovery_id: marker.recovery_id.clone(),
+            recovery_token: marker.inner_token.clone(),
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            sync_root_file_id: marker.inspection.sync_root_file_id,
+            recovery_cycle: marker.recovery_cycle,
+            module_marker_fingerprint,
+            completed_registration_artifacts_fingerprint,
+        };
+        HostTerminalFixture {
+            data_dir,
+            marker,
+            active_request,
+            cursor_stage,
+            ordinary_stage,
+            ordinary_journal,
+        }
+    }
+
+    #[cfg(windows)]
+    fn advance_host_terminal_fixture_to_completion_authorized(fixture: &mut HostTerminalFixture) {
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ),
+            b"canonical-native-completion-authorized-marker",
+        )
+        .expect("terminal CompletionAuthorized native marker");
+        fixture.active_request.module_marker_fingerprint =
+            cloud_files_module_marker_raw_fingerprint(&fixture.data_dir)
+                .expect("CompletionAuthorized module fingerprint");
+    }
+
+    #[cfg(windows)]
+    fn host_terminal_active_mount_and_callbacks(
+        fixture: &HostTerminalFixture,
+        worker_finished: bool,
+    ) -> (ActiveMount, CloudFilesSupervisorCallbacks) {
+        let (lease, _) =
+            SifsMountLease::try_acquire_existing_for_cursor_recovery(&fixture.data_dir)
+                .expect("terminal active fixture existing lease");
+        let lease = Arc::new(lease);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let supervisor_shutdown = Arc::new(AtomicBool::new(false));
+        let operation_fence = Arc::new(Mutex::new(()));
+        let (event_tx, event_rx) = mpsc::sync_channel(8);
+        let (finished_tx, finished_rx) = mpsc::sync_channel(1);
+        let (thread, finished_result) = if worker_finished {
+            drop(finished_tx);
+            (
+                None,
+                Some(Err(
+                    "terminal fixture provider exited after AuthorityFinalized".to_string(),
+                )),
+            )
+        } else {
+            let worker_cancel = Arc::clone(&cancel);
+            let thread = thread::Builder::new()
+                .name("cursor-terminal-fixture-worker".to_string())
+                .spawn(move || {
+                    while !worker_cancel.load(Ordering::SeqCst) {
+                        thread::yield_now();
+                    }
+                    let _ = finished_tx.send(Ok(()));
+                })
+                .expect("terminal fixture worker");
+            (Some(thread), None)
+        };
+        let enabled = SifsMountConfig {
+            enabled: true,
+            ..fixture.marker.disabled_config.clone()
+        };
+        let active = ActiveMount {
+            config: enabled,
+            mount_point: fixture.marker.identity.sync_root.clone(),
+            cancel: Arc::clone(&cancel),
+            events: event_rx,
+            finished: finished_rx,
+            thread,
+            lifecycle: None,
+            finished_result,
+            provider_content_hash: fixture.marker.module.content_hash.clone(),
+            provider_interface_version: fixture.marker.module.interface_version.clone(),
+            module_provenance: fixture.marker.module.clone(),
+            lease,
+            operation_fence: Arc::clone(&operation_fence),
+            last_health_generation: 0,
+            last_health_observed: None,
+            last_health_observed_at: None,
+        };
+        let callbacks = CloudFilesSupervisorCallbacks {
+            cancel,
+            supervisor_shutdown,
+            events: event_tx,
+            data_dir: fixture.data_dir.clone(),
+            cursor_recovery: Some(fixture.marker.clone()),
+            operation_fence,
+        };
+        (active, callbacks)
+    }
+
+    #[cfg(windows)]
+    fn host_terminal_active_event_payload(
+        request: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest,
+    ) -> Vec<u8> {
+        sinomo_runtime::module_api::encode_sobj(
+            &sinomo_runtime::dfs_cloud_files_api::CloudFilesModuleEvent::CursorRecoveryActiveObserved(
+                request.clone(),
+            ),
+        )
+        .expect("terminal ActiveObserved event payload")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_callback_drives_authority_finalized_normalization_and_release_cuts() {
+        let temp = TestDir::new("sifs-cursor-terminal-active-callback");
+        let mut fixture = host_terminal_fixture(&temp);
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("NamespaceFinalized acknowledgement");
+        let active = load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+            .expect("load ActiveObserved marker")
+            .expect("ActiveObserved marker");
+        assert_eq!(active.phase, HostCursorRecoveryPhase::ActiveObserved);
+        assert_eq!(
+            active.active_module_marker_fingerprint.as_deref(),
+            Some(fixture.active_request.module_marker_fingerprint.as_str())
+        );
+
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("CompletionAuthorized acknowledgement");
+        let authority_finalized = load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+            .expect("load AuthorityFinalized marker")
+            .expect("AuthorityFinalized marker");
+        assert_eq!(
+            authority_finalized.phase,
+            HostCursorRecoveryPhase::AuthorityFinalized
+        );
+        assert_eq!(
+            authority_finalized
+                .completion_registration_artifacts_fingerprint
+                .as_deref(),
+            Some(
+                fixture
+                    .active_request
+                    .completed_registration_artifacts_fingerprint
+                    .as_str()
+            )
+        );
+
+        // Duplicate AF acknowledgement is an idempotent predecessor replay.
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("idempotent AuthorityFinalized acknowledgement");
+        assert_eq!(
+            load_staged_cloud_registration_record(&fixture.data_dir)
+                .expect("cursor stage before native normalization"),
+            Some(fixture.cursor_stage.clone())
+        );
+
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+            ),
+            &fixture.ordinary_journal,
+        )
+        .expect("native normalized ordinary journal");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("normalization acknowledgement");
+        let normalized = load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+            .expect("load normalized host marker")
+            .expect("normalized host marker");
+        assert!(normalized.completed_artifacts_fingerprint.is_some());
+        assert_eq!(
+            load_staged_cloud_registration_record(&fixture.data_dir)
+                .expect("ordinary stage after normalization"),
+            Some(fixture.ordinary_stage.clone())
+        );
+
+        std::fs::remove_file(cloud_files_module_runtime_path(
+            &fixture.data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        ))
+        .expect("native clears CompletionAuthorized marker");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("final authority release acknowledgement");
+        assert!(
+            load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+                .expect("host marker after release")
+                .is_none()
+        );
+        assert!(!host_cursor_recovery_provider_bundle_path(&fixture.data_dir).exists());
+        assert!(!cancel.load(Ordering::SeqCst));
+
+        let temp = TestDir::new("sifs-cursor-terminal-disabled-final-ack");
+        let mut fixture = host_terminal_fixture(&temp);
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled fixture Ready to Active");
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled fixture Active to AF");
+        configure_managed_sifs_mount(&fixture.data_dir, &fixture.marker.disabled_config)
+            .expect("disable after AF linearization");
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+            ),
+            &fixture.ordinary_journal,
+        )
+        .expect("disabled fixture ordinary journal");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled fixture normalization");
+        std::fs::remove_file(cloud_files_module_runtime_path(
+            &fixture.data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        ))
+        .expect("disabled fixture native marker clear");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled fixture final ACK");
+        assert!(cancel.load(Ordering::SeqCst));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn operation_fence_serializes_unregister_first_and_authority_finalized_first() {
+        let temp = TestDir::new("sifs-cursor-terminal-fence-u-first");
+        let mut fixture = host_terminal_fixture(&temp);
+        let (active_mount, callbacks) = host_terminal_active_mount_and_callbacks(&fixture, false);
+        let mut active = Some(active_mount);
+        let mut pending = None;
+        let mount_cancellation = Mutex::new(None);
+        assert!(
+            callbacks.handle_output(&host_terminal_active_event_payload(&fixture.active_request,))
+        );
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        let ca_payload = host_terminal_active_event_payload(&fixture.active_request);
+        configure_managed_sifs_mount(&fixture.data_dir, &fixture.marker.disabled_config)
+            .expect("persist U-first disabled consent");
+        let pending_path = pending_cloud_unregister_path(&fixture.data_dir);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        let (retire_result, callback_result) = thread::scope(|scope| {
+            let retire_start = Arc::clone(&start);
+            let data_dir = &fixture.data_dir;
+            let active = &mut active;
+            let pending = &mut pending;
+            let mount_cancellation = &mount_cancellation;
+            let retire = scope.spawn(move || {
+                retire_start.wait();
+                retire_active_mount(
+                    data_dir,
+                    active,
+                    mount_cancellation,
+                    pending,
+                    MountRetirementReason::ExplicitDisable,
+                )
+            });
+            let callback_start = Arc::clone(&start);
+            let callbacks = &callbacks;
+            let ca_payload = &ca_payload;
+            let pending_path = &pending_path;
+            let callback = scope.spawn(move || {
+                callback_start.wait();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !pending_path.exists() && Instant::now() < deadline {
+                    thread::yield_now();
+                }
+                assert!(pending_path.exists(), "retirement must linearize U first");
+                callbacks.handle_output(&ca_payload)
+            });
+            (
+                retire.join().expect("U-first retirement thread"),
+                callback.join().expect("U-first callback thread"),
+            )
+        });
+        assert!(retire_result.is_err());
+        assert!(!callback_result);
+        assert!(pending.is_some());
+        assert!(pending_path.exists());
+        assert_eq!(
+            load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+                .expect("U-first host marker")
+                .expect("U-first host authority")
+                .phase,
+            HostCursorRecoveryPhase::ActiveObserved
+        );
+
+        let temp = TestDir::new("sifs-cursor-terminal-fence-af-first");
+        let mut fixture = host_terminal_fixture(&temp);
+        let (active_mount, callbacks) = host_terminal_active_mount_and_callbacks(&fixture, false);
+        let mut active = Some(active_mount);
+        let mut pending = None;
+        let mount_cancellation = Mutex::new(None);
+        assert!(
+            callbacks.handle_output(&host_terminal_active_event_payload(&fixture.active_request,))
+        );
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        let ca_payload = host_terminal_active_event_payload(&fixture.active_request);
+        let start = Arc::new(std::sync::Barrier::new(2));
+        thread::scope(|scope| {
+            let callback_start = Arc::clone(&start);
+            let callbacks = &callbacks;
+            let ca_payload = &ca_payload;
+            let callback = scope.spawn(move || {
+                callback_start.wait();
+                callbacks.handle_output(&ca_payload)
+            });
+            start.wait();
+            assert!(callback.join().expect("AF-first callback thread"));
+        });
+        assert_eq!(
+            load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+                .expect("AF-first host marker")
+                .expect("AF-first host authority")
+                .phase,
+            HostCursorRecoveryPhase::AuthorityFinalized
+        );
+        configure_managed_sifs_mount(&fixture.data_dir, &fixture.marker.disabled_config)
+            .expect("persist AF-first disabled consent");
+        retire_active_mount(
+            &fixture.data_dir,
+            &mut active,
+            &mount_cancellation,
+            &mut pending,
+            MountRetirementReason::ExplicitDisable,
+        )
+        .expect("live AF worker remains parked");
+        assert!(active.is_some());
+        assert!(pending.is_none());
+        assert!(!pending_cloud_unregister_path(&fixture.data_dir).exists());
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+            ),
+            &fixture.ordinary_journal,
+        )
+        .expect("AF-first ordinary journal");
+        assert!(callbacks.handle_output(&ca_payload));
+        std::fs::remove_file(cloud_files_module_runtime_path(
+            &fixture.data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        ))
+        .expect("AF-first native authority release");
+        assert!(callbacks.handle_output(&ca_payload));
+        assert!(callbacks.cancel.load(Ordering::SeqCst));
+        stop_active_mount(&mut active, &mount_cancellation).expect("join cancelled AF worker");
+
+        let temp = TestDir::new("sifs-cursor-terminal-fence-af-finished");
+        let mut fixture = host_terminal_fixture(&temp);
+        let (active_mount, callbacks) = host_terminal_active_mount_and_callbacks(&fixture, true);
+        let mut active = Some(active_mount);
+        let mut pending = None;
+        let mount_cancellation = Mutex::new(None);
+        assert!(
+            callbacks.handle_output(&host_terminal_active_event_payload(&fixture.active_request,))
+        );
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        assert!(
+            callbacks.handle_output(&host_terminal_active_event_payload(&fixture.active_request,))
+        );
+        configure_managed_sifs_mount(&fixture.data_dir, &fixture.marker.disabled_config)
+            .expect("persist finished-AF disabled consent");
+        retire_active_mount(
+            &fixture.data_dir,
+            &mut active,
+            &mount_cancellation,
+            &mut pending,
+            MountRetirementReason::ExplicitDisable,
+        )
+        .expect("retire finished AF worker without Preserve");
+        assert!(active.is_none());
+        assert!(pending.is_none());
+        assert!(!pending_cloud_unregister_path(&fixture.data_dir).exists());
+        assert_eq!(
+            load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+                .expect("finished-AF host marker")
+                .expect("finished-AF host authority")
+                .phase,
+            HostCursorRecoveryPhase::AuthorityFinalized
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn active_callback_rejects_u_first_and_terminal_temps_before_host_mutation() {
+        for evidence in ["pending", "journal-temp", "stage-temp", "changed-proof"] {
+            let temp = TestDir::new(&format!("sifs-cursor-terminal-reject-{evidence}"));
+            let mut fixture = host_terminal_fixture(&temp);
+            match evidence {
+                "pending" => {
+                    let record = pending_cloud_unregister_record_with_policy(
+                        sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                            sync_root: fixture.marker.identity.sync_root.clone(),
+                            root_path: fixture.marker.identity.root_path.clone(),
+                            data_dir_root: Some(fixture.marker.identity.data_dir_root.clone()),
+                            provider_name: fixture.marker.identity.provider_name.clone(),
+                            cursor_recovery: Some(host_cursor_recovery_context(&fixture.marker)),
+                        },
+                        fixture.marker.module.clone(),
+                        CloudUnregisterPolicy::PreserveState,
+                    )
+                    .expect("U-first pending record");
+                    persist_pending_cloud_unregister_record(&fixture.data_dir, &record)
+                        .expect("U-first durable intent");
+                }
+                "journal-temp" => std::fs::write(
+                    cloud_files_registration_journal_temp_path(&fixture.data_dir),
+                    b"unexpected-journal-temp",
+                )
+                .expect("journal temp"),
+                "stage-temp" => std::fs::write(
+                    cursor_recovery_staged_temp_path(&fixture.data_dir),
+                    sinomo_runtime::module_api::encode_sobj(&fixture.ordinary_stage)
+                        .expect("ordinary stage temp bytes"),
+                )
+                .expect("stage temp"),
+                "changed-proof" => {
+                    fixture.active_request.module_marker_fingerprint =
+                        format!("blake3:{}", "9".repeat(64));
+                }
+                _ => unreachable!(),
+            }
+            let marker_before = std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                .expect("host marker before rejection");
+            let stage_before = inspect_cursor_recovery_staged_record_snapshot(&fixture.data_dir)
+                .expect("stage before rejection");
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+            )
+            .expect_err("terminal ambiguity must fail closed");
+            assert_eq!(
+                std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                    .expect("host marker after rejection"),
+                marker_before
+            );
+            let stage_after = inspect_cursor_recovery_staged_record_snapshot(&fixture.data_dir)
+                .expect("stage after rejection");
+            assert_eq!(stage_after.current, stage_before.current);
+            assert_eq!(stage_after.temporary, stage_before.temporary);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authority_finalized_restart_cleans_bundle_first_and_rejects_orphan_stage_temp() {
+        for bundle_present in [true, false] {
+            let temp = TestDir::new(if bundle_present {
+                "sifs-cursor-terminal-restart-bundle-present"
+            } else {
+                "sifs-cursor-terminal-restart-bundle-absent"
+            });
+            let mut fixture = host_terminal_fixture(&temp);
+            let cancel = AtomicBool::new(false);
+            let shutdown = AtomicBool::new(false);
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &cancel,
+                &shutdown,
+            )
+            .expect("Ready to Active");
+            advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &cancel,
+                &shutdown,
+            )
+            .expect("Active to AuthorityFinalized");
+            std::fs::write(
+                cloud_files_module_runtime_path(
+                    &fixture.data_dir,
+                    CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+                ),
+                &fixture.ordinary_journal,
+            )
+            .expect("ordinary journal");
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &cancel,
+                &shutdown,
+            )
+            .expect("host normalization");
+            std::fs::remove_file(cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+            ))
+            .expect("native marker clear");
+            if !bundle_present {
+                std::fs::remove_file(host_cursor_recovery_provider_bundle_path(&fixture.data_dir))
+                    .expect("simulate bundle-first crash");
+            }
+            let enabled = SifsMountConfig {
+                enabled: true,
+                ..fixture.marker.disabled_config.clone()
+            };
+            assert!(
+                resume_active_observed_host_cursor_recovery_cleanup(&fixture.data_dir, &enabled)
+                    .expect("restart final cleanup")
+            );
+            assert!(!host_cursor_recovery_marker_path(&fixture.data_dir).exists());
+            assert!(!host_cursor_recovery_provider_bundle_path(&fixture.data_dir).exists());
+        }
+
+        let temp = TestDir::new("sifs-cursor-terminal-disabled-restart");
+        let mut fixture = host_terminal_fixture(&temp);
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled restart Ready to Active");
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled restart Active to AF");
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+            ),
+            &fixture.ordinary_journal,
+        )
+        .expect("disabled restart ordinary journal");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("disabled restart normalization");
+        std::fs::remove_file(cloud_files_module_runtime_path(
+            &fixture.data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        ))
+        .expect("disabled restart native marker clear");
+        configure_managed_sifs_mount(&fixture.data_dir, &fixture.marker.disabled_config)
+            .expect("persist disabled restart consent");
+        assert!(
+            resume_active_observed_host_cursor_recovery_cleanup(
+                &fixture.data_dir,
+                &fixture.marker.disabled_config,
+            )
+            .expect("disabled restart host cleanup")
+        );
+
+        let temp = TestDir::new("sifs-cursor-terminal-restart-stage-temp");
+        let mut fixture = host_terminal_fixture(&temp);
+        let cancel = AtomicBool::new(false);
+        let shutdown = AtomicBool::new(false);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("Ready to Active");
+        advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("Active to AF");
+        std::fs::write(
+            cloud_files_module_runtime_path(
+                &fixture.data_dir,
+                CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+            ),
+            &fixture.ordinary_journal,
+        )
+        .expect("ordinary journal");
+        acknowledge_host_cursor_recovery_active_observed(
+            &fixture.data_dir,
+            &fixture.marker,
+            &fixture.active_request,
+            &cancel,
+            &shutdown,
+        )
+        .expect("host normalization");
+        std::fs::remove_file(cloud_files_module_runtime_path(
+            &fixture.data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        ))
+        .expect("native marker clear");
+        std::fs::write(
+            cursor_recovery_staged_temp_path(&fixture.data_dir),
+            sinomo_runtime::module_api::encode_sobj(&fixture.ordinary_stage)
+                .expect("orphan stage temp bytes"),
+        )
+        .expect("orphan stage temp");
+        let marker_before = std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+            .expect("AF marker before orphan temp rejection");
+        resume_active_observed_host_cursor_recovery_cleanup(
+            &fixture.data_dir,
+            &SifsMountConfig {
+                enabled: true,
+                ..fixture.marker.disabled_config.clone()
+            },
+        )
+        .expect_err("orphan stage temp blocks authority release");
+        assert_eq!(
+            std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                .expect("AF marker after orphan temp rejection"),
+            marker_before
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn authority_finalized_restart_classifies_exact_native_and_stage_normalization_cuts() {
+        for cut in [
+            "journal-successor-temp",
+            "stage-successor-temp",
+            "changed-journal-temp",
+            "changed-stage-temp",
+            "missing-bundle",
+        ] {
+            let temp = TestDir::new(&format!("sifs-cursor-terminal-af-restart-{cut}"));
+            let mut fixture = host_terminal_fixture(&temp);
+            let cancel = AtomicBool::new(false);
+            let shutdown = AtomicBool::new(false);
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &cancel,
+                &shutdown,
+            )
+            .expect("restart fixture Ready to Active");
+            advance_host_terminal_fixture_to_completion_authorized(&mut fixture);
+            acknowledge_host_cursor_recovery_active_observed(
+                &fixture.data_dir,
+                &fixture.marker,
+                &fixture.active_request,
+                &cancel,
+                &shutdown,
+            )
+            .expect("restart fixture Active to AF");
+            let marker = load_host_cursor_recovery_marker_strict(&fixture.data_dir)
+                .expect("load AF restart marker")
+                .expect("AF restart marker");
+            match cut {
+                "journal-successor-temp" => std::fs::write(
+                    cloud_files_registration_journal_temp_path(&fixture.data_dir),
+                    &fixture.ordinary_journal,
+                )
+                .expect("ordinary journal successor temp"),
+                "stage-successor-temp" => {
+                    std::fs::write(
+                        cloud_files_module_runtime_path(
+                            &fixture.data_dir,
+                            CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+                        ),
+                        &fixture.ordinary_journal,
+                    )
+                    .expect("ordinary journal final");
+                    std::fs::write(
+                        cursor_recovery_staged_temp_path(&fixture.data_dir),
+                        sinomo_runtime::module_api::encode_sobj(&fixture.ordinary_stage)
+                            .expect("ordinary stage successor bytes"),
+                    )
+                    .expect("ordinary stage successor temp");
+                }
+                "changed-journal-temp" => std::fs::write(
+                    cloud_files_registration_journal_temp_path(&fixture.data_dir),
+                    b"changed ordinary journal successor",
+                )
+                .expect("changed journal temp"),
+                "changed-stage-temp" => {
+                    std::fs::write(
+                        cloud_files_module_runtime_path(
+                            &fixture.data_dir,
+                            CLOUD_FILES_REGISTRATION_JOURNAL_FILE,
+                        ),
+                        &fixture.ordinary_journal,
+                    )
+                    .expect("ordinary journal final");
+                    let mut changed = fixture.ordinary_stage.clone();
+                    changed.recovery.request.root_path = "/changed".to_string();
+                    std::fs::write(
+                        cursor_recovery_staged_temp_path(&fixture.data_dir),
+                        sinomo_runtime::module_api::encode_sobj(&changed)
+                            .expect("changed stage temp bytes"),
+                    )
+                    .expect("changed stage temp");
+                }
+                "missing-bundle" => {
+                    std::fs::remove_file(host_cursor_recovery_provider_bundle_path(
+                        &fixture.data_dir,
+                    ))
+                    .expect("remove required AF bundle");
+                }
+                _ => unreachable!(),
+            }
+            let positive = matches!(cut, "journal-successor-temp" | "stage-successor-temp");
+            if positive {
+                let classified =
+                    validate_authority_finalized_completion_cut(&fixture.data_dir, &marker)
+                        .expect("classify exact AF normalization cut");
+                assert_eq!(
+                    classified.registration_normalized,
+                    cut == "stage-successor-temp"
+                );
+                assert!(!classified.stage_normalized);
+                assert!(
+                    !resume_active_observed_host_cursor_recovery_cleanup(
+                        &fixture.data_dir,
+                        &SifsMountConfig {
+                            enabled: true,
+                            ..fixture.marker.disabled_config.clone()
+                        },
+                    )
+                    .expect("AF+CA restart defers to pinned native completion")
+                );
+            } else if cut == "missing-bundle" {
+                let marker_before =
+                    std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                        .expect("AF marker before missing-bundle admission");
+                admit_host_cursor_recovery_enable(
+                    &fixture.data_dir,
+                    &SifsMountConfig {
+                        enabled: true,
+                        ..fixture.marker.disabled_config.clone()
+                    },
+                )
+                .expect_err("AF+CA admission requires its durable provider bundle");
+                assert_eq!(
+                    std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                        .expect("AF marker after missing-bundle admission"),
+                    marker_before
+                );
+            } else {
+                let marker_before =
+                    std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                        .expect("AF marker before rejected restart cut");
+                let result = resume_active_observed_host_cursor_recovery_cleanup(
+                    &fixture.data_dir,
+                    &SifsMountConfig {
+                        enabled: true,
+                        ..fixture.marker.disabled_config.clone()
+                    },
+                );
+                assert!(result.is_err(), "{cut} must fail closed");
+                assert_eq!(
+                    std::fs::read(host_cursor_recovery_marker_path(&fixture.data_dir))
+                        .expect("AF marker after rejected restart cut"),
+                    marker_before
+                );
+            }
         }
     }
 
@@ -4471,7 +10337,9 @@ mod tests {
             &v3.module,
             &rejected_descriptor,
             sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
-            true,
+            Some(
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+            ),
             || {
                 effects.set(effects.get() + 1);
                 let upgraded =
@@ -4558,7 +10426,9 @@ mod tests {
             &provenance,
             &descriptor,
             SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-            true,
+            Some(
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+            ),
             || {
                 effects.set(effects.get() + 1);
                 Ok(())
@@ -4584,7 +10454,9 @@ mod tests {
                 &provenance,
                 &missing_capability,
                 SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-                true,
+                Some(
+                    sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+                ),
                 || {
                     effects.set(effects.get() + 1);
                     Ok(())
@@ -4607,7 +10479,9 @@ mod tests {
                 &provenance,
                 &missing_operation,
                 SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
-                true,
+                Some(
+                    sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+                ),
                 || {
                     effects.set(effects.get() + 1);
                     Ok(())
@@ -4645,7 +10519,9 @@ mod tests {
                     &provenance,
                     &mismatched,
                     SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-                    true,
+                    Some(
+                        sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+                    ),
                     || {
                         effects.set(effects.get() + 1);
                         Ok(())
@@ -4746,6 +10622,667 @@ mod tests {
     }
 
     #[test]
+    fn cursor_recovery_staged_enable_transition_replays_only_exact_deterministic_cuts() {
+        let temp = TestDir::new("sifs-cursor-recovery-staged-enable-cuts");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let retained = staged_cloud_registration_record(
+            &recovery,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )
+        .expect("retained stage");
+        let armed = staged_cloud_registration_record(
+            &recovery,
+            StagedCloudRegistrationState::MayBeRegistered,
+        )
+        .expect("armed stage");
+        let retained_bytes =
+            sinomo_runtime::module_api::encode_sobj(&retained).expect("retained bytes");
+        let armed_bytes = sinomo_runtime::module_api::encode_sobj(&armed).expect("armed bytes");
+        let final_path = staged_cloud_registration_path(&data_dir);
+        let temporary_path = cursor_recovery_staged_temp_path(&data_dir);
+
+        persist_or_promote_cursor_recovery_staged_record(&data_dir, &retained)
+            .expect("initial retained stage");
+        transition_or_promote_cursor_recovery_staged_record(&data_dir, &retained, &armed)
+            .expect("retained to armed transition");
+        assert_eq!(
+            std::fs::read(&final_path).expect("armed final"),
+            armed_bytes
+        );
+        assert!(!temporary_path.exists());
+
+        std::fs::write(&final_path, &retained_bytes).expect("restore retained predecessor");
+        std::fs::write(&temporary_path, &armed_bytes).expect("persist successor cut");
+        transition_or_promote_cursor_recovery_staged_record(&data_dir, &retained, &armed)
+            .expect("promote exact successor cut");
+        assert_eq!(
+            std::fs::read(&final_path).expect("promoted final"),
+            armed_bytes
+        );
+        assert!(!temporary_path.exists());
+
+        std::fs::write(&temporary_path, &armed_bytes).expect("redundant successor cut");
+        transition_or_promote_cursor_recovery_staged_record(&data_dir, &retained, &armed)
+            .expect("clean redundant successor cut");
+        assert_eq!(
+            std::fs::read(&final_path).expect("stable final"),
+            armed_bytes
+        );
+        assert!(!temporary_path.exists());
+
+        std::fs::write(&final_path, &retained_bytes).expect("restore retained predecessor");
+        std::fs::write(&temporary_path, b"torn successor").expect("torn successor cut");
+        let error =
+            transition_or_promote_cursor_recovery_staged_record(&data_dir, &retained, &armed)
+                .expect_err("torn successor must fail closed");
+        assert!(error.contains("exact retained predecessor"));
+        assert_eq!(
+            std::fs::read(&final_path).expect("retained final unchanged"),
+            retained_bytes
+        );
+        assert_eq!(
+            std::fs::read(&temporary_path).expect("torn evidence retained"),
+            b"torn successor"
+        );
+    }
+
+    #[cfg(windows)]
+    #[derive(Clone, Copy, Debug)]
+    enum CursorPendingReplayCut {
+        PendingAndRetainedTemps,
+        RetainedWithHostPredecessor,
+        PreservedHostTemp,
+        PreservedHostFinal,
+        ReversedPreservedHostAndRetainedTemp,
+        PredecessorHostTemp,
+        PreservedHostProofMismatch,
+        PreservedHostArtifactDrift,
+    }
+
+    #[cfg(windows)]
+    fn run_cursor_pending_replay_cut(label: &str, cut: CursorPendingReplayCut) {
+        let temp = TestDir::new(label);
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+
+        let pinned = pending_record_fixture(&data_dir);
+        let provider_path = verify_cloud_unregister_recovery_module(&data_dir, &pinned.module)
+            .expect("pinned provider");
+        let provider_bytes = std::fs::read(provider_path).expect("pinned provider bytes");
+        let initial_lease =
+            SifsMountLease::try_acquire(&data_dir, "cursor replay fixture").expect("initial lease");
+        let host_lock_bytes =
+            std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
+        drop(initial_lease);
+
+        let mut marker = host_cursor_recovery_marker_fixture(
+            &data_dir,
+            &mount_point,
+            HostCursorRecoveryPhase::ActiveObserved,
+        );
+        marker.module = pinned.module;
+        marker.identity.provider_provenance_fingerprint =
+            cloud_files_provenance_fingerprint(&marker.module).expect("provider fingerprint");
+        marker.outer_token = host_cursor_recovery_outer_token(
+            &marker.disabled_config,
+            &marker.module,
+            &host_lock_bytes,
+            &marker.identity,
+            &marker.inspection,
+        )
+        .expect("outer token");
+        marker.recovery_id = deterministic_host_cursor_recovery_id(&marker.outer_token);
+        marker
+            .applied
+            .as_mut()
+            .expect("applied fixture")
+            .recovery_id = marker.recovery_id.clone();
+
+        let pending = pending_cloud_unregister_record_with_policy(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                data_dir_root: Some(marker.identity.data_dir_root.clone()),
+                provider_name: marker.identity.provider_name.clone(),
+                cursor_recovery: Some(host_cursor_recovery_context(&marker)),
+            },
+            marker.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )
+        .expect("pending preserve");
+        let may_be_registered = staged_cloud_registration_record(
+            &pending,
+            StagedCloudRegistrationState::MayBeRegistered,
+        )
+        .expect("MayBeRegistered stage");
+        let successor_context =
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                recovery_id: marker.recovery_id.clone(),
+                recovery_token: marker.inner_token.clone(),
+                recovery_cycle: 1,
+                native_successor_fingerprint: Some(format!("blake3:{}", "3".repeat(64))),
+            };
+        let retained_response =
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                was_registered: true,
+                outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Retained,
+                cursor_recovery: Some(successor_context.clone()),
+                detail: "retained replay fixture".to_string(),
+            };
+        let mut retained = staged_cursor_recovery_successor_record(&pending, &retained_response)
+            .expect("RetainedAbsent successor");
+        if matches!(cut, CursorPendingReplayCut::PreservedHostProofMismatch) {
+            retained
+                .recovery
+                .request
+                .cursor_recovery
+                .as_mut()
+                .expect("retained context")
+                .native_successor_fingerprint = Some(format!("blake3:{}", "4".repeat(64)));
+            retained.recovery.payload_sobj = sinomo_runtime::module_api::encode_sobj(
+                &sinomo_runtime::dfs_cloud_files_api::CloudFilesModuleRequest::Unregister(
+                    retained.recovery.request.clone(),
+                ),
+            )
+            .expect("policy-neutral staged payload");
+        }
+
+        let receipt = sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt {
+            interface_version:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    .to_string(),
+            registration_identity_interface_version: None,
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            provider_name: marker.identity.provider_name.clone(),
+        };
+        let receipt_path = cloud_files_registration_receipt_path(&data_dir);
+        std::fs::create_dir_all(receipt_path.parent().expect("receipt parent"))
+            .expect("module runtime");
+        std::fs::write(
+            &receipt_path,
+            sinomo_runtime::module_api::encode_sobj(&receipt).expect("receipt bytes"),
+        )
+        .expect("receipt");
+        std::fs::write(
+            cloud_files_module_runtime_path(&data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            b"exact-next-cycle-StateOwned-journal",
+        )
+        .expect("StateOwned journal");
+
+        let mut preserved_marker = marker.clone();
+        preserved_marker.phase = HostCursorRecoveryPhase::PreservedRetained;
+        preserved_marker.ready_artifacts_fingerprint = None;
+        preserved_marker.preserved_artifacts_fingerprint = Some(
+            cloud_files_preserved_artifacts_fingerprint(&data_dir)
+                .expect("preserved artifacts fingerprint"),
+        );
+        preserved_marker.active_module_marker_fingerprint = None;
+        preserved_marker.completion_module_marker_fingerprint = None;
+        preserved_marker.completion_registration_artifacts_fingerprint = None;
+        preserved_marker.completed_artifacts_fingerprint = None;
+        preserved_marker.recovery_cycle = 1;
+        preserved_marker.native_successor_fingerprint =
+            successor_context.native_successor_fingerprint.clone();
+
+        let bundle = HostCursorRecoveryProviderBundle {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            requested: requested_host_cursor_recovery_marker(&marker),
+            provider_bytes,
+        };
+        persist_host_cursor_recovery_provider_bundle(&data_dir, &bundle).expect("provider bundle");
+
+        let write_marker_final = |value: &HostCursorRecoveryMarker| {
+            stage_host_cursor_recovery_marker(&data_dir, value).expect("stage marker fixture");
+            commit_staged_host_cursor_recovery_marker(&data_dir).expect("commit marker fixture");
+        };
+        match cut {
+            CursorPendingReplayCut::PreservedHostTemp => {
+                write_marker_final(&marker);
+                stage_host_cursor_recovery_marker(&data_dir, &preserved_marker)
+                    .expect("stage preserved host successor");
+            }
+            CursorPendingReplayCut::PreservedHostFinal
+            | CursorPendingReplayCut::ReversedPreservedHostAndRetainedTemp
+            | CursorPendingReplayCut::PreservedHostProofMismatch
+            | CursorPendingReplayCut::PreservedHostArtifactDrift => {
+                write_marker_final(&preserved_marker);
+            }
+            CursorPendingReplayCut::PredecessorHostTemp => {
+                let mut ready = marker.clone();
+                ready.phase = HostCursorRecoveryPhase::ReadyObserved;
+                ready.active_module_marker_fingerprint = None;
+                write_marker_final(&ready);
+                stage_host_cursor_recovery_marker(&data_dir, &marker)
+                    .expect("stage impossible Active predecessor temp");
+            }
+            _ => write_marker_final(&marker),
+        }
+
+        persist_or_promote_cursor_recovery_staged_record(&data_dir, &may_be_registered)
+            .expect("MayBeRegistered stage");
+        match cut {
+            CursorPendingReplayCut::PendingAndRetainedTemps
+            | CursorPendingReplayCut::ReversedPreservedHostAndRetainedTemp => {
+                std::fs::write(
+                    cursor_recovery_staged_temp_path(&data_dir),
+                    sinomo_runtime::module_api::encode_sobj(&retained)
+                        .expect("RetainedAbsent temp bytes"),
+                )
+                .expect("RetainedAbsent temp");
+            }
+            _ => {
+                transition_or_promote_cursor_recovery_staged_record(
+                    &data_dir,
+                    &may_be_registered,
+                    &retained,
+                )
+                .expect("RetainedAbsent final");
+            }
+        }
+
+        let pending_bytes =
+            sinomo_runtime::module_api::encode_sobj(&pending).expect("pending bytes");
+        let pending_temp_only = matches!(cut, CursorPendingReplayCut::PendingAndRetainedTemps);
+        std::fs::write(
+            if pending_temp_only {
+                cursor_recovery_pending_temp_path(&data_dir)
+            } else {
+                pending_cloud_unregister_path(&data_dir)
+            },
+            &pending_bytes,
+        )
+        .expect("pending intent cut");
+        if matches!(cut, CursorPendingReplayCut::PreservedHostArtifactDrift) {
+            std::fs::write(
+                cloud_files_module_runtime_path(&data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+                b"changed-after-preserved-host-commit",
+            )
+            .expect("drift preserved journal");
+        }
+
+        let before_pending =
+            inspect_pending_cloud_unregister_record(&data_dir).expect("pending before replay");
+        let before_stage =
+            inspect_cursor_recovery_staged_record_snapshot(&data_dir).expect("stage before replay");
+        let before_marker = inspect_host_cursor_recovery_marker_for_resume(&data_dir)
+            .expect("marker before replay");
+        let (lease, observed_lock_bytes) =
+            SifsMountLease::try_acquire_existing_for_cursor_recovery(&data_dir)
+                .expect("existing cursor-recovery lease");
+        assert_eq!(observed_lock_bytes, host_lock_bytes);
+        let mut runnable = PendingCloudUnregister::new(pending.clone(), Some(Arc::new(lease)));
+
+        let impossible = matches!(
+            cut,
+            CursorPendingReplayCut::ReversedPreservedHostAndRetainedTemp
+                | CursorPendingReplayCut::PredecessorHostTemp
+                | CursorPendingReplayCut::PreservedHostProofMismatch
+                | CursorPendingReplayCut::PreservedHostArtifactDrift
+        );
+        if impossible {
+            complete_pending_cloud_unregister(&data_dir, &mut runnable)
+                .expect_err("impossible cursor replay cut must fail closed");
+            let after_pending = inspect_pending_cloud_unregister_record(&data_dir)
+                .expect("pending after rejection");
+            let after_stage = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
+                .expect("stage after rejection");
+            let after_marker = inspect_host_cursor_recovery_marker_for_resume(&data_dir)
+                .expect("marker after rejection");
+            assert_eq!(after_pending.value, before_pending.value);
+            assert_eq!(
+                after_pending.current_present,
+                before_pending.current_present
+            );
+            assert_eq!(
+                after_pending.temporary_present,
+                before_pending.temporary_present
+            );
+            assert_eq!(after_stage.current, before_stage.current);
+            assert_eq!(after_stage.temporary, before_stage.temporary);
+            assert_eq!(after_marker.value, before_marker.value);
+            assert_eq!(after_marker.temporary, before_marker.temporary);
+            return;
+        }
+
+        complete_pending_cloud_unregister(&data_dir, &mut runnable)
+            .expect("complete exact cursor replay cut");
+        assert!(
+            inspect_pending_cloud_unregister_record(&data_dir)
+                .expect("pending after replay")
+                .value
+                .is_none()
+        );
+        assert_eq!(
+            inspect_cursor_recovery_staged_record_snapshot(&data_dir)
+                .expect("stage after replay")
+                .current,
+            Some(retained)
+        );
+        let completed_marker = load_host_cursor_recovery_marker_strict(&data_dir)
+            .expect("load completed host marker")
+            .expect("completed host marker");
+        assert_eq!(completed_marker, preserved_marker);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_pending_replay_classifies_u_stage_and_host_successor_cuts() {
+        for (label, cut) in [
+            (
+                "sifs-cursor-replay-u-and-stage-temps",
+                CursorPendingReplayCut::PendingAndRetainedTemps,
+            ),
+            (
+                "sifs-cursor-replay-retained-before-host",
+                CursorPendingReplayCut::RetainedWithHostPredecessor,
+            ),
+            (
+                "sifs-cursor-replay-host-successor-temp",
+                CursorPendingReplayCut::PreservedHostTemp,
+            ),
+            (
+                "sifs-cursor-replay-host-successor-final",
+                CursorPendingReplayCut::PreservedHostFinal,
+            ),
+            (
+                "sifs-cursor-replay-reversed-host-stage",
+                CursorPendingReplayCut::ReversedPreservedHostAndRetainedTemp,
+            ),
+            (
+                "sifs-cursor-replay-predecessor-host-temp",
+                CursorPendingReplayCut::PredecessorHostTemp,
+            ),
+            (
+                "sifs-cursor-replay-host-proof-mismatch",
+                CursorPendingReplayCut::PreservedHostProofMismatch,
+            ),
+            (
+                "sifs-cursor-replay-host-artifact-drift",
+                CursorPendingReplayCut::PreservedHostArtifactDrift,
+            ),
+        ] {
+            run_cursor_pending_replay_cut(label, cut);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn disabled_armed_replay_rolls_stage_forward_and_retains_existing_lease() {
+        for with_may_be_registered_temp in [false, true] {
+            let temp = TestDir::new(if with_may_be_registered_temp {
+                "sifs-cursor-disabled-armed-with-stage-temp"
+            } else {
+                "sifs-cursor-disabled-armed-before-stage"
+            });
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let mount_point = temp.path().join("mount");
+            std::fs::create_dir_all(&mount_point).expect("mount point");
+
+            let pinned = pending_record_fixture(&data_dir);
+            let provider_path = verify_cloud_unregister_recovery_module(&data_dir, &pinned.module)
+                .expect("pinned provider");
+            let provider_bytes = std::fs::read(provider_path).expect("pinned provider bytes");
+            let seed = SifsMountLease::try_acquire(&data_dir, "rapid disabled replay fixture")
+                .expect("seed lease");
+            let lock_bytes =
+                std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
+            drop(seed);
+
+            let mut marker = host_cursor_recovery_marker_fixture(
+                &data_dir,
+                &mount_point,
+                HostCursorRecoveryPhase::ArmedAwaitingReady,
+            );
+            marker.module = pinned.module;
+            marker.identity.provider_provenance_fingerprint =
+                cloud_files_provenance_fingerprint(&marker.module).expect("provider fingerprint");
+            marker.outer_token = host_cursor_recovery_outer_token(
+                &marker.disabled_config,
+                &marker.module,
+                &lock_bytes,
+                &marker.identity,
+                &marker.inspection,
+            )
+            .expect("outer token");
+            marker.recovery_id = deterministic_host_cursor_recovery_id(&marker.outer_token);
+            marker
+                .applied
+                .as_mut()
+                .expect("applied fixture")
+                .recovery_id = marker.recovery_id.clone();
+            let recovery = pending_cloud_unregister_record_with_policy(
+                sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                    sync_root: marker.identity.sync_root.clone(),
+                    root_path: marker.identity.root_path.clone(),
+                    data_dir_root: Some(marker.identity.data_dir_root.clone()),
+                    provider_name: marker.identity.provider_name.clone(),
+                    cursor_recovery: Some(host_cursor_recovery_context(&marker)),
+                },
+                marker.module.clone(),
+                CloudUnregisterPolicy::PreserveState,
+            )
+            .expect("stage recovery");
+            let retained = staged_cloud_registration_record(
+                &recovery,
+                StagedCloudRegistrationState::RetainedAbsent,
+            )
+            .expect("RetainedAbsent stage");
+            let may_be_registered = staged_cloud_registration_record(
+                &recovery,
+                StagedCloudRegistrationState::MayBeRegistered,
+            )
+            .expect("MayBeRegistered stage");
+            persist_or_promote_cursor_recovery_staged_record(&data_dir, &retained)
+                .expect("RetainedAbsent final");
+            if with_may_be_registered_temp {
+                std::fs::write(
+                    cursor_recovery_staged_temp_path(&data_dir),
+                    sinomo_runtime::module_api::encode_sobj(&may_be_registered)
+                        .expect("MayBeRegistered temp bytes"),
+                )
+                .expect("MayBeRegistered temp");
+            }
+            let bundle = HostCursorRecoveryProviderBundle {
+                schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+                requested: requested_host_cursor_recovery_marker(&marker),
+                provider_bytes,
+            };
+            persist_host_cursor_recovery_provider_bundle(&data_dir, &bundle)
+                .expect("provider bundle");
+            stage_host_cursor_recovery_marker(&data_dir, &marker).expect("stage Armed marker");
+            commit_staged_host_cursor_recovery_marker(&data_dir).expect("commit Armed marker");
+
+            configure_managed_sifs_mount(&data_dir, &marker.disabled_config)
+                .expect("persist exact disabled config");
+            let (owned, lease) =
+                admit_host_cursor_recovery_enable(&data_dir, &marker.disabled_config)
+                    .expect("disabled Armed admission");
+            assert!(owned);
+            let lease = lease.expect("returned existing lease");
+            assert_eq!(lease.cursor_recovery_bytes(), Some(lock_bytes.as_slice()));
+            assert_eq!(
+                load_host_cursor_recovery_marker_strict(&data_dir)
+                    .expect("load Armed marker")
+                    .expect("Armed marker")
+                    .phase,
+                HostCursorRecoveryPhase::ArmedAwaitingReady
+            );
+            let staged = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
+                .expect("stage after disabled admission");
+            assert_eq!(staged.current, Some(may_be_registered));
+            assert!(staged.temporary.is_none());
+
+            let pending = recover_pending_cloud_unregister_from_staged_with(
+                &data_dir,
+                &marker.disabled_config,
+                Some(&marker.module),
+            )
+            .expect("recover disabled Preserve intent")
+            .expect("disabled Armed requires Preserve");
+            assert_eq!(
+                pending.request.cursor_recovery,
+                Some(host_cursor_recovery_context(&marker))
+            );
+            persist_pending_cloud_unregister_record(&data_dir, &pending)
+                .expect("persist Preserve intent");
+            let runnable = PendingCloudUnregister::new(pending, Some(Arc::new(lease)));
+            assert!(SifsMountLease::try_acquire_existing_for_cursor_recovery(&data_dir).is_err());
+            assert!(
+                runnable
+                    .lease
+                    .as_ref()
+                    .and_then(|lease| lease.cursor_recovery_bytes())
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn host_cursor_recovery_preserve_successor_is_durable_before_pending_clear() {
+        let temp = TestDir::new("sifs-cursor-recovery-preserved-successor");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let mut marker = host_cursor_recovery_marker_fixture(
+            &data_dir,
+            &mount_point,
+            HostCursorRecoveryPhase::ActiveObserved,
+        );
+        let pinned = pending_record_fixture(&data_dir);
+        marker.module = pinned.module;
+        let provider_bytes = std::fs::read(
+            verify_cloud_unregister_recovery_module(&data_dir, &marker.module)
+                .expect("pinned provider path"),
+        )
+        .expect("pinned provider bytes");
+        marker.identity.provider_provenance_fingerprint =
+            cloud_files_provenance_fingerprint(&marker.module).expect("provider fingerprint");
+        let pending = pending_cloud_unregister_record_with_policy(
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesUnregisterRequest {
+                sync_root: mount_point.clone(),
+                root_path: "/root".to_string(),
+                data_dir_root: Some(data_dir.root()),
+                provider_name:
+                    sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                        .to_string(),
+                cursor_recovery: Some(
+                    sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                        recovery_id: marker.recovery_id.clone(),
+                        recovery_token: marker.inner_token.clone(),
+                        recovery_cycle: marker.recovery_cycle,
+                        native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
+                    },
+                ),
+            },
+            marker.module.clone(),
+            CloudUnregisterPolicy::PreserveState,
+        )
+        .expect("pending preserve");
+        let successor_context =
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
+                recovery_id: marker.recovery_id.clone(),
+                recovery_token: marker.inner_token.clone(),
+                recovery_cycle: marker.recovery_cycle + 1,
+                native_successor_fingerprint: Some(format!("blake3:{}", "3".repeat(64))),
+            };
+        let retained_response =
+            sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                was_registered: true,
+                outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Retained,
+                cursor_recovery: Some(successor_context.clone()),
+                detail: "retained fixture".to_string(),
+            };
+        let retained = staged_cursor_recovery_successor_record(&pending, &retained_response)
+            .expect("next-cycle retained stage");
+        persist_or_promote_cursor_recovery_staged_record(&data_dir, &retained)
+            .expect("retained ownership");
+        std::fs::create_dir_all(data_dir.dfs_dir()).expect("dfs directory");
+        std::fs::write(
+            pending_cloud_unregister_path(&data_dir),
+            sinomo_runtime::module_api::encode_sobj(&pending).expect("pending bytes"),
+        )
+        .expect("pending intent");
+        let receipt = sinomo_runtime::dfs_cloud_files_api::CloudFilesRegistrationReceipt {
+            interface_version:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+                    .to_string(),
+            registration_identity_interface_version: None,
+            sync_root: mount_point,
+            root_path: "/root".to_string(),
+            provider_name:
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                    .to_string(),
+        };
+        let receipt_path = cloud_files_registration_receipt_path(&data_dir);
+        std::fs::create_dir_all(receipt_path.parent().expect("receipt parent"))
+            .expect("module runtime");
+        std::fs::write(
+            &receipt_path,
+            sinomo_runtime::module_api::encode_sobj(&receipt).expect("receipt bytes"),
+        )
+        .expect("receipt");
+        std::fs::write(
+            cloud_files_module_runtime_path(&data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            b"exact-module-validated-state-owned-journal",
+        )
+        .expect("StateOwned journal bytes");
+        let bundle = HostCursorRecoveryProviderBundle {
+            schema_version: CLOUD_FILES_CURSOR_RECOVERY_HOST_SCHEMA_VERSION,
+            requested: requested_host_cursor_recovery_marker(&marker),
+            provider_bytes,
+        };
+        persist_host_cursor_recovery_provider_bundle(&data_dir, &bundle).expect("provider bundle");
+        stage_host_cursor_recovery_marker(&data_dir, &marker)
+            .expect("stage ActiveObserved fixture marker");
+        commit_staged_host_cursor_recovery_marker(&data_dir)
+            .expect("commit ActiveObserved fixture marker");
+
+        advance_host_cursor_recovery_preserved_successor(&data_dir, &pending, &retained)
+            .expect("durable preserved successor");
+        marker = load_host_cursor_recovery_marker_strict(&data_dir)
+            .expect("load preserved marker")
+            .expect("preserved marker");
+        assert_eq!(marker.phase, HostCursorRecoveryPhase::PreservedRetained);
+        assert_eq!(marker.recovery_cycle, successor_context.recovery_cycle);
+        assert_eq!(
+            marker.native_successor_fingerprint,
+            successor_context.native_successor_fingerprint
+        );
+        assert_eq!(marker.ready_artifacts_fingerprint, None);
+        assert_eq!(
+            marker.preserved_artifacts_fingerprint,
+            Some(
+                cloud_files_preserved_artifacts_fingerprint(&data_dir)
+                    .expect("preserved fingerprint")
+            )
+        );
+        assert!(
+            pending_cloud_unregister_path(&data_dir).is_file(),
+            "host successor must precede pending deletion"
+        );
+        std::fs::remove_file(pending_cloud_unregister_path(&data_dir)).expect("clear pending");
+
+        std::fs::write(
+            cloud_files_module_runtime_path(&data_dir, CLOUD_FILES_REGISTRATION_JOURNAL_FILE),
+            b"changed-state-owned-journal",
+        )
+        .expect("change journal");
+        let error =
+            advance_host_cursor_recovery_preserved_successor(&data_dir, &pending, &retained)
+                .expect_err("preserved artifact drift must fail closed");
+        assert!(error.contains("changed before pending cleanup"));
+    }
+
+    #[test]
     fn disabled_v3_cleanup_uses_pinned_stage_when_selected_loader_differs() {
         let temp = TestDir::new("sifs-cloud-disabled-pinned-provider");
         let data_dir = SinomoDataDir::new(temp.path().join("data"));
@@ -4776,6 +11313,190 @@ mod tests {
             load_staged_cloud_registration_record(&data_dir).expect("stage remains exact"),
             Some(staged)
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_v3_stage_settles_exact_enable_temp_before_loader_selection() {
+        for enabled in [true, false] {
+            let temp = TestDir::new(if enabled {
+                "sifs-cloud-ordinary-option-b-enabled-temp"
+            } else {
+                "sifs-cloud-ordinary-option-b-disabled-temp"
+            });
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let mount_point = temp.path().join("mount");
+            std::fs::create_dir_all(&mount_point).expect("mount point");
+            let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+            let retained = staged_cloud_registration_record(
+                &recovery,
+                StagedCloudRegistrationState::RetainedAbsent,
+            )
+            .expect("ordinary retained stage");
+            let may_be_registered = may_be_registered_stage(&recovery);
+            persist_or_promote_cursor_recovery_staged_record(&data_dir, &retained)
+                .expect("ordinary retained final");
+            std::fs::write(
+                cursor_recovery_staged_temp_path(&data_dir),
+                sinomo_runtime::module_api::encode_sobj(&may_be_registered)
+                    .expect("ordinary MayBeRegistered temp bytes"),
+            )
+            .expect("ordinary MayBeRegistered temp");
+            let mut config = windows_mount_config(&mount_point, "/root");
+            config.enabled = enabled;
+            let pending = recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+                .expect("settle exact ordinary stage successor");
+            assert_eq!(
+                load_staged_cloud_registration_record(&data_dir).expect("ordinary settled stage"),
+                Some(may_be_registered)
+            );
+            assert!(!cursor_recovery_staged_temp_path(&data_dir).exists());
+            if enabled {
+                assert!(pending.is_none());
+            } else {
+                let pending = pending.expect("disabled ordinary stage requires Preserve(None)");
+                assert!(pending.request.cursor_recovery.is_none());
+                assert_eq!(pending.module, recovery.module);
+                assert_eq!(
+                    pending.operation,
+                    sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_v3_stage_rejects_pin_tamper_changed_temp_and_config_without_fallback() {
+        for cut in ["pin", "missing-pin", "temp", "config"] {
+            let temp = TestDir::new(&format!("sifs-cloud-ordinary-option-b-reject-{cut}"));
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let mount_point = temp.path().join("mount");
+            std::fs::create_dir_all(&mount_point).expect("mount point");
+            let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+            let staged = may_be_registered_stage(&recovery);
+            persist_or_promote_cursor_recovery_staged_record(&data_dir, &staged)
+                .expect("ordinary authoritative stage");
+            let mut config = windows_mount_config(&mount_point, "/root");
+            match cut {
+                "pin" => {
+                    let pin = verify_cloud_unregister_recovery_module(&data_dir, &recovery.module)
+                        .expect("ordinary pin before tamper");
+                    std::fs::write(pin, b"tampered provider bytes")
+                        .expect("tamper ordinary provider pin");
+                }
+                "missing-pin" => {
+                    let pin = verify_cloud_unregister_recovery_module(&data_dir, &recovery.module)
+                        .expect("ordinary pin before removal");
+                    std::fs::remove_file(pin).expect("remove ordinary provider pin");
+                }
+                "temp" => {
+                    let mut changed = staged.clone();
+                    changed.recovery.request.root_path = "/changed".to_string();
+                    std::fs::write(
+                        cursor_recovery_staged_temp_path(&data_dir),
+                        sinomo_runtime::module_api::encode_sobj(&changed)
+                            .expect("changed ordinary stage temp bytes"),
+                    )
+                    .expect("changed ordinary stage temp");
+                }
+                "config" => config.root_path = "/changed".to_string(),
+                _ => unreachable!(),
+            }
+            let before = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
+                .expect("ordinary stage before rejection");
+            recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+                .expect_err("ordinary authoritative stage must fail closed");
+            let after = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
+                .expect("ordinary stage after rejection");
+            assert_eq!(after.current, before.current);
+            assert_eq!(after.temporary, before.temporary);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_v3_stage_is_public_restart_and_mount_provider_authority_despite_loader_drift() {
+        use sinomo_runtime::module::{
+            NativeDylibModuleLoaderState, native_module_cache_path,
+            write_native_dylib_module_loader_state,
+        };
+
+        let temp = TestDir::new("sifs-cloud-ordinary-option-b-loader-drift");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let mount_point = temp.path().join("mount");
+        std::fs::create_dir_all(&mount_point).expect("mount point");
+        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+        let stage = may_be_registered_stage(&recovery);
+        persist_or_promote_cursor_recovery_staged_record(&data_dir, &stage)
+            .expect("ordinary stage authority");
+
+        let loader_bytes = b"different active loader provider";
+        let loader_hash = sinomo_runtime::module::native_module_content_hash(loader_bytes);
+        let loader = NativeDylibModuleLoaderState {
+            module_id: recovery.module.module_id.clone(),
+            artifact_id: None,
+            content_hash: loader_hash.clone(),
+            cache_key: "drifted/cloud-files".to_string(),
+            library_name: "drifted-cloud-files.dll".to_string(),
+            platform_triple: recovery.module.platform_triple.clone(),
+            native_abi_version: recovery.module.native_abi_version,
+            interface_version: recovery.module.interface_version.clone(),
+            activated_at: "2026-08-12T00:00:00Z".to_string(),
+            source: "test loader drift".to_string(),
+        };
+        write_native_dylib_module_loader_state(&data_dir.root(), &loader)
+            .expect("persist drifted loader state");
+        let loader_path = native_module_cache_path(
+            &data_dir.root(),
+            &loader.cache_key,
+            &loader.content_hash,
+            &loader.library_name,
+        );
+        std::fs::create_dir_all(loader_path.parent().expect("loader cache parent"))
+            .expect("loader cache directory");
+        std::fs::write(&loader_path, loader_bytes).expect("drifted loader bytes");
+
+        let config = windows_mount_config(&mount_point, "/root");
+        assert!(
+            recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+                .expect("ordinary enabled restart bypasses loader drift")
+                .is_none()
+        );
+        let pin = verify_cloud_unregister_recovery_module(&data_dir, &recovery.module)
+            .expect("ordinary staged provider pin");
+        let lease = SifsMountLease::try_acquire(&data_dir, "option B mount selector")
+            .expect("option B mount lease");
+        let error = match start_platform_mount(
+            &data_dir,
+            &config,
+            &mount_point,
+            Arc::new(AtomicBool::new(false)),
+            &Mutex::new(None),
+            lease,
+        ) {
+            Ok(mut mount) => {
+                let _ = mount.stop();
+                panic!("fake staged dylib unexpectedly mounted")
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(&pin.display().to_string()),
+            "mount must try the authoritative staged pin: {error}"
+        );
+        assert!(
+            !error.contains(&loader_path.display().to_string()),
+            "mount must not fall back to the drifted loader: {error}"
+        );
+
+        let mut disabled = config;
+        disabled.enabled = false;
+        let pending = recover_pending_cloud_unregister_from_staged(&data_dir, &disabled)
+            .expect("ordinary disabled restart bypasses loader drift")
+            .expect("disabled ordinary authority produces Preserve(None)");
+        assert_eq!(pending.module, recovery.module);
+        assert!(pending.request.cursor_recovery.is_none());
     }
 
     #[test]
@@ -4838,6 +11559,7 @@ mod tests {
                 was_registered: true,
                 outcome: CloudFilesPreserveStateUnregisterOutcome::Retained,
                 detail: "retained".to_string(),
+                cursor_recovery: None,
             });
         let release_stage = may_be_registered_stage(&release);
         let preserve_stage = may_be_registered_stage(&preserve);
@@ -5173,6 +11895,7 @@ mod tests {
                 was_registered: false,
                 outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Released,
                 detail: "journal, receipt, and CFAPI registration were absent".to_string(),
+                cursor_recovery: None,
             },
         );
         let error = finalize_cloud_unregister_completion_with(
@@ -5258,6 +11981,7 @@ mod tests {
                 was_registered: false,
                 outcome: sinomo_runtime::dfs_cloud_files_api::CloudFilesPreserveStateUnregisterOutcome::Retained,
                 detail: "journal normalized to StateOwned".to_string(),
+                cursor_recovery: None,
             },
         );
 
@@ -5350,6 +12074,7 @@ mod tests {
                 root_path: "/new-root".to_string(),
                 data_dir_root: Some(data_dir.root()),
                 provider_name: old_record.request.provider_name.clone(),
+                cursor_recovery: None,
             },
             old_record.module.clone(),
         )

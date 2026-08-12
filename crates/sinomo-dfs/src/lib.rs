@@ -421,10 +421,11 @@ pub use module_surface::{
     dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
 };
 pub use mount_config::{
-    SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_STATUS_CONFIG_KEY, SIFS_MOUNT_STATUS_ROUTE,
-    SifsMountAttentionKind, SifsMountAttentionNextAction, SifsMountAttentionSummary,
-    SifsMountConfig, SifsMountPlatform, SifsMountRetainedLocalEvidence, SifsMountRuntimePhase,
-    SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
+    SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE, SIFS_MOUNT_STATUS_CONFIG_KEY,
+    SIFS_MOUNT_STATUS_ROUTE, SifsMountAttentionKind, SifsMountAttentionNextAction,
+    SifsMountAttentionSummary, SifsMountConfig, SifsMountCursorOnlyRecoveryRequest,
+    SifsMountCursorOnlyRecoveryResponse, SifsMountPlatform, SifsMountRetainedLocalEvidence,
+    SifsMountRuntimePhase, SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
     SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_status_config_definition,
 };
 pub use mounted_mutation_outbox::{
@@ -436,10 +437,13 @@ pub use mounted_mutation_outbox::{
     MountedSifsMutationCapturedWork, MountedSifsMutationCommittedWorkLatch,
     MountedSifsMutationCorruptRecoveryClaim, MountedSifsMutationCorruptRecoveryReceipt,
     MountedSifsMutationErrorObservation, MountedSifsMutationLease, MountedSifsMutationMarkerId,
-    MountedSifsMutationNonce, MountedSifsMutationOrigin, MountedSifsMutationOutboxMarker,
+    MountedSifsMutationNonce, MountedSifsMutationOrigin,
+    MountedSifsMutationOutboxCursorRecoveryGuard,
+    MountedSifsMutationOutboxCursorRecoveryInspection, MountedSifsMutationOutboxMarker,
     MountedSifsMutationOutboxPhase, MountedSifsMutationOutboxStatus,
     MountedSifsMutationOutboxStore, MountedSifsMutationRecoveryClaim,
     MountedSifsMutationRecoveryKind, MountedSifsMutationRecoveryReceipt,
+    inspect_mounted_sifs_mutation_outbox_for_cursor_recovery,
 };
 pub use mounted_sifs::{
     MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsMutationReport,

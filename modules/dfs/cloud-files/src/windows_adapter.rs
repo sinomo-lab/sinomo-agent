@@ -4,10 +4,11 @@
 //! provider share the exact same routed DFS service and placeholder encoder.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs;
 use std::io::Read;
 use std::mem::{offset_of, size_of};
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::fs::MetadataExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -23,7 +24,8 @@ use sinomo_dfs_cloud_files_api::{
 };
 use sinomo_runtime::dfs::{self, DfsMessageTransport, DfsObjectKind, NetworkedDfsService};
 use windows::Win32::Foundation::{
-    ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION, GENERIC_READ, HANDLE,
+    ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
+    GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_IN_SYNC_STATE_IN_SYNC,
@@ -32,15 +34,24 @@ use windows::Win32::Storage::CloudFilters::{
     CfUpdatePlaceholder,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
-    FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME, FILE_ACTION_RENAMED_OLD_NAME,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY,
-    FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
-    FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA,
-    GetFileInformationByHandle, OPEN_EXISTING, ReadDirectoryChangesW,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE, FILE_ACTION_ADDED,
+    FILE_ACTION_MODIFIED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+    FILE_ACTION_RENAMED_OLD_NAME, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_DELETE_ON_CLOSE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED,
+    FILE_FLAG_WRITE_THROUGH, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_CREATION,
+    FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE,
+    FILE_NOTIFY_CHANGE_SIZE, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY,
+    FileDispositionInfo, FindClose, FindExInfoStandard, FindExSearchNameMatch, FindFirstFileExW,
+    FindNextFileW, FlushFileBuffers, GetFileInformationByHandle, OPEN_EXISTING,
+    ReadDirectoryChangesW, ReadFile, SetFileInformationByHandle, SetFilePointerEx,
+    WIN32_FIND_DATAW, WriteFile,
 };
-use windows::Win32::System::IO::{CancelIoEx, CancelSynchronousIo};
+use windows::Win32::System::IO::{
+    CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED,
+};
+use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 use windows::core::{HRESULT, PCWSTR};
 
 use super::{
@@ -66,7 +77,7 @@ use crate::sync_executor::{
 };
 use crate::windows_sync::{
     CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesCapturedChangeBatch, CloudFilesCapturedContent,
-    CloudFilesCapturedLocalChange, CloudFilesConcreteDfsAdapter,
+    CloudFilesCapturedLocalChange, CloudFilesConcreteDfsAdapter, CloudFilesCursorRecoveryControl,
     CloudFilesDfsServiceMutationBackend, CloudFilesDirectoryChange,
     CloudFilesDirectoryChangeAction, CloudFilesDirectoryChangePlan, CloudFilesFullScanSnapshot,
     CloudFilesLocalCaptureRetries, CloudFilesLocalChangeAccelerator,
@@ -91,6 +102,9 @@ const LOCAL_STARTUP_SCAN_WORK_PER_PASS: usize = 32;
 const WORKER_HEARTBEAT_MILLIS: u64 = 1_000;
 const SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
+const CURSOR_RECOVERY_SENTINEL_TIMEOUT: Duration = Duration::from_secs(5);
+const CURSOR_RECOVERY_SENTINEL_PAYLOAD_DOMAIN: &[u8] =
+    b"sinomo.cloud-files.cursor-recovery.sentinel.v1";
 
 fn adapter_error(code: &str, detail: impl Into<String>) -> CloudFilesModuleError {
     CloudFilesModuleError {
@@ -544,10 +558,251 @@ struct RawDirectoryChangeBatch {
     overflowed: bool,
 }
 
+#[derive(Debug)]
+struct CursorRecoverySentinelCommand {
+    name: String,
+    payload: Vec<u8>,
+    stale_specs: Vec<CursorRecoverySentinelSpec>,
+    reply: mpsc::SyncSender<Result<CursorRecoverySentinelAck, String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CursorRecoverySentinelSpec {
+    name: String,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CursorRecoverySentinelAck {
+    non_sentinel_epoch: u64,
+    sync_root_file_id: u64,
+}
+
+struct CursorRecoveryAuditGuard {
+    children: Vec<CursorRecoveryHeldChild>,
+    sync_root_file_id: u64,
+    post_audit_fence_epoch: Option<u64>,
+}
+
+struct CursorRecoveryHeldChild {
+    handle: OwnedWin32Handle,
+    sifs_path: String,
+    is_directory: bool,
+    file_id: u64,
+}
+
+// Win32 kernel handles are process-wide values. The guard is created and
+// destroyed by the writable worker, but that worker itself is moved into its
+// dedicated thread before recovery begins.
+unsafe impl Send for CursorRecoveryAuditGuard {}
+
+struct ActiveCursorRecoverySentinel {
+    command: CursorRecoverySentinelCommand,
+    state: CursorRecoverySentinelState,
+    handle: Option<OwnedWin32Handle>,
+    stale_removal: Option<PathBuf>,
+    needs_create: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PhysicalDirectoryEntryName {
+    name: OsString,
+    alternate_name: Option<OsString>,
+}
+
+struct OwnedFindHandle(HANDLE);
+
+impl Drop for OwnedFindHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = FindClose(self.0);
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PlaceholderStandardState {
+    in_sync: bool,
+    modified_data_size: i64,
+    file_id: u64,
+    sync_root_file_id: u64,
+    identity: Option<CloudFilesPlaceholderIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoverySentinelPhase {
+    AwaitAdded,
+    AwaitRemoved,
+    Complete,
+}
+
+#[derive(Debug)]
+struct CursorRecoverySentinelState {
+    name: PathBuf,
+    phase: CursorRecoverySentinelPhase,
+}
+
+impl CursorRecoverySentinelState {
+    fn new(name: &str) -> Self {
+        Self {
+            name: PathBuf::from(name),
+            phase: CursorRecoverySentinelPhase::AwaitAdded,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        change: &CloudFilesDirectoryChange,
+    ) -> Result<SentinelObservation, String> {
+        let (action, path) = match change {
+            CloudFilesDirectoryChange::Added(path) => ("added", path),
+            CloudFilesDirectoryChange::Removed(path) => ("removed", path),
+            CloudFilesDirectoryChange::Modified(path) => ("modified", path),
+            CloudFilesDirectoryChange::Renamed { from, to } => {
+                if from == &self.name || to == &self.name {
+                    return Err("cursor recovery sentinel was renamed".to_string());
+                }
+                return Ok(SentinelObservation::NonSentinel);
+            }
+        };
+        if path != &self.name {
+            return Ok(SentinelObservation::NonSentinel);
+        }
+        match (self.phase, action) {
+            (CursorRecoverySentinelPhase::AwaitAdded, "added") => {
+                self.phase = CursorRecoverySentinelPhase::AwaitRemoved;
+                Ok(SentinelObservation::Added)
+            }
+            (CursorRecoverySentinelPhase::AwaitRemoved, "removed") => {
+                self.phase = CursorRecoverySentinelPhase::Complete;
+                Ok(SentinelObservation::Removed)
+            }
+            (CursorRecoverySentinelPhase::AwaitRemoved, "modified") => {
+                Ok(SentinelObservation::SentinelModified)
+            }
+            _ => Err(format!(
+                "cursor recovery sentinel received out-of-order `{action}` notification"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SentinelObservation {
+    Added,
+    Removed,
+    SentinelModified,
+    NonSentinel,
+}
+
+fn hash_cursor_recovery_sentinel_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn cursor_recovery_sentinel_digest(
+    recovery_id: &str,
+    recovery_token: &str,
+    nonce: &str,
+    sync_root_file_id: u64,
+    round: u8,
+) -> blake3::Hash {
+    let mut hasher = blake3::Hasher::new();
+    hash_cursor_recovery_sentinel_field(&mut hasher, CURSOR_RECOVERY_SENTINEL_PAYLOAD_DOMAIN);
+    hash_cursor_recovery_sentinel_field(&mut hasher, recovery_id.as_bytes());
+    hash_cursor_recovery_sentinel_field(&mut hasher, recovery_token.as_bytes());
+    hash_cursor_recovery_sentinel_field(&mut hasher, nonce.as_bytes());
+    hash_cursor_recovery_sentinel_field(&mut hasher, &sync_root_file_id.to_le_bytes());
+    hash_cursor_recovery_sentinel_field(&mut hasher, &[round]);
+    hasher.finalize()
+}
+
+fn cursor_recovery_sentinel_name(
+    recovery_id: &str,
+    recovery_token: &str,
+    nonce: &str,
+    sync_root_file_id: u64,
+    round: u8,
+) -> String {
+    let hex = cursor_recovery_sentinel_digest(
+        recovery_id,
+        recovery_token,
+        nonce,
+        sync_root_file_id,
+        round,
+    )
+    .to_hex()
+    .to_string()
+    .to_ascii_uppercase();
+    format!("{}.{}", &hex[..8], &hex[8..11])
+}
+
+fn cursor_recovery_sentinel_payload(
+    recovery_id: &str,
+    recovery_token: &str,
+    nonce: &str,
+    sync_root_file_id: u64,
+    round: u8,
+) -> Vec<u8> {
+    cursor_recovery_sentinel_digest(recovery_id, recovery_token, nonce, sync_root_file_id, round)
+        .as_bytes()
+        .to_vec()
+}
+
+fn cursor_recovery_sentinel_spec(
+    recovery_id: &str,
+    recovery_token: &str,
+    nonce: &str,
+    sync_root_file_id: u64,
+    round: u8,
+) -> CursorRecoverySentinelSpec {
+    CursorRecoverySentinelSpec {
+        name: cursor_recovery_sentinel_name(
+            recovery_id,
+            recovery_token,
+            nonce,
+            sync_root_file_id,
+            round,
+        ),
+        payload: cursor_recovery_sentinel_payload(
+            recovery_id,
+            recovery_token,
+            nonce,
+            sync_root_file_id,
+            round,
+        ),
+    }
+}
+
+fn validate_cursor_recovery_final_snapshot(
+    post_audit_fence_epoch: Option<u64>,
+    current_non_sentinel_epoch: u64,
+    guard_root_file_id: u64,
+    expected_root_file_id: u64,
+    watcher_root_file_id: u64,
+) -> Result<(), String> {
+    let _linearization_epoch = post_audit_fence_epoch.ok_or_else(|| {
+        "cursor recovery root audit has no completed post-audit fence".to_string()
+    })?;
+    // The sentinel Removed record is the proof cut. Later non-sentinel changes
+    // are valid buffered work, so continuity deliberately does not require
+    // the live epoch to equal the cut epoch.
+    let _post_cut_epoch = current_non_sentinel_epoch;
+    if guard_root_file_id != expected_root_file_id {
+        return Err("cursor recovery root audit guard identity changed".to_string());
+    }
+    if watcher_root_file_id != guard_root_file_id {
+        return Err("cursor recovery watcher root identity changed".to_string());
+    }
+    Ok(())
+}
+
 struct DirectoryWatcherThread {
     stop: Arc<AtomicBool>,
     raw_handle: Arc<AtomicIsize>,
+    sync_root_file_id: u64,
     join: Option<JoinHandle<()>>,
+    sentinel: mpsc::SyncSender<CursorRecoverySentinelCommand>,
 }
 
 impl DirectoryWatcherThread {
@@ -575,13 +830,17 @@ impl Drop for DirectoryWatcherThread {
 pub(super) struct WindowsDirectoryChangeAccelerator {
     sync_root: PathBuf,
     root_path: String,
+    expected_cursor_recovery_sync_root_file_id: Option<u64>,
     startup_scan_plan: Option<WindowsLocalStartupScanPlan>,
     startup_conflicts: Vec<CloudFilesStartupConflictEvidence>,
     suppressed_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
     receiver: Option<mpsc::Receiver<RawDirectoryChangeBatch>>,
     notification_overflow: Arc<AtomicBool>,
+    notification_epoch: Arc<AtomicU64>,
     watcher_failure: Arc<Mutex<Option<String>>>,
     watcher: Option<DirectoryWatcherThread>,
+    cursor_recovery_fence_round: u8,
+    cursor_recovery_audit_guard: Option<CursorRecoveryAuditGuard>,
     capture_retry_epoch: Instant,
     capture_retries: CloudFilesLocalCaptureRetries,
     content_stager: CloudFilesContentStager,
@@ -592,19 +851,24 @@ impl WindowsDirectoryChangeAccelerator {
         sync_root: PathBuf,
         root_path: String,
         _existing_owned_root: bool,
+        expected_cursor_recovery_sync_root_file_id: Option<u64>,
         suppressed_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
         content_stager: CloudFilesContentStager,
     ) -> Self {
         Self {
             sync_root,
             root_path,
+            expected_cursor_recovery_sync_root_file_id,
             startup_scan_plan: None,
             startup_conflicts: Vec::new(),
             suppressed_paths,
             receiver: None,
             notification_overflow: Arc::new(AtomicBool::new(false)),
+            notification_epoch: Arc::new(AtomicU64::new(0)),
             watcher_failure: Arc::new(Mutex::new(None)),
             watcher: None,
+            cursor_recovery_fence_round: 0,
+            cursor_recovery_audit_guard: None,
             capture_retry_epoch: Instant::now(),
             capture_retries: CloudFilesLocalCaptureRetries::default(),
             content_stager,
@@ -613,6 +877,180 @@ impl WindowsDirectoryChangeAccelerator {
 }
 
 impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
+    fn arm_cursor_recovery_observer(&mut self) -> Result<u64, String> {
+        let epoch = self.notification_epoch.load(Ordering::SeqCst);
+        self.activate()?;
+        Ok(epoch)
+    }
+
+    fn cursor_recovery_observation_epoch(&self) -> Result<u64, String> {
+        if self.watcher.is_none() || self.receiver.is_none() {
+            return Err("ReadDirectoryChangesW recovery observer is not active".to_string());
+        }
+        if let Some(error) = self
+            .watcher_failure
+            .lock()
+            .map_err(|_| "ReadDirectoryChangesW failure state is poisoned".to_string())?
+            .as_ref()
+        {
+            return Err(error.clone());
+        }
+        if self.notification_overflow.load(Ordering::SeqCst) {
+            return Err("ReadDirectoryChangesW recovery observer overflowed".to_string());
+        }
+        if self
+            .watcher
+            .as_ref()
+            .is_none_or(|watcher| watcher.raw_handle.load(Ordering::SeqCst) == 0)
+        {
+            return Err("ReadDirectoryChangesW recovery observer stopped".to_string());
+        }
+        Ok(self.notification_epoch.load(Ordering::SeqCst))
+    }
+
+    fn cursor_recovery_namespace_fence(
+        &mut self,
+        recovery_id: &str,
+        recovery_token: &str,
+        nonce: &str,
+    ) -> Result<u64, String> {
+        let expected_sync_root_file_id = self
+            .expected_cursor_recovery_sync_root_file_id
+            .ok_or_else(|| {
+                "cursor recovery namespace fence has no pinned sync-root file ID".to_string()
+            })?;
+        let round = self
+            .cursor_recovery_fence_round
+            .checked_add(1)
+            .ok_or_else(|| "cursor recovery namespace fence round overflowed".to_string())?;
+        if round > 2 {
+            return Err("cursor recovery namespace fence ran more than twice".to_string());
+        }
+        let spec = cursor_recovery_sentinel_spec(
+            recovery_id,
+            recovery_token,
+            nonce,
+            expected_sync_root_file_id,
+            round,
+        );
+        let stale_specs = if round == 1 {
+            vec![
+                cursor_recovery_sentinel_spec(
+                    recovery_id,
+                    recovery_token,
+                    nonce,
+                    expected_sync_root_file_id,
+                    1,
+                ),
+                cursor_recovery_sentinel_spec(
+                    recovery_id,
+                    recovery_token,
+                    nonce,
+                    expected_sync_root_file_id,
+                    2,
+                ),
+            ]
+        } else {
+            Vec::new()
+        };
+        let watcher = self
+            .watcher
+            .as_ref()
+            .ok_or_else(|| "ReadDirectoryChangesW recovery observer is not active".to_string())?;
+        let (reply, response) = mpsc::sync_channel(1);
+        watcher
+            .sentinel
+            .send(CursorRecoverySentinelCommand {
+                name: spec.name,
+                payload: spec.payload,
+                stale_specs,
+                reply,
+            })
+            .map_err(|_| "ReadDirectoryChangesW recovery observer stopped".to_string())?;
+        let ack = response
+            .recv_timeout(CURSOR_RECOVERY_SENTINEL_TIMEOUT)
+            .map_err(|error| format!("cursor recovery namespace fence timed out: {error}"))??;
+        if ack.sync_root_file_id != expected_sync_root_file_id {
+            return Err(format!(
+                "cursor recovery watcher root file ID {} does not match pinned root file ID {}",
+                ack.sync_root_file_id, expected_sync_root_file_id
+            ));
+        }
+        self.cursor_recovery_observation_epoch()?;
+        if round == 2 {
+            let guard = self.cursor_recovery_audit_guard.as_mut().ok_or_else(|| {
+                "cursor recovery post-audit fence has no retained root-audit handles".to_string()
+            })?;
+            guard.post_audit_fence_epoch = Some(ack.non_sentinel_epoch);
+        }
+        self.cursor_recovery_fence_round = round;
+        Ok(ack.non_sentinel_epoch)
+    }
+
+    fn audit_cursor_recovery_root(
+        &mut self,
+        mount: &str,
+        root: &str,
+        remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        cancelled: &AtomicBool,
+    ) -> Result<(), String> {
+        if self.cursor_recovery_audit_guard.is_some() {
+            return Err("cursor recovery root audit already retains child handles".to_string());
+        }
+        let expected_sync_root_file_id = self
+            .expected_cursor_recovery_sync_root_file_id
+            .ok_or_else(|| "cursor recovery root audit has no pinned root file ID".to_string())?;
+        let children = audit_cursor_recovery_root(
+            &self.sync_root,
+            mount,
+            root,
+            expected_sync_root_file_id,
+            remote_manifest,
+            cancelled,
+        )?;
+        self.cursor_recovery_audit_guard = Some(CursorRecoveryAuditGuard {
+            children,
+            sync_root_file_id: expected_sync_root_file_id,
+            post_audit_fence_epoch: None,
+        });
+        Ok(())
+    }
+
+    fn verify_cursor_recovery_root_audit(&self) -> Result<(), String> {
+        let guard = self.cursor_recovery_audit_guard.as_ref().ok_or_else(|| {
+            "cursor recovery root audit has no retained child handles".to_string()
+        })?;
+        let current_epoch = self.cursor_recovery_observation_epoch()?;
+        let expected_root_file_id = self
+            .expected_cursor_recovery_sync_root_file_id
+            .ok_or_else(|| "cursor recovery root file ID pin disappeared".to_string())?;
+        let watcher_root_file_id = self
+            .watcher
+            .as_ref()
+            .ok_or_else(|| "cursor recovery watcher disappeared".to_string())?
+            .sync_root_file_id;
+        validate_cursor_recovery_final_snapshot(
+            guard.post_audit_fence_epoch,
+            current_epoch,
+            guard.sync_root_file_id,
+            expected_root_file_id,
+            watcher_root_file_id,
+        )?;
+        for child in &guard.children {
+            verify_held_cursor_recovery_child(child)?;
+        }
+        Ok(())
+    }
+
+    fn release_cursor_recovery_root_audit(&mut self) {
+        if let Some(mut watcher) = self.watcher.take() {
+            watcher.stop_and_join();
+        }
+        self.receiver = None;
+        self.cursor_recovery_audit_guard = None;
+        self.expected_cursor_recovery_sync_root_file_id = None;
+    }
+
     fn startup_scan(
         &mut self,
         previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
@@ -670,17 +1108,23 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
 
     fn activate(&mut self) -> Result<(), String> {
         if self.watcher.is_some() {
+            if self.expected_cursor_recovery_sync_root_file_id.is_some() {
+                self.cursor_recovery_observation_epoch()?;
+            }
             return Ok(());
         }
         let (sender, receiver) = mpsc::sync_channel(DIRECTORY_CHANGE_CHANNEL_CAPACITY);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (sentinel_sender, sentinel_receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
         let raw_handle = Arc::new(AtomicIsize::new(0));
         let sync_root = self.sync_root.clone();
         let thread_stop = Arc::clone(&stop);
         let thread_handle = Arc::clone(&raw_handle);
         let notification_overflow = Arc::clone(&self.notification_overflow);
+        let notification_epoch = Arc::clone(&self.notification_epoch);
         let watcher_failure = Arc::clone(&self.watcher_failure);
+        let cursor_recovery = self.expected_cursor_recovery_sync_root_file_id.is_some();
         let join = thread::Builder::new()
             .name("sinomo-cloud-files-directory-changes".to_string())
             .spawn(move || {
@@ -691,17 +1135,22 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
                     sender,
                     ready_sender,
                     notification_overflow,
+                    notification_epoch,
                     watcher_failure,
+                    sentinel_receiver,
+                    cursor_recovery,
                 )
             })
             .map_err(|error| format!("spawn ReadDirectoryChangesW worker: {error}"))?;
-        match ready_receiver.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
+        let observed_sync_root_file_id = match ready_receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(file_id)) => file_id,
             Ok(Err(error)) => {
                 let mut watcher = DirectoryWatcherThread {
                     stop,
                     raw_handle,
+                    sync_root_file_id: 0,
                     join: Some(join),
+                    sentinel: sentinel_sender.clone(),
                 };
                 watcher.stop_and_join();
                 return Err(error);
@@ -710,19 +1159,38 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
                 let mut watcher = DirectoryWatcherThread {
                     stop,
                     raw_handle,
+                    sync_root_file_id: 0,
                     join: Some(join),
+                    sentinel: sentinel_sender.clone(),
                 };
                 watcher.stop_and_join();
                 return Err(format!(
                     "ReadDirectoryChangesW worker did not become ready: {error}"
                 ));
             }
+        };
+        if let Some(expected) = self.expected_cursor_recovery_sync_root_file_id
+            && observed_sync_root_file_id != expected
+        {
+            let mut watcher = DirectoryWatcherThread {
+                stop,
+                raw_handle,
+                sync_root_file_id: observed_sync_root_file_id,
+                join: Some(join),
+                sentinel: sentinel_sender,
+            };
+            watcher.stop_and_join();
+            return Err(format!(
+                "ReadDirectoryChangesW root file ID {observed_sync_root_file_id} does not match pinned cursor recovery root file ID {expected}"
+            ));
         }
         self.receiver = Some(receiver);
         self.watcher = Some(DirectoryWatcherThread {
             stop,
             raw_handle,
+            sync_root_file_id: observed_sync_root_file_id,
             join: Some(join),
+            sentinel: sentinel_sender,
         });
         Ok(())
     }
@@ -880,9 +1348,12 @@ fn watch_directory_changes(
     stop: Arc<AtomicBool>,
     raw_handle: Arc<AtomicIsize>,
     sender: mpsc::SyncSender<RawDirectoryChangeBatch>,
-    ready: mpsc::SyncSender<Result<(), String>>,
+    ready: mpsc::SyncSender<Result<u64, String>>,
     notification_overflow: Arc<AtomicBool>,
+    notification_epoch: Arc<AtomicU64>,
     watcher_failure: Arc<Mutex<Option<String>>>,
+    sentinel: mpsc::Receiver<CursorRecoverySentinelCommand>,
+    cursor_recovery: bool,
 ) {
     let root_wide = wide_path(&sync_root);
     let handle = match unsafe {
@@ -892,7 +1363,7 @@ fn watch_directory_changes(
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
             OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
             None,
         )
     } {
@@ -910,52 +1381,244 @@ fn watch_directory_changes(
         }
     };
     raw_handle.store(handle.0 as isize, Ordering::SeqCst);
-    let _ = ready.send(Ok(()));
     let owned = OwnedWin32Handle(handle);
+    let sync_root_file_id = match file_id_for_handle(owned.0, &sync_root) {
+        Ok(file_id) => file_id,
+        Err(detail) => {
+            let _ = ready.send(Err(detail.clone()));
+            if let Ok(mut failure) = watcher_failure.lock() {
+                *failure = Some(detail);
+            }
+            raw_handle.store(0, Ordering::SeqCst);
+            return;
+        }
+    };
+    let event = match unsafe { CreateEventW(None, false, false, None) } {
+        Ok(event) => OwnedWin32Handle(event),
+        Err(error) => {
+            let detail = format!(
+                "create overlapped ReadDirectoryChangesW event for {}: {error}",
+                sync_root.display()
+            );
+            let _ = ready.send(Err(detail.clone()));
+            if let Ok(mut failure) = watcher_failure.lock() {
+                *failure = Some(detail);
+            }
+            raw_handle.store(0, Ordering::SeqCst);
+            return;
+        }
+    };
     let mut buffer = vec![0u8; DIRECTORY_CHANGE_BUFFER_BYTES];
     let mut rename_pairing = CloudFilesRenamePairingState::default();
+    let mut active_sentinel: Option<ActiveCursorRecoverySentinel> = None;
+    let mut first_request = true;
     while !stop.load(Ordering::SeqCst) {
-        let mut bytes_returned = 0u32;
-        let result = unsafe {
+        let mut overlapped = OVERLAPPED {
+            hEvent: event.0,
+            ..OVERLAPPED::default()
+        };
+        let issued = unsafe {
             ReadDirectoryChangesW(
                 owned.0,
                 buffer.as_mut_ptr().cast::<c_void>(),
                 buffer.len() as u32,
                 true,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_DIR_NAME
-                    | FILE_NOTIFY_CHANGE_SIZE
-                    | FILE_NOTIFY_CHANGE_LAST_WRITE
-                    | FILE_NOTIFY_CHANGE_CREATION,
-                Some(&mut bytes_returned),
+                if cursor_recovery {
+                    FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME
+                } else {
+                    FILE_NOTIFY_CHANGE_FILE_NAME
+                        | FILE_NOTIFY_CHANGE_DIR_NAME
+                        | FILE_NOTIFY_CHANGE_SIZE
+                        | FILE_NOTIFY_CHANGE_LAST_WRITE
+                        | FILE_NOTIFY_CHANGE_CREATION
+                },
                 None,
+                Some(&mut overlapped),
                 None,
             )
         };
-        if let Err(error) = result {
+        if let Err(error) = issued {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
+            notification_epoch.fetch_add(1, Ordering::SeqCst);
+            let detail = format!("start overlapped ReadDirectoryChangesW: {error}");
+            if first_request {
+                let _ = ready.send(Err(detail.clone()));
+            }
             if let Ok(mut failure) = watcher_failure.lock() {
-                *failure = Some(format!("ReadDirectoryChangesW failed: {error}"));
+                *failure = Some(detail);
+            }
+            break;
+        }
+        if first_request {
+            // The first request is now owned by the kernel. A successful arm
+            // acknowledgement therefore has no open-to-observe gap.
+            let _ = ready.send(Ok(sync_root_file_id));
+            first_request = false;
+        }
+        let mut bytes_returned = 0u32;
+        loop {
+            if active_sentinel.is_none() {
+                match sentinel.try_recv() {
+                    Ok(command) if !cursor_recovery => {
+                        let _ = command.reply.send(Err(
+                            "cursor recovery sentinel requested on an ordinary watcher".to_string(),
+                        ));
+                    }
+                    Ok(command) => match start_cursor_recovery_sentinel_command(
+                        &sync_root,
+                        sync_root_file_id,
+                        command,
+                    ) {
+                        Ok(active) => active_sentinel = Some(active),
+                        Err(error) => {
+                            let _ = error.0.reply.send(Err(error.1));
+                        }
+                    },
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {}
+                }
+            } else if let Ok(command) = sentinel.try_recv() {
+                let _ = command.reply.send(Err(
+                    "cursor recovery sentinel fence is already in progress".to_string(),
+                ));
+            }
+            if active_sentinel
+                .as_ref()
+                .is_some_and(|active| active.needs_create)
+            {
+                let create = {
+                    let active = active_sentinel
+                        .as_ref()
+                        .expect("active cursor recovery sentinel checked above");
+                    create_cursor_recovery_sentinel(
+                        &sync_root,
+                        &active.command.name,
+                        &active.command.payload,
+                    )
+                };
+                match create {
+                    Ok(handle) => {
+                        let active = active_sentinel
+                            .as_mut()
+                            .expect("active cursor recovery sentinel checked above");
+                        active.handle = Some(handle);
+                        active.needs_create = false;
+                    }
+                    Err(detail) => {
+                        fail_active_cursor_recovery_sentinel(&mut active_sentinel, detail);
+                    }
+                }
+            }
+            let completion = unsafe { WaitForMultipleObjects(&[event.0], false, 50) };
+            if completion == WAIT_OBJECT_0 {
+                break;
+            }
+            if completion == WAIT_FAILED {
+                let detail = format!(
+                    "wait for overlapped ReadDirectoryChangesW on {} failed",
+                    sync_root.display()
+                );
+                fail_active_cursor_recovery_sentinel(&mut active_sentinel, detail.clone());
+                if let Ok(mut failure) = watcher_failure.lock() {
+                    *failure = Some(detail);
+                }
+                stop.store(true, Ordering::SeqCst);
+                unsafe {
+                    let _ = CancelIoEx(owned.0, Some(&overlapped));
+                }
+                break;
+            }
+            if completion != WAIT_TIMEOUT {
+                let detail = format!(
+                    "unexpected ReadDirectoryChangesW wait result {}",
+                    completion.0
+                );
+                fail_active_cursor_recovery_sentinel(&mut active_sentinel, detail.clone());
+                if let Ok(mut failure) = watcher_failure.lock() {
+                    *failure = Some(detail);
+                }
+                stop.store(true, Ordering::SeqCst);
+                unsafe {
+                    let _ = CancelIoEx(owned.0, Some(&overlapped));
+                }
+                break;
+            }
+            if stop.load(Ordering::SeqCst) {
+                unsafe {
+                    let _ = CancelIoEx(owned.0, Some(&overlapped));
+                }
+                break;
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            let _ = unsafe { GetOverlappedResult(owned.0, &overlapped, &mut bytes_returned, true) };
+            break;
+        }
+        if let Err(error) =
+            unsafe { GetOverlappedResult(owned.0, &overlapped, &mut bytes_returned, true) }
+        {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            notification_epoch.fetch_add(1, Ordering::SeqCst);
+            let detail = format!("complete overlapped ReadDirectoryChangesW: {error}");
+            fail_active_cursor_recovery_sentinel(&mut active_sentinel, detail.clone());
+            if let Ok(mut failure) = watcher_failure.lock() {
+                *failure = Some(detail);
             }
             break;
         }
         if bytes_returned == 0 {
+            notification_epoch.fetch_add(1, Ordering::SeqCst);
             rename_pairing.reset_for_overflow();
             notification_overflow.store(true, Ordering::SeqCst);
+            fail_active_cursor_recovery_sentinel(
+                &mut active_sentinel,
+                "ReadDirectoryChangesW overflowed during cursor recovery fence".to_string(),
+            );
             continue;
         }
         match parse_directory_changes(&buffer[..bytes_returned as usize], &mut rename_pairing) {
-            Ok(batch) => match sender.try_send(batch) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(_)) => {
-                    rename_pairing.reset_for_overflow();
-                    notification_overflow.store(true, Ordering::SeqCst);
+            Ok(batch) => {
+                match process_cursor_recovery_sentinel_batch(
+                    batch,
+                    &mut active_sentinel,
+                    &sync_root,
+                    sync_root_file_id,
+                ) {
+                    Ok((batch, ack)) => {
+                        if !batch.changes.is_empty() || batch.overflowed {
+                            notification_epoch.fetch_add(1, Ordering::SeqCst);
+                            match sender.try_send(batch) {
+                                Ok(()) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {
+                                    rename_pairing.reset_for_overflow();
+                                    notification_overflow.store(true, Ordering::SeqCst);
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_)) => break,
+                            }
+                        }
+                        if let Some(reply) = ack {
+                            let _ = reply.send(Ok(CursorRecoverySentinelAck {
+                                non_sentinel_epoch: notification_epoch.load(Ordering::SeqCst),
+                                sync_root_file_id,
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        notification_epoch.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(mut failure) = watcher_failure.lock() {
+                            *failure = Some(error);
+                        }
+                        break;
+                    }
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
-            },
+            }
             Err(error) => {
+                notification_epoch.fetch_add(1, Ordering::SeqCst);
+                fail_active_cursor_recovery_sentinel(&mut active_sentinel, error.clone());
                 if let Ok(mut failure) = watcher_failure.lock() {
                     *failure = Some(error);
                 }
@@ -963,7 +1626,398 @@ fn watch_directory_changes(
             }
         }
     }
+    fail_active_cursor_recovery_sentinel(
+        &mut active_sentinel,
+        "ReadDirectoryChangesW recovery observer stopped during sentinel fence".to_string(),
+    );
+    while let Ok(command) = sentinel.try_recv() {
+        let _ = command.reply.send(Err(
+            "ReadDirectoryChangesW recovery observer stopped".to_string()
+        ));
+    }
     raw_handle.store(0, Ordering::SeqCst);
+}
+
+fn file_id_for_handle(handle: HANDLE, path: &Path) -> Result<u64, String> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut info) }
+        .map_err(|error| format!("read stable file ID for {}: {error}", path.display()))?;
+    Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+}
+
+fn recover_stale_cursor_recovery_sentinel(
+    sync_root: &Path,
+    expected_sync_root_file_id: u64,
+    specs: &[CursorRecoverySentinelSpec],
+) -> Result<Option<PathBuf>, String> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let entries = physical_directory_entries(sync_root)?;
+    let Some(spec_index) = select_stale_cursor_recovery_sentinel(&entries, specs)? else {
+        return Ok(None);
+    };
+    let spec = &specs[spec_index];
+    let root_wide = wide_path(sync_root);
+    let root_guard = unsafe {
+        CreateFileW(
+            PCWSTR(root_wide.as_ptr()),
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map(OwnedWin32Handle)
+    .map_err(|error| {
+        format!(
+            "open pinned cursor recovery root for stale-sentinel cleanup {}: {error}",
+            sync_root.display()
+        )
+    })?;
+    let root_file_id = file_id_for_handle(root_guard.0, sync_root)?;
+    if root_file_id != expected_sync_root_file_id {
+        return Err(format!(
+            "stale sentinel root file ID {root_file_id} does not match pinned root file ID {expected_sync_root_file_id}"
+        ));
+    }
+
+    let path = sync_root.join(&spec.name);
+    let path_wide = wide_path(&path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(path_wide.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0 | DELETE.0,
+            FILE_SHARE_MODE(0),
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,
+            None,
+        )
+    }
+    .map(OwnedWin32Handle)
+    .map_err(|error| {
+        format!(
+            "open stale cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }.map_err(|error| {
+        format!(
+            "inspect stale cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    let logical_size = ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64;
+    validate_stale_cursor_recovery_sentinel_metadata(
+        info.dwFileAttributes,
+        logical_size,
+        spec.payload.len(),
+    )
+    .map_err(|detail| format!("{}: {detail}", path.display()))?;
+    let mut observed = vec![0u8; logical_size as usize];
+    let mut read = 0u32;
+    unsafe { ReadFile(handle.0, Some(&mut observed), Some(&mut read), None) }.map_err(|error| {
+        format!(
+            "read stale cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    if read as usize != observed.len() {
+        return Err(format!(
+            "stale cursor recovery sentinel {} returned a short payload",
+            path.display()
+        ));
+    }
+    validate_stale_cursor_recovery_sentinel(
+        info.dwFileAttributes,
+        logical_size,
+        &observed,
+        &spec.payload,
+    )
+    .map_err(|detail| format!("{}: {detail}", path.display()))?;
+
+    unsafe { FlushFileBuffers(handle.0) }.map_err(|error| {
+        format!(
+            "flush stale cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            handle.0,
+            FileDispositionInfo,
+            (&disposition as *const FILE_DISPOSITION_INFO).cast::<c_void>(),
+            size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    }
+    .map_err(|error| {
+        format!(
+            "mark stale cursor recovery sentinel {} for same-object deletion: {error}",
+            path.display()
+        )
+    })?;
+    unsafe { FlushFileBuffers(handle.0) }.map_err(|error| {
+        format!(
+            "flush stale cursor recovery sentinel deletion {}: {error}",
+            path.display()
+        )
+    })?;
+    drop(handle);
+    // Directory handles do not support FlushFileBuffers. Replay safety does
+    // not require a durable directory flush: after a crash the marker-bound
+    // file is either absent or is revalidated and removed again. Retaining the
+    // no-share-delete root handle above pins its identity through this cleanup.
+    if select_stale_cursor_recovery_sentinel(&physical_directory_entries(sync_root)?, specs)?
+        .is_some()
+    {
+        return Err("cursor recovery sentinel reappeared after exact cleanup".to_string());
+    }
+    Ok(Some(PathBuf::from(&spec.name)))
+}
+
+fn start_cursor_recovery_sentinel_command(
+    sync_root: &Path,
+    sync_root_file_id: u64,
+    command: CursorRecoverySentinelCommand,
+) -> Result<ActiveCursorRecoverySentinel, (CursorRecoverySentinelCommand, String)> {
+    let stale_removal = match recover_stale_cursor_recovery_sentinel(
+        sync_root,
+        sync_root_file_id,
+        &command.stale_specs,
+    ) {
+        Ok(stale) => stale,
+        Err(detail) => return Err((command, detail)),
+    };
+    let handle = if stale_removal.is_none() {
+        match create_cursor_recovery_sentinel(sync_root, &command.name, &command.payload) {
+            Ok(handle) => Some(handle),
+            Err(detail) => return Err((command, detail)),
+        }
+    } else {
+        None
+    };
+    Ok(ActiveCursorRecoverySentinel {
+        state: CursorRecoverySentinelState::new(&command.name),
+        command,
+        handle,
+        stale_removal,
+        needs_create: false,
+    })
+}
+
+fn create_cursor_recovery_sentinel(
+    sync_root: &Path,
+    name: &str,
+    payload: &[u8],
+) -> Result<OwnedWin32Handle, String> {
+    if Path::new(name).components().count() != 1 || payload.is_empty() {
+        return Err("cursor recovery sentinel name or payload is invalid".to_string());
+    }
+    let path = sync_root.join(name);
+    let wide = wide_path(&path);
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            GENERIC_READ.0 | GENERIC_WRITE.0 | DELETE.0,
+            FILE_SHARE_MODE(0),
+            None,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_DELETE_ON_CLOSE | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map(OwnedWin32Handle)
+    .map_err(|error| {
+        format!(
+            "create cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut written = 0u32;
+    unsafe { WriteFile(handle.0, Some(payload), Some(&mut written), None) }
+        .map_err(|error| format!("write cursor recovery sentinel {}: {error}", path.display()))?;
+    if written as usize != payload.len() {
+        return Err(format!(
+            "cursor recovery sentinel {} wrote {written} of {} bytes",
+            path.display(),
+            payload.len()
+        ));
+    }
+    unsafe { FlushFileBuffers(handle.0) }
+        .map_err(|error| format!("flush cursor recovery sentinel {}: {error}", path.display()))?;
+    unsafe { SetFilePointerEx(handle.0, 0, None, FILE_BEGIN) }.map_err(|error| {
+        format!(
+            "rewind cursor recovery sentinel {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut observed = vec![0u8; payload.len()];
+    let mut read = 0u32;
+    unsafe { ReadFile(handle.0, Some(&mut observed), Some(&mut read), None) }
+        .map_err(|error| format!("read cursor recovery sentinel {}: {error}", path.display()))?;
+    if read as usize != payload.len() || observed != payload {
+        return Err(format!(
+            "cursor recovery sentinel {} payload verification failed",
+            path.display()
+        ));
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }.map_err(|error| {
+        format!(
+            "read cursor recovery sentinel metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        || info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || ((info.nFileSizeHigh as u64) << 32) | info.nFileSizeLow as u64 != payload.len() as u64
+    {
+        return Err(format!(
+            "cursor recovery sentinel {} is not the exact payload-bound regular file",
+            path.display()
+        ));
+    }
+    Ok(handle)
+}
+
+fn fail_active_cursor_recovery_sentinel(
+    active: &mut Option<ActiveCursorRecoverySentinel>,
+    detail: String,
+) {
+    if let Some(active) = active.take() {
+        let _ = active.command.reply.send(Err(detail));
+    }
+}
+
+fn process_cursor_recovery_sentinel_batch(
+    batch: RawDirectoryChangeBatch,
+    active: &mut Option<ActiveCursorRecoverySentinel>,
+    sync_root: &Path,
+    sync_root_file_id: u64,
+) -> Result<
+    (
+        RawDirectoryChangeBatch,
+        Option<mpsc::SyncSender<Result<CursorRecoverySentinelAck, String>>>,
+    ),
+    String,
+> {
+    let Some(sentinel) = active.as_mut() else {
+        return Ok((batch, None));
+    };
+    if let Some(stale_name) = sentinel.stale_removal.as_ref() {
+        let outcome = classify_stale_cursor_recovery_removal_batch(batch, stale_name)?;
+        if outcome.removed {
+            sentinel.stale_removal = None;
+            sentinel.needs_create = true;
+        }
+        return Ok((outcome.preserved, None));
+    }
+    let outcome = classify_cursor_recovery_sentinel_batch(batch, &mut sentinel.state)?;
+    if outcome.added {
+        // Closing the DELETE_ON_CLOSE handle creates the ordered removal only
+        // after the exact Added record was consumed. ReadDirectoryChangesW's
+        // handle-associated kernel buffer records changes between calls.
+        sentinel.handle.take();
+    }
+    let preserved = outcome.preserved;
+    let complete = outcome.complete;
+    if !complete {
+        return Ok((preserved, None));
+    }
+    let completed = active
+        .take()
+        .ok_or_else(|| "cursor recovery sentinel completion lost its command".to_string())?;
+    let sentinel_path = sync_root.join(&completed.command.name);
+    match fs::symlink_metadata(&sentinel_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(format!(
+                "cursor recovery sentinel {} remained after its removal record",
+                sentinel_path.display()
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "verify removed cursor recovery sentinel {}: {error}",
+                sentinel_path.display()
+            ));
+        }
+    }
+    if sync_root_file_id == 0 {
+        return Err("cursor recovery watcher root has an invalid zero file ID".to_string());
+    }
+    Ok((preserved, Some(completed.command.reply)))
+}
+
+struct StaleCursorRecoveryRemovalBatchOutcome {
+    preserved: RawDirectoryChangeBatch,
+    removed: bool,
+}
+
+fn classify_stale_cursor_recovery_removal_batch(
+    batch: RawDirectoryChangeBatch,
+    stale_name: &Path,
+) -> Result<StaleCursorRecoveryRemovalBatchOutcome, String> {
+    let mut outcome = StaleCursorRecoveryRemovalBatchOutcome {
+        preserved: RawDirectoryChangeBatch {
+            changes: Vec::new(),
+            overflowed: batch.overflowed,
+        },
+        removed: false,
+    };
+    for change in batch.changes {
+        let touches_stale = raw_change_paths(&change)
+            .into_iter()
+            .any(|path| path == stale_name);
+        if !touches_stale {
+            outcome.preserved.changes.push(change);
+            continue;
+        }
+        if matches!(&change, CloudFilesDirectoryChange::Removed(path) if path == stale_name)
+            && !outcome.removed
+        {
+            outcome.removed = true;
+            continue;
+        }
+        return Err(
+            "stale cursor recovery sentinel emitted an unexpected namespace record".to_string(),
+        );
+    }
+    Ok(outcome)
+}
+
+struct CursorRecoverySentinelBatchOutcome {
+    preserved: RawDirectoryChangeBatch,
+    added: bool,
+    complete: bool,
+}
+
+fn classify_cursor_recovery_sentinel_batch(
+    batch: RawDirectoryChangeBatch,
+    state: &mut CursorRecoverySentinelState,
+) -> Result<CursorRecoverySentinelBatchOutcome, String> {
+    let mut outcome = CursorRecoverySentinelBatchOutcome {
+        preserved: RawDirectoryChangeBatch {
+            changes: Vec::new(),
+            overflowed: batch.overflowed,
+        },
+        added: false,
+        complete: false,
+    };
+    for change in batch.changes {
+        match state.observe(&change)? {
+            SentinelObservation::Added => outcome.added = true,
+            SentinelObservation::Removed => outcome.complete = true,
+            SentinelObservation::SentinelModified => {}
+            SentinelObservation::NonSentinel => outcome.preserved.changes.push(change),
+        }
+    }
+    Ok(outcome)
 }
 
 fn parse_directory_changes(
@@ -1000,26 +2054,26 @@ fn parse_directory_changes(
             .chunks_exact(2)
             .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
             .collect::<Vec<_>>();
-        let path = PathBuf::from(String::from_utf16_lossy(&name));
+        let path = PathBuf::from(String::from_utf16(&name).map_err(|_| {
+            "ReadDirectoryChangesW returned an invalid UTF-16 filename".to_string()
+        })?);
         let action = match action {
-            value if value == FILE_ACTION_ADDED.0 => Some(CloudFilesDirectoryChangeAction::Added),
-            value if value == FILE_ACTION_MODIFIED.0 => {
-                Some(CloudFilesDirectoryChangeAction::Modified)
-            }
-            value if value == FILE_ACTION_REMOVED.0 => {
-                Some(CloudFilesDirectoryChangeAction::Removed)
-            }
+            value if value == FILE_ACTION_ADDED.0 => CloudFilesDirectoryChangeAction::Added,
+            value if value == FILE_ACTION_MODIFIED.0 => CloudFilesDirectoryChangeAction::Modified,
+            value if value == FILE_ACTION_REMOVED.0 => CloudFilesDirectoryChangeAction::Removed,
             value if value == FILE_ACTION_RENAMED_OLD_NAME.0 => {
-                Some(CloudFilesDirectoryChangeAction::RenamedOldName)
+                CloudFilesDirectoryChangeAction::RenamedOldName
             }
             value if value == FILE_ACTION_RENAMED_NEW_NAME.0 => {
-                Some(CloudFilesDirectoryChangeAction::RenamedNewName)
+                CloudFilesDirectoryChangeAction::RenamedNewName
             }
-            _ => None,
+            _ => {
+                return Err(format!(
+                    "ReadDirectoryChangesW returned unknown action {action}"
+                ));
+            }
         };
-        if let Some(action) = action {
-            rename_pairing.push(action, path, &mut changes);
-        }
+        rename_pairing.push(action, path, &mut changes);
         if next_entry_offset == 0 {
             break;
         }
@@ -1527,6 +2581,364 @@ fn identity_matches_manifest(
         && identity.object_id == manifest.object_id
         && identity.version == manifest.version
         && identity.content_hash == manifest.content_hash
+}
+
+fn find_data_name(data: &WIN32_FIND_DATAW) -> Result<OsString, String> {
+    let length = data
+        .cFileName
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| "FindFirstFileExW returned a filename without a terminator".to_string())?;
+    Ok(OsString::from_wide(&data.cFileName[..length]))
+}
+
+fn find_data_alternate_name(data: &WIN32_FIND_DATAW) -> Result<Option<OsString>, String> {
+    let length = data
+        .cAlternateFileName
+        .iter()
+        .position(|unit| *unit == 0)
+        .ok_or_else(|| {
+            "FindFirstFileExW returned an alternate filename without a terminator".to_string()
+        })?;
+    Ok((length != 0).then(|| OsString::from_wide(&data.cAlternateFileName[..length])))
+}
+
+/// Enumerate only entries represented on disk. With a virtualization filter,
+/// FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY excludes projected-but-unmaterialized
+/// children and therefore cannot request provider population. Unsupported
+/// filtering is deliberately an error, never a fallback to ordinary listing.
+fn physical_directory_entries(path: &Path) -> Result<Vec<PhysicalDirectoryEntryName>, String> {
+    let pattern = path.join("*");
+    let pattern_wide = wide_path(&pattern);
+    let mut data = WIN32_FIND_DATAW::default();
+    let find = match unsafe {
+        FindFirstFileExW(
+            PCWSTR(pattern_wide.as_ptr()),
+            // Standard info is required so short-name aliases of the exact
+            // marker-derived sentinel are visible and can fail closed.
+            FindExInfoStandard,
+            (&mut data as *mut WIN32_FIND_DATAW).cast::<c_void>(),
+            FindExSearchNameMatch,
+            None,
+            FIND_FIRST_EX_ON_DISK_ENTRIES_ONLY,
+        )
+    } {
+        Ok(handle) => OwnedFindHandle(handle),
+        Err(error)
+            if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+                || error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(error) => {
+            return Err(format!(
+                "enumerate physical children of {} without population: {error}",
+                path.display()
+            ));
+        }
+    };
+    let mut children = Vec::new();
+    loop {
+        let name = find_data_name(&data)?;
+        if name != "." && name != ".." {
+            children.push(PhysicalDirectoryEntryName {
+                name,
+                alternate_name: find_data_alternate_name(&data)?,
+            });
+        }
+        data = WIN32_FIND_DATAW::default();
+        match unsafe { FindNextFileW(find.0, &mut data) } {
+            Ok(()) => {}
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_NO_MORE_FILES.0) => break,
+            Err(error) => {
+                return Err(format!(
+                    "continue enumerating physical children of {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(children)
+}
+
+fn physical_directory_children(path: &Path) -> Result<Vec<OsString>, String> {
+    physical_directory_entries(path).map(|entries| {
+        entries
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>()
+    })
+}
+
+fn validate_physically_empty_recovery_directory(
+    sifs_path: &str,
+    children: &[OsString],
+) -> Result<(), String> {
+    if let Some(name) = children.first() {
+        return Err(format!(
+            "recovery-root directory `{sifs_path}` contains physical child `{}`",
+            name.to_string_lossy()
+        ));
+    }
+    Ok(())
+}
+
+fn select_stale_cursor_recovery_sentinel(
+    entries: &[PhysicalDirectoryEntryName],
+    specs: &[CursorRecoverySentinelSpec],
+) -> Result<Option<usize>, String> {
+    for (index, spec) in specs.iter().enumerate() {
+        if specs[..index].iter().any(|prior| prior.name == spec.name) {
+            return Err("cursor recovery sentinel rounds derived the same filename".to_string());
+        }
+    }
+    let mut exact = Vec::new();
+    for entry in entries {
+        let primary = entry.name.to_str();
+        for (index, spec) in specs.iter().enumerate() {
+            if primary.is_some_and(|name| name.eq_ignore_ascii_case(&spec.name)) {
+                if primary != Some(spec.name.as_str()) {
+                    return Err(format!(
+                        "cursor recovery root contains case-alias `{}` for sentinel `{}`",
+                        entry.name.to_string_lossy(),
+                        spec.name
+                    ));
+                }
+                exact.push(index);
+            }
+            if entry.alternate_name.as_ref().is_some_and(|alternate| {
+                alternate
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&spec.name))
+            }) {
+                return Err(format!(
+                    "cursor recovery root contains long-name alias `{}` for sentinel `{}`",
+                    entry.name.to_string_lossy(),
+                    spec.name
+                ));
+            }
+        }
+    }
+    match exact.as_slice() {
+        [] => Ok(None),
+        [index] => Ok(Some(*index)),
+        _ => Err("cursor recovery root contains multiple stale sentinels".to_string()),
+    }
+}
+
+fn validate_stale_cursor_recovery_sentinel(
+    attributes: u32,
+    logical_size: u64,
+    observed_payload: &[u8],
+    expected_payload: &[u8],
+) -> Result<(), String> {
+    validate_stale_cursor_recovery_sentinel_metadata(
+        attributes,
+        logical_size,
+        expected_payload.len(),
+    )?;
+    if observed_payload != expected_payload {
+        return Err(
+            "stale cursor recovery sentinel payload does not match its recovery marker".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_stale_cursor_recovery_sentinel_metadata(
+    attributes: u32,
+    logical_size: u64,
+    expected_payload_bytes: usize,
+) -> Result<(), String> {
+    const MAX_SENTINEL_BYTES: usize = 64;
+    if attributes & FILE_ATTRIBUTE_HIDDEN.0 == 0
+        || attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0
+        || attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    {
+        return Err("stale cursor recovery sentinel is not a plain hidden file".to_string());
+    }
+    if expected_payload_bytes == 0
+        || expected_payload_bytes > MAX_SENTINEL_BYTES
+        || logical_size != expected_payload_bytes as u64
+    {
+        return Err(
+            "stale cursor recovery sentinel payload does not match its recovery marker".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn verify_held_cursor_recovery_child(child: &CursorRecoveryHeldChild) -> Result<(), String> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(child.handle.0, &mut info) }.map_err(|error| {
+        format!(
+            "cursor recovery retained child handle `{}` is invalid: {error}",
+            child.sifs_path
+        )
+    })?;
+    let is_directory = info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    let file_id = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+    if is_directory != child.is_directory || file_id != child.file_id {
+        return Err(format!(
+            "cursor recovery retained child `{}` changed kind or file identity",
+            child.sifs_path
+        ));
+    }
+    Ok(())
+}
+
+fn audit_cursor_recovery_root(
+    sync_root: &Path,
+    mount: &str,
+    root: &str,
+    expected_sync_root_file_id: u64,
+    remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    cancelled: &AtomicBool,
+) -> Result<Vec<CursorRecoveryHeldChild>, String> {
+    let expected = remote_manifest
+        .values()
+        .filter(|entry| relative_depth(root, &entry.path) == 1)
+        .filter(|entry| matches!(entry.kind.as_str(), "file" | "directory" | "mount"))
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut observed = BTreeSet::new();
+    let mut handles = Vec::with_capacity(expected.len());
+    for name in physical_directory_children(sync_root)? {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("sync-cancelled".to_string());
+        }
+        let name = name.to_str().ok_or_else(|| {
+            format!(
+                "recovery root {} contains a non-Unicode child",
+                sync_root.display()
+            )
+        })?;
+        let sifs_path = local_relative_to_sifs(root, Path::new(name))?;
+        let authoritative = expected.get(&sifs_path).ok_or_else(|| {
+            format!(
+                "recovery root contains local child `{sifs_path}` without an authoritative projectable identity"
+            )
+        })?;
+        let authoritative_is_directory =
+            matches!(authoritative.kind.as_str(), "directory" | "mount");
+        let child_path = sync_root.join(name);
+        let child_wide = wide_path(&child_path);
+        let desired_access = FILE_READ_ATTRIBUTES.0
+            | if authoritative_is_directory {
+                FILE_LIST_DIRECTORY.0
+            } else {
+                0
+            };
+        let flags = FILE_FLAG_OPEN_REPARSE_POINT
+            | if authoritative_is_directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                Default::default()
+            };
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(child_wide.as_ptr()),
+                desired_access,
+                // Existing writers make this open fail, and new write/delete
+                // handles cannot open until the audit guard is released.
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                flags,
+                None,
+            )
+        }
+        .map(OwnedWin32Handle)
+        .map_err(|error| {
+            format!(
+                "open recovery-root child fence {}: {error}",
+                child_path.display()
+            )
+        })?;
+        let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle.0, &mut handle_info) }.map_err(|error| {
+            format!(
+                "read recovery-root child metadata {}: {error}",
+                child_path.display()
+            )
+        })?;
+        let is_directory = handle_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        if is_directory != authoritative_is_directory {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` has the wrong local object kind"
+            ));
+        }
+        let Some(placeholder) = query_placeholder_state_handle(handle.0, &child_path)? else {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` is not a Cloud Files placeholder"
+            ));
+        };
+        if !placeholder.in_sync {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` is not marked in sync"
+            ));
+        }
+        if placeholder.modified_data_size != 0 {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` has {} modified bytes",
+                placeholder.modified_data_size
+            ));
+        }
+        let handle_file_id =
+            ((handle_info.nFileIndexHigh as u64) << 32) | handle_info.nFileIndexLow as u64;
+        if placeholder.file_id != handle_file_id {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` CFAPI file ID does not match its held handle"
+            ));
+        }
+        if placeholder.sync_root_file_id != expected_sync_root_file_id {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` belongs to sync-root file ID {}, expected {}",
+                placeholder.sync_root_file_id, expected_sync_root_file_id
+            ));
+        }
+        let identity = placeholder.identity.ok_or_else(|| {
+            format!(
+                "recovery-root child `{sifs_path}` has no current versioned placeholder identity"
+            )
+        })?;
+        if identity.mount != mount
+            || identity.root != root
+            || !identity_matches_manifest(&identity, authoritative)
+        {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` does not match its authoritative placeholder identity"
+            ));
+        }
+        if is_directory {
+            let nested = physical_directory_children(&child_path)?;
+            validate_physically_empty_recovery_directory(&sifs_path, &nested)?;
+        } else {
+            let logical_size =
+                ((handle_info.nFileSizeHigh as u64) << 32) | handle_info.nFileSizeLow as u64;
+            let expected_size = authoritative.content_size_bytes.ok_or_else(|| {
+                format!("authoritative recovery-root file `{sifs_path}` has no exact logical size")
+            })?;
+            if logical_size != expected_size {
+                return Err(format!(
+                    "recovery-root file `{sifs_path}` logical size {logical_size} does not match authoritative size {expected_size}"
+                ));
+            }
+        }
+        observed.insert(sifs_path.clone());
+        handles.push(CursorRecoveryHeldChild {
+            handle,
+            sifs_path,
+            is_directory,
+            file_id: handle_file_id,
+        });
+    }
+    if let Some(missing) = expected.keys().find(|path| !observed.contains(*path)) {
+        return Err(format!(
+            "authoritative recovery-root child `{missing}` has no exact local placeholder"
+        ));
+    }
+    Ok(handles)
 }
 
 fn manifest_generations_match(
@@ -2213,10 +3625,18 @@ fn query_placeholder_state(
     }
     .map(OwnedWin32Handle)
     .map_err(|error| format!("open placeholder {}: {error}", path.display()))?;
+    let state = query_placeholder_state_handle(handle.0, path)?;
+    Ok(state.map(|state| (state.in_sync, state.identity)))
+}
+
+fn query_placeholder_state_handle(
+    handle: HANDLE,
+    path: &Path,
+) -> Result<Option<PlaceholderStandardState>, String> {
     let mut buffer = vec![0u64; (size_of::<CF_PLACEHOLDER_STANDARD_INFO>() + 4096).div_ceil(8)];
     let result = unsafe {
         CfGetPlaceholderInfo(
-            handle.0,
+            handle,
             CF_PLACEHOLDER_INFO_STANDARD,
             buffer.as_mut_ptr().cast::<c_void>(),
             (buffer.len() * size_of::<u64>()) as u32,
@@ -2252,10 +3672,13 @@ fn query_placeholder_state(
         Ok(DecodedCloudFilesPlaceholderIdentity::Versioned(identity)) => Some(identity),
         Ok(DecodedCloudFilesPlaceholderIdentity::LegacyPath(_)) | Err(_) => None,
     };
-    Ok(Some((
-        info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
-        decoded,
-    )))
+    Ok(Some(PlaceholderStandardState {
+        in_sync: info.InSyncState == CF_IN_SYNC_STATE_IN_SYNC,
+        modified_data_size: info.ModifiedDataSize,
+        file_id: info.FileId as u64,
+        sync_root_file_id: info.SyncRootFileId as u64,
+        identity: decoded,
+    }))
 }
 
 pub(super) struct WindowsPlaceholderEffects<T> {
@@ -2826,6 +4249,7 @@ pub(super) struct WindowsWritableWorkerOptions {
     pub sync_root: PathBuf,
     pub root_path: String,
     pub existing_owned_root: bool,
+    pub expected_cursor_recovery_sync_root_file_id: Option<u64>,
     pub prepopulate_depth: u32,
     pub materialized_directories: Arc<Mutex<BTreeSet<String>>>,
 }
@@ -2842,6 +4266,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
         sync_root,
         root_path,
         existing_owned_root,
+        expected_cursor_recovery_sync_root_file_id,
         prepopulate_depth,
         materialized_directories,
     } = options;
@@ -2854,6 +4279,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
             sync_root.clone(),
             root_path.clone(),
             existing_owned_root,
+            expected_cursor_recovery_sync_root_file_id,
             Arc::clone(&suppressed_paths),
             content_stager.clone(),
         ),
@@ -2942,7 +4368,17 @@ pub(super) struct WindowsWritableWorkerHandle {
     alive: Arc<AtomicBool>,
     failure: mpsc::Receiver<CloudFilesModuleError>,
     progress: mpsc::Receiver<u64>,
+    cursor_recovery_progress: mpsc::Receiver<CursorRecoveryWorkerProgress>,
+    cursor_recovery: Option<CloudFilesCursorRecoveryControl>,
+    cursor_recovery_terminal_observed: AtomicBool,
+    cursor_recovery_finalize:
+        mpsc::SyncSender<mpsc::SyncSender<Result<bool, CloudFilesModuleError>>>,
     worker_join: Option<JoinHandle<()>>,
+}
+
+enum CursorRecoveryWorkerProgress {
+    Advanced(u64),
+    Terminal(u64),
 }
 
 impl WindowsWritableWorkerHandle {
@@ -2955,22 +4391,34 @@ impl WindowsWritableWorkerHandle {
     where
         T: DfsMessageTransport + Send + 'static,
     {
+        let cursor_recovery = worker.cursor_recovery_control();
+        let thread_cursor_recovery = cursor_recovery.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_alive = Arc::clone(&alive);
         let failure_emitter = emitter.clone();
         let (failure_sender, failure) = mpsc::channel();
         let (progress_sender, progress) = mpsc::sync_channel(1);
+        let (cursor_recovery_progress_sender, cursor_recovery_progress) = mpsc::channel();
+        let (cursor_recovery_finalize_sender, cursor_recovery_finalize_receiver) =
+            mpsc::sync_channel::<mpsc::SyncSender<Result<bool, CloudFilesModuleError>>>(1);
         let worker_join = thread::Builder::new()
             .name("sinomo-cloud-files-writable-sync".to_string())
             .spawn(move || {
                 let progress_emitter = emitter;
                 let last_generation = AtomicU64::new(initial_generation);
+                let mut cursor_recovery_terminal_emitted = false;
                 let run_result = catch_unwind(AssertUnwindSafe(|| {
                     run_progress_gated_worker_loop(
                         &thread_cancelled,
                         initial_generation,
                         || {
+                            if let Ok(reply) = cursor_recovery_finalize_receiver.try_recv() {
+                                let finalized = worker
+                                    .finalize_cursor_recovery_after_host_ready()
+                                    .map_err(|error| adapter_error(error.code, error.detail));
+                                let _ = reply.send(finalized);
+                            }
                             worker
                                 .run_once(&thread_cancelled)
                                 .map(|_| worker.state().status())
@@ -2982,10 +4430,30 @@ impl WindowsWritableWorkerHandle {
                             if ready {
                                 let _ = progress_sender.try_send(generation);
                             }
+                            if let Some(control) = thread_cursor_recovery.as_ref() {
+                                if control.terminal() && !cursor_recovery_terminal_emitted {
+                                    let _ = cursor_recovery_progress_sender
+                                        .send(CursorRecoveryWorkerProgress::Terminal(generation));
+                                    cursor_recovery_terminal_emitted = true;
+                                } else if !control.terminal() && control.should_run_immediately() {
+                                    let _ = cursor_recovery_progress_sender
+                                        .send(CursorRecoveryWorkerProgress::Advanced(generation));
+                                }
+                            }
                         },
                         |cancelled| {
+                            if thread_cursor_recovery.as_ref().is_some_and(
+                                CloudFilesCursorRecoveryControl::should_run_immediately,
+                            ) {
+                                return;
+                            }
                             for _ in 0..(WORKER_HEARTBEAT_MILLIS / 50) {
                                 if cancelled.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                if thread_cursor_recovery.as_ref().is_some_and(
+                                    CloudFilesCursorRecoveryControl::should_run_immediately,
+                                ) {
                                     break;
                                 }
                                 thread::sleep(std::time::Duration::from_millis(50));
@@ -3026,6 +4494,10 @@ impl WindowsWritableWorkerHandle {
             alive,
             failure,
             progress,
+            cursor_recovery_progress,
+            cursor_recovery,
+            cursor_recovery_terminal_observed: AtomicBool::new(false),
+            cursor_recovery_finalize: cursor_recovery_finalize_sender,
             worker_join: Some(worker_join),
         })
     }
@@ -3065,6 +4537,109 @@ impl WindowsWritableWorkerHandle {
         }
     }
 
+    /// Wait until each authoritative depth-0 scan quantum is durably applied,
+    /// the terminal nonempty cursor boundary is installed, and the exact
+    /// immediate-root placeholder audit passes. `stall_timeout` is refreshed
+    /// after every successful scan quantum rather than bounding total root size.
+    pub(super) fn wait_for_cursor_recovery_terminal(
+        &self,
+        stall_timeout: Duration,
+    ) -> Result<u64, CloudFilesModuleError> {
+        loop {
+            match self.cursor_recovery_progress.recv_timeout(stall_timeout) {
+                Ok(CursorRecoveryWorkerProgress::Advanced(_generation)) => continue,
+                Ok(CursorRecoveryWorkerProgress::Terminal(generation)) => {
+                    self.cursor_recovery_terminal_observed
+                        .store(true, Ordering::SeqCst);
+                    return Ok(generation);
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(self.take_failure().unwrap_or_else(|| {
+                        adapter_error(
+                            "cursor-recovery-worker-stopped",
+                            "writable worker stopped before cursor recovery became terminal",
+                        )
+                    }));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(adapter_error(
+                        "cursor-recovery-progress-timeout",
+                        format!(
+                            "cursor recovery made no complete scan progress within {} ms",
+                            stall_timeout.as_millis()
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Release a proven terminal worker only after the owner has durably
+    /// completed the recovery marker/registration transition.
+    pub(super) fn release_cursor_recovery(&self) -> Result<(), CloudFilesModuleError> {
+        let control = self.cursor_recovery.as_ref().ok_or_else(|| {
+            adapter_error(
+                "cursor-recovery-not-armed",
+                "writable worker was not opened for authorized cursor recovery",
+            )
+        })?;
+        if !self
+            .cursor_recovery_terminal_observed
+            .load(Ordering::SeqCst)
+        {
+            return Err(adapter_error(
+                "cursor-recovery-terminal-not-observed",
+                "cursor recovery cannot be released before its terminal waiter succeeds",
+            ));
+        }
+        control
+            .release()
+            .map_err(|detail| adapter_error("cursor-recovery-release-rejected", detail))
+    }
+
+    pub(super) fn complete_cursor_recovery_after_host_active(
+        &self,
+    ) -> Result<(), CloudFilesModuleError> {
+        self.cursor_recovery
+            .as_ref()
+            .ok_or_else(|| {
+                adapter_error(
+                    "cursor-recovery-not-armed",
+                    "writable worker was not opened for authorized cursor recovery",
+                )
+            })?
+            .complete_after_host_active()
+            .map_err(|detail| adapter_error("cursor-recovery-active-completion-rejected", detail))
+    }
+
+    pub(super) fn finalize_cursor_recovery_after_host_ready(
+        &self,
+        timeout: Duration,
+    ) -> Result<bool, CloudFilesModuleError> {
+        if !self
+            .cursor_recovery_terminal_observed
+            .load(Ordering::SeqCst)
+        {
+            return Err(adapter_error(
+                "cursor-recovery-terminal-not-observed",
+                "cursor recovery cannot finalize before its terminal waiter succeeds",
+            ));
+        }
+        let (reply, response) = mpsc::sync_channel(1);
+        self.cursor_recovery_finalize.send(reply).map_err(|_| {
+            adapter_error(
+                "cursor-recovery-worker-stopped",
+                "cursor recovery worker stopped before marker finalization",
+            )
+        })?;
+        response.recv_timeout(timeout).map_err(|error| {
+            adapter_error(
+                "cursor-recovery-finalize-timeout",
+                format!("cursor recovery marker finalization did not complete: {error}"),
+            )
+        })?
+    }
+
     pub(super) fn stop_and_join(&mut self) -> Result<(), CloudFilesModuleError> {
         self.cancelled.store(true, Ordering::SeqCst);
         if let Some(join) = self.worker_join.as_ref() {
@@ -3089,5 +4664,400 @@ impl WindowsWritableWorkerHandle {
 impl Drop for WindowsWritableWorkerHandle {
     fn drop(&mut self) {
         let _ = self.stop_and_join();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct WindowsFilesystemTestDir(PathBuf);
+
+    impl WindowsFilesystemTestDir {
+        fn new(label: &str) -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("sinomo-{label}-{}-{suffix}", std::process::id()));
+            fs::create_dir_all(&path).expect("create Windows filesystem test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for WindowsFilesystemTestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn raw_batch(changes: Vec<CloudFilesDirectoryChange>) -> RawDirectoryChangeBatch {
+        RawDirectoryChangeBatch {
+            changes,
+            overflowed: false,
+        }
+    }
+
+    fn directory_change_record(action: u32, name: &[u16]) -> Vec<u8> {
+        let mut record = Vec::with_capacity(12 + name.len() * 2);
+        record.extend_from_slice(&0u32.to_le_bytes());
+        record.extend_from_slice(&action.to_le_bytes());
+        record.extend_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+        for unit in name {
+            record.extend_from_slice(&unit.to_le_bytes());
+        }
+        record
+    }
+
+    #[test]
+    fn cursor_recovery_sentinel_is_stable_exact_uppercase_8dot3() {
+        let first = cursor_recovery_sentinel_name("recovery", "token", "nonce", 71, 1);
+        let replay = cursor_recovery_sentinel_name("recovery", "token", "nonce", 71, 1);
+        let second = cursor_recovery_sentinel_name("recovery", "token", "nonce", 71, 2);
+        assert_eq!(first, replay);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 12);
+        assert_eq!(first.as_bytes()[8], b'.');
+        assert!(first.bytes().enumerate().all(|(index, byte)| index == 8
+            || byte.is_ascii_digit()
+            || (b'A'..=b'F').contains(&byte)));
+        assert_eq!(
+            cursor_recovery_sentinel_payload("recovery", "token", "nonce", 71, 1).len(),
+            32
+        );
+    }
+
+    #[test]
+    fn cursor_recovery_sentinel_batch_preserves_every_unrelated_record() {
+        let name = "1234ABCD.EF0";
+        let sentinel = PathBuf::from(name);
+        let unrelated = PathBuf::from("ordinary.txt");
+        let mut state = CursorRecoverySentinelState::new(name);
+        let added = classify_cursor_recovery_sentinel_batch(
+            raw_batch(vec![
+                CloudFilesDirectoryChange::Added(sentinel.clone()),
+                CloudFilesDirectoryChange::Modified(sentinel.clone()),
+                CloudFilesDirectoryChange::Modified(unrelated.clone()),
+            ]),
+            &mut state,
+        )
+        .expect("ordered sentinel add batch");
+        assert!(added.added);
+        assert!(!added.complete);
+        assert_eq!(
+            added.preserved.changes,
+            vec![CloudFilesDirectoryChange::Modified(unrelated.clone())]
+        );
+
+        let removed = classify_cursor_recovery_sentinel_batch(
+            raw_batch(vec![
+                CloudFilesDirectoryChange::Removed(sentinel),
+                CloudFilesDirectoryChange::Added(PathBuf::from("after-cut")),
+            ]),
+            &mut state,
+        )
+        .expect("ordered sentinel removal batch");
+        assert!(!removed.added);
+        assert!(removed.complete);
+        assert_eq!(
+            removed.preserved.changes,
+            vec![CloudFilesDirectoryChange::Added(PathBuf::from("after-cut"))]
+        );
+    }
+
+    #[test]
+    fn cursor_recovery_sentinel_consumes_added_modified_removed_in_one_batch() {
+        let name = "1234ABCD.EF0";
+        let sentinel = PathBuf::from(name);
+        let before = CloudFilesDirectoryChange::Added(PathBuf::from("before"));
+        let after = CloudFilesDirectoryChange::Removed(PathBuf::from("after"));
+        let mut state = CursorRecoverySentinelState::new(name);
+        let outcome = classify_cursor_recovery_sentinel_batch(
+            raw_batch(vec![
+                before.clone(),
+                CloudFilesDirectoryChange::Added(sentinel.clone()),
+                CloudFilesDirectoryChange::Modified(sentinel.clone()),
+                CloudFilesDirectoryChange::Removed(sentinel),
+                after.clone(),
+            ]),
+            &mut state,
+        )
+        .expect("complete ordered sentinel batch");
+        assert!(outcome.added);
+        assert!(outcome.complete);
+        assert_eq!(outcome.preserved.changes, vec![before, after]);
+    }
+
+    #[test]
+    fn cursor_recovery_sentinel_rejects_aliases_and_out_of_order_records() {
+        let name = "1234ABCD.EF0";
+        let mut state = CursorRecoverySentinelState::new(name);
+        assert_eq!(
+            state
+                .observe(&CloudFilesDirectoryChange::Added(PathBuf::from(
+                    "1234abcd.ef0"
+                )))
+                .expect("case alias is ordinary namespace work"),
+            SentinelObservation::NonSentinel
+        );
+        assert!(
+            state
+                .observe(&CloudFilesDirectoryChange::Modified(PathBuf::from(name)))
+                .is_err()
+        );
+
+        let mut duplicate = CursorRecoverySentinelState::new(name);
+        duplicate
+            .observe(&CloudFilesDirectoryChange::Added(PathBuf::from(name)))
+            .expect("first add");
+        assert!(
+            duplicate
+                .observe(&CloudFilesDirectoryChange::Added(PathBuf::from(name)))
+                .is_err()
+        );
+
+        let mut renamed = CursorRecoverySentinelState::new(name);
+        assert!(
+            renamed
+                .observe(&CloudFilesDirectoryChange::Renamed {
+                    from: PathBuf::from(name),
+                    to: PathBuf::from("OTHER.TMP"),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn directory_change_parser_rejects_unknown_actions_and_invalid_utf16() {
+        let mut pairing = CloudFilesRenamePairingState::default();
+        assert!(
+            parse_directory_changes(
+                &directory_change_record(0xFFFF_FFFE, &[b'x' as u16]),
+                &mut pairing,
+            )
+            .is_err()
+        );
+
+        let mut pairing = CloudFilesRenamePairingState::default();
+        assert!(
+            parse_directory_changes(
+                &directory_change_record(FILE_ACTION_ADDED.0, &[0xD800]),
+                &mut pairing,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn final_snapshot_accepts_post_cut_epoch_advance_but_not_identity_drift() {
+        assert!(validate_cursor_recovery_final_snapshot(Some(4), 99, 71, 71, 71).is_ok());
+        assert!(validate_cursor_recovery_final_snapshot(None, 99, 71, 71, 71).is_err());
+        assert!(validate_cursor_recovery_final_snapshot(Some(4), 4, 71, 72, 71).is_err());
+        assert!(validate_cursor_recovery_final_snapshot(Some(4), 4, 71, 71, 72).is_err());
+    }
+
+    #[test]
+    fn stale_sentinel_selection_accepts_one_exact_name_and_rejects_aliases_or_multiple() {
+        let specs = vec![
+            CursorRecoverySentinelSpec {
+                name: "1234ABCD.EF0".to_string(),
+                payload: vec![1; 32],
+            },
+            CursorRecoverySentinelSpec {
+                name: "5678ABCD.EF0".to_string(),
+                payload: vec![2; 32],
+            },
+        ];
+        let exact = vec![PhysicalDirectoryEntryName {
+            name: OsString::from("1234ABCD.EF0"),
+            alternate_name: None,
+        }];
+        assert_eq!(
+            select_stale_cursor_recovery_sentinel(&exact, &specs).expect("one exact sentinel"),
+            Some(0)
+        );
+
+        let case_alias = vec![PhysicalDirectoryEntryName {
+            name: OsString::from("1234abcd.ef0"),
+            alternate_name: None,
+        }];
+        assert!(select_stale_cursor_recovery_sentinel(&case_alias, &specs).is_err());
+
+        let long_name_alias = vec![PhysicalDirectoryEntryName {
+            name: OsString::from("forged-long-name"),
+            alternate_name: Some(OsString::from("1234ABCD.EF0")),
+        }];
+        assert!(select_stale_cursor_recovery_sentinel(&long_name_alias, &specs).is_err());
+
+        let multiple = vec![
+            exact[0].clone(),
+            PhysicalDirectoryEntryName {
+                name: OsString::from("5678ABCD.EF0"),
+                alternate_name: None,
+            },
+        ];
+        assert!(select_stale_cursor_recovery_sentinel(&multiple, &specs).is_err());
+    }
+
+    #[test]
+    fn stale_sentinel_validation_rejects_forged_or_reparse_entries() {
+        let payload = vec![7; 32];
+        assert!(
+            validate_stale_cursor_recovery_sentinel(
+                FILE_ATTRIBUTE_HIDDEN.0,
+                payload.len() as u64,
+                &payload,
+                &payload,
+            )
+            .is_ok()
+        );
+        let mut forged = payload.clone();
+        forged[0] ^= 1;
+        assert!(
+            validate_stale_cursor_recovery_sentinel(
+                FILE_ATTRIBUTE_HIDDEN.0,
+                forged.len() as u64,
+                &forged,
+                &payload,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_stale_cursor_recovery_sentinel(
+                FILE_ATTRIBUTE_HIDDEN.0 | FILE_ATTRIBUTE_REPARSE_POINT.0,
+                payload.len() as u64,
+                &payload,
+                &payload,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_stale_cursor_recovery_sentinel(0, payload.len() as u64, &payload, &payload,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_sentinel_same_handle_cleanup_succeeds_on_windows_filesystem() {
+        let root = WindowsFilesystemTestDir::new("cursor-recovery-stale-sentinel");
+        let root_wide = wide_path(root.path());
+        let root_handle = unsafe {
+            CreateFileW(
+                PCWSTR(root_wide.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        }
+        .map(OwnedWin32Handle)
+        .expect("open test root");
+        let root_file_id =
+            file_id_for_handle(root_handle.0, root.path()).expect("test root file ID");
+        drop(root_handle);
+
+        let spec = cursor_recovery_sentinel_spec("recovery", "token", "nonce", root_file_id, 1);
+        let stale_path = root.path().join(&spec.name);
+        let stale_wide = wide_path(&stale_path);
+        let stale_handle = unsafe {
+            CreateFileW(
+                PCWSTR(stale_wide.as_ptr()),
+                GENERIC_READ.0 | GENERIC_WRITE.0,
+                FILE_SHARE_MODE(0),
+                None,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_HIDDEN | FILE_FLAG_WRITE_THROUGH,
+                None,
+            )
+        }
+        .map(OwnedWin32Handle)
+        .expect("create stale sentinel fixture");
+        let mut written = 0u32;
+        unsafe {
+            WriteFile(
+                stale_handle.0,
+                Some(&spec.payload),
+                Some(&mut written),
+                None,
+            )
+        }
+        .expect("write stale sentinel fixture");
+        assert_eq!(written as usize, spec.payload.len());
+        unsafe { FlushFileBuffers(stale_handle.0) }.expect("flush stale sentinel fixture");
+        drop(stale_handle);
+
+        assert_eq!(
+            recover_stale_cursor_recovery_sentinel(root.path(), root_file_id, &[spec.clone()])
+                .expect("clean exact stale sentinel"),
+            Some(PathBuf::from(&spec.name))
+        );
+        assert!(!stale_path.exists());
+        assert!(
+            select_stale_cursor_recovery_sentinel(
+                &physical_directory_entries(root.path()).expect("enumerate test root"),
+                &[spec],
+            )
+            .expect("classify cleaned test root")
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_sentinel_removal_batch_is_exact_and_preserves_unrelated_work() {
+        let stale = PathBuf::from("1234ABCD.EF0");
+        let unrelated = PathBuf::from("ordinary.txt");
+        let outcome = classify_stale_cursor_recovery_removal_batch(
+            raw_batch(vec![
+                CloudFilesDirectoryChange::Modified(unrelated.clone()),
+                CloudFilesDirectoryChange::Removed(stale.clone()),
+                CloudFilesDirectoryChange::Added(PathBuf::from("after")),
+            ]),
+            &stale,
+        )
+        .expect("exact stale removal");
+        assert!(outcome.removed);
+        assert_eq!(
+            outcome.preserved.changes,
+            vec![
+                CloudFilesDirectoryChange::Modified(unrelated),
+                CloudFilesDirectoryChange::Added(PathBuf::from("after")),
+            ]
+        );
+        assert!(
+            classify_stale_cursor_recovery_removal_batch(
+                raw_batch(vec![CloudFilesDirectoryChange::Added(stale.clone())]),
+                &stale,
+            )
+            .is_err()
+        );
+        assert!(
+            classify_stale_cursor_recovery_removal_batch(
+                raw_batch(vec![
+                    CloudFilesDirectoryChange::Removed(stale.clone()),
+                    CloudFilesDirectoryChange::Removed(stale),
+                ]),
+                Path::new("1234ABCD.EF0"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recovery_directory_audit_requires_physical_emptiness() {
+        assert!(validate_physically_empty_recovery_directory("/root/empty", &[]).is_ok());
+        assert!(
+            validate_physically_empty_recovery_directory(
+                "/root/nonempty",
+                &[OsString::from("nested-placeholder")],
+            )
+            .is_err()
+        );
     }
 }

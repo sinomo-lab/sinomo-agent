@@ -23,6 +23,23 @@ pub const SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION: &str =
     "sifs.cloud-files.unregister-preserve-state";
 pub const SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY: &str =
     "dfs.sifs.cloud-files.unregister-preserve-state";
+/// Read-only v3 inspection for the one narrowly supported legacy state shape:
+/// a physically empty, unregistered sync root whose private state contains
+/// valid namespace cursors and no other writable evidence.
+pub const SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION: &str =
+    "sifs.cloud-files.recover-cursor-only-state.inspect";
+/// Explicit v3 adoption of the exact snapshot returned by the inspect
+/// operation. This is deliberately distinct from mount and unregister so an
+/// older provider cannot deserialize it as a permissive legacy request.
+pub const SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION: &str =
+    "sifs.cloud-files.recover-cursor-only-state.apply";
+pub const SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY: &str =
+    "dfs.sifs.cloud-files.recover-cursor-only-state.inspect";
+pub const SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY: &str =
+    "dfs.sifs.cloud-files.recover-cursor-only-state.apply";
+pub const CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION: u16 = 1;
+pub const CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN: &str =
+    "sinomo.dfs.cloud-files.cursor-only-recovery.v1";
 pub const CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE: &str = "writable-sync-unsupported";
 pub const CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE: &str =
     "writable-sync-contract-not-ready";
@@ -143,6 +160,47 @@ impl std::error::Error for CloudFilesFetchDataError {}
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum CloudFilesModuleEvent {
     MountLifecycle(CloudFilesMountLifecycleEvent),
+    /// Synchronous durability handshake emitted only after the authorized
+    /// recovery worker is commit-ready. The module must receive a successful
+    /// host callback status before it may clear recovery markers or release
+    /// local capture.
+    CursorRecoveryReadyObserved(CloudFilesCursorRecoveryReadyObservedRequest),
+    /// Synchronous successor emitted after the recovered worker has published
+    /// Active but remains parked before ordinary capture/writeback. The host
+    /// must durably persist ActiveObserved before the module may clear its last
+    /// recovery marker and unpark local synchronization.
+    CursorRecoveryActiveObserved(CloudFilesCursorRecoveryActiveObservedRequest),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorRecoveryReadyObservedRequest {
+    pub schema_version: u16,
+    pub recovery_id: String,
+    pub recovery_token: String,
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub sync_root_file_id: u64,
+    #[serde(default)]
+    pub recovery_cycle: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorRecoveryActiveObservedRequest {
+    pub schema_version: u16,
+    pub recovery_id: String,
+    pub recovery_token: String,
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub sync_root_file_id: u64,
+    #[serde(default)]
+    pub recovery_cycle: u64,
+    /// Domain-separated fingerprint of the exact current native recovery
+    /// marker bytes. The host binds NamespaceFinalized and
+    /// CompletionAuthorized as distinct durable predecessors.
+    pub module_marker_fingerprint: String,
+    /// Domain-separated fingerprint of the canonical ordinary Ready journal
+    /// and unchanged Ready receipt expected after terminal normalization.
+    pub completed_registration_artifacts_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -607,6 +665,48 @@ pub enum CloudFilesModuleRequest {
     Mount(CloudFilesMountRequest),
     Unregister(CloudFilesUnregisterRequest),
     PreserveStateUnregister(CloudFilesUnregisterRequest),
+    InspectCursorOnlyRecovery(CloudFilesCursorOnlyRecoveryInspectRequest),
+    ApplyCursorOnlyRecovery(CloudFilesCursorOnlyRecoveryApplyRequest),
+}
+
+/// Identity supplied by the daemon-owned supervisor to both recovery
+/// operations. The module domain-separates and hashes these fields together
+/// with its owner-defined raw disk inspection. In particular, changing the
+/// selected provider artifact or any disabled mount setting invalidates an
+/// operator's previously inspected token.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorOnlyRecoveryIdentity {
+    pub schema_version: u16,
+    pub enabled: bool,
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub data_dir_root: PathBuf,
+    pub provider_name: String,
+    pub provider_version: String,
+    pub read_only: bool,
+    pub allow_other: bool,
+    pub sync_local_changes: bool,
+    pub prepopulate_depth: u32,
+    pub connect: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_run_seconds: Option<u64>,
+    pub disabled_config_fingerprint: String,
+    pub provider_provenance_fingerprint: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorOnlyRecoveryInspectRequest {
+    pub identity: CloudFilesCursorOnlyRecoveryIdentity,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorOnlyRecoveryApplyRequest {
+    pub identity: CloudFilesCursorOnlyRecoveryIdentity,
+    pub expected_token: String,
+    pub recovery_id: String,
+    /// This field must be true at the native module's final effect boundary;
+    /// the CLI and supervisor checks alone are not authorization.
+    pub acknowledge_authoritative_full_reconciliation: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -618,6 +718,8 @@ pub struct CloudFilesUnregisterRequest {
     pub data_dir_root: Option<PathBuf>,
     #[serde(default = "default_provider_name")]
     pub provider_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
 }
 
 impl CloudFilesUnregisterRequest {
@@ -627,8 +729,22 @@ impl CloudFilesUnregisterRequest {
             root_path: default_root_path(),
             data_dir_root: None,
             provider_name: default_provider_name(),
+            cursor_recovery: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorRecoveryContext {
+    pub recovery_id: String,
+    pub recovery_token: String,
+    pub recovery_cycle: u64,
+    /// Opaque, domain-separated hash of the exact native
+    /// `PreservedStateOwned` successor. It binds a re-enable to the native
+    /// namespace resume class without exposing that private state machine at
+    /// the host API boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_successor_fingerprint: Option<String>,
 }
 
 /// Durable ownership evidence for the one Cloud Files sync root supported by
@@ -676,6 +792,8 @@ pub struct CloudFilesMountRequest {
     pub connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
 }
 
 impl CloudFilesMountRequest {
@@ -691,6 +809,7 @@ impl CloudFilesMountRequest {
             prepopulate_depth: default_prepopulate_depth(),
             connect: default_connect(),
             max_run_seconds: None,
+            cursor_recovery: None,
         }
     }
 
@@ -723,7 +842,33 @@ pub enum CloudFilesModuleResponse {
     Mounted(CloudFilesMountResponse),
     Unregistered(CloudFilesUnregisterResponse),
     StatePreservingUnregistered(CloudFilesPreserveStateUnregisterResponse),
+    CursorOnlyRecoveryInspected(CloudFilesCursorOnlyRecoveryInspection),
+    CursorOnlyRecoveryApplied(CloudFilesCursorOnlyRecoveryApplied),
     Error(CloudFilesModuleError),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorOnlyRecoveryInspection {
+    pub schema_version: u16,
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub sync_root_file_id: u64,
+    pub cursor_count: u64,
+    pub raw_state_fingerprint: String,
+    pub recovery_token: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesCursorOnlyRecoveryApplied {
+    pub schema_version: u16,
+    pub sync_root: PathBuf,
+    pub root_path: String,
+    pub sync_root_file_id: u64,
+    pub cursor_count_cleared: u64,
+    pub recovery_id: String,
+    pub recovery_token: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -755,6 +900,8 @@ pub struct CloudFilesPreserveStateUnregisterResponse {
     pub root_path: String,
     pub was_registered: bool,
     pub outcome: CloudFilesPreserveStateUnregisterOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
     pub detail: String,
 }
 
@@ -1082,6 +1229,140 @@ mod tests {
         assert_eq!(
             CloudFilesModuleRequest::PreserveStateUnregister(request.clone()),
             CloudFilesModuleRequest::PreserveStateUnregister(request)
+        );
+    }
+
+    fn cursor_only_recovery_identity() -> CloudFilesCursorOnlyRecoveryIdentity {
+        CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            enabled: false,
+            sync_root: PathBuf::from(r"C:\SinomoSIFS"),
+            root_path: "/services".to_string(),
+            data_dir_root: PathBuf::from(r"C:\SinomoData"),
+            provider_name: SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME.to_string(),
+            provider_version: "0.1.0".to_string(),
+            read_only: false,
+            allow_other: false,
+            sync_local_changes: true,
+            prepopulate_depth: 0,
+            connect: true,
+            max_run_seconds: None,
+            disabled_config_fingerprint: "blake3:disabled-config".to_string(),
+            provider_provenance_fingerprint: "blake3:provider".to_string(),
+        }
+    }
+
+    #[test]
+    fn cursor_only_recovery_uses_distinct_v3_operations_and_capabilities() {
+        assert_eq!(
+            SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+            "sinomo.dfs.cloud-files.v3"
+        );
+        let operations = [
+            SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
+        ];
+        for (index, operation) in operations.iter().enumerate() {
+            assert!(
+                operations[..index].iter().all(|other| other != operation),
+                "operation names must be pairwise distinct: {operation}"
+            );
+        }
+        assert_ne!(
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY
+        );
+        assert_ne!(
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY
+        );
+        assert_ne!(
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY
+        );
+        assert_eq!(
+            CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN,
+            "sinomo.dfs.cloud-files.cursor-only-recovery.v1"
+        );
+        assert_eq!(CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
+    fn cursor_only_inspect_apply_and_ready_ack_remain_exact_typed_variants() {
+        let identity = cursor_only_recovery_identity();
+        let inspect = CloudFilesModuleRequest::InspectCursorOnlyRecovery(
+            CloudFilesCursorOnlyRecoveryInspectRequest {
+                identity: identity.clone(),
+            },
+        );
+        let apply = CloudFilesModuleRequest::ApplyCursorOnlyRecovery(
+            CloudFilesCursorOnlyRecoveryApplyRequest {
+                identity: identity.clone(),
+                expected_token: "blake3:token".to_string(),
+                recovery_id: "cursor-recovery-blake3-id".to_string(),
+                acknowledge_authoritative_full_reconciliation: true,
+            },
+        );
+        let CloudFilesModuleRequest::InspectCursorOnlyRecovery(inspect_request) = inspect else {
+            panic!("inspect must retain its distinct typed request variant");
+        };
+        assert_eq!(inspect_request.identity, identity);
+        let CloudFilesModuleRequest::ApplyCursorOnlyRecovery(apply_request) = apply else {
+            panic!("apply must retain its distinct typed request variant");
+        };
+        assert_eq!(apply_request.identity, identity);
+        assert_eq!(apply_request.expected_token, "blake3:token");
+        assert_eq!(apply_request.recovery_id, "cursor-recovery-blake3-id");
+        assert!(apply_request.acknowledge_authoritative_full_reconciliation);
+
+        let event = CloudFilesModuleEvent::CursorRecoveryReadyObserved(
+            CloudFilesCursorRecoveryReadyObservedRequest {
+                schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+                recovery_id: apply_request.recovery_id,
+                recovery_token: apply_request.expected_token,
+                sync_root: identity.sync_root.clone(),
+                root_path: identity.root_path.clone(),
+                sync_root_file_id: 42,
+                recovery_cycle: 0,
+            },
+        );
+        let CloudFilesModuleEvent::CursorRecoveryReadyObserved(ready) = event else {
+            panic!("ready acknowledgement must not alias an asynchronous lifecycle event");
+        };
+        assert_eq!(
+            ready.schema_version,
+            CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+        );
+        assert_eq!(ready.sync_root, identity.sync_root);
+        assert_eq!(ready.root_path, identity.root_path);
+        assert_eq!(ready.sync_root_file_id, 42);
+
+        let active = CloudFilesModuleEvent::CursorRecoveryActiveObserved(
+            CloudFilesCursorRecoveryActiveObservedRequest {
+                schema_version: ready.schema_version,
+                recovery_id: ready.recovery_id,
+                recovery_token: ready.recovery_token,
+                sync_root: ready.sync_root.clone(),
+                root_path: ready.root_path.clone(),
+                sync_root_file_id: ready.sync_root_file_id,
+                recovery_cycle: ready.recovery_cycle,
+                module_marker_fingerprint: format!("blake3:{}", "1".repeat(64)),
+                completed_registration_artifacts_fingerprint: format!("blake3:{}", "2".repeat(64)),
+            },
+        );
+        let CloudFilesModuleEvent::CursorRecoveryActiveObserved(active) = active else {
+            panic!("Active acknowledgement must retain its distinct typed event variant");
+        };
+        assert_eq!(active.sync_root, ready.sync_root);
+        assert_eq!(active.root_path, ready.root_path);
+        assert_eq!(active.sync_root_file_id, ready.sync_root_file_id);
+        assert_eq!(active.recovery_cycle, ready.recovery_cycle);
+        assert_ne!(
+            active.module_marker_fingerprint,
+            active.completed_registration_artifacts_fingerprint
         );
     }
 }

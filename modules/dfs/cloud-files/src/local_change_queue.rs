@@ -22,6 +22,9 @@ use sinomo_runtime::storage::durable_file::{
 
 use sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
+
 const QUEUE_SCHEMA_VERSION: u16 = 1;
 const QUEUE_RECORD_MAX_BYTES: usize = 1024 * 1024;
 #[cfg(not(test))]
@@ -359,6 +362,82 @@ impl CloudFilesLocalChangeQueue {
         queue.load_reconciled_retirement_ledger()?;
         queue.requeue_ambiguous_operations()?;
         Ok(queue)
+    }
+
+    pub(crate) fn open_authorized_cursor_recovery(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+    ) -> Result<Self, CloudFilesLocalChangeQueueError> {
+        let mount = mount.into();
+        if mount.trim().is_empty() {
+            return Err(queue_error(
+                "invalid-mount",
+                "mount identity cannot be empty",
+            ));
+        }
+        let root = canonical_sifs_path(&root.into())?;
+        let guard = inspect_cursor_only_local_change_queue(data_dir, &mount, &root)?;
+        if !guard.inspection().scope_present {
+            return Err(queue_error(
+                "cursor-recovery-queue-absent",
+                "authorized recovery requires the canonical pre-existing queue",
+            ));
+        }
+        // Transfer the exact pre-existing lock into the live queue. Calling the
+        // ordinary opener here would drop this fence and then delete a
+        // compaction stage, truncate a torn tail, or requeue ambiguous records
+        // before we could discover that evidence appeared in the gap.
+        let CloudFilesCursorOnlyQueueInspectionGuard {
+            inspection: _,
+            _lock: Some(lock),
+        } = guard
+        else {
+            return Err(queue_error(
+                "cursor-recovery-queue-lock",
+                "authorized recovery lost its pre-existing queue lock",
+            ));
+        };
+        let queue_dir = data_dir
+            .module_runtime_dir()
+            .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .join(QUEUE_DIR)
+            .join(mount_scope_directory(&mount, &root)?);
+        let blobs_dir = queue_dir.join(QUEUE_BLOBS_DIR);
+        let journal_path = queue_dir.join(QUEUE_JOURNAL);
+        let retired_ledger_path = queue_dir.join(QUEUE_RETIRED_LEDGER);
+        let journal = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(false)
+            .open(&journal_path)
+            .map_err(io_error("open exact cursor-recovery queue journal"))?;
+        if journal
+            .metadata()
+            .map_err(io_error("recheck cursor-recovery queue journal"))?
+            .len()
+            != 0
+        {
+            return Err(queue_error(
+                "cursor-recovery-queue-not-empty",
+                "authorized recovery queue journal changed under its owner lock",
+            ));
+        }
+        Ok(Self {
+            mount,
+            root,
+            queue_dir,
+            blobs_dir,
+            journal_path,
+            retired_ledger_path,
+            _lock: lock,
+            journal: Some(journal),
+            next_sequence: 1,
+            journal_record_count: 0,
+            operations: BTreeMap::new(),
+            retired_ledger: ReconciledRetirementLedger::default(),
+            usable: true,
+        })
     }
 
     pub fn queue_dir(&self) -> &Path {
@@ -1418,6 +1497,248 @@ pub(crate) fn fresh_local_change_scope_is_absent(
     }
 }
 
+/// Exact raw evidence accepted by the explicit cursor-only recovery. Unlike
+/// [`CloudFilesLocalChangeQueue::open`], this inspector never creates a scope,
+/// lock, journal, or blob directory and never repairs or requeues anything.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct CloudFilesCursorOnlyQueueInspection {
+    pub scope_present: bool,
+    pub raw_files: BTreeMap<String, Vec<u8>>,
+}
+
+pub(crate) struct CloudFilesCursorOnlyQueueInspectionGuard {
+    inspection: CloudFilesCursorOnlyQueueInspection,
+    _lock: Option<File>,
+}
+
+impl CloudFilesCursorOnlyQueueInspectionGuard {
+    pub(crate) fn inspection(&self) -> &CloudFilesCursorOnlyQueueInspection {
+        &self.inspection
+    }
+}
+
+pub(crate) fn inspect_cursor_only_local_change_queue(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+) -> Result<CloudFilesCursorOnlyQueueInspectionGuard, CloudFilesLocalChangeQueueError> {
+    if mount.trim().is_empty() {
+        return Err(queue_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(root)?;
+    let module_runtime = data_dir.module_runtime_dir();
+    let module_dir = module_runtime.join(SINOMO_DFS_CLOUD_FILES_MODULE_ID);
+    let queue_root = module_dir.join(QUEUE_DIR);
+    let scope_name = mount_scope_directory(mount, &root)?;
+    let scope = queue_root.join(&scope_name);
+    for (label, path) in [
+        ("module runtime", module_runtime.as_path()),
+        ("Cloud Files module", module_dir.as_path()),
+        ("local-change queue", queue_root.as_path()),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata_is_reparse(&metadata) => {}
+            Ok(_) => {
+                return Err(queue_error(
+                    "cursor-recovery-queue-topology",
+                    format!("{label} path {} is not a plain directory", path.display()),
+                ));
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                if label == "local-change queue" {
+                    return Ok(CloudFilesCursorOnlyQueueInspectionGuard {
+                        inspection: CloudFilesCursorOnlyQueueInspection::default(),
+                        _lock: None,
+                    });
+                }
+                return Err(io_error("inspect cursor-only queue parent")(source));
+            }
+            Err(source) => return Err(io_error("inspect cursor-only queue parent")(source)),
+        }
+    }
+    let metadata = match fs::symlink_metadata(&scope) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(&queue_root).is_ok() {
+                return Err(queue_error(
+                    "cursor-recovery-queue-topology",
+                    "local-change queue root exists without the exact mount/root scope",
+                ));
+            }
+            return Ok(CloudFilesCursorOnlyQueueInspectionGuard {
+                inspection: CloudFilesCursorOnlyQueueInspection::default(),
+                _lock: None,
+            });
+        }
+        Err(source) => return Err(io_error("inspect cursor-only queue scope")(source)),
+    };
+    if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+        return Err(queue_error(
+            "cursor-recovery-queue-topology",
+            format!("queue scope {} is not a plain directory", scope.display()),
+        ));
+    }
+    for entry in fs::read_dir(&queue_root).map_err(io_error("list local-change queue root"))? {
+        let entry = entry.map_err(io_error("read local-change queue root entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            queue_error(
+                "cursor-recovery-queue-topology",
+                "local-change queue root contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(io_error("inspect local-change queue root entry"))?;
+        if name != scope_name || !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+            return Err(queue_error(
+                "cursor-recovery-queue-topology",
+                format!("unexpected local-change queue root entry `{name}`"),
+            ));
+        }
+    }
+
+    let lock_path = scope.join(QUEUE_LOCK);
+    let lock_metadata = fs::symlink_metadata(&lock_path)
+        .map_err(io_error("inspect pre-existing cursor-only queue lock"))?;
+    if !lock_metadata.file_type().is_file() || metadata_is_reparse(&lock_metadata) {
+        return Err(queue_error(
+            "cursor-recovery-queue-lock",
+            "queue lock is not a plain pre-existing file",
+        ));
+    }
+    let queue_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(io_error("open pre-existing cursor-only queue lock"))?;
+    queue_lock.try_lock_exclusive().map_err(|source| {
+        queue_error(
+            "cursor-recovery-queue-live",
+            format!("local-change queue is live: {source}"),
+        )
+    })?;
+
+    let mut raw_files = BTreeMap::new();
+    let mut saw_journal = false;
+    let mut saw_lock = false;
+    let mut saw_blobs = false;
+    for entry in fs::read_dir(&scope).map_err(io_error("list cursor-only queue scope"))? {
+        let entry = entry.map_err(io_error("read cursor-only queue scope entry"))?;
+        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|_| {
+            queue_error(
+                "cursor-recovery-queue-topology",
+                "queue scope contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata =
+            fs::symlink_metadata(&path).map_err(io_error("inspect cursor-only queue entry"))?;
+        if metadata_is_reparse(&metadata) {
+            return Err(queue_error(
+                "cursor-recovery-queue-topology",
+                format!("queue scope contains symlink/reparse evidence `{name}`"),
+            ));
+        }
+        match name.as_str() {
+            QUEUE_JOURNAL if metadata.file_type().is_file() => {
+                let bytes = fs::read(&path).map_err(io_error("read cursor-only queue journal"))?;
+                if !bytes.is_empty() {
+                    return Err(queue_error(
+                        "cursor-recovery-queue-not-empty",
+                        "local-change journal contains operation evidence",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+                saw_journal = true;
+            }
+            QUEUE_LOCK if metadata.file_type().is_file() => {
+                let bytes = fs::read(&path).map_err(io_error("read cursor-only queue lock"))?;
+                if !bytes.is_empty() {
+                    return Err(queue_error(
+                        "cursor-recovery-queue-lock",
+                        "queue lock contains unexpected state bytes",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+                saw_lock = true;
+            }
+            QUEUE_BLOBS_DIR if metadata.file_type().is_dir() => {
+                if fs::read_dir(&path)
+                    .map_err(io_error("list cursor-only queue blobs"))?
+                    .next()
+                    .transpose()
+                    .map_err(io_error("read cursor-only queue blob entry"))?
+                    .is_some()
+                {
+                    return Err(queue_error(
+                        "cursor-recovery-queue-not-empty",
+                        "local-change blob directory contains retained content",
+                    ));
+                }
+                saw_blobs = true;
+            }
+            QUEUE_RETIRED_LEDGER if metadata.file_type().is_file() => {
+                let bytes = fs::read(&path)
+                    .map_err(io_error("read cursor-only retired-operation ledger"))?;
+                if bytes.len() as u64 > QUEUE_RETIRED_LEDGER_MAX_BYTES {
+                    return Err(queue_error(
+                        "cursor-recovery-queue-ledger",
+                        "retired-operation ledger exceeds its bound",
+                    ));
+                }
+                let ledger: ReconciledRetirementLedgerSnapshot = decode_sobj(&bytes)
+                    .map_err(sobj_error("decode cursor-only retired-operation ledger"))?;
+                if ledger.schema_version != QUEUE_RETIRED_LEDGER_SCHEMA_VERSION
+                    || !ledger.tombstones.is_empty()
+                    || ledger.next_ordinal != 1
+                    || encode_sobj(&ledger)
+                        .map_err(sobj_error("re-encode cursor-only retired-operation ledger"))?
+                        != bytes
+                {
+                    return Err(queue_error(
+                        "cursor-recovery-queue-not-empty",
+                        "retired-operation ledger contains history or is malformed",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+            }
+            _ => {
+                return Err(queue_error(
+                    "cursor-recovery-queue-topology",
+                    format!("unexpected queue recovery entry `{name}`"),
+                ));
+            }
+        }
+    }
+    if !saw_journal || !saw_lock || !saw_blobs {
+        return Err(queue_error(
+            "cursor-recovery-queue-topology",
+            "existing queue scope is missing its canonical journal, lock, or blobs directory",
+        ));
+    }
+    Ok(CloudFilesCursorOnlyQueueInspectionGuard {
+        inspection: CloudFilesCursorOnlyQueueInspection {
+            scope_present: true,
+            raw_files,
+        },
+        _lock: Some(queue_lock),
+    })
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
 fn stage_reader_in_blobs_dir<R: Read>(
     blobs_dir: &Path,
     mut reader: R,
@@ -1689,6 +2010,47 @@ mod tests {
             .expect("open queue")
     }
 
+    fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn relative_name(root: &Path, path: &Path) -> String {
+            path.strip_prefix(root)
+                .expect("path beneath snapshot root")
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        }
+
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+                let relative = relative_name(root, &path);
+                if metadata.file_type().is_dir() {
+                    snapshot.insert(format!("{relative}/"), None);
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(&path).expect("snapshot file")));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    fn canonical_queue_scope(root: &TestRoot) -> PathBuf {
+        root.data_dir()
+            .module_runtime_dir()
+            .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .join(QUEUE_DIR)
+            .join(mount_scope_directory("mount-a", "/services").expect("queue scope name"))
+    }
+
     #[test]
     fn fresh_scope_probe_is_read_only_and_rejects_even_an_empty_scope() {
         let root = TestRoot::new("fresh-scope-probe");
@@ -1715,6 +2077,131 @@ mod tests {
                 .expect("probe retained scope")
         );
         assert!(scope.exists(), "probe must retain existing evidence");
+    }
+
+    #[test]
+    fn cursor_only_queue_inspection_is_byte_read_only_for_canonical_empty_state() {
+        let root = TestRoot::new("cursor-only-inspection-read-only");
+        drop(queue(&root));
+        let scope = canonical_queue_scope(&root);
+        let before = snapshot_tree(&scope);
+
+        let guard =
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect canonical empty queue");
+        assert!(guard.inspection().scope_present);
+        assert_eq!(
+            guard.inspection().raw_files.get(QUEUE_JOURNAL),
+            Some(&vec![])
+        );
+        assert_eq!(guard.inspection().raw_files.get(QUEUE_LOCK), Some(&vec![]));
+        drop(guard);
+        assert_eq!(snapshot_tree(&scope), before);
+
+        let ledger = ReconciledRetirementLedgerSnapshot {
+            schema_version: QUEUE_RETIRED_LEDGER_SCHEMA_VERSION,
+            next_ordinal: 1,
+            tombstones: Vec::new(),
+        };
+        fs::write(
+            scope.join(QUEUE_RETIRED_LEDGER),
+            encode_sobj(&ledger).expect("encode canonical empty ledger"),
+        )
+        .expect("write canonical empty ledger");
+        let with_ledger_before = snapshot_tree(&scope);
+        let guard =
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect canonical empty queue with ledger");
+        assert!(
+            guard
+                .inspection()
+                .raw_files
+                .contains_key(QUEUE_RETIRED_LEDGER)
+        );
+        drop(guard);
+        assert_eq!(snapshot_tree(&scope), with_ledger_before);
+    }
+
+    #[test]
+    fn cursor_only_queue_inspection_rejects_history_and_unknown_topology_without_mutation() {
+        let root = TestRoot::new("cursor-only-inspection-ledger-history");
+        drop(queue(&root));
+        let scope = canonical_queue_scope(&root);
+        let historical = ReconciledRetirementLedgerSnapshot {
+            schema_version: QUEUE_RETIRED_LEDGER_SCHEMA_VERSION,
+            next_ordinal: 2,
+            tombstones: Vec::new(),
+        };
+        fs::write(
+            scope.join(QUEUE_RETIRED_LEDGER),
+            encode_sobj(&historical).expect("encode historical ledger"),
+        )
+        .expect("write historical ledger");
+        let historical_before = snapshot_tree(&scope);
+        assert!(
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services",)
+                .is_err()
+        );
+        assert_eq!(snapshot_tree(&scope), historical_before);
+
+        let root = TestRoot::new("cursor-only-inspection-unknown-entry");
+        drop(queue(&root));
+        let scope = canonical_queue_scope(&root);
+        fs::write(scope.join("operations.active.slog.stage"), b"torn evidence")
+            .expect("write unknown queue evidence");
+        let unknown_before = snapshot_tree(&scope);
+        assert!(
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services",)
+                .is_err()
+        );
+        assert_eq!(snapshot_tree(&scope), unknown_before);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_transfers_the_exact_lock_without_repairing_evidence() {
+        let root = TestRoot::new("cursor-only-authorized-lock-transfer");
+        drop(queue(&root));
+        let scope = canonical_queue_scope(&root);
+        let before = snapshot_tree(&scope);
+        let authorized = CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+            &root.data_dir(),
+            "mount-a",
+            "/services",
+        )
+        .expect("open canonical queue under the inspection lock");
+        assert_eq!(snapshot_tree(&scope), before);
+        assert_eq!(authorized.next_sequence, 1);
+        assert_eq!(authorized.journal_record_count, 0);
+        assert!(authorized.operations.is_empty());
+        assert_eq!(authorized.retired_ledger.next_ordinal, 1);
+        assert!(
+            CloudFilesLocalChangeQueue::open(&root.data_dir(), "mount-a", "/services").is_err(),
+            "the authorized queue must retain the same exclusive owner lock"
+        );
+        drop(authorized);
+        assert_eq!(snapshot_tree(&scope), before);
+
+        let root = TestRoot::new("cursor-only-authorized-does-not-repair");
+        drop(queue(&root));
+        let scope = canonical_queue_scope(&root);
+        let compaction_stage = scope.join(QUEUE_COMPACTION_STAGE);
+        fs::write(&compaction_stage, b"ambiguous compacted operation evidence")
+            .expect("write abandoned compaction evidence");
+        let before = snapshot_tree(&scope);
+        assert!(
+            CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+                &root.data_dir(),
+                "mount-a",
+                "/services",
+            )
+            .is_err(),
+            "authorized recovery must reject instead of deleting a compaction stage"
+        );
+        assert_eq!(snapshot_tree(&scope), before);
+        assert_eq!(
+            fs::read(compaction_stage).expect("retained compaction evidence"),
+            b"ambiguous compacted operation evidence"
+        );
     }
 
     #[test]

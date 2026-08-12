@@ -22,6 +22,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -294,6 +297,213 @@ impl MountedSifsMutationOutboxStatus {
 #[derive(Clone, Debug)]
 pub struct MountedSifsMutationOutboxStore {
     root: PathBuf,
+}
+
+/// Raw, owner-validated evidence used only by the explicit Cloud Files
+/// cursor-only recovery token. Constructing this value never creates a path,
+/// opens the normal self-healing store, repairs state, prunes history, or
+/// creates a lock file.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MountedSifsMutationOutboxCursorRecoveryInspection {
+    pub outbox_present: bool,
+    pub raw_files: BTreeMap<String, Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_work_latch: Option<MountedSifsMutationCommittedWorkLatch>,
+}
+
+#[derive(Debug)]
+pub struct MountedSifsMutationOutboxCursorRecoveryGuard {
+    inspection: MountedSifsMutationOutboxCursorRecoveryInspection,
+    _store_lock: Option<File>,
+}
+
+impl MountedSifsMutationOutboxCursorRecoveryGuard {
+    pub fn inspection(&self) -> &MountedSifsMutationOutboxCursorRecoveryInspection {
+        &self.inspection
+    }
+}
+
+/// Inspect the outbox in the only state compatible with adopting cursor-only
+/// Cloud Files history: no session, operation, staging, or retired evidence
+/// exists. A pre-existing store lock is acquired without `create` and held by
+/// the returned guard for the complete snapshot/effect fence; its bytes are
+/// included in the evidence.
+pub fn inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(
+    data_dir: &SinomoDataDir,
+) -> Result<MountedSifsMutationOutboxCursorRecoveryGuard, DfsError> {
+    let dfs_root = data_dir.dfs_dir();
+    if let Ok(metadata) = fs::symlink_metadata(&dfs_root)
+        && (!metadata.file_type().is_dir() || cursor_recovery_metadata_is_reparse(&metadata))
+    {
+        return Err(outbox_error(format!(
+            "DFS root {} is not a plain directory",
+            dfs_root.display()
+        )));
+    }
+    let root = dfs_root.join(OUTBOX_DIRECTORY);
+    let root_metadata = match fs::symlink_metadata(&root) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+            return Ok(MountedSifsMutationOutboxCursorRecoveryGuard {
+                inspection: MountedSifsMutationOutboxCursorRecoveryInspection::default(),
+                _store_lock: None,
+            });
+        }
+        Err(source) => return Err(lock_error(&root, source)),
+    };
+    if !root_metadata.file_type().is_dir() || cursor_recovery_metadata_is_reparse(&root_metadata) {
+        return Err(outbox_error(format!(
+            "mounted-mutation outbox {} is not a plain directory",
+            root.display()
+        )));
+    }
+
+    let lock_path = root.join(STORE_LOCK_FILE);
+    let lock_metadata = fs::symlink_metadata(&lock_path).map_err(|source| {
+        outbox_error(format!(
+            "mounted-mutation outbox has no pre-existing store lock {}: {source}",
+            lock_path.display()
+        ))
+    })?;
+    if !lock_metadata.file_type().is_file() || cursor_recovery_metadata_is_reparse(&lock_metadata) {
+        return Err(outbox_error(
+            "mounted-mutation outbox store lock is not a plain file",
+        ));
+    }
+    let store_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(|source| lock_error(&lock_path, source))?;
+    store_lock.try_lock_exclusive().map_err(|source| {
+        outbox_error(format!(
+            "mounted-mutation outbox is not globally quiescent: {source}"
+        ))
+    })?;
+
+    let expected_directories = BTreeSet::from([
+        SESSIONS_DIRECTORY.to_string(),
+        PREPARING_SESSIONS_DIRECTORY.to_string(),
+        OPERATIONS_DIRECTORY.to_string(),
+        PREPARING_OPERATIONS_DIRECTORY.to_string(),
+        RETIRED_SESSIONS_DIRECTORY.to_string(),
+        RETIRED_OPERATIONS_DIRECTORY.to_string(),
+    ]);
+    let expected_files = BTreeSet::from([
+        STORE_LOCK_FILE.to_string(),
+        DAEMON_COMMITTED_WORK_LATCH_FILE.to_string(),
+    ]);
+    let mut observed_directories = BTreeSet::new();
+    let mut observed_files = BTreeSet::new();
+    for entry in fs::read_dir(&root).map_err(|source| lock_error(&root, source))? {
+        let entry = entry.map_err(|source| lock_error(&root, source))?;
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| outbox_error("mounted-mutation outbox contains a non-UTF-8 entry"))?;
+        let metadata = fs::symlink_metadata(&path).map_err(|source| lock_error(&path, source))?;
+        if cursor_recovery_metadata_is_reparse(&metadata) {
+            return Err(outbox_error(format!(
+                "mounted-mutation outbox contains reparse/symlink evidence {}",
+                path.display()
+            )));
+        }
+        if metadata.file_type().is_dir() && expected_directories.contains(&name) {
+            if fs::read_dir(&path)
+                .map_err(|source| lock_error(&path, source))?
+                .next()
+                .transpose()
+                .map_err(|source| lock_error(&path, source))?
+                .is_some()
+            {
+                return Err(outbox_error(format!(
+                    "mounted-mutation outbox recovery requires empty `{name}` evidence"
+                )));
+            }
+            observed_directories.insert(name);
+        } else if metadata.file_type().is_file() && expected_files.contains(&name) {
+            observed_files.insert(name);
+        } else {
+            return Err(outbox_error(format!(
+                "unexpected mounted-mutation outbox recovery entry {}",
+                path.display()
+            )));
+        }
+    }
+    if observed_directories != expected_directories {
+        return Err(outbox_error(
+            "mounted-mutation outbox recovery topology is missing a canonical directory",
+        ));
+    }
+    if !observed_files.contains(STORE_LOCK_FILE) {
+        return Err(outbox_error(
+            "mounted-mutation outbox recovery requires its pre-existing store lock",
+        ));
+    }
+
+    let lock_bytes = fs::read(&lock_path).map_err(|source| lock_error(&lock_path, source))?;
+    if !lock_bytes.is_empty() {
+        return Err(outbox_error(
+            "mounted-mutation outbox lock contains unexpected state bytes",
+        ));
+    }
+    let mut raw_files = BTreeMap::from([(STORE_LOCK_FILE.to_string(), lock_bytes)]);
+    let committed_work_latch = if observed_files.contains(DAEMON_COMMITTED_WORK_LATCH_FILE) {
+        let path = root.join(DAEMON_COMMITTED_WORK_LATCH_FILE);
+        let bytes = fs::read(&path).map_err(|source| lock_error(&path, source))?;
+        if bytes.len() > MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES {
+            return Err(outbox_error(
+                "mounted-mutation committed-work latch exceeds its bound",
+            ));
+        }
+        let latch: MountedSifsMutationCommittedWorkLatch = sinomo_object_serde::from_bytes(&bytes)
+            .map_err(|source| {
+                outbox_error(format!(
+                    "cannot decode mounted-mutation committed-work latch: {source}"
+                ))
+            })?;
+        if latch.schema_version != MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION
+            || (latch.generation == 0 && latch != MountedSifsMutationCommittedWorkLatch::default())
+            || (latch.generation != 0 && latch.updated_at_unix_nanos == 0)
+            || sinomo_object_serde::to_bytes(&latch, 1, LengthMode::U32).map_err(|source| {
+                outbox_error(format!(
+                    "cannot re-encode mounted-mutation committed-work latch: {source}"
+                ))
+            })? != bytes
+        {
+            return Err(outbox_error(
+                "mounted-mutation committed-work latch is not monotonic and valid",
+            ));
+        }
+        raw_files.insert(DAEMON_COMMITTED_WORK_LATCH_FILE.to_string(), bytes);
+        Some(latch)
+    } else {
+        return Err(outbox_error(
+            "mounted-mutation outbox is missing its committed-work latch; absence is possible lost wake ownership",
+        ));
+    };
+
+    Ok(MountedSifsMutationOutboxCursorRecoveryGuard {
+        inspection: MountedSifsMutationOutboxCursorRecoveryInspection {
+            outbox_present: true,
+            raw_files,
+            committed_work_latch,
+        },
+        _store_lock: Some(store_lock),
+    })
+}
+
+#[cfg(windows)]
+fn cursor_recovery_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn cursor_recovery_metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 #[derive(Debug)]
@@ -2704,6 +2914,39 @@ fn outbox_error(message: impl Into<String>) -> DfsError {
 mod tests {
     use super::*;
 
+    fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn relative_name(root: &Path, path: &Path) -> String {
+            path.strip_prefix(root)
+                .expect("path beneath snapshot root")
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        }
+
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+                let relative = relative_name(root, &path);
+                if metadata.file_type().is_dir() {
+                    snapshot.insert(format!("{relative}/"), None);
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(&path).expect("snapshot file")));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
     fn store(label: &str) -> (sinomo_testdir::TestDir, MountedSifsMutationOutboxStore) {
         let root = sinomo_testdir::TestDir::new(label);
         let data_dir = SinomoDataDir::new(root.path());
@@ -2786,6 +3029,81 @@ mod tests {
         assert!(work.namespace_maintenance);
         assert!(work.metadata_replica_progress);
         assert!(work.metadata_materialization);
+    }
+
+    #[test]
+    fn cursor_recovery_inspection_is_byte_read_only_for_default_and_nonzero_latches() {
+        let (root, store) = store("mounted-mutation-cursor-recovery-read-only");
+        let data_dir = SinomoDataDir::new(root.path());
+
+        let default_before = snapshot_tree(store.root());
+        let default_guard = inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .expect("inspect canonical default outbox");
+        assert!(default_guard.inspection().outbox_present);
+        assert_eq!(
+            default_guard.inspection().committed_work_latch,
+            Some(MountedSifsMutationCommittedWorkLatch::default())
+        );
+        assert_eq!(default_guard.inspection().raw_files.len(), 2);
+        drop(default_guard);
+        assert_eq!(snapshot_tree(store.root()), default_before);
+
+        let retained = store
+            .retain_daemon_committed_work(DfsCommittedWork {
+                publish_metadata: true,
+                ..DfsCommittedWork::default()
+            })
+            .expect("retain daemon work");
+        assert!(retained.generation > 0);
+        assert!(retained.updated_at_unix_nanos > 0);
+        let retained_before = snapshot_tree(store.root());
+        let retained_guard = inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .expect("inspect canonical nonzero latch");
+        assert_eq!(
+            retained_guard.inspection().committed_work_latch,
+            Some(retained)
+        );
+        assert_eq!(
+            retained_guard
+                .inspection()
+                .raw_files
+                .get(DAEMON_COMMITTED_WORK_LATCH_FILE),
+            retained_before
+                .get(DAEMON_COMMITTED_WORK_LATCH_FILE)
+                .and_then(Option::as_ref)
+        );
+        drop(retained_guard);
+        assert_eq!(snapshot_tree(store.root()), retained_before);
+    }
+
+    #[test]
+    fn cursor_recovery_inspection_rejects_history_and_malformed_latch_without_mutation() {
+        let (history_root, history_store) = store("mounted-mutation-cursor-recovery-history");
+        let data_dir = SinomoDataDir::new(history_root.path());
+        let retained_path = history_store
+            .root
+            .join(OPERATIONS_DIRECTORY)
+            .join("retained-evidence");
+        fs::write(&retained_path, b"operation evidence").expect("write retained evidence");
+        let history_before = snapshot_tree(history_store.root());
+        assert!(inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir).is_err());
+        assert_eq!(snapshot_tree(history_store.root()), history_before);
+
+        let (root, store) = store("mounted-mutation-cursor-recovery-invalid-latch");
+        let data_dir = SinomoDataDir::new(root.path());
+        let invalid = MountedSifsMutationCommittedWorkLatch {
+            committed_work: DfsCommittedWork {
+                publish_metadata: true,
+                ..DfsCommittedWork::default()
+            },
+            ..MountedSifsMutationCommittedWorkLatch::default()
+        };
+        store
+            .write_daemon_committed_work_latch_unlocked(&invalid)
+            .expect("write canonical but invalid generation-zero latch");
+        let invalid_before = snapshot_tree(store.root());
+        assert!(inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir).is_err());
+        assert_eq!(snapshot_tree(store.root()), invalid_before);
     }
 
     #[test]

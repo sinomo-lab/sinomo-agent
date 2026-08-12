@@ -16,6 +16,10 @@ use sinomo_dfs_cloud_files_api::{
 };
 use sinomo_dfs_cloud_files_api::{
     CloudFilesModuleError, CloudFilesModuleRequest, CloudFilesModuleResponse,
+    SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
+    SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
+    SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY,
+    SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
     SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
     SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
     SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
@@ -278,10 +282,14 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
             SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string(),
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION.to_string(),
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION.to_string(),
         ],
         capabilities: vec![
             "dfs.sifs.cloud-files.unregister-sync-root".to_string(),
             SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY.to_string(),
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY.to_string(),
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY.to_string(),
             "dfs.sifs.cloud-files.lifecycle-status".to_string(),
             "dfs.sifs.cloud-files.writable-sync-v2".to_string(),
         ],
@@ -312,6 +320,8 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
     if request.operation != SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION
         && request.operation != SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
         && request.operation != SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
+        && request.operation != SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION
+        && request.operation != SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION
     {
         return NativeModuleResponse::Error(native_error_response(
             "unsupported-operation",
@@ -349,6 +359,20 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
             CloudFilesModuleRequest::PreserveStateUnregister(request),
         ) => match unregister_sifs_cloud_files_preserving_state(request) {
             Ok(response) => CloudFilesModuleResponse::StatePreservingUnregistered(response),
+            Err(error) => CloudFilesModuleResponse::Error(error),
+        },
+        (
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
+            CloudFilesModuleRequest::InspectCursorOnlyRecovery(request),
+        ) => match inspect_cursor_only_recovery(request) {
+            Ok(response) => CloudFilesModuleResponse::CursorOnlyRecoveryInspected(response),
+            Err(error) => CloudFilesModuleResponse::Error(error),
+        },
+        (
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
+            CloudFilesModuleRequest::ApplyCursorOnlyRecovery(request),
+        ) => match apply_cursor_only_recovery(request) {
+            Ok(response) => CloudFilesModuleResponse::CursorOnlyRecoveryApplied(response),
             Err(error) => CloudFilesModuleResponse::Error(error),
         },
         _ => CloudFilesModuleResponse::Error(CloudFilesModuleError {
@@ -396,6 +420,22 @@ fn unregister_sifs_cloud_files_preserving_state(
     windows_impl::unregister_sifs_cloud_files_preserving_state(request)
 }
 
+#[cfg(windows)]
+fn inspect_cursor_only_recovery(
+    request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest,
+) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError>
+{
+    windows_impl::inspect_cursor_only_recovery(request)
+}
+
+#[cfg(windows)]
+fn apply_cursor_only_recovery(
+    request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError>
+{
+    windows_impl::apply_cursor_only_recovery(request)
+}
+
 #[cfg(not(windows))]
 fn mount_sifs_cloud_files(
     request: sinomo_dfs_cloud_files_api::CloudFilesMountRequest,
@@ -427,6 +467,30 @@ fn unregister_sifs_cloud_files_preserving_state(
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files support is only available in Windows builds".to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn inspect_cursor_only_recovery(
+    _request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest,
+) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError>
+{
+    Err(CloudFilesModuleError {
+        code: "unsupported-platform".to_string(),
+        detail: "Windows Cloud Files cursor recovery is only available in Windows builds"
+            .to_string(),
+    })
+}
+
+#[cfg(not(windows))]
+fn apply_cursor_only_recovery(
+    _request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError>
+{
+    Err(CloudFilesModuleError {
+        code: "unsupported-platform".to_string(),
+        detail: "Windows Cloud Files cursor recovery is only available in Windows builds"
+            .to_string(),
     })
 }
 
@@ -538,6 +602,33 @@ pub(crate) fn host_emit_event(event: &CloudFilesModuleEvent) {
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn host_emit_event_ack(event: &CloudFilesModuleEvent) -> Result<(), String> {
+    let payload_sobj = encode_sobj(event)
+        .map_err(|error| format!("encode acknowledged Cloud Files host event: {error}"))?;
+    let api = HOST_API
+        .lock()
+        .map_err(|_| "Cloud Files host API lock is poisoned".to_string())?
+        .ok_or_else(|| "Cloud Files host API is unavailable".to_string())?;
+    let output_chunk = api
+        .0
+        .output_chunk
+        .ok_or_else(|| "Cloud Files host has no acknowledged output callback".to_string())?;
+    let status = unsafe {
+        output_chunk(
+            api.0.user_data,
+            SinomoModuleByteSlice::from_slice(&payload_sobj),
+        )
+    };
+    if status == SINOMO_MODULE_STATUS_OK {
+        Ok(())
+    } else {
+        Err(format!(
+            "Cloud Files host rejected durable recovery acknowledgement with status {status}"
+        ))
+    }
+}
+
 fn platform_triple() -> String {
     format!(
         "{}-{}-{}",
@@ -576,6 +667,16 @@ mod tests {
                 .contains(&SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string())
         );
         assert!(
+            descriptor.supported_operations.contains(
+                &SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION.to_string()
+            )
+        );
+        assert!(
+            descriptor
+                .supported_operations
+                .contains(&SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION.to_string())
+        );
+        assert!(
             descriptor
                 .capabilities
                 .contains(&"dfs.sifs.cloud-files.unregister-sync-root".to_string())
@@ -584,6 +685,16 @@ mod tests {
             descriptor
                 .capabilities
                 .contains(&SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY.to_string())
+        );
+        assert!(
+            descriptor.capabilities.contains(
+                &SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_CAPABILITY.to_string()
+            )
+        );
+        assert!(
+            descriptor.capabilities.contains(
+                &SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY.to_string()
+            )
         );
         assert!(
             descriptor
@@ -616,38 +727,74 @@ mod tests {
             sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest::new("C:\\SinomoSIFS");
         let unregister = CloudFilesModuleRequest::Unregister(unregister_request.clone());
         let preserve = CloudFilesModuleRequest::PreserveStateUnregister(unregister_request);
-        let cases = [
-            (SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION, unregister.clone()),
-            (SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION, preserve.clone()),
-            (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, mount.clone()),
-            (SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION, preserve),
-            (
-                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
-                mount,
-            ),
-            (
-                SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
-                unregister,
-            ),
+        let recovery_identity = sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version:
+                sinomo_dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            enabled: false,
+            sync_root: "C:\\SinomoSIFS".into(),
+            root_path: "/services".to_string(),
+            data_dir_root: "C:\\SinomoData".into(),
+            provider_name: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                .to_string(),
+            provider_version: env!("CARGO_PKG_VERSION").to_string(),
+            read_only: false,
+            allow_other: false,
+            sync_local_changes: true,
+            prepopulate_depth: 0,
+            connect: true,
+            max_run_seconds: None,
+            disabled_config_fingerprint: "blake3:disabled-config".to_string(),
+            provider_provenance_fingerprint: "blake3:provider".to_string(),
+        };
+        let inspect = CloudFilesModuleRequest::InspectCursorOnlyRecovery(
+            sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest {
+                identity: recovery_identity.clone(),
+            },
+        );
+        let apply = CloudFilesModuleRequest::ApplyCursorOnlyRecovery(
+            sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest {
+                identity: recovery_identity,
+                expected_token: "v1:blake3:token".to_string(),
+                recovery_id: "cursor-recovery-id".to_string(),
+                acknowledge_authoritative_full_reconciliation: true,
+            },
+        );
+        let operations = [
+            SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_INSPECT_OPERATION,
+            SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
         ];
+        let payloads = [mount, unregister, preserve, inspect, apply];
 
-        for (operation, payload) in cases {
-            let response = invoke_cloud_files_operation(NativeModuleInvocationRequest {
-                operation: operation.to_string(),
-                payload_sobj: encode_sobj(&payload).expect("encode mismatched request"),
-                request_body: None,
-                response_body_path: None,
-            });
-            let NativeModuleResponse::Invocation(response) = response else {
-                panic!("mismatched typed payload should return an invocation response");
-            };
-            let decoded = decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
-                .expect("decode mismatch response");
-            let CloudFilesModuleResponse::Error(error) = decoded else {
-                panic!("cross-paired operation and payload must be rejected");
-            };
-            assert_eq!(error.code, "operation-payload-mismatch");
+        let mut rejected = 0;
+        for (operation_index, operation) in operations.into_iter().enumerate() {
+            for (payload_index, payload) in payloads.iter().enumerate() {
+                if operation_index == payload_index {
+                    continue;
+                }
+                rejected += 1;
+                let response = invoke_cloud_files_operation(NativeModuleInvocationRequest {
+                    operation: operation.to_string(),
+                    payload_sobj: encode_sobj(payload).expect("encode mismatched request"),
+                    request_body: None,
+                    response_body_path: None,
+                });
+                let NativeModuleResponse::Invocation(response) = response else {
+                    panic!("mismatched typed payload should return an invocation response");
+                };
+                let decoded = decode_sobj::<CloudFilesModuleResponse>(&response.payload_sobj)
+                    .expect("decode mismatch response");
+                let CloudFilesModuleResponse::Error(error) = decoded else {
+                    panic!(
+                        "operation {operation} accepted cross-paired payload index {payload_index}"
+                    );
+                };
+                assert_eq!(error.code, "operation-payload-mismatch");
+            }
         }
+        assert_eq!(rejected, 20, "the complete 5x5 off-diagonal matrix ran");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1155,6 +1155,56 @@ pub struct CloudFilesStartupScanBatch {
 }
 
 pub trait CloudFilesLocalChangeAccelerator {
+    /// Arm a lossless observer without draining, classifying, staging, or
+    /// enqueueing any local change. The returned epoch is the beginning of the
+    /// recovery audit barrier.
+    fn arm_cursor_recovery_observer(&mut self) -> Result<u64, String>;
+
+    /// Return the current raw observer epoch. Any change, notification
+    /// overflow, or observer failure since the arm epoch must fail closed.
+    fn cursor_recovery_observation_epoch(&self) -> Result<u64, String>;
+
+    /// Complete one marker-bound create/remove round trip on the continuously
+    /// armed observer. The implementation must acknowledge only after parsing
+    /// the complete batches containing both exact sentinel actions and must
+    /// fail on any non-sentinel record, overflow, or observer failure. This is
+    /// a namespace-event fence; the synchronous CFAPI in-sync audit below is
+    /// the corresponding content-state fence.
+    fn cursor_recovery_namespace_fence(
+        &mut self,
+        recovery_id: &str,
+        recovery_token: &str,
+        nonce: &str,
+    ) -> Result<u64, String> {
+        let _ = (recovery_id, recovery_token, nonce);
+        self.cursor_recovery_observation_epoch()
+    }
+
+    /// Read-only final proof for authorized cursor recovery. Implementations
+    /// must verify that every immediate local child is the exact in-sync
+    /// placeholder described by the recovered authoritative manifest, and
+    /// that every projectable immediate authoritative child exists locally.
+    /// This hook must never stage content or classify a local mutation.
+    fn audit_cursor_recovery_root(
+        &mut self,
+        mount: &str,
+        root: &str,
+        remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        cancelled: &AtomicBool,
+    ) -> Result<(), String>;
+
+    /// Release the exact child handles retained by the recovery audit. The
+    /// worker calls this only after synchronous host Ready and durable removal
+    /// of the plan-bound namespace Terminal marker.
+    fn release_cursor_recovery_root_audit(&mut self) {}
+
+    /// Revalidate the parked observer snapshot immediately before the
+    /// namespace Terminal marker is removed. Any post-terminal change,
+    /// overflow, or watcher failure keeps the recovery fail-closed.
+    fn verify_cursor_recovery_root_audit(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Discover local divergence that may have happened while the provider was
     /// stopped. The previous durable manifest distinguishes a true local
     /// delete from a remote path that has never been materialized locally.
@@ -1967,6 +2017,15 @@ pub struct CloudFilesWritableSyncState {
     queue: CloudFilesLocalChangeQueue,
     reconciler: CloudFilesNamespaceReconciler,
     materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
+    authorized_cursor_recovery: bool,
+    cursor_recovery_plan:
+        Option<crate::namespace_reconciler::CloudFilesCursorRecoveryReconciliationPlan>,
+    cursor_recovery_terminal_proof:
+        Option<crate::namespace_reconciler::CloudFilesCursorRecoveryTerminalProof>,
+    cursor_recovery_module_namespace_finalized: bool,
+    cursor_recovery_namespace_rewrite_absent: bool,
+    #[cfg(test)]
+    cursor_recovery_test_bypass: bool,
     ready: bool,
     last_error: Option<CloudFilesModuleError>,
 }
@@ -1993,6 +2052,150 @@ impl CloudFilesWritableSyncState {
             queue,
             reconciler,
             materialization_audit_intents,
+            authorized_cursor_recovery: false,
+            cursor_recovery_plan: None,
+            cursor_recovery_terminal_proof: None,
+            cursor_recovery_module_namespace_finalized: false,
+            cursor_recovery_namespace_rewrite_absent: false,
+            #[cfg(test)]
+            cursor_recovery_test_bypass: false,
+            ready: false,
+            last_error: None,
+        })
+    }
+
+    pub(crate) fn open_authorized_cursor_recovery(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+        plan: &crate::namespace_reconciler::CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<Self, CloudFilesWindowsSyncError> {
+        let mount = mount.into();
+        let root = root.into();
+        let queue = CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+            data_dir,
+            mount.clone(),
+            root.clone(),
+        )
+        .map_err(queue_error)?;
+        let reconciler = CloudFilesNamespaceReconciler::open_authorized_cursor_recovery(
+            data_dir,
+            mount.clone(),
+            root.clone(),
+            plan,
+        )
+        .map_err(reconcile_error)?;
+        let materialization_audit_intents = Arc::new(Mutex::new(
+            CloudFilesMaterializationAuditIntentStore::open(data_dir, mount.clone(), root.clone())
+                .map_err(reconcile_error)?,
+        ));
+        Ok(Self {
+            mount,
+            root,
+            queue,
+            reconciler,
+            materialization_audit_intents,
+            authorized_cursor_recovery: true,
+            cursor_recovery_plan: Some(plan.clone()),
+            cursor_recovery_terminal_proof: None,
+            cursor_recovery_module_namespace_finalized: false,
+            cursor_recovery_namespace_rewrite_absent: false,
+            #[cfg(test)]
+            cursor_recovery_test_bypass: false,
+            ready: false,
+            last_error: None,
+        })
+    }
+
+    pub(crate) fn open_authorized_cursor_recovery_namespace_finalized(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+        plan: &crate::namespace_reconciler::CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<Self, CloudFilesWindowsSyncError> {
+        let mount = mount.into();
+        let root = root.into();
+        let queue = CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+            data_dir,
+            mount.clone(),
+            root.clone(),
+        )
+        .map_err(queue_error)?;
+        let (reconciler, namespace_rewrite_absent) =
+            crate::namespace_reconciler::open_authorized_cursor_recovery_namespace_finalized(
+                data_dir,
+                mount.clone(),
+                root.clone(),
+                plan,
+            )
+            .map_err(reconcile_error)?;
+        let materialization_audit_intents = Arc::new(Mutex::new(
+            CloudFilesMaterializationAuditIntentStore::open(data_dir, mount.clone(), root.clone())
+                .map_err(reconcile_error)?,
+        ));
+        Ok(Self {
+            mount,
+            root,
+            queue,
+            reconciler,
+            materialization_audit_intents,
+            authorized_cursor_recovery: true,
+            cursor_recovery_plan: Some(plan.clone()),
+            cursor_recovery_terminal_proof: None,
+            cursor_recovery_module_namespace_finalized: true,
+            cursor_recovery_namespace_rewrite_absent: namespace_rewrite_absent,
+            #[cfg(test)]
+            cursor_recovery_test_bypass: false,
+            ready: false,
+            last_error: None,
+        })
+    }
+
+    /// Reopens a cycle whose authoritative scan and Terminal rewrite are
+    /// already durable, but whose namespace-finalization handshake did not
+    /// complete. This path requires the rewrite and terminal state and never
+    /// polls the namespace again.
+    pub(crate) fn open_authorized_cursor_recovery_terminal_pending_finalize(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+        plan: &crate::namespace_reconciler::CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<Self, CloudFilesWindowsSyncError> {
+        let mount = mount.into();
+        let root = root.into();
+        let queue = CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+            data_dir,
+            mount.clone(),
+            root.clone(),
+        )
+        .map_err(queue_error)?;
+        let reconciler =
+            crate::namespace_reconciler::open_authorized_cursor_recovery_terminal_pending_finalize(
+                data_dir,
+                mount.clone(),
+                root.clone(),
+                plan,
+            )
+            .map_err(reconcile_error)?;
+        let materialization_audit_intents = Arc::new(Mutex::new(
+            CloudFilesMaterializationAuditIntentStore::open(data_dir, mount.clone(), root.clone())
+                .map_err(reconcile_error)?,
+        ));
+        Ok(Self {
+            mount,
+            root,
+            queue,
+            reconciler,
+            materialization_audit_intents,
+            authorized_cursor_recovery: true,
+            cursor_recovery_plan: Some(plan.clone()),
+            cursor_recovery_terminal_proof: None,
+            // The worker uses this bit to re-establish only the observer/root
+            // proof and reconstruct the Terminal capability without rescanning.
+            cursor_recovery_module_namespace_finalized: true,
+            cursor_recovery_namespace_rewrite_absent: false,
+            #[cfg(test)]
+            cursor_recovery_test_bypass: false,
             ready: false,
             last_error: None,
         })
@@ -2004,6 +2207,82 @@ impl CloudFilesWritableSyncState {
 
     pub fn reconciler(&self) -> &CloudFilesNamespaceReconciler {
         &self.reconciler
+    }
+
+    fn mark_cursor_recovery_terminal(&mut self) -> Result<(), CloudFilesWindowsSyncError> {
+        #[cfg(test)]
+        if self.cursor_recovery_test_bypass {
+            return Ok(());
+        }
+        let plan = self.cursor_recovery_plan.as_ref().ok_or_else(|| {
+            sync_error(
+                "cursor-recovery-plan-missing",
+                "authorized worker lost its exact reconciliation plan",
+            )
+        })?;
+        self.cursor_recovery_terminal_proof =
+            Some(if self.cursor_recovery_namespace_rewrite_absent {
+                self.reconciler
+                    .resume_authorized_cursor_recovery_namespace_finalized_proof(plan)
+                    .map_err(reconcile_error)?
+            } else if self.cursor_recovery_module_namespace_finalized {
+                self.reconciler
+                    .resume_authorized_cursor_recovery_terminal_proof(plan)
+                    .map_err(reconcile_error)?
+            } else {
+                self.reconciler
+                    .mark_authorized_cursor_recovery_terminal(plan)
+                    .map_err(reconcile_error)?
+            });
+        Ok(())
+    }
+
+    fn finalize_cursor_recovery_after_host_ready(
+        &mut self,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        #[cfg(test)]
+        if self.cursor_recovery_test_bypass {
+            return Ok(true);
+        }
+        let plan = self.cursor_recovery_plan.as_ref().ok_or_else(|| {
+            sync_error(
+                "cursor-recovery-plan-missing",
+                "authorized worker lost its exact reconciliation plan",
+            )
+        })?;
+        let terminal = match self.cursor_recovery_terminal_proof.take() {
+            Some(terminal) => terminal,
+            None if self.cursor_recovery_namespace_rewrite_absent => self
+                .reconciler
+                .resume_authorized_cursor_recovery_namespace_finalized_proof(plan)
+                .map_err(reconcile_error)?,
+            None => self
+                .reconciler
+                .resume_authorized_cursor_recovery_terminal_proof(plan)
+                .map_err(reconcile_error)?,
+        };
+        self.reconciler
+            .finalize_authorized_cursor_recovery_after_ready(
+                plan,
+                terminal.authorize_after_host_ready_observed(),
+            )
+            .map_err(reconcile_error)
+    }
+
+    #[cfg(test)]
+    fn authorize_cursor_recovery_for_test(&mut self) {
+        let recovery_id = "cursor-recovery-worker-test";
+        let recovery_token = format!("v1:blake3:{}", "0".repeat(64));
+        self.cursor_recovery_plan =
+            Some(crate::namespace_reconciler::cursor_recovery_plan_fixture(
+                &self.mount,
+                &self.root,
+                recovery_id,
+                &recovery_token,
+                "0123456789abcdef0123456789abcdef",
+            ));
+        self.authorized_cursor_recovery = true;
+        self.cursor_recovery_test_bypass = true;
     }
 
     pub fn materialization_audit_intents(
@@ -2331,12 +2610,130 @@ pub(crate) fn completion_follow_up_request(
     }
 }
 
+const CURSOR_RECOVERY_SCANNING: u8 = 0;
+const CURSOR_RECOVERY_TERMINAL: u8 = 1;
+const CURSOR_RECOVERY_RELEASED: u8 = 2;
+const CURSOR_RECOVERY_ACTIVE_PARKED: u8 = 3;
+const CURSOR_RECOVERY_COMPLETE: u8 = 4;
+
+/// Shared one-way gate between the recovery worker and its Windows owner.
+/// Only the worker may publish Terminal, and the owner may release it only
+/// from that exact phase after the registration rewrite is durable.
+#[derive(Clone)]
+pub(crate) struct CloudFilesCursorRecoveryControl {
+    phase: Arc<AtomicU8>,
+}
+
+impl CloudFilesCursorRecoveryControl {
+    fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicU8::new(CURSOR_RECOVERY_SCANNING)),
+        }
+    }
+
+    pub(crate) fn terminal(&self) -> bool {
+        matches!(
+            self.phase.load(Ordering::SeqCst),
+            CURSOR_RECOVERY_TERMINAL | CURSOR_RECOVERY_RELEASED
+        )
+    }
+
+    pub(crate) fn should_run_immediately(&self) -> bool {
+        matches!(
+            self.phase.load(Ordering::SeqCst),
+            CURSOR_RECOVERY_SCANNING | CURSOR_RECOVERY_RELEASED
+        )
+    }
+
+    pub(crate) fn release(&self) -> Result<(), &'static str> {
+        self.phase
+            .compare_exchange(
+                CURSOR_RECOVERY_TERMINAL,
+                CURSOR_RECOVERY_RELEASED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|phase| match phase {
+                CURSOR_RECOVERY_SCANNING => "cursor recovery is not terminal",
+                CURSOR_RECOVERY_RELEASED
+                | CURSOR_RECOVERY_ACTIVE_PARKED
+                | CURSOR_RECOVERY_COMPLETE => "cursor recovery was already released",
+                _ => "cursor recovery has an invalid phase",
+            })
+    }
+
+    fn mark_terminal(&self) -> Result<(), CloudFilesWindowsSyncError> {
+        self.phase
+            .compare_exchange(
+                CURSOR_RECOVERY_SCANNING,
+                CURSOR_RECOVERY_TERMINAL,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|phase| {
+                sync_error(
+                    "cursor-recovery-phase-invalid",
+                    format!("cannot publish cursor-recovery terminal from phase {phase}"),
+                )
+            })
+    }
+
+    fn released(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == CURSOR_RECOVERY_RELEASED
+    }
+
+    fn active_parked(&self) -> bool {
+        self.phase.load(Ordering::SeqCst) == CURSOR_RECOVERY_ACTIVE_PARKED
+    }
+
+    fn mark_active_parked(&self) -> Result<(), CloudFilesWindowsSyncError> {
+        self.phase
+            .compare_exchange(
+                CURSOR_RECOVERY_RELEASED,
+                CURSOR_RECOVERY_ACTIVE_PARKED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|phase| {
+                sync_error(
+                    "cursor-recovery-phase-invalid",
+                    format!("cannot park recovered Active worker from phase {phase}"),
+                )
+            })
+    }
+
+    pub(crate) fn complete_after_host_active(&self) -> Result<(), &'static str> {
+        self.phase
+            .compare_exchange(
+                CURSOR_RECOVERY_ACTIVE_PARKED,
+                CURSOR_RECOVERY_COMPLETE,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map(|_| ())
+            .map_err(|phase| match phase {
+                CURSOR_RECOVERY_SCANNING | CURSOR_RECOVERY_TERMINAL => {
+                    "cursor recovery has not published parked Active"
+                }
+                CURSOR_RECOVERY_RELEASED => "cursor recovery release pass has not completed",
+                CURSOR_RECOVERY_COMPLETE => "cursor recovery was already completed",
+                _ => "cursor recovery has an invalid phase",
+            })
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CloudFilesWritableSyncProgress {
     pub captures_enqueued: u64,
     pub mutation_progress: Vec<CloudFilesSyncExecutionProgress>,
     pub namespace_progress: Vec<CloudFilesNamespaceReconcileProgress>,
     pub full_scan_applied: bool,
+    /// Distinct from ordinary Active progress. The worker remains Starting
+    /// and parked until its owner durably completes the recovery rewrite.
+    pub cursor_recovery_terminal: bool,
 }
 
 /// Cooperative worker shell. The Windows owner may run it on a dedicated
@@ -2347,6 +2744,7 @@ pub struct CloudFilesWritableSyncWorker<C, D, F, E> {
     mutations: D,
     namespace: F,
     effects: E,
+    cursor_recovery: Option<CloudFilesCursorRecoveryControl>,
     full_scan_pending: bool,
     startup_scan_baseline: Option<BTreeMap<String, CloudFilesReconciledManifestEntry>>,
 }
@@ -2365,12 +2763,16 @@ where
         namespace: F,
         effects: E,
     ) -> Self {
+        let cursor_recovery = state
+            .authorized_cursor_recovery
+            .then(CloudFilesCursorRecoveryControl::new);
         Self {
             state,
             capture,
             mutations,
             namespace,
             effects,
+            cursor_recovery,
             full_scan_pending: false,
             startup_scan_baseline: None,
         }
@@ -2378,6 +2780,31 @@ where
 
     pub fn state(&self) -> &CloudFilesWritableSyncState {
         &self.state
+    }
+
+    pub(crate) fn cursor_recovery_control(&self) -> Option<CloudFilesCursorRecoveryControl> {
+        self.cursor_recovery.clone()
+    }
+
+    pub(crate) fn finalize_cursor_recovery_after_host_ready(
+        &mut self,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        if !self
+            .cursor_recovery
+            .as_ref()
+            .is_some_and(CloudFilesCursorRecoveryControl::terminal)
+        {
+            return Err(sync_error(
+                "cursor-recovery-not-terminal",
+                "host Ready cannot finalize a nonterminal recovery worker",
+            ));
+        }
+        self.capture
+            .verify_cursor_recovery_root_audit()
+            .map_err(capture_sync_error("cursor-recovery-root-audit-final"))?;
+        let finalized = self.state.finalize_cursor_recovery_after_host_ready()?;
+        self.capture.release_cursor_recovery_root_audit();
+        Ok(finalized)
     }
 
     pub fn startup(
@@ -2395,6 +2822,9 @@ where
         &mut self,
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        if self.cursor_recovery_is_armed() {
+            return self.run_authorized_cursor_recovery(cancelled);
+        }
         check_cancelled(cancelled)?;
         self.mutations.ensure_contracts_ready().map_err(|detail| {
             sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
@@ -2454,6 +2884,9 @@ where
         &mut self,
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        if self.cursor_recovery_is_armed() {
+            return self.run_authorized_cursor_recovery(cancelled);
+        }
         if !self.state.ready && !self.full_scan_pending && self.startup_scan_baseline.is_none() {
             return Err(sync_error(
                 "worker-not-ready",
@@ -2542,6 +2975,213 @@ where
         }
         self.run_maintenance()?;
         Ok(progress)
+    }
+
+    fn cursor_recovery_is_armed(&self) -> bool {
+        self.cursor_recovery
+            .as_ref()
+            .is_some_and(|control| control.phase.load(Ordering::SeqCst) != CURSOR_RECOVERY_COMPLETE)
+    }
+
+    fn ensure_cursor_recovery_queue_empty(&self) -> Result<(), CloudFilesWindowsSyncError> {
+        if self.state.queue.operations().next().is_some() {
+            return Err(sync_error(
+                "cursor-recovery-queue-not-empty",
+                "authorized cursor recovery cannot run while any local operation exists",
+            ));
+        }
+        Ok(())
+    }
+
+    fn run_authorized_cursor_recovery(
+        &mut self,
+        cancelled: &AtomicBool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        self.ensure_cursor_recovery_queue_empty()?;
+        let control = self.cursor_recovery.clone().ok_or_else(|| {
+            sync_error(
+                "cursor-recovery-control-missing",
+                "authorized cursor recovery lost its worker control",
+            )
+        })?;
+
+        if control.released() {
+            return self.finish_released_cursor_recovery(cancelled, &control);
+        }
+        if control.active_parked() {
+            return Ok(CloudFilesWritableSyncProgress::default());
+        }
+        if control.terminal() {
+            return Ok(CloudFilesWritableSyncProgress {
+                cursor_recovery_terminal: true,
+                ..CloudFilesWritableSyncProgress::default()
+            });
+        }
+
+        // NamespaceFinalized is a durable successor to host Ready. Its inner
+        // Terminal rewrite may still be present or may already be removed.
+        // In either cut, re-establish only the observer/fence/root-audit proof;
+        // never rerun or mutate the authoritative scan after the successor is
+        // durable.
+        if self.state.cursor_recovery_module_namespace_finalized {
+            if !self.state.reconciler.cursor_recovery_terminal()
+                || self.state.reconciler.materialized_directories()
+                    != &BTreeSet::from([self.state.root.clone()])
+            {
+                return Err(sync_error(
+                    "cursor-recovery-namespace-finalized-invalid",
+                    "NamespaceFinalized recovery lost its exact terminal root-only state",
+                ));
+            }
+            return self.establish_cursor_recovery_terminal_proof(cancelled, &control);
+        }
+
+        self.mutations.ensure_contracts_ready().map_err(|detail| {
+            sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
+        })?;
+        let snapshot = self.full_scan_snapshot(cancelled)?;
+        if snapshot.scan_complete && snapshot.cursors.is_empty() {
+            return Err(sync_error(
+                "cursor-recovery-terminal-cursor-missing",
+                "authorized cursor recovery reached a terminal scan without a namespace cursor",
+            ));
+        }
+        if !snapshot.scan_complete && !snapshot.cursors.is_empty() {
+            return Err(sync_error(
+                "cursor-recovery-partial-cursor",
+                "authorized cursor recovery received a cursor before its terminal scan delta",
+            ));
+        }
+        let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+        let progress = CloudFilesWritableSyncProgress {
+            full_scan_applied: true,
+            ..CloudFilesWritableSyncProgress::default()
+        };
+        if !scan_complete {
+            return Ok(progress);
+        }
+        if !self.state.reconciler.cursor_recovery_terminal()
+            || self.state.reconciler.materialized_directories()
+                != &BTreeSet::from([self.state.root.clone()])
+        {
+            return Err(sync_error(
+                "cursor-recovery-terminal-incomplete",
+                "terminal cursor recovery did not durably clear the full-scan request, materialize only the depth-0 root, and leave no inflight namespace effect",
+            ));
+        }
+        self.ensure_cursor_recovery_queue_empty()?;
+        let mut terminal = self.establish_cursor_recovery_terminal_proof(cancelled, &control)?;
+        terminal.full_scan_applied = progress.full_scan_applied;
+        Ok(terminal)
+    }
+
+    fn establish_cursor_recovery_terminal_proof(
+        &mut self,
+        cancelled: &AtomicBool,
+        control: &CloudFilesCursorRecoveryControl,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        self.ensure_cursor_recovery_queue_empty()?;
+        self.capture
+            .arm_cursor_recovery_observer()
+            .map_err(capture_sync_error("cursor-recovery-observer-start"))?;
+        let pre_audit_epoch = self
+            .capture
+            .cursor_recovery_namespace_fence(
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .ok_or_else(|| {
+                        sync_error(
+                            "cursor-recovery-plan-missing",
+                            "authorized cursor recovery lost its reconciliation plan",
+                        )
+                    })?
+                    .recovery_id,
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .expect("cursor recovery plan checked above")
+                    .recovery_token,
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .expect("cursor recovery plan checked above")
+                    .nonce,
+            )
+            .map_err(capture_sync_error("cursor-recovery-namespace-fence"))?;
+        self.capture
+            .audit_cursor_recovery_root(
+                &self.state.mount,
+                &self.state.root,
+                self.state.reconciler.manifest(),
+                cancelled,
+            )
+            .map_err(capture_sync_error("cursor-recovery-root-audit"))?;
+        let post_audit_epoch = self
+            .capture
+            .cursor_recovery_namespace_fence(
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .expect("cursor recovery plan remains owned")
+                    .recovery_id,
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .expect("cursor recovery plan remains owned")
+                    .recovery_token,
+                &self
+                    .state
+                    .cursor_recovery_plan
+                    .as_ref()
+                    .expect("cursor recovery plan remains owned")
+                    .nonce,
+            )
+            .map_err(capture_sync_error("cursor-recovery-namespace-fence"))?;
+        if post_audit_epoch != pre_audit_epoch {
+            return Err(sync_error(
+                "cursor-recovery-local-change-observed",
+                "local change raced the terminal recovery-root audit",
+            ));
+        }
+        check_cancelled(cancelled)?;
+        self.ensure_cursor_recovery_queue_empty()?;
+        self.state.mark_cursor_recovery_terminal()?;
+        control.mark_terminal()?;
+        Ok(CloudFilesWritableSyncProgress {
+            cursor_recovery_terminal: true,
+            ..CloudFilesWritableSyncProgress::default()
+        })
+    }
+
+    fn finish_released_cursor_recovery(
+        &mut self,
+        cancelled: &AtomicBool,
+        control: &CloudFilesCursorRecoveryControl,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        check_cancelled(cancelled)?;
+        self.ensure_cursor_recovery_queue_empty()?;
+        self.mutations.ensure_contracts_ready().map_err(|detail| {
+            sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
+        })?;
+        self.capture
+            .activate()
+            .map_err(|detail| sync_error("read-directory-changes-start", detail))?;
+        // Publication of Active is a separate pass boundary from all local
+        // classification and writeback. The newly active watcher closes the
+        // observation gap; the next ordinary pass performs the startup scan
+        // against this exact recovered baseline.
+        self.startup_scan_baseline = Some(self.state.reconciler.manifest().clone());
+        self.state.authorized_cursor_recovery = false;
+        self.state.mark_ready();
+        control.mark_active_parked()?;
+        Ok(CloudFilesWritableSyncProgress::default())
     }
 
     fn finish_startup_local_scan(
@@ -4971,6 +5611,12 @@ mod tests {
     struct FakeCapture {
         batches: VecDeque<Result<CloudFilesCapturedChangeBatch, String>>,
         activated: Arc<AtomicBool>,
+        startup_scan_calls: Arc<AtomicUsize>,
+        drain_calls: Arc<AtomicUsize>,
+        recovery_audit_calls: Arc<AtomicUsize>,
+        recovery_audit_error: Option<String>,
+        recovery_observation_epoch: Arc<AtomicU64>,
+        recovery_audit_records_change: bool,
         require_activation_before_scan: bool,
         startup_batches: VecDeque<CloudFilesStartupScanBatch>,
         startup_captures: Vec<CloudFilesCapturedLocalChange>,
@@ -4978,12 +5624,38 @@ mod tests {
     }
 
     impl CloudFilesLocalChangeAccelerator for FakeCapture {
+        fn arm_cursor_recovery_observer(&mut self) -> Result<u64, String> {
+            let epoch = self.recovery_observation_epoch.load(Ordering::SeqCst);
+            self.activate()?;
+            Ok(epoch)
+        }
+
+        fn cursor_recovery_observation_epoch(&self) -> Result<u64, String> {
+            Ok(self.recovery_observation_epoch.load(Ordering::SeqCst))
+        }
+
+        fn audit_cursor_recovery_root(
+            &mut self,
+            _mount: &str,
+            _root: &str,
+            _remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            _cancelled: &AtomicBool,
+        ) -> Result<(), String> {
+            self.recovery_audit_calls.fetch_add(1, Ordering::SeqCst);
+            if self.recovery_audit_records_change {
+                self.recovery_observation_epoch
+                    .fetch_add(1, Ordering::SeqCst);
+            }
+            self.recovery_audit_error.clone().map_or(Ok(()), Err)
+        }
+
         fn startup_scan(
             &mut self,
             _previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
             _remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
             _cancelled: &AtomicBool,
         ) -> Result<CloudFilesStartupScanBatch, String> {
+            self.startup_scan_calls.fetch_add(1, Ordering::SeqCst);
             if self.require_activation_before_scan && !self.activated.load(Ordering::SeqCst) {
                 return Err("startup scan ran before change capture was active".to_string());
             }
@@ -5011,6 +5683,7 @@ mod tests {
             _manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
             _cancelled: &AtomicBool,
         ) -> Result<CloudFilesCapturedChangeBatch, String> {
+            self.drain_calls.fetch_add(1, Ordering::SeqCst);
             self.batches.pop_front().unwrap_or_else(|| {
                 Ok(CloudFilesCapturedChangeBatch {
                     changes: Vec::new(),
@@ -5024,6 +5697,7 @@ mod tests {
     struct FakeBackend {
         readiness_error: Option<String>,
         calls: Vec<CloudFilesLocalOperationKind>,
+        call_count: Arc<AtomicUsize>,
         reconcile_calls: usize,
         outcome: CloudFilesDfsMutationOutcome,
         reconciliation: CloudFilesDfsMutationReconciliation,
@@ -5034,6 +5708,7 @@ mod tests {
             Self {
                 readiness_error: None,
                 calls: Vec::new(),
+                call_count: Arc::new(AtomicUsize::new(0)),
                 reconcile_calls: 0,
                 outcome: CloudFilesDfsMutationOutcome::Ambiguous {
                     detail: "test outcome".to_string(),
@@ -5051,6 +5726,7 @@ mod tests {
             kind: CloudFilesLocalOperationKind,
         ) -> Result<CloudFilesDfsMutationOutcome, String> {
             self.calls.push(kind);
+            self.call_count.fetch_add(1, Ordering::SeqCst);
             Ok(self.outcome.clone())
         }
     }
@@ -5115,6 +5791,7 @@ mod tests {
         scans: VecDeque<Result<CloudFilesFullScanSnapshot, String>>,
         batches: VecDeque<Result<Vec<CloudFilesNamespaceFeedBatch>, String>>,
         scan_calls: Arc<AtomicUsize>,
+        poll_calls: Arc<AtomicUsize>,
         resolved: BTreeMap<String, CloudFilesReconciledManifestEntry>,
         materialization_audit_intents:
             Option<Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>>,
@@ -5126,6 +5803,7 @@ mod tests {
                 scans: scans.into_iter().map(Ok).collect(),
                 batches: VecDeque::new(),
                 scan_calls: Arc::new(AtomicUsize::new(0)),
+                poll_calls: Arc::new(AtomicUsize::new(0)),
                 resolved: BTreeMap::new(),
                 materialization_audit_intents: None,
             }
@@ -5148,6 +5826,7 @@ mod tests {
             _root: &str,
             _cursors: &[CloudFilesNamespaceCursor],
         ) -> Result<Vec<CloudFilesNamespaceFeedBatch>, String> {
+            self.poll_calls.fetch_add(1, Ordering::SeqCst);
             self.batches.pop_front().unwrap_or_else(|| Ok(Vec::new()))
         }
 
@@ -5261,6 +5940,374 @@ mod tests {
                 Ok(())
             }
         }
+    }
+
+    fn cursor_recovery_snapshot(sequence: u64, scan_complete: bool) -> CloudFilesFullScanSnapshot {
+        let mut snapshot = snapshot(sequence);
+        snapshot.materialized_directories = vec!["/services".to_string()];
+        snapshot.scan_complete = scan_complete;
+        if !scan_complete {
+            snapshot.cursors.clear();
+        }
+        snapshot
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_gates_all_local_writeback_until_terminal_release() {
+        let root = TestRoot::new("cursor-recovery-gate");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+
+        let activated = Arc::new(AtomicBool::new(false));
+        let startup_scan_calls = Arc::new(AtomicUsize::new(0));
+        let drain_calls = Arc::new(AtomicUsize::new(0));
+        let recovery_audit_calls = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture {
+            activated: Arc::clone(&activated),
+            startup_scan_calls: Arc::clone(&startup_scan_calls),
+            drain_calls: Arc::clone(&drain_calls),
+            recovery_audit_calls: Arc::clone(&recovery_audit_calls),
+            ..FakeCapture::default()
+        };
+        let backend = FakeBackend::default();
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let namespace = FakeNamespace::with_scans([
+            cursor_recovery_snapshot(1, false),
+            cursor_recovery_snapshot(2, true),
+        ]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let poll_calls = Arc::clone(&namespace.poll_calls);
+        let effects = FakeEffects::default();
+        let effect_calls = Arc::clone(&effects.full_scan_effects);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            effects,
+        );
+        let control = worker.cursor_recovery_control().expect("recovery control");
+        assert_eq!(control.release(), Err("cursor recovery is not terminal"));
+        assert!(control.should_run_immediately());
+
+        let cancelled = AtomicBool::new(false);
+        let first = worker.startup(&cancelled).expect("partial recovery scan");
+        assert!(first.full_scan_applied);
+        assert!(!first.cursor_recovery_terminal);
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Starting
+        );
+        assert!(!worker.state().is_ready());
+        assert!(!activated.load(Ordering::SeqCst));
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+
+        let terminal = worker.run_once(&cancelled).expect("terminal recovery scan");
+        assert!(terminal.full_scan_applied);
+        assert!(terminal.cursor_recovery_terminal);
+        assert!(control.terminal());
+        assert!(!control.should_run_immediately());
+        assert_eq!(recovery_audit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Starting
+        );
+        assert!(!worker.state().is_ready());
+        assert!(activated.load(Ordering::SeqCst));
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+
+        let parked = worker.run_once(&cancelled).expect("parked terminal pass");
+        assert!(parked.cursor_recovery_terminal);
+        assert!(!parked.full_scan_applied);
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(effect_calls.lock().expect("effects").len(), 2);
+        assert_eq!(recovery_audit_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+
+        control.release().expect("durable owner release");
+        assert!(control.should_run_immediately());
+        let released = worker.run_once(&cancelled).expect("released startup pass");
+        assert!(!released.cursor_recovery_terminal);
+        assert!(worker.state().is_ready());
+        assert_eq!(
+            worker.state().status().mode,
+            CloudFilesLocalChangeSyncMode::Active
+        );
+        assert!(activated.load(Ordering::SeqCst));
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+        assert!(!control.should_run_immediately());
+
+        let still_parked = worker
+            .run_once(&cancelled)
+            .expect("Active remains parked before durable host acknowledgement");
+        assert_eq!(still_parked, CloudFilesWritableSyncProgress::default());
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        control
+            .complete_after_host_active()
+            .expect("durable host ActiveObserved completion");
+
+        worker
+            .run_once(&cancelled)
+            .expect("post-Ready local classification pass");
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_rejects_terminal_without_cursor_before_effects() {
+        let root = TestRoot::new("cursor-recovery-empty-terminal-cursor");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+        let capture = FakeCapture::default();
+        let recovery_audit_calls = Arc::clone(&capture.recovery_audit_calls);
+        let mut invalid = cursor_recovery_snapshot(1, true);
+        invalid.cursors.clear();
+        let effects = FakeEffects::default();
+        let effect_calls = Arc::clone(&effects.full_scan_effects);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([invalid]),
+            effects,
+        );
+
+        let error = worker
+            .startup(&AtomicBool::new(false))
+            .expect_err("empty terminal cursor must fail closed");
+        assert_eq!(error.code, "cursor-recovery-terminal-cursor-missing");
+        assert!(effect_calls.lock().expect("effects").is_empty());
+        assert_eq!(recovery_audit_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_never_publishes_terminal_when_root_audit_fails() {
+        let root = TestRoot::new("cursor-recovery-root-audit");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+        let capture = FakeCapture {
+            recovery_audit_error: Some("local root contains offline.txt".to_string()),
+            ..FakeCapture::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([cursor_recovery_snapshot(1, true)]),
+            FakeEffects::default(),
+        );
+        let control = worker.cursor_recovery_control().expect("recovery control");
+
+        let error = worker
+            .startup(&AtomicBool::new(false))
+            .expect_err("root audit must fail closed");
+        assert_eq!(error.code, "cursor-recovery-root-audit");
+        assert!(!control.terminal());
+        assert_eq!(control.release(), Err("cursor recovery is not terminal"));
+        assert!(!worker.state().is_ready());
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_never_publishes_terminal_when_local_change_races_audit() {
+        let root = TestRoot::new("cursor-recovery-audit-race");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+        let activated = Arc::new(AtomicBool::new(false));
+        let recovery_observation_epoch = Arc::new(AtomicU64::new(0));
+        let capture = FakeCapture {
+            activated: Arc::clone(&activated),
+            recovery_observation_epoch: Arc::clone(&recovery_observation_epoch),
+            recovery_audit_records_change: true,
+            ..FakeCapture::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([cursor_recovery_snapshot(1, true)]),
+            FakeEffects::default(),
+        );
+        let control = worker.cursor_recovery_control().expect("recovery control");
+
+        let error = worker
+            .startup(&AtomicBool::new(false))
+            .expect_err("observer barrier must catch the audit race");
+        assert_eq!(error.code, "cursor-recovery-local-change-observed");
+        assert!(activated.load(Ordering::SeqCst));
+        assert_eq!(recovery_observation_epoch.load(Ordering::SeqCst), 1);
+        assert!(!control.terminal());
+        assert_eq!(control.release(), Err("cursor recovery is not terminal"));
+        assert!(!worker.state().is_ready());
+    }
+
+    #[test]
+    fn post_commit_ready_change_stays_buffered_until_after_release_and_active_progress() {
+        let root = TestRoot::new("cursor-recovery-buffered-after-cut");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+        let observation_epoch = Arc::new(AtomicU64::new(0));
+        let startup_scan_calls = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture {
+            recovery_observation_epoch: Arc::clone(&observation_epoch),
+            startup_scan_calls: Arc::clone(&startup_scan_calls),
+            startup_captures: vec![create_capture("post-cut-local-create", b"local")],
+            ..FakeCapture::default()
+        };
+        let backend = FakeBackend::default();
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let namespace = FakeNamespace::with_scans([cursor_recovery_snapshot(1, true)]);
+        let poll_calls = Arc::clone(&namespace.poll_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            FakeEffects::default(),
+        );
+        let control = worker.cursor_recovery_control().expect("recovery control");
+        let cancelled = AtomicBool::new(false);
+
+        let terminal = worker
+            .startup(&cancelled)
+            .expect("commit-ready recovery cut");
+        assert!(terminal.cursor_recovery_terminal);
+        observation_epoch.fetch_add(1, Ordering::SeqCst);
+        let parked = worker
+            .run_once(&cancelled)
+            .expect("post-cut event remains parked");
+        assert!(parked.cursor_recovery_terminal);
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+
+        control.release().expect("durable Ready owner release");
+        worker
+            .run_once(&cancelled)
+            .expect("publish Active without classification");
+        assert!(worker.state().is_ready());
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 0);
+        control
+            .complete_after_host_active()
+            .expect("durable host ActiveObserved completion");
+
+        let post_ready = worker
+            .run_once(&cancelled)
+            .expect("classify buffered local change after Active");
+        assert_eq!(post_ready.captures_enqueued, 1);
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn crash_after_commit_ready_reaudits_local_evidence_before_any_restart_upload() {
+        let root = TestRoot::new("cursor-recovery-crash-after-cut");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state.authorize_cursor_recovery_for_test();
+        let observation_epoch = Arc::new(AtomicU64::new(0));
+        let mut first = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture {
+                recovery_observation_epoch: Arc::clone(&observation_epoch),
+                ..FakeCapture::default()
+            },
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([cursor_recovery_snapshot(1, true)]),
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        assert!(
+            first
+                .startup(&cancelled)
+                .expect("first commit-ready cut")
+                .cursor_recovery_terminal
+        );
+        // The watcher observed a local mutation after commit-ready, but the
+        // process dies before the owner can durably publish Ready or release.
+        observation_epoch.fetch_add(1, Ordering::SeqCst);
+        drop(first);
+
+        let mut reopened =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                .expect("reopen recovery state after crash");
+        reopened.authorize_cursor_recovery_for_test();
+        let startup_scan_calls = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture {
+            startup_scan_calls: Arc::clone(&startup_scan_calls),
+            recovery_audit_error: Some("restart audit found post-cut local evidence".to_string()),
+            ..FakeCapture::default()
+        };
+        let backend = FakeBackend::default();
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let mut restarted = CloudFilesWritableSyncWorker::new(
+            reopened,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(backend),
+            FakeNamespace::with_scans([cursor_recovery_snapshot(2, true)]),
+            FakeEffects::default(),
+        );
+
+        let error = restarted
+            .startup(&cancelled)
+            .expect_err("restart must re-audit before Ready");
+        assert_eq!(error.code, "cursor-recovery-root-audit");
+        assert!(!restarted.state().is_ready());
+        assert_eq!(startup_scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(restarted.state().queue().operations().count(), 0);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_rejects_any_preexisting_queue_operation() {
+        let root = TestRoot::new("cursor-recovery-nonempty-queue");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state
+            .enqueue_capture(create_capture("recovery-must-not-upload", b"offline"))
+            .expect("seed queued local operation");
+        state.authorize_cursor_recovery_for_test();
+        let backend = FakeBackend::default();
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let namespace = FakeNamespace::with_scans([cursor_recovery_snapshot(1, true)]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            FakeEffects::default(),
+        );
+
+        let error = worker
+            .startup(&AtomicBool::new(false))
+            .expect_err("armed queue must be exactly empty");
+        assert_eq!(error.code, "cursor-recovery-queue-not-empty");
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
     }
 
     fn content() -> CloudFilesDfsMutationContent {

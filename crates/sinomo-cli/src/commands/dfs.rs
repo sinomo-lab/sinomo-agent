@@ -117,8 +117,16 @@ pub(crate) struct DfsConflictSaveVersionOptions {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsMountOptions {
     Mount(DfsHostMountOptions),
-    Status { json: bool },
-    Disable { json: bool },
+    Status {
+        json: bool,
+    },
+    Disable {
+        json: bool,
+    },
+    RecoverCursorOnlyState {
+        request: sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest,
+        json: bool,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -472,6 +480,19 @@ fn dfs_cli_spec() -> CliCommandSpec {
                         "--disable",
                         "disable the local supervised mount while preserving its identity",
                     ),
+                    CliOptionSpec::flag(
+                        "--recover-cursor-only-state",
+                        "inspect or explicitly adopt retained Windows Cloud Files cursor-only state",
+                    ),
+                    option(
+                        "--expected-token",
+                        "exact cursor-only recovery token returned by inspection",
+                        "token",
+                    ),
+                    CliOptionSpec::flag(
+                        "--acknowledge-authoritative-full-reconciliation",
+                        "authorize clearing retained cursors and rebuilding them by authoritative full reconciliation",
+                    ),
                     json(),
                     option("--root", "SIFS root path", "path").with_aliases(["--path"]),
                     option("--data-dir", "Sinomo data directory", "path"),
@@ -809,15 +830,28 @@ pub(crate) fn parse_dfs_schema_for_test(args: &[String]) -> Result<DfsCliCommand
 fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOptions, CliParseError> {
     let status = matches.contains("--status");
     let disable = matches.contains("--disable");
-    if status && disable {
+    let recover_cursor_only_state = matches.contains("--recover-cursor-only-state");
+    let expected_token = matches.value("--expected-token");
+    let acknowledge_authoritative_full_reconciliation =
+        matches.contains("--acknowledge-authoritative-full-reconciliation");
+    if !recover_cursor_only_state
+        && (expected_token.is_some() || acknowledge_authoritative_full_reconciliation)
+    {
         return Err(CliParseError::Parse {
-            detail: "dfs mount cannot combine --status and --disable".to_string(),
+            detail: "dfs mount --expected-token and --acknowledge-authoritative-full-reconciliation require --recover-cursor-only-state"
+                .to_string(),
         });
     }
-    if status || disable {
+    if usize::from(status) + usize::from(disable) + usize::from(recover_cursor_only_state) > 1 {
+        return Err(CliParseError::Parse {
+            detail: "dfs mount requires exactly one of --status, --disable, or --recover-cursor-only-state"
+                .to_string(),
+        });
+    }
+    if status || disable || recover_cursor_only_state {
         if !matches.positionals().is_empty() {
             return Err(CliParseError::Parse {
-                detail: "dfs mount --status and --disable do not accept a mount-point".to_string(),
+                detail: "dfs mount control operations do not accept a mount-point".to_string(),
             });
         }
         const MOUNT_ONLY_OPTIONS: [&str; 8] = [
@@ -837,23 +871,65 @@ fn parse_dfs_mount_matches(matches: &CliCommandMatches) -> Result<DfsMountOption
             return Err(CliParseError::Parse {
                 detail: format!(
                     "dfs mount {} cannot be combined with mount option {option}",
-                    if status { "--status" } else { "--disable" }
+                    if status {
+                        "--status"
+                    } else if disable {
+                        "--disable"
+                    } else {
+                        "--recover-cursor-only-state"
+                    }
                 ),
             });
         }
-        return Ok(if status {
-            DfsMountOptions::Status {
+        return Ok(match (status, disable) {
+            (true, false) => DfsMountOptions::Status {
                 json: matches.contains("--json"),
-            }
-        } else {
-            DfsMountOptions::Disable {
+            },
+            (false, true) => DfsMountOptions::Disable {
                 json: matches.contains("--json"),
+            },
+            (false, false) => {
+                let request = match (
+                    expected_token,
+                    acknowledge_authoritative_full_reconciliation,
+                ) {
+                    (None, false) => {
+                        sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest::Inspect
+                    }
+                    (Some(expected_token), true)
+                        if !expected_token.trim().is_empty()
+                            && expected_token.trim() == expected_token =>
+                    {
+                        sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest::Apply {
+                            expected_token: expected_token.to_string(),
+                            acknowledge_authoritative_full_reconciliation: true,
+                        }
+                    }
+                    (Some(_), true) => {
+                        return Err(CliParseError::Parse {
+                            detail: "dfs mount --expected-token must be non-empty without surrounding whitespace"
+                                .to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(CliParseError::Parse {
+                            detail: "dfs mount cursor-only recovery apply requires both --expected-token and --acknowledge-authoritative-full-reconciliation; omit both for read-only inspection"
+                                .to_string(),
+                        });
+                    }
+                };
+                DfsMountOptions::RecoverCursorOnlyState {
+                    request,
+                    json: matches.contains("--json"),
+                }
             }
+            (true, true) => unreachable!("mutually exclusive mount controls were rejected"),
         });
     }
     if matches.contains("--json") {
         return Err(CliParseError::Parse {
-            detail: "dfs mount --json requires --status or --disable".to_string(),
+            detail: "dfs mount --json requires --status, --disable, or --recover-cursor-only-state"
+                .to_string(),
         });
     }
     if matches.contains("--foreground") && matches.contains("--background") {
@@ -2377,10 +2453,19 @@ fn publish_dfs_metadata_journal_from_data_dir(
 }
 
 const DFS_MOUNT_LOCAL_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Cursor recovery is supervisor-serialized and may need to replay durable
+// authorization cuts. Keep the client budget above the supervisor's bounded
+// control wait so an ordinary 5-second timeout cannot hide a successful Apply.
+const DFS_MOUNT_CURSOR_RECOVERY_RPC_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(90);
 const DFS_MOUNT_STATUS_RPC_CATEGORY: &str = "sifs-mount-supervisor";
 
 trait DfsMountSupervisorControl {
     fn live_status(&self) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError>;
+    fn recover_cursor_only_state(
+        &self,
+        request: &sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest,
+    ) -> Result<sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse, CliError>;
     fn mount_config(&self) -> Result<sinomo_runtime::dfs::SifsMountConfig, CliError>;
     fn write_mount_config(
         &self,
@@ -2421,6 +2506,24 @@ impl DfsMountSupervisorControl for LocalDfsMountSupervisorControl {
             .status)
     }
 
+    fn recover_cursor_only_state(
+        &self,
+        request: &sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest,
+    ) -> Result<sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse, CliError> {
+        let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
+            sinomo_runtime::dfs::SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE,
+            DFS_MOUNT_STATUS_RPC_CATEGORY,
+            request,
+        )?
+        .with_trace_context_if_missing();
+        self.daemon
+            .clone()
+            .with_timeout(DFS_MOUNT_CURSOR_RECOVERY_RPC_TIMEOUT)
+            .call_request(&request)?
+            .decode_body::<sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse>()
+            .map_err(Into::into)
+    }
+
     fn mount_config(&self) -> Result<sinomo_runtime::dfs::SifsMountConfig, CliError> {
         use sinomo_runtime::config::ConfigClientExt as _;
 
@@ -2450,6 +2553,13 @@ fn query_live_dfs_mount_status(
     control: &dyn DfsMountSupervisorControl,
 ) -> Result<sinomo_runtime::dfs::SifsMountRuntimeStatus, CliError> {
     control.live_status()
+}
+
+fn request_cursor_only_recovery(
+    control: &dyn DfsMountSupervisorControl,
+    request: &sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest,
+) -> Result<sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse, CliError> {
+    control.recover_cursor_only_state(request)
 }
 
 fn disable_managed_dfs_mount(
@@ -2500,11 +2610,69 @@ fn run_dfs_mount_disable_command(json: bool) -> Result<(), CliError> {
     }
 }
 
+fn print_cursor_only_recovery_response(
+    response: &sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse,
+    json: bool,
+) -> Result<(), CliError> {
+    use sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryResponse;
+
+    if json {
+        return print_json("<dfs-mount-cursor-only-recovery>", response);
+    }
+    match response {
+        SifsMountCursorOnlyRecoveryResponse::Inspected {
+            recovery_token,
+            raw_state_fingerprint,
+            sync_root_file_id,
+            cursor_count,
+            provider_content_hash,
+            provider_interface_version,
+            detail,
+        } => {
+            println!("Windows Cloud Files cursor-only recovery inspection:");
+            println!("  recovery token: {recovery_token}");
+            println!("  raw state fingerprint: {raw_state_fingerprint}");
+            println!("  sync-root file ID: {sync_root_file_id}");
+            println!("  retained cursors: {cursor_count}");
+            println!("  provider content hash: {provider_content_hash}");
+            println!("  provider interface: {provider_interface_version}");
+            println!("  detail: {detail}");
+        }
+        SifsMountCursorOnlyRecoveryResponse::Applied {
+            recovery_id,
+            recovery_token,
+            sync_root_file_id,
+            cursor_count_cleared,
+            detail,
+        } => {
+            println!("Windows Cloud Files cursor-only recovery was authorized:");
+            println!("  recovery ID: {recovery_id}");
+            println!("  recovery token: {recovery_token}");
+            println!("  sync-root file ID: {sync_root_file_id}");
+            println!("  cursors cleared under durable ownership: {cursor_count_cleared}");
+            println!("  detail: {detail}");
+        }
+    }
+    Ok(())
+}
+
+fn run_dfs_mount_cursor_only_recovery_command(
+    request: sinomo_runtime::dfs::SifsMountCursorOnlyRecoveryRequest,
+    json: bool,
+) -> Result<(), CliError> {
+    let control = LocalDfsMountSupervisorControl::connect()?;
+    let response = request_cursor_only_recovery(&control, &request)?;
+    print_cursor_only_recovery_response(&response, json)
+}
+
 pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliError> {
     validate_dfs_mount_options_for_platform(&options)?;
     match options {
         DfsMountOptions::Status { json } => run_dfs_mount_status_command(json),
         DfsMountOptions::Disable { json } => run_dfs_mount_disable_command(json),
+        DfsMountOptions::RecoverCursorOnlyState { request, json } => {
+            run_dfs_mount_cursor_only_recovery_command(request, json)
+        }
         DfsMountOptions::Mount(options) => run_dfs_host_mount_command(options),
     }
 }
@@ -2583,6 +2751,19 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
 pub(crate) fn validate_dfs_mount_options_for_platform(
     options: &DfsMountOptions,
 ) -> Result<(), CliError> {
+    if matches!(options, DfsMountOptions::RecoverCursorOnlyState { .. }) {
+        #[cfg(not(windows))]
+        {
+            return Err(CliError::Parse {
+                detail: "`--recover-cursor-only-state` is only supported by Windows Cloud Files"
+                    .to_string(),
+            });
+        }
+        #[cfg(windows)]
+        {
+            return Ok(());
+        }
+    }
     let DfsMountOptions::Mount(options) = options else {
         return Ok(());
     };
@@ -2616,10 +2797,14 @@ mod dfs_mount_tests {
     use std::cell::{Cell, RefCell};
 
     use super::{
-        DfsHostMountOptions, DfsMountOptions, DfsMountSupervisorControl, disable_managed_dfs_mount,
-        query_live_dfs_mount_status, run_dfs_mount_command,
+        DfsCliCommand, DfsHostMountOptions, DfsMountOptions, DfsMountSupervisorControl,
+        disable_managed_dfs_mount, parse_dfs_schema_for_test, query_live_dfs_mount_status,
+        request_cursor_only_recovery, run_dfs_mount_command,
     };
-    use sinomo_runtime::dfs::{SifsMountConfig, SifsMountRuntimePhase, SifsMountRuntimeStatus};
+    use sinomo_runtime::dfs::{
+        SifsMountConfig, SifsMountCursorOnlyRecoveryRequest, SifsMountCursorOnlyRecoveryResponse,
+        SifsMountRuntimePhase, SifsMountRuntimeStatus,
+    };
     #[cfg(not(windows))]
     use sinomo_runtime::local::SinomoDataDir;
 
@@ -2628,6 +2813,8 @@ mod dfs_mount_tests {
         live_error: Option<&'static str>,
         config: SifsMountConfig,
         live_calls: Cell<usize>,
+        cursor_recovery_requests: RefCell<Vec<SifsMountCursorOnlyRecoveryRequest>>,
+        cursor_recovery_response: SifsMountCursorOnlyRecoveryResponse,
         config_reads: Cell<usize>,
         config_writes: RefCell<Vec<SifsMountConfig>>,
     }
@@ -2639,6 +2826,16 @@ mod dfs_mount_tests {
                 live_error: None,
                 config,
                 live_calls: Cell::new(0),
+                cursor_recovery_requests: RefCell::new(Vec::new()),
+                cursor_recovery_response: SifsMountCursorOnlyRecoveryResponse::Inspected {
+                    recovery_token: "cursor-recovery-token".to_string(),
+                    raw_state_fingerprint: "blake3:cursor-state".to_string(),
+                    sync_root_file_id: 42,
+                    cursor_count: 2,
+                    provider_content_hash: "blake3:provider".to_string(),
+                    provider_interface_version: "sinomo.dfs.cloud-files.v3".to_string(),
+                    detail: "eligible cursor-only state".to_string(),
+                },
                 config_reads: Cell::new(0),
                 config_writes: RefCell::new(Vec::new()),
             }
@@ -2654,6 +2851,16 @@ mod dfs_mount_tests {
                 });
             }
             Ok(self.live_status.clone())
+        }
+
+        fn recover_cursor_only_state(
+            &self,
+            request: &SifsMountCursorOnlyRecoveryRequest,
+        ) -> Result<SifsMountCursorOnlyRecoveryResponse, crate::CliError> {
+            self.cursor_recovery_requests
+                .borrow_mut()
+                .push(request.clone());
+            Ok(self.cursor_recovery_response.clone())
         }
 
         fn mount_config(&self) -> Result<SifsMountConfig, crate::CliError> {
@@ -2725,7 +2932,128 @@ mod dfs_mount_tests {
         assert_eq!(disabled, expected);
         assert_eq!(control.config_reads.get(), 1);
         assert_eq!(control.live_calls.get(), 0);
+        assert!(control.cursor_recovery_requests.borrow().is_empty());
         assert_eq!(control.config_writes.borrow().as_slice(), &[expected]);
+    }
+
+    #[test]
+    fn cursor_only_recovery_parser_builds_only_inspect_or_fully_authorized_apply_requests() {
+        assert_eq!(
+            parse_dfs_schema_for_test(&[
+                "mount".to_string(),
+                "--recover-cursor-only-state".to_string(),
+                "--json".to_string(),
+            ])
+            .expect("parse read-only cursor recovery inspection"),
+            DfsCliCommand::Mount(DfsMountOptions::RecoverCursorOnlyState {
+                request: SifsMountCursorOnlyRecoveryRequest::Inspect,
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse_dfs_schema_for_test(&[
+                "mount".to_string(),
+                "--recover-cursor-only-state".to_string(),
+                "--expected-token".to_string(),
+                "cursor-recovery-token".to_string(),
+                "--acknowledge-authoritative-full-reconciliation".to_string(),
+            ])
+            .expect("parse explicitly authorized cursor recovery"),
+            DfsCliCommand::Mount(DfsMountOptions::RecoverCursorOnlyState {
+                request: SifsMountCursorOnlyRecoveryRequest::Apply {
+                    expected_token: "cursor-recovery-token".to_string(),
+                    acknowledge_authoritative_full_reconciliation: true,
+                },
+                json: false,
+            })
+        );
+
+        for invalid in [
+            vec![
+                "mount",
+                "--recover-cursor-only-state",
+                "--expected-token",
+                "cursor-recovery-token",
+            ],
+            vec![
+                "mount",
+                "--recover-cursor-only-state",
+                "--acknowledge-authoritative-full-reconciliation",
+            ],
+            vec!["mount", "--expected-token", "cursor-recovery-token"],
+            vec!["mount", "--acknowledge-authoritative-full-reconciliation"],
+            vec!["mount", "--recover-cursor-only-state", "--status"],
+            vec!["mount", "--recover-cursor-only-state", "--disable"],
+            vec!["mount", "--recover-cursor-only-state", "C:\\SinomoSIFS"],
+            vec![
+                "mount",
+                "--recover-cursor-only-state",
+                "--root",
+                "/services",
+            ],
+            vec!["mount", "--recover-cursor-only-state", "--background"],
+            vec![
+                "mount",
+                "--recover-cursor-only-state",
+                "--expected-token",
+                " cursor-recovery-token",
+                "--acknowledge-authoritative-full-reconciliation",
+            ],
+        ] {
+            assert!(
+                parse_dfs_schema_for_test(
+                    &invalid.into_iter().map(str::to_string).collect::<Vec<_>>()
+                )
+                .is_err(),
+                "partial or mixed cursor-only recovery unexpectedly parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_only_recovery_forwards_exact_request_without_mount_or_config_effects() {
+        let control = FakeMountSupervisorControl::new(
+            SifsMountRuntimeStatus::default(),
+            SifsMountConfig::default(),
+        );
+        let inspect = SifsMountCursorOnlyRecoveryRequest::Inspect;
+        let expected_response = control.cursor_recovery_response.clone();
+        assert_eq!(
+            request_cursor_only_recovery(&control, &inspect).expect("inspect recovery state"),
+            expected_response
+        );
+        assert_eq!(
+            control.cursor_recovery_requests.borrow().as_slice(),
+            &[inspect]
+        );
+        assert_eq!(control.live_calls.get(), 0);
+        assert_eq!(control.config_reads.get(), 0);
+        assert!(control.config_writes.borrow().is_empty());
+
+        let apply = SifsMountCursorOnlyRecoveryRequest::Apply {
+            expected_token: "cursor-recovery-token".to_string(),
+            acknowledge_authoritative_full_reconciliation: true,
+        };
+        request_cursor_only_recovery(&control, &apply).expect("apply recovery state");
+        assert_eq!(
+            control.cursor_recovery_requests.borrow().as_slice(),
+            &[SifsMountCursorOnlyRecoveryRequest::Inspect, apply]
+        );
+        assert_eq!(control.live_calls.get(), 0);
+        assert_eq!(control.config_reads.get(), 0);
+        assert!(control.config_writes.borrow().is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cursor_only_recovery_is_rejected_off_windows_before_rpc_effects() {
+        let options = DfsMountOptions::RecoverCursorOnlyState {
+            request: SifsMountCursorOnlyRecoveryRequest::Inspect,
+            json: false,
+        };
+        let error = super::validate_dfs_mount_options_for_platform(&options)
+            .expect_err("cursor recovery must remain Windows-only");
+        assert!(error.to_string().contains("Windows Cloud Files"));
     }
 
     #[cfg(not(windows))]

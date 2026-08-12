@@ -3,7 +3,7 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{OsStr, c_void};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::MetadataExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -14,7 +14,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_dfs_cloud_files_api::{
+    CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION, CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN,
+    CloudFilesCursorOnlyRecoveryApplied, CloudFilesCursorOnlyRecoveryApplyRequest,
+    CloudFilesCursorOnlyRecoveryIdentity, CloudFilesCursorOnlyRecoveryInspectRequest,
+    CloudFilesCursorOnlyRecoveryInspection, CloudFilesCursorRecoveryContext,
     CloudFilesFetchDataError, CloudFilesLocalChangeSyncMode, CloudFilesLocalChangeSyncStatus,
     CloudFilesModuleError, CloudFilesModuleEvent, CloudFilesMountLifecycleEvent,
     CloudFilesMountRequest, CloudFilesMountResponse, CloudFilesPlaceholderIdentity,
@@ -68,7 +73,11 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::{GUID, HRESULT, PCWSTR};
 
-use crate::namespace_reconciler::CloudFilesMaterializationAuditIntentStore;
+use crate::local_change_queue::inspect_cursor_only_local_change_queue;
+use crate::namespace_reconciler::{
+    CloudFilesCursorRecoveryReconciliationPlan, CloudFilesMaterializationAuditIntentStore,
+    inspect_cursor_only_reconciliation_state, resume_authorized_cursor_recovery,
+};
 use crate::registration_journal::{
     REGISTRATION_IDENTITY_MAX_BYTES, RegistrationJournal, RegistrationOwnershipDisposition,
     RegistrationPhase, RegistrationRecoveryAction,
@@ -80,7 +89,8 @@ use crate::windows_sync::{
 };
 use crate::{
     DecodedCloudFilesPlaceholderIdentity, decode_placeholder_identity, encode_placeholder_identity,
-    host_emit_event, host_is_cancelled, host_log, placeholder_identity_mismatch,
+    host_emit_event, host_emit_event_ack, host_is_cancelled, host_log,
+    placeholder_identity_mismatch,
 };
 
 #[path = "windows_adapter.rs"]
@@ -93,6 +103,11 @@ const CLOUD_FILES_PROVIDER_ID_TEXT: &str = "a318f9ce140b41bc9e44d0f154459584";
 const CLOUD_FILES_REGISTRATION_RECEIPT_FILE: &str = "registration.sobj";
 const CLOUD_FILES_REGISTRATION_JOURNAL_FILE: &str = "registration-journal.sobj";
 const CLOUD_FILES_REGISTRATION_LOCK_FILE: &str = "registration.lock";
+const CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE: &str = "cursor-recovery-control.sobj";
+const CLOUD_FILES_CURSOR_RECOVERY_MODULE_TEMP_LABEL: &str = "cursor-recovery-marker-next";
+const CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
+const CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 /// One Cloud Files DFS call must yield to cancellation promptly. Higher-level
 /// DFS operations may request longer deadlines, but this provider clamps each
 /// routed call and observes cancellation between bounded work items.
@@ -381,6 +396,7 @@ enum RecoveredRegistration {
 struct RecoveredUnregister {
     was_registered: bool,
     ownership: RegistrationOwnershipDisposition,
+    cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -389,15 +405,197 @@ enum UnregisterPolicy {
     PreserveState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoveryPreserveContextRelation {
+    Current,
+    PredecessorRetry,
+}
+
 struct RegistrationActivation {
     data_dir: SinomoDataDir,
     journal: RegistrationJournal,
     state_owned: bool,
     armed: bool,
+    terminal_completion_handoff: bool,
 }
 
 struct RegistrationLease {
     _file: fs::File,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CursorRecoveryModulePhase {
+    Authorized,
+    Validated,
+    StateOwned,
+    ReconcileArmed,
+    Ready,
+    NamespaceFinalized,
+    CompletionAuthorized,
+    PreserveAuthorized,
+    PreservedStateOwned,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum CursorRecoveryNamespaceResume {
+    /// The authoritative root scan has not yet durably reached Terminal.
+    #[default]
+    ReconcileProgress,
+    /// Terminal reconciliation is durable, but its rewrite still awaits the
+    /// synchronous Ready/host finalization handshake.
+    TerminalPendingFinalize,
+    /// Namespace finalization was durably authorized. The Terminal rewrite may
+    /// be present or absent, and no later recovery cycle may rescan remotely.
+    Finalized,
+}
+
+fn cursor_recovery_namespace_resume_is_monotonic(
+    authorized: CursorRecoveryNamespaceResume,
+    current: CursorRecoveryNamespaceResume,
+) -> bool {
+    matches!(
+        (authorized, current),
+        (
+            CursorRecoveryNamespaceResume::ReconcileProgress,
+            CursorRecoveryNamespaceResume::ReconcileProgress
+                | CursorRecoveryNamespaceResume::TerminalPendingFinalize
+                | CursorRecoveryNamespaceResume::Finalized
+        ) | (
+            CursorRecoveryNamespaceResume::TerminalPendingFinalize,
+            CursorRecoveryNamespaceResume::TerminalPendingFinalize
+                | CursorRecoveryNamespaceResume::Finalized
+        ) | (
+            CursorRecoveryNamespaceResume::Finalized,
+            CursorRecoveryNamespaceResume::Finalized
+        )
+    )
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct CursorRecoveryModuleMarker {
+    schema_version: u16,
+    identity: CloudFilesCursorOnlyRecoveryIdentity,
+    recovery_id: String,
+    recovery_token: String,
+    raw_state_fingerprint: String,
+    registration_lock_bytes: Vec<u8>,
+    module_topology: Vec<String>,
+    queue_raw_files: BTreeMap<String, Vec<u8>>,
+    reconciliation_raw_files: BTreeMap<String, Vec<u8>>,
+    outbox_raw_files: BTreeMap<String, Vec<u8>>,
+    sync_root_file_id: u64,
+    registration_nonce: String,
+    plan: CloudFilesCursorRecoveryReconciliationPlan,
+    #[serde(default)]
+    recovery_cycle: u64,
+    /// Stable cycle commitment. PreserveAuthorized/PreservedStateOwned retain
+    /// the predecessor cycle's commitment for lost-response replay; the
+    /// PSO->ReconcileArmed transition replaces it with the hash of the exact
+    /// PSO image and later same-cycle phases retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cycle_authorization_fingerprint: Option<String>,
+    /// Exact preceding-cycle commitment carried through the successor cycle.
+    /// It is part of the PSO hash and authorizes only a lost-response retry of
+    /// the already-durable preserve intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predecessor_cycle_fingerprint: Option<String>,
+    /// Immutable namespace resume class captured at PreserveAuthorized. The
+    /// live class may only advance; successor hashing always resets to this
+    /// authorized predecessor.
+    #[serde(default)]
+    cycle_authorized_namespace_resume: CursorRecoveryNamespaceResume,
+    #[serde(default)]
+    namespace_resume: CursorRecoveryNamespaceResume,
+    phase: CursorRecoveryModulePhase,
+}
+
+struct CursorRecoveryRawInspection {
+    identity: CloudFilesCursorOnlyRecoveryIdentity,
+    data_dir: SinomoDataDir,
+    sync_root_file_id: u64,
+    raw_state_fingerprint: String,
+    recovery_token: String,
+    registration_lock_bytes: Vec<u8>,
+    module_topology: Vec<String>,
+    queue_raw_files: BTreeMap<String, Vec<u8>>,
+    reconciliation_raw_files: BTreeMap<String, Vec<u8>>,
+    outbox_raw_files: BTreeMap<String, Vec<u8>>,
+    reconciliation: crate::namespace_reconciler::CloudFilesCursorOnlyReconciliationInspectionGuard,
+    root_fence: CursorRecoveryRootFence,
+    _registration_lease: RegistrationLease,
+    _queue: crate::local_change_queue::CloudFilesCursorOnlyQueueInspectionGuard,
+    _outbox: dfs::MountedSifsMutationOutboxCursorRecoveryGuard,
+}
+
+struct CursorRecoveryOwnerGuards {
+    _queue: crate::local_change_queue::CloudFilesCursorOnlyQueueInspectionGuard,
+    _outbox: dfs::MountedSifsMutationOutboxCursorRecoveryGuard,
+}
+
+fn acquire_cursor_recovery_empty_owner_guards(
+    data_dir: &SinomoDataDir,
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<CursorRecoveryOwnerGuards, CloudFilesModuleError> {
+    // Keep the same outbox -> queue -> reconciliation order used by the raw
+    // recovery snapshot. Each inspector retains its owner lock, so no work can
+    // appear between strict Terminal proof and the module successor fsync.
+    let outbox = dfs::inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(data_dir).map_err(
+        |error| CloudFilesModuleError {
+            code: "cursor-recovery-outbox".to_string(),
+            detail: error.to_string(),
+        },
+    )?;
+    if !outbox.inspection().outbox_present {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-outbox-absent".to_string(),
+            detail: "terminal successor lost its canonical empty outbox owner".to_string(),
+        });
+    }
+    if outbox.inspection().raw_files != marker.outbox_raw_files {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-outbox-drift".to_string(),
+            detail: "terminal successor outbox bytes changed from the token-bound snapshot"
+                .to_string(),
+        });
+    }
+    let queue = inspect_cursor_only_local_change_queue(
+        data_dir,
+        &marker.identity.sync_root.to_string_lossy(),
+        &marker.identity.root_path,
+    )
+    .map_err(|error| CloudFilesModuleError {
+        code: error.code.to_string(),
+        detail: error.detail,
+    })?;
+    if !queue.inspection().scope_present {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-queue-absent".to_string(),
+            detail: "terminal successor lost its canonical empty local-change queue".to_string(),
+        });
+    }
+    if queue.inspection().raw_files != marker.queue_raw_files {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-queue-drift".to_string(),
+            detail: "terminal successor queue bytes changed from the token-bound snapshot"
+                .to_string(),
+        });
+    }
+    Ok(CursorRecoveryOwnerGuards {
+        _queue: queue,
+        _outbox: outbox,
+    })
+}
+
+struct CursorRecoveryRootFence {
+    _handle: OwnedWin32Handle,
+    file_id: u64,
+}
+
+struct RegistrationArtifactSnapshot<T> {
+    current: Option<T>,
+    temporary: Option<T>,
 }
 
 impl RegistrationLease {
@@ -442,6 +640,137 @@ impl RegistrationLease {
             })?;
         Ok(Self { _file: file })
     }
+
+    /// Read-only inspection may serialize against a pre-existing registration
+    /// owner but must never create the module directory or lock file.
+    fn acquire_existing_for_inspection(
+        data_dir: &SinomoDataDir,
+    ) -> Result<(Self, Vec<u8>), CloudFilesModuleError> {
+        let path = data_dir
+            .module_runtime_dir()
+            .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .join(CLOUD_FILES_REGISTRATION_LOCK_FILE);
+        let metadata = fs::symlink_metadata(&path).map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-registration-lock".to_string(),
+            detail: format!(
+                "cursor recovery requires a pre-existing registration lock {}: {source}",
+                path.display()
+            ),
+        })?;
+        if !metadata.file_type().is_file()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || metadata.len() != 0
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-registration-lock".to_string(),
+                detail: format!(
+                    "cursor recovery registration lock {} is not a canonical zero-byte plain file",
+                    path.display()
+                ),
+            });
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(false)
+            .open(&path)
+            .map_err(|source| CloudFilesModuleError {
+                code: "cursor-recovery-registration-lock".to_string(),
+                detail: format!(
+                    "open pre-existing registration lock {}: {source}",
+                    path.display()
+                ),
+            })?;
+        file.try_lock_exclusive()
+            .map_err(|source| CloudFilesModuleError {
+                code: "registration-lease-busy".to_string(),
+                detail: format!(
+                    "another Cloud Files operation owns {}: {source}",
+                    path.display()
+                ),
+            })?;
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+            .map_err(|source| CloudFilesModuleError {
+                code: "cursor-recovery-registration-lock".to_string(),
+                detail: format!(
+                    "read pre-existing registration lock {}: {source}",
+                    path.display()
+                ),
+            })?;
+        if !bytes.is_empty() {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-registration-lock".to_string(),
+                detail: "registration lock changed during cursor recovery inspection".to_string(),
+            });
+        }
+        Ok((Self { _file: file }, bytes))
+    }
+}
+
+fn acquire_registration_lease_for_request(
+    data_dir: &SinomoDataDir,
+    cursor_recovery: Option<&CloudFilesCursorRecoveryContext>,
+) -> Result<(RegistrationLease, Option<Vec<u8>>), CloudFilesModuleError> {
+    if cursor_recovery.is_some() {
+        let (lease, bytes) = RegistrationLease::acquire_existing_for_inspection(data_dir)?;
+        return Ok((lease, Some(bytes)));
+    }
+    for path in [
+        cursor_recovery_module_marker_path(data_dir),
+        cursor_recovery_module_marker_temp_path(data_dir),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-context-required".to_string(),
+                    detail: format!(
+                        "ordinary operation found cursor-recovery authority at {}",
+                        path.display()
+                    ),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-marker-inspect".to_string(),
+                    detail: format!(
+                        "inspect cursor-recovery authority {}: {source}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    let lease = RegistrationLease::acquire(data_dir)?;
+    for path in [
+        cursor_recovery_module_marker_path(data_dir),
+        cursor_recovery_module_marker_temp_path(data_dir),
+    ] {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-context-required".to_string(),
+                    detail: format!(
+                        "cursor-recovery authority appeared before ordinary lease admission at {}",
+                        path.display()
+                    ),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-marker-inspect".to_string(),
+                    detail: format!(
+                        "reinspect cursor-recovery authority {}: {source}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok((lease, None))
 }
 
 impl RegistrationActivation {
@@ -451,7 +780,24 @@ impl RegistrationActivation {
             journal,
             state_owned,
             armed: true,
+            terminal_completion_handoff: false,
         }
+    }
+
+    fn retain_terminal_completion_handoff(&mut self) -> Result<(), CloudFilesModuleError> {
+        if self.journal.phase != RegistrationPhase::Ready || !self.state_owned {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-completion-journal-phase".to_string(),
+                detail: "CompletionAuthorized mount requires an already-owned Ready journal"
+                    .to_string(),
+            });
+        }
+        self.terminal_completion_handoff = true;
+        // CompletionAuthorized is forward-only. A failed restart must retain
+        // its exact Ready/ordinary normalization cut instead of invoking the
+        // generic activation rollback.
+        self.armed = false;
+        Ok(())
     }
 
     fn journal(&self) -> &RegistrationJournal {
@@ -462,6 +808,9 @@ impl RegistrationActivation {
         &mut self,
         request: &CloudFilesMountRequest,
     ) -> Result<(), CloudFilesModuleError> {
+        if self.terminal_completion_handoff {
+            return Ok(());
+        }
         if !self.state_owned {
             self.journal.phase = RegistrationPhase::Registered;
         }
@@ -477,6 +826,9 @@ impl RegistrationActivation {
         &mut self,
         request: &CloudFilesMountRequest,
     ) -> Result<(), CloudFilesModuleError> {
+        if self.terminal_completion_handoff {
+            return Ok(());
+        }
         self.journal.phase = RegistrationPhase::StateOwned;
         self.journal.provider_version = request.provider_version.clone();
         self.state_owned = true;
@@ -488,6 +840,9 @@ impl RegistrationActivation {
         &mut self,
         request: &CloudFilesMountRequest,
     ) -> Result<(), CloudFilesModuleError> {
+        if self.terminal_completion_handoff {
+            return Ok(());
+        }
         // The stable receipt means that the whole provider is ready, not merely
         // that CfRegisterSyncRoot returned. Keep the journal at StateOwned until
         // the receipt is durable so a crash cannot surrender writable state.
@@ -495,6 +850,130 @@ impl RegistrationActivation {
         self.journal.phase = RegistrationPhase::Ready;
         self.journal.provider_version = request.provider_version.clone();
         persist_registration_journal(&self.data_dir, &self.journal)
+    }
+
+    fn mark_cursor_recovery_ready(
+        &mut self,
+        request: &CloudFilesMountRequest,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError> {
+        if marker.phase != CursorRecoveryModulePhase::ReconcileArmed
+            || !matches!(
+                marker.namespace_resume,
+                CursorRecoveryNamespaceResume::TerminalPendingFinalize
+                    | CursorRecoveryNamespaceResume::Finalized
+            )
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-terminal-successor-missing".to_string(),
+                detail: "Ready artifacts require ReconcileArmed with a prior durable terminal/finalized namespace successor".to_string(),
+            });
+        }
+        self.mark_ready(request)?;
+        marker.phase = CursorRecoveryModulePhase::Ready;
+        persist_cursor_recovery_module_marker(marker_path, marker)
+    }
+
+    fn mark_cursor_recovery_terminal_pending_finalize(
+        &mut self,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError> {
+        if marker.phase != CursorRecoveryModulePhase::ReconcileArmed
+            || marker.namespace_resume != CursorRecoveryNamespaceResume::ReconcileProgress
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-terminal-successor-invalid".to_string(),
+                detail: "only ReconcileArmed/ReconcileProgress may enter TerminalPendingFinalize"
+                    .to_string(),
+            });
+        }
+        marker.namespace_resume = CursorRecoveryNamespaceResume::TerminalPendingFinalize;
+        persist_cursor_recovery_module_marker(marker_path, marker)
+    }
+
+    fn mark_cursor_recovery_preserve_authorized(
+        &mut self,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError> {
+        if matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::Authorized
+                | CursorRecoveryModulePhase::Validated
+                | CursorRecoveryModulePhase::PreserveAuthorized
+        ) {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-preserve-predecessor".to_string(),
+                detail: "cursor recovery has no exact state-owned preserve predecessor".to_string(),
+            });
+        }
+        marker.predecessor_cycle_fingerprint = cursor_recovery_cycle_authorization(marker)?;
+        marker.cycle_authorization_fingerprint = None;
+        marker.recovery_cycle =
+            marker
+                .recovery_cycle
+                .checked_add(1)
+                .ok_or_else(|| CloudFilesModuleError {
+                    code: "cursor-recovery-cycle-overflow".to_string(),
+                    detail: "cursor recovery preserve cycle overflowed".to_string(),
+                })?;
+        marker.cycle_authorized_namespace_resume = marker.namespace_resume;
+        marker.phase = CursorRecoveryModulePhase::PreserveAuthorized;
+        persist_cursor_recovery_module_marker(marker_path, marker)
+    }
+
+    fn mark_cursor_recovery_preserved_state_owned(
+        &mut self,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<CloudFilesCursorRecoveryContext, CloudFilesModuleError> {
+        if marker.phase != CursorRecoveryModulePhase::PreserveAuthorized {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-preserve-successor".to_string(),
+                detail: "PreservedStateOwned requires a durable PreserveAuthorized predecessor"
+                    .to_string(),
+            });
+        }
+        marker.phase = CursorRecoveryModulePhase::PreservedStateOwned;
+        persist_cursor_recovery_module_marker(marker_path, marker)?;
+        Ok(CloudFilesCursorRecoveryContext {
+            recovery_id: marker.recovery_id.clone(),
+            recovery_token: marker.recovery_token.clone(),
+            recovery_cycle: marker.recovery_cycle,
+            native_successor_fingerprint: Some(cursor_recovery_native_successor_fingerprint(
+                marker,
+            )?),
+        })
+    }
+
+    fn mark_cursor_recovery_namespace_finalized(
+        &mut self,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError> {
+        marker.namespace_resume = CursorRecoveryNamespaceResume::Finalized;
+        marker.phase = CursorRecoveryModulePhase::NamespaceFinalized;
+        persist_cursor_recovery_module_marker(marker_path, marker)
+    }
+
+    fn mark_cursor_recovery_completion_authorized(
+        &mut self,
+        marker_path: &Path,
+        marker: &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError> {
+        if marker.phase != CursorRecoveryModulePhase::NamespaceFinalized
+            || marker.namespace_resume != CursorRecoveryNamespaceResume::Finalized
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-completion-predecessor".to_string(),
+                detail: "CompletionAuthorized requires the exact NamespaceFinalized/Finalized predecessor"
+                    .to_string(),
+            });
+        }
+        marker.phase = CursorRecoveryModulePhase::CompletionAuthorized;
+        persist_cursor_recovery_module_marker(marker_path, marker)
     }
 
     fn rollback(&mut self) -> Result<(), CloudFilesModuleError> {
@@ -508,6 +987,12 @@ impl RegistrationActivation {
         mut error: CloudFilesModuleError,
         lifecycle: &mut MountLifecycleState,
     ) -> CloudFilesModuleError {
+        if !self.armed {
+            error.detail.push_str(
+                "; durable cursor-recovery Ready ownership was retained for exact replay",
+            );
+            return error;
+        }
         match self.rollback() {
             Ok(()) => {
                 lifecycle.registered = false;
@@ -545,6 +1030,2354 @@ impl Drop for RegistrationActivation {
                 "best-effort Cloud Files activation rollback deferred to durable recovery: {error}"
             ));
         }
+    }
+}
+
+pub(crate) fn inspect_cursor_only_recovery(
+    mut request: CloudFilesCursorOnlyRecoveryInspectRequest,
+) -> Result<CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError> {
+    request.identity.root_path = normalize_sifs_root(&request.identity.root_path)?;
+    let inspection = inspect_cursor_only_recovery_raw(request.identity)?;
+    let cursor_count = u64::try_from(inspection.reconciliation.inspection().cursors.len())
+        .map_err(|_| CloudFilesModuleError {
+            code: "cursor-recovery-cursor-count".to_string(),
+            detail: "cursor count overflowed u64".to_string(),
+        })?;
+    Ok(CloudFilesCursorOnlyRecoveryInspection {
+        schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+        sync_root: inspection.identity.sync_root.clone(),
+        root_path: inspection.identity.root_path.clone(),
+        sync_root_file_id: inspection.sync_root_file_id,
+        cursor_count,
+        raw_state_fingerprint: inspection.raw_state_fingerprint,
+        recovery_token: inspection.recovery_token,
+        detail: "exact cursor-only state is eligible; applying this token authorizes a full authoritative reconciliation and local startup audit before readiness".to_string(),
+    })
+}
+
+pub(crate) fn apply_cursor_only_recovery(
+    mut request: CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError> {
+    if !request.acknowledge_authoritative_full_reconciliation {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-acknowledgement-required".to_string(),
+            detail: "the native effect boundary requires explicit acknowledgement of authoritative full reconciliation".to_string(),
+        });
+    }
+    if request.expected_token.trim().is_empty() || request.recovery_id.trim().is_empty() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-authorization-invalid".to_string(),
+            detail: "expected token and stable recovery ID must be nonempty".to_string(),
+        });
+    }
+    request.identity.root_path = normalize_sifs_root(&request.identity.root_path)?;
+    let data_dir = resolve_cursor_recovery_data_dir(&request.identity)?;
+    let (_registration_lease, _) = RegistrationLease::acquire_existing_for_inspection(&data_dir)?;
+    let marker_path = cursor_recovery_module_marker_path(&data_dir);
+    let existing = recover_cursor_recovery_registration_snapshot(&data_dir, true, |marker| {
+        validate_cursor_recovery_apply_authority(marker, &request)
+    })?;
+    if let Some(marker) = existing {
+        inspect_cursor_recovery_module_topology(&data_dir, Some(marker.phase))?;
+        if matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::ReconcileArmed
+                | CursorRecoveryModulePhase::Ready
+                | CursorRecoveryModulePhase::NamespaceFinalized
+        ) {
+            validate_owned_cursor_recovery_root(&request.identity, marker.sync_root_file_id)?;
+            validate_cursor_recovery_registration_artifacts(&data_dir, &marker)?;
+            return Ok(cursor_recovery_applied_response(marker));
+        }
+        let root_fence = CursorRecoveryRootFence::acquire(&request.identity.sync_root)?;
+        validate_cursor_recovery_root(&request.identity, marker.sync_root_file_id, &root_fence)?;
+        if query_registered_sync_root(&request.identity.sync_root)?.is_some() {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-registration-present".to_string(),
+                detail: "cursor recovery cannot resume while a CFAPI registration is present"
+                    .to_string(),
+            });
+        }
+        let outbox = dfs::inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .map_err(|error| CloudFilesModuleError {
+                code: "cursor-recovery-outbox".to_string(),
+                detail: error.to_string(),
+            })?;
+        let queue = inspect_cursor_only_local_change_queue(
+            &data_dir,
+            &request.identity.sync_root.to_string_lossy(),
+            &request.identity.root_path,
+        )
+        .map_err(|error| CloudFilesModuleError {
+            code: error.code.to_string(),
+            detail: error.detail,
+        })?;
+        let reconciliation = resume_authorized_cursor_recovery(
+            &data_dir,
+            &request.identity.sync_root.to_string_lossy(),
+            &request.identity.root_path,
+            &marker.plan,
+        )
+        .map_err(reconciliation_recovery_error)?;
+        if !queue.inspection().scope_present || !outbox.inspection().outbox_present {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-owner-evidence-lost".to_string(),
+                detail: "authorized cursor recovery lost queue or outbox ownership evidence"
+                    .to_string(),
+            });
+        }
+        if queue.inspection().raw_files != marker.queue_raw_files
+            || outbox.inspection().raw_files != marker.outbox_raw_files
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-owner-evidence-drift".to_string(),
+                detail: "authorized cursor recovery queue or outbox bytes changed from the token-bound owner snapshot"
+                    .to_string(),
+            });
+        }
+        let guards = CursorRecoveryOwnerGuards {
+            _queue: queue,
+            _outbox: outbox,
+        };
+        return finish_cursor_only_recovery(
+            &data_dir,
+            &marker_path,
+            marker,
+            &reconciliation,
+            &root_fence,
+            &guards,
+        );
+    } else {
+        drop(_registration_lease);
+        let raw = inspect_cursor_only_recovery_raw(request.identity.clone())?;
+        if raw.recovery_token != request.expected_token {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-token-mismatch".to_string(),
+                detail: "the exact cursor-only snapshot changed after inspection".to_string(),
+            });
+        }
+        let nonce = GUID::new().map_err(|source| CloudFilesModuleError {
+            code: "registration-nonce-generate".to_string(),
+            detail: format!("generate cursor recovery registration nonce: {source}"),
+        })?;
+        let nonce = format!("{:032x}", nonce.to_u128());
+        let plan = raw
+            .reconciliation
+            .authoritative_reconciliation_plan(
+                &request.recovery_id,
+                &request.expected_token,
+                &nonce,
+            )
+            .map_err(reconciliation_recovery_error)?;
+        let encoded_marker_bound = CursorRecoveryModuleMarker {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            identity: request.identity.clone(),
+            recovery_id: request.recovery_id.clone(),
+            recovery_token: request.expected_token.clone(),
+            raw_state_fingerprint: raw.raw_state_fingerprint.clone(),
+            registration_lock_bytes: raw.registration_lock_bytes.clone(),
+            module_topology: raw.module_topology.clone(),
+            queue_raw_files: raw.queue_raw_files.clone(),
+            reconciliation_raw_files: raw.reconciliation_raw_files.clone(),
+            outbox_raw_files: raw.outbox_raw_files.clone(),
+            sync_root_file_id: raw.sync_root_file_id,
+            registration_nonce: nonce,
+            plan,
+            recovery_cycle: 0,
+            cycle_authorization_fingerprint: None,
+            predecessor_cycle_fingerprint: None,
+            cycle_authorized_namespace_resume: CursorRecoveryNamespaceResume::ReconcileProgress,
+            namespace_resume: CursorRecoveryNamespaceResume::ReconcileProgress,
+            phase: CursorRecoveryModulePhase::Authorized,
+        };
+        let marker_bytes =
+            encode_sobj(&encoded_marker_bound).map_err(|source| CloudFilesModuleError {
+                code: "cursor-recovery-marker-encode".to_string(),
+                detail: format!("encode cursor recovery marker: {source}"),
+            })?;
+        if marker_bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-marker-too-large".to_string(),
+                detail: "cursor recovery marker exceeds its durable owner bound".to_string(),
+            });
+        }
+        validate_cursor_recovery_root(&request.identity, raw.sync_root_file_id, &raw.root_fence)?;
+        persist_cursor_recovery_module_marker(&marker_path, &encoded_marker_bound)?;
+        return finish_cursor_only_recovery(
+            &raw.data_dir,
+            &marker_path,
+            encoded_marker_bound,
+            &raw.reconciliation,
+            &raw.root_fence,
+            &CursorRecoveryOwnerGuards {
+                _queue: raw._queue,
+                _outbox: raw._outbox,
+            },
+        );
+    }
+}
+
+fn cursor_recovery_applied_response(
+    marker: CursorRecoveryModuleMarker,
+) -> CloudFilesCursorOnlyRecoveryApplied {
+    CloudFilesCursorOnlyRecoveryApplied {
+        schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+        sync_root: marker.identity.sync_root,
+        root_path: marker.identity.root_path,
+        sync_root_file_id: marker.sync_root_file_id,
+        cursor_count_cleared: marker.plan.cursor_count_cleared,
+        recovery_id: marker.recovery_id,
+        recovery_token: marker.recovery_token,
+        detail: "cursor recovery is already durably owned and ReconcileArmed or Ready; the same authorization is idempotently retained".to_string(),
+    }
+}
+
+fn validate_cursor_recovery_registration_artifacts(
+    data_dir: &SinomoDataDir,
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    let request = cursor_recovery_mount_request(marker);
+    let expected_journal = RegistrationJournal::cursor_recovery_state_owned(
+        &request,
+        CLOUD_FILES_PROVIDER_ID_TEXT,
+        marker.registration_nonce.clone(),
+        marker.sync_root_file_id,
+        marker.recovery_id.clone(),
+        marker.recovery_token.clone(),
+        marker.recovery_cycle,
+    )?;
+    let journal_path = registration_journal_path(data_dir);
+    let journal_snapshot = inspect_registration_artifact_snapshot::<RegistrationJournal>(
+        &journal_path,
+        &registration_journal_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+        "registration-journal",
+        "Cloud Files registration journal",
+    )?;
+    if let Some(journal) = journal_snapshot.current.as_ref() {
+        journal.validate(CLOUD_FILES_PROVIDER_ID_TEXT)?;
+    }
+    if let Some(journal) = journal_snapshot.temporary.as_ref() {
+        journal.validate(CLOUD_FILES_PROVIDER_ID_TEXT)?;
+    }
+    let mut ready_journal = expected_journal.clone();
+    ready_journal.phase = RegistrationPhase::Ready;
+    let mut ordinary_ready_journal = ready_journal.clone();
+    ordinary_ready_journal.clear_cursor_recovery();
+    let journal_matches = match marker.phase {
+        CursorRecoveryModulePhase::ReconcileArmed => {
+            journal_snapshot.current.as_ref() == Some(&expected_journal)
+                || journal_snapshot.current.as_ref() == Some(&ready_journal)
+                || (journal_snapshot.current.as_ref() == Some(&expected_journal)
+                    && journal_snapshot.temporary.as_ref() == Some(&ready_journal))
+        }
+        CursorRecoveryModulePhase::Ready | CursorRecoveryModulePhase::NamespaceFinalized => {
+            journal_snapshot.current.as_ref() == Some(&ready_journal)
+                || journal_snapshot.current.as_ref() == Some(&expected_journal)
+                || (journal_snapshot.current.is_none()
+                    && journal_snapshot.temporary.as_ref() == Some(&ready_journal))
+        }
+        CursorRecoveryModulePhase::CompletionAuthorized => {
+            (journal_snapshot.current.as_ref() == Some(&ready_journal)
+                || journal_snapshot.current.as_ref() == Some(&ordinary_ready_journal))
+                && journal_snapshot.temporary.is_none()
+        }
+        _ => false,
+    };
+    if !journal_matches {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-state-owned-mismatch".to_string(),
+            detail: "cursor recovery registration journal does not match its exact durable phase"
+                .to_string(),
+        });
+    }
+    let receipt_path = registration_receipt_path(data_dir);
+    let receipt_snapshot = inspect_registration_artifact_snapshot::<CloudFilesRegistrationReceipt>(
+        &receipt_path,
+        &registration_receipt_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+        "registration-receipt",
+        "Cloud Files registration receipt",
+    )?;
+    let receipt = receipt_snapshot.current;
+    let expected = CloudFilesRegistrationReceipt {
+        interface_version: SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string(),
+        registration_identity_interface_version: None,
+        sync_root: request.sync_root,
+        root_path: request.root_path,
+        provider_name: request.provider_name,
+    };
+    if marker.phase != CursorRecoveryModulePhase::CompletionAuthorized
+        && (journal_snapshot
+            .temporary
+            .as_ref()
+            .is_some_and(|value| value != &ready_journal)
+            || (journal_snapshot.current.is_some()
+                && journal_snapshot.temporary.is_some()
+                && journal_snapshot.current.as_ref() != journal_snapshot.temporary.as_ref()))
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-journal-temp-mismatch".to_string(),
+            detail: "cursor recovery journal temporary file is not the exact next Ready image"
+                .to_string(),
+        });
+    }
+    if receipt_snapshot
+        .temporary
+        .as_ref()
+        .is_some_and(|value| value != &expected)
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-receipt-temp-mismatch".to_string(),
+            detail: "cursor recovery receipt temporary file changed from its exact Ready image"
+                .to_string(),
+        });
+    }
+    if journal_snapshot.current.is_none() && journal_snapshot.temporary.is_some() {
+        promote_exact_registration_artifact(
+            &journal_path,
+            &registration_journal_temp_path(data_dir),
+            CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+            &ready_journal,
+            "registration-journal",
+            "Cloud Files registration journal",
+        )?;
+    }
+    if receipt.is_none() && receipt_snapshot.temporary.is_some() {
+        promote_exact_registration_artifact(
+            &receipt_path,
+            &registration_receipt_temp_path(data_dir),
+            CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+            &expected,
+            "registration-receipt",
+            "Cloud Files registration receipt",
+        )?;
+    }
+    let receipt_matches =
+        receipt.as_ref() == Some(&expected) || receipt_snapshot.temporary.is_some();
+    match marker.phase {
+        CursorRecoveryModulePhase::ReconcileArmed
+            if receipt.is_none() || receipt.as_ref() == Some(&expected) =>
+        {
+            Ok(())
+        }
+        CursorRecoveryModulePhase::Ready
+        | CursorRecoveryModulePhase::NamespaceFinalized
+        | CursorRecoveryModulePhase::CompletionAuthorized => {
+            if receipt_matches {
+                Ok(())
+            } else {
+                Err(CloudFilesModuleError {
+                    code: "cursor-recovery-ready-receipt-mismatch".to_string(),
+                    detail: "Ready cursor recovery receipt does not match its exact authorization"
+                        .to_string(),
+                })
+            }
+        }
+        _ => Err(CloudFilesModuleError {
+            code: "cursor-recovery-registration-phase".to_string(),
+            detail: "registration artifact validation was requested for a non-owned phase"
+                .to_string(),
+        }),
+    }
+}
+
+fn rearm_preserved_cursor_recovery(
+    data_dir: &SinomoDataDir,
+    marker_path: &Path,
+    marker: &mut CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    if marker.phase != CursorRecoveryModulePhase::PreservedStateOwned {
+        return Ok(());
+    }
+    let (state_owned, _, receipt) = cursor_recovery_expected_registration_artifacts(marker)?;
+    let journal_snapshot = inspect_registration_artifact_snapshot::<RegistrationJournal>(
+        &registration_journal_path(data_dir),
+        &registration_journal_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+        "registration-journal",
+        "Cloud Files registration journal",
+    )?;
+    let receipt_snapshot = inspect_registration_artifact_snapshot::<CloudFilesRegistrationReceipt>(
+        &registration_receipt_path(data_dir),
+        &registration_receipt_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+        "registration-receipt",
+        "Cloud Files registration receipt",
+    )?;
+    if journal_snapshot.current.as_ref() != Some(&state_owned)
+        || journal_snapshot.temporary.is_some()
+        || receipt_snapshot
+            .current
+            .as_ref()
+            .is_some_and(|value| value != &receipt)
+        || receipt_snapshot.temporary.is_some()
+        || query_registered_sync_root(&marker.identity.sync_root)?.is_some()
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-rearm-artifacts".to_string(),
+            detail: "PreservedStateOwned rearm requires exact owned-absent successor artifacts"
+                .to_string(),
+        });
+    }
+    let successor = cursor_recovery_rearmed_successor(marker)?;
+    persist_cursor_recovery_module_marker(marker_path, &successor)?;
+    *marker = successor;
+    Ok(())
+}
+
+fn finish_cursor_only_recovery(
+    data_dir: &SinomoDataDir,
+    marker_path: &Path,
+    mut marker: CursorRecoveryModuleMarker,
+    reconciliation: &crate::namespace_reconciler::CloudFilesCursorOnlyReconciliationInspectionGuard,
+    root_fence: &CursorRecoveryRootFence,
+    _owner_guards: &CursorRecoveryOwnerGuards,
+) -> Result<CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError> {
+    if marker.phase == CursorRecoveryModulePhase::Authorized {
+        validate_cursor_recovery_root(&marker.identity, marker.sync_root_file_id, root_fence)?;
+        marker.phase = CursorRecoveryModulePhase::Validated;
+        persist_cursor_recovery_module_marker(marker_path, &marker)?;
+    }
+    if marker.phase == CursorRecoveryModulePhase::Validated {
+        validate_cursor_recovery_root(&marker.identity, marker.sync_root_file_id, root_fence)?;
+        let mount_request = cursor_recovery_mount_request(&marker);
+        let expected_journal = RegistrationJournal::cursor_recovery_state_owned(
+            &mount_request,
+            CLOUD_FILES_PROVIDER_ID_TEXT,
+            marker.registration_nonce.clone(),
+            marker.sync_root_file_id,
+            marker.recovery_id.clone(),
+            marker.recovery_token.clone(),
+            marker.recovery_cycle,
+        )?;
+        match load_registration_journal(data_dir)? {
+            None => persist_registration_journal(data_dir, &expected_journal)?,
+            Some(journal) if journal == expected_journal => {}
+            Some(_) => {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-state-owned-mismatch".to_string(),
+                    detail: "Validated recovery found a changed StateOwned journal".to_string(),
+                });
+            }
+        }
+        marker.phase = CursorRecoveryModulePhase::StateOwned;
+        persist_cursor_recovery_module_marker(marker_path, &marker)?;
+    } else {
+        let journal =
+            load_registration_journal(data_dir)?.ok_or_else(|| CloudFilesModuleError {
+                code: "cursor-recovery-state-owned-missing".to_string(),
+                detail: "authorized cursor recovery lost its StateOwned registration journal"
+                    .to_string(),
+            })?;
+        let mount_request = cursor_recovery_mount_request(&marker);
+        if journal.phase != RegistrationPhase::StateOwned
+            || journal.registration_nonce != marker.registration_nonce
+            || !journal.matches_mount_request(&mount_request)
+            || journal.sync_root_file_id != marker.sync_root_file_id
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-state-owned-mismatch".to_string(),
+                detail: "StateOwned journal does not exactly match the authorized cursor recovery"
+                    .to_string(),
+            });
+        }
+    }
+    validate_cursor_recovery_root(&marker.identity, marker.sync_root_file_id, root_fence)?;
+    let cursor_count = reconciliation
+        .apply_authoritative_reconciliation_plan(&marker.plan)
+        .map_err(reconciliation_recovery_error)?;
+    marker.phase = CursorRecoveryModulePhase::ReconcileArmed;
+    persist_cursor_recovery_module_marker(marker_path, &marker)?;
+    Ok(CloudFilesCursorOnlyRecoveryApplied {
+        schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+        sync_root: marker.identity.sync_root,
+        root_path: marker.identity.root_path,
+        sync_root_file_id: marker.sync_root_file_id,
+        cursor_count_cleared: cursor_count,
+        recovery_id: marker.recovery_id,
+        recovery_token: marker.recovery_token,
+        detail: "cursor state is durably ReconcileArmed; the supervisor must retain StateOwned ownership and keep readiness gated through terminal authoritative and local startup reconciliation".to_string(),
+    })
+}
+
+fn inspect_cursor_only_recovery_raw(
+    identity: CloudFilesCursorOnlyRecoveryIdentity,
+) -> Result<CursorRecoveryRawInspection, CloudFilesModuleError> {
+    validate_cursor_recovery_identity(&identity)?;
+    let data_dir = resolve_cursor_recovery_data_dir(&identity)?;
+    let (registration_lease, registration_lock_bytes) =
+        RegistrationLease::acquire_existing_for_inspection(&data_dir)?;
+    let module_topology = inspect_cursor_recovery_module_topology(&data_dir, None)?;
+    if load_registration_journal(&data_dir)?.is_some()
+        || load_registration_receipt(&registration_receipt_path(&data_dir))?.is_some()
+        || load_cursor_recovery_module_marker(&cursor_recovery_module_marker_path(&data_dir))?
+            .is_some()
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-registration-evidence".to_string(),
+            detail: "cursor-only inspection requires absent journal, receipt, and recovery marker"
+                .to_string(),
+        });
+    }
+    ensure_new_sync_root_is_empty(&identity.sync_root)?;
+    let root_fence = CursorRecoveryRootFence::acquire(&identity.sync_root)?;
+    if query_registered_sync_root(&identity.sync_root)?.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-registration-present".to_string(),
+            detail: "cursor-only inspection requires an unregistered CFAPI root".to_string(),
+        });
+    }
+    let sync_root_file_id = root_fence.file_id;
+    let outbox = dfs::inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir).map_err(
+        |error| CloudFilesModuleError {
+            code: "cursor-recovery-outbox".to_string(),
+            detail: error.to_string(),
+        },
+    )?;
+    if !outbox.inspection().outbox_present {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-outbox-absent".to_string(),
+            detail:
+                "nonempty namespace cursors require the canonical mounted-mutation outbox evidence"
+                    .to_string(),
+        });
+    }
+    let queue = inspect_cursor_only_local_change_queue(
+        &data_dir,
+        &identity.sync_root.to_string_lossy(),
+        &identity.root_path,
+    )
+    .map_err(|error| CloudFilesModuleError {
+        code: error.code.to_string(),
+        detail: error.detail,
+    })?;
+    if !queue.inspection().scope_present {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-queue-absent".to_string(),
+            detail: "nonempty namespace cursors require the canonical local-change queue scope"
+                .to_string(),
+        });
+    }
+    let reconciliation = inspect_cursor_only_reconciliation_state(
+        &data_dir,
+        &identity.sync_root.to_string_lossy(),
+        &identity.root_path,
+    )
+    .map_err(reconciliation_recovery_error)?;
+    validate_cursor_recovery_root(&identity, sync_root_file_id, &root_fence)?;
+
+    let raw_state_fingerprint = cursor_recovery_raw_fingerprint(
+        &identity,
+        sync_root_file_id,
+        &registration_lock_bytes,
+        &module_topology,
+        &queue.inspection().raw_files,
+        &reconciliation.inspection().raw_files,
+        &outbox.inspection().raw_files,
+    )?;
+    let recovery_token = cursor_recovery_token(&raw_state_fingerprint);
+    Ok(CursorRecoveryRawInspection {
+        identity,
+        data_dir,
+        sync_root_file_id,
+        raw_state_fingerprint,
+        recovery_token,
+        registration_lock_bytes,
+        module_topology,
+        queue_raw_files: queue.inspection().raw_files.clone(),
+        reconciliation_raw_files: reconciliation.inspection().raw_files.clone(),
+        outbox_raw_files: outbox.inspection().raw_files.clone(),
+        reconciliation,
+        root_fence,
+        _registration_lease: registration_lease,
+        _queue: queue,
+        _outbox: outbox,
+    })
+}
+
+fn inspect_cursor_recovery_module_topology(
+    data_dir: &SinomoDataDir,
+    phase: Option<CursorRecoveryModulePhase>,
+) -> Result<Vec<String>, CloudFilesModuleError> {
+    let runtime = data_dir.module_runtime_dir();
+    let module_dir = runtime.join(SINOMO_DFS_CLOUD_FILES_MODULE_ID);
+    for (label, path) in [
+        ("module runtime", runtime.as_path()),
+        ("module", module_dir.as_path()),
+    ] {
+        let metadata = fs::symlink_metadata(path).map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-module-topology".to_string(),
+            detail: format!("inspect {label} path {}: {source}", path.display()),
+        })?;
+        if !metadata.file_type().is_dir()
+            || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-module-topology".to_string(),
+                detail: format!("{label} path {} is not a plain directory", path.display()),
+            });
+        }
+    }
+    let mut observed = Vec::new();
+    for entry in fs::read_dir(&module_dir).map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-module-topology".to_string(),
+        detail: format!(
+            "list Cloud Files module directory {}: {source}",
+            module_dir.display()
+        ),
+    })? {
+        let entry = entry.map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-module-topology".to_string(),
+            detail: format!("read Cloud Files module directory entry: {source}"),
+        })?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| CloudFilesModuleError {
+                code: "cursor-recovery-module-topology".to_string(),
+                detail: "Cloud Files module directory contains a non-UTF-8 entry".to_string(),
+            })?;
+        let metadata =
+            fs::symlink_metadata(entry.path()).map_err(|source| CloudFilesModuleError {
+                code: "cursor-recovery-module-topology".to_string(),
+                detail: format!("inspect Cloud Files module entry `{name}`: {source}"),
+            })?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-module-topology".to_string(),
+                detail: format!("Cloud Files module entry `{name}` is reparse evidence"),
+            });
+        }
+        let valid = match name.as_str() {
+            CLOUD_FILES_REGISTRATION_LOCK_FILE => {
+                metadata.file_type().is_file() && metadata.len() == 0
+            }
+            "local-changes" | "namespace-reconciliation" => metadata.file_type().is_dir(),
+            CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE if phase.is_some() => {
+                metadata.file_type().is_file()
+            }
+            name if name
+                == cursor_recovery_module_marker_temp_path(data_dir)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                && phase.is_some() =>
+            {
+                metadata.file_type().is_file()
+            }
+            name if name
+                == registration_journal_temp_path(data_dir)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                && phase.is_some_and(|value| {
+                    matches!(
+                        value,
+                        CursorRecoveryModulePhase::Validated
+                            | CursorRecoveryModulePhase::StateOwned
+                            | CursorRecoveryModulePhase::ReconcileArmed
+                            | CursorRecoveryModulePhase::CompletionAuthorized
+                    )
+                }) =>
+            {
+                metadata.file_type().is_file()
+            }
+            name if name
+                == registration_receipt_temp_path(data_dir)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                && phase == Some(CursorRecoveryModulePhase::ReconcileArmed) =>
+            {
+                metadata.file_type().is_file()
+            }
+            CLOUD_FILES_REGISTRATION_JOURNAL_FILE
+                if phase.is_some_and(|value| {
+                    matches!(
+                        value,
+                        CursorRecoveryModulePhase::Validated
+                            | CursorRecoveryModulePhase::StateOwned
+                            | CursorRecoveryModulePhase::ReconcileArmed
+                            | CursorRecoveryModulePhase::Ready
+                            | CursorRecoveryModulePhase::NamespaceFinalized
+                            | CursorRecoveryModulePhase::CompletionAuthorized
+                    )
+                }) =>
+            {
+                metadata.file_type().is_file()
+            }
+            CLOUD_FILES_REGISTRATION_RECEIPT_FILE
+                if phase.is_some_and(|value| {
+                    matches!(
+                        value,
+                        CursorRecoveryModulePhase::ReconcileArmed
+                            | CursorRecoveryModulePhase::Ready
+                            | CursorRecoveryModulePhase::NamespaceFinalized
+                            | CursorRecoveryModulePhase::CompletionAuthorized
+                    )
+                }) =>
+            {
+                metadata.file_type().is_file()
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-module-topology".to_string(),
+                detail: format!("unexpected Cloud Files module recovery entry `{name}`"),
+            });
+        }
+        observed.push(name);
+    }
+    observed.sort();
+    let mut expected = vec![
+        "local-changes".to_string(),
+        "namespace-reconciliation".to_string(),
+        CLOUD_FILES_REGISTRATION_LOCK_FILE.to_string(),
+    ];
+    if let Some(value) = phase {
+        expected.push(CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE.to_string());
+        if matches!(
+            value,
+            CursorRecoveryModulePhase::StateOwned
+                | CursorRecoveryModulePhase::ReconcileArmed
+                | CursorRecoveryModulePhase::Ready
+                | CursorRecoveryModulePhase::NamespaceFinalized
+                | CursorRecoveryModulePhase::CompletionAuthorized
+        ) {
+            expected.push(CLOUD_FILES_REGISTRATION_JOURNAL_FILE.to_string());
+        }
+        if matches!(
+            value,
+            CursorRecoveryModulePhase::Ready
+                | CursorRecoveryModulePhase::NamespaceFinalized
+                | CursorRecoveryModulePhase::CompletionAuthorized
+        ) {
+            expected.push(CLOUD_FILES_REGISTRATION_RECEIPT_FILE.to_string());
+        }
+        expected.sort();
+    }
+    let authorized_with_exact_marker_temp = phase.is_some()
+        && observed == {
+            let mut value = expected.clone();
+            value.push(
+                cursor_recovery_module_marker_temp_path(data_dir)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            value.sort();
+            value
+        };
+    let with_exact_journal_temp = phase.is_some_and(|value| {
+        matches!(
+            value,
+            CursorRecoveryModulePhase::Validated
+                | CursorRecoveryModulePhase::StateOwned
+                | CursorRecoveryModulePhase::ReconcileArmed
+                | CursorRecoveryModulePhase::CompletionAuthorized
+        )
+    }) && observed == {
+        let mut value = expected.clone();
+        value.push(
+            registration_journal_temp_path(data_dir)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
+        value.sort();
+        value
+    };
+    let with_exact_receipt_temp = phase == Some(CursorRecoveryModulePhase::ReconcileArmed)
+        && observed == {
+            let mut value = expected.clone();
+            value.push(
+                registration_receipt_temp_path(data_dir)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            value.sort();
+            value
+        };
+    let validated_with_journal = phase == Some(CursorRecoveryModulePhase::Validated)
+        && observed == {
+            let mut value = expected.clone();
+            value.push(CLOUD_FILES_REGISTRATION_JOURNAL_FILE.to_string());
+            value.sort();
+            value
+        };
+    let reconcile_armed_with_receipt = phase == Some(CursorRecoveryModulePhase::ReconcileArmed)
+        && observed == {
+            let mut value = expected.clone();
+            value.push(CLOUD_FILES_REGISTRATION_RECEIPT_FILE.to_string());
+            value.sort();
+            value
+        };
+    if observed != expected
+        && !authorized_with_exact_marker_temp
+        && !with_exact_journal_temp
+        && !with_exact_receipt_temp
+        && !validated_with_journal
+        && !reconcile_armed_with_receipt
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-module-topology".to_string(),
+            detail: format!(
+                "Cloud Files module topology {:?} is not canonical",
+                observed
+            ),
+        });
+    }
+    Ok(observed)
+}
+
+fn validate_cursor_recovery_identity(
+    identity: &CloudFilesCursorOnlyRecoveryIdentity,
+) -> Result<(), CloudFilesModuleError> {
+    if identity.schema_version != CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+        || identity.provider_name
+            != sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+        || identity.provider_version != env!("CARGO_PKG_VERSION")
+        || identity.disabled_config_fingerprint.trim().is_empty()
+        || identity.provider_provenance_fingerprint.trim().is_empty()
+        || identity.enabled
+        || identity.read_only
+        || identity.allow_other
+        || !identity.sync_local_changes
+        || !identity.connect
+        || identity.prepopulate_depth != 0
+        || identity.max_run_seconds.is_some()
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-identity-invalid".to_string(),
+            detail: "cursor recovery identity is incomplete or not the exact disabled writable configuration".to_string(),
+        });
+    }
+    if identity.root_path != normalize_sifs_root(&identity.root_path)? {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-root-not-canonical".to_string(),
+            detail: "cursor recovery root path is not canonical".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_cursor_recovery_data_dir(
+    identity: &CloudFilesCursorOnlyRecoveryIdentity,
+) -> Result<SinomoDataDir, CloudFilesModuleError> {
+    let data_dir = SinomoDataDir::new(identity.data_dir_root.clone());
+    if data_dir.root() != identity.data_dir_root {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-data-dir".to_string(),
+            detail: "cursor recovery data directory identity changed".to_string(),
+        });
+    }
+    Ok(data_dir)
+}
+
+fn cursor_recovery_mount_request(marker: &CursorRecoveryModuleMarker) -> CloudFilesMountRequest {
+    let identity = &marker.identity;
+    CloudFilesMountRequest {
+        sync_root: identity.sync_root.clone(),
+        root_path: identity.root_path.clone(),
+        data_dir_root: Some(identity.data_dir_root.clone()),
+        read_only: identity.read_only,
+        sync_local_changes: identity.sync_local_changes,
+        provider_name: identity.provider_name.clone(),
+        provider_version: identity.provider_version.clone(),
+        prepopulate_depth: identity.prepopulate_depth,
+        connect: true,
+        max_run_seconds: identity.max_run_seconds,
+        cursor_recovery: Some(CloudFilesCursorRecoveryContext {
+            recovery_id: marker.recovery_id.clone(),
+            recovery_token: marker.recovery_token.clone(),
+            recovery_cycle: marker.recovery_cycle,
+            native_successor_fingerprint: None,
+        }),
+    }
+}
+
+fn cursor_recovery_native_successor_fingerprint(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<String, CloudFilesModuleError> {
+    let mut committed = marker.clone();
+    committed.phase = CursorRecoveryModulePhase::PreservedStateOwned;
+    committed.namespace_resume = marker.cycle_authorized_namespace_resume;
+    committed.cycle_authorization_fingerprint = None;
+    let bytes = sinomo_runtime::module_api::encode_sobj(&committed).map_err(|source| {
+        CloudFilesModuleError {
+            code: "cursor-recovery-successor-encode".to_string(),
+            detail: format!("encode PreservedStateOwned successor: {source}"),
+        }
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.native-successor.v1\0");
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn cursor_recovery_module_marker_fingerprint(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<String, CloudFilesModuleError> {
+    let bytes = encode_sobj(marker).map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-marker-encode".to_string(),
+        detail: format!("encode current cursor recovery marker: {source}"),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.module-marker.v1\0");
+    hash_cursor_recovery_field(&mut hasher, &bytes);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn cursor_recovery_completed_registration_artifacts_fingerprint(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<String, CloudFilesModuleError> {
+    let (_, mut ready, receipt) = cursor_recovery_expected_registration_artifacts(marker)?;
+    ready.phase = RegistrationPhase::Ready;
+    ready.clear_cursor_recovery();
+    let journal_bytes = encode_sobj(&ready).map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-completion-journal-encode".to_string(),
+        detail: format!("encode expected ordinary Ready journal: {source}"),
+    })?;
+    let receipt_bytes = encode_sobj(&receipt).map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-completion-receipt-encode".to_string(),
+        detail: format!("encode expected Ready receipt: {source}"),
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"sinomo.dfs.cloud-files.cursor-recovery.completed-registration.v1\0");
+    for (label, bytes) in [
+        (b"receipt".as_slice(), receipt_bytes.as_slice()),
+        (b"journal".as_slice(), journal_bytes.as_slice()),
+    ] {
+        hash_cursor_recovery_field(&mut hasher, label);
+        hash_cursor_recovery_field(&mut hasher, bytes);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn cursor_recovery_active_observed_event(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<CloudFilesModuleEvent, CloudFilesModuleError> {
+    Ok(CloudFilesModuleEvent::CursorRecoveryActiveObserved(
+        sinomo_dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            recovery_id: marker.recovery_id.clone(),
+            recovery_token: marker.recovery_token.clone(),
+            sync_root: marker.identity.sync_root.clone(),
+            root_path: marker.identity.root_path.clone(),
+            sync_root_file_id: marker.sync_root_file_id,
+            recovery_cycle: marker.recovery_cycle,
+            module_marker_fingerprint: cursor_recovery_module_marker_fingerprint(marker)?,
+            completed_registration_artifacts_fingerprint:
+                cursor_recovery_completed_registration_artifacts_fingerprint(marker)?,
+        },
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoveryTerminalHandoffStep {
+    AcknowledgeNamespaceFinalized,
+    PersistCompletionAuthorized,
+    AcknowledgeCompletionAuthority,
+    NormalizeRegistration,
+    AcknowledgeNormalization,
+    ClearCompletionAuthorized,
+    AcknowledgeAuthorityRelease,
+    CompleteWorker,
+    ReleasePopulation,
+}
+
+/// Runs the forward-only terminal handoff while the writable worker remains
+/// parked. Keeping this ordering in one production-used seam makes it
+/// impossible for restart handling and the live path to disagree about which
+/// durable cut precedes the next host acknowledgement.
+fn run_cursor_recovery_terminal_handoff_with<FStep, FCancelled>(
+    marker: &mut CursorRecoveryModuleMarker,
+    mut step: FStep,
+    mut cancelled: FCancelled,
+) -> Result<bool, CloudFilesModuleError>
+where
+    FStep: FnMut(
+        CursorRecoveryTerminalHandoffStep,
+        &mut CursorRecoveryModuleMarker,
+    ) -> Result<(), CloudFilesModuleError>,
+    FCancelled: FnMut() -> bool,
+{
+    if marker.phase == CursorRecoveryModulePhase::NamespaceFinalized {
+        step(
+            CursorRecoveryTerminalHandoffStep::AcknowledgeNamespaceFinalized,
+            marker,
+        )?;
+        step(
+            CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized,
+            marker,
+        )?;
+    }
+    if marker.phase != CursorRecoveryModulePhase::CompletionAuthorized {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-completion-phase".to_string(),
+            detail: "ActiveParked recovery lacks exact CompletionAuthorized authority".to_string(),
+        });
+    }
+    for terminal_step in [
+        CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority,
+        CursorRecoveryTerminalHandoffStep::NormalizeRegistration,
+        CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization,
+        CursorRecoveryTerminalHandoffStep::ClearCompletionAuthorized,
+        CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease,
+    ] {
+        step(terminal_step, marker)?;
+    }
+    // The final acknowledged host decision may have observed disabled consent
+    // and latched cancellation. Complete/Release are the first operations
+    // which unpark ordinary writeback, so they must remain strictly after this
+    // cancellation observation.
+    if cancelled() {
+        return Ok(false);
+    }
+    step(CursorRecoveryTerminalHandoffStep::CompleteWorker, marker)?;
+    if cancelled() {
+        return Ok(false);
+    }
+    step(CursorRecoveryTerminalHandoffStep::ReleasePopulation, marker)?;
+    Ok(true)
+}
+
+fn cursor_recovery_cycle_authorization(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<Option<String>, CloudFilesModuleError> {
+    if marker.recovery_cycle == 0 {
+        return Ok(None);
+    }
+    if marker.phase == CursorRecoveryModulePhase::PreservedStateOwned {
+        return cursor_recovery_native_successor_fingerprint(marker).map(Some);
+    }
+    let observed = marker
+        .cycle_authorization_fingerprint
+        .clone()
+        .ok_or_else(|| CloudFilesModuleError {
+            code: "cursor-recovery-cycle-authorization-missing".to_string(),
+            detail: "rearmed cursor recovery lost its PreservedStateOwned commitment".to_string(),
+        })?;
+    let expected = cursor_recovery_native_successor_fingerprint(marker)?;
+    if observed != expected {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-cycle-authorization-mismatch".to_string(),
+            detail: "rearmed cursor recovery changed from its exact PreservedStateOwned commitment"
+                .to_string(),
+        });
+    }
+    Ok(Some(observed))
+}
+
+fn validate_cursor_recovery_root(
+    identity: &CloudFilesCursorOnlyRecoveryIdentity,
+    expected_file_id: u64,
+    root_fence: &CursorRecoveryRootFence,
+) -> Result<(), CloudFilesModuleError> {
+    ensure_new_sync_root_is_empty(&identity.sync_root)?;
+    if root_fence.file_id != expected_file_id
+        || sync_root_file_index(&identity.sync_root)? != expected_file_id
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-root-drift".to_string(),
+            detail: "cursor recovery sync root physical identity changed".to_string(),
+        });
+    }
+    if query_registered_sync_root(&identity.sync_root)?.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-registration-present".to_string(),
+            detail: "cursor recovery requires absent CFAPI registration".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_owned_cursor_recovery_root(
+    identity: &CloudFilesCursorOnlyRecoveryIdentity,
+    expected_file_id: u64,
+) -> Result<(), CloudFilesModuleError> {
+    ensure_owned_sync_root_is_plain_directory(&identity.sync_root)?;
+    if sync_root_file_index(&identity.sync_root)? != expected_file_id {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-root-drift".to_string(),
+            detail: "owned cursor recovery sync root physical identity changed".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn cursor_recovery_module_marker_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .module_runtime_dir()
+        .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE)
+}
+
+fn cursor_recovery_artifact_temp_path(path: &Path, label: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("cursor-recovery");
+    path.with_file_name(format!(".{name}.{label}"))
+}
+
+fn registration_journal_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cursor_recovery_artifact_temp_path(
+        &registration_journal_path(data_dir),
+        "registration-journal-next",
+    )
+}
+
+fn registration_receipt_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cursor_recovery_artifact_temp_path(
+        &registration_receipt_path(data_dir),
+        "registration-receipt-next",
+    )
+}
+
+fn cursor_recovery_module_marker_temp_path(data_dir: &SinomoDataDir) -> PathBuf {
+    cursor_recovery_artifact_temp_path(
+        &cursor_recovery_module_marker_path(data_dir),
+        CLOUD_FILES_CURSOR_RECOVERY_MODULE_TEMP_LABEL,
+    )
+}
+
+fn load_cursor_recovery_module_marker(
+    path: &Path,
+) -> Result<Option<CursorRecoveryModuleMarker>, CloudFilesModuleError> {
+    let Some(bytes) = read_bounded_plain_registration_file(
+        path,
+        CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES,
+        "Cloud Files cursor recovery marker",
+    )?
+    else {
+        return Ok(None);
+    };
+    let marker: CursorRecoveryModuleMarker = decode_canonical_registration_artifact(
+        path,
+        &bytes,
+        "cursor-recovery-marker",
+        "Cloud Files cursor recovery marker",
+    )?;
+    validate_cursor_recovery_marker(&marker)?;
+    Ok(Some(marker))
+}
+
+fn inspect_cursor_recovery_module_marker_snapshot(
+    data_dir: &SinomoDataDir,
+) -> Result<RegistrationArtifactSnapshot<CursorRecoveryModuleMarker>, CloudFilesModuleError> {
+    let path = cursor_recovery_module_marker_path(data_dir);
+    let temporary = cursor_recovery_module_marker_temp_path(data_dir);
+    let snapshot = inspect_registration_artifact_snapshot::<CursorRecoveryModuleMarker>(
+        &path,
+        &temporary,
+        CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES,
+        "cursor-recovery-marker",
+        "Cloud Files cursor recovery marker",
+    )?;
+    if let Some(marker) = snapshot.current.as_ref() {
+        validate_cursor_recovery_marker(marker)?;
+    }
+    if let Some(marker) = snapshot.temporary.as_ref() {
+        validate_cursor_recovery_marker(marker)?;
+    }
+    Ok(snapshot)
+}
+
+fn cursor_recovery_marker_with_phase(
+    marker: &CursorRecoveryModuleMarker,
+    phase: CursorRecoveryModulePhase,
+) -> CursorRecoveryModuleMarker {
+    let mut expected = marker.clone();
+    match phase {
+        CursorRecoveryModulePhase::NamespaceFinalized
+        | CursorRecoveryModulePhase::CompletionAuthorized => {
+            expected.namespace_resume = CursorRecoveryNamespaceResume::Finalized;
+        }
+        _ => {}
+    }
+    expected.phase = phase;
+    expected
+}
+
+fn cursor_recovery_phase_successor(
+    phase: CursorRecoveryModulePhase,
+) -> Option<CursorRecoveryModulePhase> {
+    match phase {
+        CursorRecoveryModulePhase::Authorized => Some(CursorRecoveryModulePhase::Validated),
+        CursorRecoveryModulePhase::Validated => Some(CursorRecoveryModulePhase::StateOwned),
+        CursorRecoveryModulePhase::StateOwned => Some(CursorRecoveryModulePhase::ReconcileArmed),
+        CursorRecoveryModulePhase::ReconcileArmed => Some(CursorRecoveryModulePhase::Ready),
+        CursorRecoveryModulePhase::Ready => Some(CursorRecoveryModulePhase::NamespaceFinalized),
+        CursorRecoveryModulePhase::NamespaceFinalized => {
+            Some(CursorRecoveryModulePhase::CompletionAuthorized)
+        }
+        CursorRecoveryModulePhase::CompletionAuthorized
+        | CursorRecoveryModulePhase::PreserveAuthorized
+        | CursorRecoveryModulePhase::PreservedStateOwned => None,
+    }
+}
+
+fn cursor_recovery_preserve_authorized_successor(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<CursorRecoveryModuleMarker, CloudFilesModuleError> {
+    if matches!(
+        marker.phase,
+        CursorRecoveryModulePhase::Authorized
+            | CursorRecoveryModulePhase::Validated
+            | CursorRecoveryModulePhase::PreserveAuthorized
+    ) {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-preserve-predecessor".to_string(),
+            detail: "cursor recovery has no exact state-owned preserve predecessor".to_string(),
+        });
+    }
+    let mut expected = marker.clone();
+    expected.predecessor_cycle_fingerprint = cursor_recovery_cycle_authorization(marker)?;
+    expected.cycle_authorization_fingerprint = None;
+    expected.recovery_cycle =
+        expected
+            .recovery_cycle
+            .checked_add(1)
+            .ok_or_else(|| CloudFilesModuleError {
+                code: "cursor-recovery-cycle-overflow".to_string(),
+                detail: "cursor recovery preserve cycle overflowed".to_string(),
+            })?;
+    expected.cycle_authorized_namespace_resume = marker.namespace_resume;
+    expected.phase = CursorRecoveryModulePhase::PreserveAuthorized;
+    Ok(expected)
+}
+
+fn cursor_recovery_preserved_state_owned_successor(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<CursorRecoveryModuleMarker, CloudFilesModuleError> {
+    if marker.phase != CursorRecoveryModulePhase::PreserveAuthorized {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-preserve-successor".to_string(),
+            detail: "PreservedStateOwned requires PreserveAuthorized".to_string(),
+        });
+    }
+    let mut expected = marker.clone();
+    expected.phase = CursorRecoveryModulePhase::PreservedStateOwned;
+    Ok(expected)
+}
+
+fn cursor_recovery_rearmed_successor(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<CursorRecoveryModuleMarker, CloudFilesModuleError> {
+    if marker.phase != CursorRecoveryModulePhase::PreservedStateOwned {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-rearm-predecessor".to_string(),
+            detail: "rearm requires PreservedStateOwned".to_string(),
+        });
+    }
+    let mut expected = marker.clone();
+    expected.namespace_resume = marker.cycle_authorized_namespace_resume;
+    expected.cycle_authorization_fingerprint =
+        Some(cursor_recovery_native_successor_fingerprint(marker)?);
+    expected.phase = CursorRecoveryModulePhase::ReconcileArmed;
+    Ok(expected)
+}
+
+fn validate_cursor_recovery_apply_authority(
+    marker: &CursorRecoveryModuleMarker,
+    request: &CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<(), CloudFilesModuleError> {
+    if marker.schema_version != request.identity.schema_version
+        || marker.identity != request.identity
+        || marker.recovery_id != request.recovery_id
+        || marker.recovery_token != request.expected_token
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-mismatch".to_string(),
+            detail: "a durable cursor recovery artifact belongs to another token, identity, or recovery ID"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_cursor_recovery_mount_authority(
+    marker: &CursorRecoveryModuleMarker,
+    request: &CloudFilesMountRequest,
+    data_dir: &SinomoDataDir,
+) -> Result<(), CloudFilesModuleError> {
+    if !matches!(
+        marker.phase,
+        CursorRecoveryModulePhase::ReconcileArmed
+            | CursorRecoveryModulePhase::Ready
+            | CursorRecoveryModulePhase::NamespaceFinalized
+            | CursorRecoveryModulePhase::CompletionAuthorized
+            | CursorRecoveryModulePhase::PreservedStateOwned
+    ) || marker.identity.sync_root != request.sync_root
+        || marker.identity.root_path != request.root_path
+        || marker.identity.data_dir_root != data_dir.root()
+        || marker.identity.provider_name != request.provider_name
+        || marker.identity.provider_version != request.provider_version
+        || marker.identity.read_only != request.read_only
+        || marker.identity.sync_local_changes != request.sync_local_changes
+        || marker.identity.prepopulate_depth != request.prepopulate_depth
+        || marker.identity.max_run_seconds != request.max_run_seconds
+        || request.cursor_recovery.as_ref()
+            != Some(&CloudFilesCursorRecoveryContext {
+                recovery_id: marker.recovery_id.clone(),
+                recovery_token: marker.recovery_token.clone(),
+                recovery_cycle: marker.recovery_cycle,
+                native_successor_fingerprint: cursor_recovery_cycle_authorization(marker)?,
+            })
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-mount-blocked".to_string(),
+            detail:
+                "ordinary mount is blocked by a nonterminal or mismatched cursor recovery artifact"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_cursor_recovery_preserve_authority(
+    marker: &CursorRecoveryModuleMarker,
+    request: &CloudFilesUnregisterRequest,
+    data_dir: &SinomoDataDir,
+    registration_lock_bytes: Option<&[u8]>,
+) -> Result<CursorRecoveryPreserveContextRelation, CloudFilesModuleError> {
+    if marker.identity.sync_root != request.sync_root
+        || marker.identity.root_path != request.root_path
+        || marker.identity.data_dir_root != data_dir.root()
+        || marker.identity.provider_name != request.provider_name
+        || registration_lock_bytes != Some(marker.registration_lock_bytes.as_slice())
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-unregister-mismatch".to_string(),
+            detail: "state-preserving unregister identity or existing registration lock does not match the durable cursor recovery"
+                .to_string(),
+        });
+    }
+    let context = request
+        .cursor_recovery
+        .as_ref()
+        .ok_or_else(|| CloudFilesModuleError {
+            code: "cursor-recovery-unregister-context-missing".to_string(),
+            detail: "state-preserving unregister omitted its exact cursor-recovery context"
+                .to_string(),
+        })?;
+    if context.recovery_id != marker.recovery_id || context.recovery_token != marker.recovery_token
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-unregister-context-mismatch".to_string(),
+            detail: "state-preserving unregister token does not match cursor recovery".to_string(),
+        });
+    }
+    let predecessor_retry = matches!(
+        marker.phase,
+        CursorRecoveryModulePhase::PreserveAuthorized
+            | CursorRecoveryModulePhase::PreservedStateOwned
+    ) && context
+        .recovery_cycle
+        .checked_add(1)
+        .is_some_and(|cycle| cycle == marker.recovery_cycle)
+        && context.native_successor_fingerprint == marker.predecessor_cycle_fingerprint;
+    if predecessor_retry {
+        return Ok(CursorRecoveryPreserveContextRelation::PredecessorRetry);
+    }
+    let current_authorization = cursor_recovery_cycle_authorization(marker)?;
+    if context.recovery_cycle == marker.recovery_cycle
+        && context.native_successor_fingerprint == current_authorization
+        && marker.phase == CursorRecoveryModulePhase::PreservedStateOwned
+    {
+        // Rapid disable after the host rearmed PSO but before native PSO->RA.
+        return Ok(CursorRecoveryPreserveContextRelation::Current);
+    }
+    if context.recovery_cycle == marker.recovery_cycle
+        && context.native_successor_fingerprint == current_authorization
+        && !matches!(marker.phase, CursorRecoveryModulePhase::PreserveAuthorized)
+    {
+        return Ok(CursorRecoveryPreserveContextRelation::Current);
+    }
+    Err(CloudFilesModuleError {
+        code: "cursor-recovery-unregister-context-mismatch".to_string(),
+        detail: "state-preserving unregister context is neither the exact current cycle nor a durable preserve retry"
+            .to_string(),
+    })
+}
+
+fn promote_cursor_recovery_artifact_temp(
+    temporary: &Path,
+    path: &Path,
+    code: &str,
+    label: &str,
+) -> Result<(), CloudFilesModuleError> {
+    let temporary_wide = wide_path(temporary);
+    let path_wide = wide_path(path);
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary_wide.as_ptr()),
+            PCWSTR(path_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|source| CloudFilesModuleError {
+        code: format!("{code}-commit"),
+        detail: format!("promote exact {label} {}: {source}", path.display()),
+    })
+}
+
+fn cursor_recovery_expected_registration_artifacts(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<
+    (
+        RegistrationJournal,
+        RegistrationJournal,
+        CloudFilesRegistrationReceipt,
+    ),
+    CloudFilesModuleError,
+> {
+    let request = cursor_recovery_mount_request(marker);
+    let state_owned = RegistrationJournal::cursor_recovery_state_owned(
+        &request,
+        CLOUD_FILES_PROVIDER_ID_TEXT,
+        marker.registration_nonce.clone(),
+        marker.sync_root_file_id,
+        marker.recovery_id.clone(),
+        marker.recovery_token.clone(),
+        marker.recovery_cycle,
+    )?;
+    let mut ready = state_owned.clone();
+    ready.phase = RegistrationPhase::Ready;
+    let receipt = CloudFilesRegistrationReceipt {
+        interface_version: SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string(),
+        registration_identity_interface_version: None,
+        sync_root: request.sync_root,
+        root_path: request.root_path,
+        provider_name: request.provider_name,
+    };
+    Ok((state_owned, ready, receipt))
+}
+
+fn cursor_recovery_predecessor_registration_artifacts(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<
+    (
+        RegistrationJournal,
+        RegistrationJournal,
+        CloudFilesRegistrationReceipt,
+    ),
+    CloudFilesModuleError,
+> {
+    let mut predecessor = marker.clone();
+    predecessor.recovery_cycle =
+        predecessor
+            .recovery_cycle
+            .checked_sub(1)
+            .ok_or_else(|| CloudFilesModuleError {
+                code: "cursor-recovery-preserve-cycle".to_string(),
+                detail: "preserve successor has no predecessor cycle".to_string(),
+            })?;
+    cursor_recovery_expected_registration_artifacts(&predecessor)
+}
+
+fn cursor_recovery_receipt_cut_matches(
+    journal: &RegistrationJournal,
+    receipt: Option<&CloudFilesRegistrationReceipt>,
+    expected_receipt: &CloudFilesRegistrationReceipt,
+) -> bool {
+    match journal.phase {
+        RegistrationPhase::Ready => receipt == Some(expected_receipt),
+        RegistrationPhase::StateOwned => receipt.is_none() || receipt == Some(expected_receipt),
+        RegistrationPhase::Prepared | RegistrationPhase::Registered => false,
+    }
+}
+
+/// Classify and advance only the finite, causally ordered registration
+/// artifact cuts produced by cursor recovery. This runs under the pre-existing
+/// registration lease before phase topology admission. It never deletes or
+/// normalizes an unknown artifact.
+fn recover_cursor_recovery_registration_snapshot<F>(
+    data_dir: &SinomoDataDir,
+    allow_initial_authorized_temp: bool,
+    validate_authority: F,
+) -> Result<Option<CursorRecoveryModuleMarker>, CloudFilesModuleError>
+where
+    F: Fn(&CursorRecoveryModuleMarker) -> Result<(), CloudFilesModuleError>,
+{
+    let marker_path = cursor_recovery_module_marker_path(data_dir);
+    let marker_temp_path = cursor_recovery_module_marker_temp_path(data_dir);
+    let journal_path = registration_journal_path(data_dir);
+    let journal_temp_path = registration_journal_temp_path(data_dir);
+    let receipt_path = registration_receipt_path(data_dir);
+    let receipt_temp_path = registration_receipt_temp_path(data_dir);
+
+    for _ in 0..8 {
+        let marker_snapshot = inspect_cursor_recovery_module_marker_snapshot(data_dir)?;
+        let journal_snapshot = inspect_registration_artifact_snapshot::<RegistrationJournal>(
+            &journal_path,
+            &journal_temp_path,
+            CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+            "registration-journal",
+            "Cloud Files registration journal",
+        )?;
+        let receipt_snapshot =
+            inspect_registration_artifact_snapshot::<CloudFilesRegistrationReceipt>(
+                &receipt_path,
+                &receipt_temp_path,
+                CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+                "registration-receipt",
+                "Cloud Files registration receipt",
+            )?;
+        for journal in [
+            journal_snapshot.current.as_ref(),
+            journal_snapshot.temporary.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            journal.validate(CLOUD_FILES_PROVIDER_ID_TEXT)?;
+        }
+
+        let Some(current) = marker_snapshot.current.as_ref() else {
+            let Some(temporary) = marker_snapshot.temporary.as_ref() else {
+                if journal_snapshot
+                    .current
+                    .as_ref()
+                    .is_some_and(|journal| journal.cursor_recovery.is_some())
+                    || journal_snapshot.temporary.is_some()
+                    || receipt_snapshot.temporary.is_some()
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-artifact-orphan".to_string(),
+                        detail: "cursor-provenance journal or temporary evidence exists without an exact cursor recovery marker"
+                            .to_string(),
+                    });
+                }
+                // Ordinary nonce-journal/receipt recovery is owned by the
+                // registration lifecycle below. It is not cursor evidence and
+                // must remain admissible when the optional provenance is None.
+                return Ok(None);
+            };
+            validate_authority(temporary)?;
+            if !allow_initial_authorized_temp
+                || temporary.phase != CursorRecoveryModulePhase::Authorized
+                || journal_snapshot.current.is_some()
+                || journal_snapshot.temporary.is_some()
+                || receipt_snapshot.current.is_some()
+                || receipt_snapshot.temporary.is_some()
+            {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-artifact-cut-invalid".to_string(),
+                    detail: "final-absent cursor recovery evidence is not the exact request-bound Authorized marker cut"
+                        .to_string(),
+                });
+            }
+            promote_cursor_recovery_artifact_temp(
+                &marker_temp_path,
+                &marker_path,
+                "cursor-recovery-marker",
+                "Cloud Files cursor recovery marker",
+            )?;
+            continue;
+        };
+        validate_authority(current)?;
+        let (state_owned, ready, receipt) =
+            cursor_recovery_expected_registration_artifacts(current)?;
+        let mut ordinary_ready = ready.clone();
+        ordinary_ready.clear_cursor_recovery();
+
+        if let Some(temporary) = marker_snapshot.temporary.as_ref() {
+            validate_authority(temporary)?;
+            if matches!(
+                temporary.phase,
+                CursorRecoveryModulePhase::PreserveAuthorized
+            ) && temporary == &cursor_recovery_preserve_authorized_successor(current)?
+            {
+                let (_, predecessor_ready, predecessor_receipt) =
+                    cursor_recovery_expected_registration_artifacts(current)?;
+                let predecessor_state_owned = {
+                    let mut journal = predecessor_ready.clone();
+                    journal.phase = RegistrationPhase::StateOwned;
+                    journal
+                };
+                let predecessor = journal_snapshot.current.as_ref().is_some_and(|journal| {
+                    (journal == &predecessor_ready || journal == &predecessor_state_owned)
+                        && cursor_recovery_receipt_cut_matches(
+                            journal,
+                            receipt_snapshot.current.as_ref(),
+                            &predecessor_receipt,
+                        )
+                });
+                if !predecessor
+                    || journal_snapshot.temporary.is_some()
+                    || receipt_snapshot.temporary.is_some()
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-preserve-authorized-cut".to_string(),
+                        detail: "PreserveAuthorized temp lacks its exact predecessor artifacts"
+                            .to_string(),
+                    });
+                }
+                promote_cursor_recovery_artifact_temp(
+                    &marker_temp_path,
+                    &marker_path,
+                    "cursor-recovery-marker",
+                    "Cloud Files PreserveAuthorized marker",
+                )?;
+                continue;
+            }
+            if current.phase == CursorRecoveryModulePhase::PreserveAuthorized
+                && temporary == &cursor_recovery_preserved_state_owned_successor(current)?
+            {
+                let (successor_state_owned, _, successor_receipt) =
+                    cursor_recovery_expected_registration_artifacts(current)?;
+                if journal_snapshot.current.as_ref() != Some(&successor_state_owned)
+                    || journal_snapshot.temporary.is_some()
+                    || receipt_snapshot
+                        .current
+                        .as_ref()
+                        .is_some_and(|receipt| receipt != &successor_receipt)
+                    || receipt_snapshot.temporary.is_some()
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-preserved-state-owned-cut".to_string(),
+                        detail: "PreservedStateOwned temp lacks its exact successor journal"
+                            .to_string(),
+                    });
+                }
+                promote_cursor_recovery_artifact_temp(
+                    &marker_temp_path,
+                    &marker_path,
+                    "cursor-recovery-marker",
+                    "Cloud Files PreservedStateOwned marker",
+                )?;
+                continue;
+            }
+            if current.phase == CursorRecoveryModulePhase::PreservedStateOwned
+                && temporary == &cursor_recovery_rearmed_successor(current)?
+            {
+                let (state_owned, _, receipt) =
+                    cursor_recovery_expected_registration_artifacts(current)?;
+                if journal_snapshot.current.as_ref() != Some(&state_owned)
+                    || journal_snapshot.temporary.is_some()
+                    || receipt_snapshot
+                        .current
+                        .as_ref()
+                        .is_some_and(|value| value != &receipt)
+                    || receipt_snapshot.temporary.is_some()
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-rearm-cut".to_string(),
+                        detail: "rearm temp lacks exact PreservedStateOwned artifacts".to_string(),
+                    });
+                }
+                promote_cursor_recovery_artifact_temp(
+                    &marker_temp_path,
+                    &marker_path,
+                    "cursor-recovery-marker",
+                    "Cloud Files rearmed marker",
+                )?;
+                continue;
+            }
+            if current.phase == CursorRecoveryModulePhase::ReconcileArmed
+                && current.namespace_resume == CursorRecoveryNamespaceResume::ReconcileProgress
+            {
+                let mut terminal_pending = current.clone();
+                terminal_pending.namespace_resume =
+                    CursorRecoveryNamespaceResume::TerminalPendingFinalize;
+                if temporary == &terminal_pending {
+                    if journal_snapshot.current.as_ref() != Some(&state_owned)
+                        || journal_snapshot.temporary.is_some()
+                        || receipt_snapshot.current.is_some()
+                        || receipt_snapshot.temporary.is_some()
+                    {
+                        return Err(CloudFilesModuleError {
+                            code: "cursor-recovery-terminal-successor-artifacts".to_string(),
+                            detail: "TerminalPendingFinalize marker temp is not preceded by the exact StateOwned journal with receipt absent"
+                                .to_string(),
+                        });
+                    }
+                    let owner_guards =
+                        acquire_cursor_recovery_empty_owner_guards(data_dir, current)?;
+                    let terminal = crate::namespace_reconciler::acquire_authorized_cursor_recovery_terminal_successor(
+                        data_dir,
+                        current.identity.sync_root.display().to_string(),
+                        current.identity.root_path.clone(),
+                        &current.plan,
+                    )
+                    .map_err(reconciliation_recovery_error)?
+                    .ok_or_else(|| CloudFilesModuleError {
+                        code: "cursor-recovery-terminal-successor-invalid".to_string(),
+                        detail: "TerminalPendingFinalize marker temp lacks exact terminal owner state"
+                            .to_string(),
+                    })?;
+                    promote_cursor_recovery_artifact_temp(
+                        &marker_temp_path,
+                        &marker_path,
+                        "cursor-recovery-marker",
+                        "Cloud Files cursor recovery marker",
+                    )?;
+                    drop(terminal);
+                    drop(owner_guards);
+                    continue;
+                }
+            }
+            let Some(next) = cursor_recovery_phase_successor(current.phase) else {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-marker-temp-unexpected".to_string(),
+                    detail: "NamespaceFinalized recovery cannot have a successor marker"
+                        .to_string(),
+                });
+            };
+            if temporary != &cursor_recovery_marker_with_phase(current, next) {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-marker-temp-mismatch".to_string(),
+                    detail: "cursor recovery marker temporary file is not the exact single-phase successor"
+                        .to_string(),
+                });
+            }
+            let artifacts_match = match next {
+                CursorRecoveryModulePhase::Validated => {
+                    journal_snapshot.current.is_none()
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.is_none()
+                        && receipt_snapshot.temporary.is_none()
+                }
+                CursorRecoveryModulePhase::StateOwned => {
+                    journal_snapshot.current.as_ref() == Some(&state_owned)
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.is_none()
+                        && receipt_snapshot.temporary.is_none()
+                }
+                CursorRecoveryModulePhase::ReconcileArmed => {
+                    journal_snapshot.current.as_ref() == Some(&state_owned)
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.is_none()
+                        && receipt_snapshot.temporary.is_none()
+                }
+                CursorRecoveryModulePhase::Ready
+                | CursorRecoveryModulePhase::NamespaceFinalized => {
+                    journal_snapshot.current.as_ref() == Some(&ready)
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.as_ref() == Some(&receipt)
+                        && receipt_snapshot.temporary.is_none()
+                }
+                CursorRecoveryModulePhase::CompletionAuthorized => {
+                    journal_snapshot.current.as_ref() == Some(&ready)
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.as_ref() == Some(&receipt)
+                        && receipt_snapshot.temporary.is_none()
+                }
+                CursorRecoveryModulePhase::PreserveAuthorized
+                | CursorRecoveryModulePhase::PreservedStateOwned => false,
+                CursorRecoveryModulePhase::Authorized => false,
+            };
+            if !artifacts_match {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-artifact-cut-invalid".to_string(),
+                    detail: "cursor recovery marker successor is not preceded by its exact causal journal and receipt artifacts"
+                        .to_string(),
+                });
+            }
+            if next == CursorRecoveryModulePhase::ReconcileArmed {
+                // The exact inner rewrite must be revalidated under its owner
+                // lock before this marker successor is promoted. The Apply
+                // state machine performs that check and then replays the same
+                // deterministic marker write.
+                return Ok(Some(current.clone()));
+            }
+            promote_cursor_recovery_artifact_temp(
+                &marker_temp_path,
+                &marker_path,
+                "cursor-recovery-marker",
+                "Cloud Files cursor recovery marker",
+            )?;
+            continue;
+        }
+
+        if current.phase == CursorRecoveryModulePhase::ReconcileArmed
+            && current.namespace_resume == CursorRecoveryNamespaceResume::ReconcileProgress
+        {
+            if journal_snapshot.current.as_ref() != Some(&state_owned)
+                || journal_snapshot.temporary.is_some()
+                || receipt_snapshot.current.is_some()
+                || receipt_snapshot.temporary.is_some()
+            {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-terminal-successor-artifacts".to_string(),
+                    detail: "TerminalPendingFinalize synthesis requires the exact StateOwned journal with receipt absent"
+                        .to_string(),
+                });
+            }
+            let owner_guards = acquire_cursor_recovery_empty_owner_guards(data_dir, current)?;
+            if let Some(terminal) =
+                crate::namespace_reconciler::acquire_authorized_cursor_recovery_terminal_successor(
+                    data_dir,
+                    current.identity.sync_root.display().to_string(),
+                    current.identity.root_path.clone(),
+                    &current.plan,
+                )
+                .map_err(reconciliation_recovery_error)?
+            {
+                let mut terminal_pending = current.clone();
+                terminal_pending.namespace_resume =
+                    CursorRecoveryNamespaceResume::TerminalPendingFinalize;
+                persist_cursor_recovery_module_marker(&marker_path, &terminal_pending)?;
+                drop(terminal);
+                drop(owner_guards);
+                continue;
+            }
+        }
+
+        match current.phase {
+            CursorRecoveryModulePhase::Authorized => {
+                if journal_snapshot.current.is_none()
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::Validated => {
+                if journal_snapshot.current.is_none()
+                    && journal_snapshot.temporary.as_ref() == Some(&state_owned)
+                    && receipt_snapshot.current.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    promote_cursor_recovery_artifact_temp(
+                        &journal_temp_path,
+                        &journal_path,
+                        "registration-journal",
+                        "Cloud Files registration journal",
+                    )?;
+                    continue;
+                }
+                if journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                    && (journal_snapshot.current.is_none()
+                        || journal_snapshot.current.as_ref() == Some(&state_owned))
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::StateOwned => {
+                if journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::ReconcileArmed => {
+                if current.namespace_resume == CursorRecoveryNamespaceResume::ReconcileProgress {
+                    if journal_snapshot.current.as_ref() == Some(&state_owned)
+                        && journal_snapshot.temporary.is_none()
+                        && receipt_snapshot.current.is_none()
+                        && receipt_snapshot.temporary.is_none()
+                    {
+                        return Ok(Some(current.clone()));
+                    }
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-progress-artifact-cut-invalid".to_string(),
+                        detail: "ReconcileProgress permits only the exact StateOwned journal with no receipt or artifact temporary evidence"
+                            .to_string(),
+                    });
+                }
+                if journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.is_none()
+                    && receipt_snapshot.temporary.as_ref() == Some(&receipt)
+                {
+                    promote_cursor_recovery_artifact_temp(
+                        &receipt_temp_path,
+                        &receipt_path,
+                        "registration-receipt",
+                        "Cloud Files registration receipt",
+                    )?;
+                    continue;
+                }
+                if journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.as_ref() == Some(&ready)
+                    && receipt_snapshot.current.as_ref() == Some(&receipt)
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    promote_cursor_recovery_artifact_temp(
+                        &journal_temp_path,
+                        &journal_path,
+                        "registration-journal",
+                        "Cloud Files registration journal",
+                    )?;
+                    continue;
+                }
+                let exact_state_owned_cut = journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                    && (receipt_snapshot.current.is_none()
+                        || receipt_snapshot.current.as_ref() == Some(&receipt));
+                let exact_ready_cut = journal_snapshot.current.as_ref() == Some(&ready)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.as_ref() == Some(&receipt)
+                    && receipt_snapshot.temporary.is_none();
+                if exact_state_owned_cut || exact_ready_cut {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::Ready | CursorRecoveryModulePhase::NamespaceFinalized => {
+                if journal_snapshot.current.as_ref() == Some(&ready)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.current.as_ref() == Some(&receipt)
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::PreserveAuthorized => {
+                let (predecessor_state_owned, predecessor_ready, predecessor_receipt) =
+                    cursor_recovery_predecessor_registration_artifacts(current)?;
+                if journal_snapshot.current.as_ref().is_some_and(|journal| {
+                    (journal == &predecessor_ready || journal == &predecessor_state_owned)
+                        && cursor_recovery_receipt_cut_matches(
+                            journal,
+                            receipt_snapshot.current.as_ref(),
+                            &predecessor_receipt,
+                        )
+                }) && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+                if journal_snapshot.current.as_ref().is_some_and(|journal| {
+                    (journal == &predecessor_ready || journal == &predecessor_state_owned)
+                        && cursor_recovery_receipt_cut_matches(
+                            journal,
+                            receipt_snapshot.current.as_ref(),
+                            &predecessor_receipt,
+                        )
+                }) && journal_snapshot.temporary.as_ref() == Some(&state_owned)
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    promote_cursor_recovery_artifact_temp(
+                        &journal_temp_path,
+                        &journal_path,
+                        "registration-journal",
+                        "Cloud Files preserved StateOwned journal",
+                    )?;
+                    continue;
+                }
+                if journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot
+                        .current
+                        .as_ref()
+                        .is_none_or(|value| value == &receipt)
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::PreservedStateOwned => {
+                if journal_snapshot.current.as_ref() == Some(&state_owned)
+                    && journal_snapshot.temporary.is_none()
+                    && receipt_snapshot
+                        .current
+                        .as_ref()
+                        .is_none_or(|value| value == &receipt)
+                    && receipt_snapshot.temporary.is_none()
+                {
+                    return Ok(Some(current.clone()));
+                }
+            }
+            CursorRecoveryModulePhase::CompletionAuthorized => {
+                if receipt_snapshot.current.as_ref() != Some(&receipt)
+                    || receipt_snapshot.temporary.is_some()
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-completion-receipt-cut".to_string(),
+                        detail: "CompletionAuthorized requires the exact Ready receipt with no temporary evidence"
+                            .to_string(),
+                    });
+                }
+                let exact_recovery_ready = journal_snapshot.current.as_ref() == Some(&ready)
+                    && journal_snapshot.temporary.is_none();
+                let exact_normalized_ready = journal_snapshot.current.as_ref()
+                    == Some(&ordinary_ready)
+                    && journal_snapshot.temporary.is_none();
+                let exact_normalization_temp = journal_snapshot.current.as_ref() == Some(&ready)
+                    && journal_snapshot.temporary.as_ref() == Some(&ordinary_ready);
+                let exact_redundant_normalized_temp = journal_snapshot.current.as_ref()
+                    == Some(&ordinary_ready)
+                    && journal_snapshot.temporary.as_ref() == Some(&ordinary_ready);
+                if exact_normalization_temp || exact_redundant_normalized_temp {
+                    promote_exact_registration_artifact(
+                        &journal_path,
+                        &journal_temp_path,
+                        CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+                        &ordinary_ready,
+                        "registration-journal",
+                        "normalized Cloud Files registration journal",
+                    )?;
+                    continue;
+                }
+                if exact_recovery_ready || exact_normalized_ready {
+                    return Ok(Some(current.clone()));
+                }
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-completion-journal-cut".to_string(),
+                    detail: "CompletionAuthorized journal is neither its exact recovery Ready predecessor nor exact ordinary Ready successor"
+                        .to_string(),
+                });
+            }
+        }
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-artifact-cut-invalid".to_string(),
+            detail: format!(
+                "cursor recovery {:?} marker/journal/receipt snapshot is not an exact causal cut",
+                current.phase
+            ),
+        });
+    }
+    Err(CloudFilesModuleError {
+        code: "cursor-recovery-artifact-replay-loop".to_string(),
+        detail: "cursor recovery artifact replay exceeded its finite causal transition bound"
+            .to_string(),
+    })
+}
+
+fn validate_cursor_recovery_marker(
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    validate_cursor_recovery_identity(&marker.identity)?;
+    let valid_fingerprint = |value: &str| {
+        value
+            .strip_prefix("blake3:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
+    let valid_token = |value: &str| {
+        value
+            .strip_prefix("v1:blake3:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    };
+    let valid_cycle_authorization = marker
+        .cycle_authorization_fingerprint
+        .as_deref()
+        .is_some_and(|value| {
+            value.strip_prefix("blake3:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        });
+    let valid_predecessor_authorization = marker
+        .predecessor_cycle_fingerprint
+        .as_deref()
+        .is_some_and(|value| {
+            value.strip_prefix("blake3:").is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        });
+    let preserve_phase = matches!(
+        marker.phase,
+        CursorRecoveryModulePhase::PreserveAuthorized
+            | CursorRecoveryModulePhase::PreservedStateOwned
+    );
+    if marker.schema_version != CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
+        || marker.recovery_id.trim().is_empty()
+        || !valid_token(&marker.recovery_token)
+        || !valid_fingerprint(&marker.raw_state_fingerprint)
+        || marker.sync_root_file_id == 0
+        || marker.registration_nonce.trim().is_empty()
+        || marker.registration_lock_bytes != Vec::<u8>::new()
+        || (marker.recovery_cycle == 0
+            && (marker.cycle_authorization_fingerprint.is_some()
+                || marker.predecessor_cycle_fingerprint.is_some()))
+        || (marker.recovery_cycle > 0
+            && ((preserve_phase && marker.cycle_authorization_fingerprint.is_some())
+                || (!preserve_phase && !valid_cycle_authorization)
+                || (marker.recovery_cycle == 1 && marker.predecessor_cycle_fingerprint.is_some())
+                || (marker.recovery_cycle > 1 && !valid_predecessor_authorization)))
+        || marker.module_topology
+            != vec![
+                "local-changes".to_string(),
+                "namespace-reconciliation".to_string(),
+                CLOUD_FILES_REGISTRATION_LOCK_FILE.to_string(),
+            ]
+        || marker.plan.schema_version != marker.schema_version
+        || marker.plan.recovery_id != marker.recovery_id
+        || marker.plan.recovery_token != marker.recovery_token
+        || marker.plan.nonce != marker.registration_nonce
+        || marker.plan.root != marker.identity.root_path
+        || marker.plan.cursor_count_cleared == 0
+        || marker.plan.original_state.is_empty()
+        || marker.plan.expected_state.is_empty()
+        || marker.plan.original_audit.is_empty()
+        || marker.plan.expected_audit.is_empty()
+        || matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::PreserveAuthorized
+                | CursorRecoveryModulePhase::PreservedStateOwned
+        ) && (marker.recovery_cycle == 0
+            || marker.namespace_resume != marker.cycle_authorized_namespace_resume)
+        || !cursor_recovery_namespace_resume_is_monotonic(
+            marker.cycle_authorized_namespace_resume,
+            marker.namespace_resume,
+        )
+        || !match marker.phase {
+            CursorRecoveryModulePhase::Authorized
+            | CursorRecoveryModulePhase::Validated
+            | CursorRecoveryModulePhase::StateOwned => {
+                marker.namespace_resume == CursorRecoveryNamespaceResume::ReconcileProgress
+                    && marker.recovery_cycle == 0
+            }
+            CursorRecoveryModulePhase::ReconcileArmed => {
+                marker.recovery_cycle > 0
+                    || marker.namespace_resume != CursorRecoveryNamespaceResume::Finalized
+            }
+            CursorRecoveryModulePhase::Ready => matches!(
+                marker.namespace_resume,
+                CursorRecoveryNamespaceResume::TerminalPendingFinalize
+                    | CursorRecoveryNamespaceResume::Finalized
+            ),
+            CursorRecoveryModulePhase::NamespaceFinalized
+            | CursorRecoveryModulePhase::CompletionAuthorized => {
+                marker.namespace_resume == CursorRecoveryNamespaceResume::Finalized
+            }
+            CursorRecoveryModulePhase::PreserveAuthorized
+            | CursorRecoveryModulePhase::PreservedStateOwned => true,
+        }
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-invariant".to_string(),
+            detail: "cursor recovery marker outer identity does not match its embedded exact plan"
+                .to_string(),
+        });
+    }
+    if marker.recovery_cycle > 0
+        && !matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::PreserveAuthorized
+                | CursorRecoveryModulePhase::PreservedStateOwned
+        )
+    {
+        let expected = cursor_recovery_native_successor_fingerprint(marker)?;
+        if marker.cycle_authorization_fingerprint.as_deref() != Some(&expected) {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-cycle-authorization-mismatch".to_string(),
+                detail:
+                    "cursor recovery cycle authorization does not match its exact native successor"
+                        .to_string(),
+            });
+        }
+    }
+    if marker.phase == CursorRecoveryModulePhase::PreservedStateOwned {
+        let expected = cursor_recovery_native_successor_fingerprint(marker)?;
+        if expected.trim().is_empty() {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-successor-fingerprint".to_string(),
+                detail: "PreservedStateOwned successor fingerprint is empty".to_string(),
+            });
+        }
+    }
+    if marker.reconciliation_raw_files.get("state.sobj") != Some(&marker.plan.original_state)
+        || marker
+            .reconciliation_raw_files
+            .get("materialization-audit-intents.sobj")
+            != Some(&marker.plan.original_audit)
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-original-mismatch".to_string(),
+            detail: "cursor recovery plan original bytes do not match the captured owner snapshot"
+                .to_string(),
+        });
+    }
+    crate::namespace_reconciler::validate_authorized_cursor_recovery_plan(
+        &marker.plan,
+        &marker.identity.sync_root.display().to_string(),
+        &marker.identity.root_path,
+    )
+    .map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-marker-plan".to_string(),
+        detail: format!("cursor recovery marker embeds an invalid deterministic plan: {source}"),
+    })?;
+    let raw_state_fingerprint = cursor_recovery_raw_fingerprint(
+        &marker.identity,
+        marker.sync_root_file_id,
+        &marker.registration_lock_bytes,
+        &marker.module_topology,
+        &marker.queue_raw_files,
+        &marker.reconciliation_raw_files,
+        &marker.outbox_raw_files,
+    )?;
+    let recovery_token = cursor_recovery_token(&raw_state_fingerprint);
+    if marker.raw_state_fingerprint != raw_state_fingerprint
+        || marker.recovery_token != recovery_token
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-token-mismatch".to_string(),
+            detail:
+                "cursor recovery marker token is not derived from its complete captured preimage"
+                    .to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn cursor_recovery_raw_fingerprint(
+    identity: &CloudFilesCursorOnlyRecoveryIdentity,
+    sync_root_file_id: u64,
+    registration_lock_bytes: &[u8],
+    module_topology: &[String],
+    queue_raw_files: &BTreeMap<String, Vec<u8>>,
+    reconciliation_raw_files: &BTreeMap<String, Vec<u8>>,
+    outbox_raw_files: &BTreeMap<String, Vec<u8>>,
+) -> Result<String, CloudFilesModuleError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN.as_bytes());
+    hasher.update(&[0]);
+    hash_cursor_recovery_field(&mut hasher, b"identity");
+    hash_cursor_recovery_field(
+        &mut hasher,
+        &encode_sobj(identity).map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-identity-encode".to_string(),
+            detail: source.to_string(),
+        })?,
+    );
+    hash_cursor_recovery_field(&mut hasher, b"sync-root-file-id");
+    hash_cursor_recovery_field(&mut hasher, &sync_root_file_id.to_le_bytes());
+    hash_cursor_recovery_field(&mut hasher, b"registration-lock");
+    hash_cursor_recovery_field(&mut hasher, registration_lock_bytes);
+    hash_cursor_recovery_field(&mut hasher, b"module-topology");
+    hash_cursor_recovery_field(&mut hasher, &(module_topology.len() as u64).to_le_bytes());
+    for name in module_topology {
+        hash_cursor_recovery_field(&mut hasher, name.as_bytes());
+    }
+    hash_cursor_recovery_field(&mut hasher, b"local-change-queue");
+    hash_cursor_recovery_map(&mut hasher, queue_raw_files);
+    hash_cursor_recovery_field(&mut hasher, b"namespace-reconciliation");
+    hash_cursor_recovery_map(&mut hasher, reconciliation_raw_files);
+    hash_cursor_recovery_field(&mut hasher, b"mounted-mutation-outbox");
+    hash_cursor_recovery_map(&mut hasher, outbox_raw_files);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn cursor_recovery_token(raw_state_fingerprint: &str) -> String {
+    let mut token_hasher = blake3::Hasher::new();
+    token_hasher.update(CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN.as_bytes());
+    token_hasher.update(b"\0operator-token\0");
+    token_hasher.update(raw_state_fingerprint.as_bytes());
+    format!("v1:blake3:{}", token_hasher.finalize().to_hex())
+}
+
+fn persist_cursor_recovery_module_marker(
+    path: &Path,
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    let bytes = encode_sobj(marker).map_err(|source| CloudFilesModuleError {
+        code: "cursor-recovery-marker-encode".to_string(),
+        detail: source.to_string(),
+    })?;
+    if bytes.len() as u64 > CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-too-large".to_string(),
+            detail: "cursor recovery marker exceeds its bound".to_string(),
+        });
+    }
+    persist_cursor_recovery_registration_artifact(
+        path,
+        marker,
+        "cursor-recovery-marker",
+        "Cloud Files cursor recovery marker",
+    )
+}
+
+fn clear_completion_authorized_cursor_recovery_module_marker(
+    data_dir: &SinomoDataDir,
+    expected: &CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    if expected.phase != CursorRecoveryModulePhase::CompletionAuthorized
+        || expected.namespace_resume != CursorRecoveryNamespaceResume::Finalized
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-completion-not-authorized".to_string(),
+            detail: "only exact CompletionAuthorized/Finalized authority may be cleared"
+                .to_string(),
+        });
+    }
+    let path = cursor_recovery_module_marker_path(data_dir);
+    let marker_snapshot = inspect_cursor_recovery_module_marker_snapshot(data_dir)?;
+    if marker_snapshot.current.as_ref() != Some(expected) || marker_snapshot.temporary.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-marker-mismatch".to_string(),
+            detail: "refusing to clear changed or temporary completion authority".to_string(),
+        });
+    }
+    let (_, mut recovery_ready, expected_receipt) =
+        cursor_recovery_expected_registration_artifacts(expected)?;
+    recovery_ready.phase = RegistrationPhase::Ready;
+    let mut ordinary_ready = recovery_ready;
+    ordinary_ready.clear_cursor_recovery();
+    let journal_snapshot = inspect_registration_artifact_snapshot::<RegistrationJournal>(
+        &registration_journal_path(data_dir),
+        &registration_journal_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+        "registration-journal",
+        "normalized Cloud Files registration journal",
+    )?;
+    let receipt_snapshot = inspect_registration_artifact_snapshot::<CloudFilesRegistrationReceipt>(
+        &registration_receipt_path(data_dir),
+        &registration_receipt_temp_path(data_dir),
+        CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+        "registration-receipt",
+        "Cloud Files registration receipt",
+    )?;
+    if journal_snapshot.current.as_ref() != Some(&ordinary_ready)
+        || journal_snapshot.temporary.is_some()
+        || receipt_snapshot.current.as_ref() != Some(&expected_receipt)
+        || receipt_snapshot.temporary.is_some()
+    {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-completion-artifacts".to_string(),
+            detail: "CompletionAuthorized may clear only after exact ordinary Ready journal normalization"
+                .to_string(),
+        });
+    }
+    sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(&path)
+        .map(|_| ())
+        .map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-marker-finalize".to_string(),
+            detail: format!("clear CompletionAuthorized cursor recovery marker: {source}"),
+        })
+}
+
+fn hash_cursor_recovery_field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_cursor_recovery_map(hasher: &mut blake3::Hasher, files: &BTreeMap<String, Vec<u8>>) {
+    hasher.update(&(files.len() as u64).to_le_bytes());
+    for (name, bytes) in files {
+        hash_cursor_recovery_field(hasher, name.as_bytes());
+        hash_cursor_recovery_field(hasher, bytes);
+    }
+}
+
+fn reconciliation_recovery_error(
+    error: crate::namespace_reconciler::CloudFilesNamespaceReconcileError,
+) -> CloudFilesModuleError {
+    CloudFilesModuleError {
+        code: error.code.to_string(),
+        detail: error.detail,
     }
 }
 
@@ -672,9 +3505,14 @@ fn unregister_sifs_cloud_files_inner(
     request.root_path = normalize_sifs_root(&request.root_path)?;
     lifecycle.root_path.clone_from(&request.root_path);
     let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
-    let _registration_lease = RegistrationLease::acquire(&data_dir)?;
-    let recovered =
-        recover_registration_for_unregister(&request, &data_dir, UnregisterPolicy::Release)?;
+    let (_registration_lease, registration_lock_bytes) =
+        acquire_registration_lease_for_request(&data_dir, request.cursor_recovery.as_ref())?;
+    let recovered = recover_registration_for_unregister(
+        &request,
+        &data_dir,
+        UnregisterPolicy::Release,
+        registration_lock_bytes.as_deref(),
+    )?;
     lifecycle.registered = false;
     let detail = if recovered.was_registered {
         "Cloud Files sync root unregistered after nonce-bound ownership verification".to_string()
@@ -698,11 +3536,16 @@ pub fn unregister_sifs_cloud_files_preserving_state(
         request.root_path = normalize_sifs_root(&request.root_path)?;
         lifecycle.root_path.clone_from(&request.root_path);
         let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
-        let _registration_lease = RegistrationLease::acquire(&data_dir)?;
+        let (_registration_lease, registration_lock_bytes) =
+            acquire_registration_lease_for_request(
+                &data_dir,
+                request.cursor_recovery.as_ref(),
+            )?;
         let recovered = recover_registration_for_unregister(
             &request,
             &data_dir,
             UnregisterPolicy::PreserveState,
+            registration_lock_bytes.as_deref(),
         )?;
         lifecycle.registered = false;
         let outcome = match recovered.ownership {
@@ -734,6 +3577,7 @@ pub fn unregister_sifs_cloud_files_preserving_state(
             root_path: request.root_path,
             was_registered: recovered.was_registered,
             outcome,
+            cursor_recovery: recovered.cursor_recovery,
             detail,
         })
     }))
@@ -757,7 +3601,62 @@ fn mount_sifs_cloud_files_inner(
     request.root_path = normalize_sifs_root(&request.root_path)?;
     lifecycle.root_path.clone_from(&request.root_path);
     let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
-    let _registration_lease = RegistrationLease::acquire(&data_dir)?;
+    let (_registration_lease, registration_lock_bytes) =
+        acquire_registration_lease_for_request(&data_dir, request.cursor_recovery.as_ref())?;
+    let cursor_recovery_root_fence = request
+        .cursor_recovery
+        .as_ref()
+        .map(|_| CursorRecoveryRootFence::acquire(&request.sync_root))
+        .transpose()?;
+    let cursor_recovery_marker = if let Some(marker) =
+        recover_cursor_recovery_registration_snapshot(&data_dir, false, |marker| {
+            if registration_lock_bytes.as_deref() != Some(marker.registration_lock_bytes.as_slice())
+            {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-registration-lock-drift".to_string(),
+                    detail: "cursor recovery registration lock bytes changed before mount"
+                        .to_string(),
+                });
+            }
+            if cursor_recovery_root_fence
+                .as_ref()
+                .map(|fence| fence.file_id)
+                != Some(marker.sync_root_file_id)
+            {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-root-drift".to_string(),
+                    detail: "owned cursor recovery root changed before mount snapshot replay"
+                        .to_string(),
+                });
+            }
+            validate_cursor_recovery_mount_authority(marker, &request, &data_dir)
+        })? {
+        Some(marker)
+    } else {
+        None
+    };
+    let cursor_recovery_marker = if let Some(mut marker) = cursor_recovery_marker {
+        if marker.phase == CursorRecoveryModulePhase::PreservedStateOwned {
+            rearm_preserved_cursor_recovery(
+                &data_dir,
+                &cursor_recovery_module_marker_path(&data_dir),
+                &mut marker,
+            )?;
+        }
+        inspect_cursor_recovery_module_topology(&data_dir, Some(marker.phase))?;
+        validate_cursor_recovery_registration_artifacts(&data_dir, &marker)?;
+        Some(marker)
+    } else {
+        None
+    };
+    if request.cursor_recovery.is_some() != cursor_recovery_marker.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-context-marker-mismatch".to_string(),
+            detail: "mount cursor-recovery context and durable native authority must be present together"
+                .to_string(),
+        });
+    }
+    let _cursor_recovery_root_fence = cursor_recovery_root_fence;
     if !request.connect {
         return Err(CloudFilesModuleError {
             code: "writable-sync-requires-connection".to_string(),
@@ -802,9 +3701,24 @@ fn mount_sifs_cloud_files_inner(
             });
         }
     }
-    let (journal, state_owned) =
-        prepare_registration_activation(&request, &data_dir, recovered_registration)?;
+    let terminal_ready_handoff = cursor_recovery_marker.as_ref().is_some_and(|marker| {
+        matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::Ready
+                | CursorRecoveryModulePhase::NamespaceFinalized
+                | CursorRecoveryModulePhase::CompletionAuthorized
+        )
+    });
+    let (journal, state_owned) = prepare_registration_activation(
+        &request,
+        &data_dir,
+        recovered_registration,
+        terminal_ready_handoff,
+    )?;
     let mut activation = RegistrationActivation::new(data_dir.clone(), journal, state_owned);
+    if terminal_ready_handoff {
+        activation.retain_terminal_completion_handoff()?;
+    }
     let opened_effects = activate_registration_before_writable_effects_with(
         &mut activation,
         |activation| register_sync_root(&request, activation.journal(), existing_registration),
@@ -850,11 +3764,40 @@ fn mount_sifs_cloud_files_inner(
                     detail,
                 })?,
             );
-            let writable_state = CloudFilesWritableSyncState::open(
-                &data_dir,
-                request.sync_root.to_string_lossy(),
-                request.root_path.clone(),
-            )
+            let writable_state = if let Some(marker) = cursor_recovery_marker.as_ref() {
+                match marker.namespace_resume {
+                    CursorRecoveryNamespaceResume::ReconcileProgress => {
+                        CloudFilesWritableSyncState::open_authorized_cursor_recovery(
+                            &data_dir,
+                            request.sync_root.to_string_lossy(),
+                            request.root_path.clone(),
+                            &marker.plan,
+                        )
+                    }
+                    CursorRecoveryNamespaceResume::TerminalPendingFinalize => {
+                        CloudFilesWritableSyncState::open_authorized_cursor_recovery_terminal_pending_finalize(
+                            &data_dir,
+                            request.sync_root.to_string_lossy(),
+                            request.root_path.clone(),
+                            &marker.plan,
+                        )
+                    }
+                    CursorRecoveryNamespaceResume::Finalized => {
+                        CloudFilesWritableSyncState::open_authorized_cursor_recovery_namespace_finalized(
+                            &data_dir,
+                            request.sync_root.to_string_lossy(),
+                            request.root_path.clone(),
+                            &marker.plan,
+                        )
+                    }
+                }
+            } else {
+                CloudFilesWritableSyncState::open(
+                    &data_dir,
+                    request.sync_root.to_string_lossy(),
+                    request.root_path.clone(),
+                )
+            }
             .map_err(|error| CloudFilesModuleError {
                 code: error.code.to_string(),
                 detail: error.detail,
@@ -886,12 +3829,16 @@ fn mount_sifs_cloud_files_inner(
         };
     let shared_service = Arc::new(Mutex::new(opened.service));
     let materialized_directories = Arc::new(Mutex::new(BTreeSet::new()));
+    let cursor_recovery_population_released = cursor_recovery_marker
+        .as_ref()
+        .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let provider = Arc::new(CloudFilesProvider::new(
         Arc::clone(&shared_service),
         Arc::clone(&mounted_mutation_handoff),
         request.sync_root.clone(),
         request.root_path.clone(),
         request.read_only,
+        cursor_recovery_population_released.clone(),
         Arc::clone(&materialized_directories),
         materialization_audit_intents,
     ));
@@ -906,6 +3853,9 @@ fn mount_sifs_cloud_files_inner(
             sync_root: request.sync_root.clone(),
             root_path: request.root_path.clone(),
             existing_owned_root,
+            expected_cursor_recovery_sync_root_file_id: cursor_recovery_marker
+                .as_ref()
+                .map(|marker| marker.sync_root_file_id),
             prepopulate_depth: request.prepopulate_depth,
             materialized_directories,
         },
@@ -979,23 +3929,205 @@ fn mount_sifs_cloud_files_inner(
         lifecycle.connected = false;
         return Err(activation.fail(error, lifecycle));
     }
-    let first_progress_generation = match writable_worker
-        .wait_for_first_progress(Duration::from_secs(5))
-    {
-        Ok(generation) => generation,
-        Err(error) => {
+    let first_progress_generation = if let Some(mut marker) = cursor_recovery_marker.clone() {
+        let terminal_generation =
+            match writable_worker.wait_for_cursor_recovery_terminal(Duration::from_secs(10)) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    let error =
+                        with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                    let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                    lifecycle.connected = false;
+                    return Err(activation.fail(error, lifecycle));
+                }
+            };
+        let marker_path = cursor_recovery_module_marker_path(&data_dir);
+        // From the first Ready artifact write onward, every failure is a
+        // replayable recovery cut. Never roll the owned registration back to
+        // an earlier phase after a receipt or Ready journal may be durable.
+        activation.disarm();
+        if marker.phase == CursorRecoveryModulePhase::ReconcileArmed
+            && marker.namespace_resume == CursorRecoveryNamespaceResume::ReconcileProgress
+        {
+            if let Err(error) =
+                activation.mark_cursor_recovery_terminal_pending_finalize(&marker_path, &mut marker)
+            {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        }
+        let restoring_preserved_ready = matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::Ready | CursorRecoveryModulePhase::NamespaceFinalized
+        ) && activation.journal().phase
+            == RegistrationPhase::StateOwned;
+        if marker.phase == CursorRecoveryModulePhase::ReconcileArmed {
+            if let Err(error) =
+                activation.mark_cursor_recovery_ready(&request, &marker_path, &mut marker)
+            {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        } else if restoring_preserved_ready {
+            if let Err(error) = activation.mark_ready(&request) {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        }
+        if marker.phase == CursorRecoveryModulePhase::Ready || restoring_preserved_ready {
+            let ready_observed = CloudFilesModuleEvent::CursorRecoveryReadyObserved(
+                sinomo_dfs_cloud_files_api::CloudFilesCursorRecoveryReadyObservedRequest {
+                    schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+                    recovery_id: marker.recovery_id.clone(),
+                    recovery_token: marker.recovery_token.clone(),
+                    sync_root: marker.identity.sync_root.clone(),
+                    root_path: marker.identity.root_path.clone(),
+                    sync_root_file_id: marker.sync_root_file_id,
+                    recovery_cycle: marker.recovery_cycle,
+                },
+            );
+            if let Err(detail) = host_emit_event_ack(&ready_observed) {
+                let error = CloudFilesModuleError {
+                    code: "cursor-recovery-host-ready-ack".to_string(),
+                    detail,
+                };
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        }
+        // Persist the successor before removing the inner Terminal rewrite.
+        // A restart can therefore distinguish "host acked, inner present"
+        // from "host acked, inner already finalized" without guessing.
+        if marker.phase == CursorRecoveryModulePhase::Ready {
+            if let Err(error) =
+                activation.mark_cursor_recovery_namespace_finalized(&marker_path, &mut marker)
+            {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        }
+        if let Err(error) =
+            writable_worker.finalize_cursor_recovery_after_host_ready(Duration::from_secs(10))
+        {
             let error = with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
             let error = with_cleanup_result(error, "disconnect", connection.disconnect());
             lifecycle.connected = false;
             return Err(activation.fail(error, lifecycle));
         }
+        if let Err(error) = writable_worker.release_cursor_recovery() {
+            let error = with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+            let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+            lifecycle.connected = false;
+            return Err(activation.fail(error, lifecycle));
+        }
+        match writable_worker.wait_for_first_progress(Duration::from_secs(5)) {
+            Ok(generation) => {
+                let handoff = run_cursor_recovery_terminal_handoff_with(
+                    &mut marker,
+                    |step, marker| match step {
+                        CursorRecoveryTerminalHandoffStep::AcknowledgeNamespaceFinalized
+                        | CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority
+                        | CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization
+                        | CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease => {
+                            let code = match step {
+                                CursorRecoveryTerminalHandoffStep::AcknowledgeNamespaceFinalized => {
+                                    "cursor-recovery-host-active-ack"
+                                }
+                                CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority => {
+                                    "cursor-recovery-host-completion-authority-ack"
+                                }
+                                CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization => {
+                                    "cursor-recovery-host-normalization-ack"
+                                }
+                                CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease => {
+                                    "cursor-recovery-host-authority-release-ack"
+                                }
+                                _ => unreachable!("matched acknowledged terminal step"),
+                            };
+                            let event = cursor_recovery_active_observed_event(marker)?;
+                            host_emit_event_ack(&event).map_err(|detail| CloudFilesModuleError {
+                                code: code.to_string(),
+                                detail,
+                            })
+                        }
+                        CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized => {
+                            activation
+                                .mark_cursor_recovery_completion_authorized(&marker_path, marker)
+                        }
+                        CursorRecoveryTerminalHandoffStep::NormalizeRegistration => {
+                            normalize_completed_cursor_recovery_journal(&data_dir, marker)
+                        }
+                        CursorRecoveryTerminalHandoffStep::ClearCompletionAuthorized => {
+                            clear_completion_authorized_cursor_recovery_module_marker(
+                                &data_dir, marker,
+                            )
+                        }
+                        CursorRecoveryTerminalHandoffStep::CompleteWorker => {
+                            writable_worker.complete_cursor_recovery_after_host_active()
+                        }
+                        CursorRecoveryTerminalHandoffStep::ReleasePopulation => {
+                            if let Some(released) = cursor_recovery_population_released.as_ref() {
+                                released.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            Ok(())
+                        }
+                    },
+                    host_is_cancelled,
+                );
+                if let Err(error) = handoff {
+                    let error =
+                        with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                    let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                    lifecycle.connected = false;
+                    return Err(activation.fail(error, lifecycle));
+                }
+                host_log(&format!(
+                    "Cloud Files cursor recovery reached terminal generation {terminal_generation} and became Active at generation {generation}"
+                ));
+                generation
+            }
+            Err(error) => {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        }
+    } else {
+        let generation = match writable_worker.wait_for_first_progress(Duration::from_secs(5)) {
+            Ok(generation) => generation,
+            Err(error) => {
+                let error =
+                    with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+                let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+                lifecycle.connected = false;
+                return Err(activation.fail(error, lifecycle));
+            }
+        };
+        if let Err(error) = activation.mark_ready(&request) {
+            let error = with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
+            let error = with_cleanup_result(error, "disconnect", connection.disconnect());
+            lifecycle.connected = false;
+            return Err(activation.fail(error, lifecycle));
+        }
+        generation
     };
-    if let Err(error) = activation.mark_ready(&request) {
-        let error = with_cleanup_result(error, "worker stop", writable_worker.stop_and_join());
-        let error = with_cleanup_result(error, "disconnect", connection.disconnect());
-        lifecycle.connected = false;
-        return Err(activation.fail(error, lifecycle));
-    }
     activation.disarm();
     host_log(&format!(
         "Cloud Files registration became ready after worker progress generation {first_progress_generation}"
@@ -1297,6 +4429,21 @@ unsafe extern "system" fn fetch_placeholders_callback(
             return;
         }
     };
+    if provider.cursor_recovery_blocks_nested_population(&path) {
+        host_log(&format!(
+            "Cloud Files cursor recovery rejected nested placeholder population for `{path}` before Ready"
+        ));
+        let _ = unsafe {
+            transfer_placeholders(
+                info,
+                Vec::new(),
+                0,
+                CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+                STATUS_CLOUD_FILE_UNSUCCESSFUL,
+            )
+        };
+        return;
+    }
     let page_state = match after_durable_materialization_intent(
         || {
             windows_adapter::record_materialization_audit_intent(
@@ -1624,6 +4771,7 @@ struct CloudFilesProvider {
     sync_root: PathBuf,
     root_path: String,
     read_only: bool,
+    cursor_recovery_released: Option<Arc<std::sync::atomic::AtomicBool>>,
     cancelled_requests: Mutex<BTreeSet<i64>>,
     placeholder_pages: Mutex<BTreeMap<String, CloudFilesPlaceholderPageState>>,
     placeholder_page_leases: Mutex<BTreeSet<String>>,
@@ -1661,6 +4809,7 @@ impl CloudFilesProvider {
         sync_root: PathBuf,
         root_path: String,
         read_only: bool,
+        cursor_recovery_released: Option<Arc<std::sync::atomic::AtomicBool>>,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
     ) -> Self {
@@ -1672,6 +4821,7 @@ impl CloudFilesProvider {
             sync_root,
             root_path,
             read_only,
+            cursor_recovery_released,
             cancelled_requests: Mutex::new(BTreeSet::new()),
             placeholder_pages: Mutex::new(BTreeMap::new()),
             placeholder_page_leases: Mutex::new(BTreeSet::new()),
@@ -1721,6 +4871,13 @@ impl CloudFilesProvider {
             .lock()
             .map_err(|_| STATUS_UNSUCCESSFUL)
             .map(|pages| pages.get(path).cloned().unwrap_or_default())
+    }
+
+    fn cursor_recovery_blocks_nested_population(&self, path: &str) -> bool {
+        self.cursor_recovery_released
+            .as_ref()
+            .is_some_and(|released| !released.load(std::sync::atomic::Ordering::SeqCst))
+            && path != self.root_path
     }
 
     fn finish_placeholder_page(
@@ -2262,6 +5419,48 @@ fn sync_root_file_index(path: &Path) -> Result<u64, CloudFilesModuleError> {
     Ok(((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
 }
 
+impl CursorRecoveryRootFence {
+    fn acquire(path: &Path) -> Result<Self, CloudFilesModuleError> {
+        ensure_sync_root_is_plain_directory(path, "cursor recovery")?;
+        let path_wide = wide_path(path);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path_wide.as_ptr()),
+                FILE_READ_ATTRIBUTES.0,
+                // Deliberately omit FILE_SHARE_DELETE so replacement cannot
+                // race the durable authorization and StateOwned boundary.
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                None,
+            )
+        }
+        .map(OwnedWin32Handle)
+        .map_err(|source| CloudFilesModuleError {
+            code: "cursor-recovery-root-fence".to_string(),
+            detail: format!(
+                "open cursor recovery root fence {}: {source}",
+                path.display()
+            ),
+        })?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle.0, &mut info) }.map_err(|source| {
+            CloudFilesModuleError {
+                code: "cursor-recovery-root-fence".to_string(),
+                detail: format!(
+                    "read cursor recovery root fence identity {}: {source}",
+                    path.display()
+                ),
+            }
+        })?;
+        Ok(Self {
+            _handle: handle,
+            file_id: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+        })
+    }
+}
+
 fn resolve_data_dir(
     data_dir_root: Option<PathBuf>,
 ) -> Result<SinomoDataDir, CloudFilesModuleError> {
@@ -2285,31 +5484,184 @@ fn registration_journal_path(data_dir: &SinomoDataDir) -> PathBuf {
         .join(CLOUD_FILES_REGISTRATION_JOURNAL_FILE)
 }
 
+fn read_bounded_plain_registration_file(
+    path: &Path,
+    maximum_bytes: u64,
+    label: &str,
+) -> Result<Option<Vec<u8>>, CloudFilesModuleError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(CloudFilesModuleError {
+                code: "registration-artifact-inspect".to_string(),
+                detail: format!("inspect {label} {}: {source}", path.display()),
+            });
+        }
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+        || metadata.len() > maximum_bytes
+    {
+        return Err(CloudFilesModuleError {
+            code: "registration-artifact-invalid".to_string(),
+            detail: format!(
+                "{label} {} is reparse, non-file, or exceeds {maximum_bytes} bytes",
+                path.display()
+            ),
+        });
+    }
+    let mut file = OpenOptions::new()
+        .create(false)
+        .read(true)
+        .open(path)
+        .map_err(|source| CloudFilesModuleError {
+            code: "registration-artifact-open".to_string(),
+            detail: format!("open {label} {}: {source}", path.display()),
+        })?;
+    let opened_length = file
+        .metadata()
+        .map_err(|source| CloudFilesModuleError {
+            code: "registration-artifact-inspect".to_string(),
+            detail: format!("inspect open {label} {}: {source}", path.display()),
+        })?
+        .len();
+    if opened_length != metadata.len() || opened_length > maximum_bytes {
+        return Err(CloudFilesModuleError {
+            code: "registration-artifact-changed".to_string(),
+            detail: format!("{label} {} changed before it was read", path.display()),
+        });
+    }
+    let mut bytes = Vec::with_capacity(opened_length as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|source| CloudFilesModuleError {
+            code: "registration-artifact-read".to_string(),
+            detail: format!("read {label} {}: {source}", path.display()),
+        })?;
+    if bytes.len() as u64 != opened_length
+        || file
+            .metadata()
+            .map_err(|source| CloudFilesModuleError {
+                code: "registration-artifact-inspect".to_string(),
+                detail: format!("reinspect open {label} {}: {source}", path.display()),
+            })?
+            .len()
+            != opened_length
+    {
+        return Err(CloudFilesModuleError {
+            code: "registration-artifact-changed".to_string(),
+            detail: format!("{label} {} changed while it was read", path.display()),
+        });
+    }
+    Ok(Some(bytes))
+}
+
+fn decode_canonical_registration_artifact<T: DeserializeOwned + Serialize>(
+    path: &Path,
+    bytes: &[u8],
+    code: &str,
+    label: &str,
+) -> Result<T, CloudFilesModuleError> {
+    let value = decode_sobj::<T>(bytes).map_err(|source| CloudFilesModuleError {
+        code: format!("{code}-decode"),
+        detail: format!("decode {label} {}: {source}", path.display()),
+    })?;
+    if encode_sobj(&value).map_err(|source| CloudFilesModuleError {
+        code: format!("{code}-encode"),
+        detail: format!("re-encode {label}: {source}"),
+    })? != bytes
+    {
+        return Err(CloudFilesModuleError {
+            code: format!("{code}-noncanonical"),
+            detail: format!("{label} {} is not canonically encoded", path.display()),
+        });
+    }
+    Ok(value)
+}
+
+fn inspect_registration_artifact_snapshot<T: DeserializeOwned + Serialize>(
+    path: &Path,
+    temporary: &Path,
+    maximum_bytes: u64,
+    code: &str,
+    label: &str,
+) -> Result<RegistrationArtifactSnapshot<T>, CloudFilesModuleError> {
+    let current = read_bounded_plain_registration_file(path, maximum_bytes, label)?
+        .map(|bytes| decode_canonical_registration_artifact(path, &bytes, code, label))
+        .transpose()?;
+    let temporary_value = read_bounded_plain_registration_file(
+        temporary,
+        maximum_bytes,
+        &format!("{label} temporary file"),
+    )?
+    .map(|bytes| decode_canonical_registration_artifact(temporary, &bytes, code, label))
+    .transpose()?;
+    Ok(RegistrationArtifactSnapshot {
+        current,
+        temporary: temporary_value,
+    })
+}
+
+fn promote_exact_registration_artifact<T: DeserializeOwned + Serialize + Eq>(
+    path: &Path,
+    temporary: &Path,
+    maximum_bytes: u64,
+    expected: &T,
+    code: &str,
+    label: &str,
+) -> Result<(), CloudFilesModuleError> {
+    let snapshot =
+        inspect_registration_artifact_snapshot::<T>(path, temporary, maximum_bytes, code, label)?;
+    match (snapshot.current, snapshot.temporary) {
+        (Some(current), None) if current == *expected => Ok(()),
+        (None, Some(staged)) if staged == *expected => {
+            let temporary_wide = wide_path(temporary);
+            let path_wide = wide_path(path);
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(temporary_wide.as_ptr()),
+                    PCWSTR(path_wide.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|source| CloudFilesModuleError {
+                code: format!("{code}-commit"),
+                detail: format!("promote exact {label} {}: {source}", path.display()),
+            })
+        }
+        (Some(current), Some(staged)) if current == *expected && staged == *expected => {
+            sinomo_runtime::storage::durable_file::remove_file_if_exists_and_sync_parent(temporary)
+                .map_err(|source| CloudFilesModuleError {
+                    code: format!("{code}-temp-cleanup"),
+                    detail: format!("remove redundant exact {label} temporary file: {source}"),
+                })?;
+            Ok(())
+        }
+        _ => Err(CloudFilesModuleError {
+            code: format!("{code}-replay-mismatch"),
+            detail: format!("{label} current/temporary cut is not the exact expected image"),
+        }),
+    }
+}
+
 fn load_registration_journal(
     data_dir: &SinomoDataDir,
 ) -> Result<Option<RegistrationJournal>, CloudFilesModuleError> {
     let path = registration_journal_path(data_dir);
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(CloudFilesModuleError {
-                code: "registration-journal-read".to_string(),
-                detail: format!(
-                    "read Cloud Files registration journal {}: {source}",
-                    path.display()
-                ),
-            });
-        }
+    let Some(bytes) = read_bounded_plain_registration_file(
+        &path,
+        CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES,
+        "Cloud Files registration journal",
+    )?
+    else {
+        return Ok(None);
     };
-    let journal =
-        decode_sobj::<RegistrationJournal>(&bytes).map_err(|source| CloudFilesModuleError {
-            code: "registration-journal-decode".to_string(),
-            detail: format!(
-                "decode Cloud Files registration journal {}: {source}",
-                path.display()
-            ),
-        })?;
+    let journal: RegistrationJournal = decode_canonical_registration_artifact(
+        &path,
+        &bytes,
+        "registration-journal",
+        "Cloud Files registration journal",
+    )?;
     journal.validate(CLOUD_FILES_PROVIDER_ID_TEXT)?;
     Ok(Some(journal))
 }
@@ -2320,9 +5672,54 @@ fn persist_registration_journal(
 ) -> Result<(), CloudFilesModuleError> {
     journal.validate(CLOUD_FILES_PROVIDER_ID_TEXT)?;
     let path = registration_journal_path(data_dir);
-    persist_registration_artifact(
-        &path,
-        journal,
+    if journal.cursor_recovery.is_some() {
+        persist_cursor_recovery_registration_artifact(
+            &path,
+            journal,
+            "registration-journal",
+            "Cloud Files registration journal",
+        )
+    } else {
+        persist_ordinary_registration_artifact(
+            &path,
+            journal,
+            "registration-journal",
+            "Cloud Files registration journal",
+        )
+    }
+}
+
+fn normalize_completed_cursor_recovery_journal(
+    data_dir: &SinomoDataDir,
+    marker: &CursorRecoveryModuleMarker,
+) -> Result<(), CloudFilesModuleError> {
+    if marker.phase != CursorRecoveryModulePhase::CompletionAuthorized {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-completion-not-authorized".to_string(),
+            detail: "only CompletionAuthorized may normalize cursor provenance".to_string(),
+        });
+    }
+    let current = load_registration_journal(data_dir)?.ok_or_else(|| CloudFilesModuleError {
+        code: "cursor-recovery-completion-journal-missing".to_string(),
+        detail: "CompletionAuthorized recovery lost its Ready journal".to_string(),
+    })?;
+    let mut expected = cursor_recovery_expected_registration_artifacts(marker)?.0;
+    expected.phase = RegistrationPhase::Ready;
+    let mut ordinary = expected.clone();
+    ordinary.clear_cursor_recovery();
+    if current == ordinary {
+        return Ok(());
+    }
+    if current != expected {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-completion-journal-mismatch".to_string(),
+            detail: "CompletionAuthorized journal is not the exact cycle-bound Ready predecessor"
+                .to_string(),
+        });
+    }
+    persist_cursor_recovery_registration_artifact(
+        &registration_journal_path(data_dir),
+        &ordinary,
         "registration-journal",
         "Cloud Files registration journal",
     )
@@ -2331,28 +5728,21 @@ fn persist_registration_journal(
 fn load_registration_receipt(
     path: &Path,
 ) -> Result<Option<CloudFilesRegistrationReceipt>, CloudFilesModuleError> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(CloudFilesModuleError {
-                code: "registration-receipt-read".to_string(),
-                detail: format!(
-                    "read Cloud Files registration receipt {}: {source}",
-                    path.display()
-                ),
-            });
-        }
+    let Some(bytes) = read_bounded_plain_registration_file(
+        path,
+        CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES,
+        "Cloud Files registration receipt",
+    )?
+    else {
+        return Ok(None);
     };
-    decode_sobj(&bytes)
-        .map(Some)
-        .map_err(|source| CloudFilesModuleError {
-            code: "registration-receipt-decode".to_string(),
-            detail: format!(
-                "decode Cloud Files registration receipt {}: {source}",
-                path.display()
-            ),
-        })
+    decode_canonical_registration_artifact(
+        path,
+        &bytes,
+        "registration-receipt",
+        "Cloud Files registration receipt",
+    )
+    .map(Some)
 }
 
 fn persist_registration_receipt(
@@ -2370,15 +5760,150 @@ fn persist_registration_receipt(
         root_path: request.root_path.clone(),
         provider_name: request.provider_name.clone(),
     };
-    persist_registration_artifact(
-        &path,
-        &receipt,
-        "registration-receipt",
-        "Cloud Files registration receipt",
-    )
+    if journal.cursor_recovery.is_some() {
+        persist_cursor_recovery_registration_artifact(
+            &path,
+            &receipt,
+            "registration-receipt",
+            "Cloud Files registration receipt",
+        )
+    } else {
+        persist_ordinary_registration_artifact(
+            &path,
+            &receipt,
+            "registration-receipt",
+            "Cloud Files registration receipt",
+        )
+    }
 }
 
-fn persist_registration_artifact<T: serde::Serialize>(
+fn persist_cursor_recovery_registration_artifact<T: serde::Serialize>(
+    path: &Path,
+    value: &T,
+    code_prefix: &str,
+    label: &str,
+) -> Result<(), CloudFilesModuleError> {
+    let Some(parent) = path.parent() else {
+        return Err(CloudFilesModuleError {
+            code: format!("{code_prefix}-path"),
+            detail: format!("{label} path {} has no parent", path.display()),
+        });
+    };
+    fs::create_dir_all(parent).map_err(|source| CloudFilesModuleError {
+        code: format!("{code_prefix}-dir"),
+        detail: format!("create {label} directory {}: {source}", parent.display()),
+    })?;
+    let bytes = encode_sobj(value).map_err(|source| CloudFilesModuleError {
+        code: format!("{code_prefix}-encode"),
+        detail: format!("encode {label}: {source}"),
+    })?;
+    let temporary = cursor_recovery_artifact_temp_path(path, &format!("{code_prefix}-next"));
+    if read_bounded_plain_registration_file(
+        path,
+        CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES,
+        label,
+    )?
+    .as_deref()
+        == Some(bytes.as_slice())
+        && matches!(
+            fs::symlink_metadata(&temporary),
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound
+        )
+    {
+        return Ok(());
+    }
+    match fs::symlink_metadata(&temporary) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+                && metadata.len() == bytes.len() as u64 =>
+        {
+            let observed = fs::read(&temporary).map_err(|source| CloudFilesModuleError {
+                code: format!("{code_prefix}-temp-read"),
+                detail: format!(
+                    "read {label} temporary file {}: {source}",
+                    temporary.display()
+                ),
+            })?;
+            if observed != bytes {
+                return Err(CloudFilesModuleError {
+                    code: format!("{code_prefix}-temp-mismatch"),
+                    detail: format!(
+                        "refusing to replay changed {label} temporary file {}",
+                        temporary.display()
+                    ),
+                });
+            }
+            let temporary_wide = wide_path(&temporary);
+            let path_wide = wide_path(path);
+            unsafe {
+                MoveFileExW(
+                    PCWSTR(temporary_wide.as_ptr()),
+                    PCWSTR(path_wide.as_ptr()),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+            .map_err(|source| CloudFilesModuleError {
+                code: format!("{code_prefix}-commit"),
+                detail: format!("commit exact replayed {label} {}: {source}", path.display()),
+            })?;
+            return Ok(());
+        }
+        Ok(_) => {
+            return Err(CloudFilesModuleError {
+                code: format!("{code_prefix}-temp-invalid"),
+                detail: format!(
+                    "{label} temporary file {} is reparse, non-file, changed, or torn",
+                    temporary.display()
+                ),
+            });
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CloudFilesModuleError {
+                code: format!("{code_prefix}-temp-inspect"),
+                detail: format!(
+                    "inspect {label} temporary file {}: {source}",
+                    temporary.display()
+                ),
+            });
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| CloudFilesModuleError {
+            code: format!("{code_prefix}-create"),
+            detail: format!("create {label} {}: {source}", temporary.display()),
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| CloudFilesModuleError {
+            code: format!("{code_prefix}-write"),
+            detail: format!("write {label} {}: {source}", temporary.display()),
+        })?;
+    drop(file);
+    let temporary_wide = wide_path(&temporary);
+    let path_wide = wide_path(path);
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary_wide.as_ptr()),
+            PCWSTR(path_wide.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|source| CloudFilesModuleError {
+        code: format!("{code_prefix}-commit"),
+        detail: format!("commit {label} {}: {source}", path.display()),
+    })
+}
+
+/// Keep the established ordinary registration writer and its process-scoped
+/// temporary name separate from the recovery classifier. Cursor recovery uses
+/// the deterministic writer above only while a durable marker/provenance makes
+/// every current/temp cut exactly classifiable.
+fn persist_ordinary_registration_artifact<T: serde::Serialize>(
     path: &Path,
     value: &T,
     code_prefix: &str,
@@ -2760,6 +6285,7 @@ fn recover_legacy_receipt_before_mount(
         root_path: receipt.root_path.clone(),
         data_dir_root: request.data_dir_root.clone(),
         provider_name: receipt.provider_name.clone(),
+        cursor_recovery: None,
     };
     verify_registration_ownership(&legacy_request, Some(&receipt), &observed)?;
     Err(CloudFilesModuleError {
@@ -2775,7 +6301,109 @@ fn recover_registration_for_unregister(
     request: &CloudFilesUnregisterRequest,
     data_dir: &SinomoDataDir,
     policy: UnregisterPolicy,
+    registration_lock_bytes: Option<&[u8]>,
 ) -> Result<RecoveredUnregister, CloudFilesModuleError> {
+    let cursor_root_fence = request
+        .cursor_recovery
+        .as_ref()
+        .map(|_| CursorRecoveryRootFence::acquire(&request.sync_root))
+        .transpose()?;
+    let mut recovery_marker =
+        recover_cursor_recovery_registration_snapshot(data_dir, false, |marker| {
+            if policy == UnregisterPolicy::Release {
+                return Err(CloudFilesModuleError {
+                    code: "cursor-recovery-release-forbidden".to_string(),
+                    detail: "release unregister may not mutate cursor recovery artifacts"
+                        .to_string(),
+                });
+            } else {
+                validate_cursor_recovery_preserve_authority(
+                    marker,
+                    request,
+                    data_dir,
+                    registration_lock_bytes,
+                )?;
+                if cursor_root_fence.as_ref().map(|fence| fence.file_id)
+                    != Some(marker.sync_root_file_id)
+                {
+                    return Err(CloudFilesModuleError {
+                        code: "cursor-recovery-root-drift".to_string(),
+                        detail: "cursor-recovery preserve root file ID changed".to_string(),
+                    });
+                }
+            }
+            Ok(())
+        })?;
+    let preserve_relation = recovery_marker
+        .as_ref()
+        .map(|marker| {
+            validate_cursor_recovery_preserve_authority(
+                marker,
+                request,
+                data_dir,
+                registration_lock_bytes,
+            )
+        })
+        .transpose()?;
+    let _cursor_root_fence = cursor_root_fence;
+    if let Some(marker) = recovery_marker.as_ref() {
+        if policy == UnregisterPolicy::Release {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-release-forbidden".to_string(),
+                detail: format!(
+                    "cursor recovery {} is {:?}; release unregister may not clear its StateOwned ownership",
+                    marker.recovery_id, marker.phase
+                ),
+            });
+        }
+        if !marker.identity.sync_root.eq(&request.sync_root)
+            || marker.identity.root_path != request.root_path
+            || marker.identity.provider_name != request.provider_name
+        {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-unregister-mismatch".to_string(),
+                detail: "state-preserving unregister does not match the durable cursor recovery"
+                    .to_string(),
+            });
+        }
+        if matches!(
+            marker.phase,
+            CursorRecoveryModulePhase::Authorized | CursorRecoveryModulePhase::Validated
+        ) {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-not-state-owned".to_string(),
+                detail: "state-preserving unregister cannot cancel or release an authorized cursor recovery before its StateOwned journal is durable"
+                    .to_string(),
+            });
+        }
+    } else if request.cursor_recovery.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "cursor-recovery-unregister-orphan-context".to_string(),
+            detail: "ordinary unregister cannot manufacture cursor-recovery cycle authority"
+                .to_string(),
+        });
+    }
+
+    let marker_path = cursor_recovery_module_marker_path(data_dir);
+    if policy == UnregisterPolicy::PreserveState
+        && preserve_relation == Some(CursorRecoveryPreserveContextRelation::Current)
+        && recovery_marker
+            .as_ref()
+            .is_some_and(|marker| marker.phase != CursorRecoveryModulePhase::PreserveAuthorized)
+    {
+        let mut marker = recovery_marker.take().expect("checked cursor marker");
+        let mut activation = RegistrationActivation::new(
+            data_dir.clone(),
+            load_registration_journal(data_dir)?.ok_or_else(|| CloudFilesModuleError {
+                code: "registration-journal-missing".to_string(),
+                detail: "cursor recovery preserve lost its nonce-bound journal".to_string(),
+            })?,
+            true,
+        );
+        activation.disarm();
+        activation.mark_cursor_recovery_preserve_authorized(&marker_path, &mut marker)?;
+        recovery_marker = Some(marker);
+    }
     if let Some(journal) = load_registration_journal(data_dir)? {
         if !journal.matches_unregister_request(request) {
             return Err(CloudFilesModuleError {
@@ -2789,6 +6417,9 @@ fn recover_registration_for_unregister(
         }
         let ownership = match policy {
             UnregisterPolicy::Release => RegistrationOwnershipDisposition::Release,
+            UnregisterPolicy::PreserveState if recovery_marker.is_some() => {
+                RegistrationOwnershipDisposition::Retain
+            }
             UnregisterPolicy::PreserveState => {
                 registration_ownership_disposition(data_dir, &journal)?
             }
@@ -2800,12 +6431,46 @@ fn recover_registration_for_unregister(
             RegistrationOwnershipDisposition::Retain => {
                 let mut retained = journal;
                 retained.phase = RegistrationPhase::StateOwned;
-                persist_registration_journal(data_dir, &retained)?;
+                let mut response_context = None;
+                if let Some(marker) = recovery_marker.as_mut() {
+                    retained.bind_cursor_recovery(
+                        marker.recovery_id.clone(),
+                        marker.recovery_token.clone(),
+                        marker.recovery_cycle,
+                    );
+                    persist_registration_journal(data_dir, &retained)?;
+                    if marker.phase == CursorRecoveryModulePhase::PreserveAuthorized {
+                        let mut activation =
+                            RegistrationActivation::new(data_dir.clone(), retained.clone(), true);
+                        activation.disarm();
+                        response_context = Some(
+                            activation
+                                .mark_cursor_recovery_preserved_state_owned(&marker_path, marker)?,
+                        );
+                    } else {
+                        response_context = Some(CloudFilesCursorRecoveryContext {
+                            recovery_id: marker.recovery_id.clone(),
+                            recovery_token: marker.recovery_token.clone(),
+                            recovery_cycle: marker.recovery_cycle,
+                            native_successor_fingerprint: Some(
+                                cursor_recovery_native_successor_fingerprint(marker)?,
+                            ),
+                        });
+                    }
+                } else {
+                    persist_registration_journal(data_dir, &retained)?;
+                }
+                return Ok(RecoveredUnregister {
+                    was_registered,
+                    ownership,
+                    cursor_recovery: response_context,
+                });
             }
         }
         return Ok(RecoveredUnregister {
             was_registered,
             ownership,
+            cursor_recovery: None,
         });
     }
 
@@ -2823,6 +6488,7 @@ fn recover_registration_for_unregister(
             return Ok(RecoveredUnregister {
                 was_registered: false,
                 ownership: RegistrationOwnershipDisposition::Release,
+                cursor_recovery: None,
             });
         }
         return Err(CloudFilesModuleError {
@@ -2844,6 +6510,7 @@ fn recover_registration_for_unregister(
         return Ok(RecoveredUnregister {
             was_registered: false,
             ownership: RegistrationOwnershipDisposition::Release,
+            cursor_recovery: None,
         });
     };
     verify_registration_ownership(request, receipt.as_ref(), &observed)?;
@@ -2853,6 +6520,7 @@ fn recover_registration_for_unregister(
     Ok(RecoveredUnregister {
         was_registered: true,
         ownership: RegistrationOwnershipDisposition::Release,
+        cursor_recovery: None,
     })
 }
 
@@ -2880,6 +6548,7 @@ fn prepare_registration_activation(
     request: &CloudFilesMountRequest,
     data_dir: &SinomoDataDir,
     recovered: RecoveredRegistration,
+    retain_ready_for_completion: bool,
 ) -> Result<(RegistrationJournal, bool), CloudFilesModuleError> {
     let (mut journal, state_owned) = match recovered {
         RecoveredRegistration::Fresh => {
@@ -2899,7 +6568,15 @@ fn prepare_registration_activation(
         }
         RecoveredRegistration::Owned { journal, .. } => (*journal, true),
     };
-    if state_owned {
+    if state_owned && retain_ready_for_completion {
+        if journal.phase != RegistrationPhase::Ready {
+            return Err(CloudFilesModuleError {
+                code: "cursor-recovery-completion-journal-phase".to_string(),
+                detail: "CompletionAuthorized restart requires the exact Ready ownership phase"
+                    .to_string(),
+            });
+        }
+    } else if state_owned {
         // A reactivation must prove health again, but never surrender the
         // durable boundary that already owns queue/reconciliation state.
         journal.phase = RegistrationPhase::StateOwned;
@@ -2907,7 +6584,9 @@ fn prepare_registration_activation(
         journal.phase = RegistrationPhase::Prepared;
     }
     journal.provider_version = request.provider_version.clone();
-    persist_registration_journal(data_dir, &journal)?;
+    if !retain_ready_for_completion {
+        persist_registration_journal(data_dir, &journal)?;
+    }
     Ok((journal, state_owned))
 }
 
@@ -3628,6 +7307,137 @@ mod tests {
     use sinomo_runtime::dfs::DfsMessageResponse;
     use sinomo_runtime::network::{ObjectRpcCall, ObjectRpcResponse, ObjectRpcResult};
 
+    struct CursorRecoveryTestDir(PathBuf);
+
+    impl CursorRecoveryTestDir {
+        fn new(label: &str) -> Self {
+            let suffix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("sinomo-{label}-{}-{suffix}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for CursorRecoveryTestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn cursor_recovery_marker_fixture(
+        data_dir: &SinomoDataDir,
+        sync_root: &Path,
+        phase: CursorRecoveryModulePhase,
+    ) -> CursorRecoveryModuleMarker {
+        let recovery_id = "cursor-recovery-test-id";
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let identity = CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            enabled: false,
+            sync_root: sync_root.to_path_buf(),
+            root_path: "/".to_string(),
+            data_dir_root: data_dir.root(),
+            provider_name: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+                .to_string(),
+            provider_version: env!("CARGO_PKG_VERSION").to_string(),
+            read_only: false,
+            allow_other: false,
+            sync_local_changes: true,
+            prepopulate_depth: 0,
+            connect: true,
+            max_run_seconds: None,
+            disabled_config_fingerprint: format!("blake3:{}", "1".repeat(64)),
+            provider_provenance_fingerprint: format!("blake3:{}", "2".repeat(64)),
+        };
+        let provisional_token = format!("v1:blake3:{}", "0".repeat(64));
+        let provisional_plan = crate::namespace_reconciler::cursor_recovery_plan_fixture(
+            &sync_root.display().to_string(),
+            "/",
+            recovery_id,
+            &provisional_token,
+            nonce,
+        );
+        let mut reconciliation_raw_files = BTreeMap::new();
+        reconciliation_raw_files.insert(
+            "materialization-audit-intents.sobj".to_string(),
+            provisional_plan.original_audit.clone(),
+        );
+        reconciliation_raw_files.insert(
+            "state.sobj".to_string(),
+            provisional_plan.original_state.clone(),
+        );
+        let module_topology = vec![
+            "local-changes".to_string(),
+            "namespace-reconciliation".to_string(),
+            CLOUD_FILES_REGISTRATION_LOCK_FILE.to_string(),
+        ];
+        let queue_raw_files = BTreeMap::from([("operations.journal".to_string(), Vec::new())]);
+        let outbox_raw_files = BTreeMap::from([("handoff.lock".to_string(), Vec::new())]);
+        let raw_state_fingerprint = cursor_recovery_raw_fingerprint(
+            &identity,
+            41,
+            &[],
+            &module_topology,
+            &queue_raw_files,
+            &reconciliation_raw_files,
+            &outbox_raw_files,
+        )
+        .expect("fixture raw fingerprint");
+        let recovery_token = cursor_recovery_token(&raw_state_fingerprint);
+        let plan = crate::namespace_reconciler::cursor_recovery_plan_fixture(
+            &sync_root.display().to_string(),
+            "/",
+            recovery_id,
+            &recovery_token,
+            nonce,
+        );
+        CursorRecoveryModuleMarker {
+            schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+            identity,
+            recovery_id: recovery_id.to_string(),
+            recovery_token,
+            raw_state_fingerprint,
+            registration_lock_bytes: Vec::new(),
+            module_topology,
+            queue_raw_files,
+            reconciliation_raw_files,
+            outbox_raw_files,
+            sync_root_file_id: 41,
+            registration_nonce: nonce.to_string(),
+            plan,
+            recovery_cycle: 0,
+            cycle_authorization_fingerprint: None,
+            predecessor_cycle_fingerprint: None,
+            cycle_authorized_namespace_resume: CursorRecoveryNamespaceResume::ReconcileProgress,
+            namespace_resume: match phase {
+                CursorRecoveryModulePhase::Ready => {
+                    CursorRecoveryNamespaceResume::TerminalPendingFinalize
+                }
+                CursorRecoveryModulePhase::NamespaceFinalized
+                | CursorRecoveryModulePhase::CompletionAuthorized => {
+                    CursorRecoveryNamespaceResume::Finalized
+                }
+                _ => CursorRecoveryNamespaceResume::ReconcileProgress,
+            },
+            phase,
+        }
+    }
+
+    fn write_canonical_registration_artifact<T: serde::Serialize>(path: &Path, value: &T) {
+        std::fs::create_dir_all(path.parent().expect("artifact parent"))
+            .expect("artifact directory");
+        std::fs::write(path, encode_sobj(value).expect("canonical artifact bytes"))
+            .expect("write artifact");
+    }
+
     #[derive(Debug)]
     struct RecordingCloudFilesDaemonPeer {
         calls: Mutex<Vec<(NodeId, Vec<u8>, DfsObjectRpcSendOptions)>>,
@@ -3803,6 +7613,848 @@ mod tests {
         assert!(!writable_worker_ready(
             &CloudFilesLocalChangeSyncStatus::disabled()
         ));
+    }
+
+    #[test]
+    fn cursor_recovery_registration_snapshot_promotes_exact_causal_crash_cuts() {
+        let temp = CursorRecoveryTestDir::new("cloud-files-cursor-recovery-artifact-cuts");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let sync_root = temp.path().join("root");
+        let authorized = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::Authorized,
+        );
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &authorized,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, true, |_| Ok(()))
+            .expect("promote request-bound Authorized marker")
+            .expect("authorized marker");
+        assert_eq!(recovered.phase, CursorRecoveryModulePhase::Authorized);
+        assert!(cursor_recovery_module_marker_path(&data_dir).is_file());
+        assert!(!cursor_recovery_module_marker_temp_path(&data_dir).exists());
+
+        let validated =
+            cursor_recovery_marker_with_phase(&authorized, CursorRecoveryModulePhase::Validated);
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &validated,
+        );
+        let (state_owned, ready, receipt) =
+            cursor_recovery_expected_registration_artifacts(&validated)
+                .expect("expected registration artifacts");
+        write_canonical_registration_artifact(
+            &registration_journal_temp_path(&data_dir),
+            &state_owned,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote StateOwned journal cut")
+            .expect("validated marker");
+        assert_eq!(recovered.phase, CursorRecoveryModulePhase::Validated);
+        assert_eq!(
+            load_registration_journal(&data_dir)
+                .expect("journal load")
+                .expect("journal"),
+            state_owned
+        );
+        assert!(!registration_journal_temp_path(&data_dir).exists());
+
+        let armed_progress = cursor_recovery_marker_with_phase(
+            &authorized,
+            CursorRecoveryModulePhase::ReconcileArmed,
+        );
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &armed_progress,
+        );
+        write_canonical_registration_artifact(&registration_receipt_temp_path(&data_dir), &receipt);
+        let marker_before = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+            .expect("progress marker before rejected receipt cut");
+        let journal_before = std::fs::read(registration_journal_path(&data_dir))
+            .expect("StateOwned journal before rejected receipt cut");
+        let receipt_temp_before = std::fs::read(registration_receipt_temp_path(&data_dir))
+            .expect("receipt temp before rejected progress cut");
+        let error = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect_err("ReconcileProgress must reject Ready receipt evidence");
+        assert_eq!(error.code, "cursor-recovery-terminal-successor-artifacts");
+        assert_eq!(
+            std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("progress marker after rejected receipt cut"),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(registration_journal_path(&data_dir))
+                .expect("StateOwned journal after rejected receipt cut"),
+            journal_before
+        );
+        assert_eq!(
+            std::fs::read(registration_receipt_temp_path(&data_dir))
+                .expect("receipt temp after rejected progress cut"),
+            receipt_temp_before
+        );
+
+        std::fs::remove_file(registration_receipt_temp_path(&data_dir))
+            .expect("remove rejected progress receipt temp");
+        let mut armed_terminal = armed_progress.clone();
+        armed_terminal.namespace_resume = CursorRecoveryNamespaceResume::TerminalPendingFinalize;
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &armed_terminal,
+        );
+        write_canonical_registration_artifact(&registration_receipt_temp_path(&data_dir), &receipt);
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote Ready receipt cut")
+            .expect("armed marker");
+        assert_eq!(recovered.phase, CursorRecoveryModulePhase::ReconcileArmed);
+        assert_eq!(
+            recovered.namespace_resume,
+            CursorRecoveryNamespaceResume::TerminalPendingFinalize
+        );
+        assert!(registration_receipt_path(&data_dir).is_file());
+        write_canonical_registration_artifact(&registration_journal_temp_path(&data_dir), &ready);
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote Ready journal cut")
+            .expect("armed marker");
+        assert_eq!(recovered.phase, CursorRecoveryModulePhase::ReconcileArmed);
+        assert_eq!(
+            load_registration_journal(&data_dir)
+                .expect("ready journal load")
+                .expect("ready journal"),
+            ready
+        );
+
+        let ready_marker =
+            cursor_recovery_marker_with_phase(&armed_terminal, CursorRecoveryModulePhase::Ready);
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &ready_marker,
+        );
+        let namespace_finalized = cursor_recovery_marker_with_phase(
+            &ready_marker,
+            CursorRecoveryModulePhase::NamespaceFinalized,
+        );
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &namespace_finalized,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote NamespaceFinalized marker cut")
+            .expect("namespace-finalized marker");
+        assert_eq!(
+            recovered.phase,
+            CursorRecoveryModulePhase::NamespaceFinalized
+        );
+    }
+
+    #[test]
+    fn cursor_recovery_registration_snapshot_replays_preserve_cycle_successors() {
+        let temp = CursorRecoveryTestDir::new("cloud-files-cursor-recovery-preserve-cuts");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let sync_root = temp.path().join("root");
+        let ready_marker =
+            cursor_recovery_marker_fixture(&data_dir, &sync_root, CursorRecoveryModulePhase::Ready);
+        let (state_owned, ready, receipt) =
+            cursor_recovery_expected_registration_artifacts(&ready_marker)
+                .expect("expected registration artifacts");
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &ready_marker,
+        );
+        write_canonical_registration_artifact(&registration_journal_path(&data_dir), &ready);
+        write_canonical_registration_artifact(&registration_receipt_path(&data_dir), &receipt);
+
+        let preserve_authorized = cursor_recovery_preserve_authorized_successor(&ready_marker)
+            .expect("PreserveAuthorized successor");
+        let request_for = |marker: &CursorRecoveryModuleMarker,
+                           recovery_cycle: u64,
+                           native_successor_fingerprint: Option<String>| {
+            CloudFilesUnregisterRequest {
+                sync_root: marker.identity.sync_root.clone(),
+                root_path: marker.identity.root_path.clone(),
+                data_dir_root: Some(marker.identity.data_dir_root.clone()),
+                provider_name: marker.identity.provider_name.clone(),
+                cursor_recovery: Some(CloudFilesCursorRecoveryContext {
+                    recovery_id: marker.recovery_id.clone(),
+                    recovery_token: marker.recovery_token.clone(),
+                    recovery_cycle,
+                    native_successor_fingerprint,
+                }),
+            }
+        };
+        let predecessor_request = request_for(&ready_marker, 0, None);
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &preserve_authorized,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote PreserveAuthorized successor")
+            .expect("PreserveAuthorized marker");
+        assert_eq!(
+            recovered.phase,
+            CursorRecoveryModulePhase::PreserveAuthorized
+        );
+        assert_eq!(recovered.recovery_cycle, 1);
+        assert_eq!(preserve_authorized.predecessor_cycle_fingerprint, None);
+        assert_eq!(
+            validate_cursor_recovery_preserve_authority(
+                &preserve_authorized,
+                &predecessor_request,
+                &data_dir,
+                Some(preserve_authorized.registration_lock_bytes.as_slice()),
+            )
+            .expect("PreserveAuthorized predecessor retry"),
+            CursorRecoveryPreserveContextRelation::PredecessorRetry
+        );
+
+        let (preserved_state_owned, _, _) =
+            cursor_recovery_expected_registration_artifacts(&preserve_authorized)
+                .expect("preserved registration artifacts");
+        assert_ne!(preserved_state_owned, state_owned);
+        write_canonical_registration_artifact(
+            &registration_journal_temp_path(&data_dir),
+            &preserved_state_owned,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote next-cycle StateOwned journal")
+            .expect("PreserveAuthorized marker after journal replay");
+        assert_eq!(
+            recovered.phase,
+            CursorRecoveryModulePhase::PreserveAuthorized
+        );
+        assert_eq!(
+            load_registration_journal(&data_dir)
+                .expect("preserved journal load")
+                .expect("preserved journal"),
+            preserved_state_owned
+        );
+
+        let preserved = cursor_recovery_preserved_state_owned_successor(&preserve_authorized)
+            .expect("PreservedStateOwned successor");
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &preserved,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote PreservedStateOwned successor")
+            .expect("PreservedStateOwned marker");
+        assert_eq!(
+            recovered.phase,
+            CursorRecoveryModulePhase::PreservedStateOwned
+        );
+        let successor_fingerprint = cursor_recovery_native_successor_fingerprint(&recovered)
+            .expect("native successor fingerprint");
+        assert_eq!(
+            validate_cursor_recovery_preserve_authority(
+                &preserved,
+                &predecessor_request,
+                &data_dir,
+                Some(preserved.registration_lock_bytes.as_slice()),
+            )
+            .expect("PreservedStateOwned predecessor retry"),
+            CursorRecoveryPreserveContextRelation::PredecessorRetry
+        );
+        let current_request = request_for(&preserved, 1, Some(successor_fingerprint.clone()));
+        assert_eq!(
+            validate_cursor_recovery_preserve_authority(
+                &preserved,
+                &current_request,
+                &data_dir,
+                Some(preserved.registration_lock_bytes.as_slice()),
+            )
+            .expect("rapid current-cycle preserve"),
+            CursorRecoveryPreserveContextRelation::Current
+        );
+
+        let rearmed = cursor_recovery_rearmed_successor(&preserved).expect("rearmed successor");
+        assert_eq!(
+            rearmed.cycle_authorization_fingerprint.as_deref(),
+            Some(successor_fingerprint.as_str())
+        );
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &rearmed,
+        );
+        let recovered = recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect("promote rearmed successor")
+            .expect("rearmed marker");
+        assert_eq!(recovered, rearmed);
+        assert_eq!(recovered.recovery_cycle, 1);
+        assert!(!cursor_recovery_module_marker_temp_path(&data_dir).exists());
+        assert_eq!(
+            validate_cursor_recovery_preserve_authority(
+                &rearmed,
+                &current_request,
+                &data_dir,
+                Some(rearmed.registration_lock_bytes.as_slice()),
+            )
+            .expect("rearmed current cycle"),
+            CursorRecoveryPreserveContextRelation::Current
+        );
+
+        let wrong_request = request_for(&rearmed, 1, Some(format!("blake3:{}", "9".repeat(64))));
+        assert!(
+            validate_cursor_recovery_preserve_authority(
+                &rearmed,
+                &wrong_request,
+                &data_dir,
+                Some(rearmed.registration_lock_bytes.as_slice()),
+            )
+            .is_err()
+        );
+
+        let preserve_authorized_two = cursor_recovery_preserve_authorized_successor(&rearmed)
+            .expect("second PreserveAuthorized successor");
+        assert_eq!(preserve_authorized_two.recovery_cycle, 2);
+        assert_eq!(
+            preserve_authorized_two
+                .predecessor_cycle_fingerprint
+                .as_deref(),
+            Some(successor_fingerprint.as_str())
+        );
+        assert_eq!(
+            validate_cursor_recovery_preserve_authority(
+                &preserve_authorized_two,
+                &current_request,
+                &data_dir,
+                Some(preserve_authorized_two.registration_lock_bytes.as_slice()),
+            )
+            .expect("second-cycle predecessor retry"),
+            CursorRecoveryPreserveContextRelation::PredecessorRetry
+        );
+        let preserved_two =
+            cursor_recovery_preserved_state_owned_successor(&preserve_authorized_two)
+                .expect("second PreservedStateOwned successor");
+        let successor_fingerprint_two =
+            cursor_recovery_native_successor_fingerprint(&preserved_two)
+                .expect("second native successor fingerprint");
+        assert_ne!(successor_fingerprint_two, successor_fingerprint);
+        let mut changed_predecessor = preserved_two.clone();
+        changed_predecessor.predecessor_cycle_fingerprint =
+            Some(format!("blake3:{}", "8".repeat(64)));
+        assert_ne!(
+            cursor_recovery_native_successor_fingerprint(&changed_predecessor)
+                .expect("changed predecessor fingerprint"),
+            successor_fingerprint_two
+        );
+        let mut rearmed_with_changed_predecessor =
+            cursor_recovery_rearmed_successor(&preserved_two)
+                .expect("second-cycle rearmed successor");
+        rearmed_with_changed_predecessor.predecessor_cycle_fingerprint =
+            changed_predecessor.predecessor_cycle_fingerprint;
+        assert_eq!(
+            validate_cursor_recovery_marker(&rearmed_with_changed_predecessor)
+                .expect_err("changed predecessor must invalidate installed cycle proof")
+                .code,
+            "cursor-recovery-cycle-authorization-mismatch"
+        );
+
+        let finalized = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::NamespaceFinalized,
+        );
+        let preserved_finalized = cursor_recovery_preserved_state_owned_successor(
+            &cursor_recovery_preserve_authorized_successor(&finalized)
+                .expect("finalized PreserveAuthorized successor"),
+        )
+        .expect("finalized PreservedStateOwned successor");
+        let rearmed_finalized = cursor_recovery_rearmed_successor(&preserved_finalized)
+            .expect("finalized rearmed successor");
+        assert_eq!(
+            rearmed_finalized.namespace_resume,
+            CursorRecoveryNamespaceResume::Finalized
+        );
+
+        let final_before = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+            .expect("rearmed marker before changed temp");
+        let mut changed_temp =
+            cursor_recovery_marker_with_phase(&rearmed, CursorRecoveryModulePhase::Ready);
+        changed_temp.recovery_id.push_str("-changed");
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_temp_path(&data_dir),
+            &changed_temp,
+        );
+        let changed_temp_before = std::fs::read(cursor_recovery_module_marker_temp_path(&data_dir))
+            .expect("changed marker temp before rejection");
+        assert!(
+            recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(())).is_err()
+        );
+        assert_eq!(
+            std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("rearmed marker after changed temp rejection"),
+            final_before
+        );
+        assert_eq!(
+            std::fs::read(cursor_recovery_module_marker_temp_path(&data_dir))
+                .expect("changed marker temp after rejection"),
+            changed_temp_before
+        );
+    }
+
+    fn completion_authorized_fixture(
+        data_dir: &SinomoDataDir,
+        sync_root: &Path,
+    ) -> (
+        CursorRecoveryModuleMarker,
+        RegistrationJournal,
+        RegistrationJournal,
+        CloudFilesRegistrationReceipt,
+    ) {
+        let marker = cursor_recovery_marker_fixture(
+            data_dir,
+            sync_root,
+            CursorRecoveryModulePhase::CompletionAuthorized,
+        );
+        let (_, mut recovery_ready, receipt) =
+            cursor_recovery_expected_registration_artifacts(&marker)
+                .expect("completion registration artifacts");
+        recovery_ready.phase = RegistrationPhase::Ready;
+        let mut ordinary_ready = recovery_ready.clone();
+        ordinary_ready.clear_cursor_recovery();
+        (marker, recovery_ready, ordinary_ready, receipt)
+    }
+
+    #[test]
+    fn cursor_recovery_completion_authority_replays_exact_normalization_and_clear_cuts() {
+        for cut in [
+            "namespace-finalized-ca-temp",
+            "normalization-temp",
+            "normalized-redundant-temp",
+        ] {
+            let temp = CursorRecoveryTestDir::new(cut);
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let sync_root = temp.path().join("root");
+            let (completion, recovery_ready, ordinary_ready, receipt) =
+                completion_authorized_fixture(&data_dir, &sync_root);
+            let namespace_finalized = cursor_recovery_marker_with_phase(
+                &completion,
+                CursorRecoveryModulePhase::NamespaceFinalized,
+            );
+
+            match cut {
+                "namespace-finalized-ca-temp" => {
+                    write_canonical_registration_artifact(
+                        &cursor_recovery_module_marker_path(&data_dir),
+                        &namespace_finalized,
+                    );
+                    write_canonical_registration_artifact(
+                        &cursor_recovery_module_marker_temp_path(&data_dir),
+                        &completion,
+                    );
+                    write_canonical_registration_artifact(
+                        &registration_journal_path(&data_dir),
+                        &recovery_ready,
+                    );
+                }
+                "normalization-temp" => {
+                    write_canonical_registration_artifact(
+                        &cursor_recovery_module_marker_path(&data_dir),
+                        &completion,
+                    );
+                    write_canonical_registration_artifact(
+                        &registration_journal_path(&data_dir),
+                        &recovery_ready,
+                    );
+                    write_canonical_registration_artifact(
+                        &registration_journal_temp_path(&data_dir),
+                        &ordinary_ready,
+                    );
+                }
+                "normalized-redundant-temp" => {
+                    write_canonical_registration_artifact(
+                        &cursor_recovery_module_marker_path(&data_dir),
+                        &completion,
+                    );
+                    write_canonical_registration_artifact(
+                        &registration_journal_path(&data_dir),
+                        &ordinary_ready,
+                    );
+                    write_canonical_registration_artifact(
+                        &registration_journal_temp_path(&data_dir),
+                        &ordinary_ready,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            write_canonical_registration_artifact(&registration_receipt_path(&data_dir), &receipt);
+
+            let recovered =
+                recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+                    .expect("recover exact completion cut")
+                    .expect("completion marker");
+            assert_eq!(recovered, completion);
+            assert!(!cursor_recovery_module_marker_temp_path(&data_dir).exists());
+            if cut != "namespace-finalized-ca-temp" {
+                assert_eq!(
+                    load_registration_journal(&data_dir)
+                        .expect("load normalized journal")
+                        .expect("normalized journal"),
+                    ordinary_ready
+                );
+                assert!(!registration_journal_temp_path(&data_dir).exists());
+            }
+        }
+
+        for changed in ["marker-temp", "receipt"] {
+            let temp = CursorRecoveryTestDir::new(if changed == "marker-temp" {
+                "cloud-files-completion-changed-marker-temp"
+            } else {
+                "cloud-files-completion-changed-receipt"
+            });
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let sync_root = temp.path().join("root");
+            let (completion, recovery_ready, _, receipt) =
+                completion_authorized_fixture(&data_dir, &sync_root);
+            write_canonical_registration_artifact(
+                &cursor_recovery_module_marker_path(&data_dir),
+                &completion,
+            );
+            write_canonical_registration_artifact(
+                &registration_journal_path(&data_dir),
+                &recovery_ready,
+            );
+            write_canonical_registration_artifact(&registration_receipt_path(&data_dir), &receipt);
+            if changed == "marker-temp" {
+                let mut changed_marker = completion.clone();
+                changed_marker.recovery_id.push_str("-changed");
+                write_canonical_registration_artifact(
+                    &cursor_recovery_module_marker_temp_path(&data_dir),
+                    &changed_marker,
+                );
+            } else {
+                let mut changed_receipt = receipt.clone();
+                changed_receipt.provider_name.push_str(" changed");
+                write_canonical_registration_artifact(
+                    &registration_receipt_path(&data_dir),
+                    &changed_receipt,
+                );
+            }
+            let marker_before = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("completion marker before changed evidence");
+            let journal_before = std::fs::read(registration_journal_path(&data_dir))
+                .expect("completion journal before changed evidence");
+            let receipt_before = std::fs::read(registration_receipt_path(&data_dir))
+                .expect("completion receipt before changed evidence");
+            let marker_temp_before =
+                std::fs::read(cursor_recovery_module_marker_temp_path(&data_dir)).ok();
+            recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+                .expect_err("changed completion evidence must fail closed");
+            assert_eq!(
+                std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                    .expect("completion marker after changed evidence"),
+                marker_before
+            );
+            assert_eq!(
+                std::fs::read(registration_journal_path(&data_dir))
+                    .expect("completion journal after changed evidence"),
+                journal_before
+            );
+            assert_eq!(
+                std::fs::read(registration_receipt_path(&data_dir))
+                    .expect("completion receipt after changed evidence"),
+                receipt_before
+            );
+            assert_eq!(
+                std::fs::read(cursor_recovery_module_marker_temp_path(&data_dir)).ok(),
+                marker_temp_before
+            );
+        }
+
+        let temp = CursorRecoveryTestDir::new("cloud-files-completion-clear-matrix");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let sync_root = temp.path().join("root");
+        let (completion, recovery_ready, ordinary_ready, receipt) =
+            completion_authorized_fixture(&data_dir, &sync_root);
+        write_canonical_registration_artifact(
+            &cursor_recovery_module_marker_path(&data_dir),
+            &completion,
+        );
+        write_canonical_registration_artifact(
+            &registration_journal_path(&data_dir),
+            &recovery_ready,
+        );
+        write_canonical_registration_artifact(&registration_receipt_path(&data_dir), &receipt);
+
+        let marker_before_normalize = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+            .expect("completion marker before premature clear");
+        let journal_before_normalize = std::fs::read(registration_journal_path(&data_dir))
+            .expect("recovery journal before premature clear");
+        let receipt_before_normalize = std::fs::read(registration_receipt_path(&data_dir))
+            .expect("receipt before premature clear");
+        clear_completion_authorized_cursor_recovery_module_marker(&data_dir, &completion)
+            .expect_err("CompletionAuthorized cannot clear before journal normalization");
+        assert_eq!(
+            std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("completion marker after premature clear"),
+            marker_before_normalize
+        );
+        assert_eq!(
+            std::fs::read(registration_journal_path(&data_dir))
+                .expect("recovery journal after premature clear"),
+            journal_before_normalize
+        );
+        assert_eq!(
+            std::fs::read(registration_receipt_path(&data_dir))
+                .expect("receipt after premature clear"),
+            receipt_before_normalize
+        );
+
+        normalize_completed_cursor_recovery_journal(&data_dir, &completion)
+            .expect("normalize completion journal");
+        assert_eq!(
+            load_registration_journal(&data_dir)
+                .expect("load ordinary journal")
+                .expect("ordinary journal"),
+            ordinary_ready
+        );
+
+        let mut changed_ready = ordinary_ready.clone();
+        changed_ready.provider_version.push_str("-changed");
+        write_canonical_registration_artifact(
+            &registration_journal_temp_path(&data_dir),
+            &changed_ready,
+        );
+        let marker_before = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+            .expect("completion marker before changed journal temp");
+        let journal_before = std::fs::read(registration_journal_path(&data_dir))
+            .expect("ordinary journal before changed temp");
+        let receipt_before = std::fs::read(registration_receipt_path(&data_dir))
+            .expect("receipt before changed journal temp");
+        let changed_temp_before = std::fs::read(registration_journal_temp_path(&data_dir))
+            .expect("changed journal temp before rejection");
+        recover_cursor_recovery_registration_snapshot(&data_dir, false, |_| Ok(()))
+            .expect_err("changed normalized journal temp must fail closed");
+        assert_eq!(
+            std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("completion marker after changed journal temp"),
+            marker_before
+        );
+        assert_eq!(
+            std::fs::read(registration_journal_path(&data_dir))
+                .expect("ordinary journal after changed temp"),
+            journal_before
+        );
+        assert_eq!(
+            std::fs::read(registration_receipt_path(&data_dir))
+                .expect("receipt after changed journal temp"),
+            receipt_before
+        );
+        assert_eq!(
+            std::fs::read(registration_journal_temp_path(&data_dir))
+                .expect("changed journal temp after rejection"),
+            changed_temp_before
+        );
+        std::fs::remove_file(registration_journal_temp_path(&data_dir))
+            .expect("remove changed journal temp");
+
+        for (path, value) in [
+            (
+                cursor_recovery_module_marker_temp_path(&data_dir),
+                encode_sobj(&completion).expect("marker temp bytes"),
+            ),
+            (
+                registration_journal_temp_path(&data_dir),
+                encode_sobj(&ordinary_ready).expect("journal temp bytes"),
+            ),
+            (
+                registration_receipt_temp_path(&data_dir),
+                encode_sobj(&receipt).expect("receipt temp bytes"),
+            ),
+        ] {
+            std::fs::write(&path, &value).expect("write rejected completion temp");
+            let marker_before = std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                .expect("completion marker before rejection");
+            let temp_before = std::fs::read(&path).expect("temporary bytes before rejection");
+            clear_completion_authorized_cursor_recovery_module_marker(&data_dir, &completion)
+                .expect_err("completion clear must reject temporary evidence");
+            assert_eq!(
+                std::fs::read(cursor_recovery_module_marker_path(&data_dir))
+                    .expect("completion marker after rejection"),
+                marker_before
+            );
+            assert_eq!(
+                std::fs::read(&path).expect("temporary bytes after rejection"),
+                temp_before
+            );
+            std::fs::remove_file(path).expect("remove rejected temporary evidence");
+        }
+        clear_completion_authorized_cursor_recovery_module_marker(&data_dir, &completion)
+            .expect("clear exact CompletionAuthorized marker");
+        assert!(!cursor_recovery_module_marker_path(&data_dir).exists());
+    }
+
+    #[test]
+    fn cursor_recovery_terminal_handoff_orders_four_acks_and_cancels_before_unpark() {
+        let temp = CursorRecoveryTestDir::new("cloud-files-terminal-handoff-order");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let sync_root = temp.path().join("root");
+        let mut marker = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::NamespaceFinalized,
+        );
+        let order = std::cell::RefCell::new(Vec::new());
+        let cancelled = std::cell::Cell::new(false);
+        let completed = run_cursor_recovery_terminal_handoff_with(
+            &mut marker,
+            |step, marker| {
+                order.borrow_mut().push(step);
+                match step {
+                    CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized => {
+                        marker.phase = CursorRecoveryModulePhase::CompletionAuthorized;
+                    }
+                    CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease => {
+                        cancelled.set(true);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+            || cancelled.get(),
+        )
+        .expect("terminal handoff with final cancellation");
+        assert!(!completed);
+        assert_eq!(
+            order.into_inner(),
+            vec![
+                CursorRecoveryTerminalHandoffStep::AcknowledgeNamespaceFinalized,
+                CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized,
+                CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority,
+                CursorRecoveryTerminalHandoffStep::NormalizeRegistration,
+                CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization,
+                CursorRecoveryTerminalHandoffStep::ClearCompletionAuthorized,
+                CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease,
+            ]
+        );
+
+        let mut marker = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::CompletionAuthorized,
+        );
+        let success_order = std::cell::RefCell::new(Vec::new());
+        assert!(
+            run_cursor_recovery_terminal_handoff_with(
+                &mut marker,
+                |step, _| {
+                    success_order.borrow_mut().push(step);
+                    Ok(())
+                },
+                || false,
+            )
+            .expect("uncancelled terminal handoff")
+        );
+        assert_eq!(
+            success_order.into_inner(),
+            vec![
+                CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority,
+                CursorRecoveryTerminalHandoffStep::NormalizeRegistration,
+                CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization,
+                CursorRecoveryTerminalHandoffStep::ClearCompletionAuthorized,
+                CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease,
+                CursorRecoveryTerminalHandoffStep::CompleteWorker,
+                CursorRecoveryTerminalHandoffStep::ReleasePopulation,
+            ]
+        );
+
+        let mut marker = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::CompletionAuthorized,
+        );
+        let after_complete_order = std::cell::RefCell::new(Vec::new());
+        let cancel_after_complete = std::cell::Cell::new(false);
+        assert!(
+            !run_cursor_recovery_terminal_handoff_with(
+                &mut marker,
+                |step, _| {
+                    after_complete_order.borrow_mut().push(step);
+                    if step == CursorRecoveryTerminalHandoffStep::CompleteWorker {
+                        cancel_after_complete.set(true);
+                    }
+                    Ok(())
+                },
+                || cancel_after_complete.get(),
+            )
+            .expect("cancellation after CompleteWorker")
+        );
+        assert_eq!(
+            after_complete_order.borrow().last().copied(),
+            Some(CursorRecoveryTerminalHandoffStep::CompleteWorker)
+        );
+        assert!(
+            !after_complete_order
+                .borrow()
+                .contains(&CursorRecoveryTerminalHandoffStep::ReleasePopulation)
+        );
+
+        for fail_at in [
+            CursorRecoveryTerminalHandoffStep::AcknowledgeNamespaceFinalized,
+            CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized,
+            CursorRecoveryTerminalHandoffStep::AcknowledgeCompletionAuthority,
+            CursorRecoveryTerminalHandoffStep::NormalizeRegistration,
+            CursorRecoveryTerminalHandoffStep::AcknowledgeNormalization,
+            CursorRecoveryTerminalHandoffStep::ClearCompletionAuthorized,
+            CursorRecoveryTerminalHandoffStep::AcknowledgeAuthorityRelease,
+        ] {
+            let mut marker = cursor_recovery_marker_fixture(
+                &data_dir,
+                &sync_root,
+                CursorRecoveryModulePhase::NamespaceFinalized,
+            );
+            let observed = std::cell::RefCell::new(Vec::new());
+            let error = run_cursor_recovery_terminal_handoff_with(
+                &mut marker,
+                |step, marker| {
+                    observed.borrow_mut().push(step);
+                    if step == fail_at {
+                        return Err(CloudFilesModuleError {
+                            code: "injected-terminal-cut".to_string(),
+                            detail: format!("fail at {step:?}"),
+                        });
+                    }
+                    if step == CursorRecoveryTerminalHandoffStep::PersistCompletionAuthorized {
+                        marker.phase = CursorRecoveryModulePhase::CompletionAuthorized;
+                    }
+                    Ok(())
+                },
+                || false,
+            )
+            .expect_err("injected durable boundary must stop the handoff");
+            assert_eq!(error.code, "injected-terminal-cut");
+            assert_eq!(observed.borrow().last().copied(), Some(fail_at));
+            assert!(
+                !observed
+                    .borrow()
+                    .contains(&CursorRecoveryTerminalHandoffStep::CompleteWorker)
+            );
+        }
+    }
+
+    #[test]
+    fn registration_artifact_same_image_is_a_strict_noop() {
+        let temp = CursorRecoveryTestDir::new("cloud-files-registration-artifact-same-image");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let sync_root = temp.path().join("root");
+        let marker = cursor_recovery_marker_fixture(
+            &data_dir,
+            &sync_root,
+            CursorRecoveryModulePhase::Authorized,
+        );
+        let path = cursor_recovery_module_marker_path(&data_dir);
+        write_canonical_registration_artifact(&path, &marker);
+        let before = std::fs::read(&path).expect("marker before no-op");
+        persist_cursor_recovery_registration_artifact(
+            &path,
+            &marker,
+            "cursor-recovery-marker",
+            "Cloud Files cursor recovery marker",
+        )
+        .expect("same-image persistence");
+        assert_eq!(std::fs::read(&path).expect("marker after no-op"), before);
+        assert!(!cursor_recovery_module_marker_temp_path(&data_dir).exists());
     }
 
     #[test]

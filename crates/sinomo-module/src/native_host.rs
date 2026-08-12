@@ -12,10 +12,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use libloading::Library;
 use sinomo_module_api::{
     NativeModuleDescriptor, NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_OK,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleApiVersionFn, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleDescriptorFn, SinomoModuleFreeBufferFn,
-    SinomoModuleHostApiV2, SinomoModuleInitFn, SinomoModuleInvokeFn, SinomoModuleShutdownFn,
-    SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleApiVersionFn,
+    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleDescriptorFn,
+    SinomoModuleFreeBufferFn, SinomoModuleHostApiV2, SinomoModuleInitFn, SinomoModuleInvokeFn,
+    SinomoModuleShutdownFn, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +47,13 @@ pub enum NativeModuleHostError {
 
 pub trait NativeModuleHostCallbacks: Send + Sync {
     fn output_payload(&self, _payload_sobj: &[u8]) {}
+    /// Synchronous output hook for module effects which require durable host
+    /// acknowledgement before they may proceed. Existing hosts retain their
+    /// historical fire-and-forget behavior through the default implementation.
+    fn output_payload_status(&self, payload_sobj: &[u8]) -> bool {
+        self.output_payload(payload_sobj);
+        true
+    }
     fn log(&self, _message: &[u8]) {}
     fn is_cancelled(&self) -> bool {
         false
@@ -595,16 +602,19 @@ unsafe extern "C" fn native_module_output_payload(
 ) -> SinomoModuleStatusCode {
     let Some(state) = (unsafe { (user_data as *const NativeModuleHostCallbackState).as_ref() })
     else {
-        return 1;
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
     };
     let Ok(callbacks) = state.callbacks.lock() else {
-        return 1;
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
     };
     let Some(callbacks) = callbacks.as_ref() else {
         return SINOMO_MODULE_STATUS_OK;
     };
-    callbacks.output_payload(unsafe { payload_sobj.as_slice() });
-    SINOMO_MODULE_STATUS_OK
+    if callbacks.output_payload_status(unsafe { payload_sobj.as_slice() }) {
+        SINOMO_MODULE_STATUS_OK
+    } else {
+        SINOMO_MODULE_STATUS_RUNTIME_ERROR
+    }
 }
 
 unsafe extern "C" fn native_module_log(
@@ -725,6 +735,32 @@ mod lifecycle_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    struct RejectingOutput;
+
+    impl NativeModuleHostCallbacks for RejectingOutput {
+        fn output_payload_status(&self, _payload_sobj: &[u8]) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn synchronous_output_failure_reaches_the_native_module() {
+        let state = NativeModuleHostCallbackState::default();
+        let _guard = state
+            .set_callbacks(Some(Arc::new(RejectingOutput)))
+            .expect("install rejecting output callback");
+        let payload = b"requires-durable-host-ack";
+        let status = unsafe {
+            native_module_output_payload(
+                (&state as *const NativeModuleHostCallbackState)
+                    .cast_mut()
+                    .cast(),
+                SinomoModuleByteSlice::from_slice(payload),
+            )
+        };
+        assert_eq!(status, SINOMO_MODULE_STATUS_RUNTIME_ERROR);
+    }
 
     #[test]
     fn mapping_lifetime_only_pins_process_resident_modules() {

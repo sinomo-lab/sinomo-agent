@@ -16,6 +16,7 @@ use crate::{SINOMO_DFS_MODULE_OWNER, dfs_module_id};
 pub const SIFS_MOUNT_CONFIG_KEY: &str = "storage.sifs-mount";
 pub const SIFS_MOUNT_STATUS_CONFIG_KEY: &str = "storage.sifs-mount-status";
 pub const SIFS_MOUNT_STATUS_ROUTE: &str = "/dfs/mount/status";
+pub const SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE: &str = "/dfs/mount/recover-cursor-only-state";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SifsMountConfig {
@@ -235,6 +236,40 @@ pub struct SifsMountStatusRequest;
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SifsMountStatusResponse {
     pub status: SifsMountRuntimeStatus,
+}
+
+/// Daemon-local control request for the explicit Windows Cloud Files
+/// cursor-only recovery. The main daemon's mount supervisor serializes this
+/// with registration staging, cleanup, and active-provider lifecycle work.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum SifsMountCursorOnlyRecoveryRequest {
+    Inspect,
+    Apply {
+        expected_token: String,
+        acknowledge_authoritative_full_reconciliation: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum SifsMountCursorOnlyRecoveryResponse {
+    Inspected {
+        recovery_token: String,
+        raw_state_fingerprint: String,
+        sync_root_file_id: u64,
+        cursor_count: u64,
+        provider_content_hash: String,
+        provider_interface_version: String,
+        detail: String,
+    },
+    Applied {
+        recovery_id: String,
+        recovery_token: String,
+        sync_root_file_id: u64,
+        cursor_count_cleared: u64,
+        detail: String,
+    },
 }
 
 pub fn sifs_mount_config_definition() -> ConfigDefinition {

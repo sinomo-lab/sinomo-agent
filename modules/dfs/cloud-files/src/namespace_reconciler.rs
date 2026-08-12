@@ -7,8 +7,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt as _;
 
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
@@ -31,6 +34,11 @@ const MATERIALIZATION_AUDIT_INTENTS_FILE: &str = "materialization-audit-intents.
 const MATERIALIZATION_AUDIT_INTENTS_TEMP_LABEL: &str = "cloud-files-materialization-audits";
 const MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION: u16 = 1;
 const MATERIALIZATION_AUDIT_INTENTS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const CURSOR_RECOVERY_REWRITE_MAX_BYTES: u64 = 256 * 1024;
+const CURSOR_RECOVERY_PAGE_INTENT_FILE: &str = "cursor-recovery-page.sobj";
+const CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL: &str = "cloud-files-cursor-recovery-page";
+const CURSOR_RECOVERY_PAGE_INTENT_SCHEMA_VERSION: u16 = 1;
 #[cfg(not(test))]
 const RECONCILIATION_STATE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(test)]
@@ -42,6 +50,7 @@ const MANIFEST_INDEX_FILE: &str = "index.sobj";
 const MANIFEST_INDEX_TEMP_LABEL: &str = "cloud-files-manifest-index";
 const MANIFEST_JOURNAL_FILE: &str = "active.slog";
 const MANIFEST_RECORD_MAX_BYTES: usize = 1024 * 1024;
+const MANIFEST_INDEX_MAX_BYTES: u64 = 1024 * 1024;
 #[cfg(not(test))]
 const MANIFEST_JOURNAL_COMPACT_BYTES: u64 = 8 * 1024 * 1024;
 #[cfg(test)]
@@ -57,6 +66,8 @@ const MANIFEST_CHUNK_TARGET_BYTES: usize = 32 * 1024;
 const MANIFEST_CHUNK_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MANIFEST_CHUNK_TEMP_LABEL: &str = "cloud-files-manifest-chunk";
 const MANIFEST_RECORD_MUTATIONS_MAX: usize = 512;
+const CURSOR_RECOVERY_PAGE_INTENT_MAX_BYTES: u64 =
+    RECONCILIATION_STATE_MAX_BYTES * 2 + 8 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct CloudFilesNamespaceCursor {
@@ -313,6 +324,815 @@ struct CloudFilesNamespaceReconciliationState {
     applied_events: BTreeMap<String, CloudFilesAppliedNamespaceEvent>,
 }
 
+/// Raw owner-validated snapshot accepted by the explicit recovery. The bytes
+/// are retained because the operator token binds the exact pre-migration disk
+/// image, not merely the decoded cursor values.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct CloudFilesCursorOnlyReconciliationInspection {
+    pub scope_path: PathBuf,
+    pub raw_files: BTreeMap<String, Vec<u8>>,
+    pub cursors: BTreeMap<String, CloudFilesNamespaceCursor>,
+}
+
+pub(crate) struct CloudFilesCursorOnlyReconciliationInspectionGuard {
+    inspection: CloudFilesCursorOnlyReconciliationInspection,
+    _lock: File,
+}
+
+/// Lock-held, plan-bound proof that the namespace owner has already crossed
+/// its Terminal durability boundary. The module keeps this guard alive while
+/// it fsyncs the ReconcileArmed/TerminalPendingFinalize successor, closing the
+/// otherwise unavoidable crash window between the two owner markers.
+pub(crate) struct CloudFilesCursorRecoveryTerminalSuccessorGuard {
+    reconciler: CloudFilesNamespaceReconciler,
+}
+
+impl CloudFilesCursorRecoveryTerminalSuccessorGuard {
+    pub(crate) fn into_reconciler(self) -> CloudFilesNamespaceReconciler {
+        self.reconciler
+    }
+}
+
+impl CloudFilesCursorOnlyReconciliationInspectionGuard {
+    pub(crate) fn inspection(&self) -> &CloudFilesCursorOnlyReconciliationInspection {
+        &self.inspection
+    }
+
+    /// Builds both byte images while the owner lock and original snapshot are
+    /// still held. The caller persists this plan in the module authorization
+    /// marker before it establishes StateOwned registration ownership.
+    pub(crate) fn authoritative_reconciliation_plan(
+        &self,
+        recovery_id: &str,
+        recovery_token: &str,
+        nonce: &str,
+    ) -> Result<CloudFilesCursorRecoveryReconciliationPlan, CloudFilesNamespaceReconcileError> {
+        let original_state = self
+            .inspection
+            .raw_files
+            .get(RECONCILIATION_STATE_FILE)
+            .cloned()
+            .ok_or_else(|| {
+                reconcile_error(
+                    "cursor-recovery-state-drift",
+                    "inspected state bytes are unavailable",
+                )
+            })?;
+        let mut state: CloudFilesNamespaceReconciliationState = decode_sobj(&original_state)
+            .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
+        if state.cursors != self.inspection.cursors || state.cursors.is_empty() {
+            return Err(reconcile_error(
+                "cursor-recovery-state-drift",
+                "reconciliation cursor set changed after token inspection",
+            ));
+        }
+        let cursor_count = u64::try_from(state.cursors.len()).map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-cursor-count",
+                "cursor count overflowed u64",
+            )
+        })?;
+        let boundary = state
+            .cursors
+            .values()
+            .next()
+            .cloned()
+            .expect("nonempty cursor-only inspection");
+        state.cursors.clear();
+        state.materialized_directories.insert(state.root.clone());
+        state.full_scan_request = Some(CloudFilesFullScanRequest {
+            shard_key: boundary.shard_key()?,
+            cursor: boundary,
+            reason: "cursor-only-state-recovery".to_string(),
+            detail: format!(
+                "explicit recovery {recovery_id} cleared stale cursors and requires a terminal authoritative root reconciliation"
+            ),
+        });
+        let expected_state = encode_reconciliation_state(&state)?;
+        let original_audit = self
+            .inspection
+            .raw_files
+            .get(MATERIALIZATION_AUDIT_INTENTS_FILE)
+            .cloned()
+            .ok_or_else(|| {
+                reconcile_error(
+                    "cursor-recovery-state-drift",
+                    "inspected audit bytes are unavailable",
+                )
+            })?;
+        let mut audit: CloudFilesMaterializationAuditIntentState = decode_sobj(&original_audit)
+            .map_err(|source| {
+                reconcile_error("decode-materialization-audit-intents", source.to_string())
+            })?;
+        audit.directories.insert(state.root.clone());
+        let expected_audit = encode_materialization_audit_intents(&audit)?;
+        Ok(CloudFilesCursorRecoveryReconciliationPlan {
+            schema_version: CURSOR_RECOVERY_REWRITE_SCHEMA_VERSION,
+            recovery_id: recovery_id.to_string(),
+            recovery_token: recovery_token.to_string(),
+            nonce: nonce.to_string(),
+            root: state.root,
+            cursor_count_cleared: cursor_count,
+            original_state,
+            expected_state,
+            original_audit,
+            expected_audit,
+        })
+    }
+
+    /// Replays the only admissible deterministic rewrite cuts. The
+    /// ReconcileArmed marker is fsynced before either owner state file can
+    /// change, and it remains installed until the authoritative worker has
+    /// durably reached Terminal.
+    pub(crate) fn apply_authoritative_reconciliation_plan(
+        &self,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<u64, CloudFilesNamespaceReconcileError> {
+        let original: CloudFilesNamespaceReconciliationState = decode_sobj(&plan.original_state)
+            .map_err(|source| {
+                reconcile_error("decode-recovery-original-state", source.to_string())
+            })?;
+        let validated = validate_cursor_recovery_plan(plan, &original.mount, &original.root)?;
+        if validated.original.cursors != self.inspection.cursors {
+            return Err(reconcile_error(
+                "cursor-recovery-state-drift",
+                "authorized recovery cursor set differs from the locked inspection",
+            ));
+        }
+        let cut = inspect_authorized_cursor_recovery_cut(&self.inspection.scope_path, plan)?;
+        for path in &cut.temp_paths {
+            durable_file::remove_file_if_exists_and_sync_parent(path)
+                .map_err(storage_error("remove authorized cursor recovery stage"))?;
+        }
+        let state_path = self.inspection.scope_path.join(RECONCILIATION_STATE_FILE);
+        let audit_path = self
+            .inspection
+            .scope_path
+            .join(MATERIALIZATION_AUDIT_INTENTS_FILE);
+        let rewrite_path = self
+            .inspection
+            .scope_path
+            .join(CURSOR_RECOVERY_REWRITE_FILE);
+        let armed = CloudFilesCursorRecoveryRewrite::from_plan(
+            plan,
+            CloudFilesCursorRecoveryRewritePhase::ReconcileArmed,
+        );
+        persist_cursor_recovery_rewrite(&rewrite_path, &armed)?;
+        if cut.state_is_original {
+            durable_file::write_file_atomic(
+                &state_path,
+                &plan.expected_state,
+                DurableAtomicFileOptions::new(
+                    RECONCILIATION_STATE_FILE,
+                    CURSOR_RECOVERY_STATE_TEMP_LABEL,
+                )
+                .sync_all(),
+            )
+            .map_err(storage_error(
+                "persist cursor recovery reconciliation fence",
+            ))?;
+        }
+        if cut.audit_is_original {
+            durable_file::write_file_atomic(
+                &audit_path,
+                &plan.expected_audit,
+                DurableAtomicFileOptions::new(
+                    MATERIALIZATION_AUDIT_INTENTS_FILE,
+                    CURSOR_RECOVERY_AUDIT_TEMP_LABEL,
+                )
+                .sync_all(),
+            )
+            .map_err(storage_error(
+                "persist cursor recovery materialization audit fence",
+            ))?;
+        }
+        let final_state = read_bounded_plain_file(
+            &state_path,
+            CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+            "cursor recovery reconciliation state",
+        )?;
+        let final_audit = read_bounded_plain_file(
+            &audit_path,
+            CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+            "cursor recovery materialization audit state",
+        )?;
+        if final_state != plan.expected_state || final_audit != plan.expected_audit {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-torn",
+                "cursor recovery did not reach the exact authorized target bytes",
+            ));
+        }
+        Ok(plan.cursor_count_cleared)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub(crate) struct CloudFilesCursorRecoveryReconciliationPlan {
+    pub(crate) schema_version: u16,
+    pub(crate) recovery_id: String,
+    pub(crate) recovery_token: String,
+    pub(crate) nonce: String,
+    pub(crate) root: String,
+    pub(crate) cursor_count_cleared: u64,
+    pub(crate) original_state: Vec<u8>,
+    pub(crate) expected_state: Vec<u8>,
+    pub(crate) original_audit: Vec<u8>,
+    pub(crate) expected_audit: Vec<u8>,
+}
+
+impl CloudFilesCursorRecoveryReconciliationPlan {
+    pub(crate) fn cursor_count_cleared(&self) -> u64 {
+        self.cursor_count_cleared
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct CloudFilesCursorRecoveryRewrite {
+    schema_version: u16,
+    recovery_id: String,
+    recovery_token: String,
+    nonce: String,
+    root: String,
+    cursor_count_cleared: u64,
+    original_state_fingerprint: String,
+    expected_state_fingerprint: String,
+    original_audit_fingerprint: String,
+    expected_audit_fingerprint: String,
+    #[serde(rename = "phase")]
+    phase: CloudFilesCursorRecoveryRewritePhase,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum CloudFilesCursorRecoveryRewritePhase {
+    ReconcileArmed,
+    Terminal,
+}
+
+const CURSOR_RECOVERY_REWRITE_FILE: &str = "cursor-recovery.sobj";
+const CURSOR_RECOVERY_REWRITE_SCHEMA_VERSION: u16 = 1;
+const CURSOR_RECOVERY_REWRITE_TEMP_LABEL: &str = "cloud-files-cursor-recovery-rewrite";
+const CURSOR_RECOVERY_STATE_TEMP_LABEL: &str = "cloud-files-cursor-recovery-state";
+const CURSOR_RECOVERY_AUDIT_TEMP_LABEL: &str = "cloud-files-cursor-recovery-audit";
+
+impl CloudFilesCursorRecoveryRewrite {
+    fn from_plan(
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+        phase: CloudFilesCursorRecoveryRewritePhase,
+    ) -> Self {
+        Self {
+            schema_version: plan.schema_version,
+            recovery_id: plan.recovery_id.clone(),
+            recovery_token: plan.recovery_token.clone(),
+            nonce: plan.nonce.clone(),
+            root: plan.root.clone(),
+            cursor_count_cleared: plan.cursor_count_cleared,
+            original_state_fingerprint: cursor_recovery_bytes_fingerprint(&plan.original_state),
+            expected_state_fingerprint: cursor_recovery_bytes_fingerprint(&plan.expected_state),
+            original_audit_fingerprint: cursor_recovery_bytes_fingerprint(&plan.original_audit),
+            expected_audit_fingerprint: cursor_recovery_bytes_fingerprint(&plan.expected_audit),
+            phase,
+        }
+    }
+
+    fn matches_plan(&self, plan: &CloudFilesCursorRecoveryReconciliationPlan) -> bool {
+        let expected = Self::from_plan(plan, self.phase);
+        self == &expected
+    }
+}
+
+fn cursor_recovery_bytes_fingerprint(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+fn persist_cursor_recovery_rewrite(
+    path: &Path,
+    rewrite: &CloudFilesCursorRecoveryRewrite,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    let bytes = encode_sobj(rewrite)
+        .map_err(|source| reconcile_error("encode-cursor-recovery-rewrite", source.to_string()))?;
+    if bytes.len() as u64 > CURSOR_RECOVERY_REWRITE_MAX_BYTES {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-too-large",
+            "cursor recovery rewrite marker exceeds its durable owner bound",
+        ));
+    }
+    durable_file::write_file_atomic(
+        path,
+        &bytes,
+        DurableAtomicFileOptions::new(
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+        )
+        .sync_all(),
+    )
+    .map_err(storage_error("persist cursor recovery rewrite phase"))
+}
+
+struct ValidatedCursorRecoveryPlan {
+    original: CloudFilesNamespaceReconciliationState,
+    expected: CloudFilesNamespaceReconciliationState,
+}
+
+fn validate_cursor_recovery_plan(
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    mount: &str,
+    root: &str,
+) -> Result<ValidatedCursorRecoveryPlan, CloudFilesNamespaceReconcileError> {
+    if plan.schema_version != CURSOR_RECOVERY_REWRITE_SCHEMA_VERSION
+        || plan.recovery_id.trim().is_empty()
+        || plan.recovery_token.trim().is_empty()
+        || plan.nonce.trim().is_empty()
+        || plan.original_state.is_empty()
+        || plan.expected_state.is_empty()
+        || plan.original_audit.is_empty()
+        || plan.expected_audit.is_empty()
+        || plan.original_state.len() as u64 > CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES
+        || plan.expected_state.len() as u64 > CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES
+        || plan.original_audit.len() as u64 > CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES
+        || plan.expected_audit.len() as u64 > CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-plan",
+            "cursor recovery rewrite plan is malformed or exceeds its durable image bound",
+        ));
+    }
+    let original: CloudFilesNamespaceReconciliationState = decode_sobj(&plan.original_state)
+        .map_err(|source| reconcile_error("decode-recovery-original-state", source.to_string()))?;
+    let expected: CloudFilesNamespaceReconciliationState = decode_sobj(&plan.expected_state)
+        .map_err(|source| reconcile_error("decode-recovery-expected-state", source.to_string()))?;
+    let original_audit: CloudFilesMaterializationAuditIntentState =
+        decode_sobj(&plan.original_audit).map_err(|source| {
+            reconcile_error("decode-recovery-original-audit", source.to_string())
+        })?;
+    let expected_audit: CloudFilesMaterializationAuditIntentState =
+        decode_sobj(&plan.expected_audit).map_err(|source| {
+            reconcile_error("decode-recovery-expected-audit", source.to_string())
+        })?;
+    if encode_sobj(&original)
+        .map_err(|source| reconcile_error("encode-recovery-original-state", source.to_string()))?
+        != plan.original_state
+        || encode_sobj(&expected).map_err(|source| {
+            reconcile_error("encode-recovery-expected-state", source.to_string())
+        })? != plan.expected_state
+        || encode_sobj(&original_audit).map_err(|source| {
+            reconcile_error("encode-recovery-original-audit", source.to_string())
+        })? != plan.original_audit
+        || encode_sobj(&expected_audit).map_err(|source| {
+            reconcile_error("encode-recovery-expected-audit", source.to_string())
+        })? != plan.expected_audit
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-plan",
+            "cursor recovery rewrite plan contains noncanonical state bytes",
+        ));
+    }
+
+    let mut recomputed = original.clone();
+    let boundary = recomputed.cursors.values().next().cloned().ok_or_else(|| {
+        reconcile_error(
+            "cursor-recovery-rewrite-plan",
+            "authorized original state has no cursor",
+        )
+    })?;
+    let cursor_count = u64::try_from(recomputed.cursors.len()).map_err(|_| {
+        reconcile_error(
+            "cursor-recovery-cursor-count",
+            "cursor count overflowed u64",
+        )
+    })?;
+    recomputed.cursors.clear();
+    recomputed.materialized_directories.insert(root.to_string());
+    recomputed.full_scan_request = Some(CloudFilesFullScanRequest {
+        shard_key: boundary.shard_key()?,
+        cursor: boundary,
+        reason: "cursor-only-state-recovery".to_string(),
+        detail: format!(
+            "explicit recovery {} cleared stale cursors and requires a terminal authoritative root reconciliation",
+            plan.recovery_id
+        ),
+    });
+    let mut recomputed_audit = original_audit.clone();
+    recomputed_audit.directories.insert(root.to_string());
+    if plan.root != root
+        || original.schema_version != RECONCILIATION_SCHEMA_VERSION
+        || original.mount != mount
+        || original.root != root
+        || original.cursors.is_empty()
+        || !original.legacy_manifest.is_empty()
+        || !original.suppressions.is_empty()
+        || !original.conflicts.is_empty()
+        || !original.startup_conflicts.is_empty()
+        || !original.materialized_directories.is_empty()
+        || original.unsupported_projection_count != 0
+        || !original.unsupported_projection_examples.is_empty()
+        || original.full_scan_request.is_some()
+        || original.inflight_effect.is_some()
+        || !original.applied_events.is_empty()
+        || expected.schema_version != RECONCILIATION_SCHEMA_VERSION
+        || expected.mount != mount
+        || expected.root != root
+        || recomputed != expected
+        || cursor_count != plan.cursor_count_cleared
+        || original_audit.schema_version != MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION
+        || original_audit.mount != mount
+        || original_audit.root != root
+        || !original_audit.directories.is_empty()
+        || expected_audit.schema_version != MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION
+        || expected_audit.mount != mount
+        || expected_audit.root != root
+        || recomputed_audit != expected_audit
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-plan",
+            "cursor recovery plan does not bind the exact cursor-only transition",
+        ));
+    }
+    for (key, cursor) in &original.cursors {
+        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-plan",
+                "cursor recovery original image contains an invalid cursor",
+            ));
+        }
+    }
+    Ok(ValidatedCursorRecoveryPlan { original, expected })
+}
+
+pub(crate) fn validate_authorized_cursor_recovery_plan(
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    mount: &str,
+    root: &str,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    validate_cursor_recovery_plan(plan, mount, root).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn cursor_recovery_plan_fixture(
+    mount: &str,
+    root: &str,
+    recovery_id: &str,
+    recovery_token: &str,
+    nonce: &str,
+) -> CloudFilesCursorRecoveryReconciliationPlan {
+    let cursor = CloudFilesNamespaceCursor {
+        file_system_id: "sifs".to_string(),
+        shard_id: "services".to_string(),
+        authority_epoch: 7,
+        after_sequence: 41,
+    };
+    let mut cursors = BTreeMap::new();
+    cursors.insert(
+        cursor.shard_key().expect("fixture cursor key"),
+        cursor.clone(),
+    );
+    let original = CloudFilesNamespaceReconciliationState {
+        schema_version: RECONCILIATION_SCHEMA_VERSION,
+        mount: mount.to_string(),
+        root: root.to_string(),
+        cursors,
+        legacy_manifest: BTreeMap::new(),
+        suppressions: BTreeMap::new(),
+        conflicts: BTreeMap::new(),
+        startup_conflicts: BTreeMap::new(),
+        materialized_directories: BTreeSet::new(),
+        unsupported_projection_count: 0,
+        unsupported_projection_examples: BTreeMap::new(),
+        full_scan_request: None,
+        inflight_effect: None,
+        applied_events: BTreeMap::new(),
+    };
+    let mut expected = original.clone();
+    expected.cursors.clear();
+    expected.materialized_directories.insert(root.to_string());
+    expected.full_scan_request = Some(CloudFilesFullScanRequest {
+        shard_key: cursor.shard_key().expect("fixture cursor key"),
+        cursor,
+        reason: "cursor-only-state-recovery".to_string(),
+        detail: format!(
+            "explicit recovery {recovery_id} cleared stale cursors and requires a terminal authoritative root reconciliation"
+        ),
+    });
+    let original_audit = CloudFilesMaterializationAuditIntentState {
+        schema_version: MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION,
+        mount: mount.to_string(),
+        root: root.to_string(),
+        directories: BTreeSet::new(),
+    };
+    let mut expected_audit = original_audit.clone();
+    expected_audit.directories.insert(root.to_string());
+    CloudFilesCursorRecoveryReconciliationPlan {
+        schema_version: CURSOR_RECOVERY_REWRITE_SCHEMA_VERSION,
+        recovery_id: recovery_id.to_string(),
+        recovery_token: recovery_token.to_string(),
+        nonce: nonce.to_string(),
+        root: root.to_string(),
+        cursor_count_cleared: 1,
+        original_state: encode_sobj(&original).expect("fixture original state"),
+        expected_state: encode_sobj(&expected).expect("fixture expected state"),
+        original_audit: encode_sobj(&original_audit).expect("fixture original audit"),
+        expected_audit: encode_sobj(&expected_audit).expect("fixture expected audit"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CursorRecoveryTempKind {
+    Rewrite,
+    State,
+    Audit,
+}
+
+fn cursor_recovery_temp_kind(name: &str) -> Option<CursorRecoveryTempKind> {
+    [
+        (
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            CursorRecoveryTempKind::Rewrite,
+        ),
+        (
+            RECONCILIATION_STATE_FILE,
+            CURSOR_RECOVERY_STATE_TEMP_LABEL,
+            CursorRecoveryTempKind::State,
+        ),
+        (
+            MATERIALIZATION_AUDIT_INTENTS_FILE,
+            CURSOR_RECOVERY_AUDIT_TEMP_LABEL,
+            CursorRecoveryTempKind::Audit,
+        ),
+    ]
+    .into_iter()
+    .find_map(|(file_name, label, kind)| {
+        let prefix = format!(".{file_name}.{label}-");
+        let suffix = name.strip_prefix(&prefix)?;
+        let (pid_text, sequence_text) = suffix.split_once('-')?;
+        if sequence_text.contains('-') {
+            return None;
+        }
+        let pid = pid_text.parse::<u32>().ok()?;
+        let sequence = sequence_text.parse::<u64>().ok()?;
+        (pid.to_string() == pid_text && sequence.to_string() == sequence_text).then_some(kind)
+    })
+}
+
+fn looks_like_cursor_recovery_temp(name: &str) -> bool {
+    [
+        (
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+        ),
+        (RECONCILIATION_STATE_FILE, CURSOR_RECOVERY_STATE_TEMP_LABEL),
+        (
+            MATERIALIZATION_AUDIT_INTENTS_FILE,
+            CURSOR_RECOVERY_AUDIT_TEMP_LABEL,
+        ),
+    ]
+    .into_iter()
+    .any(|(file_name, label)| name.starts_with(&format!(".{file_name}.{label}-")))
+}
+
+fn read_bounded_plain_file(
+    path: &Path,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>, CloudFilesNamespaceReconcileError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(io_error("inspect bounded cursor recovery file"))?;
+    if !metadata.file_type().is_file() || metadata_is_reparse(&metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            format!("{label} is not a plain file"),
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(reconcile_error(
+            "cursor-recovery-state-too-large",
+            format!("{label} exceeds its {max_bytes}-byte recovery bound"),
+        ));
+    }
+    let file = File::open(path).map_err(io_error("open bounded cursor recovery file"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(io_error("read bounded cursor recovery file"))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(reconcile_error(
+            "cursor-recovery-state-too-large",
+            format!("{label} grew beyond its recovery bound while being read"),
+        ));
+    }
+    Ok(bytes)
+}
+
+struct AuthorizedCursorRecoveryCut {
+    raw_files: BTreeMap<String, Vec<u8>>,
+    state_is_original: bool,
+    audit_is_original: bool,
+    temp_paths: Vec<PathBuf>,
+}
+
+fn inspect_authorized_cursor_recovery_cut(
+    scope: &Path,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<AuthorizedCursorRecoveryCut, CloudFilesNamespaceReconcileError> {
+    let mut raw_files = BTreeMap::new();
+    let mut state_bytes = None;
+    let mut audit_bytes = None;
+    let mut rewrite = None;
+    let mut temps = BTreeMap::<CursorRecoveryTempKind, (PathBuf, Vec<u8>)>::new();
+    let mut saw_lock = false;
+    let mut saw_manifest = false;
+    for entry in fs::read_dir(scope).map_err(io_error("list authorized reconciliation scope"))? {
+        let entry = entry.map_err(io_error("read authorized reconciliation scope entry"))?;
+        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "authorized reconciliation scope contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(io_error("inspect authorized reconciliation scope entry"))?;
+        if metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("authorized reconciliation contains reparse evidence `{name}`"),
+            ));
+        }
+        match name.as_str() {
+            RECONCILIATION_STATE_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(
+                    &path,
+                    CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+                    "authorized reconciliation state",
+                )?;
+                raw_files.insert(name, bytes.clone());
+                state_bytes = Some(bytes);
+            }
+            MATERIALIZATION_AUDIT_INTENTS_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(
+                    &path,
+                    CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+                    "authorized materialization audit state",
+                )?;
+                raw_files.insert(name, bytes.clone());
+                audit_bytes = Some(bytes);
+            }
+            RECONCILIATION_LOCK_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(&path, 0, "authorized reconciliation lock")?;
+                raw_files.insert(name, bytes);
+                saw_lock = true;
+            }
+            MANIFEST_DIR if metadata.file_type().is_dir() => {
+                inspect_empty_cursor_recovery_manifest(&path, &mut raw_files)?;
+                saw_manifest = true;
+            }
+            CURSOR_RECOVERY_REWRITE_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(
+                    &path,
+                    CURSOR_RECOVERY_REWRITE_MAX_BYTES,
+                    "authorized cursor recovery rewrite marker",
+                )?;
+                let decoded: CloudFilesCursorRecoveryRewrite =
+                    decode_sobj(&bytes).map_err(|source| {
+                        reconcile_error("decode-cursor-recovery-rewrite", source.to_string())
+                    })?;
+                if encode_sobj(&decoded).map_err(|source| {
+                    reconcile_error("encode-cursor-recovery-rewrite", source.to_string())
+                })? != bytes
+                    || !decoded.matches_plan(plan)
+                    || decoded.phase != CloudFilesCursorRecoveryRewritePhase::ReconcileArmed
+                {
+                    return Err(reconcile_error(
+                        "cursor-recovery-rewrite-mismatch",
+                        "authorized rewrite marker is noncanonical, non-armed, or mismatched",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+                rewrite = Some(decoded);
+            }
+            _ => {
+                let Some(kind) = cursor_recovery_temp_kind(&name) else {
+                    return Err(reconcile_error(
+                        "cursor-recovery-reconciliation-topology",
+                        format!("unexpected authorized reconciliation entry `{name}`"),
+                    ));
+                };
+                let max_bytes = match kind {
+                    CursorRecoveryTempKind::Rewrite => CURSOR_RECOVERY_REWRITE_MAX_BYTES,
+                    CursorRecoveryTempKind::State | CursorRecoveryTempKind::Audit => {
+                        CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES
+                    }
+                };
+                let bytes =
+                    read_bounded_plain_file(&path, max_bytes, "authorized cursor recovery stage")?;
+                if temps.insert(kind, (path, bytes.clone())).is_some() {
+                    return Err(reconcile_error(
+                        "cursor-recovery-rewrite-torn",
+                        "multiple cursor recovery stages target one durable owner file",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+            }
+        }
+    }
+    if !saw_lock || !saw_manifest {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "authorized reconciliation scope is missing its lock or empty manifest",
+        ));
+    }
+    let state_bytes = state_bytes.ok_or_else(|| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "authorized reconciliation scope is missing state.sobj",
+        )
+    })?;
+    let audit_bytes = audit_bytes.ok_or_else(|| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "authorized reconciliation scope is missing audit state",
+        )
+    })?;
+    let state_is_original = state_bytes == plan.original_state;
+    let state_is_expected = state_bytes == plan.expected_state;
+    let audit_is_original = audit_bytes == plan.original_audit;
+    let audit_is_expected = audit_bytes == plan.expected_audit;
+    let rewrite_present = rewrite.is_some();
+    let cut_is_valid = if rewrite_present {
+        (state_is_original && audit_is_original)
+            || (state_is_expected && audit_is_original)
+            || (state_is_expected && audit_is_expected)
+    } else {
+        state_is_original && audit_is_original
+    };
+    if !cut_is_valid {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-torn",
+            "reconciliation state is outside the exact authorized rewrite-cut set",
+        ));
+    }
+
+    let armed_bytes = encode_sobj(&CloudFilesCursorRecoveryRewrite::from_plan(
+        plan,
+        CloudFilesCursorRecoveryRewritePhase::ReconcileArmed,
+    ))
+    .map_err(|source| reconcile_error("encode-cursor-recovery-rewrite", source.to_string()))?;
+    if let Some((_, bytes)) = temps.get(&CursorRecoveryTempKind::Rewrite)
+        && bytes != &armed_bytes
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-mismatch",
+            "cursor recovery rewrite stage does not encode the exact armed marker",
+        ));
+    }
+    if let Some((_, bytes)) = temps.get(&CursorRecoveryTempKind::State)
+        && bytes != &plan.expected_state
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-mismatch",
+            "cursor recovery state stage does not encode the exact expected state",
+        ));
+    }
+    if let Some((_, bytes)) = temps.get(&CursorRecoveryTempKind::Audit)
+        && bytes != &plan.expected_audit
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-mismatch",
+            "cursor recovery audit stage does not encode the exact expected audit state",
+        ));
+    }
+    if temps.len() > 1 {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-torn",
+            "cursor recovery permits at most one exact durable stage at a time",
+        ));
+    }
+    let predecessor_matches = match temps.keys().next().copied() {
+        None => true,
+        Some(CursorRecoveryTempKind::Rewrite) => {
+            !rewrite_present && state_is_original && audit_is_original
+        }
+        Some(CursorRecoveryTempKind::State) => {
+            rewrite_present && state_is_original && audit_is_original
+        }
+        Some(CursorRecoveryTempKind::Audit) => {
+            rewrite_present && state_is_expected && audit_is_original
+        }
+    };
+    if !predecessor_matches {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-torn",
+            "cursor recovery stage does not follow its exact durable predecessor cut",
+        ));
+    }
+    Ok(AuthorizedCursorRecoveryCut {
+        raw_files,
+        state_is_original,
+        audit_is_original,
+        temp_paths: temps.into_values().map(|(path, _)| path).collect(),
+    })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct CloudFilesManifestIndex {
     schema_version: u16,
@@ -356,6 +1176,40 @@ enum CloudFilesManifestMutation {
     Remove {
         path: String,
     },
+}
+
+/// Crash fence for one authoritative cursor-recovery page. The sidecar is
+/// installed and fsynced before the manifest transition. It binds the exact
+/// owner plan, state images, logical manifest images, and affected manifest
+/// entries so an authorized reopen can distinguish only the three protocol
+/// cuts: before/before, before/after, and after/after.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+struct CloudFilesCursorRecoveryPageIntent {
+    schema_version: u16,
+    recovery_id: String,
+    recovery_token: String,
+    nonce: String,
+    plan_fingerprint: String,
+    mount: String,
+    root: String,
+    before_state_fingerprint: String,
+    before_state: Vec<u8>,
+    after_state_fingerprint: String,
+    after_state: Vec<u8>,
+    before_manifest_fingerprint: String,
+    after_manifest_fingerprint: String,
+    mutations: Vec<CloudFilesManifestMutation>,
+    previous_manifest_entries: BTreeMap<String, Option<CloudFilesReconciledManifestEntry>>,
+    materialized_directories: Vec<String>,
+    cursors: BTreeMap<String, CloudFilesNamespaceCursor>,
+    scan_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CloudFilesCursorRecoveryPage {
+    materialized_directories: Vec<String>,
+    cursors: BTreeMap<String, CloudFilesNamespaceCursor>,
+    scan_complete: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -427,6 +1281,229 @@ impl CloudFilesManifestStore {
             store.remove_unreferenced_chunks()?;
         }
         Ok((store, manifest, migrated_legacy))
+    }
+
+    /// Opens an already-owned manifest without creating, compacting, pruning,
+    /// or repairing any artifact. Cursor-recovery terminal admission uses this
+    /// path because observing a Terminal successor must be a strict proof of
+    /// the bytes already on disk, not a side effect of the opener.
+    fn open_authorized_cursor_recovery_terminal(
+        reconciliation_dir: &Path,
+    ) -> Result<
+        (Self, BTreeMap<String, CloudFilesReconciledManifestEntry>),
+        CloudFilesNamespaceReconcileError,
+    > {
+        let dir = reconciliation_dir.join(MANIFEST_DIR);
+        let dir_metadata = fs::symlink_metadata(&dir)
+            .map_err(io_error("inspect terminal recovery manifest directory"))?;
+        if !dir_metadata.file_type().is_dir() || metadata_is_reparse(&dir_metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-manifest-topology",
+                "terminal recovery manifest is not a plain directory",
+            ));
+        }
+
+        let index_path = dir.join(MANIFEST_INDEX_FILE);
+        let index_bytes = read_bounded_plain_file(
+            &index_path,
+            MANIFEST_INDEX_MAX_BYTES,
+            "terminal recovery manifest index",
+        )?;
+        let index: CloudFilesManifestIndex = decode_sobj(&index_bytes)
+            .map_err(|source| reconcile_error("decode-manifest-index", source.to_string()))?;
+        if index.schema_version != MANIFEST_SCHEMA_VERSION
+            || index.generation == 0
+            || encode_sobj(&index)
+                .map_err(|source| reconcile_error("encode-manifest-index", source.to_string()))?
+                != index_bytes
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-manifest-invalid",
+                "terminal recovery manifest index is noncanonical or unsupported",
+            ));
+        }
+
+        let mut expected_names = BTreeSet::from([
+            MANIFEST_INDEX_FILE.to_string(),
+            MANIFEST_JOURNAL_FILE.to_string(),
+        ]);
+        let mut manifest = BTreeMap::new();
+        for (ordinal, reference) in index.chunks.iter().enumerate() {
+            let ordinal = u64::try_from(ordinal).map_err(|_| {
+                reconcile_error(
+                    "manifest-chunk-overflow",
+                    "terminal recovery manifest chunk ordinal overflowed",
+                )
+            })?;
+            if reference.file_name != manifest_chunk_file_name(index.generation, ordinal)
+                || reference.file_name.contains('/')
+                || reference.file_name.contains('\\')
+                || !expected_names.insert(reference.file_name.clone())
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-manifest-invalid",
+                    "terminal recovery manifest index contains a duplicate or invalid chunk path",
+                ));
+            }
+            let bytes = read_bounded_plain_file(
+                &dir.join(&reference.file_name),
+                MANIFEST_CHUNK_MAX_BYTES as u64,
+                "terminal recovery manifest chunk",
+            )?;
+            if bytes_hash(&bytes) != reference.content_hash {
+                return Err(reconcile_error(
+                    "manifest-chunk-checksum",
+                    format!(
+                        "terminal recovery manifest chunk `{}` failed checksum validation",
+                        reference.file_name
+                    ),
+                ));
+            }
+            let chunk: CloudFilesManifestChunk = decode_sobj(&bytes)
+                .map_err(|source| reconcile_error("decode-manifest-chunk", source.to_string()))?;
+            if chunk.schema_version != MANIFEST_SCHEMA_VERSION
+                || chunk.generation != index.generation
+                || chunk.ordinal != ordinal
+                || u64::try_from(chunk.entries.len()).unwrap_or(u64::MAX) != reference.entry_count
+                || encode_sobj(&chunk).map_err(|source| {
+                    reconcile_error("encode-manifest-chunk", source.to_string())
+                })? != bytes
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-manifest-invalid",
+                    format!(
+                        "terminal recovery manifest chunk `{}` is noncanonical or mismatched",
+                        reference.file_name
+                    ),
+                ));
+            }
+            for entry in chunk.entries {
+                validate_manifest_entry(&entry)?;
+                if manifest.insert(entry.path.clone(), entry).is_some() {
+                    return Err(reconcile_error(
+                        "cursor-recovery-manifest-invalid",
+                        "terminal recovery manifest contains a duplicate path",
+                    ));
+                }
+            }
+        }
+
+        for entry in fs::read_dir(&dir).map_err(io_error("list terminal recovery manifest"))? {
+            let entry = entry.map_err(io_error("read terminal recovery manifest entry"))?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                reconcile_error(
+                    "cursor-recovery-manifest-topology",
+                    "terminal recovery manifest contains a non-UTF-8 entry",
+                )
+            })?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(io_error("inspect terminal recovery manifest entry"))?;
+            if !metadata.file_type().is_file()
+                || metadata_is_reparse(&metadata)
+                || !expected_names.contains(&name)
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-manifest-topology",
+                    format!(
+                        "terminal recovery manifest contains unexpected or non-plain entry `{name}`"
+                    ),
+                ));
+            }
+        }
+
+        let journal_path = dir.join(MANIFEST_JOURNAL_FILE);
+        let journal_metadata = fs::symlink_metadata(&journal_path)
+            .map_err(io_error("inspect terminal recovery manifest journal"))?;
+        if !journal_metadata.file_type().is_file()
+            || metadata_is_reparse(&journal_metadata)
+            || journal_metadata.len() > MANIFEST_JOURNAL_MAX_BYTES
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-manifest-topology",
+                "terminal recovery manifest journal is not a bounded plain file",
+            ));
+        }
+        let mut journal = fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(false)
+            .open(&journal_path)
+            .map_err(io_error("open terminal recovery manifest journal"))?;
+        journal
+            .seek(SeekFrom::Start(0))
+            .map_err(io_error("rewind terminal recovery manifest journal"))?;
+        let mut last_sequence = None;
+        let mut expected_live_sequence = index.applied_through_sequence.saturating_add(1);
+        let mut last_valid_offset = 0_u64;
+        loop {
+            let record = durable_file::read_length_prefixed_record(
+                &mut journal,
+                &journal_path,
+                DurableRecordReadOptions::new(DurableLengthEndian::Little)
+                    .max_record_bytes(MANIFEST_RECORD_MAX_BYTES),
+            )
+            .map_err(storage_error(
+                "strictly read terminal recovery manifest journal",
+            ))?;
+            let Some(record) = record else {
+                break;
+            };
+            let decoded: CloudFilesManifestJournalRecord = decode_sobj(&record.bytes)
+                .map_err(|source| reconcile_error("decode-manifest-record", source.to_string()))?;
+            validate_manifest_record(&decoded)?;
+            if encode_sobj(&decoded)
+                .map_err(|source| reconcile_error("encode-manifest-record", source.to_string()))?
+                != record.bytes
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-manifest-invalid",
+                    "terminal recovery manifest journal contains a noncanonical record",
+                ));
+            }
+            let sequence = decoded.body.sequence;
+            if last_sequence.is_some_and(|previous| sequence <= previous) {
+                return Err(reconcile_error(
+                    "manifest-sequence-order",
+                    "terminal recovery manifest sequences are not strictly increasing",
+                ));
+            }
+            if sequence > index.applied_through_sequence {
+                if sequence != expected_live_sequence {
+                    return Err(reconcile_error(
+                        "manifest-sequence-gap",
+                        format!(
+                            "terminal recovery expected manifest sequence {expected_live_sequence}, observed {sequence}"
+                        ),
+                    ));
+                }
+                apply_manifest_mutations(&mut manifest, &decoded.body.mutations);
+                expected_live_sequence = expected_live_sequence.saturating_add(1);
+            }
+            last_sequence = Some(sequence);
+            last_valid_offset = record.record_end;
+        }
+        if last_valid_offset != journal_metadata.len() {
+            return Err(reconcile_error(
+                "cursor-recovery-manifest-torn",
+                "terminal recovery manifest journal has an incomplete trailing record",
+            ));
+        }
+        journal
+            .seek(SeekFrom::End(0))
+            .map_err(io_error("seek terminal recovery manifest journal"))?;
+        Ok((
+            Self {
+                dir,
+                index_path,
+                journal_path,
+                journal: Some(journal),
+                index,
+                next_sequence: expected_live_sequence,
+                journal_bytes: journal_metadata.len(),
+                usable: true,
+            },
+            manifest,
+        ))
     }
 
     fn append_mutations(
@@ -951,6 +2028,481 @@ fn apply_manifest_mutations(
     }
 }
 
+fn manifest_mutation_path(mutation: &CloudFilesManifestMutation) -> &str {
+    match mutation {
+        CloudFilesManifestMutation::Upsert { entry } => &entry.path,
+        CloudFilesManifestMutation::Remove { path } => path,
+    }
+}
+
+fn cursor_recovery_plan_fingerprint(
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<String, CloudFilesNamespaceReconcileError> {
+    let bytes = encode_sobj(plan)
+        .map_err(|source| reconcile_error("encode-cursor-recovery-plan", source.to_string()))?;
+    Ok(cursor_recovery_bytes_fingerprint(&bytes))
+}
+
+fn cursor_recovery_manifest_fingerprint(
+    manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) -> Result<String, CloudFilesNamespaceReconcileError> {
+    const DOMAIN: &[u8] = b"sinomo.dfs.cloud-files.cursor-recovery-manifest.v1\0";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DOMAIN);
+    hasher.update(&(manifest.len() as u64).to_le_bytes());
+    for (path, entry) in manifest {
+        let entry_bytes = encode_sobj(entry).map_err(|source| {
+            reconcile_error("encode-cursor-recovery-manifest-entry", source.to_string())
+        })?;
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path.as_bytes());
+        hasher.update(&(entry_bytes.len() as u64).to_le_bytes());
+        hasher.update(&entry_bytes);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn encode_cursor_recovery_page_intent(
+    intent: &CloudFilesCursorRecoveryPageIntent,
+) -> Result<Vec<u8>, CloudFilesNamespaceReconcileError> {
+    let bytes = encode_sobj(intent).map_err(|source| {
+        reconcile_error("encode-cursor-recovery-page-intent", source.to_string())
+    })?;
+    if bytes.len() as u64 > CURSOR_RECOVERY_PAGE_INTENT_MAX_BYTES {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-too-large",
+            format!(
+                "cursor recovery page intent exceeds its {CURSOR_RECOVERY_PAGE_INTENT_MAX_BYTES}-byte bound"
+            ),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn persist_cursor_recovery_page_intent(
+    path: &Path,
+    intent: &CloudFilesCursorRecoveryPageIntent,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    let bytes = encode_cursor_recovery_page_intent(intent)?;
+    durable_file::write_file_atomic(
+        path,
+        &bytes,
+        DurableAtomicFileOptions::new(
+            CURSOR_RECOVERY_PAGE_INTENT_FILE,
+            CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL,
+        )
+        .sync_all(),
+    )
+    .map_err(storage_error("persist cursor recovery page intent"))
+}
+
+fn canonical_atomic_stage_name(name: &str, file_name: &str, temp_label: &str) -> bool {
+    let prefix = format!(".{file_name}.{temp_label}-");
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return false;
+    };
+    let Some((pid_text, sequence_text)) = suffix.split_once('-') else {
+        return false;
+    };
+    if sequence_text.contains('-') {
+        return false;
+    }
+    let Ok(pid) = pid_text.parse::<u32>() else {
+        return false;
+    };
+    let Ok(sequence) = sequence_text.parse::<u64>() else {
+        return false;
+    };
+    pid.to_string() == pid_text && sequence.to_string() == sequence_text
+}
+
+fn looks_like_cursor_recovery_page_intent_temp(name: &str) -> bool {
+    name.starts_with(&format!(
+        ".{CURSOR_RECOVERY_PAGE_INTENT_FILE}.{CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL}-"
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoveryPageIntentEvidenceKind {
+    Final,
+    Temp,
+}
+
+struct CursorRecoveryPageIntentEvidence {
+    path: PathBuf,
+    kind: CursorRecoveryPageIntentEvidenceKind,
+    intent: CloudFilesCursorRecoveryPageIntent,
+}
+
+fn inspect_cursor_recovery_page_intent(
+    scope: &Path,
+) -> Result<Option<CursorRecoveryPageIntentEvidence>, CloudFilesNamespaceReconcileError> {
+    let mut evidence = None;
+    for entry in fs::read_dir(scope).map_err(io_error("list cursor recovery page-intent scope"))? {
+        let entry = entry.map_err(io_error("read cursor recovery page-intent scope entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery scope contains a non-UTF-8 entry",
+            )
+        })?;
+        let kind = if name == CURSOR_RECOVERY_PAGE_INTENT_FILE {
+            Some(CursorRecoveryPageIntentEvidenceKind::Final)
+        } else if looks_like_cursor_recovery_page_intent_temp(&name) {
+            if !canonical_atomic_stage_name(
+                &name,
+                CURSOR_RECOVERY_PAGE_INTENT_FILE,
+                CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL,
+            ) {
+                return Err(reconcile_error(
+                    "cursor-recovery-page-intent-topology",
+                    "cursor recovery page intent has a malformed durable stage name",
+                ));
+            }
+            Some(CursorRecoveryPageIntentEvidenceKind::Temp)
+        } else {
+            None
+        };
+        let Some(kind) = kind else {
+            continue;
+        };
+        if evidence.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-topology",
+                "cursor recovery permits at most one page intent or durable page-intent stage",
+            ));
+        }
+        let path = entry.path();
+        let bytes = read_bounded_plain_file(
+            &path,
+            CURSOR_RECOVERY_PAGE_INTENT_MAX_BYTES,
+            "cursor recovery page intent",
+        )?;
+        let intent: CloudFilesCursorRecoveryPageIntent = decode_sobj(&bytes).map_err(|source| {
+            reconcile_error("decode-cursor-recovery-page-intent", source.to_string())
+        })?;
+        if encode_cursor_recovery_page_intent(&intent)? != bytes {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-noncanonical",
+                "cursor recovery page intent bytes are noncanonical",
+            ));
+        }
+        evidence = Some(CursorRecoveryPageIntentEvidence { path, kind, intent });
+    }
+    Ok(evidence)
+}
+
+struct ValidatedCursorRecoveryPageIntent {
+    before_state: CloudFilesNamespaceReconciliationState,
+    after_state: CloudFilesNamespaceReconciliationState,
+    actual_manifest_is_before: bool,
+    actual_manifest_is_after: bool,
+}
+
+fn validate_cursor_recovery_page_intent(
+    intent: &CloudFilesCursorRecoveryPageIntent,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    actual_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) -> Result<ValidatedCursorRecoveryPageIntent, CloudFilesNamespaceReconcileError> {
+    let validated_plan = validate_cursor_recovery_plan(plan, &intent.mount, &intent.root)?;
+    if intent.schema_version != CURSOR_RECOVERY_PAGE_INTENT_SCHEMA_VERSION
+        || intent.recovery_id != plan.recovery_id
+        || intent.recovery_token != plan.recovery_token
+        || intent.nonce != plan.nonce
+        || intent.root != plan.root
+        || intent.mount != validated_plan.expected.mount
+        || intent.plan_fingerprint != cursor_recovery_plan_fingerprint(plan)?
+        || intent.before_state.is_empty()
+        || intent.after_state.is_empty()
+        || intent.before_state.len() as u64 > RECONCILIATION_STATE_MAX_BYTES
+        || intent.after_state.len() as u64 > RECONCILIATION_STATE_MAX_BYTES
+        || intent.before_state_fingerprint
+            != cursor_recovery_bytes_fingerprint(&intent.before_state)
+        || intent.after_state_fingerprint != cursor_recovery_bytes_fingerprint(&intent.after_state)
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-mismatch",
+            "cursor recovery page intent is malformed or does not match its authorized plan",
+        ));
+    }
+
+    let before_state: CloudFilesNamespaceReconciliationState = decode_sobj(&intent.before_state)
+        .map_err(|source| {
+            reconcile_error("decode-cursor-recovery-page-before", source.to_string())
+        })?;
+    let after_state: CloudFilesNamespaceReconciliationState = decode_sobj(&intent.after_state)
+        .map_err(|source| {
+            reconcile_error("decode-cursor-recovery-page-after", source.to_string())
+        })?;
+    if encode_reconciliation_state(&before_state)? != intent.before_state
+        || encode_reconciliation_state(&after_state)? != intent.after_state
+        || !cursor_recovery_progress_state_is_valid(&before_state, &validated_plan, false)?
+        || !cursor_recovery_progress_state_is_valid(&after_state, &validated_plan, false)?
+        || !before_state.cursors.is_empty()
+        || before_state.full_scan_request != validated_plan.expected.full_scan_request
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "cursor recovery page intent does not start from valid armed progress",
+        ));
+    }
+
+    let mut previous_directory = None::<&str>;
+    for directory in &intent.materialized_directories {
+        if canonical_sifs_path(directory)? != *directory
+            || previous_directory.is_some_and(|previous| previous >= directory.as_str())
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page contains noncanonical or duplicate materialized directories",
+            ));
+        }
+        ensure_within_root(directory, &intent.root)?;
+        previous_directory = Some(directory);
+    }
+
+    let mut previous_path = None::<&str>;
+    for mutation in &intent.mutations {
+        let path = manifest_mutation_path(mutation);
+        if canonical_sifs_path(path)? != path
+            || previous_path.is_some_and(|previous| previous >= path)
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page contains noncanonical, duplicate, or unordered mutations",
+            ));
+        }
+        ensure_within_root(path, &intent.root)?;
+        if let CloudFilesManifestMutation::Upsert { entry } = mutation {
+            if entry.path != path {
+                return Err(reconcile_error(
+                    "cursor-recovery-page-intent-transition",
+                    "cursor recovery page mutation path does not match its entry",
+                ));
+            }
+            validate_manifest_entry(entry)?;
+        }
+        previous_path = Some(path);
+    }
+    if intent.previous_manifest_entries.len() != intent.mutations.len() {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "cursor recovery page preimage set does not match its mutations",
+        ));
+    }
+    for (path, previous) in &intent.previous_manifest_entries {
+        if !intent
+            .mutations
+            .iter()
+            .any(|mutation| manifest_mutation_path(mutation) == path)
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page contains an unrelated manifest preimage",
+            ));
+        }
+        if let Some(entry) = previous {
+            if entry.path != *path || canonical_sifs_path(path)? != *path {
+                return Err(reconcile_error(
+                    "cursor-recovery-page-intent-transition",
+                    "cursor recovery page contains a mismatched manifest preimage",
+                ));
+            }
+            ensure_within_root(path, &intent.root)?;
+            validate_manifest_entry(entry)?;
+        }
+    }
+    if intent.scan_complete {
+        if intent.cursors.is_empty() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "terminal cursor recovery page must install a cursor",
+            ));
+        }
+    } else if !intent.cursors.is_empty() {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "partial cursor recovery page may not install cursors",
+        ));
+    }
+    for (key, cursor) in &intent.cursors {
+        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page contains an invalid cursor",
+            ));
+        }
+    }
+
+    let actual_fingerprint = cursor_recovery_manifest_fingerprint(actual_manifest)?;
+    let actual_manifest_is_before = actual_fingerprint == intent.before_manifest_fingerprint;
+    let actual_manifest_is_after = actual_fingerprint == intent.after_manifest_fingerprint;
+    if !actual_manifest_is_before && !actual_manifest_is_after {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-cut",
+            "cursor recovery manifest is outside the page intent's exact before/after cut",
+        ));
+    }
+    let mut before_manifest = actual_manifest.clone();
+    if !actual_manifest_is_before {
+        for (path, previous) in &intent.previous_manifest_entries {
+            match previous {
+                Some(entry) => {
+                    before_manifest.insert(path.clone(), entry.clone());
+                }
+                None => {
+                    before_manifest.remove(path);
+                }
+            }
+        }
+    }
+    if cursor_recovery_manifest_fingerprint(&before_manifest)? != intent.before_manifest_fingerprint
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "cursor recovery page manifest preimages do not reconstruct its exact predecessor",
+        ));
+    }
+    for mutation in &intent.mutations {
+        let path = manifest_mutation_path(mutation);
+        if before_manifest.get(path) != intent.previous_manifest_entries[path].as_ref() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page manifest preimage differs from its predecessor",
+            ));
+        }
+    }
+    let mut after_manifest = before_manifest.clone();
+    apply_manifest_mutations(&mut after_manifest, &intent.mutations);
+    if cursor_recovery_manifest_fingerprint(&after_manifest)? != intent.after_manifest_fingerprint
+        || (actual_manifest_is_after && actual_manifest != &after_manifest)
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "cursor recovery page mutations do not derive its exact successor manifest",
+        ));
+    }
+
+    let mut expected_after = before_state.clone();
+    expected_after
+        .materialized_directories
+        .extend(intent.materialized_directories.iter().cloned());
+    apply_materialized_manifest_mutations(&mut expected_after, &intent.mutations);
+    if intent.scan_complete {
+        for (key, cursor) in &intent.cursors {
+            let replace = expected_after
+                .cursors
+                .get(key)
+                .is_none_or(|current| cursor.after_sequence >= current.after_sequence);
+            if replace {
+                expected_after.cursors.insert(key.clone(), cursor.clone());
+            }
+        }
+        expected_after.full_scan_request = None;
+        expected_after.applied_events.clear();
+    }
+    let (unsupported_count, unsupported_examples) = unsupported_projection_summary(&after_manifest);
+    expected_after.unsupported_projection_count = unsupported_count;
+    expected_after.unsupported_projection_examples = unsupported_examples;
+    compact_reconciliation_state(&mut expected_after);
+    if expected_after != after_state
+        || (intent.scan_complete
+            && (after_state.cursors.is_empty() || after_state.full_scan_request.is_some()))
+        || (!intent.scan_complete
+            && (!after_state.cursors.is_empty()
+                || after_state.full_scan_request != validated_plan.expected.full_scan_request))
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-transition",
+            "cursor recovery page state is not the deterministic authoritative successor",
+        ));
+    }
+
+    Ok(ValidatedCursorRecoveryPageIntent {
+        before_state,
+        after_state,
+        actual_manifest_is_before,
+        actual_manifest_is_after,
+    })
+}
+
+fn repair_authorized_cursor_recovery_page_intent(
+    scope: &Path,
+    state_path: &Path,
+    state_bytes: &[u8],
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) -> Result<CloudFilesNamespaceReconciliationState, CloudFilesNamespaceReconcileError> {
+    let decoded_state: CloudFilesNamespaceReconciliationState = decode_sobj(state_bytes)
+        .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
+    let Some(evidence) = inspect_cursor_recovery_page_intent(scope)? else {
+        return Ok(decoded_state);
+    };
+    let rewrite =
+        load_required_cursor_recovery_rewrite(&scope.join(CURSOR_RECOVERY_REWRITE_FILE), plan)?;
+    if rewrite.phase != CloudFilesCursorRecoveryRewritePhase::ReconcileArmed {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-phase",
+            "cursor recovery page intent is admissible only while ReconcileArmed",
+        ));
+    }
+    let validated = validate_cursor_recovery_page_intent(&evidence.intent, plan, manifest)?;
+    let state_is_before = state_bytes == evidence.intent.before_state;
+    let state_is_after = state_bytes == evidence.intent.after_state;
+    if !state_is_before && !state_is_after {
+        return Err(reconcile_error(
+            "cursor-recovery-page-intent-cut",
+            "cursor recovery state is outside the page intent's exact before/after cut",
+        ));
+    }
+
+    let repaired_state = match evidence.kind {
+        CursorRecoveryPageIntentEvidenceKind::Temp => {
+            if !state_is_before || !validated.actual_manifest_is_before {
+                return Err(reconcile_error(
+                    "cursor-recovery-page-intent-cut",
+                    "a page-intent stage is admissible only at the exact predecessor cut",
+                ));
+            }
+            validated.before_state
+        }
+        CursorRecoveryPageIntentEvidenceKind::Final
+            if state_is_before
+                && validated.actual_manifest_is_before
+                && !validated.actual_manifest_is_after =>
+        {
+            validated.before_state
+        }
+        CursorRecoveryPageIntentEvidenceKind::Final
+            if state_is_before && validated.actual_manifest_is_after =>
+        {
+            durable_file::write_file_atomic(
+                state_path,
+                &evidence.intent.after_state,
+                DurableAtomicFileOptions::new(RECONCILIATION_STATE_FILE, RECONCILIATION_TEMP_LABEL)
+                    .sync_all(),
+            )
+            .map_err(storage_error("repair cursor recovery page state"))?;
+            validated.after_state
+        }
+        CursorRecoveryPageIntentEvidenceKind::Final
+            if state_is_after && validated.actual_manifest_is_after =>
+        {
+            validated.after_state
+        }
+        CursorRecoveryPageIntentEvidenceKind::Final => {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-cut",
+                "cursor recovery page intent does not match an exact durable protocol cut",
+            ));
+        }
+    };
+    durable_file::remove_file_if_exists_and_sync_parent(&evidence.path).map_err(storage_error(
+        "complete authorized cursor recovery page intent",
+    ))?;
+    Ok(repaired_state)
+}
+
 fn encode_manifest_record(
     sequence: u64,
     mutations: &[CloudFilesManifestMutation],
@@ -1218,6 +2770,7 @@ pub struct CloudFilesNamespaceReconciler {
     root: String,
     state_path: PathBuf,
     _lock: File,
+    cursor_recovery_plan: Option<CloudFilesCursorRecoveryReconciliationPlan>,
     manifest_store: CloudFilesManifestStore,
     manifest: BTreeMap<String, CloudFilesReconciledManifestEntry>,
     state: CloudFilesNamespaceReconciliationState,
@@ -1419,6 +2972,12 @@ impl CloudFilesNamespaceReconciler {
         let reconciliation_dir = reconciliation_root.join(mount_scope_directory(&mount, &root)?);
         durable_file::ensure_private_directory(&reconciliation_dir)
             .map_err(storage_error("create namespace reconciliation scope"))?;
+        if cursor_recovery_evidence_exists(&reconciliation_dir)? {
+            return Err(reconcile_error(
+                "cursor-recovery-requires-authorized-open",
+                "ordinary namespace reconciler open is forbidden while cursor recovery marker or stage evidence exists",
+            ));
+        }
         let lock_path = reconciliation_dir.join(RECONCILIATION_LOCK_FILE);
         let lock = durable_file::open_file_for_append(&lock_path)
             .map_err(storage_error("open namespace reconciliation lock"))?
@@ -1490,6 +3049,7 @@ impl CloudFilesNamespaceReconciler {
             root,
             state_path,
             _lock: lock,
+            cursor_recovery_plan: None,
             manifest_store,
             manifest,
             state,
@@ -1502,6 +3062,14 @@ impl CloudFilesNamespaceReconciler {
         Ok(reconciler)
     }
 
+    pub(crate) fn open_authorized_cursor_recovery(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<Self, CloudFilesNamespaceReconcileError> {
+        open_authorized_cursor_recovery_progress(data_dir, mount, root, plan)
+    }
     pub fn state_path(&self) -> &Path {
         &self.state_path
     }
@@ -1516,6 +3084,210 @@ impl CloudFilesNamespaceReconciler {
 
     pub fn materialized_directories(&self) -> &BTreeSet<String> {
         &self.state.materialized_directories
+    }
+
+    pub(crate) fn cursor_recovery_terminal(&self) -> bool {
+        !self.state.cursors.is_empty()
+            && self.state.full_scan_request.is_none()
+            && self.state.inflight_effect.is_none()
+            && self.state.materialized_directories.contains(&self.root)
+    }
+
+    /// Persists the plan-bound terminal phase while this reconciler still owns
+    /// the namespace lock. The recovery worker must call this only after its
+    /// local observer barrier and exact root audit have reached commit-ready.
+    pub(crate) fn mark_authorized_cursor_recovery_terminal(
+        &mut self,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<CloudFilesCursorRecoveryTerminalProof, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        let validated = validate_cursor_recovery_plan(plan, &self.state.mount, &self.root)?;
+        if !cursor_recovery_progress_state_is_valid(&self.state, &validated, true)?
+            || !self.cursor_recovery_terminal()
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-incomplete",
+                "cursor recovery cannot become Terminal before its authoritative terminal state is durable",
+            ));
+        }
+        let scope = self.state_path.parent().ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery state has no reconciliation scope",
+            )
+        })?;
+        if inspect_cursor_recovery_page_intent(scope)?.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-live",
+                "cursor recovery cannot become Terminal while a page transaction is incomplete",
+            ));
+        }
+        let audit = load_required_cursor_recovery_audit(scope, &self.state.mount, &self.root)?;
+        if !audit.directories.is_empty() {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-audit-pending",
+                "cursor recovery cannot become Terminal while materialization audit intents remain",
+            ));
+        }
+        let rewrite_path = scope.join(CURSOR_RECOVERY_REWRITE_FILE);
+        let rewrite = resume_terminal_rewrite_stage(
+            scope,
+            &rewrite_path,
+            plan,
+            load_required_cursor_recovery_rewrite(&rewrite_path, plan)?,
+            true,
+            true,
+        )?;
+        match rewrite.phase {
+            CloudFilesCursorRecoveryRewritePhase::Terminal => {}
+            CloudFilesCursorRecoveryRewritePhase::ReconcileArmed => {}
+        }
+        let terminal = CloudFilesCursorRecoveryRewrite::from_plan(
+            plan,
+            CloudFilesCursorRecoveryRewritePhase::Terminal,
+        );
+        if rewrite.phase != CloudFilesCursorRecoveryRewritePhase::Terminal {
+            persist_cursor_recovery_rewrite(&rewrite_path, &terminal)?;
+        }
+        cursor_recovery_terminal_proof(plan)
+    }
+
+    /// Reconstructs the same narrow finalization capability after a crash,
+    /// but only from an exact plan-bound Terminal marker and terminal owner
+    /// state. The module owner must retain this value until its synchronous
+    /// host Ready acknowledgement has completed.
+    pub(crate) fn resume_authorized_cursor_recovery_terminal_proof(
+        &self,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<CloudFilesCursorRecoveryTerminalProof, CloudFilesNamespaceReconcileError> {
+        let validated = validate_cursor_recovery_plan(plan, &self.state.mount, &self.root)?;
+        if !cursor_recovery_progress_state_is_valid(&self.state, &validated, true)? {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-incomplete",
+                "cannot resume finalization without matching terminal reconciliation state",
+            ));
+        }
+        let scope = self.state_path.parent().ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery state has no reconciliation scope",
+            )
+        })?;
+        if inspect_cursor_recovery_page_intent(scope)?.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-live",
+                "cursor recovery cannot resume Terminal proof while a page transaction is incomplete",
+            ));
+        }
+        if !load_required_cursor_recovery_audit(scope, &self.state.mount, &self.root)?
+            .directories
+            .is_empty()
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-audit-pending",
+                "cannot resume finalization while materialization audit intents remain",
+            ));
+        }
+        let rewrite =
+            load_required_cursor_recovery_rewrite(&scope.join(CURSOR_RECOVERY_REWRITE_FILE), plan)?;
+        if rewrite.phase != CloudFilesCursorRecoveryRewritePhase::Terminal {
+            return Err(reconcile_error(
+                "cursor-recovery-not-terminal",
+                "cannot resume finalization from a nonterminal recovery marker",
+            ));
+        }
+        cursor_recovery_terminal_proof(plan)
+    }
+
+    pub(crate) fn resume_authorized_cursor_recovery_namespace_finalized_proof(
+        &self,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ) -> Result<CloudFilesCursorRecoveryTerminalProof, CloudFilesNamespaceReconcileError> {
+        let validated = validate_cursor_recovery_plan(plan, &self.state.mount, &self.root)?;
+        if !cursor_recovery_progress_state_is_valid(&self.state, &validated, true)? {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-incomplete",
+                "NamespaceFinalized recovery lost its exact terminal owner state",
+            ));
+        }
+        let scope = self.state_path.parent().ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "NamespaceFinalized state has no reconciliation scope",
+            )
+        })?;
+        if inspect_cursor_recovery_page_intent(scope)?.is_some()
+            || !load_required_cursor_recovery_audit(scope, &self.state.mount, &self.root)?
+                .directories
+                .is_empty()
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-incomplete",
+                "NamespaceFinalized recovery retains page or audit work",
+            ));
+        }
+        ensure_cursor_recovery_rewrite_absent(scope, &scope.join(CURSOR_RECOVERY_REWRITE_FILE))?;
+        cursor_recovery_terminal_proof(plan)
+    }
+
+    /// Consumes the capability only after the module owner has synchronously
+    /// observed host Ready. The existing worker retains this reconciler lock,
+    /// its watcher, and buffered local observations across marker removal.
+    pub(crate) fn finalize_authorized_cursor_recovery_after_ready(
+        &mut self,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+        ready: CloudFilesCursorRecoveryReadyToFinalize,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        validate_cursor_recovery_ready_to_finalize(plan, &self.root, &ready)?;
+        let validated = validate_cursor_recovery_plan(plan, &self.state.mount, &self.root)?;
+        if !cursor_recovery_progress_state_is_valid(&self.state, &validated, true)? {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-incomplete",
+                "cursor recovery finalization lost its terminal reconciliation state",
+            ));
+        }
+        let scope = self.state_path.parent().ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery state has no reconciliation scope",
+            )
+        })?;
+        if inspect_cursor_recovery_page_intent(scope)?.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-live",
+                "cursor recovery cannot finalize while a page transaction is incomplete",
+            ));
+        }
+        if !load_required_cursor_recovery_audit(scope, &self.state.mount, &self.root)?
+            .directories
+            .is_empty()
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-terminal-audit-pending",
+                "cursor recovery finalization still has pending audit intents",
+            ));
+        }
+        let rewrite_path = scope.join(CURSOR_RECOVERY_REWRITE_FILE);
+        let rewrite = match fs::symlink_metadata(&rewrite_path) {
+            Ok(_) => load_required_cursor_recovery_rewrite(&rewrite_path, plan)?,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                self.cursor_recovery_plan = None;
+                return Ok(false);
+            }
+            Err(source) => {
+                return Err(io_error("inspect cursor recovery terminal marker")(source));
+            }
+        };
+        if rewrite.phase != CloudFilesCursorRecoveryRewritePhase::Terminal {
+            return Err(reconcile_error(
+                "cursor-recovery-not-terminal",
+                "host Ready may finalize only an exact Terminal recovery marker",
+            ));
+        }
+        durable_file::remove_file_if_exists_and_sync_parent(&rewrite_path)
+            .map_err(storage_error("finalize terminal cursor recovery marker"))?;
+        self.cursor_recovery_plan = None;
+        Ok(true)
     }
 
     /// Durably adopts one exact authoritative identity recovered from a local
@@ -1922,7 +3694,7 @@ impl CloudFilesNamespaceReconciler {
     ) -> Result<Vec<String>, CloudFilesNamespaceReconcileError> {
         self.ensure_usable()?;
         for (path, entry) in &manifest {
-            if path != &entry.path {
+            if path != &entry.path || canonical_sifs_path(path)? != *path {
                 return Err(reconcile_error(
                     "invalid-full-scan",
                     format!(
@@ -1986,7 +3758,7 @@ impl CloudFilesNamespaceReconciler {
     ) -> Result<Vec<String>, CloudFilesNamespaceReconcileError> {
         self.ensure_usable()?;
         for (path, entry) in &manifest {
-            if path != &entry.path {
+            if path != &entry.path || canonical_sifs_path(path)? != *path {
                 return Err(reconcile_error(
                     "invalid-full-scan",
                     format!(
@@ -1999,9 +3771,15 @@ impl CloudFilesNamespaceReconciler {
             validate_manifest_entry(entry)?;
         }
         for path in &removed_paths {
+            if canonical_sifs_path(path)? != *path {
+                return Err(reconcile_error(
+                    "invalid-full-scan",
+                    format!("removed path `{path}` is not canonical"),
+                ));
+            }
             ensure_within_root(path, &self.root)?;
         }
-        let materialized_directories = materialized_directories
+        let mut materialized_directories = materialized_directories
             .into_iter()
             .map(|directory| {
                 let canonical = canonical_sifs_path(&directory)?;
@@ -2015,6 +3793,10 @@ impl CloudFilesNamespaceReconciler {
                 Ok(canonical)
             })
             .collect::<Result<Vec<_>, CloudFilesNamespaceReconcileError>>()?;
+        if self.cursor_recovery_plan.is_some() {
+            materialized_directories.sort();
+            materialized_directories.dedup();
+        }
         if scan_complete {
             for (key, cursor) in &cursors {
                 if key != &cursor.shard_key()? {
@@ -2037,6 +3819,15 @@ impl CloudFilesNamespaceReconciler {
             ));
         }
 
+        let recovery_page =
+            self.cursor_recovery_plan
+                .as_ref()
+                .map(|_| CloudFilesCursorRecoveryPage {
+                    materialized_directories: materialized_directories.clone(),
+                    cursors: cursors.clone(),
+                    scan_complete,
+                });
+
         let previous = self.state.clone();
         self.state
             .materialized_directories
@@ -2050,6 +3841,20 @@ impl CloudFilesNamespaceReconciler {
                 .into_values()
                 .map(|entry| CloudFilesManifestMutation::Upsert { entry }),
         );
+        if self.cursor_recovery_plan.is_some() {
+            mutations.sort_by(|left, right| {
+                manifest_mutation_path(left).cmp(manifest_mutation_path(right))
+            });
+            if mutations
+                .windows(2)
+                .any(|pair| manifest_mutation_path(&pair[0]) == manifest_mutation_path(&pair[1]))
+            {
+                return Err(reconcile_error(
+                    "invalid-full-scan",
+                    "cursor recovery page contains multiple mutations for one path",
+                ));
+            }
+        }
         apply_materialized_manifest_mutations(&mut self.state, &mutations);
         let undo = apply_manifest_mutations_with_undo(&mut self.manifest, &mutations);
         if scan_complete {
@@ -2078,7 +3883,11 @@ impl CloudFilesNamespaceReconciler {
         for operation_id in &reconciled_local_operation_ids {
             self.state.suppressions.remove(operation_id);
         }
-        self.persist_manifest_or_restore(previous, mutations, undo)?;
+        if let Some(page) = recovery_page {
+            self.persist_cursor_recovery_page_or_restore(previous, mutations, undo, page)?;
+        } else {
+            self.persist_manifest_or_restore(previous, mutations, undo)?;
+        }
         Ok(reconciled_local_operation_ids)
     }
 
@@ -2319,6 +4128,213 @@ impl CloudFilesNamespaceReconciler {
         }
         Ok(())
     }
+
+    fn persist_cursor_recovery_page_or_restore(
+        &mut self,
+        mut previous: CloudFilesNamespaceReconciliationState,
+        mutations: Vec<CloudFilesManifestMutation>,
+        undo: CloudFilesManifestUndo,
+        page: CloudFilesCursorRecoveryPage,
+    ) -> Result<(), CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        let Some(plan) = self.cursor_recovery_plan.as_ref() else {
+            self.state = previous;
+            restore_manifest(&mut self.manifest, undo);
+            return Err(reconcile_error(
+                "cursor-recovery-page-without-plan",
+                "cursor recovery page persistence requires an authorized plan",
+            ));
+        };
+        let scope = self.state_path.parent().ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery state has no reconciliation scope",
+            )
+        })?;
+        let rewrite =
+            load_required_cursor_recovery_rewrite(&scope.join(CURSOR_RECOVERY_REWRITE_FILE), plan)?;
+        if rewrite.phase != CloudFilesCursorRecoveryRewritePhase::ReconcileArmed {
+            self.state = previous;
+            restore_manifest(&mut self.manifest, undo);
+            return Err(reconcile_error(
+                "cursor-recovery-page-not-armed",
+                "authoritative recovery pages may be persisted only while ReconcileArmed",
+            ));
+        }
+        if inspect_cursor_recovery_page_intent(scope)?.is_some() {
+            self.state = previous;
+            restore_manifest(&mut self.manifest, undo);
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-live",
+                "a prior cursor recovery page intent requires authorized reopen",
+            ));
+        }
+
+        let (unsupported_count, unsupported_examples) =
+            unsupported_projection_summary(&self.manifest);
+        self.state.unsupported_projection_count = unsupported_count;
+        self.state.unsupported_projection_examples = unsupported_examples;
+        compact_reconciliation_state(&mut previous);
+        compact_reconciliation_state(&mut self.state);
+        let before_state = match encode_reconciliation_state(&previous) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.state = previous;
+                restore_manifest(&mut self.manifest, undo);
+                return Err(error);
+            }
+        };
+        let after_state = match encode_reconciliation_state(&self.state) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.state = previous;
+                restore_manifest(&mut self.manifest, undo);
+                return Err(error);
+            }
+        };
+        let mut before_manifest = self.manifest.clone();
+        for (path, previous_entry) in &undo {
+            match previous_entry {
+                Some(entry) => {
+                    before_manifest.insert(path.clone(), entry.clone());
+                }
+                None => {
+                    before_manifest.remove(path);
+                }
+            }
+        }
+        let previous_manifest_entries = undo.iter().cloned().collect::<BTreeMap<_, _>>();
+        if previous_manifest_entries.len() != mutations.len() {
+            self.state = previous;
+            restore_manifest(&mut self.manifest, undo);
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-transition",
+                "cursor recovery page mutations do not have an exact unique preimage set",
+            ));
+        }
+        let intent = CloudFilesCursorRecoveryPageIntent {
+            schema_version: CURSOR_RECOVERY_PAGE_INTENT_SCHEMA_VERSION,
+            recovery_id: plan.recovery_id.clone(),
+            recovery_token: plan.recovery_token.clone(),
+            nonce: plan.nonce.clone(),
+            plan_fingerprint: cursor_recovery_plan_fingerprint(plan)?,
+            mount: self.state.mount.clone(),
+            root: self.root.clone(),
+            before_state_fingerprint: cursor_recovery_bytes_fingerprint(&before_state),
+            before_state,
+            after_state_fingerprint: cursor_recovery_bytes_fingerprint(&after_state),
+            after_state: after_state.clone(),
+            before_manifest_fingerprint: cursor_recovery_manifest_fingerprint(&before_manifest)?,
+            after_manifest_fingerprint: cursor_recovery_manifest_fingerprint(&self.manifest)?,
+            mutations: mutations.clone(),
+            previous_manifest_entries,
+            materialized_directories: page.materialized_directories,
+            cursors: page.cursors,
+            scan_complete: page.scan_complete,
+        };
+        if let Err(error) = validate_cursor_recovery_page_intent(&intent, plan, &self.manifest) {
+            self.state = previous;
+            restore_manifest(&mut self.manifest, undo);
+            return Err(error);
+        }
+        let intent_path = scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
+        if let Err(error) = persist_cursor_recovery_page_intent(&intent_path, &intent) {
+            self.usable = false;
+            return Err(error);
+        }
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterIntent) {
+            self.usable = false;
+            return Err(reconcile_error(
+                "injected-cursor-recovery-page-crash",
+                "injected crash after page-intent durability and before manifest durability",
+            ));
+        }
+        if let Err(error) = self
+            .manifest_store
+            .append_mutations(mutations, &self.manifest)
+        {
+            self.usable = false;
+            return Err(error);
+        }
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterManifest) {
+            self.usable = false;
+            return Err(reconcile_error(
+                "injected-cursor-recovery-page-crash",
+                "injected crash after manifest durability and before recovery state durability",
+            ));
+        }
+        if let Err(source) = durable_file::write_file_atomic(
+            &self.state_path,
+            &after_state,
+            DurableAtomicFileOptions::new(RECONCILIATION_STATE_FILE, RECONCILIATION_TEMP_LABEL)
+                .sync_all(),
+        ) {
+            self.usable = false;
+            return Err(storage_error("persist cursor recovery page state")(source));
+        }
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterState) {
+            self.usable = false;
+            return Err(reconcile_error(
+                "injected-cursor-recovery-page-crash",
+                "injected crash after recovery state durability and before page-intent completion",
+            ));
+        }
+        if let Err(error) = durable_file::remove_file_if_exists_and_sync_parent(&intent_path)
+            .map_err(storage_error("complete cursor recovery page intent"))
+        {
+            self.usable = false;
+            return Err(error);
+        }
+        if let Err(error) = self.manifest_store.compact_if_needed(&self.manifest) {
+            self.usable = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static CURSOR_RECOVERY_PAGE_CRASH_CUT: std::cell::Cell<u8> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoveryPageCrashCut {
+    AfterIntent = 1,
+    AfterManifest = 2,
+    AfterState = 3,
+}
+
+#[cfg(test)]
+fn arm_cursor_recovery_page_crash(cut: CursorRecoveryPageCrashCut) {
+    CURSOR_RECOVERY_PAGE_CRASH_CUT.with(|armed| armed.set(cut as u8));
+}
+
+#[cfg(test)]
+fn cursor_recovery_page_crash_is_armed(cut: CursorRecoveryPageCrashCut) -> bool {
+    CURSOR_RECOVERY_PAGE_CRASH_CUT.with(|armed| {
+        if armed.get() == cut as u8 {
+            armed.set(0);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorRecoveryPageCrashCut {
+    AfterIntent,
+    AfterManifest,
+    AfterState,
+}
+
+#[cfg(not(test))]
+fn cursor_recovery_page_crash_is_armed(_cut: CursorRecoveryPageCrashCut) -> bool {
+    false
 }
 
 /// Read-only Fresh-activation admission check. Opening this scope can create
@@ -2347,6 +4363,1205 @@ pub(crate) fn fresh_reconciliation_scope_is_absent(
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(source) => Err(io_error("inspect namespace reconciliation scope")(source)),
     }
+}
+
+pub(crate) fn inspect_cursor_only_reconciliation_state(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+) -> Result<CloudFilesCursorOnlyReconciliationInspectionGuard, CloudFilesNamespaceReconcileError> {
+    if mount.trim().is_empty() {
+        return Err(reconcile_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(root)?;
+    let module_runtime = data_dir.module_runtime_dir();
+    let module_dir = module_runtime.join(SINOMO_DFS_CLOUD_FILES_MODULE_ID);
+    let reconciliation_root = module_dir.join(RECONCILIATION_DIR);
+    for (label, path) in [
+        ("module runtime", module_runtime.as_path()),
+        ("Cloud Files module", module_dir.as_path()),
+        ("namespace reconciliation", reconciliation_root.as_path()),
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(io_error("inspect cursor-only reconciliation parent"))?;
+        if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("{label} path {} is not a plain directory", path.display()),
+            ));
+        }
+    }
+    let scope_name = mount_scope_directory(mount, &root)?;
+    let scope = reconciliation_root.join(&scope_name);
+    let metadata = fs::symlink_metadata(&scope)
+        .map_err(io_error("inspect cursor-only reconciliation scope"))?;
+    if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            format!(
+                "reconciliation scope {} is not a plain directory",
+                scope.display()
+            ),
+        ));
+    }
+    for entry in fs::read_dir(&reconciliation_root)
+        .map_err(io_error("list namespace reconciliation root"))?
+    {
+        let entry = entry.map_err(io_error("read namespace reconciliation root entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "reconciliation root contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(io_error("inspect namespace reconciliation root entry"))?;
+        if name != scope_name || !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("unexpected reconciliation root entry `{name}`"),
+            ));
+        }
+    }
+
+    let lock_path = scope.join(RECONCILIATION_LOCK_FILE);
+    let lock_metadata = fs::symlink_metadata(&lock_path).map_err(io_error(
+        "inspect pre-existing cursor-only reconciliation lock",
+    ))?;
+    if !lock_metadata.file_type().is_file() || metadata_is_reparse(&lock_metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-lock",
+            "reconciliation lock is not a plain pre-existing file",
+        ));
+    }
+    let reconciliation_lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(io_error(
+            "open pre-existing cursor-only reconciliation lock",
+        ))?;
+    reconciliation_lock.try_lock_exclusive().map_err(|source| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-live",
+            format!("namespace reconciler is live: {source}"),
+        )
+    })?;
+
+    let mut raw_files = BTreeMap::new();
+    let mut state = None;
+    let mut saw_lock = false;
+    let mut saw_manifest = false;
+    let mut saw_materialization_audit = false;
+    for entry in fs::read_dir(&scope).map_err(io_error("list cursor-only reconciliation scope"))? {
+        let entry = entry.map_err(io_error("read cursor-only reconciliation entry"))?;
+        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "reconciliation scope contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(io_error("inspect cursor-only reconciliation entry"))?;
+        if metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("reconciliation scope contains symlink/reparse evidence `{name}`"),
+            ));
+        }
+        match name.as_str() {
+            RECONCILIATION_STATE_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(
+                    &path,
+                    CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+                    "cursor-only reconciliation state",
+                )?;
+                let decoded: CloudFilesNamespaceReconciliationState =
+                    decode_sobj(&bytes).map_err(|source| {
+                        reconcile_error("decode-reconciliation-state", source.to_string())
+                    })?;
+                if encode_sobj(&decoded).map_err(|source| {
+                    reconcile_error("encode-reconciliation-state", source.to_string())
+                })? != bytes
+                {
+                    return Err(reconcile_error(
+                        "cursor-recovery-reconciliation-noncanonical",
+                        "reconciliation state bytes are not canonical",
+                    ));
+                }
+                state = Some(decoded);
+                raw_files.insert(name, bytes);
+            }
+            RECONCILIATION_LOCK_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(&path, 0, "cursor-only reconciliation lock")?;
+                raw_files.insert(name, bytes);
+                saw_lock = true;
+            }
+            MATERIALIZATION_AUDIT_INTENTS_FILE if metadata.file_type().is_file() => {
+                let bytes = read_bounded_plain_file(
+                    &path,
+                    CURSOR_RECOVERY_STATE_IMAGE_MAX_BYTES,
+                    "cursor-only materialization audit state",
+                )?;
+                let intents: CloudFilesMaterializationAuditIntentState = decode_sobj(&bytes)
+                    .map_err(|source| {
+                        reconcile_error("decode-materialization-audit-intents", source.to_string())
+                    })?;
+                if intents.schema_version != MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION
+                    || intents.mount != mount
+                    || intents.root != root
+                    || !intents.directories.is_empty()
+                    || encode_sobj(&intents).map_err(|source| {
+                        reconcile_error("encode-materialization-audit-intents", source.to_string())
+                    })? != bytes
+                {
+                    return Err(reconcile_error(
+                        "cursor-recovery-materialization-audit-not-empty",
+                        "materialization audit state is nonempty, mismatched, or noncanonical",
+                    ));
+                }
+                raw_files.insert(name, bytes);
+                saw_materialization_audit = true;
+            }
+            MANIFEST_DIR if metadata.file_type().is_dir() => {
+                inspect_empty_cursor_recovery_manifest(&path, &mut raw_files)?;
+                saw_manifest = true;
+            }
+            _ => {
+                return Err(reconcile_error(
+                    "cursor-recovery-reconciliation-topology",
+                    format!("unexpected reconciliation recovery entry `{name}`"),
+                ));
+            }
+        }
+    }
+    if !saw_lock || !saw_manifest || !saw_materialization_audit {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "reconciliation scope is missing its canonical lock, manifest, or audit state",
+        ));
+    }
+    let state = state.ok_or_else(|| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "reconciliation scope is missing state.sobj",
+        )
+    })?;
+    if state.schema_version != RECONCILIATION_SCHEMA_VERSION
+        || state.mount != mount
+        || state.root != root
+        || state.cursors.is_empty()
+        || !state.legacy_manifest.is_empty()
+        || !state.suppressions.is_empty()
+        || !state.conflicts.is_empty()
+        || !state.startup_conflicts.is_empty()
+        || !state.materialized_directories.is_empty()
+        || state.unsupported_projection_count != 0
+        || !state.unsupported_projection_examples.is_empty()
+        || state.full_scan_request.is_some()
+        || state.inflight_effect.is_some()
+        || !state.applied_events.is_empty()
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-not-cursor-only",
+            "reconciliation state contains non-cursor history or lacks a valid cursor set",
+        ));
+    }
+    for (key, cursor) in &state.cursors {
+        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
+            return Err(reconcile_error(
+                "cursor-recovery-invalid-cursor",
+                format!("cursor `{key}` has an invalid shard key or authority epoch"),
+            ));
+        }
+    }
+    Ok(CloudFilesCursorOnlyReconciliationInspectionGuard {
+        inspection: CloudFilesCursorOnlyReconciliationInspection {
+            scope_path: scope,
+            raw_files,
+            cursors: state.cursors,
+        },
+        _lock: reconciliation_lock,
+    })
+}
+
+/// Opens only a recovery whose complete before/after images were already
+/// authorized durably by the module. This is intentionally separate from the
+/// public strict inspector: post-authorization state must never be mistaken
+/// for a newly eligible cursor-only tree.
+pub(crate) fn resume_authorized_cursor_recovery(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<CloudFilesCursorOnlyReconciliationInspectionGuard, CloudFilesNamespaceReconcileError> {
+    if mount.trim().is_empty() {
+        return Err(reconcile_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(root)?;
+    let validated = validate_cursor_recovery_plan(plan, mount, &root)?;
+    let module_runtime = data_dir.module_runtime_dir();
+    let module_dir = module_runtime.join(SINOMO_DFS_CLOUD_FILES_MODULE_ID);
+    let reconciliation_root = module_dir.join(RECONCILIATION_DIR);
+    for (label, path) in [
+        ("module runtime", module_runtime.as_path()),
+        ("Cloud Files module", module_dir.as_path()),
+        ("namespace reconciliation", reconciliation_root.as_path()),
+    ] {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(io_error("inspect authorized reconciliation parent"))?;
+        if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("{label} path {} is not a plain directory", path.display()),
+            ));
+        }
+    }
+    let scope_name = mount_scope_directory(mount, &root)?;
+    let scope = reconciliation_root.join(&scope_name);
+    for entry in fs::read_dir(&reconciliation_root)
+        .map_err(io_error("list authorized reconciliation root"))?
+    {
+        let entry = entry.map_err(io_error("read authorized reconciliation root entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "reconciliation root contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(io_error("inspect authorized reconciliation root entry"))?;
+        if name != scope_name || !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("unexpected reconciliation root entry `{name}`"),
+            ));
+        }
+    }
+    let scope_metadata = fs::symlink_metadata(&scope)
+        .map_err(io_error("inspect authorized reconciliation scope"))?;
+    if !scope_metadata.file_type().is_dir() || metadata_is_reparse(&scope_metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "authorized reconciliation scope is not a plain directory",
+        ));
+    }
+    let lock_path = scope.join(RECONCILIATION_LOCK_FILE);
+    read_bounded_plain_file(&lock_path, 0, "authorized reconciliation lock")?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(io_error("open authorized reconciliation lock"))?;
+    lock.try_lock_exclusive().map_err(|source| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-live",
+            format!("namespace reconciler is live: {source}"),
+        )
+    })?;
+    let cut = inspect_authorized_cursor_recovery_cut(&scope, plan)?;
+    Ok(CloudFilesCursorOnlyReconciliationInspectionGuard {
+        inspection: CloudFilesCursorOnlyReconciliationInspection {
+            scope_path: scope,
+            raw_files: cut.raw_files,
+            cursors: validated.original.cursors,
+        },
+        _lock: lock,
+    })
+}
+
+/// Reopens a recovery after the deterministic rewrite has completed and the
+/// authoritative scan may already have installed bounded page deltas. This
+/// never accepts a pristine/torn rewrite cut and never repairs owner files.
+pub(crate) fn open_authorized_cursor_recovery_progress(
+    data_dir: &SinomoDataDir,
+    mount: impl Into<String>,
+    root: impl Into<String>,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<CloudFilesNamespaceReconciler, CloudFilesNamespaceReconcileError> {
+    open_authorized_cursor_recovery_progress_inner(data_dir, mount.into(), root.into(), plan, false)
+        .map(|(reconciler, _)| reconciler)
+}
+
+/// Acquires the reconciliation owner lock and returns a positive successor
+/// guard only when the exact plan-bound Terminal cut is already durable. A
+/// valid earlier progress cut returns `None` without changing any owner file;
+/// malformed, torn, or ambiguous evidence fails closed.
+pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
+    data_dir: &SinomoDataDir,
+    mount: impl Into<String>,
+    root: impl Into<String>,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<Option<CloudFilesCursorRecoveryTerminalSuccessorGuard>, CloudFilesNamespaceReconcileError>
+{
+    let mount = mount.into();
+    if mount.trim().is_empty() {
+        return Err(reconcile_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(&root.into())?;
+    let validated = validate_cursor_recovery_plan(plan, &mount, &root)?;
+    let reconciliation_dir = data_dir
+        .module_runtime_dir()
+        .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(RECONCILIATION_DIR)
+        .join(mount_scope_directory(&mount, &root)?);
+    let scope_metadata = fs::symlink_metadata(&reconciliation_dir)
+        .map_err(io_error("inspect terminal successor reconciliation scope"))?;
+    if !scope_metadata.file_type().is_dir() || metadata_is_reparse(&scope_metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "terminal successor reconciliation scope is not a plain directory",
+        ));
+    }
+    let lock_path = reconciliation_dir.join(RECONCILIATION_LOCK_FILE);
+    read_bounded_plain_file(&lock_path, 0, "terminal successor reconciliation lock")?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(io_error("open terminal successor reconciliation lock"))?;
+    lock.try_lock_exclusive().map_err(|source| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-live",
+            format!("namespace reconciler is live: {source}"),
+        )
+    })?;
+
+    let mut rewrite_stage = None;
+    for entry in
+        fs::read_dir(&reconciliation_dir).map_err(io_error("list terminal successor scope"))?
+    {
+        let entry = entry.map_err(io_error("read terminal successor scope entry"))?;
+        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "terminal successor scope contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(io_error("inspect terminal successor scope entry"))?;
+        if metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                format!("terminal successor contains reparse evidence `{name}`"),
+            ));
+        }
+        let expected_final = matches!(
+            name.as_str(),
+            RECONCILIATION_STATE_FILE
+                | RECONCILIATION_LOCK_FILE
+                | MATERIALIZATION_AUDIT_INTENTS_FILE
+                | CURSOR_RECOVERY_REWRITE_FILE
+                | CURSOR_RECOVERY_PAGE_INTENT_FILE
+        );
+        if expected_final {
+            if !metadata.file_type().is_file() {
+                return Err(reconcile_error(
+                    "cursor-recovery-reconciliation-topology",
+                    format!("terminal successor owner entry `{name}` is not a plain file"),
+                ));
+            }
+            continue;
+        }
+        if name == MANIFEST_DIR {
+            if !metadata.file_type().is_dir() {
+                return Err(reconcile_error(
+                    "cursor-recovery-reconciliation-topology",
+                    "terminal successor manifest is not a plain directory",
+                ));
+            }
+            continue;
+        }
+        if looks_like_cursor_recovery_page_intent_temp(&name) {
+            if !metadata.file_type().is_file()
+                || !canonical_atomic_stage_name(
+                    &name,
+                    CURSOR_RECOVERY_PAGE_INTENT_FILE,
+                    CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL,
+                )
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-page-intent-topology",
+                    "terminal successor contains malformed page-intent evidence",
+                ));
+            }
+            continue;
+        }
+        if looks_like_cursor_recovery_temp(&name) {
+            let kind = cursor_recovery_temp_kind(&name).ok_or_else(|| {
+                reconcile_error(
+                    "cursor-recovery-rewrite-torn",
+                    format!("terminal successor has malformed durable stage `{name}`"),
+                )
+            })?;
+            if !metadata.file_type().is_file()
+                || kind != CursorRecoveryTempKind::Rewrite
+                || rewrite_stage.is_some()
+            {
+                return Err(reconcile_error(
+                    "cursor-recovery-rewrite-torn",
+                    "terminal successor permits only one exact plain rewrite stage",
+                ));
+            }
+            rewrite_stage = Some(path);
+            continue;
+        }
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            format!("terminal successor contains unexpected entry `{name}`"),
+        ));
+    }
+    if inspect_cursor_recovery_page_intent(&reconciliation_dir)?.is_some() {
+        // A canonical page intent is a legitimate earlier progress cut, but it
+        // can never authorize TerminalPendingFinalize. The progress opener
+        // owns its later deterministic repair.
+        return Ok(None);
+    }
+    let state_path = reconciliation_dir.join(RECONCILIATION_STATE_FILE);
+    let state_bytes = read_bounded_plain_file(
+        &state_path,
+        RECONCILIATION_STATE_MAX_BYTES,
+        "terminal successor reconciliation state",
+    )?;
+    let state: CloudFilesNamespaceReconciliationState = decode_sobj(&state_bytes)
+        .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
+    if encode_reconciliation_state(&state)? != state_bytes
+        || !cursor_recovery_progress_state_is_valid(&state, &validated, false)?
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-invalid",
+            "terminal successor state is noncanonical or not authorized scan progress",
+        ));
+    }
+    let terminal_state = cursor_recovery_progress_state_is_valid(&state, &validated, true)?
+        && state.materialized_directories == BTreeSet::from([root.clone()]);
+    let audit = load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
+    let rewrite_path = reconciliation_dir.join(CURSOR_RECOVERY_REWRITE_FILE);
+    let mut rewrite = load_required_cursor_recovery_rewrite(&rewrite_path, plan)?;
+
+    if let Some(stage_path) = rewrite_stage {
+        if !terminal_state || !audit.directories.is_empty() {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-torn",
+                "terminal rewrite stage is not preceded by exact terminal owner state",
+            ));
+        }
+        let terminal = CloudFilesCursorRecoveryRewrite::from_plan(
+            plan,
+            CloudFilesCursorRecoveryRewritePhase::Terminal,
+        );
+        let expected = encode_sobj(&terminal).map_err(|source| {
+            reconcile_error("encode-cursor-recovery-rewrite", source.to_string())
+        })?;
+        let staged = read_bounded_plain_file(
+            &stage_path,
+            CURSOR_RECOVERY_REWRITE_MAX_BYTES,
+            "terminal successor rewrite stage",
+        )?;
+        if staged != expected
+            || !matches!(
+                rewrite.phase,
+                CloudFilesCursorRecoveryRewritePhase::ReconcileArmed
+                    | CloudFilesCursorRecoveryRewritePhase::Terminal
+            )
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-mismatch",
+                "terminal successor rewrite stage is not its exact plan-bound successor",
+            ));
+        }
+        // The stage is already fsynced. Atomically promote that exact entry and
+        // sync the parent; never delete it and create a new power-loss gap.
+        durable_file::install_staged_file(&stage_path, &rewrite_path, true)
+            .map_err(storage_error("promote terminal recovery rewrite stage"))?;
+        rewrite = terminal;
+    }
+
+    if rewrite.phase == CloudFilesCursorRecoveryRewritePhase::ReconcileArmed {
+        // The remote scan may have installed its terminal state before the
+        // worker finishes the observer/root audit and writes Terminal. That is
+        // still a valid earlier progress cut and must resume the parked worker,
+        // never be upgraded from state shape alone.
+        return Ok(None);
+    }
+    if !terminal_state || !audit.directories.is_empty() {
+        return Err(reconcile_error(
+            "cursor-recovery-terminal-incomplete",
+            "Terminal rewrite is not backed by exact root-only terminal owner state",
+        ));
+    }
+
+    let (manifest_store, manifest) =
+        CloudFilesManifestStore::open_authorized_cursor_recovery_terminal(&reconciliation_dir)?;
+    validate_recovery_manifest(&manifest, &state, &root)?;
+    Ok(Some(CloudFilesCursorRecoveryTerminalSuccessorGuard {
+        reconciler: CloudFilesNamespaceReconciler {
+            root,
+            state_path,
+            _lock: lock,
+            cursor_recovery_plan: Some(plan.clone()),
+            manifest_store,
+            manifest,
+            state,
+            usable: true,
+        },
+    }))
+}
+
+/// Strict TerminalPendingFinalize opener. It is deliberately the positive
+/// guard above, never the progress opener that may repair page/manifest state.
+pub(crate) fn open_authorized_cursor_recovery_terminal_pending_finalize(
+    data_dir: &SinomoDataDir,
+    mount: impl Into<String>,
+    root: impl Into<String>,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<CloudFilesNamespaceReconciler, CloudFilesNamespaceReconcileError> {
+    acquire_authorized_cursor_recovery_terminal_successor(data_dir, mount, root, plan)?
+        .map(CloudFilesCursorRecoveryTerminalSuccessorGuard::into_reconciler)
+        .ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-not-terminal",
+                "TerminalPendingFinalize recovery has only an earlier progress cut",
+            )
+        })
+}
+
+/// Reopens only the crash cut after the module durably recorded
+/// NamespaceFinalized and the exact Terminal rewrite was already removed.
+/// This is not an ordinary recovery opener: the missing rewrite is accepted
+/// only with a terminal owner state, empty audit/page intent, and no rewrite
+/// temporary evidence.
+pub(crate) fn open_authorized_cursor_recovery_namespace_finalized(
+    data_dir: &SinomoDataDir,
+    mount: impl Into<String>,
+    root: impl Into<String>,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<(CloudFilesNamespaceReconciler, bool), CloudFilesNamespaceReconcileError> {
+    open_authorized_cursor_recovery_progress_inner(data_dir, mount.into(), root.into(), plan, true)
+}
+
+fn open_authorized_cursor_recovery_progress_inner(
+    data_dir: &SinomoDataDir,
+    mount: String,
+    root: String,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    namespace_finalized: bool,
+) -> Result<(CloudFilesNamespaceReconciler, bool), CloudFilesNamespaceReconcileError> {
+    if mount.trim().is_empty() {
+        return Err(reconcile_error(
+            "invalid-mount",
+            "mount identity cannot be empty",
+        ));
+    }
+    let root = canonical_sifs_path(&root)?;
+    let validated = validate_cursor_recovery_plan(plan, &mount, &root)?;
+    let reconciliation_dir = data_dir
+        .module_runtime_dir()
+        .join(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .join(RECONCILIATION_DIR)
+        .join(mount_scope_directory(&mount, &root)?);
+    let scope_metadata = fs::symlink_metadata(&reconciliation_dir)
+        .map_err(io_error("inspect authorized recovery progress scope"))?;
+    if !scope_metadata.file_type().is_dir() || metadata_is_reparse(&scope_metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-reconciliation-topology",
+            "authorized recovery progress scope is not a plain directory",
+        ));
+    }
+    let lock_path = reconciliation_dir.join(RECONCILIATION_LOCK_FILE);
+    read_bounded_plain_file(&lock_path, 0, "authorized recovery progress lock")?;
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(io_error("open authorized recovery progress lock"))?;
+    lock.try_lock_exclusive().map_err(|source| {
+        reconcile_error(
+            "cursor-recovery-reconciliation-live",
+            format!("namespace reconciler is live: {source}"),
+        )
+    })?;
+    let rewrite_path = reconciliation_dir.join(CURSOR_RECOVERY_REWRITE_FILE);
+    let rewrite = if namespace_finalized {
+        match fs::symlink_metadata(&rewrite_path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() || metadata_is_reparse(&metadata) {
+                    return Err(reconcile_error(
+                        "cursor-recovery-rewrite-invalid",
+                        "NamespaceFinalized rewrite is not a plain owner file",
+                    ));
+                }
+                Some(load_required_cursor_recovery_rewrite(&rewrite_path, plan)?)
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                ensure_cursor_recovery_rewrite_absent(&reconciliation_dir, &rewrite_path)?;
+                None
+            }
+            Err(source) => {
+                return Err(io_error(
+                    "inspect NamespaceFinalized cursor recovery rewrite",
+                )(source));
+            }
+        }
+    } else {
+        Some(load_required_cursor_recovery_rewrite(&rewrite_path, plan)?)
+    };
+    let namespace_rewrite_absent = namespace_finalized && rewrite.is_none();
+    let state_path = reconciliation_dir.join(RECONCILIATION_STATE_FILE);
+    let state_bytes = read_bounded_plain_file(
+        &state_path,
+        RECONCILIATION_STATE_MAX_BYTES,
+        "authorized cursor recovery progress state",
+    )?;
+    let state: CloudFilesNamespaceReconciliationState = decode_sobj(&state_bytes)
+        .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
+    if encode_sobj(&state)
+        .map_err(|source| reconcile_error("encode-reconciliation-state", source.to_string()))?
+        != state_bytes
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-invalid",
+            "authorized cursor recovery progress state is noncanonical",
+        ));
+    }
+    let audit = load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
+    let (manifest_store, manifest, migrated) =
+        CloudFilesManifestStore::open(&reconciliation_dir, BTreeMap::new())?;
+    if migrated {
+        return Err(reconcile_error(
+            "cursor-recovery-manifest-migration",
+            "authorized recovery progress may not migrate a legacy manifest",
+        ));
+    }
+    let state = if namespace_finalized {
+        if inspect_cursor_recovery_page_intent(&reconciliation_dir)?.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-page-intent-live",
+                "NamespaceFinalized recovery cannot retain a page transaction",
+            ));
+        }
+        state
+    } else {
+        repair_authorized_cursor_recovery_page_intent(
+            &reconciliation_dir,
+            &state_path,
+            &state_bytes,
+            plan,
+            &manifest,
+        )?
+    };
+    let require_terminal = if let Some(rewrite) = rewrite {
+        let rewrite = resume_terminal_rewrite_stage(
+            &reconciliation_dir,
+            &rewrite_path,
+            plan,
+            rewrite,
+            cursor_recovery_progress_state_is_valid(&state, &validated, true)?,
+            audit.directories.is_empty(),
+        )?;
+        rewrite.phase == CloudFilesCursorRecoveryRewritePhase::Terminal
+    } else {
+        true
+    };
+    if !cursor_recovery_progress_state_is_valid(&state, &validated, require_terminal)? {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-invalid",
+            "recovery state did not evolve solely through the authoritative scan protocol",
+        ));
+    }
+    if require_terminal && !audit.directories.is_empty() {
+        return Err(reconcile_error(
+            "cursor-recovery-terminal-audit-pending",
+            "Terminal recovery progress still has materialization audit intents",
+        ));
+    }
+    validate_recovery_manifest(&manifest, &state, &root)?;
+    Ok((
+        CloudFilesNamespaceReconciler {
+            root,
+            state_path,
+            _lock: lock,
+            cursor_recovery_plan: Some(plan.clone()),
+            manifest_store,
+            manifest,
+            state,
+            usable: true,
+        },
+        namespace_rewrite_absent,
+    ))
+}
+
+fn ensure_cursor_recovery_rewrite_absent(
+    scope: &Path,
+    rewrite_path: &Path,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    match fs::symlink_metadata(rewrite_path) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(io_error("inspect finalized cursor recovery rewrite")(
+                source,
+            ));
+        }
+        Ok(_) => {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-present",
+                "NamespaceFinalized recovery still has its Terminal rewrite",
+            ));
+        }
+    }
+    for entry in fs::read_dir(scope).map_err(io_error("list finalized recovery scope"))? {
+        let entry = entry.map_err(io_error("read finalized recovery scope entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "finalized recovery scope contains a non-UTF-8 entry",
+            )
+        })?;
+        if cursor_recovery_temp_kind(&name) == Some(CursorRecoveryTempKind::Rewrite)
+            || name.starts_with(&format!(
+                ".{CURSOR_RECOVERY_REWRITE_FILE}.{CURSOR_RECOVERY_REWRITE_TEMP_LABEL}-"
+            ))
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-temp-present",
+                "NamespaceFinalized recovery retains rewrite temporary evidence",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Exact plan-bound evidence that the lock-owning reconciler persisted
+/// Terminal. This is deliberately not itself finalization authorization: the
+/// module owner must explicitly convert it only after synchronous host Ready
+/// observation has completed.
+pub(crate) struct CloudFilesCursorRecoveryTerminalProof {
+    recovery_id: String,
+    recovery_token: String,
+    nonce: String,
+    root: String,
+    terminal_rewrite_fingerprint: String,
+}
+
+/// Caller-owned proof that host Ready was synchronously observed after the
+/// inner Terminal marker. Its fields and constructor stay private so ordinary
+/// namespace code cannot fabricate a broad marker-delete request.
+pub(crate) struct CloudFilesCursorRecoveryReadyToFinalize {
+    terminal: CloudFilesCursorRecoveryTerminalProof,
+}
+
+impl CloudFilesCursorRecoveryTerminalProof {
+    /// Call only after the outer/module Ready transition and its synchronous
+    /// host acknowledgement are durable. The explicit type transition keeps
+    /// that ordering visible at the worker/module API boundary.
+    pub(crate) fn authorize_after_host_ready_observed(
+        self,
+    ) -> CloudFilesCursorRecoveryReadyToFinalize {
+        CloudFilesCursorRecoveryReadyToFinalize { terminal: self }
+    }
+}
+
+fn cursor_recovery_terminal_proof(
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<CloudFilesCursorRecoveryTerminalProof, CloudFilesNamespaceReconcileError> {
+    let terminal_bytes = encode_sobj(&CloudFilesCursorRecoveryRewrite::from_plan(
+        plan,
+        CloudFilesCursorRecoveryRewritePhase::Terminal,
+    ))
+    .map_err(|source| reconcile_error("encode-cursor-recovery-rewrite", source.to_string()))?;
+    Ok(CloudFilesCursorRecoveryTerminalProof {
+        recovery_id: plan.recovery_id.clone(),
+        recovery_token: plan.recovery_token.clone(),
+        nonce: plan.nonce.clone(),
+        root: plan.root.clone(),
+        terminal_rewrite_fingerprint: cursor_recovery_bytes_fingerprint(&terminal_bytes),
+    })
+}
+
+fn validate_cursor_recovery_ready_to_finalize(
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    root: &str,
+    ready: &CloudFilesCursorRecoveryReadyToFinalize,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    let expected = cursor_recovery_terminal_proof(plan)?;
+    if ready.terminal.recovery_id != expected.recovery_id
+        || ready.terminal.recovery_token != expected.recovery_token
+        || ready.terminal.nonce != expected.nonce
+        || ready.terminal.root != root
+        || ready.terminal.terminal_rewrite_fingerprint != expected.terminal_rewrite_fingerprint
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-ready-proof-mismatch",
+            "cursor recovery finalization proof does not match the exact Terminal plan",
+        ));
+    }
+    Ok(())
+}
+
+/// Removes only the exact plan-bound Terminal marker after the outer/module
+/// owner has durably committed Ready. An armed marker, changed plan, pending
+/// audit, or nonterminal state is never deleted.
+pub(crate) fn finalize_authorized_cursor_recovery_after_ready(
+    data_dir: &SinomoDataDir,
+    mount: &str,
+    root: &str,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    ready: CloudFilesCursorRecoveryReadyToFinalize,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    let mut reconciler = open_authorized_cursor_recovery_progress(data_dir, mount, root, plan)?;
+    reconciler.finalize_authorized_cursor_recovery_after_ready(plan, ready)
+}
+fn cursor_recovery_progress_state_is_valid(
+    state: &CloudFilesNamespaceReconciliationState,
+    plan: &ValidatedCursorRecoveryPlan,
+    require_terminal: bool,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    if state.schema_version != RECONCILIATION_SCHEMA_VERSION
+        || state.mount != plan.expected.mount
+        || state.root != plan.expected.root
+        || !state.legacy_manifest.is_empty()
+        || !state.suppressions.is_empty()
+        || !state.conflicts.is_empty()
+        || !state.startup_conflicts.is_empty()
+        || !state.materialized_directories.contains(&state.root)
+        || state.inflight_effect.is_some()
+        || !state.applied_events.is_empty()
+    {
+        return Ok(false);
+    }
+    for directory in &state.materialized_directories {
+        if canonical_sifs_path(directory)? != *directory {
+            return Ok(false);
+        }
+        ensure_within_root(directory, &state.root)?;
+    }
+    for (path, kind) in &state.unsupported_projection_examples {
+        if canonical_sifs_path(path)? != *path
+            || !matches!(kind.as_str(), "symlink" | "hardlink" | "artifact")
+        {
+            return Ok(false);
+        }
+        ensure_within_root(path, &state.root)?;
+    }
+    if state.unsupported_projection_examples.len() as u64 > state.unsupported_projection_count {
+        return Ok(false);
+    }
+    if require_terminal {
+        if state.cursors.is_empty() || state.full_scan_request.is_some() {
+            return Ok(false);
+        }
+    } else if state.cursors.is_empty() {
+        if state.full_scan_request != plan.expected.full_scan_request {
+            return Ok(false);
+        }
+    } else if state.full_scan_request.is_some() {
+        return Ok(false);
+    }
+    for (key, cursor) in &state.cursors {
+        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn validate_recovery_manifest(
+    manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    state: &CloudFilesNamespaceReconciliationState,
+    root: &str,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    for (path, entry) in manifest {
+        if path != &entry.path || canonical_sifs_path(path)? != *path {
+            return Err(reconcile_error(
+                "cursor-recovery-progress-manifest",
+                "recovery manifest contains a noncanonical or mismatched path",
+            ));
+        }
+        ensure_within_root(path, root)?;
+        validate_manifest_entry(entry)?;
+    }
+    let (unsupported_count, unsupported_examples) = unsupported_projection_summary(manifest);
+    if state.unsupported_projection_count != unsupported_count
+        || state.unsupported_projection_examples != unsupported_examples
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-manifest",
+            "recovery manifest does not match its durable projection summary",
+        ));
+    }
+    for directory in &state.materialized_directories {
+        if directory == root {
+            continue;
+        }
+        if !manifest
+            .get(directory)
+            .is_some_and(|entry| matches!(entry.kind.as_str(), "directory" | "mount"))
+        {
+            return Err(reconcile_error(
+                "cursor-recovery-progress-manifest",
+                format!(
+                    "materialized directory `{directory}` lacks matching authoritative manifest evidence"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_required_cursor_recovery_audit(
+    scope: &Path,
+    mount: &str,
+    root: &str,
+) -> Result<CloudFilesMaterializationAuditIntentState, CloudFilesNamespaceReconcileError> {
+    let path = scope.join(MATERIALIZATION_AUDIT_INTENTS_FILE);
+    let bytes = read_bounded_plain_file(
+        &path,
+        MATERIALIZATION_AUDIT_INTENTS_MAX_BYTES,
+        "cursor recovery materialization audit state",
+    )?;
+    let audit: CloudFilesMaterializationAuditIntentState =
+        decode_sobj(&bytes).map_err(|source| {
+            reconcile_error("decode-materialization-audit-intents", source.to_string())
+        })?;
+    if audit.schema_version != MATERIALIZATION_AUDIT_INTENTS_SCHEMA_VERSION
+        || audit.mount != mount
+        || audit.root != root
+        || encode_sobj(&audit).map_err(|source| {
+            reconcile_error("encode-materialization-audit-intents", source.to_string())
+        })? != bytes
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-audit",
+            "cursor recovery audit state is noncanonical or has changed identity",
+        ));
+    }
+    for directory in &audit.directories {
+        if canonical_sifs_path(directory)? != *directory {
+            return Err(reconcile_error(
+                "cursor-recovery-progress-audit",
+                "cursor recovery audit contains a noncanonical directory",
+            ));
+        }
+        ensure_within_root(directory, root)?;
+    }
+    Ok(audit)
+}
+
+fn load_required_cursor_recovery_rewrite(
+    path: &Path,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+) -> Result<CloudFilesCursorRecoveryRewrite, CloudFilesNamespaceReconcileError> {
+    let bytes = read_bounded_plain_file(
+        path,
+        CURSOR_RECOVERY_REWRITE_MAX_BYTES,
+        "cursor recovery rewrite marker",
+    )?;
+    let rewrite: CloudFilesCursorRecoveryRewrite = decode_sobj(&bytes)
+        .map_err(|source| reconcile_error("decode-cursor-recovery-rewrite", source.to_string()))?;
+    if encode_sobj(&rewrite)
+        .map_err(|source| reconcile_error("encode-cursor-recovery-rewrite", source.to_string()))?
+        != bytes
+        || !rewrite.matches_plan(plan)
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-mismatch",
+            "cursor recovery rewrite marker is noncanonical or belongs to another plan",
+        ));
+    }
+    Ok(rewrite)
+}
+
+fn resume_terminal_rewrite_stage(
+    scope: &Path,
+    rewrite_path: &Path,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    rewrite: CloudFilesCursorRecoveryRewrite,
+    terminal_state: bool,
+    audit_empty: bool,
+) -> Result<CloudFilesCursorRecoveryRewrite, CloudFilesNamespaceReconcileError> {
+    let mut stage = None;
+    for entry in fs::read_dir(scope).map_err(io_error("list cursor recovery scope"))? {
+        let entry = entry.map_err(io_error("read cursor recovery scope entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "cursor recovery scope contains a non-UTF-8 entry",
+            )
+        })?;
+        if !looks_like_cursor_recovery_temp(&name) {
+            continue;
+        }
+        let kind = cursor_recovery_temp_kind(&name).ok_or_else(|| {
+            reconcile_error(
+                "cursor-recovery-rewrite-torn",
+                format!("cursor recovery has a noncanonical durable stage `{name}`"),
+            )
+        })?;
+        if stage.is_some() {
+            return Err(reconcile_error(
+                "cursor-recovery-rewrite-torn",
+                "cursor recovery has multiple unresolved durable stages",
+            ));
+        }
+        stage = Some((kind, entry.path()));
+    }
+    let Some((kind, path)) = stage else {
+        return Ok(rewrite);
+    };
+    if kind != CursorRecoveryTempKind::Rewrite || !terminal_state || !audit_empty {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-torn",
+            "only an exact terminal-marker stage may follow authoritative scan progress",
+        ));
+    }
+    let terminal = CloudFilesCursorRecoveryRewrite::from_plan(
+        plan,
+        CloudFilesCursorRecoveryRewritePhase::Terminal,
+    );
+    let expected_bytes = encode_sobj(&terminal)
+        .map_err(|source| reconcile_error("encode-cursor-recovery-rewrite", source.to_string()))?;
+    let staged_bytes = read_bounded_plain_file(
+        &path,
+        CURSOR_RECOVERY_REWRITE_MAX_BYTES,
+        "cursor recovery terminal marker stage",
+    )?;
+    if staged_bytes != expected_bytes
+        || !matches!(
+            rewrite.phase,
+            CloudFilesCursorRecoveryRewritePhase::ReconcileArmed
+                | CloudFilesCursorRecoveryRewritePhase::Terminal
+        )
+    {
+        return Err(reconcile_error(
+            "cursor-recovery-rewrite-mismatch",
+            "terminal marker stage does not match its exact plan-bound predecessor",
+        ));
+    }
+    durable_file::remove_file_if_exists_and_sync_parent(&path).map_err(storage_error(
+        "remove replayed cursor recovery terminal stage",
+    ))?;
+    persist_cursor_recovery_rewrite(rewrite_path, &terminal)?;
+    Ok(terminal)
+}
+
+fn inspect_empty_cursor_recovery_manifest(
+    manifest_dir: &Path,
+    raw_files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), CloudFilesNamespaceReconcileError> {
+    let metadata = fs::symlink_metadata(manifest_dir)
+        .map_err(io_error("inspect cursor-only manifest directory"))?;
+    if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
+        return Err(reconcile_error(
+            "cursor-recovery-manifest-topology",
+            "manifest path is not a plain directory",
+        ));
+    }
+    let mut saw_index = false;
+    let mut saw_journal = false;
+    for entry in fs::read_dir(manifest_dir).map_err(io_error("list cursor-only manifest"))? {
+        let entry = entry.map_err(io_error("read cursor-only manifest entry"))?;
+        let path = entry.path();
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-manifest-topology",
+                "manifest contains a non-UTF-8 entry",
+            )
+        })?;
+        let metadata =
+            fs::symlink_metadata(&path).map_err(io_error("inspect cursor-only manifest entry"))?;
+        if !metadata.file_type().is_file() || metadata_is_reparse(&metadata) {
+            return Err(reconcile_error(
+                "cursor-recovery-manifest-topology",
+                format!("manifest entry `{name}` is not a plain file"),
+            ));
+        }
+        match name.as_str() {
+            MANIFEST_INDEX_FILE => {
+                if metadata.len() > MANIFEST_INDEX_MAX_BYTES {
+                    return Err(reconcile_error(
+                        "cursor-recovery-manifest-too-large",
+                        "manifest index exceeds its recovery bound",
+                    ));
+                }
+                let bytes = fs::read(&path).map_err(io_error("read cursor-only manifest index"))?;
+                let index: CloudFilesManifestIndex = decode_sobj(&bytes).map_err(|source| {
+                    reconcile_error("decode-manifest-index", source.to_string())
+                })?;
+                if index.schema_version != MANIFEST_SCHEMA_VERSION
+                    || index.generation != 1
+                    || index.applied_through_sequence != 0
+                    || !index.chunks.is_empty()
+                    || encode_sobj(&index).map_err(|source| {
+                        reconcile_error("encode-manifest-index", source.to_string())
+                    })? != bytes
+                {
+                    return Err(reconcile_error(
+                        "cursor-recovery-manifest-not-empty",
+                        "manifest index is nonempty or noncanonical",
+                    ));
+                }
+                raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
+                saw_index = true;
+            }
+            MANIFEST_JOURNAL_FILE => {
+                if metadata.len() > MANIFEST_JOURNAL_MAX_BYTES {
+                    return Err(reconcile_error(
+                        "cursor-recovery-manifest-too-large",
+                        "manifest journal exceeds its owner bound",
+                    ));
+                }
+                let bytes =
+                    fs::read(&path).map_err(io_error("read cursor-only manifest journal"))?;
+                if !bytes.is_empty() {
+                    return Err(reconcile_error(
+                        "cursor-recovery-manifest-not-empty",
+                        "manifest journal contains retained history",
+                    ));
+                }
+                raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
+                saw_journal = true;
+            }
+            _ => {
+                return Err(reconcile_error(
+                    "cursor-recovery-manifest-not-empty",
+                    format!("manifest contains history, temporary, or unknown entry `{name}`"),
+                ));
+            }
+        }
+    }
+    if !saw_index || !saw_journal {
+        return Err(reconcile_error(
+            "cursor-recovery-manifest-topology",
+            "manifest is missing its canonical empty index or journal",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn suppression_action_matches_manifest(
@@ -2532,6 +5747,30 @@ fn remove_abandoned_state_stages(
         RECONCILIATION_STATE_FILE,
         RECONCILIATION_TEMP_LABEL,
     )
+}
+
+fn cursor_recovery_evidence_exists(
+    reconciliation_dir: &Path,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    for entry in
+        fs::read_dir(reconciliation_dir).map_err(io_error("list namespace reconciliation scope"))?
+    {
+        let entry = entry.map_err(io_error("read namespace reconciliation scope entry"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-reconciliation-topology",
+                "reconciliation scope contains a non-UTF-8 entry",
+            )
+        })?;
+        if name == CURSOR_RECOVERY_REWRITE_FILE
+            || name == CURSOR_RECOVERY_PAGE_INTENT_FILE
+            || looks_like_cursor_recovery_temp(&name)
+            || looks_like_cursor_recovery_page_intent_temp(&name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn remove_abandoned_atomic_stages(
@@ -3134,6 +6373,835 @@ mod tests {
     fn open_reconciler(root: &TestRoot) -> CloudFilesNamespaceReconciler {
         CloudFilesNamespaceReconciler::open(&root.data_dir(), "mount-a", "/services")
             .expect("open reconciler")
+    }
+
+    struct CursorRecoveryFixture {
+        root: TestRoot,
+        scope: PathBuf,
+        plan: CloudFilesCursorRecoveryReconciliationPlan,
+    }
+
+    fn cursor_recovery_fixture(name: &str) -> CursorRecoveryFixture {
+        let root = TestRoot::new(name);
+        let mut reconciler = open_reconciler(&root);
+        let scope = reconciler
+            .state_path()
+            .parent()
+            .expect("reconciliation scope")
+            .to_path_buf();
+        let boundary = cursor(41);
+        reconciler
+            .state
+            .cursors
+            .insert(boundary.shard_key().expect("shard key"), boundary);
+        reconciler.persist().expect("persist cursor-only state");
+        drop(reconciler);
+        drop(
+            CloudFilesMaterializationAuditIntentStore::open(
+                &root.data_dir(),
+                "mount-a",
+                "/services",
+            )
+            .expect("create empty audit state"),
+        );
+        let guard =
+            inspect_cursor_only_reconciliation_state(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect exact cursor-only state");
+        let plan = guard
+            .authoritative_reconciliation_plan("recovery-a", "token-a", "nonce-a")
+            .expect("build recovery plan");
+        drop(guard);
+        CursorRecoveryFixture { root, scope, plan }
+    }
+
+    fn persist_armed_rewrite(fixture: &CursorRecoveryFixture) {
+        persist_cursor_recovery_rewrite(
+            &fixture.scope.join(CURSOR_RECOVERY_REWRITE_FILE),
+            &CloudFilesCursorRecoveryRewrite::from_plan(
+                &fixture.plan,
+                CloudFilesCursorRecoveryRewritePhase::ReconcileArmed,
+            ),
+        )
+        .expect("persist armed rewrite");
+    }
+
+    fn recovery_stage_path(
+        fixture: &CursorRecoveryFixture,
+        file_name: &str,
+        label: &str,
+        sequence: u64,
+    ) -> PathBuf {
+        fixture.scope.join(format!(
+            ".{file_name}.{label}-{}-{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn write_recovery_stage(
+        fixture: &CursorRecoveryFixture,
+        file_name: &str,
+        label: &str,
+        sequence: u64,
+        bytes: &[u8],
+    ) -> PathBuf {
+        let path = recovery_stage_path(fixture, file_name, label, sequence);
+        fs::write(&path, bytes).expect("write recovery stage");
+        path
+    }
+
+    fn write_recovery_state(fixture: &CursorRecoveryFixture, bytes: &[u8]) {
+        fs::write(fixture.scope.join(RECONCILIATION_STATE_FILE), bytes)
+            .expect("write recovery state cut");
+    }
+
+    fn write_recovery_audit(fixture: &CursorRecoveryFixture, bytes: &[u8]) {
+        fs::write(
+            fixture.scope.join(MATERIALIZATION_AUDIT_INTENTS_FILE),
+            bytes,
+        )
+        .expect("write recovery audit cut");
+    }
+
+    fn open_armed_cursor_recovery(
+        fixture: &CursorRecoveryFixture,
+    ) -> CloudFilesNamespaceReconciler {
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open cursor recovery rewrite cut");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply cursor recovery rewrite");
+        drop(guard);
+        open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open armed cursor recovery progress")
+    }
+
+    fn unsupported_recovery_entry(path: &str) -> CloudFilesReconciledManifestEntry {
+        CloudFilesReconciledManifestEntry {
+            path: path.to_string(),
+            object_id: format!("object-{path}"),
+            version: "version-unsupported".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "symlink".to_string(),
+        }
+    }
+
+    fn inject_unsupported_recovery_page_cut(
+        fixture: &CursorRecoveryFixture,
+        cut: CursorRecoveryPageCrashCut,
+        path: &str,
+    ) {
+        let mut reconciler = open_armed_cursor_recovery(fixture);
+        let entry = unsupported_recovery_entry(path);
+        arm_cursor_recovery_page_crash(cut);
+        let error = reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(entry.path.clone(), entry)]),
+                Vec::new(),
+                vec!["/services".to_string()],
+                BTreeMap::new(),
+                false,
+            )
+            .expect_err("inject cursor recovery page crash cut");
+        assert_eq!(error.code, "injected-cursor-recovery-page-crash");
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_accepts_only_the_three_plan_bound_rewrite_cuts() {
+        let fixture = cursor_recovery_fixture("recovery-exact-cuts");
+        drop(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("accept pristine authorized cut"),
+        );
+
+        persist_armed_rewrite(&fixture);
+        assert!(
+            inspect_cursor_only_reconciliation_state(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services"
+            )
+            .is_err(),
+            "public inspection must reject an armed marker before transformation"
+        );
+        drop(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("accept original state plus armed marker"),
+        );
+
+        write_recovery_state(&fixture, &fixture.plan.expected_state);
+        drop(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("accept expected state plus old audit plus marker"),
+        );
+
+        write_recovery_audit(&fixture, &fixture.plan.expected_audit);
+        drop(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("accept exact expected state and audit plus marker"),
+        );
+
+        let before_state = fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE))
+            .expect("state before strict inspection");
+        assert!(
+            inspect_cursor_only_reconciliation_state(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services"
+            )
+            .is_err(),
+            "public inspection must reject armed/transformed recovery evidence"
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE)).expect("state after reject"),
+            before_state,
+            "rejected public inspection must be immutable"
+        );
+        fs::remove_file(fixture.scope.join(CURSOR_RECOVERY_REWRITE_FILE))
+            .expect("remove marker only to isolate transformed-state admission");
+        assert!(
+            inspect_cursor_only_reconciliation_state(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services"
+            )
+            .is_err(),
+            "public inspection must reject a transformed image even without its marker"
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE))
+                .expect("transformed state retained"),
+            before_state
+        );
+    }
+
+    #[test]
+    fn cursor_recovery_replays_each_exact_atomic_stage() {
+        let rewrite = cursor_recovery_fixture("recovery-rewrite-stage");
+        let armed_bytes = encode_sobj(&CloudFilesCursorRecoveryRewrite::from_plan(
+            &rewrite.plan,
+            CloudFilesCursorRecoveryRewritePhase::ReconcileArmed,
+        ))
+        .expect("encode armed rewrite");
+        let rewrite_stage = write_recovery_stage(
+            &rewrite,
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            1,
+            &armed_bytes,
+        );
+        let guard = resume_authorized_cursor_recovery(
+            &rewrite.root.data_dir(),
+            "mount-a",
+            "/services",
+            &rewrite.plan,
+        )
+        .expect("accept exact rewrite stage");
+        guard
+            .apply_authoritative_reconciliation_plan(&rewrite.plan)
+            .expect("replay rewrite stage");
+        assert!(!rewrite_stage.exists());
+        drop(guard);
+
+        let state = cursor_recovery_fixture("recovery-state-stage");
+        persist_armed_rewrite(&state);
+        let state_stage = write_recovery_stage(
+            &state,
+            RECONCILIATION_STATE_FILE,
+            CURSOR_RECOVERY_STATE_TEMP_LABEL,
+            2,
+            &state.plan.expected_state,
+        );
+        let guard = resume_authorized_cursor_recovery(
+            &state.root.data_dir(),
+            "mount-a",
+            "/services",
+            &state.plan,
+        )
+        .expect("accept exact state stage");
+        guard
+            .apply_authoritative_reconciliation_plan(&state.plan)
+            .expect("replay state stage");
+        assert!(!state_stage.exists());
+        drop(guard);
+
+        let audit = cursor_recovery_fixture("recovery-audit-stage");
+        persist_armed_rewrite(&audit);
+        write_recovery_state(&audit, &audit.plan.expected_state);
+        let audit_stage = write_recovery_stage(
+            &audit,
+            MATERIALIZATION_AUDIT_INTENTS_FILE,
+            CURSOR_RECOVERY_AUDIT_TEMP_LABEL,
+            3,
+            &audit.plan.expected_audit,
+        );
+        let guard = resume_authorized_cursor_recovery(
+            &audit.root.data_dir(),
+            "mount-a",
+            "/services",
+            &audit.plan,
+        )
+        .expect("accept exact audit stage");
+        guard
+            .apply_authoritative_reconciliation_plan(&audit.plan)
+            .expect("replay audit stage");
+        assert!(!audit_stage.exists());
+        drop(guard);
+    }
+
+    #[test]
+    fn cursor_recovery_rejects_wrong_predecessor_multiple_and_forged_stages_without_mutation() {
+        let fixture = cursor_recovery_fixture("recovery-invalid-stages");
+        persist_armed_rewrite(&fixture);
+        write_recovery_state(&fixture, &fixture.plan.expected_state);
+        let wrong_predecessor = write_recovery_stage(
+            &fixture,
+            RECONCILIATION_STATE_FILE,
+            CURSOR_RECOVERY_STATE_TEMP_LABEL,
+            11,
+            &fixture.plan.expected_state,
+        );
+        let state_before = fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE))
+            .expect("state before wrong predecessor");
+        let marker_before = fs::read(fixture.scope.join(CURSOR_RECOVERY_REWRITE_FILE))
+            .expect("marker before wrong predecessor");
+        assert!(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .is_err(),
+            "state stage after an already-installed expected state must stop"
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(CURSOR_RECOVERY_REWRITE_FILE)).expect("unchanged marker"),
+            marker_before
+        );
+        assert!(wrong_predecessor.exists());
+
+        let multiple = cursor_recovery_fixture("recovery-multiple-stages");
+        let armed_bytes = encode_sobj(&CloudFilesCursorRecoveryRewrite::from_plan(
+            &multiple.plan,
+            CloudFilesCursorRecoveryRewritePhase::ReconcileArmed,
+        ))
+        .expect("encode armed marker");
+        let first = write_recovery_stage(
+            &multiple,
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            12,
+            &armed_bytes,
+        );
+        let second = write_recovery_stage(
+            &multiple,
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            13,
+            &armed_bytes,
+        );
+        assert!(
+            resume_authorized_cursor_recovery(
+                &multiple.root.data_dir(),
+                "mount-a",
+                "/services",
+                &multiple.plan,
+            )
+            .is_err(),
+            "multiple exact stages must stop"
+        );
+        assert!(first.exists() && second.exists());
+
+        let forged = cursor_recovery_fixture("recovery-forged-stage");
+        let forged_stage = write_recovery_stage(
+            &forged,
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            14,
+            b"forged-plan-stage",
+        );
+        let original_state =
+            fs::read(forged.scope.join(RECONCILIATION_STATE_FILE)).expect("original state");
+        assert!(
+            resume_authorized_cursor_recovery(
+                &forged.root.data_dir(),
+                "mount-a",
+                "/services",
+                &forged.plan,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(forged.scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            original_state
+        );
+        assert!(forged_stage.exists());
+    }
+
+    #[test]
+    fn forged_cursor_recovery_plan_and_torn_cut_are_rejected_immutably() {
+        let fixture = cursor_recovery_fixture("recovery-forged-plan");
+        persist_armed_rewrite(&fixture);
+        write_recovery_audit(&fixture, &fixture.plan.expected_audit);
+        let state_before =
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE)).expect("state before torn cut");
+        let audit_before = fs::read(fixture.scope.join(MATERIALIZATION_AUDIT_INTENTS_FILE))
+            .expect("audit before torn cut");
+        assert!(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .is_err(),
+            "expected audit may never precede expected state"
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE)).expect("state after reject"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(MATERIALIZATION_AUDIT_INTENTS_FILE))
+                .expect("audit after reject"),
+            audit_before
+        );
+
+        write_recovery_audit(&fixture, &fixture.plan.original_audit);
+        let mut forged = fixture.plan.clone();
+        forged.expected_state.push(0);
+        assert!(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &forged,
+            )
+            .is_err(),
+            "forged deterministic after-image must stop"
+        );
+        assert_eq!(
+            fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            state_before
+        );
+    }
+
+    #[test]
+    fn ordinary_open_rejects_recovery_temp_evidence_without_removing_it() {
+        let fixture = cursor_recovery_fixture("recovery-ordinary-open-temp");
+        let stage = write_recovery_stage(
+            &fixture,
+            CURSOR_RECOVERY_REWRITE_FILE,
+            CURSOR_RECOVERY_REWRITE_TEMP_LABEL,
+            21,
+            b"retained-stage-evidence",
+        );
+        assert!(
+            inspect_cursor_only_reconciliation_state(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services"
+            )
+            .is_err(),
+            "public inspection must reject recovery temp evidence"
+        );
+        assert!(
+            stage.exists(),
+            "public inspection must retain temp evidence"
+        );
+        let error = match CloudFilesNamespaceReconciler::open(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+        ) {
+            Ok(_) => panic!("ordinary open must not consume recovery evidence"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "cursor-recovery-requires-authorized-open");
+        assert_eq!(
+            fs::read(&stage).expect("retained recovery stage"),
+            b"retained-stage-evidence"
+        );
+    }
+
+    #[test]
+    fn malformed_recovery_temp_name_is_never_treated_as_resumable() {
+        let fixture = cursor_recovery_fixture("recovery-malformed-temp");
+        let malformed = fixture.scope.join(format!(
+            ".{CURSOR_RECOVERY_REWRITE_FILE}.{CURSOR_RECOVERY_REWRITE_TEMP_LABEL}-not-a-sequence"
+        ));
+        fs::write(&malformed, b"forged").expect("write malformed recovery stage");
+        assert!(
+            resume_authorized_cursor_recovery(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .is_err()
+        );
+        assert!(malformed.exists());
+        assert!(
+            CloudFilesNamespaceReconciler::open(&fixture.root.data_dir(), "mount-a", "/services")
+                .is_err()
+        );
+        assert!(malformed.exists());
+    }
+
+    #[test]
+    fn recovery_progress_terminal_and_finalize_are_plan_bound_and_idempotent() {
+        let fixture = cursor_recovery_fixture("recovery-terminal");
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open pristine cut");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply exact rewrite");
+        drop(guard);
+
+        let mut reconciler = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open armed progress");
+        assert!(
+            reconciler
+                .mark_authorized_cursor_recovery_terminal(&fixture.plan)
+                .is_err(),
+            "armed initial state is not terminal"
+        );
+        let original: CloudFilesNamespaceReconciliationState =
+            decode_sobj(&fixture.plan.original_state).expect("decode original state");
+        reconciler
+            .install_full_scan_delta(
+                BTreeMap::new(),
+                Vec::new(),
+                vec!["/services".to_string()],
+                original.cursors,
+                true,
+            )
+            .expect("install terminal authoritative delta");
+        let mut audits = CloudFilesMaterializationAuditIntentStore::open(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+        )
+        .expect("open recovery audit store");
+        audits
+            .acknowledge_directories(["/services"])
+            .expect("acknowledge terminal root audit");
+        drop(audits);
+
+        let terminal = reconciler
+            .mark_authorized_cursor_recovery_terminal(&fixture.plan)
+            .expect("persist exact terminal phase");
+        let replay_terminal = reconciler
+            .resume_authorized_cursor_recovery_terminal_proof(&fixture.plan)
+            .expect("reconstruct finalization capability");
+        assert!(
+            CloudFilesNamespaceReconciler::open(&fixture.root.data_dir(), "mount-a", "/services")
+                .is_err(),
+            "ordinary open remains blocked through Terminal"
+        );
+        assert!(
+            reconciler
+                .finalize_authorized_cursor_recovery_after_ready(
+                    &fixture.plan,
+                    terminal.authorize_after_host_ready_observed(),
+                )
+                .expect("finalize Terminal marker")
+        );
+        assert!(
+            !reconciler
+                .finalize_authorized_cursor_recovery_after_ready(
+                    &fixture.plan,
+                    replay_terminal.authorize_after_host_ready_observed(),
+                )
+                .expect("idempotent finalization replay")
+        );
+        drop(reconciler);
+        drop(
+            CloudFilesNamespaceReconciler::open(&fixture.root.data_dir(), "mount-a", "/services")
+                .expect("ordinary open after exact finalized Terminal"),
+        );
+    }
+
+    #[test]
+    fn partial_authoritative_scan_progress_reopens_only_under_armed_plan() {
+        let fixture = cursor_recovery_fixture("recovery-partial-progress");
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open pristine cut");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply exact rewrite");
+        drop(guard);
+        let mut reconciler = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open armed recovery");
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/remote.txt".to_string(),
+            object_id: "object-remote".to_string(),
+            version: "version-remote".to_string(),
+            content_hash: Some("blake3:remote".to_string()),
+            content_size_bytes: Some(6),
+            kind: "file".to_string(),
+        };
+        reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(entry.path.clone(), entry)]),
+                Vec::new(),
+                vec!["/services".to_string()],
+                BTreeMap::new(),
+                false,
+            )
+            .expect("install partial authoritative page");
+        drop(reconciler);
+        let reopened = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("reopen partial scan progress");
+        assert!(reopened.cursors().is_empty());
+        assert!(reopened.full_scan_request().is_some());
+        assert!(reopened.manifest().contains_key("/services/remote.txt"));
+    }
+
+    #[test]
+    fn cursor_recovery_page_intent_repairs_only_the_three_exact_durable_cuts() {
+        for (name, cut, manifest_committed, state_committed) in [
+            (
+                "recovery-page-before-before",
+                CursorRecoveryPageCrashCut::AfterIntent,
+                false,
+                false,
+            ),
+            (
+                "recovery-page-before-after",
+                CursorRecoveryPageCrashCut::AfterManifest,
+                true,
+                false,
+            ),
+            (
+                "recovery-page-after-after",
+                CursorRecoveryPageCrashCut::AfterState,
+                true,
+                true,
+            ),
+        ] {
+            let fixture = cursor_recovery_fixture(name);
+            let path = "/services/unsupported-link";
+            inject_unsupported_recovery_page_cut(&fixture, cut, path);
+            let intent_path = fixture.scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
+            assert!(intent_path.exists(), "crash cut retains its durable intent");
+
+            let state_at_cut = fs::read(fixture.scope.join(RECONCILIATION_STATE_FILE))
+                .expect("read recovery state at injected cut");
+            let decoded_at_cut: CloudFilesNamespaceReconciliationState =
+                decode_sobj(&state_at_cut).expect("decode state at injected cut");
+            assert_eq!(
+                decoded_at_cut.unsupported_projection_count,
+                if state_committed { 1 } else { 0 },
+                "state image must identify the injected cut"
+            );
+
+            let reopened = open_authorized_cursor_recovery_progress(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("repair exact cursor recovery page cut");
+            assert_eq!(reopened.manifest().contains_key(path), manifest_committed);
+            assert_eq!(
+                reopened.unsupported_projection_count(),
+                if manifest_committed { 1 } else { 0 }
+            );
+            assert_eq!(
+                reopened
+                    .unsupported_projection_examples()
+                    .get(path)
+                    .map(String::as_str),
+                manifest_committed.then_some("symlink")
+            );
+            assert!(reopened.cursors().is_empty());
+            assert!(reopened.full_scan_request().is_some());
+            assert!(
+                !intent_path.exists(),
+                "exact repair must fsync-remove its completed page intent"
+            );
+        }
+    }
+
+    #[test]
+    fn forged_or_multiple_cursor_recovery_page_intents_stop_immutably() {
+        let forged = cursor_recovery_fixture("recovery-page-forged-plan");
+        let forged_path = "/services/forged-link";
+        inject_unsupported_recovery_page_cut(
+            &forged,
+            CursorRecoveryPageCrashCut::AfterManifest,
+            forged_path,
+        );
+        let intent_path = forged.scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
+        let mut intent: CloudFilesCursorRecoveryPageIntent =
+            decode_sobj(&fs::read(&intent_path).expect("read valid page intent before forging"))
+                .expect("decode valid page intent");
+        intent.nonce.push_str("-forged");
+        let forged_bytes =
+            encode_cursor_recovery_page_intent(&intent).expect("encode forged intent");
+        fs::write(&intent_path, &forged_bytes).expect("install forged page intent");
+        let state_before = fs::read(forged.scope.join(RECONCILIATION_STATE_FILE))
+            .expect("state before forged intent admission");
+        let journal_path = forged.scope.join(MANIFEST_DIR).join(MANIFEST_JOURNAL_FILE);
+        let journal_before = fs::read(&journal_path).expect("journal before forged admission");
+        assert!(
+            open_authorized_cursor_recovery_progress(
+                &forged.root.data_dir(),
+                "mount-a",
+                "/services",
+                &forged.plan,
+            )
+            .is_err(),
+            "forged plan binding must stop"
+        );
+        assert_eq!(
+            fs::read(forged.scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&intent_path).expect("retained forged intent"),
+            forged_bytes
+        );
+        assert_eq!(
+            fs::read(&journal_path).expect("unchanged journal"),
+            journal_before
+        );
+
+        let multiple = cursor_recovery_fixture("recovery-page-multiple");
+        inject_unsupported_recovery_page_cut(
+            &multiple,
+            CursorRecoveryPageCrashCut::AfterIntent,
+            "/services/multiple-link",
+        );
+        let final_path = multiple.scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
+        let final_bytes = fs::read(&final_path).expect("read retained page intent");
+        let temp_path = recovery_stage_path(
+            &multiple,
+            CURSOR_RECOVERY_PAGE_INTENT_FILE,
+            CURSOR_RECOVERY_PAGE_INTENT_TEMP_LABEL,
+            91,
+        );
+        fs::write(&temp_path, &final_bytes).expect("write duplicate page-intent stage");
+        let state_before = fs::read(multiple.scope.join(RECONCILIATION_STATE_FILE))
+            .expect("state before multiple-intent admission");
+        assert!(
+            open_authorized_cursor_recovery_progress(
+                &multiple.root.data_dir(),
+                "mount-a",
+                "/services",
+                &multiple.plan,
+            )
+            .is_err(),
+            "multiple page intent objects must stop"
+        );
+        assert_eq!(
+            fs::read(multiple.scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&final_path).expect("retained final intent"),
+            final_bytes
+        );
+        assert_eq!(
+            fs::read(&temp_path).expect("retained intent stage"),
+            final_bytes
+        );
+    }
+
+    #[test]
+    fn ordinary_and_public_open_reject_page_intent_evidence_without_a_plan() {
+        let root = TestRoot::new("recovery-page-no-plan");
+        let reconciler = open_reconciler(&root);
+        let scope = reconciler
+            .state_path()
+            .parent()
+            .expect("reconciliation scope")
+            .to_path_buf();
+        let state_before = fs::read(reconciler.state_path()).expect("state before page evidence");
+        drop(reconciler);
+        let evidence_path = scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
+        fs::write(&evidence_path, b"unbound-page-intent").expect("write unbound page intent");
+
+        assert!(
+            inspect_cursor_only_reconciliation_state(&root.data_dir(), "mount-a", "/services")
+                .is_err(),
+            "public inspection must reject page-intent evidence"
+        );
+        let error =
+            match CloudFilesNamespaceReconciler::open(&root.data_dir(), "mount-a", "/services") {
+                Ok(_) => panic!("ordinary open must reject page-intent evidence"),
+                Err(error) => error,
+            };
+        assert_eq!(error.code, "cursor-recovery-requires-authorized-open");
+        assert_eq!(
+            fs::read(scope.join(RECONCILIATION_STATE_FILE)).expect("unchanged state"),
+            state_before
+        );
+        assert_eq!(
+            fs::read(&evidence_path).expect("retained unbound page intent"),
+            b"unbound-page-intent"
+        );
     }
 
     #[test]
