@@ -6227,15 +6227,15 @@ mod tests {
     struct TestRoot(PathBuf);
 
     impl TestRoot {
-        fn new(name: &str) -> Self {
+        fn new(_name: &str) -> Self {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "sinomo-cloud-files-reconciler-{name}-{}-{suffix}",
-                std::process::id()
-            ));
+            // Reconciliation fixtures add hashed scope names and atomic temp
+            // suffixes below this root. Keep the root short enough for hosts
+            // that still enforce the legacy Windows MAX_PATH limit.
+            let path = std::env::temp_dir().join(format!("cfr-{}-{suffix}", std::process::id()));
             fs::create_dir_all(&path).expect("test root");
             Self(path)
         }

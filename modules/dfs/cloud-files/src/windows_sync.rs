@@ -4424,12 +4424,11 @@ mod tests {
     struct TestRoot(PathBuf);
 
     impl TestRoot {
-        fn new(label: &str) -> Self {
+        fn new(_label: &str) -> Self {
             let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "sinomo-cloud-files-windows-sync-{label}-{}-{sequence}",
-                std::process::id()
-            ));
+            // Worker fixtures inherit the reconciler's deeply nested scope
+            // paths, so avoid spending the Windows path budget on labels.
+            let path = std::env::temp_dir().join(format!("cfw-{}-{sequence}", std::process::id()));
             fs::create_dir_all(&path).expect("create test root");
             Self(path)
         }

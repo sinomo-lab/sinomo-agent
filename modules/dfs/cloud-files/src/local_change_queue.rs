@@ -1981,15 +1981,14 @@ mod tests {
     struct TestRoot(PathBuf);
 
     impl TestRoot {
-        fn new(name: &str) -> Self {
+        fn new(_name: &str) -> Self {
             let suffix = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "sinomo-cloud-files-queue-{name}-{}-{suffix}",
-                std::process::id()
-            ));
+            // Queue fixtures create nested immutable-blob and atomic temp
+            // paths. Keep the root portable to legacy Windows MAX_PATH hosts.
+            let path = std::env::temp_dir().join(format!("cfq-{}-{suffix}", std::process::id()));
             fs::create_dir_all(&path).expect("test root");
             Self(path)
         }
