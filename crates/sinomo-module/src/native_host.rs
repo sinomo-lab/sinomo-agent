@@ -137,6 +137,13 @@ pub struct NativeModule {
     _lifecycle_permit: NativeModuleLifecyclePermit,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeModuleMappingLifetime {
+    Handle,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Process,
+}
+
 #[derive(Default)]
 struct NativeModuleLifecycleGate {
     active: Mutex<bool>,
@@ -230,7 +237,40 @@ impl NativeModule {
     ) -> Result<Self, NativeModuleHostError> {
         let library_path = library_path.as_ref();
         verify_native_module_hash(library_path, expected_content_hash)?;
-        unsafe { Self::load_verified(library_path) }
+        unsafe {
+            Self::load_verified_with_mapping_lifetime(
+                library_path,
+                NativeModuleMappingLifetime::Handle,
+            )
+        }
+    }
+
+    /// Load a trusted, content-addressed native module and keep its Windows
+    /// image mapped until process exit.
+    ///
+    /// This is an intentionally irreversible lifetime policy for a module
+    /// whose own runtime threads can outlive a completed invocation or module
+    /// shutdown. The normal lifecycle hook and callback ownership rules still
+    /// apply; only code/data mapping reclamation is deferred to process exit.
+    /// Do not use this for disposable staged copies which must be deleted in
+    /// the same process.
+    ///
+    /// # Safety
+    ///
+    /// The loaded library can execute arbitrary native code in the host process.
+    #[cfg(windows)]
+    pub unsafe fn load_process_resident_from_content_addressed_path(
+        library_path: impl AsRef<Path>,
+        expected_content_hash: &str,
+    ) -> Result<Self, NativeModuleHostError> {
+        let library_path = library_path.as_ref();
+        verify_native_module_hash(library_path, expected_content_hash)?;
+        unsafe {
+            Self::load_verified_with_mapping_lifetime(
+                library_path,
+                NativeModuleMappingLifetime::Process,
+            )
+        }
     }
 
     /// Load a native module after the caller has already verified its bytes.
@@ -242,7 +282,18 @@ impl NativeModule {
     pub unsafe fn load_verified(
         library_path: impl AsRef<Path>,
     ) -> Result<Self, NativeModuleHostError> {
-        let library_path = library_path.as_ref();
+        unsafe {
+            Self::load_verified_with_mapping_lifetime(
+                library_path.as_ref(),
+                NativeModuleMappingLifetime::Handle,
+            )
+        }
+    }
+
+    unsafe fn load_verified_with_mapping_lifetime(
+        library_path: &Path,
+        mapping_lifetime: NativeModuleMappingLifetime,
+    ) -> Result<Self, NativeModuleHostError> {
         let lifecycle_permit = native_module_lifecycle_gate(library_path)?.acquire()?;
         let library = unsafe { load_native_module_library(library_path) }?;
         let api_version = unsafe { native_module_api_version(&library, library_path) }?;
@@ -275,6 +326,10 @@ impl NativeModule {
                 library_path,
             )?
         };
+
+        let library = apply_native_module_mapping_lifetime(library, mapping_lifetime, |library| {
+            pin_native_module_library_until_process_exit(library, library_path)
+        })?;
 
         let callbacks = Box::new(NativeModuleHostCallbackState::default());
         let host_api = SinomoModuleHostApiV2 {
@@ -329,6 +384,43 @@ impl NativeModule {
         validate_descriptor(&descriptor)?;
         Ok(descriptor)
     }
+}
+
+fn apply_native_module_mapping_lifetime<T, E>(
+    value: T,
+    lifetime: NativeModuleMappingLifetime,
+    make_process_resident: impl FnOnce(T) -> Result<T, E>,
+) -> Result<T, E> {
+    match lifetime {
+        NativeModuleMappingLifetime::Handle => Ok(value),
+        NativeModuleMappingLifetime::Process => make_process_resident(value),
+    }
+}
+
+#[cfg(windows)]
+fn pin_native_module_library_until_process_exit(
+    library: Library,
+    library_path: &Path,
+) -> Result<Library, NativeModuleHostError> {
+    let platform_library: libloading::os::windows::Library = library.into();
+    let pin_result = platform_library.pin();
+    let library = Library::from(platform_library);
+    pin_result
+        .map(|()| library)
+        .map_err(|source| NativeModuleHostError::Load {
+            path: library_path.display().to_string(),
+            detail: format!("pin native module mapping until process exit: {source}"),
+        })
+}
+
+#[cfg(not(windows))]
+fn pin_native_module_library_until_process_exit(
+    _library: Library,
+    _library_path: &Path,
+) -> Result<Library, NativeModuleHostError> {
+    Err(NativeModuleHostError::Unavailable(
+        "process-resident native module mappings are only supported on Windows".to_string(),
+    ))
 }
 
 unsafe fn load_native_module_library(
@@ -630,8 +722,62 @@ unsafe fn copy_and_free_buffer(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn mapping_lifetime_only_pins_process_resident_modules() {
+        let pin_calls = AtomicUsize::new(0);
+        let ordinary = apply_native_module_mapping_lifetime(
+            "ordinary",
+            NativeModuleMappingLifetime::Handle,
+            |value| {
+                pin_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(value)
+            },
+        )
+        .expect("ordinary mapping");
+        assert_eq!(ordinary, "ordinary");
+        assert_eq!(pin_calls.load(Ordering::SeqCst), 0);
+
+        let resident = apply_native_module_mapping_lifetime(
+            "resident",
+            NativeModuleMappingLifetime::Process,
+            |value| {
+                pin_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, ()>(value)
+            },
+        )
+        .expect("process-resident mapping");
+        assert_eq!(resident, "resident");
+        assert_eq!(pin_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn process_resident_mapping_fails_closed_when_pinning_fails() {
+        let error = apply_native_module_mapping_lifetime(
+            "resident",
+            NativeModuleMappingLifetime::Process,
+            |_value| Err::<&str, _>("pin failed"),
+        )
+        .expect_err("failed pin must reject the module");
+        assert_eq!(error, "pin failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_resident_mapping_pins_the_loaded_image() {
+        let process_image = libloading::os::windows::Library::this()
+            .expect("obtain the current process image handle");
+        let library = Library::from(process_image);
+        let library = pin_native_module_library_until_process_exit(
+            library,
+            Path::new("current process image"),
+        )
+        .expect("pin the current process image");
+        drop(library);
+    }
 
     #[test]
     fn same_library_lifecycle_gate_serializes_callback_state_ownership() {

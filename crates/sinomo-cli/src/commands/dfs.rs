@@ -2810,7 +2810,10 @@ fn run_dfs_cloud_files_mount_command(options: DfsHostMountOptions) -> Result<(),
         &state.library_name,
     );
     let module = unsafe {
-        NativeModule::load_from_content_addressed_path(&library_path, &state.content_hash)
+        NativeModule::load_process_resident_from_content_addressed_path(
+            &library_path,
+            &state.content_hash,
+        )
     }
     .map_err(|source| CliError::Parse {
         detail: format!("load Cloud Files native module: {source}"),

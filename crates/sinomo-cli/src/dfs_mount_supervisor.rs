@@ -3195,7 +3195,10 @@ fn start_platform_mount(
         |error| format!("stage durable Cloud Files unregister provider before mount: {error}"),
     )?;
     let module = unsafe {
-        NativeModule::load_from_content_addressed_path(&library_path, &state.content_hash)
+        NativeModule::load_process_resident_from_content_addressed_path(
+            &library_path,
+            &state.content_hash,
+        )
     }
     .map_err(|error| format!("load Cloud Files native module: {error}"))?;
     let request = CloudFilesMountRequest {
