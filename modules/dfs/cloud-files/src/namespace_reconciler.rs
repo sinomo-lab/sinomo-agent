@@ -459,7 +459,8 @@ impl CloudFilesCursorOnlyReconciliationInspectionGuard {
                 "authorized recovery cursor set differs from the locked inspection",
             ));
         }
-        let cut = inspect_authorized_cursor_recovery_cut(&self.inspection.scope_path, plan)?;
+        let cut =
+            inspect_authorized_cursor_recovery_cut(&self.inspection.scope_path, plan, &self._lock)?;
         for path in &cut.temp_paths {
             durable_file::remove_file_if_exists_and_sync_parent(path)
                 .map_err(storage_error("remove authorized cursor recovery stage"))?;
@@ -933,6 +934,7 @@ struct AuthorizedCursorRecoveryCut {
 fn inspect_authorized_cursor_recovery_cut(
     scope: &Path,
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    reconciliation_lock: &File,
 ) -> Result<AuthorizedCursorRecoveryCut, CloudFilesNamespaceReconcileError> {
     let mut raw_files = BTreeMap::new();
     let mut state_bytes = None;
@@ -978,8 +980,16 @@ fn inspect_authorized_cursor_recovery_cut(
                 audit_bytes = Some(bytes);
             }
             RECONCILIATION_LOCK_FILE if metadata.file_type().is_file() => {
-                let bytes = read_bounded_plain_file(&path, 0, "authorized reconciliation lock")?;
-                raw_files.insert(name, bytes);
+                let lock_metadata = reconciliation_lock
+                    .metadata()
+                    .map_err(io_error("inspect locked authorized reconciliation lock"))?;
+                if lock_metadata.len() != 0 {
+                    return Err(reconcile_error(
+                        "cursor-recovery-reconciliation-lock",
+                        "authorized reconciliation lock file is not empty",
+                    ));
+                }
+                raw_files.insert(name, Vec::new());
                 saw_lock = true;
             }
             MANIFEST_DIR if metadata.file_type().is_dir() => {
@@ -4681,7 +4691,7 @@ pub(crate) fn resume_authorized_cursor_recovery(
             format!("namespace reconciler is live: {source}"),
         )
     })?;
-    let cut = inspect_authorized_cursor_recovery_cut(&scope, plan)?;
+    let cut = inspect_authorized_cursor_recovery_cut(&scope, plan, &lock)?;
     Ok(CloudFilesCursorOnlyReconciliationInspectionGuard {
         inspection: CloudFilesCursorOnlyReconciliationInspection {
             scope_path: scope,
