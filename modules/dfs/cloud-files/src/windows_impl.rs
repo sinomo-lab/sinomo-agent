@@ -22,16 +22,14 @@ use sinomo_dfs_cloud_files_api::{
     SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
 };
 use sinomo_module_api::{decode_sobj, encode_sobj};
-use sinomo_runtime::api::{DaemonApiClient, DaemonPaths};
-use sinomo_runtime::daemon;
+use sinomo_runtime::api::DaemonDfsPeerTransport;
 use sinomo_runtime::dfs::{
-    self, DfsControlPlaneKvClient, DfsMessageResponse, DfsMessageTransport, DfsObjectKind,
-    DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError, DfsPosixError, DfsRoutedCall,
-    DfsRoutedMessage, DfsTransportIdentity, LocalContentStore, MountedSifsControlPlaneKvClient,
-    NetworkedDfsService,
+    self, DfsControlPlaneKvClient, DfsMessageTransport, DfsObjectKind, DfsObjectRpcSendOptions,
+    DfsPeerTransport, DfsPosixError, DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity,
+    LocalContentStore, MountedSifsControlPlaneKvClient, NetworkedDfsService,
 };
 use sinomo_runtime::local::SinomoDataDir;
-use sinomo_runtime::network::{self, NetworkError, ObjectRpcCall, ObjectRpcResult};
+use sinomo_runtime::network::{self, NetworkError};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, HANDLE, NTSTATUS, STATUS_CANCELLED,
@@ -2788,18 +2786,17 @@ struct OpenedSifsService {
 fn open_sifs_service(
     data_dir_root: Option<PathBuf>,
 ) -> Result<OpenedSifsService, CloudFilesModuleError> {
-    // This cdylib links its own copy of sinomo-network, so the host's cluster
-    // directory install never reaches this image; without an in-module install
-    // every directory read (endpoint selection, route hydration) comes back
-    // empty.
+    // This cdylib links its own copy of sinomo-network, so install the cluster
+    // directory in this image before any runtime-owned route hydration.
     sinomo_runtime::cluster::install_kv_cluster_directory();
     let data_dir = resolve_data_dir(data_dir_root)?;
     data_dir.ensure_root_layout().map_err(error("local-data"))?;
-    let replica_candidates =
-        dfs::discover_mounted_sifs_content_replica_candidates(&data_dir).map_err(error("dfs"))?;
     let cluster_paths = network::ClusterPaths::new(&data_dir);
     let cluster_state = if cluster_paths.state.exists() {
-        sinomo_runtime::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
+        Some(
+            sinomo_runtime::cluster::read_cluster_state_without_kv(&cluster_paths)
+                .map_err(error("network"))?,
+        )
     } else {
         None
     };
@@ -2820,18 +2817,25 @@ fn open_sifs_service(
         .unwrap_or_default();
     let content =
         LocalContentStore::new(data_dir.dfs_dir().join("content")).map_err(error("dfs"))?;
-    let control_plane = cluster_state.as_ref().map(|_| {
-        let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(DfsCloudFilesKvPeerTransport {
-            data_dir: data_dir.clone(),
-            local_node_id: local_node_id.clone(),
-        });
+    let daemon_peer = cluster_state
+        .as_ref()
+        .map(|_| DaemonDfsPeerTransport::connect(data_dir.clone()).map(Arc::new))
+        .transpose()
+        .map_err(error("network"))?;
+    let control_plane = daemon_peer.as_ref().map(|peer_transport| {
+        let peer_transport: Arc<dyn DfsPeerTransport> = peer_transport.clone();
         MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths.clone(), peer_transport)
     });
+    let replica_candidates = mounted_content_replica_candidates(
+        cluster_state.is_some(),
+        &local_node_id,
+        control_plane.as_ref(),
+    )?;
     let mut service = NetworkedDfsService::new(
         DfsCloudFilesEndpointTransport::new(
             local_node_id,
-            cluster_paths.clone(),
             known_remote_nodes,
+            daemon_peer.map(|peer| peer as Arc<dyn DfsPeerTransport>),
         ),
         content,
     );
@@ -2848,6 +2852,40 @@ fn open_sifs_service(
         service,
         replica_candidates,
     })
+}
+
+fn mounted_content_replica_candidates(
+    clustered: bool,
+    local_node_id: &NodeId,
+    control_plane: Option<&MountedSifsControlPlaneKvClient>,
+) -> Result<Vec<NodeId>, CloudFilesModuleError> {
+    if !clustered {
+        return Ok(vec![local_node_id.clone()]);
+    }
+    let control_plane = control_plane.ok_or_else(|| CloudFilesModuleError {
+        code: "network".to_string(),
+        detail: "clustered Cloud Files requires an authoritative DFS control-plane client"
+            .to_string(),
+    })?;
+    let entries = control_plane
+        .range_prefix(dfs::content_services_prefix())
+        .map_err(error("network"))?;
+    Ok(mounted_content_replica_candidates_from_entries(entries))
+}
+
+fn mounted_content_replica_candidates_from_entries(
+    entries: impl IntoIterator<Item = sinomo_runtime::kv::KvEntry>,
+) -> Vec<NodeId> {
+    let mut candidates = Vec::new();
+    for advertisement in entries
+        .into_iter()
+        .filter_map(|entry| entry.decode::<dfs::DfsNodeAdvertisement>().ok())
+    {
+        if advertisement.accepts_content && !candidates.contains(&advertisement.node_id) {
+            candidates.push(advertisement.node_id);
+        }
+    }
+    candidates
 }
 
 fn open_metadata_backend(
@@ -2887,51 +2925,11 @@ fn open_metadata_backend(
         .map_err(error("dfs"))
 }
 
-#[derive(Clone, Debug)]
-struct DfsCloudFilesKvPeerTransport {
-    data_dir: SinomoDataDir,
-    local_node_id: NodeId,
-}
-
-impl DfsPeerTransport for DfsCloudFilesKvPeerTransport {
-    fn call_object_rpc(
-        &self,
-        target_node_id: &NodeId,
-        call: ObjectRpcCall,
-        options: DfsObjectRpcSendOptions,
-    ) -> std::result::Result<ObjectRpcResult, DfsPeerTransportError> {
-        if target_node_id != &self.local_node_id {
-            return Err(DfsPeerTransportError::new(format!(
-                "Cloud Files KV control-plane call targeted non-local node {target_node_id}"
-            )));
-        }
-        if !call.body.is_empty() {
-            return Err(DfsPeerTransportError::new(
-                "Cloud Files KV control-plane call unexpectedly carried a streamed body",
-            ));
-        }
-        let timeout = options
-            .overall_timeout
-            .unwrap_or(network::DEFAULT_NETWORK_TIMEOUT)
-            .min(CLOUD_FILES_DFS_CALL_TIMEOUT);
-        let client = DaemonApiClient::connect_for_paths_with_timeout(
-            &DaemonPaths::new(&self.data_dir),
-            options.connect_timeout,
-        )
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()))?
-        .with_timeout(timeout);
-        client
-            .call_request(&call.request)
-            .map(ObjectRpcResult::value)
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
-    }
-}
-
 #[derive(Clone)]
 struct DfsCloudFilesEndpointTransport {
     local_node_id: NodeId,
-    cluster_paths: network::ClusterPaths,
     known_remote_nodes: BTreeSet<NodeId>,
+    daemon_peer: Option<Arc<dyn DfsPeerTransport>>,
     incoming_messages: VecDeque<DfsRoutedMessage>,
     operation_deadline: Option<Instant>,
 }
@@ -2941,7 +2939,6 @@ impl std::fmt::Debug for DfsCloudFilesEndpointTransport {
         formatter
             .debug_struct("DfsCloudFilesEndpointTransport")
             .field("local_node_id", &self.local_node_id)
-            .field("cluster_paths", &self.cluster_paths)
             .field("known_remote_nodes", &self.known_remote_nodes)
             .field("incoming_messages", &self.incoming_messages)
             .field("operation_deadline", &self.operation_deadline)
@@ -2952,8 +2949,8 @@ impl std::fmt::Debug for DfsCloudFilesEndpointTransport {
 impl DfsCloudFilesEndpointTransport {
     fn new(
         local_node_id: NodeId,
-        cluster_paths: network::ClusterPaths,
         known_remote_nodes: impl IntoIterator<Item = NodeId>,
+        daemon_peer: Option<Arc<dyn DfsPeerTransport>>,
     ) -> Self {
         Self {
             known_remote_nodes: known_remote_nodes
@@ -2961,7 +2958,7 @@ impl DfsCloudFilesEndpointTransport {
                 .filter(|node_id| node_id != &local_node_id)
                 .collect(),
             local_node_id,
-            cluster_paths,
+            daemon_peer,
             incoming_messages: VecDeque::new(),
             operation_deadline: None,
         }
@@ -2988,6 +2985,28 @@ impl DfsCloudFilesEndpointTransport {
             connect_timeout: Some(connect_timeout),
             idle_timeout: Some(idle_timeout),
         })
+    }
+
+    fn send_options(&self) -> std::result::Result<DfsObjectRpcSendOptions, NetworkError> {
+        let timeouts = self.send_timeouts()?;
+        let mut options = DfsObjectRpcSendOptions::new(
+            timeouts
+                .connect_timeout
+                .unwrap_or(network::DEFAULT_NETWORK_TIMEOUT),
+        );
+        if let Some(deadline) = self.operation_deadline {
+            let Some(remaining) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+            else {
+                return Err(NetworkError::Io {
+                    operation: "send Cloud Files DFS message".to_string(),
+                    detail: "DFS operation deadline expired before endpoint send".to_string(),
+                });
+            };
+            options = options.with_overall_timeout(remaining.min(CLOUD_FILES_DFS_CALL_TIMEOUT));
+        }
+        Ok(options)
     }
 
     fn deliver_returned_message(
@@ -3040,12 +3059,24 @@ impl DfsCloudFilesEndpointTransport {
             });
         }
         let (_, call) = dfs::dfs_routed_call_rpc_call(call)?;
-        let response = send_dfs_rpc_call(
-            &self.cluster_paths,
-            target_node_id,
-            call,
-            self.send_timeouts()?,
-        )?;
+        let peer = self.daemon_peer.as_ref().ok_or_else(|| NetworkError::Io {
+            operation: "send Cloud Files DFS message".to_string(),
+            detail: "clustered Cloud Files requires the local daemon DFS service path".to_string(),
+        })?;
+        let options = self.send_options()?;
+        let response = peer
+            .call_object_rpc(target_node_id, call, options)
+            .map_err(|source| NetworkError::Io {
+                operation: format!("send Cloud Files DFS call to {target_node_id}"),
+                detail: source.to_string(),
+            })?;
+        let response =
+            dfs::dfs_message_response_from_rpc_result_sync(response).map_err(|source| {
+                NetworkError::Io {
+                    operation: format!("decode Cloud Files DFS response from {target_node_id}"),
+                    detail: source.to_string(),
+                }
+            })?;
         for returned_message in response.outbound_messages {
             self.deliver_returned_message(returned_message)?;
         }
@@ -3083,82 +3114,6 @@ impl DfsMessageTransport for DfsCloudFilesEndpointTransport {
     fn operation_deadline(&self) -> Option<Instant> {
         self.operation_deadline
     }
-}
-
-fn send_dfs_rpc_call(
-    cluster_paths: &network::ClusterPaths,
-    target_node_id: &NodeId,
-    call: network::ObjectRpcCall,
-    timeouts: network::DaemonRpcTimeouts,
-) -> std::result::Result<DfsMessageResponse, NetworkError> {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        return if matches!(
-            handle.runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
-            let runtime = handle.clone();
-            let runtime_for_future = runtime.clone();
-            tokio::task::block_in_place(|| {
-                runtime.block_on(send_dfs_rpc_call_async(
-                    cluster_paths,
-                    target_node_id,
-                    call,
-                    timeouts,
-                    &runtime_for_future,
-                ))
-            })
-        } else {
-            Err(NetworkError::Io {
-                operation: "send Cloud Files DFS RPC".to_string(),
-                detail: "Cloud Files DFS sync transport cannot run inside a current-thread Tokio runtime"
-                    .to_string(),
-            })
-        };
-    }
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| NetworkError::Io {
-            operation: "create Cloud Files DFS client runtime".to_string(),
-            detail: source.to_string(),
-        })?;
-    let output = runtime.block_on(send_dfs_rpc_call_async(
-        cluster_paths,
-        target_node_id,
-        call,
-        timeouts,
-        runtime.handle(),
-    ));
-    runtime.shutdown_timeout(Duration::from_millis(250));
-    output
-}
-
-async fn send_dfs_rpc_call_async(
-    cluster_paths: &network::ClusterPaths,
-    target_node_id: &NodeId,
-    call: network::ObjectRpcCall,
-    timeouts: network::DaemonRpcTimeouts,
-    runtime: &tokio::runtime::Handle,
-) -> std::result::Result<DfsMessageResponse, NetworkError> {
-    let result = daemon::send_object_rpc_call_to_target_async_with_cluster_paths_and_options(
-        cluster_paths,
-        target_node_id,
-        call,
-        network::ClusterObjectRpcOptions::new(timeouts),
-        runtime,
-        true,
-    )
-    .await
-    .map_err(|source| NetworkError::Io {
-        operation: format!("send Cloud Files DFS call to {target_node_id}"),
-        detail: source.to_string(),
-    })?;
-    dfs::dfs_message_response_from_rpc_result(result)
-        .await
-        .map_err(|source| NetworkError::Io {
-            operation: format!("decode Cloud Files DFS response from {target_node_id}"),
-            detail: source.to_string(),
-        })
 }
 
 fn normalize_sifs_root(path: &str) -> Result<String, CloudFilesModuleError> {
@@ -3255,6 +3210,78 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinomo_runtime::dfs::DfsMessageResponse;
+    use sinomo_runtime::network::{ObjectRpcCall, ObjectRpcResponse, ObjectRpcResult};
+
+    #[derive(Debug)]
+    struct RecordingCloudFilesDaemonPeer {
+        calls: Mutex<Vec<(NodeId, Vec<u8>, DfsObjectRpcSendOptions)>>,
+        response: Mutex<Option<ObjectRpcResult>>,
+    }
+
+    impl DfsPeerTransport for RecordingCloudFilesDaemonPeer {
+        fn call_object_rpc(
+            &self,
+            target_node_id: &NodeId,
+            call: ObjectRpcCall,
+            options: DfsObjectRpcSendOptions,
+        ) -> std::result::Result<ObjectRpcResult, dfs::DfsPeerTransportError> {
+            let body = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|source| dfs::DfsPeerTransportError::new(source.to_string()))?
+                .block_on(call.body.collect_to_vec(1024))
+                .map_err(|source| dfs::DfsPeerTransportError::new(source.to_string()))?;
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((target_node_id.clone(), body, options));
+            self.response
+                .lock()
+                .expect("response")
+                .take()
+                .ok_or_else(|| dfs::DfsPeerTransportError::new("missing test response"))
+        }
+    }
+
+    fn read_request_message(source: &NodeId, target: &NodeId, frame_id: u64) -> DfsRoutedMessage {
+        DfsRoutedMessage {
+            source_node_id: source.clone(),
+            target_node_id: target.clone(),
+            frame_id,
+            message_id: frame_id,
+            message: dfs::DfsNetworkMessage::ReadRequest(dfs::DfsReadRequest {
+                request_id: format!("cloud-files-read-{frame_id}"),
+                object_id: dfs::DfsObjectId::from_legacy_named(format!(
+                    "cloud_files_read_object_{frame_id}"
+                ))
+                .expect("object id"),
+                version: None,
+                content_hash: None,
+                content_size_bytes: None,
+                range_offset: None,
+                range_max_bytes: None,
+            }),
+        }
+    }
+
+    fn test_kv_entry(
+        key: &str,
+        advertisement: Option<&dfs::DfsNodeAdvertisement>,
+    ) -> sinomo_runtime::kv::KvEntry {
+        sinomo_runtime::kv::KvEntry {
+            key: key.to_string(),
+            value: advertisement
+                .map(sinomo_runtime::kv::encode_kv_value)
+                .transpose()
+                .expect("encode advertisement")
+                .unwrap_or_else(|| b"not-an-advertisement".to_vec()),
+            create_revision: sinomo_runtime::kv::KvRevision(1),
+            modify_revision: sinomo_runtime::kv::KvRevision(1),
+            version: sinomo_runtime::kv::KvVersion(1),
+            lease_id: None,
+        }
+    }
 
     #[test]
     fn hydration_plan_uses_bounded_aligned_chunks_and_exact_callback_range() {
@@ -3397,17 +3424,16 @@ mod tests {
     #[test]
     fn cloud_files_transport_uses_shared_default_health_timeout() {
         let local = NodeId::from_legacy_named("cloud_files_timeout_local").expect("local");
-        let data_dir = SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-timeout"));
-        let mut transport = DfsCloudFilesEndpointTransport::new(
-            local,
-            network::ClusterPaths::new(&data_dir),
-            Vec::new(),
-        );
+        let mut transport = DfsCloudFilesEndpointTransport::new(local, Vec::new(), None);
 
         let ordinary = transport.send_timeouts().expect("ordinary timeouts");
         assert_eq!(
             ordinary,
-            network::DaemonRpcTimeouts::connect_and_idle(network::DEFAULT_NETWORK_TIMEOUT)
+            network::DaemonRpcTimeouts::connect_and_idle(CLOUD_FILES_DFS_CALL_TIMEOUT)
+        );
+        assert_eq!(
+            transport.send_options().expect("ordinary options"),
+            DfsObjectRpcSendOptions::new(CLOUD_FILES_DFS_CALL_TIMEOUT)
         );
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -3426,19 +3452,149 @@ mod tests {
                 .idle_timeout
                 .is_some_and(|timeout| timeout <= Duration::from_secs(2))
         );
+        let bounded_options = transport.send_options().expect("bounded options");
+        assert!(
+            bounded_options.connect_timeout <= Duration::from_secs(2)
+                && bounded_options
+                    .overall_timeout
+                    .is_some_and(|timeout| timeout <= Duration::from_secs(2))
+        );
         assert_eq!(transport.set_operation_deadline(None), Some(deadline));
         assert_eq!(transport.operation_deadline(), None);
     }
 
     #[test]
-    fn cloud_files_transport_queues_local_value_calls_without_network_routing() {
-        let local = NodeId::from_legacy_named("cloud_files_loopback_value").expect("local");
-        let data_dir = SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-loopback"));
+    fn cloud_files_transport_delegates_remote_attachment_to_daemon_peer() {
+        let local = NodeId::from_legacy_named("cloud_files_daemon_peer_local").expect("local");
+        let remote = NodeId::from_legacy_named("cloud_files_daemon_peer_remote").expect("remote");
+        let returned = DfsRoutedMessage {
+            source_node_id: remote.clone(),
+            target_node_id: local.clone(),
+            frame_id: 109,
+            message_id: 109,
+            message: dfs::DfsNetworkMessage::ReadResponse(dfs::DfsReadResponse {
+                request_id: "cloud-files-daemon-peer-return".to_string(),
+                object_id: dfs::DfsObjectId::from_legacy_named(
+                    "cloud_files_daemon_peer_return_object",
+                )
+                .expect("object id"),
+                result: dfs::DfsReadResult::NotFound,
+            }),
+        };
+        let response = ObjectRpcResponse::encode_body(
+            dfs::DFS_DATA_STAGE_BLOB_RESPONSE_ROUTE,
+            &DfsMessageResponse {
+                request_id: "dfs_message_107".to_string(),
+                outbound_messages: vec![returned.clone()],
+            },
+        )
+        .expect("encode response");
+        let peer = Arc::new(RecordingCloudFilesDaemonPeer {
+            calls: Mutex::new(Vec::new()),
+            response: Mutex::new(Some(ObjectRpcResult::value(response))),
+        });
         let mut transport = DfsCloudFilesEndpointTransport::new(
             local.clone(),
-            network::ClusterPaths::new(&data_dir),
-            Vec::new(),
+            vec![remote.clone()],
+            Some(peer.clone()),
         );
+        let bytes = b"cloud-files-daemon-peer-attachment".to_vec();
+        let message = DfsRoutedMessage {
+            source_node_id: local.clone(),
+            target_node_id: remote.clone(),
+            frame_id: 107,
+            message_id: 107,
+            message: dfs::DfsNetworkMessage::StageBlob(dfs::DfsStageBlobCommand {
+                request_id: "cloud-files-daemon-peer-stage".to_string(),
+                intent_id: "cloud-files-daemon-peer-intent".to_string(),
+                file_system_id: dfs::sifs_file_system_id(),
+                object_id: dfs::DfsObjectId::from_legacy_named(
+                    "cloud_files_daemon_peer_stage_object",
+                )
+                .expect("object id"),
+                expected_base_version: None,
+                version: dfs::DfsVersion::from_legacy_named(
+                    "cloud_files_daemon_peer_stage_version",
+                )
+                .expect("version"),
+                content_hash: "cloud-files-daemon-peer-content".to_string(),
+                bytes: Vec::new(),
+                object_metadata: None,
+                authority_shard: None,
+            }),
+        };
+
+        transport
+            .send_routed_call(
+                &remote,
+                DfsRoutedCall::with_attachment(
+                    message,
+                    dfs::DfsOutboundAttachment::from_bytes(
+                        bytes.clone(),
+                        "cloud-files-daemon-peer-content",
+                    ),
+                ),
+            )
+            .expect("delegate through daemon peer");
+
+        assert_eq!(
+            *peer.calls.lock().expect("calls"),
+            vec![(
+                remote,
+                bytes,
+                DfsObjectRpcSendOptions::new(CLOUD_FILES_DFS_CALL_TIMEOUT),
+            )]
+        );
+        assert_eq!(
+            transport
+                .drain_incoming_messages()
+                .expect("returned local message"),
+            vec![returned]
+        );
+    }
+
+    #[test]
+    fn cloud_files_transport_fails_closed_without_daemon_peer() {
+        let local = NodeId::from_legacy_named("cloud_files_no_peer_local").expect("local");
+        let remote = NodeId::from_legacy_named("cloud_files_no_peer_remote").expect("remote");
+        let mut transport =
+            DfsCloudFilesEndpointTransport::new(local.clone(), vec![remote.clone()], None);
+
+        let error = transport
+            .send_routed_call(
+                &remote,
+                DfsRoutedCall::value(read_request_message(&local, &remote, 111)),
+            )
+            .expect_err("missing daemon peer must fail closed");
+        assert!(error.to_string().contains("local daemon DFS service path"));
+    }
+
+    #[test]
+    fn cloud_files_replica_candidates_preserve_order_filter_and_deduplicate() {
+        let first = NodeId::from_legacy_named("cloud_files_candidate_first").expect("first");
+        let second = NodeId::from_legacy_named("cloud_files_candidate_second").expect("second");
+        let rejected =
+            NodeId::from_legacy_named("cloud_files_candidate_rejected").expect("rejected");
+        let first_advertisement = dfs::DfsNodeAdvertisement::content(first.clone());
+        let second_advertisement = dfs::DfsNodeAdvertisement::content(second.clone());
+        let mut rejected_advertisement = dfs::DfsNodeAdvertisement::content(rejected);
+        rejected_advertisement.accepts_content = false;
+
+        let candidates = mounted_content_replica_candidates_from_entries([
+            test_kv_entry("first", Some(&first_advertisement)),
+            test_kv_entry("invalid", None),
+            test_kv_entry("rejected", Some(&rejected_advertisement)),
+            test_kv_entry("first-duplicate", Some(&first_advertisement)),
+            test_kv_entry("second", Some(&second_advertisement)),
+        ]);
+
+        assert_eq!(candidates, vec![first, second]);
+    }
+
+    #[test]
+    fn cloud_files_transport_queues_local_value_calls_without_network_routing() {
+        let local = NodeId::from_legacy_named("cloud_files_loopback_value").expect("local");
+        let mut transport = DfsCloudFilesEndpointTransport::new(local.clone(), Vec::new(), None);
         let message = DfsRoutedMessage {
             source_node_id: local.clone(),
             target_node_id: local.clone(),
@@ -3471,13 +3627,7 @@ mod tests {
     #[test]
     fn cloud_files_transport_materializes_local_attachments_before_queueing() {
         let local = NodeId::from_legacy_named("cloud_files_loopback_attachment").expect("local");
-        let data_dir =
-            SinomoDataDir::new(std::env::temp_dir().join("sinomo-cloud-files-loopback-attachment"));
-        let mut transport = DfsCloudFilesEndpointTransport::new(
-            local.clone(),
-            network::ClusterPaths::new(&data_dir),
-            Vec::new(),
-        );
+        let mut transport = DfsCloudFilesEndpointTransport::new(local.clone(), Vec::new(), None);
         let bytes = b"cloud-files-loopback-attachment".to_vec();
         let message = DfsRoutedMessage {
             source_node_id: local.clone(),
