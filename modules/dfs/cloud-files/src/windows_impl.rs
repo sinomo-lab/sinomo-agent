@@ -3014,7 +3014,16 @@ where
                 let exact_redundant_normalized_temp = journal_snapshot.current.as_ref()
                     == Some(&ordinary_ready)
                     && journal_snapshot.temporary.as_ref() == Some(&ordinary_ready);
-                if exact_normalization_temp || exact_redundant_normalized_temp {
+                if exact_normalization_temp {
+                    promote_cursor_recovery_artifact_temp(
+                        &journal_temp_path,
+                        &journal_path,
+                        "registration-journal",
+                        "normalized Cloud Files registration journal",
+                    )?;
+                    continue;
+                }
+                if exact_redundant_normalized_temp {
                     promote_exact_registration_artifact(
                         &journal_path,
                         &journal_temp_path,
