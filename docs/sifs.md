@@ -78,10 +78,13 @@ sinomo dfs mount <mount-point> [--root <sifs-path>]
 Unix uses FUSE where supported. Windows uses the Cloud Files integration. Both
 adapters preserve the same SIFS namespace and policy model.
 
-Content writes and namespace mutations route to the responsible metadata-shard
-primary. Successful responses carry enough metadata progress for the caller to
-read its own write. Large recursive clears, directory renames, and cross-shard
-changes run as bounded durable jobs so they can resume after restart.
+Canonical DFS content writes and namespace mutations route to the responsible
+metadata-shard primary. Once an adapter publishes an operation through that
+path, a successful response carries enough metadata progress for the caller to
+read its own write. A platform adapter can have an earlier, process-local
+acknowledgement boundary; the current FUSE write buffer is described below.
+Large recursive clears, directory renames, and cross-shard changes run as
+bounded durable jobs so they can resume after restart.
 
 SIFS is POSIX-like, with deliberate distributed-system differences:
 
@@ -100,13 +103,21 @@ SIFS is POSIX-like, with deliberate distributed-system differences:
   waits are bounded by durable cancellation and leases, although the current
   `fuser` dependency does not expose kernel `FUSE_INTERRUPT` requests, so a
   signal cannot yet cancel an individual `F_SETLKW` wait immediately.
-- FUSE writes publish to the canonical DFS path before returning; `flush` and
-  close therefore have no private byte buffer to publish and remain
-  non-durability barriers. `O_DSYNC` and `O_SYNC` writes invoke the file-data
-  and full-file barriers respectively. Explicit `fsync`, `fdatasync`, and
-  directory `fsync` require the current metadata authority and a
-  recovery-capable quorum certificate; they fail rather than weakening
-  durability when quorum is unavailable.
+- Ordinary FUSE writes may return after copying bytes into a process-local,
+  per-handle dirty buffer, before those bytes are published to canonical DFS.
+  The current implementation bounds that buffer at 64 MiB per handle; pressure
+  publishes existing ranges, while an individual write larger than the bound
+  publishes directly. `flush` and close publish that handle's pending ranges
+  and report publication failures, but they are not durability barriers.
+  `O_DSYNC` and `O_SYNC` first publish earlier buffered writes for the object,
+  publish the current write, and then invoke the file-data or full-file barrier
+  respectively. Explicit `fdatasync` and `fsync` first publish every dirty
+  handle for the object and then require the current metadata authority and a
+  recovery-capable quorum certificate. Directory `fsync` applies the
+  corresponding namespace barrier. These operations fail rather than
+  weakening durability when quorum is unavailable. A mount-process crash can
+  lose ordinary writes that returned while they existed only in the dirty
+  buffer.
 - Timestamps originate on individual nodes, so cross-node ordering is subject
   to clock skew.
 

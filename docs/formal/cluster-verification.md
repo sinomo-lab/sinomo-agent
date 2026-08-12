@@ -1107,6 +1107,13 @@ exceeding the clock-skew assumption invalidates the refinement claim.
 The `dfs_posix_fsync_safety.safety` invariant separates returned, visible,
 receipt-durable, metadata-certified, and canonical file prefixes:
 
+For its refinement to the current FUSE adapter, the model's returned-write
+transition corresponds to successful canonical DFS publication; it does not
+include a successful FUSE write syscall whose bytes remain only in the
+process-local dirty buffer. That prepublication interval, including loss on
+mount-process crash, is outside the invariant. FUSE `fdatasync` and `fsync`
+drain those buffered writes before entering the modeled barrier.
+
 - `fsync` and `fdatasync` freeze the returned-write prefix at call time, so a
   later write is not accidentally covered by an earlier barrier;
 - successful file sync requires the configured content-receipt threshold and a
@@ -1134,11 +1141,14 @@ validates the desired content receipts, and obtains fresh proofs of the
 complete canonical materialized checkpoint at the exact journal head rather
 than reusing stored replication cursors. It publishes an epoch-bound quorum
 head before `fsync`, `fdatasync`, or directory `fsync` returns. Each probe uses
-a restart-unique identity and an empty rolling-upgrade-safe journal batch. FUSE
-`flush` and `release` remain visibility/close operations. `fdatasync` has a
-distinct API kind but currently uses the stronger full-file physical metadata
-barrier. Durable caller-selected sync ids and stored outcome-unknown responses
-remain target hardening. The Rust checkpoint proof currently hashes the full
+a restart-unique identity and an empty rolling-upgrade-safe journal batch.
+Ordinary FUSE writes can return from a process-local per-handle dirty buffer;
+`flush` and `release` publish that handle's pending ranges but do not issue a
+durability barrier. File `fdatasync` and `fsync` publish all dirty handles for
+the object before entering the modeled barrier. `fdatasync` has a distinct API
+kind but currently uses the stronger full-file physical metadata barrier.
+Durable caller-selected sync ids and stored outcome-unknown responses remain
+target hardening. The Rust checkpoint proof currently hashes the full
 materialized shard state; an incremental authenticated checkpoint is a future
 performance refinement, not a weaker fallback.
 

@@ -630,7 +630,7 @@ The synchronization barriers are:
 
 | Operation | Successful-return guarantee |
 |---|---|
-| `write` | The write is visible through the current authority, but may still be volatile across authority loss. |
+| `write` | At the canonical DFS API boundary, the write is visible through the current authority but may still be volatile across authority loss. The current FUSE adapter may acknowledge an ordinary write into its process-local dirty buffer before reaching this boundary. |
 | `fdatasync(file)` | All writes returned before the call, plus data-retrieval metadata such as length/extents, meet the configured receipt policy and have a failover-recoverable metadata certificate. |
 | `fsync(file)` | The same prefix plus file-integrity metadata is durable. It does not make the parent directory entry durable. |
 | `fsync(directory)` | Namespace changes captured by the call, such as create, rename, and unlink entries, are durably certified. |
@@ -688,13 +688,23 @@ Peers that predate lock-state adoption cannot return that receipt, so a rolling
 upgrade fails the move safely; an exact retry can repair an object that the old
 peer adopted before it understood the lock aggregate.
 
-FUSE writes now publish through the canonical DFS write path before the write
-reply, eliminating per-handle dirty-buffer visibility races during lock
-handoff. `flush` and `release` therefore perform close/lock cleanup but do not
-claim durability. `O_DSYNC` and `O_SYNC` writes invoke the file-data and
-full-file barriers respectively. File `fsync`, file `fdatasync`, and directory
-`fsync` capture immutable
-targets and route distinct operations to the metadata authority. A successful
+Ordinary FUSE writes use process-local, per-handle dirty ranges and may return
+before canonical DFS publication. Each handle is currently bounded to 64 MiB
+of dirty bytes. If a new range would exceed that bound, the existing buffer is
+published before the write is retried; an individual write larger than the
+bound publishes directly. Before buffering a write, the adapter publishes a
+different dirty handle for the same stable object, preserving serialized FUSE
+write order across descriptors. A publication failure restores the removed
+dirty ranges so a later `flush` or `fsync` can retry them.
+
+`flush` and `release` publish the affected handle's pending ranges and perform
+their lock/close cleanup, but do not claim durability. `O_DSYNC` and `O_SYNC`
+first publish every earlier buffered write for the object, publish the current
+write, and then invoke the file-data or full-file barrier respectively. File
+`fsync` and `fdatasync` first publish all dirty handles for the object, then
+capture an immutable sync target. Directory `fsync` captures an immutable
+namespace target. Each barrier routes its captured target as a distinct
+operation to the metadata authority. A successful
 file result validates the exact version/hash on every desired content replica,
 collects a fresh acknowledgement of the complete canonical materialized
 metadata checkpoint at the exact journal head, and intersects that recovery set
@@ -712,6 +722,12 @@ snapshot repair is rejected below that floor or at an equal sequence with a
 different state. The current `fdatasync` physical barrier is
 deliberately as strong as `fsync` because essential and ancillary file metadata
 share one journal transaction.
+
+Because ordinary dirty ranges exist only in the FUSE process until publication,
+a mount-process crash can lose a write whose syscall already returned. The
+mounted-mutation handoff and durable DFS recovery protocol apply once canonical
+publication is attempted; they do not make the earlier in-memory buffer
+durable.
 
 Direct checkpoint journal requests use a work-conserving fan-out cap of two and
 one 250 ms operation-wide best-effort budget. On the production multithread
