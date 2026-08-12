@@ -9168,9 +9168,11 @@ mod tests {
         let provider_bytes = std::fs::read(provider_path).expect("terminal fixture provider bytes");
         let seed = SifsMountLease::try_acquire(&data_dir, "terminal fixture seed")
             .expect("terminal fixture seed lease");
-        let lock_bytes =
-            std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
         drop(seed);
+        let (observed, lock_bytes) =
+            SifsMountLease::try_acquire_existing_for_cursor_recovery(&data_dir)
+                .expect("read terminal fixture host lock through its owner handle");
+        drop(observed);
 
         let mut marker = host_cursor_recovery_marker_fixture(
             &data_dir,
@@ -10715,9 +10717,11 @@ mod tests {
         let provider_bytes = std::fs::read(provider_path).expect("pinned provider bytes");
         let initial_lease =
             SifsMountLease::try_acquire(&data_dir, "cursor replay fixture").expect("initial lease");
-        let host_lock_bytes =
-            std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
         drop(initial_lease);
+        let (observed, host_lock_bytes) =
+            SifsMountLease::try_acquire_existing_for_cursor_recovery(&data_dir)
+                .expect("read cursor replay host lock through its owner handle");
+        drop(observed);
 
         let mut marker = host_cursor_recovery_marker_fixture(
             &data_dir,
@@ -11031,9 +11035,11 @@ mod tests {
             let provider_bytes = std::fs::read(provider_path).expect("pinned provider bytes");
             let seed = SifsMountLease::try_acquire(&data_dir, "rapid disabled replay fixture")
                 .expect("seed lease");
-            let lock_bytes =
-                std::fs::read(data_dir.dfs_dir().join("host-mount.lock")).expect("host lock bytes");
             drop(seed);
+            let (observed, lock_bytes) =
+                SifsMountLease::try_acquire_existing_for_cursor_recovery(&data_dir)
+                    .expect("read rapid replay host lock through its owner handle");
+            drop(observed);
 
             let mut marker = host_cursor_recovery_marker_fixture(
                 &data_dir,
@@ -11403,14 +11409,40 @@ mod tests {
                 "config" => config.root_path = "/changed".to_string(),
                 _ => unreachable!(),
             }
-            let before = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
-                .expect("ordinary stage before rejection");
+            let staged_path = staged_cloud_registration_path(&data_dir);
+            let staged_temp_path = cursor_recovery_staged_temp_path(&data_dir);
+            let before_current = read_bounded_plain_host_file(
+                &staged_path,
+                1024 * 1024,
+                "ordinary staged ownership before rejection",
+            )
+            .expect("ordinary staged ownership bytes before rejection");
+            let before_temporary = read_bounded_plain_host_file(
+                &staged_temp_path,
+                1024 * 1024,
+                "ordinary staged ownership temporary file before rejection",
+            )
+            .expect("ordinary staged temporary bytes before rejection");
             recover_pending_cloud_unregister_from_staged(&data_dir, &config)
                 .expect_err("ordinary authoritative stage must fail closed");
-            let after = inspect_cursor_recovery_staged_record_snapshot(&data_dir)
-                .expect("ordinary stage after rejection");
-            assert_eq!(after.current, before.current);
-            assert_eq!(after.temporary, before.temporary);
+            assert_eq!(
+                read_bounded_plain_host_file(
+                    &staged_path,
+                    1024 * 1024,
+                    "ordinary staged ownership after rejection",
+                )
+                .expect("ordinary staged ownership bytes after rejection"),
+                before_current
+            );
+            assert_eq!(
+                read_bounded_plain_host_file(
+                    &staged_temp_path,
+                    1024 * 1024,
+                    "ordinary staged ownership temporary file after rejection",
+                )
+                .expect("ordinary staged temporary bytes after rejection"),
+                before_temporary
+            );
         }
     }
 
