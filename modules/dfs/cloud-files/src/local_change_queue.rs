@@ -1655,14 +1655,19 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
                 saw_journal = true;
             }
             QUEUE_LOCK if metadata.file_type().is_file() => {
-                let bytes = fs::read(&path).map_err(io_error("read cursor-only queue lock"))?;
-                if !bytes.is_empty() {
+                // Windows enforces the byte-range lock against I/O through a
+                // second handle, including handles opened by this process.
+                // Reinspect the already-owned handle instead of reopening it.
+                let lock_metadata = queue_lock
+                    .metadata()
+                    .map_err(io_error("inspect locked cursor-only queue lock"))?;
+                if lock_metadata.len() != 0 {
                     return Err(queue_error(
                         "cursor-recovery-queue-lock",
                         "queue lock contains unexpected state bytes",
                     ));
                 }
-                raw_files.insert(name, bytes);
+                raw_files.insert(name, Vec::new());
                 saw_lock = true;
             }
             QUEUE_BLOBS_DIR if metadata.file_type().is_dir() => {
