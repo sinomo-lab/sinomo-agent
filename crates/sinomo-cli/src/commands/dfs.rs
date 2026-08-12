@@ -2962,51 +2962,28 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
         ),
     );
     let remote_timeout = DFS_CLUSTER_STATUS_REMOTE_TIMEOUT;
-    let route_graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);
-    let mut probes = Vec::new();
-    for node_id in remote_node_ids {
-        if let Some(error) =
-            dfs_cluster_status_unavailable_reason(&cluster_paths, &state, &route_graph, &node_id)
-        {
-            probes.push(DfsStatusProbePlan::Unavailable { node_id, error });
-        } else {
-            probes.push(DfsStatusProbePlan::Probe(spawn_dfs_status_probe(
-                &cluster_paths,
-                &state,
-                &node_id,
-                remote_timeout,
-                trace,
-            )?));
-        }
-    }
+    let probes = spawn_remote_dfs_status_probes_with(
+        remote_node_ids,
+        remote_timeout,
+        |node_id, timeout| spawn_dfs_status_probe(&cluster_paths, &state, node_id, timeout, trace),
+    )?;
     for probe in probes {
-        nodes.push(match probe {
-            DfsStatusProbePlan::Unavailable { node_id, error } => DfsClusterNodeStatus {
+        let node_id = probe.node_id.clone();
+        nodes.push(match receive_dfs_status_probe(probe, trace, started_at) {
+            Ok(status) => DfsClusterNodeStatus {
+                node_id,
+                local: false,
+                endpoint: Some("cluster-object-rpc".to_string()),
+                status: Some(status),
+                error: None,
+            },
+            Err(error) => DfsClusterNodeStatus {
                 node_id,
                 local: false,
                 endpoint: None,
                 status: None,
-                error: Some(error),
+                error: Some(error.to_string()),
             },
-            DfsStatusProbePlan::Probe(probe) => {
-                let node_id = probe.node_id.clone();
-                match receive_dfs_status_probe(probe, trace, started_at) {
-                    Ok(status) => DfsClusterNodeStatus {
-                        node_id,
-                        local: false,
-                        endpoint: Some("cluster-object-rpc".to_string()),
-                        status: Some(status),
-                        error: None,
-                    },
-                    Err(error) => DfsClusterNodeStatus {
-                        node_id,
-                        local: false,
-                        endpoint: None,
-                        status: None,
-                        error: Some(error.to_string()),
-                    },
-                }
-            }
         });
     }
     trace_dfs_cluster_status(
@@ -3030,7 +3007,7 @@ fn inspect_local_cluster_dfs_status_from_owner<T>(
 
 #[cfg(test)]
 mod local_cluster_dfs_status_tests {
-    use super::inspect_local_cluster_dfs_status_from_owner;
+    use super::*;
     use std::cell::Cell;
 
     #[test]
@@ -3072,8 +3049,148 @@ mod local_cluster_dfs_status_tests {
         assert_eq!(daemon_calls.get(), 1);
         assert_eq!(standalone_calls.get(), 1);
     }
+
+    #[test]
+    fn unreachable_builtin_lan_projection_still_spawns_bounded_routed_probe() {
+        crate::ensure_cluster_directory_installed();
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-status-routed-recovery");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        data_dir.ensure_root_layout().expect("data dir");
+
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_dfs_status_routed_recovery").expect("cluster");
+        let local_node_id =
+            NodeId::from_legacy_named("node_dfs_status_routed_recovery_local").expect("local");
+        let remote_node_id =
+            NodeId::from_legacy_named("node_dfs_status_routed_recovery_remote").expect("remote");
+        let second_remote_node_id =
+            NodeId::from_legacy_named("node_dfs_status_routed_recovery_remote_second")
+                .expect("second remote");
+        let now = OffsetDateTime::now_utc();
+        let mut state = sinomo_runtime::core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "dfs status routed recovery",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        let remote_endpoint =
+            network::daemon_lan_endpoint(&remote_node_id, "198.51.100.42:21353".to_string(), 0);
+        let mut remote = sinomo_runtime::core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote_node_id.clone(),
+            "remote",
+            "remote-public-key",
+            now,
+        );
+        remote.capabilities =
+            sinomo_runtime::node::main_daemon_capabilities(&ClusterMemberRole::Voter);
+        remote.allowed_capabilities = remote.capabilities.clone();
+        remote.endpoints = vec![remote_endpoint.clone()];
+        state.members.push(remote);
+        sinomo_runtime::cluster::write_cluster_state(&paths, &state).expect("write state");
+        sinomo_runtime::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
+            .expect("sync state");
+        let direct_unreachable = network::cluster_connectivity_record(
+            &state,
+            &remote_endpoint,
+            network::ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            120,
+        );
+        sinomo_runtime::cluster::sync_cluster_connectivity_records_to_kv(
+            &paths,
+            &local_node_id,
+            vec![direct_unreachable],
+        )
+        .expect("sync connectivity");
+        let route_graph = network::ClusterConnectivityGraph::read_for_local(&paths, &state);
+        assert!(
+            dfs_cluster_status_unavailable_reason(&paths, &state, &route_graph, &remote_node_id,)
+                .is_some(),
+            "the persisted built-in LAN projection models the live failure that used to suppress the routed probe"
+        );
+
+        let mut attempts = Vec::new();
+        let targets =
+            std::collections::BTreeSet::from([second_remote_node_id, remote_node_id.clone()]);
+        let expected_order = targets.iter().cloned().collect::<Vec<_>>();
+        let outcomes = spawn_remote_dfs_status_probes_with(
+            targets,
+            DFS_CLUSTER_STATUS_REMOTE_TIMEOUT,
+            |node_id, timeout| {
+                attempts.push((node_id.clone(), timeout));
+                Ok(node_id.clone())
+            },
+        )
+        .expect("canonical routed probe can recover through an unobserved module path");
+
+        assert_eq!(
+            attempts,
+            expected_order
+                .iter()
+                .cloned()
+                .map(|node_id| (node_id, DFS_CLUSTER_STATUS_REMOTE_TIMEOUT))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(outcomes, expected_order);
+    }
+
+    #[test]
+    fn routed_probe_error_is_preserved_by_probe_receiver() {
+        let node_id = NodeId::from_legacy_named("node_dfs_status_routed_error").expect("node");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Err(CliError::Network {
+                address: "routed object rpc".to_string(),
+                detail: "no executable route".to_string(),
+            }))
+            .expect("send routed error");
+        let probe = DfsStatusProbe {
+            node_id,
+            started_at: std::time::Instant::now(),
+            timeout: DFS_CLUSTER_STATUS_REMOTE_TIMEOUT,
+            receiver,
+        };
+
+        match receive_dfs_status_probe(probe, false, std::time::Instant::now()) {
+            Err(CliError::Network { address, detail }) => {
+                assert_eq!(address, "routed object rpc");
+                assert_eq!(detail, "no executable route");
+            }
+            other => panic!("expected routed network error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn routed_probe_timeout_retains_the_absolute_probe_deadline() {
+        let node_id = NodeId::from_legacy_named("node_dfs_status_routed_timeout").expect("node");
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let probe = DfsStatusProbe {
+            node_id: node_id.clone(),
+            started_at: std::time::Instant::now(),
+            timeout: std::time::Duration::ZERO,
+            receiver,
+        };
+
+        match receive_dfs_status_probe(probe, false, std::time::Instant::now()) {
+            Err(CliError::Network { address, detail }) => {
+                assert_eq!(address, format!("cluster dfs status {node_id}"));
+                assert_eq!(detail, "timed out after 0ms");
+            }
+            other => panic!("expected timeout error, got {other:?}"),
+        }
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn dfs_cluster_status_unavailable_reason(
     cluster_paths: &ClusterPaths,
     state: &sinomo_runtime::core::ClusterBootstrapState,
@@ -3133,9 +3250,15 @@ struct DfsStatusProbe {
     receiver: std::sync::mpsc::Receiver<Result<sinomo_runtime::dfs::DfsOperatorStatus, CliError>>,
 }
 
-enum DfsStatusProbePlan {
-    Probe(DfsStatusProbe),
-    Unavailable { node_id: NodeId, error: String },
+fn spawn_remote_dfs_status_probes_with<T>(
+    remote_node_ids: impl IntoIterator<Item = NodeId>,
+    timeout: std::time::Duration,
+    mut spawn: impl FnMut(&NodeId, std::time::Duration) -> Result<T, CliError>,
+) -> Result<Vec<T>, CliError> {
+    remote_node_ids
+        .into_iter()
+        .map(|node_id| spawn(&node_id, timeout))
+        .collect()
 }
 
 fn spawn_dfs_status_probe(

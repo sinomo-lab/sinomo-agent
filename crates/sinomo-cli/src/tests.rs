@@ -14555,18 +14555,16 @@ fn rollout_endpoint_order_uses_connectivity_before_transport_rank() {
 }
 
 #[test]
-fn dfs_cluster_status_skips_members_without_healthy_connectivity() {
+fn dfs_cluster_status_probes_members_despite_degraded_or_unreachable_builtin_connectivity() {
     crate::ensure_cluster_directory_installed();
-    for (label, connectivity_state, expected_error) in [
+    for (label, connectivity_state) in [
         (
             "degraded",
             sinomo_runtime::network::ClusterConnectivityState::Degraded,
-            "no currently healthy main-daemon route",
         ),
         (
             "unreachable",
             sinomo_runtime::network::ClusterConnectivityState::Unreachable,
-            "currently unavailable",
         ),
     ] {
         let root_name = format!("sinomo-cli-dfs-status-{label}-member");
@@ -14639,7 +14637,7 @@ fn dfs_cluster_status_skips_members_without_healthy_connectivity() {
 
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
-            "{label} member should be reported without spending the remote RPC timeout"
+            "{label} routed authorization failure should return before the remote RPC timeout"
         );
         let remote_row = report
             .nodes
@@ -14647,14 +14645,15 @@ fn dfs_cluster_status_skips_members_without_healthy_connectivity() {
             .find(|row| row.node_id == remote_node_id)
             .expect("remote row");
         assert!(remote_row.status.is_none());
+        let error = remote_row.error.as_deref().expect("routed probe error");
         assert!(
-            remote_row
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains(expected_error)),
-            "unexpected error for {label}: {:?}",
+            error.contains("network error at daemon object RPC forward")
+                && error.contains("unauthorized cluster node"),
+            "the canonical routed probe should preserve its typed authorization failure for {label}: {:?}",
             remote_row.error
         );
+        assert!(!error.contains("no currently healthy main-daemon route"));
+        assert!(!error.contains("currently unavailable"));
     }
 }
 

@@ -1653,6 +1653,13 @@ pub fn cluster_doctor_findings(
         })
         .map(|row| row.member.node_id.clone())
         .collect::<BTreeSet<_>>();
+    let current_live_nodes = health
+        .iter()
+        .filter(|row| {
+            row.availability == ClusterNodeAvailability::Online && row.live_probe_observed
+        })
+        .map(|row| row.member.node_id.clone())
+        .collect::<BTreeSet<_>>();
     for row in health {
         if cluster_health_node_is_nonreportable_member(state, &row.member.node_id) {
             continue;
@@ -1708,6 +1715,16 @@ pub fn cluster_doctor_findings(
             if authority_health.has_quorum()
                 && (unavailable_nodes.contains(&source.node_id)
                     || unavailable_nodes.contains(&target.node_id))
+            {
+                continue;
+            }
+            // Current-request live probes use routed object RPC, and peer
+            // frontier rows retain live provenance only through a currently
+            // reachable peer. Two such authorities therefore share the live
+            // component rooted at this health aggregation even when the
+            // persisted built-in connectivity graph is stale.
+            if current_live_nodes.contains(&source.node_id)
+                && current_live_nodes.contains(&target.node_id)
             {
                 continue;
             }
@@ -2405,6 +2422,123 @@ mod tests {
             availability: ClusterNodeAvailability::Online,
             live_probe_observed: true,
         }
+    }
+
+    fn unreachable_health_test_record(
+        cluster_id: &ClusterId,
+        source_node_id: &NodeId,
+        target_node_id: &NodeId,
+        observed_at: OffsetDateTime,
+    ) -> ClusterConnectivityRecord {
+        ClusterConnectivityRecord {
+            cluster_id: cluster_id.clone(),
+            source_node_id: source_node_id.clone(),
+            target_node_id: target_node_id.clone(),
+            endpoint_id: ClusterEndpointId::from_legacy_named(format!(
+                "endpoint_health_live_authority_{source_node_id}_{target_node_id}"
+            ))
+            .expect("endpoint"),
+            transport: ClusterTransportKind::LanTcp,
+            address: "198.51.100.42:21353".to_string(),
+            state: ClusterConnectivityState::Unreachable,
+            latency_ms: None,
+            consecutive_failures: 3,
+            last_success_at: None,
+            last_failure_at: Some(observed_at.to_string()),
+            failure_reason: None,
+            observed_at,
+            expires_at: observed_at + time::Duration::seconds(120),
+        }
+    }
+
+    #[test]
+    fn current_live_authorities_override_stale_unreachable_builtin_routes() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_live_authorities").expect("cluster");
+        let local_node_id =
+            NodeId::from_legacy_named("node_health_live_authorities_local").expect("local");
+        let remote_node_id =
+            NodeId::from_legacy_named("node_health_live_authorities_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "live authorities",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        let local_member = health_test_member(&cluster_id, &local_node_id, "local", now);
+        let remote_member = health_test_member(&cluster_id, &remote_node_id, "remote", now);
+        state.members = vec![local_member.clone(), remote_member.clone()];
+        let connectivity = vec![
+            unreachable_health_test_record(&cluster_id, &local_node_id, &remote_node_id, now),
+            unreachable_health_test_record(&cluster_id, &remote_node_id, &local_node_id, now),
+        ];
+        let health = vec![
+            health_test_row(
+                &local_member,
+                health_test_status(&cluster_id, &local_node_id, "local-live", now),
+            ),
+            health_test_row(
+                &remote_member,
+                health_test_status(&cluster_id, &remote_node_id, "remote-live", now),
+            ),
+        ];
+
+        let findings = cluster_doctor_findings(&state, &connectivity, &health);
+
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.code != "authority-route-missing"),
+            "current routed health probes place both authorities in the live component: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn cached_online_authority_does_not_override_unreachable_builtin_routes() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_health_cached_authority").expect("cluster");
+        let local_node_id =
+            NodeId::from_legacy_named("node_health_cached_authority_local").expect("local");
+        let remote_node_id =
+            NodeId::from_legacy_named("node_health_cached_authority_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "cached authority",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        let local_member = health_test_member(&cluster_id, &local_node_id, "local", now);
+        let remote_member = health_test_member(&cluster_id, &remote_node_id, "remote", now);
+        state.members = vec![local_member.clone(), remote_member.clone()];
+        let connectivity = vec![
+            unreachable_health_test_record(&cluster_id, &local_node_id, &remote_node_id, now),
+            unreachable_health_test_record(&cluster_id, &remote_node_id, &local_node_id, now),
+        ];
+        let local_health = health_test_row(
+            &local_member,
+            health_test_status(&cluster_id, &local_node_id, "local-live", now),
+        );
+        let mut cached_remote_health = health_test_row(
+            &remote_member,
+            health_test_status(&cluster_id, &remote_node_id, "remote-cached", now),
+        );
+        cached_remote_health.live_probe_observed = false;
+
+        let findings =
+            cluster_doctor_findings(&state, &connectivity, &[local_health, cached_remote_health]);
+
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.code == "authority-route-missing"),
+            "cached Online status alone must not prove a live authority route"
+        );
     }
 
     #[test]
