@@ -7459,6 +7459,16 @@ impl CloudFilesSupervisorCallbacks {
 
         match sinomo_runtime::module_api::decode_sobj::<CloudFilesModuleEvent>(payload_sobj) {
             Ok(CloudFilesModuleEvent::MountLifecycle(event)) => {
+                if event.error.is_some() || event.local_change_sync.last_error.is_some() {
+                    tracing::warn!(
+                        target: "sinomo.dfs.cloud_files",
+                        phase = ?event.phase,
+                        detail = %event.detail,
+                        lifecycle_error = ?event.error,
+                        writeback_error = ?event.local_change_sync.last_error,
+                        "Cloud Files lifecycle reported an error"
+                    );
+                }
                 let _ = self.events.try_send(event);
                 true
             }
