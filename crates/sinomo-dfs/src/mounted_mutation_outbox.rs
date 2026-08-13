@@ -321,6 +321,65 @@ impl MountedSifsMutationOutboxCursorRecoveryGuard {
     pub fn inspection(&self) -> &MountedSifsMutationOutboxCursorRecoveryInspection {
         &self.inspection
     }
+
+    /// Accepts the exact token-bound owner image or the one monotonic change
+    /// this owner permits while cursor recovery runs: committed mounted DFS
+    /// work may advance the constant-size daemon latch. The latch never clears
+    /// bits, and every write increments its generation, so this does not admit
+    /// a replacement or ambiguous operation tree.
+    pub fn matches_original_or_committed_work_successor(
+        &self,
+        original_raw_files: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<bool, DfsError> {
+        if &self.inspection.raw_files == original_raw_files {
+            return Ok(true);
+        }
+        if original_raw_files.len() != 2
+            || original_raw_files.get(STORE_LOCK_FILE).map(Vec::as_slice) != Some(&[])
+            || self
+                .inspection
+                .raw_files
+                .get(STORE_LOCK_FILE)
+                .map(Vec::as_slice)
+                != Some(&[])
+        {
+            return Ok(false);
+        }
+        let Some(original_bytes) = original_raw_files.get(DAEMON_COMMITTED_WORK_LATCH_FILE) else {
+            return Ok(false);
+        };
+        let original: MountedSifsMutationCommittedWorkLatch =
+            sinomo_object_serde::from_bytes(original_bytes).map_err(|source| {
+                outbox_error(format!(
+                    "cannot decode token-bound mounted-mutation committed-work latch: {source}"
+                ))
+            })?;
+        if original.schema_version != MOUNTED_SIFS_MUTATION_OUTBOX_SCHEMA_VERSION
+            || (original.generation == 0
+                && original != MountedSifsMutationCommittedWorkLatch::default())
+            || (original.generation != 0 && original.updated_at_unix_nanos == 0)
+            || sinomo_object_serde::to_bytes(&original, 1, LengthMode::U32).map_err(|source| {
+                outbox_error(format!(
+                    "cannot re-encode token-bound mounted-mutation committed-work latch: {source}"
+                ))
+            })? != *original_bytes
+        {
+            return Ok(false);
+        }
+        let Some(current) = self.inspection.committed_work_latch else {
+            return Ok(false);
+        };
+        Ok(current.generation > original.generation
+            && committed_work_contains(current.committed_work, original.committed_work))
+    }
+}
+
+fn committed_work_contains(current: DfsCommittedWork, original: DfsCommittedWork) -> bool {
+    (!original.publish_metadata || current.publish_metadata)
+        && (!original.repair_maintenance || current.repair_maintenance)
+        && (!original.namespace_maintenance || current.namespace_maintenance)
+        && (!original.metadata_replica_progress || current.metadata_replica_progress)
+        && (!original.metadata_materialization || current.metadata_materialization)
 }
 
 /// Inspect the outbox in the only state compatible with adopting cursor-only
@@ -3183,6 +3242,56 @@ mod tests {
         );
         drop(retained_guard);
         assert_eq!(snapshot_tree(store.root()), retained_before);
+    }
+
+    #[test]
+    fn cursor_recovery_accepts_only_a_monotonic_committed_work_latch_successor() {
+        let (root, store) = store("mounted-mutation-cursor-recovery-latch-successor");
+        let data_dir = SinomoDataDir::new(root.path());
+        let original = inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .expect("inspect original outbox");
+        let original_raw = original.inspection().raw_files.clone();
+        drop(original);
+
+        let retained = store
+            .retain_daemon_committed_work(DfsCommittedWork {
+                publish_metadata: true,
+                namespace_maintenance: true,
+                ..DfsCommittedWork::default()
+            })
+            .expect("retain committed work successor");
+        let successor = inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .expect("inspect committed work successor");
+        assert!(
+            successor
+                .matches_original_or_committed_work_successor(&original_raw)
+                .expect("classify monotonic successor")
+        );
+        drop(successor);
+
+        let regressed = MountedSifsMutationCommittedWorkLatch {
+            generation: retained.generation + 1,
+            committed_work: DfsCommittedWork::default(),
+            updated_at_unix_nanos: now_unix_nanos(),
+            ..MountedSifsMutationCommittedWorkLatch::default()
+        };
+        store
+            .write_daemon_committed_work_latch_unlocked(&regressed)
+            .expect("write canonical regressed latch evidence");
+        let rejected = inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(&data_dir)
+            .expect("strictly inspect regressed latch evidence");
+        assert!(
+            !rejected
+                .matches_original_or_committed_work_successor(&BTreeMap::from([
+                    (STORE_LOCK_FILE.to_string(), Vec::new()),
+                    (
+                        DAEMON_COMMITTED_WORK_LATCH_FILE.to_string(),
+                        sinomo_object_serde::to_bytes(&retained, 1, LengthMode::U32)
+                            .expect("encode retained predecessor"),
+                    ),
+                ]),)
+                .expect("reject regressed successor")
+        );
     }
 
     #[test]

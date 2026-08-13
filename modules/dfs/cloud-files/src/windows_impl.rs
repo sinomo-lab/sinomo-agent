@@ -553,11 +553,16 @@ fn acquire_cursor_recovery_terminal_owner_guards(
             detail: "terminal successor lost its canonical empty outbox owner".to_string(),
         });
     }
-    if outbox.inspection().raw_files != marker.outbox_raw_files {
+    if !outbox
+        .matches_original_or_committed_work_successor(&marker.outbox_raw_files)
+        .map_err(|error| CloudFilesModuleError {
+            code: "cursor-recovery-outbox".to_string(),
+            detail: error.to_string(),
+        })?
+    {
         return Err(CloudFilesModuleError {
             code: "cursor-recovery-outbox-drift".to_string(),
-            detail: "terminal successor outbox bytes changed from the token-bound snapshot"
-                .to_string(),
+            detail: "terminal successor outbox is neither the token-bound snapshot nor its monotonic committed-work latch successor".to_string(),
         });
     }
     let queue = inspect_cursor_only_local_change_queue(
