@@ -2407,17 +2407,32 @@ fn fs2_lock_is_contended(source: &io::Error) -> bool {
     }
 }
 
+#[track_caller]
 fn lock_file_exclusive(path: &Path) -> Result<File, DfsError> {
     lock_file_exclusive_with_timeout(path, MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_ACQUIRE_TIMEOUT)
 }
 
+#[track_caller]
 fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<File, DfsError> {
+    let caller = std::panic::Location::caller();
     let file = open_lock_file(path)?;
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
     loop {
         match FileExt::try_lock_exclusive(&file) {
-            Ok(()) => return Ok(file),
+            Ok(()) => {
+                if path.file_name().and_then(|name| name.to_str()) == Some(STORE_LOCK_FILE) {
+                    tracing::debug!(
+                        target: "sinomo.dfs.mounted_mutation.lock",
+                        lock_path = %path.display(),
+                        caller_file = caller.file(),
+                        caller_line = caller.line(),
+                        thread_name = std::thread::current().name(),
+                        "acquired mounted-mutation global store lock"
+                    );
+                }
+                return Ok(file);
+            }
             Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
                 if now >= deadline {
