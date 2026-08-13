@@ -2434,7 +2434,12 @@ fn lock_file_exclusive_with_timeout(
                         "acquired mounted-mutation global store lock"
                     );
                 }
-                return Ok(ExclusiveFileLock { file });
+                return Ok(ExclusiveFileLock {
+                    file,
+                    path: path.to_path_buf(),
+                    caller_file: caller.file(),
+                    caller_line: caller.line(),
+                });
             }
             Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
@@ -2459,6 +2464,9 @@ fn lock_file_exclusive_with_timeout(
 #[derive(Debug)]
 struct ExclusiveFileLock {
     file: File,
+    path: PathBuf,
+    caller_file: &'static str,
+    caller_line: u32,
 }
 
 impl Drop for ExclusiveFileLock {
@@ -2467,7 +2475,28 @@ impl Drop for ExclusiveFileLock {
         // the file handle because close-time lock release differs by platform.
         // This is especially important on Windows where the main executable
         // and the Cloud Files provider DLL independently open `outbox.lock`.
-        let _ = FileExt::unlock(&self.file);
+        match FileExt::unlock(&self.file) {
+            Ok(()) => {
+                if self.path.file_name().and_then(|name| name.to_str()) == Some(STORE_LOCK_FILE) {
+                    tracing::info!(
+                        target: "sinomo.dfs.mounted_mutation.lock",
+                        lock_path = %self.path.display(),
+                        caller_file = self.caller_file,
+                        caller_line = self.caller_line,
+                        thread_name = std::thread::current().name(),
+                        "released mounted-mutation global store lock"
+                    );
+                }
+            }
+            Err(source) => tracing::warn!(
+                target: "sinomo.dfs.mounted_mutation.lock",
+                lock_path = %self.path.display(),
+                caller_file = self.caller_file,
+                caller_line = self.caller_line,
+                error = %source,
+                "failed to release mounted-mutation file lock"
+            ),
+        }
     }
 }
 
