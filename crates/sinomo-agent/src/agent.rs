@@ -15617,6 +15617,7 @@ mod tests {
                 .expect("artifact id"),
             ),
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/dynamic-native".to_string(),
             library_name: "libdynamic_native_module.so".to_string(),
             platform_triple: "x86_64-linux-unix".to_string(),

@@ -384,6 +384,7 @@ mod tests {
                 module_id,
                 artifact_id: None,
                 content_hash: "00".repeat(32),
+                replaces_content_hash: None,
                 cache_key: "remote/management".to_string(),
                 library_name: "remote-management.test".to_string(),
                 platform_triple: format!(

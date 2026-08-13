@@ -4328,6 +4328,12 @@ fn recover_pending_cloud_unregister_from_staged(
         )?;
         return Ok(None);
     };
+    let module_id = ModuleId::from_legacy_named(
+        sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+    )
+    .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+    let active_state = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
+        .map_err(|error| format!("read Cloud Files module state for staged recovery: {error}"))?;
     if record.recovery.module.interface_version
         == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
         && record.recovery.legacy_prejournal_origin.is_none()
@@ -4374,24 +4380,28 @@ fn recover_pending_cloud_unregister_from_staged(
                 &may_be_registered,
             )?;
         }
-        // A canonical ordinary v3 stage is the provider-selection authority.
-        // Loader drift alone is not a replacement request: use the verified
-        // pinned provider until this owned registration is explicitly retired.
-        // In particular, do not Release the sync root merely because rollout
-        // activated a newer loader while the staged provider was still alive.
-        return recover_pending_cloud_unregister_from_staged_with(data_dir, config, None);
+        // A canonical ordinary v3 stage remains the provider-selection
+        // authority. Loader drift alone cannot retire it. A module activation
+        // may request an exact one-step replacement by durably naming this
+        // staged provider's content hash as its predecessor; only that binding
+        // admits the old pinned provider's idempotent Release.
+        let replacement = active_state.as_ref().filter(|active| {
+            active.content_hash != record.recovery.module.content_hash
+                && active.replaces_content_hash.as_deref()
+                    == Some(record.recovery.module.content_hash.as_str())
+        });
+        let replacement = replacement.map(CloudFilesModuleProvenance::from_loader_state);
+        return recover_pending_cloud_unregister_from_staged_with(
+            data_dir,
+            config,
+            replacement.as_ref(),
+        );
     }
     require_physically_absent(
         &cursor_recovery_staged_temp_path(data_dir),
         "legacy staged Cloud Files deterministic successor",
     )?;
     ensure_cloud_unregister_recovery_module(data_dir, &record.recovery.module)?;
-    let module_id = ModuleId::from_legacy_named(
-        sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-    )
-    .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-    let active_state = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
-        .map_err(|error| format!("read Cloud Files module state for staged recovery: {error}"))?;
     if let Some(active) = active_state.as_ref() {
         upgrade_legacy_staged_provider(data_dir, config, record, active)?;
     }
@@ -11932,6 +11942,7 @@ mod tests {
             module_id: recovery.module.module_id.clone(),
             artifact_id: None,
             content_hash: loader_hash.clone(),
+            replaces_content_hash: None,
             cache_key: "drifted/cloud-files".to_string(),
             library_name: "drifted-cloud-files.dll".to_string(),
             platform_triple: recovery.module.platform_triple.clone(),
@@ -11959,9 +11970,23 @@ mod tests {
         assert_eq!(
             load_staged_cloud_registration_record(&data_dir)
                 .expect("old staged provider remains authoritative"),
-            Some(stage)
+            Some(stage.clone())
         );
         assert!(!pending_cloud_unregister_path(&data_dir).exists());
+
+        let mut replacement = loader;
+        replacement.replaces_content_hash = Some(recovery.module.content_hash.clone());
+        write_native_dylib_module_loader_state(&data_dir.root(), &replacement)
+            .expect("persist exact replacement intent");
+        let pending = recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+            .expect("exact activation predecessor must authorize replacement")
+            .expect("old provider release");
+        assert_eq!(pending, recovery);
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir)
+                .expect("release leaves staged ownership until its response"),
+            Some(stage)
+        );
     }
 
     #[test]

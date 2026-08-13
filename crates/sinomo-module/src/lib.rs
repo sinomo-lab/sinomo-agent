@@ -142,6 +142,13 @@ pub struct NativeDylibModuleLoaderState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_id: Option<ArtifactId>,
     pub content_hash: String,
+    /// Exact previously active content hash that this activation replaces.
+    ///
+    /// Consumers with durable provider ownership use this as an explicit,
+    /// one-step replacement intent. A bare loader mismatch is not sufficient
+    /// authority to retire an owned provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces_content_hash: Option<String>,
     pub cache_key: String,
     pub library_name: String,
     pub platform_triple: String,
@@ -4204,10 +4211,21 @@ fn install_native_dylib_module_from_path_and_bytes(
         native_module_cache_path(data_dir_root, &cache_key, &content_hash, &library_name);
     write_native_dylib_module_file(&cache_path, bytes, Some(descriptor_path))?;
 
+    let previous_state_path = native_dylib_module_loader_state_path(data_dir_root, &module_id);
+    let previous_state = if previous_state_path.exists() {
+        Some(read_object::<NativeDylibModuleLoaderState>(
+            &previous_state_path,
+        )?)
+    } else {
+        None
+    };
+    let replaces_content_hash =
+        native_dylib_replacement_predecessor(previous_state.as_ref(), &content_hash);
     let state = NativeDylibModuleLoaderState {
         module_id,
         artifact_id: request.artifact_id,
         content_hash,
+        replaces_content_hash,
         cache_key,
         library_name,
         platform_triple: descriptor.platform_triple,
@@ -4222,6 +4240,19 @@ fn install_native_dylib_module_from_path_and_bytes(
         state,
         cache_path,
         state_path,
+    })
+}
+
+fn native_dylib_replacement_predecessor(
+    previous: Option<&NativeDylibModuleLoaderState>,
+    content_hash: &str,
+) -> Option<String> {
+    previous.and_then(|previous| {
+        if previous.content_hash == content_hash {
+            previous.replaces_content_hash.clone()
+        } else {
+            Some(previous.content_hash.clone())
+        }
     })
 }
 
@@ -6021,6 +6052,7 @@ mod tests {
             module_id: module_id.clone(),
             artifact_id: None,
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/dynamic-native".to_string(),
             library_name: "libdynamic_native_module.so".to_string(),
             platform_triple: "x86_64-linux-unix".to_string(),
@@ -6172,6 +6204,7 @@ mod tests {
             module_id: module_id.clone(),
             artifact_id: None,
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/legacy-native".to_string(),
             library_name: "liblegacy_native_module.so".to_string(),
             platform_triple: "x86_64-linux-unix".to_string(),
@@ -6470,6 +6503,7 @@ mod tests {
                 ArtifactId::from_legacy_named("artifact_wasix_dylib").expect("artifact"),
             ),
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/sandbox/wasix".to_string(),
             library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
             platform_triple: "x86_64-unknown-linux-gnu".to_string(),
@@ -6499,6 +6533,27 @@ mod tests {
                 .expect("read overwritten state")
                 .expect("overwritten state"),
             state
+        );
+    }
+
+    #[test]
+    fn native_dylib_activation_binds_and_retains_exact_replacement_predecessor() {
+        let mut previous = test_native_dylib_loader_state("previous");
+        assert_eq!(
+            native_dylib_replacement_predecessor(Some(&previous), "blake3:next"),
+            Some("blake3:previous".to_string())
+        );
+
+        previous.content_hash = "blake3:next".to_string();
+        previous.replaces_content_hash = Some("blake3:previous".to_string());
+        assert_eq!(
+            native_dylib_replacement_predecessor(Some(&previous), "blake3:next"),
+            Some("blake3:previous".to_string()),
+            "reinstalling the same activation must not erase its pending replacement intent"
+        );
+        assert_eq!(
+            native_dylib_replacement_predecessor(None, "blake3:first"),
+            None
         );
     }
 
@@ -6626,6 +6681,7 @@ mod tests {
                 ArtifactId::from_legacy_named("artifact_wasix_dylib").expect("artifact"),
             ),
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/sandbox/wasix".to_string(),
             library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
             platform_triple: "x86_64-unknown-linux-gnu".to_string(),
@@ -6682,6 +6738,7 @@ mod tests {
             module_id,
             artifact_id: None,
             content_hash: "blake3:active".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/sandbox/wasix".to_string(),
             library_name: "libsinomo_sandbox_wasix_module.so".to_string(),
             platform_triple: "x86_64-unknown-linux-gnu".to_string(),
@@ -7645,6 +7702,7 @@ mod tests {
                 .expect("module id"),
             artifact_id: None,
             content_hash: format!("blake3:{label}"),
+            replaces_content_hash: None,
             cache_key: format!("module/test/{label}"),
             library_name: format!("libsinomo_test_{label}.so"),
             platform_triple: "x86_64-unknown-linux-gnu".to_string(),

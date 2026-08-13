@@ -7243,6 +7243,7 @@ platforms = ["{excluded_platform}"]
         module_id: module_id.clone(),
         artifact_id: None,
         content_hash: "blake3:install-policy-test".to_string(),
+        replaces_content_hash: None,
         cache_key: "install/policy-test".to_string(),
         library_name: if cfg!(windows) {
             "sinomo_install_policy_test.dll".to_string()

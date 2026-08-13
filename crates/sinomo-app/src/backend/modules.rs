@@ -772,6 +772,7 @@ mod tests {
                 module_id: typed_module_id,
                 artifact_id: None,
                 content_hash: "00".repeat(32),
+                replaces_content_hash: None,
                 cache_key: "configured/native-test".to_string(),
                 library_name: "configured-native-test.test".to_string(),
                 platform_triple: format!(

@@ -370,6 +370,7 @@ fn install_active_wasix_module(data_dir_root: &Path, module_path: &Path) {
             module_id,
             artifact_id: None,
             content_hash,
+            replaces_content_hash: None,
             cache_key: cache_key.to_string(),
             library_name,
             platform_triple: descriptor.platform_triple,

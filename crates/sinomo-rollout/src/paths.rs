@@ -1093,6 +1093,7 @@ platforms = ["{platform}"]
             module_id: sinomo_module::ModuleId::from_legacy_named(module_id).expect("module id"),
             artifact_id: None,
             content_hash: "blake3:test".to_string(),
+            replaces_content_hash: None,
             cache_key: module_id.replace('.', "/"),
             library_name: native_dylib_library_name(&module_id.replace('.', "_")),
             platform_triple: platform_triple.to_string(),

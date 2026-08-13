@@ -1419,6 +1419,7 @@ mod tests {
                     .expect("artifact"),
             ),
             content_hash: "blake3:abc".to_string(),
+            replaces_content_hash: None,
             cache_key: "module/remote/management".to_string(),
             library_name: if cfg!(windows) {
                 "sinomo_remote_management_module.dll".to_string()

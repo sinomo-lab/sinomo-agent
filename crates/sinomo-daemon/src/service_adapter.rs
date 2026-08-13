@@ -10712,6 +10712,7 @@ mod tests {
             module_id: module_id.clone(),
             artifact_id: None,
             content_hash: content_hash.to_string(),
+            replaces_content_hash: None,
             cache_key: "module/dfs/cloud-files".to_string(),
             library_name: "sinomo_dfs_cloud_files.dll".to_string(),
             platform_triple: "x86_64-pc-windows-msvc".to_string(),
