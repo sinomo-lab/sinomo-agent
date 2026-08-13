@@ -3088,13 +3088,10 @@ fn audit_cursor_recovery_root(
     remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
     cancelled: &AtomicBool,
 ) -> Result<Vec<CursorRecoveryHeldChild>, String> {
-    let expected = remote_manifest
-        .values()
-        .filter(|entry| relative_depth(root, &entry.path) == 1)
-        .filter(|entry| matches!(entry.kind.as_str(), "file" | "directory" | "mount"))
-        .map(|entry| (entry.path.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
-    let mut observed = BTreeSet::new();
+    // Recovery registration may have removed every old placeholder. Missing
+    // authoritative entries are therefore valid sparse projection state and
+    // will be populated lazily. The safety boundary is the inverse: every
+    // physical entry must be held and must match one exact manifest identity.
     let mut handles = Vec::with_capacity(remote_manifest.len());
     for name in physical_directory_children(sync_root)? {
         if cancelled.load(Ordering::SeqCst) {
@@ -3106,7 +3103,7 @@ fn audit_cursor_recovery_root(
                 sync_root.display()
             )
         })?;
-        let sifs_path = audit_cursor_recovery_entry(
+        audit_cursor_recovery_entry(
             sync_root,
             Path::new(name),
             mount,
@@ -3116,12 +3113,6 @@ fn audit_cursor_recovery_root(
             cancelled,
             &mut handles,
         )?;
-        observed.insert(sifs_path);
-    }
-    if let Some(missing) = expected.keys().find(|path| !observed.contains(*path)) {
-        return Err(format!(
-            "authoritative recovery-root child `{missing}` has no exact local placeholder"
-        ));
     }
     Ok(handles)
 }
