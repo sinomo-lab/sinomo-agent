@@ -39,9 +39,9 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, NetworkError};
 use sinomo_runtime::node::NodeId;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, HANDLE, NTSTATUS, STATUS_CANCELLED,
-    STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
+    CloseHandle, ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT, ERROR_INVALID_FUNCTION, HANDLE, NTSTATUS,
+    STATUS_CANCELLED, STATUS_CLOUD_FILE_UNSUCCESSFUL, STATUS_FILE_IS_A_DIRECTORY,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_SUCCESS, STATUS_UNSUCCESSFUL,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_CALLBACK_INFO, CF_CALLBACK_PARAMETERS, CF_CALLBACK_REGISTRATION,
@@ -5991,6 +5991,29 @@ fn remove_registration_journal(data_dir: &SinomoDataDir) -> Result<(), CloudFile
 fn query_registered_sync_root(
     sync_root: &Path,
 ) -> Result<Option<RegisteredSyncRootInfo>, CloudFilesModuleError> {
+    query_registered_sync_root_with(sync_root, false)
+}
+
+/// A volume without any Cloud Files roots may not have a CldFlt instance yet.
+/// On that exact fresh-admission cut CfGetSyncRootInfoByPath returns
+/// ERROR_INVALID_FUNCTION instead of ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT.
+/// Owned and recovery paths deliberately use the strict query above so loss of
+/// an expected filter instance can never be mistaken for registration absence.
+fn query_registered_sync_root_for_fresh_admission(
+    sync_root: &Path,
+) -> Result<Option<RegisteredSyncRootInfo>, CloudFilesModuleError> {
+    query_registered_sync_root_with(sync_root, true)
+}
+
+fn sync_root_query_reports_absence(code: HRESULT, allow_uninitialized_volume: bool) -> bool {
+    code == HRESULT::from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT.0)
+        || (allow_uninitialized_volume && code == HRESULT::from_win32(ERROR_INVALID_FUNCTION.0))
+}
+
+fn query_registered_sync_root_with(
+    sync_root: &Path,
+    allow_uninitialized_volume: bool,
+) -> Result<Option<RegisteredSyncRootInfo>, CloudFilesModuleError> {
     let buffer_bytes =
         std::mem::size_of::<CF_SYNC_ROOT_STANDARD_INFO>() + REGISTRATION_IDENTITY_MAX_BYTES;
     let word_bytes = std::mem::size_of::<usize>();
@@ -6006,7 +6029,7 @@ fn query_registered_sync_root(
             Some(&mut returned_length),
         )
     } {
-        if source.code() == HRESULT::from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT.0) {
+        if sync_root_query_reports_absence(source.code(), allow_uninitialized_volume) {
             return Ok(None);
         }
         return Err(CloudFilesModuleError {
@@ -6242,7 +6265,7 @@ fn recover_registration_for_mount(
             });
         }
     }
-    if let Some(observed) = query_registered_sync_root(&request.sync_root)? {
+    if let Some(observed) = query_registered_sync_root_for_fresh_admission(&request.sync_root)? {
         return Err(CloudFilesModuleError {
             code: "sync-root-ownership-unverifiable".to_string(),
             detail: format!(
@@ -6258,7 +6281,7 @@ fn recover_registration_for_mount(
 fn verify_fresh_registration_absent(
     request: &CloudFilesMountRequest,
 ) -> Result<(), CloudFilesModuleError> {
-    if let Some(observed) = query_registered_sync_root(&request.sync_root)? {
+    if let Some(observed) = query_registered_sync_root_for_fresh_admission(&request.sync_root)? {
         return Err(CloudFilesModuleError {
             code: "sync-root-ownership-unverifiable".to_string(),
             detail: format!(
@@ -8809,6 +8832,24 @@ mod tests {
         assert!(observed.is_none());
         assert!(!queried.get());
         assert!(!sync_root.exists());
+    }
+
+    #[test]
+    fn only_fresh_admission_accepts_an_uninitialized_cloud_files_volume() {
+        let not_under_sync_root = HRESULT::from_win32(ERROR_CLOUD_FILE_NOT_UNDER_SYNC_ROOT.0);
+        let uninitialized_volume = HRESULT::from_win32(ERROR_INVALID_FUNCTION.0);
+
+        assert!(sync_root_query_reports_absence(not_under_sync_root, false));
+        assert!(sync_root_query_reports_absence(not_under_sync_root, true));
+        assert!(!sync_root_query_reports_absence(
+            uninitialized_volume,
+            false
+        ));
+        assert!(sync_root_query_reports_absence(uninitialized_volume, true));
+        assert!(!sync_root_query_reports_absence(
+            HRESULT::from_win32(5),
+            true
+        ));
     }
 
     #[test]
