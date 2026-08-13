@@ -6037,9 +6037,10 @@ where
     // this function in the supervised blocking lane because materialization is
     // proportional to the complete keyspace.
     let wal_paths = paths.kv_paths().raft_wal_paths(&local_node_id);
-    let projected = sinomo_kv::with_cluster_kv_resident_read_projection(
+    let projected = sinomo_kv::with_cluster_kv_resident_read_projection_before(
         &wal_paths,
         &local_node_id,
+        deadline,
         |storage| project(storage),
     )
     .ok_or_else(|| NetworkError::ClusterReadOnly {

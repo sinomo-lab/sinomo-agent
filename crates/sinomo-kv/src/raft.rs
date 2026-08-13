@@ -1307,6 +1307,81 @@ where
     }))
 }
 
+fn with_idle_resident_raft_node_before<T, F>(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    deadline: Instant,
+    read: F,
+) -> Option<Result<KvLocalRead<T>, KvError>>
+where
+    F: FnOnce(&ReplicatedKvNode) -> Result<T, KvError>,
+{
+    if process_local_raft_access_is_denied(&paths.root) {
+        return None;
+    }
+    let slot = RESIDENT_RAFT_NODES.lock().ok()?.get(&paths.root)?.clone();
+    slot.touch();
+    let started = Instant::now();
+    let mut state = slot.state.lock().ok()?;
+    loop {
+        slot.remove_expired_checkout_waiters(&mut state, Instant::now());
+        if !state.checked_out && !state.read_loading && state.checkout_waiters.is_empty() {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            metrics::histogram!(
+                "sinomo.kv.raft.resident.read_projection_wait.us",
+                "outcome" => "deadline"
+            )
+            .record(started.elapsed().as_micros() as f64);
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let (next_state, timeout) = slot.ready.wait_timeout(state, remaining).ok()?;
+        state = next_state;
+        if timeout.timed_out() && Instant::now() >= deadline {
+            metrics::histogram!(
+                "sinomo.kv.raft.resident.read_projection_wait.us",
+                "outcome" => "deadline"
+            )
+            .record(started.elapsed().as_micros() as f64);
+            return None;
+        }
+    }
+    let valid = state
+        .cached
+        .as_ref()
+        .is_some_and(|resident| resident_raft_ownership_matches(resident, paths, node_id));
+    if !valid {
+        if state.cached.take().is_some() {
+            state.read_metadata = None;
+            metrics::counter!("sinomo.kv.raft.resident.opens", "outcome" => "read_invalidated")
+                .increment(1);
+        }
+        metrics::histogram!(
+            "sinomo.kv.raft.resident.read_projection_wait.us",
+            "outcome" => "invalidated"
+        )
+        .record(started.elapsed().as_micros() as f64);
+        return None;
+    }
+    let resident = state.cached.as_ref()?;
+    let result = read(&resident.node).map(|value| KvLocalRead {
+        value,
+        revision: resident.node.store.revision(),
+        observed_term: resident.node.hard_state.current_term,
+        applied_index: resident.node.applied_index,
+        known_leader: resident.node.hard_state.leader_id.clone(),
+    });
+    metrics::histogram!(
+        "sinomo.kv.raft.resident.read_projection_wait.us",
+        "outcome" => "acquired"
+    )
+    .record(started.elapsed().as_micros() as f64);
+    Some(result)
+}
+
 /// A bounded, immutable projection borrowed from the canonical resident Raft
 /// node while its coordination slot is read-locked.
 ///
@@ -1489,6 +1564,32 @@ where
     F: FnOnce(&mut ClusterKvRaftResidentReadProjection<'_>) -> T,
 {
     with_idle_resident_raft_node(paths, node_id, |node| {
+        let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
+            &paths.root,
+            Some(node.hard_state.current_term),
+            "project resident Raft ReadIndex state",
+        )?;
+        let mut projection = ClusterKvRaftResidentReadProjection { node };
+        Ok(read(&mut projection))
+    })
+}
+
+/// Wait for a transient resident mutation to finish, then borrow the exact
+/// canonical Raft view before the caller's existing absolute deadline.
+///
+/// The resident slot remains the authority fence. Queued mutable operations
+/// retain FIFO priority, and the projection still fails closed if ownership or
+/// the durable view changes before admission.
+pub fn with_cluster_kv_resident_read_projection_before<T, F>(
+    paths: &KvWalPaths,
+    node_id: &NodeId,
+    deadline: Instant,
+    read: F,
+) -> Option<Result<KvLocalRead<T>, KvError>>
+where
+    F: FnOnce(&mut ClusterKvRaftResidentReadProjection<'_>) -> T,
+{
+    with_idle_resident_raft_node_before(paths, node_id, deadline, |node| {
         let _authority_lease = acquire_pending_higher_term_authority_lease_for_root(
             &paths.root,
             Some(node.hard_state.current_term),
@@ -11769,7 +11870,8 @@ mod pending_higher_term_gate_tests {
 #[cfg(test)]
 mod resident_checkout_tests {
     use super::*;
-    use std::sync::mpsc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Barrier, mpsc};
 
     fn wait_for_checkout_queue_depth(slot: &ResidentRaftNodeSlot, expected: usize) {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -11789,6 +11891,67 @@ mod resident_checkout_tests {
             );
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn post_quorum_projection_waits_for_transient_resident_owner() {
+        let raft_root = std::env::temp_dir().join(format!(
+            "sinomo-kv-resident-projection-wait-{}-{}",
+            std::process::id(),
+            RESIDENT_RAFT_NODE_ACCESS_CLOCK.fetch_add(1, Ordering::Relaxed)
+        ));
+        let node_id =
+            NodeId::from_legacy_named("node_resident_projection_wait").expect("node id");
+        let wal_paths = KvWalPaths::new(raft_root.join(node_id.as_str()));
+        drop(
+            DurableRaftKvNode::open_resident(node_id.clone(), wal_paths.clone())
+                .expect("seed resident owner"),
+        );
+
+        let held = DurableRaftKvNode::open_resident(node_id.clone(), wal_paths.clone())
+            .expect("hold resident mutation owner");
+        let expected_term = held.hard_state().current_term;
+        assert!(
+            with_cluster_kv_resident_read_projection(&wal_paths, &node_id, |_| ()).is_none(),
+            "the immediate projection must remain nonblocking"
+        );
+        let release = Arc::new(Barrier::new(2));
+        let release_worker = Arc::clone(&release);
+        let owner = thread::spawn(move || {
+            release_worker.wait();
+            thread::sleep(Duration::from_millis(20));
+            drop(held);
+        });
+        release.wait();
+        let started = Instant::now();
+        let projected = with_cluster_kv_resident_read_projection_before(
+            &wal_paths,
+            &node_id,
+            Instant::now() + Duration::from_secs(1),
+            |projection| projection.read_index_state(),
+        )
+        .expect("resident projection becomes available")
+        .expect("project resident state");
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert_eq!(projected.value.current_term, expected_term);
+        owner.join().expect("release resident owner");
+
+        let held = DurableRaftKvNode::open_resident(node_id.clone(), wal_paths.clone())
+            .expect("hold resident owner past deadline");
+        let callback_ran = AtomicBool::new(false);
+        assert!(
+            with_cluster_kv_resident_read_projection_before(
+                &wal_paths,
+                &node_id,
+                Instant::now() + Duration::from_millis(20),
+                |_| callback_ran.store(true, Ordering::SeqCst),
+            )
+            .is_none(),
+            "the projection must preserve the caller's absolute deadline"
+        );
+        assert!(!callback_ran.load(Ordering::SeqCst));
+        drop(held);
+        let _ = fs::remove_dir_all(raft_root);
     }
 
     #[test]
