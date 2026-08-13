@@ -2408,12 +2408,15 @@ fn fs2_lock_is_contended(source: &io::Error) -> bool {
 }
 
 #[track_caller]
-fn lock_file_exclusive(path: &Path) -> Result<File, DfsError> {
+fn lock_file_exclusive(path: &Path) -> Result<ExclusiveFileLock, DfsError> {
     lock_file_exclusive_with_timeout(path, MOUNTED_SIFS_MUTATION_OUTBOX_LOCK_ACQUIRE_TIMEOUT)
 }
 
 #[track_caller]
-fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<File, DfsError> {
+fn lock_file_exclusive_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<ExclusiveFileLock, DfsError> {
     let caller = std::panic::Location::caller();
     let file = open_lock_file(path)?;
     let started = Instant::now();
@@ -2431,7 +2434,7 @@ fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<Fi
                         "acquired mounted-mutation global store lock"
                     );
                 }
-                return Ok(file);
+                return Ok(ExclusiveFileLock { file });
             }
             Err(source) if fs2_lock_is_contended(&source) => {
                 let now = Instant::now();
@@ -2450,6 +2453,21 @@ fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<Fi
             }
             Err(source) => return Err(lock_error(path, source)),
         }
+    }
+}
+
+#[derive(Debug)]
+struct ExclusiveFileLock {
+    file: File,
+}
+
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        // `fs2` recommends explicitly unlocking instead of relying on closing
+        // the file handle because close-time lock release differs by platform.
+        // This is especially important on Windows where the main executable
+        // and the Cloud Files provider DLL independently open `outbox.lock`.
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
