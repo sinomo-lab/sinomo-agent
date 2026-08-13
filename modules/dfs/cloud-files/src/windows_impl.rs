@@ -3838,16 +3838,19 @@ fn mount_sifs_cloud_files_inner(
         };
     let shared_service = Arc::new(Mutex::new(opened.service));
     let materialized_directories = Arc::new(Mutex::new(BTreeSet::new()));
-    let cursor_recovery_population_released = cursor_recovery_marker
-        .as_ref()
-        .map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    // Existing placeholders need a connected provider before CFAPI can open
+    // and validate their identities. Keep nested population parked until the
+    // worker has re-established its durable Ready proof; cursor recovery keeps
+    // the same gate until its stronger terminal handoff releases it.
+    let provider_population_released = (cursor_recovery_marker.is_some() || existing_owned_root)
+        .then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let provider = Arc::new(CloudFilesProvider::new(
         Arc::clone(&shared_service),
         Arc::clone(&mounted_mutation_handoff),
         request.sync_root.clone(),
         request.root_path.clone(),
         request.read_only,
-        cursor_recovery_population_released.clone(),
+        provider_population_released.clone(),
         Arc::clone(&materialized_directories),
         materialization_audit_intents,
     ));
@@ -3869,39 +3872,56 @@ fn mount_sifs_cloud_files_inner(
             materialized_directories,
         },
     );
+    let connect_provider = || {
+        let callback_table = callback_table();
+        let sync_root_wide = wide_path(&request.sync_root);
+        unsafe {
+            CfConnectSyncRoot(
+                PCWSTR(sync_root_wide.as_ptr()),
+                callback_table.as_ptr(),
+                Some(Arc::as_ptr(&provider).cast::<c_void>()),
+                CF_CONNECT_FLAG_NONE,
+            )
+        }
+        .map(|key| CloudFilesConnection::new(key, request.sync_root.clone()))
+        .map_err(|source| CloudFilesModuleError {
+            code: "connect-sync-root".to_string(),
+            detail: format!(
+                "connect Cloud Files sync root {}: {source}",
+                request.sync_root.display()
+            ),
+        })
+    };
+    let mut connection = if existing_owned_root {
+        match connect_provider() {
+            Ok(connection) => Some(connection),
+            Err(error) => return Err(activation.fail(error, lifecycle)),
+        }
+    } else {
+        None
+    };
     if let Err(error) = writable_worker.startup(&writable_worker_cancelled) {
         lifecycle.local_change_sync = writable_worker.state().status();
-        let error = CloudFilesModuleError {
+        let mut error = CloudFilesModuleError {
             code: error.code.to_string(),
             detail: error.detail,
         };
+        if let Some(connection) = connection.as_mut() {
+            error = with_cleanup_result(error, "disconnect", connection.disconnect());
+        }
         return Err(activation.fail(error, lifecycle));
     }
     lifecycle.local_change_sync = writable_worker.state().status();
     lifecycle.placeholders_created = writable_worker.state().reconciler().manifest().len() as u64;
     let placeholders_created = lifecycle.placeholders_created;
 
-    let callback_table = callback_table();
-    let sync_root_wide = wide_path(&request.sync_root);
-    let connection_key = match unsafe {
-        CfConnectSyncRoot(
-            PCWSTR(sync_root_wide.as_ptr()),
-            callback_table.as_ptr(),
-            Some(Arc::as_ptr(&provider).cast::<c_void>()),
-            CF_CONNECT_FLAG_NONE,
-        )
-    }
-    .map_err(|source| CloudFilesModuleError {
-        code: "connect-sync-root".to_string(),
-        detail: format!(
-            "connect Cloud Files sync root {}: {source}",
-            request.sync_root.display()
-        ),
-    }) {
-        Ok(connection_key) => connection_key,
-        Err(error) => return Err(activation.fail(error, lifecycle)),
+    let mut connection = match connection {
+        Some(connection) => connection,
+        None => match connect_provider() {
+            Ok(connection) => connection,
+            Err(error) => return Err(activation.fail(error, lifecycle)),
+        },
     };
-    let mut connection = CloudFilesConnection::new(connection_key, request.sync_root.clone());
     lifecycle.connected = true;
     lifecycle.emit_connected();
     let emitter = windows_adapter::WorkerLifecycleEmitter::from_lifecycle(lifecycle);
@@ -4090,7 +4110,7 @@ fn mount_sifs_cloud_files_inner(
                             writable_worker.complete_cursor_recovery_after_host_active()
                         }
                         CursorRecoveryTerminalHandoffStep::ReleasePopulation => {
-                            if let Some(released) = cursor_recovery_population_released.as_ref() {
+                            if let Some(released) = provider_population_released.as_ref() {
                                 released.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
                             Ok(())
@@ -4134,6 +4154,9 @@ fn mount_sifs_cloud_files_inner(
             let error = with_cleanup_result(error, "disconnect", connection.disconnect());
             lifecycle.connected = false;
             return Err(activation.fail(error, lifecycle));
+        }
+        if let Some(released) = provider_population_released.as_ref() {
+            released.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         generation
     };
@@ -4438,9 +4461,9 @@ unsafe extern "system" fn fetch_placeholders_callback(
             return;
         }
     };
-    if provider.cursor_recovery_blocks_nested_population(&path) {
+    if provider.blocks_nested_population(&path) {
         host_log(&format!(
-            "Cloud Files cursor recovery rejected nested placeholder population for `{path}` before Ready"
+            "Cloud Files rejected nested placeholder population for `{path}` before the provider reached Ready"
         ));
         let _ = unsafe {
             transfer_placeholders(
@@ -4773,7 +4796,7 @@ struct CloudFilesProvider {
     sync_root: PathBuf,
     root_path: String,
     read_only: bool,
-    cursor_recovery_released: Option<Arc<std::sync::atomic::AtomicBool>>,
+    population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
     cancelled_requests: Mutex<BTreeSet<i64>>,
     placeholder_pages: Mutex<BTreeMap<String, CloudFilesPlaceholderPageState>>,
     placeholder_page_leases: Mutex<BTreeSet<String>>,
@@ -4811,7 +4834,7 @@ impl CloudFilesProvider {
         sync_root: PathBuf,
         root_path: String,
         read_only: bool,
-        cursor_recovery_released: Option<Arc<std::sync::atomic::AtomicBool>>,
+        population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
     ) -> Self {
@@ -4823,7 +4846,7 @@ impl CloudFilesProvider {
             sync_root,
             root_path,
             read_only,
-            cursor_recovery_released,
+            population_released,
             cancelled_requests: Mutex::new(BTreeSet::new()),
             placeholder_pages: Mutex::new(BTreeMap::new()),
             placeholder_page_leases: Mutex::new(BTreeSet::new()),
@@ -4875,8 +4898,8 @@ impl CloudFilesProvider {
             .map(|pages| pages.get(path).cloned().unwrap_or_default())
     }
 
-    fn cursor_recovery_blocks_nested_population(&self, path: &str) -> bool {
-        self.cursor_recovery_released
+    fn blocks_nested_population(&self, path: &str) -> bool {
+        self.population_released
             .as_ref()
             .is_some_and(|released| !released.load(std::sync::atomic::Ordering::SeqCst))
             && path != self.root_path

@@ -90,7 +90,7 @@ use crate::windows_sync::{
     cloud_files_root_kind_is_supported, cloud_namespace_batch_from_dfs,
     cloud_namespace_cursor_from_dfs, completion_follow_up_request, dfs_namespace_cursor_from_cloud,
     local_capture_retry_delay, next_sparse_known_path, plan_directory_changes,
-    plan_owned_offline_create, run_progress_gated_worker_loop,
+    plan_owned_offline_create, run_progress_gated_worker_loop, run_retrying_namespace_read_pass,
     sparse_child_directory_is_enumerated, sparse_root_is_enumerated,
     suppression_for_completed_mutation,
 };
@@ -4463,9 +4463,22 @@ impl WindowsWritableWorkerHandle {
                                     .map_err(|error| adapter_error(error.code, error.detail));
                                 let _ = reply.send(finalized);
                             }
-                            worker
-                                .run_once(&thread_cancelled)
-                                .map(|_| worker.state().status())
+                            run_retrying_namespace_read_pass(
+                                &thread_cancelled,
+                                || {
+                                    worker
+                                        .run_once(&thread_cancelled)
+                                        .map(|_| worker.state().status())
+                                },
+                                |cancelled| {
+                                    for _ in 0..5 {
+                                        if cancelled.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(50));
+                                    }
+                                },
+                            )
                         },
                         |status, generation| {
                             let ready = status.mode == CloudFilesLocalChangeSyncMode::Active;

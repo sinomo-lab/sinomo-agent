@@ -2874,7 +2874,9 @@ where
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         let result = self.run_once_inner(cancelled);
-        if let Err(error) = &result {
+        if let Err(error) = &result
+            && !retryable_namespace_read_error(error)
+        {
             self.state.mark_failed(error);
         }
         result
@@ -3609,6 +3611,32 @@ pub(crate) fn run_progress_gated_worker_loop<S, E>(
     Ok(())
 }
 
+pub(crate) fn retryable_namespace_read_error(error: &CloudFilesWindowsSyncError) -> bool {
+    matches!(error.code, "namespace-feed" | "full-reconciliation-scan")
+}
+
+/// A namespace feed poll and an authoritative full scan are read-only remote
+/// observations. Losing their response is safe to retry in the same connected
+/// provider; tearing the worker down instead unregisters the sync root and can
+/// strand its still-present placeholders behind a disconnected filter.
+pub(crate) fn run_retrying_namespace_read_pass<S>(
+    cancelled: &AtomicBool,
+    mut run_once: impl FnMut() -> Result<S, CloudFilesWindowsSyncError>,
+    mut wait_before_retry: impl FnMut(&AtomicBool),
+) -> Result<S, CloudFilesWindowsSyncError> {
+    loop {
+        match run_once() {
+            Ok(status) => return Ok(status),
+            Err(error)
+                if retryable_namespace_read_error(&error) && !cancelled.load(Ordering::SeqCst) =>
+            {
+                wait_before_retry(cancelled);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Build the durable no-echo entry before a local completion effect marks its
 /// placeholder in sync. Missing authoritative evidence fails closed.
 pub fn suppression_for_completed_mutation(
@@ -4006,6 +4034,49 @@ mod tests {
         );
         join.join().expect("join worker loop").expect("worker loop");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn read_only_namespace_failures_retry_without_masking_fatal_or_cancelled_passes() {
+        let cancelled = AtomicBool::new(false);
+        let mut calls = 0;
+        let mut waits = 0;
+        let recovered = run_retrying_namespace_read_pass(
+            &cancelled,
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(sync_error(
+                        "namespace-feed",
+                        "transient routed read timeout",
+                    ))
+                } else {
+                    Ok("recovered")
+                }
+            },
+            |_| waits += 1,
+        )
+        .expect("read-only namespace retry");
+        assert_eq!(recovered, "recovered");
+        assert_eq!(calls, 2);
+        assert_eq!(waits, 1);
+
+        let fatal = run_retrying_namespace_read_pass(
+            &cancelled,
+            || Err::<(), _>(sync_error("namespace-effect", "ambiguous local effect")),
+            |_| panic!("fatal effects must not wait or retry"),
+        )
+        .expect_err("local effect failure remains fatal");
+        assert_eq!(fatal.code, "namespace-effect");
+
+        cancelled.store(true, Ordering::SeqCst);
+        let cancelled_read = run_retrying_namespace_read_pass(
+            &cancelled,
+            || Err::<(), _>(sync_error("full-reconciliation-scan", "network timeout")),
+            |_| panic!("cancelled read must not wait or retry"),
+        )
+        .expect_err("cancelled read returns immediately");
+        assert_eq!(cancelled_read.code, "full-reconciliation-scan");
     }
 
     #[test]
