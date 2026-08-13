@@ -2422,7 +2422,7 @@ fn lock_file_exclusive_with_timeout(path: &Path, timeout: Duration) -> Result<Fi
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
                 if path.file_name().and_then(|name| name.to_str()) == Some(STORE_LOCK_FILE) {
-                    tracing::debug!(
+                    tracing::info!(
                         target: "sinomo.dfs.mounted_mutation.lock",
                         lock_path = %path.display(),
                         caller_file = caller.file(),
