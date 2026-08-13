@@ -19,7 +19,7 @@ use sinomo_core::storage::durable_file::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -387,7 +387,7 @@ pub fn inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(
         thread_name = std::thread::current().name(),
         "acquired mounted-mutation cursor-recovery store lock"
     );
-    let store_lock = CursorRecoveryStoreLock {
+    let mut store_lock = CursorRecoveryStoreLock {
         file: store_lock,
         path: lock_path.clone(),
     };
@@ -453,7 +453,19 @@ pub fn inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(
         ));
     }
 
-    let lock_bytes = fs::read(&lock_path).map_err(|source| lock_error(&lock_path, source))?;
+    // Read the lock evidence through the handle which owns the byte-range
+    // lock. On Windows an exclusive LockFileEx range also blocks reads through
+    // a second handle in this process, so reopening via `fs::read` would make
+    // a successful recovery fence reject itself with ERROR_LOCK_VIOLATION.
+    store_lock
+        .file
+        .seek(SeekFrom::Start(0))
+        .map_err(|source| lock_error(&lock_path, source))?;
+    let mut lock_bytes = Vec::new();
+    store_lock
+        .file
+        .read_to_end(&mut lock_bytes)
+        .map_err(|source| lock_error(&lock_path, source))?;
     if !lock_bytes.is_empty() {
         return Err(outbox_error(
             "mounted-mutation outbox lock contains unexpected state bytes",
