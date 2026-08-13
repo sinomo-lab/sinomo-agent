@@ -8533,47 +8533,50 @@ fn start_platform_mount(
                 validate_authority_finalized_completion_cut(data_dir, marker)?;
             }
             let authority_path = materialize_cursor_recovery_provider_bundle(data_dir, &bundle)?;
-            let execution = materialize_cursor_recovery_execution_provider(data_dir, &bundle)?;
-            let (execution_provenance, execution_path) = if let Some(execution) = execution {
+            let pinned_execution =
+                materialize_cursor_recovery_execution_provider(data_dir, &bundle)?;
+            let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+                .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+            let active = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
+                .map_err(|error| format!("read Cloud Files module loader state: {error}"))?;
+            let active = active.map(|active| {
+                let provenance = CloudFilesModuleProvenance::from_loader_state(&active);
+                let path = native_module_cache_path(
+                    &data_dir_root,
+                    &active.cache_key,
+                    &active.content_hash,
+                    &active.library_name,
+                );
+                (provenance, path)
+            });
+            let active_is_new_execution = active.as_ref().is_some_and(|(provenance, _)| {
+                provenance != &marker.module && bundle.execution_module.as_ref() != Some(provenance)
+            });
+            let (execution_provenance, execution_path) = if active_is_new_execution {
+                let (active_provenance, active_path) = active.expect("active execution provider");
+                let active_bytes = read_bounded_plain_host_file(
+                    &active_path,
+                    CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES,
+                    "active cursor-recovery execution provider",
+                )?
+                .ok_or_else(|| {
+                    "active cursor-recovery execution provider disappeared".to_string()
+                })?;
+                if sinomo_runtime::module::native_module_content_hash(&active_bytes)
+                    != active_provenance.content_hash
+                {
+                    return Err(
+                        "active cursor-recovery execution provider hash changed".to_string()
+                    );
+                }
+                bundle.execution_module = Some(active_provenance.clone());
+                bundle.execution_provider_bytes = Some(active_bytes);
+                validate_cursor_recovery_execution_provider(&bundle)?;
+                (active_provenance, active_path)
+            } else if let Some(execution) = pinned_execution {
                 execution
             } else {
-                let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
-                    .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-                let active = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
-                    .map_err(|error| format!("read Cloud Files module loader state: {error}"))?;
-                if let Some(active) = active {
-                    let active_provenance = CloudFilesModuleProvenance::from_loader_state(&active);
-                    if active_provenance != marker.module {
-                        let active_path = native_module_cache_path(
-                            &data_dir_root,
-                            &active.cache_key,
-                            &active.content_hash,
-                            &active.library_name,
-                        );
-                        let active_bytes = read_bounded_plain_host_file(
-                            &active_path,
-                            CLOUD_FILES_CURSOR_RECOVERY_PROVIDER_MAX_BYTES,
-                            "active cursor-recovery execution provider",
-                        )?
-                        .ok_or_else(|| {
-                            "active cursor-recovery execution provider disappeared".to_string()
-                        })?;
-                        if sinomo_runtime::module::native_module_content_hash(&active_bytes)
-                            != active_provenance.content_hash
-                        {
-                            return Err("active cursor-recovery execution provider hash changed"
-                                .to_string());
-                        }
-                        bundle.execution_module = Some(active_provenance.clone());
-                        bundle.execution_provider_bytes = Some(active_bytes);
-                        validate_cursor_recovery_execution_provider(&bundle)?;
-                        (active_provenance, active_path)
-                    } else {
-                        (marker.module.clone(), authority_path)
-                    }
-                } else {
-                    (marker.module.clone(), authority_path)
-                }
+                (marker.module.clone(), authority_path)
             };
             (
                 marker.module.clone(),
