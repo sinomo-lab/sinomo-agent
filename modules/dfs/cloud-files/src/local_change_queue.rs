@@ -390,6 +390,7 @@ impl CloudFilesLocalChangeQueue {
         // before we could discover that evidence appeared in the gap.
         let CloudFilesCursorOnlyQueueInspectionGuard {
             inspection: _,
+            replay: Some(replay),
             _lock: Some(lock),
         } = guard
         else {
@@ -416,10 +417,10 @@ impl CloudFilesLocalChangeQueue {
             .metadata()
             .map_err(io_error("recheck cursor-recovery queue journal"))?
             .len()
-            != 0
+            != replay.journal_bytes
         {
             return Err(queue_error(
-                "cursor-recovery-queue-not-empty",
+                "cursor-recovery-queue-drift",
                 "authorized recovery queue journal changed under its owner lock",
             ));
         }
@@ -432,10 +433,10 @@ impl CloudFilesLocalChangeQueue {
             retired_ledger_path,
             _lock: lock,
             journal: Some(journal),
-            next_sequence: 1,
-            journal_record_count: 0,
-            operations: BTreeMap::new(),
-            retired_ledger: ReconciledRetirementLedger::default(),
+            next_sequence: replay.next_sequence,
+            journal_record_count: replay.journal_record_count,
+            operations: replay.operations,
+            retired_ledger: replay.retired_ledger,
             usable: true,
         })
     }
@@ -1508,13 +1509,165 @@ pub(crate) struct CloudFilesCursorOnlyQueueInspection {
 
 pub(crate) struct CloudFilesCursorOnlyQueueInspectionGuard {
     inspection: CloudFilesCursorOnlyQueueInspection,
+    replay: Option<ExactQueueReplay>,
     _lock: Option<File>,
+}
+
+struct ExactQueueReplay {
+    journal_bytes: u64,
+    next_sequence: u64,
+    journal_record_count: u64,
+    operations: BTreeMap<String, CloudFilesLocalOperation>,
+    retired_ledger: ReconciledRetirementLedger,
 }
 
 impl CloudFilesCursorOnlyQueueInspectionGuard {
     pub(crate) fn inspection(&self) -> &CloudFilesCursorOnlyQueueInspection {
         &self.inspection
     }
+
+    /// Accept either the byte-identical token snapshot or the one monotonic
+    /// terminal successor produced when every captured operation has been
+    /// acknowledged by an authoritative scan. The successor retains an exact
+    /// request-digest tombstone for every original operation and no active
+    /// journal/blob evidence.
+    pub(crate) fn matches_original_or_reconciled_successor(
+        &self,
+        original_raw_files: &BTreeMap<String, Vec<u8>>,
+        mount: &str,
+        root: &str,
+    ) -> Result<bool, CloudFilesLocalChangeQueueError> {
+        if &self.inspection.raw_files == original_raw_files {
+            return Ok(true);
+        }
+        let Some(current) = self.replay.as_ref() else {
+            return Ok(false);
+        };
+        let original = replay_exact_queue_raw_files(original_raw_files, mount, root)?;
+        if !current.operations.is_empty()
+            || current.journal_bytes != 0
+            || self
+                .inspection
+                .raw_files
+                .keys()
+                .any(|name| name.starts_with(&format!("{QUEUE_BLOBS_DIR}/")))
+        {
+            return Ok(false);
+        }
+        let expected = original
+            .retired_ledger
+            .tombstones
+            .iter()
+            .map(|(operation_id, tombstone)| {
+                (operation_id.clone(), tombstone.request_digest.clone())
+            })
+            .chain(original.operations.iter().map(|(operation_id, operation)| {
+                (operation_id.clone(), operation.request_digest.clone())
+            }))
+            .collect::<BTreeMap<_, _>>();
+        let observed = current
+            .retired_ledger
+            .tombstones
+            .iter()
+            .map(|(operation_id, tombstone)| {
+                (operation_id.clone(), tombstone.request_digest.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let original_order = original
+            .retired_ledger
+            .order
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let current_order = current
+            .retired_ledger
+            .order
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(!original.operations.is_empty()
+            && observed == expected
+            && current_order.starts_with(&original_order)
+            && current_order.len() == original_order.len() + original.operations.len()
+            && current.retired_ledger.next_ordinal
+                == original
+                    .retired_ledger
+                    .next_ordinal
+                    .saturating_add(original.operations.len() as u64))
+    }
+}
+
+fn replay_exact_queue_raw_files(
+    raw_files: &BTreeMap<String, Vec<u8>>,
+    mount: &str,
+    root: &str,
+) -> Result<ExactQueueReplay, CloudFilesLocalChangeQueueError> {
+    let journal = raw_files.get(QUEUE_JOURNAL).ok_or_else(|| {
+        queue_error(
+            "cursor-recovery-queue-topology",
+            "token snapshot is missing its exact queue journal",
+        )
+    })?;
+    if raw_files
+        .get(QUEUE_LOCK)
+        .is_none_or(|bytes| !bytes.is_empty())
+    {
+        return Err(queue_error(
+            "cursor-recovery-queue-topology",
+            "token snapshot is missing its canonical queue lock",
+        ));
+    }
+    if raw_files.keys().any(|name| {
+        name != QUEUE_JOURNAL
+            && name != QUEUE_LOCK
+            && name != QUEUE_RETIRED_LEDGER
+            && !name.starts_with(&format!("{QUEUE_BLOBS_DIR}/"))
+    }) {
+        return Err(queue_error(
+            "cursor-recovery-queue-topology",
+            "token snapshot contains an unknown queue entry",
+        ));
+    }
+    let mut replay = replay_exact_queue_journal(journal, mount, root)?;
+    replay.retired_ledger = decode_exact_retirement_ledger(
+        raw_files.get(QUEUE_RETIRED_LEDGER).map(Vec::as_slice),
+        &replay.operations,
+    )?;
+    let mut expected_blobs = BTreeMap::new();
+    for operation in replay
+        .operations
+        .values()
+        .filter(|operation| operation.status.retains_blob())
+    {
+        let Some(content) = operation.request.staged_content.as_ref() else {
+            continue;
+        };
+        let hash = content
+            .content_hash
+            .strip_prefix(BLOB_HASH_PREFIX)
+            .ok_or_else(|| {
+                queue_error(
+                    "cursor-recovery-queue-blob",
+                    "token snapshot operation has a malformed staged hash",
+                )
+            })?;
+        expected_blobs.insert(
+            format!("{QUEUE_BLOBS_DIR}/{hash}.blob"),
+            encode_sobj(content).map_err(sobj_error("encode cursor-recovery blob descriptor"))?,
+        );
+    }
+    let observed_blobs = raw_files
+        .iter()
+        .filter(|(name, _)| name.starts_with(&format!("{QUEUE_BLOBS_DIR}/")))
+        .map(|(name, bytes)| (name.clone(), bytes.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if observed_blobs != expected_blobs {
+        return Err(queue_error(
+            "cursor-recovery-queue-blob",
+            "token snapshot blob descriptors do not match its active journal",
+        ));
+    }
+    Ok(replay)
 }
 
 pub(crate) fn inspect_cursor_only_local_change_queue(
@@ -1551,6 +1704,7 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
                 if label == "local-change queue" {
                     return Ok(CloudFilesCursorOnlyQueueInspectionGuard {
                         inspection: CloudFilesCursorOnlyQueueInspection::default(),
+                        replay: None,
                         _lock: None,
                     });
                 }
@@ -1570,6 +1724,7 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
             }
             return Ok(CloudFilesCursorOnlyQueueInspectionGuard {
                 inspection: CloudFilesCursorOnlyQueueInspection::default(),
+                replay: None,
                 _lock: None,
             });
         }
@@ -1622,9 +1777,10 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
     })?;
 
     let mut raw_files = BTreeMap::new();
-    let mut saw_journal = false;
+    let mut journal_bytes = None;
+    let mut retired_ledger_bytes = None;
     let mut saw_lock = false;
-    let mut saw_blobs = false;
+    let mut blobs_path = None;
     for entry in fs::read_dir(&scope).map_err(io_error("list cursor-only queue scope"))? {
         let entry = entry.map_err(io_error("read cursor-only queue scope entry"))?;
         let path = entry.path();
@@ -1645,14 +1801,14 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
         match name.as_str() {
             QUEUE_JOURNAL if metadata.file_type().is_file() => {
                 let bytes = fs::read(&path).map_err(io_error("read cursor-only queue journal"))?;
-                if !bytes.is_empty() {
+                if bytes.len() as u64 > QUEUE_JOURNAL_MAX_BYTES {
                     return Err(queue_error(
-                        "cursor-recovery-queue-not-empty",
-                        "local-change journal contains operation evidence",
+                        "cursor-recovery-queue-journal",
+                        "local-change journal exceeds its hard bound",
                     ));
                 }
-                raw_files.insert(name, bytes);
-                saw_journal = true;
+                raw_files.insert(name, bytes.clone());
+                journal_bytes = Some(bytes);
             }
             QUEUE_LOCK if metadata.file_type().is_file() => {
                 // Windows enforces the byte-range lock against I/O through a
@@ -1671,19 +1827,7 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
                 saw_lock = true;
             }
             QUEUE_BLOBS_DIR if metadata.file_type().is_dir() => {
-                if fs::read_dir(&path)
-                    .map_err(io_error("list cursor-only queue blobs"))?
-                    .next()
-                    .transpose()
-                    .map_err(io_error("read cursor-only queue blob entry"))?
-                    .is_some()
-                {
-                    return Err(queue_error(
-                        "cursor-recovery-queue-not-empty",
-                        "local-change blob directory contains retained content",
-                    ));
-                }
-                saw_blobs = true;
+                blobs_path = Some(path);
             }
             QUEUE_RETIRED_LEDGER if metadata.file_type().is_file() => {
                 let bytes = fs::read(&path)
@@ -1694,21 +1838,8 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
                         "retired-operation ledger exceeds its bound",
                     ));
                 }
-                let ledger: ReconciledRetirementLedgerSnapshot = decode_sobj(&bytes)
-                    .map_err(sobj_error("decode cursor-only retired-operation ledger"))?;
-                if ledger.schema_version != QUEUE_RETIRED_LEDGER_SCHEMA_VERSION
-                    || !ledger.tombstones.is_empty()
-                    || ledger.next_ordinal != 1
-                    || encode_sobj(&ledger)
-                        .map_err(sobj_error("re-encode cursor-only retired-operation ledger"))?
-                        != bytes
-                {
-                    return Err(queue_error(
-                        "cursor-recovery-queue-not-empty",
-                        "retired-operation ledger contains history or is malformed",
-                    ));
-                }
-                raw_files.insert(name, bytes);
+                raw_files.insert(name, bytes.clone());
+                retired_ledger_bytes = Some(bytes);
             }
             _ => {
                 return Err(queue_error(
@@ -1718,19 +1849,252 @@ pub(crate) fn inspect_cursor_only_local_change_queue(
             }
         }
     }
-    if !saw_journal || !saw_lock || !saw_blobs {
+    let (Some(journal_bytes), Some(blobs_path)) = (journal_bytes, blobs_path) else {
+        return Err(queue_error(
+            "cursor-recovery-queue-topology",
+            "existing queue scope is missing its canonical journal, lock, or blobs directory",
+        ));
+    };
+    if !saw_lock {
         return Err(queue_error(
             "cursor-recovery-queue-topology",
             "existing queue scope is missing its canonical journal, lock, or blobs directory",
         ));
     }
+    let mut replay = replay_exact_queue_journal(&journal_bytes, mount, &root)?;
+    replay.retired_ledger =
+        decode_exact_retirement_ledger(retired_ledger_bytes.as_deref(), &replay.operations)?;
+    inspect_exact_queue_blobs(&blobs_path, &replay.operations, &mut raw_files)?;
     Ok(CloudFilesCursorOnlyQueueInspectionGuard {
         inspection: CloudFilesCursorOnlyQueueInspection {
             scope_present: true,
             raw_files,
         },
+        replay: Some(replay),
         _lock: Some(queue_lock),
     })
+}
+
+fn replay_exact_queue_journal(
+    journal_bytes: &[u8],
+    mount: &str,
+    root: &str,
+) -> Result<ExactQueueReplay, CloudFilesLocalChangeQueueError> {
+    let mut expected_sequence = 1_u64;
+    let mut offset = 0_usize;
+    let mut operations = BTreeMap::<String, CloudFilesLocalOperation>::new();
+    while offset < journal_bytes.len() {
+        let header_end = offset.checked_add(4).ok_or_else(|| {
+            queue_error(
+                "cursor-recovery-queue-journal",
+                "local-change journal offset overflowed",
+            )
+        })?;
+        let header = journal_bytes.get(offset..header_end).ok_or_else(|| {
+            queue_error(
+                "cursor-recovery-queue-journal",
+                "local-change journal has a torn record header",
+            )
+        })?;
+        let record_len = u32::from_le_bytes(header.try_into().expect("four-byte header")) as usize;
+        if record_len > QUEUE_RECORD_MAX_BYTES {
+            return Err(queue_error(
+                "cursor-recovery-queue-journal",
+                format!("local-change record declares {record_len} bytes"),
+            ));
+        }
+        let record_end = header_end.checked_add(record_len).ok_or_else(|| {
+            queue_error(
+                "cursor-recovery-queue-journal",
+                "local-change journal record length overflowed",
+            )
+        })?;
+        let record = journal_bytes.get(header_end..record_end).ok_or_else(|| {
+            queue_error(
+                "cursor-recovery-queue-journal",
+                "local-change journal has a torn record body",
+            )
+        })?;
+        let decoded = decode_sobj::<QueueJournalRecord>(record)
+            .map_err(sobj_error("decode exact cursor-recovery queue record"))?;
+        if decoded.body.schema_version != QUEUE_SCHEMA_VERSION
+            || decoded.body.sequence != expected_sequence
+            || decoded.checksum != journal_body_checksum(&decoded.body)?
+        {
+            return Err(queue_error(
+                "cursor-recovery-queue-journal",
+                format!(
+                    "local-change record at sequence {expected_sequence} is noncanonical, out of order, or corrupt"
+                ),
+            ));
+        }
+        validate_operation_integrity(&decoded.body.operation)?;
+        if decoded.body.operation.request.mount != mount
+            || decoded.body.operation.request.root != root
+        {
+            return Err(queue_error(
+                "queue-scope-mismatch",
+                format!(
+                    "replayed operation `{}` does not belong to the authorized mount/root",
+                    decoded.body.operation.request.operation_id
+                ),
+            ));
+        }
+        if let Some(previous) = operations.get(&decoded.body.operation.request.operation_id)
+            && previous.request_digest != decoded.body.operation.request_digest
+        {
+            return Err(queue_error(
+                "operation-id-reused",
+                format!(
+                    "replayed operation ID `{}` has conflicting immutable digests",
+                    decoded.body.operation.request.operation_id
+                ),
+            ));
+        }
+        operations.insert(
+            decoded.body.operation.request.operation_id.clone(),
+            decoded.body.operation,
+        );
+        expected_sequence = expected_sequence.saturating_add(1);
+        offset = record_end;
+    }
+    Ok(ExactQueueReplay {
+        journal_bytes: journal_bytes.len() as u64,
+        next_sequence: expected_sequence,
+        journal_record_count: expected_sequence.saturating_sub(1),
+        operations,
+        retired_ledger: ReconciledRetirementLedger::default(),
+    })
+}
+
+fn decode_exact_retirement_ledger(
+    bytes: Option<&[u8]>,
+    operations: &BTreeMap<String, CloudFilesLocalOperation>,
+) -> Result<ReconciledRetirementLedger, CloudFilesLocalChangeQueueError> {
+    let Some(bytes) = bytes else {
+        return Ok(ReconciledRetirementLedger::default());
+    };
+    let snapshot: ReconciledRetirementLedgerSnapshot = decode_sobj(bytes).map_err(sobj_error(
+        "decode cursor-recovery retired-operation ledger",
+    ))?;
+    if snapshot.schema_version != QUEUE_RETIRED_LEDGER_SCHEMA_VERSION
+        || encode_sobj(&snapshot).map_err(sobj_error(
+            "re-encode cursor-recovery retired-operation ledger",
+        ))? != bytes
+        || snapshot.tombstones.len() > QUEUE_RETIRED_TOMBSTONE_LIMIT
+    {
+        return Err(queue_error(
+            "cursor-recovery-queue-ledger",
+            "retired-operation ledger is noncanonical or exceeds its bound",
+        ));
+    }
+    let mut ledger = ReconciledRetirementLedger {
+        next_ordinal: snapshot.next_ordinal,
+        ..ReconciledRetirementLedger::default()
+    };
+    let mut previous_ordinal = 0_u64;
+    for tombstone in snapshot.tombstones {
+        if tombstone.operation_id.trim().is_empty()
+            || tombstone.operation_id.len() > 256
+            || tombstone
+                .request_digest
+                .strip_prefix(BLOB_HASH_PREFIX)
+                .is_none()
+            || tombstone.ordinal == 0
+            || (previous_ordinal != 0 && tombstone.ordinal != previous_ordinal.saturating_add(1))
+            || tombstone.ordinal >= ledger.next_ordinal
+            || operations
+                .get(&tombstone.operation_id)
+                .is_some_and(|active| active.request_digest != tombstone.request_digest)
+            || ledger.tombstones.contains_key(&tombstone.operation_id)
+        {
+            return Err(queue_error(
+                "cursor-recovery-queue-ledger",
+                format!(
+                    "retired operation `{}` has invalid identity, digest, or ordinal",
+                    tombstone.operation_id
+                ),
+            ));
+        }
+        previous_ordinal = tombstone.ordinal;
+        ledger.order.push_back(tombstone.operation_id.clone());
+        ledger
+            .tombstones
+            .insert(tombstone.operation_id.clone(), tombstone);
+    }
+    if ledger.next_ordinal != previous_ordinal.saturating_add(1) {
+        return Err(queue_error(
+            "cursor-recovery-queue-ledger",
+            "retired-operation ledger next ordinal is not its exact successor",
+        ));
+    }
+    Ok(ledger)
+}
+
+fn inspect_exact_queue_blobs(
+    blobs_dir: &Path,
+    operations: &BTreeMap<String, CloudFilesLocalOperation>,
+    raw_files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), CloudFilesLocalChangeQueueError> {
+    let mut expected = BTreeMap::<String, CloudFilesStagedContent>::new();
+    for operation in operations
+        .values()
+        .filter(|operation| operation.status.retains_blob())
+    {
+        let Some(content) = operation.request.staged_content.as_ref() else {
+            continue;
+        };
+        let path = blob_path_in_dir(blobs_dir, content)?;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| queue_error("cursor-recovery-queue-blob", "blob name is not UTF-8"))?
+            .to_string();
+        if let Some(previous) = expected.insert(name, content.clone())
+            && previous != *content
+        {
+            return Err(queue_error(
+                "cursor-recovery-queue-blob",
+                "one staged hash is referenced with conflicting lengths",
+            ));
+        }
+    }
+    for entry in fs::read_dir(blobs_dir).map_err(io_error("list cursor-recovery queue blobs"))? {
+        let entry = entry.map_err(io_error("read cursor-recovery queue blob entry"))?;
+        let path = entry.path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(io_error("inspect cursor-recovery queue blob"))?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            queue_error(
+                "cursor-recovery-queue-blob",
+                "blob directory contains a non-UTF-8 entry",
+            )
+        })?;
+        if !metadata.file_type().is_file() || metadata_is_reparse(&metadata) {
+            return Err(queue_error(
+                "cursor-recovery-queue-blob",
+                format!("staged blob `{name}` is not a plain file"),
+            ));
+        }
+        let content = expected.remove(&name).ok_or_else(|| {
+            queue_error(
+                "cursor-recovery-queue-blob",
+                format!("unreferenced or noncanonical staged blob `{name}`"),
+            )
+        })?;
+        verify_blob(&path, &content)?;
+        raw_files.insert(
+            format!("{QUEUE_BLOBS_DIR}/{name}"),
+            encode_sobj(&content).map_err(sobj_error("encode cursor-recovery blob descriptor"))?,
+        );
+    }
+    if !expected.is_empty() {
+        return Err(queue_error(
+            "cursor-recovery-queue-blob",
+            "one or more retained operations lost their immutable staged blob",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -2214,6 +2578,103 @@ mod tests {
             fs::read(compaction_stage).expect("retained compaction evidence"),
             b"ambiguous compacted operation evidence"
         );
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_replays_retained_operations_and_accepts_only_their_terminal_successor()
+     {
+        let root = TestRoot::new("cursor-only-authorized-retained-operation");
+        let mut seeded = queue(&root);
+        let content = seeded
+            .stage_content(b"retained exact bytes")
+            .expect("stage");
+        seeded
+            .enqueue(write_request("op-retained", content))
+            .expect("enqueue");
+        seeded
+            .mark_in_flight("op-retained")
+            .expect("durable ambiguous send");
+        drop(seeded);
+        let scope = canonical_queue_scope(&root);
+        let before = snapshot_tree(&scope);
+
+        let inspected =
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect retained queue");
+        let original_raw = inspected.inspection().raw_files.clone();
+        assert!(original_raw.keys().any(|name| name.starts_with("blobs/")));
+        drop(inspected);
+        let authorized = CloudFilesLocalChangeQueue::open_authorized_cursor_recovery(
+            &root.data_dir(),
+            "mount-a",
+            "/services",
+        )
+        .expect("open retained queue without repair");
+        assert_eq!(
+            authorized
+                .operation("op-retained")
+                .expect("retained operation")
+                .status,
+            CloudFilesLocalOperationStatus::InFlight,
+            "authorized open must not requeue or rewrite ambiguous evidence"
+        );
+        drop(authorized);
+        assert_eq!(snapshot_tree(&scope), before);
+
+        let mut completed = queue(&root);
+        completed
+            .mark_remote_applied_with_evidence(CloudFilesRemoteMutationEvidence {
+                operation_id: "op-retained".to_string(),
+                object_id: Some("01object".to_string()),
+                version: Some("01version-next".to_string()),
+                content_hash: None,
+                content_size_bytes: None,
+                kind: Some("file".to_string()),
+                detail: "authoritative scan confirmed the stable request".to_string(),
+            })
+            .expect("remote applied");
+        completed
+            .mark_completed("op-retained")
+            .expect("complete local effect");
+        completed
+            .retire_terminal_operation("op-retained")
+            .expect("retire terminal operation");
+        completed
+            .acknowledge_reconciled_retirements(&["op-retained".to_string()])
+            .expect("authoritative scan acknowledgement");
+        completed.prune_released_blobs().expect("prune blob");
+        drop(completed);
+
+        let terminal =
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect terminal queue successor");
+        assert!(
+            terminal
+                .matches_original_or_reconciled_successor(&original_raw, "mount-a", "/services")
+                .expect("classify terminal successor")
+        );
+    }
+
+    #[test]
+    fn cursor_only_queue_inspection_rejects_changed_retained_blob_without_mutation() {
+        let root = TestRoot::new("cursor-only-retained-blob-tamper");
+        let mut seeded = queue(&root);
+        let content = seeded
+            .stage_content(b"retained exact bytes")
+            .expect("stage");
+        seeded
+            .enqueue(write_request("op-retained", content.clone()))
+            .expect("enqueue");
+        let blob = seeded.blob_path(&content).expect("blob path");
+        drop(seeded);
+        fs::write(&blob, b"changed retained bytes").expect("change blob");
+        let scope = canonical_queue_scope(&root);
+        let before = snapshot_tree(&scope);
+        assert!(
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .is_err()
+        );
+        assert_eq!(snapshot_tree(&scope), before);
     }
 
     #[test]

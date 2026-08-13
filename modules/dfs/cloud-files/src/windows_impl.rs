@@ -534,7 +534,7 @@ struct CursorRecoveryOwnerGuards {
     _outbox: dfs::MountedSifsMutationOutboxCursorRecoveryGuard,
 }
 
-fn acquire_cursor_recovery_empty_owner_guards(
+fn acquire_cursor_recovery_terminal_owner_guards(
     data_dir: &SinomoDataDir,
     marker: &CursorRecoveryModuleMarker,
 ) -> Result<CursorRecoveryOwnerGuards, CloudFilesModuleError> {
@@ -575,11 +575,20 @@ fn acquire_cursor_recovery_empty_owner_guards(
             detail: "terminal successor lost its canonical empty local-change queue".to_string(),
         });
     }
-    if queue.inspection().raw_files != marker.queue_raw_files {
+    if !queue
+        .matches_original_or_reconciled_successor(
+            &marker.queue_raw_files,
+            &marker.identity.sync_root.to_string_lossy(),
+            &marker.identity.root_path,
+        )
+        .map_err(|error| CloudFilesModuleError {
+            code: error.code.to_string(),
+            detail: error.detail,
+        })?
+    {
         return Err(CloudFilesModuleError {
             code: "cursor-recovery-queue-drift".to_string(),
-            detail: "terminal successor queue bytes changed from the token-bound snapshot"
-                .to_string(),
+            detail: "terminal successor queue is neither the token-bound snapshot nor its exact fully reconciled successor".to_string(),
         });
     }
     Ok(CursorRecoveryOwnerGuards {
@@ -2702,7 +2711,7 @@ where
                         });
                     }
                     let owner_guards =
-                        acquire_cursor_recovery_empty_owner_guards(data_dir, current)?;
+                        acquire_cursor_recovery_terminal_owner_guards(data_dir, current)?;
                     let terminal = crate::namespace_reconciler::acquire_authorized_cursor_recovery_terminal_successor(
                         data_dir,
                         current.identity.sync_root.display().to_string(),
@@ -2813,7 +2822,7 @@ where
                         .to_string(),
                 });
             }
-            let owner_guards = acquire_cursor_recovery_empty_owner_guards(data_dir, current)?;
+            let owner_guards = acquire_cursor_recovery_terminal_owner_guards(data_dir, current)?;
             if let Some(terminal) =
                 crate::namespace_reconciler::acquire_authorized_cursor_recovery_terminal_successor(
                     data_dir,

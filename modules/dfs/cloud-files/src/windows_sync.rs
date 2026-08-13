@@ -3068,12 +3068,47 @@ where
         Ok(())
     }
 
+    fn ensure_cursor_recovery_queue_can_scan(&self) -> Result<bool, CloudFilesWindowsSyncError> {
+        let mut waiting = false;
+        for operation in self.state.queue.operations() {
+            match operation.status {
+                CloudFilesLocalOperationStatus::Superseded => {}
+                CloudFilesLocalOperationStatus::Queued
+                | CloudFilesLocalOperationStatus::InFlight
+                | CloudFilesLocalOperationStatus::Retrying
+                | CloudFilesLocalOperationStatus::RemoteApplied
+                | CloudFilesLocalOperationStatus::Completed => waiting = true,
+                CloudFilesLocalOperationStatus::Conflict
+                | CloudFilesLocalOperationStatus::Failed => {
+                    return Err(sync_error(
+                        "cursor-recovery-queue-attention-required",
+                        format!(
+                            "retained operation `{}` is {:?}: {}",
+                            operation.request.operation_id,
+                            operation.status,
+                            operation
+                                .last_error
+                                .as_deref()
+                                .or_else(|| operation
+                                    .conflict
+                                    .as_ref()
+                                    .map(|value| value.detail.as_str()))
+                                .unwrap_or(
+                                    "terminal local writeback evidence requires operator review"
+                                )
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(!waiting)
+    }
+
     fn run_authorized_cursor_recovery(
         &mut self,
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         check_cancelled(cancelled)?;
-        self.ensure_cursor_recovery_queue_empty()?;
         let control = self.cursor_recovery.clone().ok_or_else(|| {
             sync_error(
                 "cursor-recovery-control-missing",
@@ -3082,12 +3117,15 @@ where
         })?;
 
         if control.released() {
+            self.ensure_cursor_recovery_queue_empty()?;
             return self.finish_released_cursor_recovery(cancelled, &control);
         }
         if control.active_parked() {
+            self.ensure_cursor_recovery_queue_empty()?;
             return Ok(CloudFilesWritableSyncProgress::default());
         }
         if control.terminal() {
+            self.ensure_cursor_recovery_queue_empty()?;
             return Ok(CloudFilesWritableSyncProgress {
                 cursor_recovery_terminal: true,
                 ..CloudFilesWritableSyncProgress::default()
@@ -3100,6 +3138,7 @@ where
         // never rerun or mutate the authoritative scan after the successor is
         // durable.
         if self.state.cursor_recovery_module_namespace_finalized {
+            self.ensure_cursor_recovery_queue_empty()?;
             if !self.state.reconciler.cursor_recovery_terminal()
                 || self.state.reconciler.materialized_directories()
                     != &BTreeSet::from([self.state.root.clone()])
@@ -3115,6 +3154,13 @@ where
         self.mutations.ensure_contracts_ready().map_err(|detail| {
             sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
         })?;
+        let mut progress = CloudFilesWritableSyncProgress::default();
+        if self.state.queue.operations().next().is_some() {
+            progress.mutation_progress = self.execute_mutations()?;
+            if !self.ensure_cursor_recovery_queue_can_scan()? {
+                return Ok(progress);
+            }
+        }
         let snapshot = self.full_scan_snapshot(cancelled)?;
         if snapshot.scan_complete && snapshot.cursors.is_empty() {
             return Err(sync_error(
@@ -3129,10 +3175,7 @@ where
             ));
         }
         let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
-        let progress = CloudFilesWritableSyncProgress {
-            full_scan_applied: true,
-            ..CloudFilesWritableSyncProgress::default()
-        };
+        progress.full_scan_applied = true;
         if !scan_complete {
             return Ok(progress);
         }
@@ -3146,6 +3189,10 @@ where
             ));
         }
         self.ensure_cursor_recovery_queue_empty()?;
+        self.state
+            .queue
+            .prune_released_blobs()
+            .map_err(queue_error)?;
         let mut terminal = self.establish_cursor_recovery_terminal_proof(cancelled, &control)?;
         terminal.full_scan_applied = progress.full_scan_applied;
         Ok(terminal)
@@ -6476,12 +6523,73 @@ mod tests {
     }
 
     #[test]
-    fn authorized_cursor_recovery_rejects_any_preexisting_queue_operation() {
+    fn authorized_cursor_recovery_reconciles_retained_queue_before_scanning() {
         let root = TestRoot::new("cursor-recovery-nonempty-queue");
         let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
             .expect("state");
-        state
+        let operation = state
             .enqueue_capture(create_capture("recovery-must-not-upload", b"offline"))
+            .expect("seed queued local operation");
+        let staged = operation
+            .request
+            .staged_content
+            .as_ref()
+            .expect("staged content")
+            .clone();
+        state.authorize_cursor_recovery_for_test();
+        let evidence = CloudFilesRemoteMutationEvidence {
+            operation_id: operation.request.operation_id.clone(),
+            object_id: Some("01recoveredobject".to_string()),
+            version: Some("01recoveredversion".to_string()),
+            content_hash: Some(staged.content_hash.clone()),
+            content_size_bytes: Some(staged.length),
+            kind: Some("file".to_string()),
+            detail: "stable request already matches authoritative SIFS".to_string(),
+        };
+        let backend = FakeBackend {
+            outcome: CloudFilesDfsMutationOutcome::Applied(evidence),
+            ..FakeBackend::default()
+        };
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let mut scan = cursor_recovery_snapshot(1, true);
+        scan.manifest.insert(
+            operation.request.source_path.clone(),
+            CloudFilesReconciledManifestEntry {
+                path: operation.request.source_path.clone(),
+                object_id: "01recoveredobject".to_string(),
+                version: "01recoveredversion".to_string(),
+                content_hash: Some(staged.content_hash),
+                content_size_bytes: Some(staged.length),
+                kind: "file".to_string(),
+            },
+        );
+        let namespace = FakeNamespace::with_scans([scan]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            FakeEffects::default(),
+        );
+
+        let progress = worker
+            .startup(&AtomicBool::new(false))
+            .expect("retained operation reconciles before recovery scan");
+        assert!(progress.cursor_recovery_terminal);
+        assert!(progress.full_scan_applied);
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(worker.state().queue().operations().count(), 0);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_never_scans_across_ambiguous_retained_work() {
+        let root = TestRoot::new("cursor-recovery-ambiguous-queue");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        state
+            .enqueue_capture(create_capture("recovery-retained-ambiguous", b"offline"))
             .expect("seed queued local operation");
         state.authorize_cursor_recovery_for_test();
         let backend = FakeBackend::default();
@@ -6496,12 +6604,23 @@ mod tests {
             FakeEffects::default(),
         );
 
-        let error = worker
+        let progress = worker
             .startup(&AtomicBool::new(false))
-            .expect_err("armed queue must be exactly empty");
-        assert_eq!(error.code, "cursor-recovery-queue-not-empty");
+            .expect("ambiguous retained work remains parked");
+        assert!(!progress.cursor_recovery_terminal);
+        assert!(!progress.full_scan_applied);
         assert_eq!(scan_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operations()
+                .next()
+                .expect("retained operation")
+                .status,
+            CloudFilesLocalOperationStatus::Retrying
+        );
     }
 
     fn content() -> CloudFilesDfsMutationContent {
