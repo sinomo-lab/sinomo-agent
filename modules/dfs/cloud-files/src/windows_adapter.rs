@@ -92,7 +92,7 @@ use crate::windows_sync::{
     local_capture_retry_delay, next_sparse_known_path, plan_directory_changes,
     plan_owned_offline_create, run_progress_gated_worker_loop, run_retrying_namespace_read_pass,
     sparse_child_directory_is_enumerated, sparse_root_is_enumerated,
-    suppression_for_completed_mutation,
+    staged_content_matches_manifest_entry, suppression_for_completed_mutation,
 };
 
 const DIRECTORY_CHANGE_BUFFER_BYTES: usize = 64 * 1024;
@@ -3221,6 +3221,11 @@ fn capture_local_upsert_with_reader(
         Err(StableLocalFileReadError::Retryable(_)) => return Ok(LocalUpsertCapture::Deferred),
         Err(StableLocalFileReadError::Fatal(detail)) => return Err(detail),
     };
+    if let (Some(previous), CloudFilesCapturedContent::Staged(staged)) = (previous, &content)
+        && staged_content_matches_manifest_entry(staged, previous)
+    {
+        return Ok(LocalUpsertCapture::NoChange);
+    }
     let (kind, source, destination) = match previous {
         Some(previous) => (
             CloudFilesLocalOperationKind::ReplaceFile,

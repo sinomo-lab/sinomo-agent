@@ -887,6 +887,22 @@ pub enum CloudFilesCapturedContent {
     Staged(CloudFilesStagedContent),
 }
 
+/// Return whether immutable bytes captured from a projected file are already
+/// the exact authoritative content recorded in the namespace manifest.
+///
+/// Cloud Files can clear `InSyncState` for metadata-only local observations.
+/// That state is an accelerator, not proof that file bytes changed. Production
+/// capture therefore compares the stable content-addressed blob before it
+/// creates a conditional replace operation.
+pub(crate) fn staged_content_matches_manifest_entry(
+    staged: &CloudFilesStagedContent,
+    entry: &CloudFilesReconciledManifestEntry,
+) -> bool {
+    entry.kind == "file"
+        && entry.content_hash.as_deref() == Some(staged.content_hash.as_str())
+        && entry.content_size_bytes == Some(staged.length)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CloudFilesCapturedLocalChange {
     pub capture_id: String,
@@ -1508,6 +1524,11 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         &mut self,
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
+        if let Some(stat) = self.authoritative_unchanged_replace(command)? {
+            return Ok(CloudFilesDfsMutationOutcome::Applied(
+                mutation_evidence_from_stat(command, stat),
+            ));
+        }
         let expected = required_source_precondition(command)?;
         let content = required_staged_content(command)?;
         let object_id = parse_object_id(&expected.object_id)?;
@@ -1639,6 +1660,11 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
                 Ok(classify_write_reconciliation(command, receipt))
             }
             CloudFilesLocalOperationKind::ReplaceFile => {
+                if let Some(stat) = self.authoritative_unchanged_replace(command)? {
+                    return Ok(CloudFilesDfsMutationReconciliation::Applied(
+                        mutation_evidence_from_stat(command, stat),
+                    ));
+                }
                 let content = required_staged_content(command)?;
                 let expected = required_source_precondition(command)?;
                 let object_id = parse_object_id(&expected.object_id)?;
@@ -1674,6 +1700,37 @@ impl<T: dfs::DfsMessageTransport> CloudFilesDfsServiceMutationBackend<T> {
         &self,
     ) -> Result<std::sync::MutexGuard<'_, dfs::NetworkedDfsService<T>>, String> {
         lock_service_with_timeout(&self.service, CLOUD_FILES_SERVICE_LOCK_TIMEOUT)
+    }
+
+    /// Resolve a content-identical conditional replacement without entering
+    /// the mounted-mutation handoff. This both avoids needless writes and lets
+    /// older durable queues drain operations captured before the no-op filter
+    /// existed. The authoritative generation is re-read first, so a remote
+    /// change still follows normal receipt/CAS reconciliation.
+    fn authoritative_unchanged_replace(
+        &self,
+        command: &CloudFilesDfsMutationCommand,
+    ) -> Result<Option<dfs::DfsStat>, String> {
+        if !replace_command_may_have_unchanged_content(command)? {
+            return Ok(None);
+        }
+        let expected = required_source_precondition(command)?;
+        let content = required_staged_content(command)?;
+        let stat = self
+            .lock_service()?
+            .posix_lstat_distributed(&command.source_path)
+            .map_err(|error| {
+                format!(
+                    "verify content-identical Cloud Files replacement `{}`: {error}",
+                    command.source_path
+                )
+            })?;
+        Ok((stat.kind == dfs::DfsObjectKind::File
+            && stat.object_id.to_string() == expected.object_id
+            && stat.version.to_string() == expected.version
+            && stat.content_hash.as_deref() == Some(content.descriptor.content_hash.as_str())
+            && stat.size_bytes == Some(content.descriptor.length))
+        .then_some(stat))
     }
 
     fn classify_namespace_reconciliation(
@@ -1788,6 +1845,17 @@ fn required_source_precondition(
         .source
         .as_ref()
         .ok_or_else(|| "conditional mutation has no exact source generation".to_string())
+}
+
+fn replace_command_may_have_unchanged_content(
+    command: &CloudFilesDfsMutationCommand,
+) -> Result<bool, String> {
+    if command.kind != CloudFilesLocalOperationKind::ReplaceFile {
+        return Ok(false);
+    }
+    let expected = required_source_precondition(command)?;
+    let content = required_staged_content(command)?;
+    Ok(expected.content_hash.as_deref() == Some(content.descriptor.content_hash.as_str()))
 }
 
 fn parse_object_id(value: &str) -> Result<dfs::DfsObjectId, String> {
@@ -3986,6 +4054,57 @@ mod tests {
             cloud_files_object_projection(&dfs::DfsObjectKind::Artifact),
             CloudFilesObjectProjection::Unsupported("artifact")
         ));
+    }
+
+    #[test]
+    fn content_identical_local_capture_and_replace_are_noop_candidates() {
+        let staged = CloudFilesStagedContent {
+            content_hash: "blake3:same-content".to_string(),
+            length: 17,
+        };
+        let manifest = CloudFilesReconciledManifestEntry {
+            path: "/services/same.txt".to_string(),
+            object_id: "01sameobject".to_string(),
+            version: "01sameversion".to_string(),
+            content_hash: Some(staged.content_hash.clone()),
+            content_size_bytes: Some(staged.length),
+            kind: "file".to_string(),
+        };
+        assert!(staged_content_matches_manifest_entry(&staged, &manifest));
+
+        let command = CloudFilesDfsMutationCommand {
+            operation_id: "noop-replace".to_string(),
+            request_digest: "digest".to_string(),
+            kind: CloudFilesLocalOperationKind::ReplaceFile,
+            source_path: manifest.path.clone(),
+            destination_path: None,
+            preconditions: CloudFilesLocalOperationPreconditions {
+                source: Some(CloudFilesExpectedObjectState {
+                    object_id: manifest.object_id.clone(),
+                    version: manifest.version.clone(),
+                    content_hash: manifest.content_hash.clone(),
+                }),
+                destination: CloudFilesDestinationPrecondition::Unspecified,
+            },
+            staged_content: Some(CloudFilesDfsMutationContent {
+                descriptor: staged.clone(),
+                blob_path: PathBuf::from("unused-noop-blob"),
+            }),
+        };
+        assert!(replace_command_may_have_unchanged_content(&command).expect("valid replace"));
+
+        let mut changed = staged;
+        changed.content_hash = "blake3:changed-content".to_string();
+        assert!(!staged_content_matches_manifest_entry(&changed, &manifest));
+        let mut changed_command = command;
+        changed_command.staged_content = Some(CloudFilesDfsMutationContent {
+            descriptor: changed,
+            blob_path: PathBuf::from("unused-changed-blob"),
+        });
+        assert!(
+            !replace_command_may_have_unchanged_content(&changed_command)
+                .expect("valid changed replace")
+        );
     }
 
     #[test]
