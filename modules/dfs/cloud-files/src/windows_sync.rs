@@ -3203,6 +3203,16 @@ where
             return self.establish_cursor_recovery_terminal_proof(cancelled, &control);
         }
 
+        // The authoritative terminal state is durable before the observer
+        // audit and Terminal rewrite. A crash or a later proof error in that
+        // interval leaves ReconcileArmed plus exact terminal state. Re-run
+        // only the proof boundary; launching another scan from terminal
+        // cursors would reverse the plan's causal state machine.
+        if self.state.reconciler.cursor_recovery_terminal() {
+            self.ensure_cursor_recovery_queue_settled()?;
+            return self.establish_cursor_recovery_terminal_proof(cancelled, &control);
+        }
+
         self.mutations.ensure_contracts_ready().map_err(|detail| {
             sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
         })?;
@@ -6407,6 +6417,47 @@ mod tests {
             worker.state().reconciler().materialized_directories(),
             &BTreeSet::from(["/services".to_string(), directory.path])
         );
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_reaudits_terminal_state_without_rescanning() {
+        let root = TestRoot::new("cursor-recovery-terminal-before-rewrite");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        let terminal_cursor = cursor(9);
+        state
+            .reconciler
+            .install_full_scan_delta(
+                BTreeMap::new(),
+                Vec::new(),
+                vec!["/services".to_string()],
+                BTreeMap::from([(
+                    terminal_cursor.shard_key().expect("cursor key"),
+                    terminal_cursor,
+                )]),
+                true,
+            )
+            .expect("persist terminal state before Terminal rewrite");
+        state.authorize_cursor_recovery_for_test();
+        let capture = FakeCapture::default();
+        let audit_calls = Arc::clone(&capture.recovery_audit_calls);
+        let namespace = FakeNamespace::with_scans([]);
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+
+        let progress = worker
+            .startup(&AtomicBool::new(false))
+            .expect("re-establish terminal proof without scan");
+        assert!(progress.cursor_recovery_terminal);
+        assert!(!progress.full_scan_applied);
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(audit_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

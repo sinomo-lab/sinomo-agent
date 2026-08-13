@@ -3186,6 +3186,10 @@ impl CloudFilesNamespaceReconciler {
         !self.state.cursors.is_empty()
             && self.state.full_scan_request.is_none()
             && self.state.inflight_effect.is_none()
+            && self.state.suppressions.is_empty()
+            && self.state.conflicts.is_empty()
+            && self.state.startup_conflicts.is_empty()
+            && self.state.applied_events.is_empty()
             && self.state.materialized_directories.contains(&self.root)
     }
 
