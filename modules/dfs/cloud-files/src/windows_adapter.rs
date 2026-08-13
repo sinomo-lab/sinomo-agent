@@ -503,6 +503,22 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
             .acknowledge_directories(directories.iter().map(String::as_str))
             .map_err(|error| error.to_string())
     }
+
+    fn acknowledge_materialized_directories_after_cursor_recovery_root_audit(
+        &mut self,
+    ) -> Result<(), String> {
+        let mut intents = self.materialization_audit_intents.lock().map_err(|_| {
+            "Cloud Files materialization audit-intent store is poisoned".to_string()
+        })?;
+        let audited = intents
+            .pending_directories()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        intents
+            .acknowledge_directories(audited.iter().map(String::as_str))
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn remove_path_subtree(paths: &mut BTreeSet<String>, prefix: &str) {

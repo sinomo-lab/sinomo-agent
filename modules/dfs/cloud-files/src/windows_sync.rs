@@ -1202,10 +1202,11 @@ pub trait CloudFilesLocalChangeAccelerator {
     }
 
     /// Read-only final proof for authorized cursor recovery. Implementations
-    /// must verify that every immediate local child is the exact in-sync
-    /// placeholder described by the recovered authoritative manifest, and
-    /// that every projectable immediate authoritative child exists locally.
-    /// This hook must never stage content or classify a local mutation.
+    /// must recursively verify that every physical local descendant is the
+    /// exact in-sync entry described by the recovered authoritative manifest.
+    /// Missing authoritative descendants remain valid sparse projection and
+    /// are populated lazily after release. This hook must never stage content
+    /// or classify a local mutation.
     fn audit_cursor_recovery_root(
         &mut self,
         mount: &str,
@@ -1319,6 +1320,17 @@ pub trait CloudFilesNamespaceSource {
     fn acknowledge_materialized_directories(
         &mut self,
         _directories: &[String],
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Retires every durable population intent only after the stronger
+    /// cursor-recovery root audit has recursively proved that every physical
+    /// entry still matches the exact terminal manifest. Cursor recovery parks
+    /// further population while this proof is established, so the set cannot
+    /// grow across this acknowledgement.
+    fn acknowledge_materialized_directories_after_cursor_recovery_root_audit(
+        &mut self,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -3333,6 +3345,11 @@ where
         }
         check_cancelled(cancelled)?;
         self.ensure_cursor_recovery_queue_settled()?;
+        self.namespace
+            .acknowledge_materialized_directories_after_cursor_recovery_root_audit()
+            .map_err(|detail| {
+                sync_error("cursor-recovery-materialization-audit-acknowledge", detail)
+            })?;
         self.state.mark_cursor_recovery_terminal()?;
         control.mark_terminal()?;
         Ok(CloudFilesWritableSyncProgress {
@@ -6176,6 +6193,25 @@ mod tests {
                 .acknowledge_directories(directories.iter().map(String::as_str))
                 .map_err(|error| error.to_string())
         }
+
+        fn acknowledge_materialized_directories_after_cursor_recovery_root_audit(
+            &mut self,
+        ) -> Result<(), String> {
+            let Some(intents) = &self.materialization_audit_intents else {
+                return Ok(());
+            };
+            let mut intents = intents
+                .lock()
+                .map_err(|_| "fake materialization audit store is poisoned".to_string())?;
+            let audited = intents
+                .pending_directories()
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            intents
+                .acknowledge_directories(audited.iter().map(String::as_str))
+                .map_err(|error| error.to_string())
+        }
     }
 
     #[derive(Default)]
@@ -6458,6 +6494,60 @@ mod tests {
         assert!(!progress.full_scan_applied);
         assert_eq!(scan_calls.load(Ordering::SeqCst), 0);
         assert_eq!(audit_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_retires_post_terminal_population_intent_without_rescanning() {
+        let root = TestRoot::new("cursor-recovery-post-terminal-population");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        let terminal_cursor = cursor(10);
+        state
+            .reconciler
+            .install_full_scan_delta(
+                BTreeMap::new(),
+                Vec::new(),
+                vec!["/services".to_string()],
+                BTreeMap::from([(
+                    terminal_cursor.shard_key().expect("cursor key"),
+                    terminal_cursor,
+                )]),
+                true,
+            )
+            .expect("persist terminal state");
+        state.authorize_cursor_recovery_for_test();
+        let intents = state.materialization_audit_intents();
+        intents
+            .lock()
+            .expect("audit intents")
+            .record_directory("/services")
+            .expect("record post-Terminal root population");
+        let capture = FakeCapture::default();
+        let audit_calls = Arc::clone(&capture.recovery_audit_calls);
+        let namespace = FakeNamespace::with_materialization_audit_intents([], Arc::clone(&intents));
+        let scan_calls = Arc::clone(&namespace.scan_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+
+        let progress = worker
+            .startup(&AtomicBool::new(false))
+            .expect("re-audit and retire the post-Terminal population intent");
+        assert!(progress.cursor_recovery_terminal);
+        assert!(!progress.full_scan_applied);
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(audit_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            intents
+                .lock()
+                .expect("audit intents")
+                .pending_directories()
+                .is_empty()
+        );
     }
 
     #[test]

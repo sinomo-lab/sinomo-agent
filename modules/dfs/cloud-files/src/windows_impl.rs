@@ -3876,6 +3876,7 @@ fn mount_sifs_cloud_files_inner(
         request.root_path.clone(),
         request.read_only,
         provider_population_released.clone(),
+        cursor_recovery_marker.is_some(),
         Arc::clone(&materialized_directories),
         materialization_audit_intents,
     ));
@@ -4486,9 +4487,9 @@ unsafe extern "system" fn fetch_placeholders_callback(
             return;
         }
     };
-    if provider.blocks_nested_population(&path) {
+    if provider.blocks_population(&path) {
         host_log(&format!(
-            "Cloud Files rejected nested placeholder population for `{path}` before the provider reached Ready"
+            "Cloud Files rejected placeholder population for `{path}` before the provider reached Ready"
         ));
         let _ = unsafe {
             transfer_placeholders(
@@ -4822,6 +4823,7 @@ struct CloudFilesProvider {
     root_path: String,
     read_only: bool,
     population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
+    block_root_population_until_released: bool,
     cancelled_requests: Mutex<BTreeSet<i64>>,
     placeholder_pages: Mutex<BTreeMap<String, CloudFilesPlaceholderPageState>>,
     placeholder_page_leases: Mutex<BTreeSet<String>>,
@@ -4860,6 +4862,7 @@ impl CloudFilesProvider {
         root_path: String,
         read_only: bool,
         population_released: Option<Arc<std::sync::atomic::AtomicBool>>,
+        block_root_population_until_released: bool,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
     ) -> Self {
@@ -4872,6 +4875,7 @@ impl CloudFilesProvider {
             root_path,
             read_only,
             population_released,
+            block_root_population_until_released,
             cancelled_requests: Mutex::new(BTreeSet::new()),
             placeholder_pages: Mutex::new(BTreeMap::new()),
             placeholder_page_leases: Mutex::new(BTreeSet::new()),
@@ -4923,11 +4927,13 @@ impl CloudFilesProvider {
             .map(|pages| pages.get(path).cloned().unwrap_or_default())
     }
 
-    fn blocks_nested_population(&self, path: &str) -> bool {
-        self.population_released
-            .as_ref()
-            .is_some_and(|released| !released.load(std::sync::atomic::Ordering::SeqCst))
-            && path != self.root_path
+    fn blocks_population(&self, path: &str) -> bool {
+        population_is_parked(
+            self.population_released.as_deref(),
+            self.block_root_population_until_released,
+            path,
+            &self.root_path,
+        )
     }
 
     fn finish_placeholder_page(
@@ -5196,6 +5202,16 @@ impl CloudFilesProvider {
             }),
         }
     }
+}
+
+fn population_is_parked(
+    released: Option<&std::sync::atomic::AtomicBool>,
+    block_root_population: bool,
+    path: &str,
+    root: &str,
+) -> bool {
+    released.is_some_and(|released| !released.load(std::sync::atomic::Ordering::SeqCst))
+        && (block_root_population || path != root)
 }
 
 fn is_visible_placeholder_kind(kind: &DfsObjectKind) -> bool {
@@ -8573,6 +8589,46 @@ mod tests {
         );
         assert_eq!(failed, Err("persist-failed"));
         assert!(!effect_called.get());
+    }
+
+    #[test]
+    fn cursor_recovery_parks_root_population_until_terminal_release() {
+        let released = std::sync::atomic::AtomicBool::new(false);
+        assert!(population_is_parked(
+            Some(&released),
+            true,
+            "/services",
+            "/services"
+        ));
+        assert!(population_is_parked(
+            Some(&released),
+            true,
+            "/services/nested",
+            "/services"
+        ));
+
+        // Ordinary restart of an existing owned root still admits the root
+        // page required to reconnect, but parks its descendants until Ready.
+        assert!(!population_is_parked(
+            Some(&released),
+            false,
+            "/services",
+            "/services"
+        ));
+        assert!(population_is_parked(
+            Some(&released),
+            false,
+            "/services/nested",
+            "/services"
+        ));
+
+        released.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(!population_is_parked(
+            Some(&released),
+            true,
+            "/services/nested",
+            "/services"
+        ));
     }
 
     #[test]

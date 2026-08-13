@@ -5022,12 +5022,12 @@ pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
         ));
     }
     let terminal_state = cursor_recovery_progress_state_is_valid(&state, &validated, true)?;
-    let audit = load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
+    load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
     let rewrite_path = reconciliation_dir.join(CURSOR_RECOVERY_REWRITE_FILE);
     let mut rewrite = load_required_cursor_recovery_rewrite(&rewrite_path, plan)?;
 
     if let Some(stage_path) = rewrite_stage {
-        if !terminal_state || !audit.directories.is_empty() {
+        if !terminal_state {
             return Err(reconcile_error(
                 "cursor-recovery-rewrite-torn",
                 "terminal rewrite stage is not preceded by exact terminal owner state",
@@ -5071,12 +5071,18 @@ pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
         // never be upgraded from state shape alone.
         return Ok(None);
     }
-    if !terminal_state || !audit.directories.is_empty() {
+    if !terminal_state {
         return Err(reconcile_error(
             "cursor-recovery-terminal-incomplete",
             "Terminal rewrite is not backed by exact root-only terminal owner state",
         ));
     }
+
+    // Population is an independently durable CFAPI effect. A root enumeration
+    // can therefore fsync an audit intent after the exact Terminal rewrite but
+    // before the provider is parked. Retain that finite successor here: the
+    // terminal worker re-runs only its recursive local root proof, retires the
+    // intent, and never repeats the authoritative namespace scan.
 
     let (manifest_store, manifest) =
         CloudFilesManifestStore::open_authorized_cursor_recovery_terminal(&reconciliation_dir)?;
@@ -7369,6 +7375,78 @@ mod tests {
             )
             .expect("reopen exact terminal sparse state")
             .is_some()
+        );
+    }
+
+    #[test]
+    fn terminal_successor_retains_a_post_terminal_materialization_intent_for_root_reaudit() {
+        let fixture = cursor_recovery_fixture("recovery-terminal-post-population-intent");
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open pristine recovery cut");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply exact rewrite");
+        drop(guard);
+        let mut reconciler = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open armed progress");
+        let original: CloudFilesNamespaceReconciliationState =
+            decode_sobj(&fixture.plan.original_state).expect("decode original state");
+        reconciler
+            .install_full_scan_delta(
+                BTreeMap::new(),
+                Vec::new(),
+                vec!["/services".to_string()],
+                original.cursors,
+                true,
+            )
+            .expect("install terminal authoritative delta");
+        let mut audits = CloudFilesMaterializationAuditIntentStore::open(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+        )
+        .expect("open audit store");
+        audits
+            .acknowledge_directories(["/services"])
+            .expect("clear pre-Terminal audit");
+        reconciler
+            .mark_authorized_cursor_recovery_terminal(&fixture.plan)
+            .expect("persist exact Terminal rewrite");
+        audits
+            .record_directory("/services")
+            .expect("record independently durable post-Terminal population");
+        drop(audits);
+        drop(reconciler);
+
+        assert!(
+            acquire_authorized_cursor_recovery_terminal_successor(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("retain exact Terminal successor for local re-audit")
+            .is_some()
+        );
+        assert!(
+            CloudFilesMaterializationAuditIntentStore::open(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+            )
+            .expect("reopen retained audit")
+            .pending_directories()
+            .contains("/services")
         );
     }
 
