@@ -24,8 +24,9 @@ use sinomo_dfs_cloud_files_api::{
 };
 use sinomo_runtime::dfs::{self, DfsMessageTransport, DfsObjectKind, NetworkedDfsService};
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
+    ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_IN_SYNC_STATE_IN_SYNC,
@@ -1332,12 +1333,12 @@ fn raw_change_paths(change: &CloudFilesDirectoryChange) -> Vec<&PathBuf> {
 
 fn suppression_matches_current(sync_root: &Path, relative: &Path) -> bool {
     let local = sync_root.join(relative);
-    let metadata = match fs::symlink_metadata(&local) {
-        Ok(metadata) => metadata,
+    match fs::symlink_metadata(&local) {
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
         Err(_) => return false,
-    };
-    query_placeholder_state(&local, metadata.is_dir())
+    }
+    query_placeholder_state(&local)
         .ok()
         .flatten()
         .is_some_and(|(in_sync, _)| in_sync)
@@ -2206,7 +2207,7 @@ impl WindowsLocalStartupScanPlan {
                         format!("read enumerated metadata for {}: {error}", path.display())
                     })?;
                     let is_directory = metadata.is_dir();
-                    let placeholder = query_placeholder_state(&path, is_directory)?;
+                    let placeholder = query_placeholder_state(&path)?;
                     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
                         && placeholder.is_none()
                     {
@@ -3151,7 +3152,7 @@ fn capture_local_upsert_with_reader(
         ));
     }
     let previous = manifest.get(sifs_path);
-    let placeholder = query_placeholder_state(&local_path, metadata.is_dir())?;
+    let placeholder = query_placeholder_state(&local_path)?;
     if previous.is_none()
         && let Some((_in_sync, Some(identity))) = placeholder.as_ref()
     {
@@ -3633,16 +3634,13 @@ fn sifs_to_local(sync_root: &Path, root_path: &str, path: &str) -> Result<PathBu
 
 fn query_placeholder_state(
     path: &Path,
-    is_directory: bool,
 ) -> Result<Option<(bool, Option<CloudFilesPlaceholderIdentity>)>, String> {
     let wide = wide_path(path);
-    let flags = FILE_FLAG_OPEN_REPARSE_POINT
-        | if is_directory {
-            FILE_FLAG_BACKUP_SEMANTICS
-        } else {
-            Default::default()
-        };
-    let handle = unsafe {
+    // BACKUP_SEMANTICS permits directory handles and is harmless for files;
+    // OPEN_REPARSE_POINT ensures Cloud placeholders are inspected without
+    // triggering hydration or an invalid filter-manager name reopen.
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS;
+    let handle = match unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
             FILE_READ_ATTRIBUTES.0,
@@ -3652,9 +3650,16 @@ fn query_placeholder_state(
             flags,
             None,
         )
-    }
-    .map(OwnedWin32Handle)
-    .map_err(|error| format!("open placeholder {}: {error}", path.display()))?;
+    } {
+        Ok(handle) => OwnedWin32Handle(handle),
+        Err(error)
+            if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+                || error.code() == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("open placeholder {}: {error}", path.display())),
+    };
     let state = query_placeholder_state_handle(handle.0, path)?;
     Ok(state.map(|state| (state.in_sync, state.identity)))
 }
@@ -3830,7 +3835,7 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
             .map_err(|error| error.to_string())?;
             return Ok(());
         }
-        let Some((in_sync, observed)) = query_placeholder_state(&local, is_directory)? else {
+        let Some((in_sync, observed)) = query_placeholder_state(&local)? else {
             return Err(format!(
                 "local path {} is not a Cloud Files placeholder and cannot be overwritten by remote state",
                 local.display()
@@ -3864,7 +3869,7 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
         }
         let metadata = fs::symlink_metadata(&local)
             .map_err(|error| format!("stat local path {}: {error}", local.display()))?;
-        let Some((in_sync, _identity)) = query_placeholder_state(&local, metadata.is_dir())? else {
+        let Some((in_sync, _identity)) = query_placeholder_state(&local)? else {
             return Err(format!(
                 "refusing to remove non-placeholder local path {} for a remote delete",
                 local.display()
@@ -3910,9 +3915,7 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
                 destination.display()
             ));
         }
-        let metadata = fs::symlink_metadata(&source)
-            .map_err(|error| format!("stat rename source {}: {error}", source.display()))?;
-        let Some((in_sync, _)) = query_placeholder_state(&source, metadata.is_dir())? else {
+        let Some((in_sync, _)) = query_placeholder_state(&source)? else {
             return Err(format!(
                 "remote rename source {} is not a placeholder",
                 source.display()
@@ -4017,7 +4020,7 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
         let identity = self.identity(&stat);
         self.suppress_local_path(&local)?;
         self.check_cancelled()?;
-        if query_placeholder_state(&local, is_directory)?.is_none() {
+        if query_placeholder_state(&local)?.is_none() {
             let wide = wide_path(&local);
             let handle = unsafe {
                 CreateFileW(
@@ -4067,22 +4070,25 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
 impl<T: DfsMessageTransport> CloudFilesNamespaceEffectAdapter for WindowsPlaceholderEffects<T> {
     fn local_path_state(&mut self, path: &str) -> Result<CloudFilesLocalPathState, String> {
         let local = self.local_path(path)?;
-        let metadata = match fs::symlink_metadata(&local) {
-            Ok(metadata) => metadata,
+        if let Some((in_sync, _)) = query_placeholder_state(&local)? {
+            return if in_sync {
+                Ok(CloudFilesLocalPathState::Clean)
+            } else {
+                Ok(CloudFilesLocalPathState::Dirty {
+                    detail: "Cloud Files placeholder is not in sync".to_string(),
+                })
+            };
+        }
+        match fs::symlink_metadata(&local) {
+            Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(CloudFilesLocalPathState::Clean);
             }
             Err(error) => return Err(format!("stat local path {}: {error}", local.display())),
-        };
-        match query_placeholder_state(&local, metadata.is_dir())? {
-            Some((true, _)) => Ok(CloudFilesLocalPathState::Clean),
-            Some((false, _)) => Ok(CloudFilesLocalPathState::Dirty {
-                detail: "Cloud Files placeholder is not in sync".to_string(),
-            }),
-            None => Ok(CloudFilesLocalPathState::Dirty {
-                detail: "local path is not a Cloud Files placeholder".to_string(),
-            }),
         }
+        Ok(CloudFilesLocalPathState::Dirty {
+            detail: "local path is not a Cloud Files placeholder".to_string(),
+        })
     }
 
     fn apply(&mut self, action: &CloudFilesNamespaceAction) -> Result<(), String> {
