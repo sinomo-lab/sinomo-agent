@@ -2127,6 +2127,9 @@ fn persist_host_cursor_recovery_provider_bundle(
                         temporary.display()
                     )
                 })?;
+            // Windows denies replacing a file while this process still owns
+            // a non-share-delete handle to the deterministic successor.
+            drop(file);
             sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
             promote_host_cursor_recovery_provider_bundle(data_dir, bundle)
         } else {
@@ -2170,6 +2173,7 @@ fn persist_host_cursor_recovery_provider_bundle(
                 temporary.display()
             )
         })?;
+    drop(file);
     sync_pending_cloud_unregister_directory(&data_dir.dfs_dir())?;
     promote_host_cursor_recovery_provider_bundle(data_dir, bundle)?;
     Ok(())
