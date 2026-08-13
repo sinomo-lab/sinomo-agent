@@ -3236,7 +3236,6 @@ impl CloudFilesNamespaceReconciler {
             plan,
             load_required_cursor_recovery_rewrite(&rewrite_path, plan)?,
             true,
-            true,
         )?;
         match rewrite.phase {
             CloudFilesCursorRecoveryRewritePhase::Terminal => {}
@@ -5226,7 +5225,7 @@ fn open_authorized_cursor_recovery_progress_inner(
             "authorized cursor recovery progress state is noncanonical",
         ));
     }
-    let audit = load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
+    load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
     let (manifest_store, manifest, migrated) =
         CloudFilesManifestStore::open(&reconciliation_dir, BTreeMap::new())?;
     if migrated {
@@ -5260,7 +5259,6 @@ fn open_authorized_cursor_recovery_progress_inner(
             plan,
             rewrite,
             cursor_recovery_progress_state_is_valid(&state, &validated, true)?,
-            audit.directories.is_empty(),
         )?;
         rewrite.phase == CloudFilesCursorRecoveryRewritePhase::Terminal
     } else {
@@ -5277,12 +5275,10 @@ fn open_authorized_cursor_recovery_progress_inner(
             "recovery state did not evolve solely through the authoritative scan protocol",
         ));
     }
-    if require_terminal && !audit.directories.is_empty() {
-        return Err(reconcile_error(
-            "cursor-recovery-terminal-audit-pending",
-            "Terminal recovery progress still has materialization audit intents",
-        ));
-    }
+    // A CFAPI population intent may be a durable successor to Terminal (or to
+    // NamespaceFinalized) even though the namespace scan itself is complete.
+    // The parked terminal worker consumes only that local audit obligation;
+    // it does not reopen the authoritative scan.
     validate_recovery_manifest(&manifest, &state, &root)?;
     Ok((
         CloudFilesNamespaceReconciler {
@@ -5609,7 +5605,6 @@ fn resume_terminal_rewrite_stage(
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
     rewrite: CloudFilesCursorRecoveryRewrite,
     terminal_state: bool,
-    audit_empty: bool,
 ) -> Result<CloudFilesCursorRecoveryRewrite, CloudFilesNamespaceReconcileError> {
     let mut stage = None;
     for entry in fs::read_dir(scope).map_err(io_error("list cursor recovery scope"))? {
@@ -5640,7 +5635,7 @@ fn resume_terminal_rewrite_stage(
     let Some((kind, path)) = stage else {
         return Ok(rewrite);
     };
-    if kind != CursorRecoveryTempKind::Rewrite || !terminal_state || !audit_empty {
+    if kind != CursorRecoveryTempKind::Rewrite || !terminal_state {
         return Err(reconcile_error(
             "cursor-recovery-rewrite-torn",
             "only an exact terminal-marker stage may follow authoritative scan progress",
@@ -7437,6 +7432,15 @@ mod tests {
             )
             .expect("retain exact Terminal successor for local re-audit")
             .is_some()
+        );
+        drop(
+            open_authorized_cursor_recovery_progress(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("progress-mode replay must retain the same post-Terminal local audit cut"),
         );
         assert!(
             CloudFilesMaterializationAuditIntentStore::open(
