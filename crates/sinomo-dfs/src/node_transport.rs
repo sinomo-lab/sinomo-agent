@@ -3769,6 +3769,52 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
+    #[test]
+    fn stable_reconciliation_responses_return_on_served_call_without_peer_redial() {
+        let authority = node_id("node_stable_reconciliation_authority");
+        let requester = node_id("node_stable_reconciliation_requester");
+        let peer_sends = Arc::new(AtomicUsize::new(0));
+        let observed_peer_sends = Arc::clone(&peer_sends);
+        let sender: DfsMessageSender = Arc::new(move |target, command, _options| {
+            observed_peer_sends.fetch_add(1, Ordering::SeqCst);
+            Err(DfsPeerTransportError::new(format!(
+                "stable reconciliation response unexpectedly redialed {target} for {}",
+                command.request_id
+            )))
+        });
+        let mut transport = DfsNodeServedMessageTransport::new_with_message_sender_for_nodes(
+            authority.clone(),
+            vec![requester.clone()],
+            sender,
+            None,
+            Duration::from_secs(1),
+        );
+        let served_request = test_namespace_message(&requester, &authority, 1);
+        transport
+            .begin_message(&served_request)
+            .expect("begin served reconciliation request");
+
+        let expected = stable_reconciliation_test_responses()
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| DfsRoutedMessage {
+                source_node_id: authority.clone(),
+                target_node_id: requester.clone(),
+                frame_id: index as u64 + 2,
+                message_id: index as u64 + 2,
+                message,
+            })
+            .collect::<Vec<_>>();
+        for response in expected.iter().cloned() {
+            transport
+                .send_routed_call(&requester, DfsRoutedCall::value(response))
+                .expect("return stable reconciliation response on served call");
+        }
+
+        assert_eq!(peer_sends.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.finish_message(), expected);
+    }
+
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
     }
@@ -7837,7 +7883,9 @@ fn dfs_network_message_is_served_call_response(message: &DfsNetworkMessage) -> b
             | DfsNetworkMessage::BulkReadResponse(_)
             | DfsNetworkMessage::WriteResponse(_)
             | DfsNetworkMessage::DistributedWriteResponse(_)
+            | DfsNetworkMessage::StableWriteReconciliationResponse(_)
             | DfsNetworkMessage::NamespaceResponse(_)
+            | DfsNetworkMessage::StableNamespaceReconciliationResponse(_)
             | DfsNetworkMessage::StageBlobResponse(_)
             | DfsNetworkMessage::CommitVersionResponse(_)
             | DfsNetworkMessage::RepairReplicaResponse(_)
@@ -7846,6 +7894,24 @@ fn dfs_network_message_is_served_call_response(message: &DfsNetworkMessage) -> b
             | DfsNetworkMessage::MetadataSnapshotInstallResponse(_)
             | DfsNetworkMessage::ContentRootCatalogPageResponse(_)
     )
+}
+
+#[cfg(test)]
+fn stable_reconciliation_test_responses() -> [DfsNetworkMessage; 2] {
+    [
+        DfsNetworkMessage::StableWriteReconciliationResponse(
+            crate::DfsStableWriteReconciliationResponse {
+                request_id: "stable-write-reconciliation".to_string(),
+                reconciliation: crate::DfsStableWriteOperationReconciliation::NotApplied,
+            },
+        ),
+        DfsNetworkMessage::StableNamespaceReconciliationResponse(
+            crate::DfsStableNamespaceReconciliationResponse {
+                request_id: "stable-namespace-reconciliation".to_string(),
+                reconciliation: crate::DfsStableNamespaceOperationReconciliation::NotApplied,
+            },
+        ),
+    ]
 }
 
 fn dfs_network_message_can_return_to_served_caller(message: &DfsNetworkMessage) -> bool {
