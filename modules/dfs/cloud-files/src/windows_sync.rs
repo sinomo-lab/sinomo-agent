@@ -230,6 +230,7 @@ pub(crate) struct CloudFilesMountedMutationHandoff<
 > {
     inner: Mutex<CloudFilesMountedMutationHandoffInner<C>>,
     gated: AtomicBool,
+    gate_detail: Mutex<Option<String>>,
 }
 
 #[cfg(windows)]
@@ -272,15 +273,13 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
                 client,
             }),
             gated: AtomicBool::new(false),
+            gate_detail: Mutex::new(None),
         })
     }
 
     pub(crate) fn ensure_ready(&self) -> Result<(), String> {
         if self.gated.load(Ordering::Acquire) {
-            return Err(
-                "mounted-mutation handoff is gated after an ambiguous Cloud Files write"
-                    .to_string(),
-            );
+            return Err(self.gated_error());
         }
         let inner = self
             .inner
@@ -292,6 +291,16 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
         Ok(())
     }
 
+    fn gated_error(&self) -> String {
+        let detail = self
+            .gate_detail
+            .lock()
+            .ok()
+            .and_then(|detail| detail.clone())
+            .unwrap_or_else(|| "the original ambiguity detail is unavailable".to_string());
+        format!("mounted-mutation handoff is gated after an ambiguous Cloud Files write: {detail}")
+    }
+
     pub(crate) fn close_clean(&self) -> Result<(), String> {
         let mut inner = self
             .inner
@@ -301,14 +310,24 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             return Ok(());
         };
         session.close_clean().map_err(|error| {
-            self.gated.store(true, Ordering::Release);
-            error.to_string()
+            let detail = format!("close Cloud Files mounted-mutation host session: {error}");
+            self.record_gate_detail(&detail);
+            detail
         })
+    }
+
+    fn record_gate_detail(&self, detail: &str) {
+        if let Ok(mut first_detail) = self.gate_detail.lock()
+            && first_detail.is_none()
+        {
+            *first_detail = Some(detail.to_string());
+        }
+        self.gated.store(true, Ordering::Release);
     }
 
     fn gate<T>(&self, detail: impl Into<String>) -> Result<T, String> {
         let detail = detail.into();
-        self.gated.store(true, Ordering::Release);
+        self.record_gate_detail(&detail);
         #[cfg(windows)]
         super::host_log(&format!(
             "Cloud Files mounted-mutation handoff entered its ambiguity gate: {detail}"
@@ -335,10 +354,7 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             .lock()
             .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
         if self.gated.load(Ordering::Acquire) {
-            return Err(
-                "mounted-mutation handoff is gated after an ambiguous Cloud Files operation"
-                    .to_string(),
-            );
+            return Err(self.gated_error());
         }
         let session = inner
             .session
@@ -371,6 +387,9 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             Ok(opened) => opened,
             Err(error) => {
                 let service_error = error.to_string();
+                self.record_gate_detail(&format!(
+                    "Cloud Files DFS mount open returned after service entry: {service_error}"
+                ));
                 let completion = self.finish_mount_open_unknown(
                     &inner,
                     lease,
@@ -395,6 +414,9 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             Ok(captured_work) => captured_work,
             Err(error) => {
                 let capture_error = error.to_string();
+                self.record_gate_detail(&format!(
+                    "capture Cloud Files DFS mount-open recovery work: {capture_error}"
+                ));
                 let completion = self.finish_mount_open_unknown(
                     &inner,
                     lease,
@@ -440,7 +462,6 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
         arm_request_id: dfs::MountedSifsMutationArmRequestId,
         error_code: &'static str,
     ) -> Result<(), String> {
-        self.gated.store(true, Ordering::Release);
         let captured_work = dfs::MountedSifsMutationCapturedWork::new(
             cloud_files_mount_open_committed_work(),
             Vec::new(),
@@ -479,10 +500,7 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             .lock()
             .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
         if self.gated.load(Ordering::Acquire) {
-            return Err(
-                "mounted-mutation handoff is gated after an ambiguous Cloud Files write"
-                    .to_string(),
-            );
+            return Err(self.gated_error());
         }
         let session = inner
             .session
@@ -547,8 +565,9 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             report.committed_repair_records,
         )
         .map_err(|error| {
-            self.gated.store(true, Ordering::Release);
-            error.to_string()
+            let detail = format!("validate captured Cloud Files mounted mutation: {error}");
+            self.record_gate_detail(&detail);
+            detail
         })?;
         match report.outcome {
             Ok(value) => {
@@ -575,8 +594,10 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
                 // Once the service was entered, every Err is ambiguous even if
                 // this operation's work capture is empty. Gate later receipt
                 // reconciliation as well as later mutations.
-                self.gated.store(true, Ordering::Release);
                 let service_error = error.to_string();
+                self.record_gate_detail(&format!(
+                    "Cloud Files DFS mutation returned after service entry: {service_error}"
+                ));
                 let observation = dfs::MountedSifsMutationErrorObservation::new(
                     captured_work,
                     "cloud-files-dfs-service-error",
@@ -624,10 +645,7 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
             .lock()
             .map_err(|_| "Cloud Files mounted-mutation lane is poisoned".to_string())?;
         if self.gated.load(Ordering::Acquire) {
-            return Err(
-                "mounted-mutation handoff is gated after an ambiguous Cloud Files operation"
-                    .to_string(),
-            );
+            return Err(self.gated_error());
         }
         let session = inner
             .session
@@ -724,6 +742,14 @@ impl<C> Drop for CloudFilesMountedMutationHandoff<C> {
             && session.close_clean().is_err()
         {
             self.gated.store(true, Ordering::Release);
+            if let Ok(detail) = self.gate_detail.get_mut()
+                && detail.is_none()
+            {
+                *detail = Some(
+                    "drop Cloud Files mounted-mutation host session after close failure"
+                        .to_string(),
+                );
+            }
         }
     }
 }
@@ -5103,7 +5129,13 @@ mod tests {
         assert!(error.contains("prepare durable Cloud Files mounted mutation"));
         assert_eq!(*service.lock().expect("service"), 0);
         assert_eq!(&*events.lock().expect("events"), &["probe"]);
-        assert!(handoff.ensure_ready().is_err());
+        let gated = handoff
+            .ensure_ready()
+            .expect_err("invalid durable Prepare leaves its exact cause gated");
+        assert!(
+            gated.contains("prepare durable Cloud Files mounted mutation"),
+            "{gated}"
+        );
     }
 
     #[test]
@@ -5803,7 +5835,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(handoff.ensure_ready().is_err());
+        let gated = handoff
+            .ensure_ready()
+            .expect_err("service error leaves the original ambiguity gated");
+        assert!(gated.contains("service returned conflict"), "{gated}");
     }
 
     #[test]

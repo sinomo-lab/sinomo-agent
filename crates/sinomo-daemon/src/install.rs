@@ -280,8 +280,20 @@ pub fn install_managed_source_repo(
     Ok(ManagedSourceRepoInstallStatus::Updated)
 }
 
+fn install_child_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let command = Command::new(program);
+    #[cfg(windows)]
+    {
+        let mut command = command;
+        crate::prepare_noninteractive_command(&mut command);
+        command
+    }
+    #[cfg(not(windows))]
+    command
+}
+
 pub fn git_is_available() -> bool {
-    Command::new("git")
+    install_child_command("git")
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
@@ -291,7 +303,7 @@ pub fn managed_source_git_status_lines(repo: &Path) -> Result<Vec<String>, Daemo
     if !repo.join(".git").exists() {
         return Ok(Vec::new());
     }
-    let output = Command::new("git")
+    let output = install_child_command("git")
         .arg("-C")
         .arg(repo)
         .args(["status", "--short"])
@@ -407,7 +419,7 @@ if ($exists) {
     Write-Output 'added'
 }
 "#;
-    let output = Command::new("powershell")
+    let output = install_child_command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .env("SINOMO_INSTALL_BIN_DIR", bin_dir)
         .output()
@@ -1041,6 +1053,18 @@ fn vbs_string_literal(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_install_children_are_hidden_and_still_capture_output() {
+        let output = install_child_command("cmd")
+            .args(["/d", "/c", "echo", "sinomo-hidden-install-child"])
+            .output()
+            .expect("run hidden install child");
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("sinomo-hidden-install-child"));
+    }
 
     #[test]
     fn installed_daemon_start_specs_describe_main_and_shadow_daemons() {
