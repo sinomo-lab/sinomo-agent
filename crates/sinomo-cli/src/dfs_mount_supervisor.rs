@@ -2009,10 +2009,10 @@ fn is_cursor_recovery_execution_bundle_successor(
     current.schema_version == next.schema_version
         && current.requested == next.requested
         && current.provider_bytes == next.provider_bytes
-        && current.execution_module.is_none()
-        && current.execution_provider_bytes.is_none()
         && next.execution_module.is_some()
         && next.execution_provider_bytes.is_some()
+        && (current.execution_module != next.execution_module
+            || current.execution_provider_bytes != next.execution_provider_bytes)
         && validate_cursor_recovery_execution_provider(next).is_ok()
 }
 
@@ -9349,7 +9349,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_recovery_bundle_replays_one_exact_execution_provider_successor() {
+    fn cursor_recovery_bundle_replays_exact_execution_provider_successors() {
         let temp = TestDir::new("cursor-recovery-execution-provider-successor");
         let data_dir = SinomoDataDir::new(temp.path().join("data"));
         std::fs::create_dir_all(data_dir.dfs_dir()).expect("DFS directory");
@@ -9409,12 +9409,7 @@ mod tests {
         );
 
         let mut changed = successor.clone();
-        let changed_bytes = b"another rollout provider".to_vec();
-        let mut changed_execution = execution.clone();
-        changed_execution.content_hash =
-            sinomo_runtime::module::native_module_content_hash(&changed_bytes);
-        changed.execution_module = Some(changed_execution);
-        changed.execution_provider_bytes = Some(changed_bytes);
+        changed.provider_bytes.push(0);
         assert!(persist_host_cursor_recovery_provider_bundle(&data_dir, &changed).is_err());
         assert_eq!(
             inspect_host_cursor_recovery_provider_bundle_for_resume(&data_dir)
@@ -9429,6 +9424,26 @@ mod tests {
                 .expect("execution provider")
                 .1,
             path
+        );
+
+        let second_execution_bytes = b"second replacement recovery execution provider".to_vec();
+        let mut second_execution = execution.clone();
+        second_execution.content_hash =
+            sinomo_runtime::module::native_module_content_hash(&second_execution_bytes);
+        second_execution.cache_key = "second-replacement-cloud-files-cache".to_string();
+        let mut second_successor = successor.clone();
+        second_successor.execution_module = Some(second_execution.clone());
+        second_successor.execution_provider_bytes = Some(second_execution_bytes.clone());
+        persist_host_cursor_recovery_provider_bundle(&data_dir, &second_successor)
+            .expect("second execution-provider successor");
+        let (observed, second_path) =
+            materialize_cursor_recovery_execution_provider(&data_dir, &second_successor)
+                .expect("materialize second execution provider")
+                .expect("second execution provider");
+        assert_eq!(observed, second_execution);
+        assert_eq!(
+            std::fs::read(second_path).expect("second execution bytes"),
+            second_execution_bytes
         );
     }
 
