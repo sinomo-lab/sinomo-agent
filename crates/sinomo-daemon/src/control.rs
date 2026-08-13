@@ -3561,10 +3561,16 @@ async fn handle_daemon_routed_stream_carrier_async(
     service_runtime: tokio::runtime::Handle,
     routed_pool_scope: String,
 ) -> Result<bool, DaemonError> {
-    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier(
+    let destination_process_affinity = if daemon_paths_are_shadow(&paths) {
+        sinomo_core::network::DestinationProcessAffinity::Any
+    } else {
+        sinomo_core::network::DestinationProcessAffinity::MainDaemon
+    };
+    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier_with_destination_process_affinity(
         routed_pool_scope,
         directory.version().0,
         sinomo_core::network::stream_native_service_route_constraints(),
+        destination_process_affinity,
         carrier,
     )
     .await?;

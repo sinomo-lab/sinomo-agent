@@ -1081,6 +1081,33 @@ pub async fn accept_pooled_routed_stream_carrier(
     constraints: RouteConstraints,
     carrier: PeerStream,
 ) -> Result<RoutedStreamAcceptor, NetworkError> {
+    accept_pooled_routed_stream_carrier_with_destination_process_affinity(
+        scope,
+        directory_generation,
+        constraints,
+        crate::DestinationProcessAffinity::Any,
+        carrier,
+    )
+    .await
+}
+
+/// Converts one accepted authenticated routed stream into an owned logical-
+/// stream acceptor and publishes the same full-duplex carrier for reverse
+/// direction opens bound to the process that accepted it.
+///
+/// The accepting process is the only authority that can supply this affinity.
+/// A main daemon listener therefore publishes a `MainDaemon` carrier, while a
+/// shadow or process-agnostic listener must use `Any`. This prevents a
+/// main-affine Raft/KV call from adopting a shadow carrier without forcing a
+/// node behind one-way connectivity to redial a peer that already connected to
+/// its main daemon.
+pub async fn accept_pooled_routed_stream_carrier_with_destination_process_affinity(
+    scope: String,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
+    carrier: PeerStream,
+) -> Result<RoutedStreamAcceptor, NetworkError> {
     // Capture once for this accepted carrier. A later local registry mutation
     // changes the relationship key used by both incoming and outgoing opens,
     // so reverse reuse remains symmetric without comparing process-local
@@ -1091,6 +1118,7 @@ pub async fn accept_pooled_routed_stream_carrier(
         route_compatibility_generation,
         directory_generation,
         constraints,
+        destination_process_affinity,
         carrier,
     )
     .await
@@ -1101,6 +1129,7 @@ async fn accept_pooled_routed_stream_carrier_with_route_compatibility(
     route_compatibility_generation: u64,
     directory_generation: u64,
     constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
     carrier: PeerStream,
 ) -> Result<RoutedStreamAcceptor, NetworkError> {
     accept_pooled_routed_stream_carrier_with_route_compatibility_source(
@@ -1108,6 +1137,7 @@ async fn accept_pooled_routed_stream_carrier_with_route_compatibility(
         route_compatibility_generation,
         directory_generation,
         constraints,
+        destination_process_affinity,
         carrier,
         crate::network_module_routing_generation,
     )
@@ -1119,21 +1149,19 @@ async fn accept_pooled_routed_stream_carrier_with_route_compatibility_source<G>(
     route_compatibility_generation: u64,
     directory_generation: u64,
     constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
     carrier: PeerStream,
     current_route_compatibility_generation: G,
 ) -> Result<RoutedStreamAcceptor, NetworkError>
 where
     G: Fn() -> u64,
 {
-    // The routed handshake proves the initiating node, but it does not identify
-    // which process endpoint on that node opened the carrier. Publish accepted
-    // carriers only for affinity-neutral reverse calls.
     let key = PoolKey::new(
         scope,
         route_compatibility_generation,
         directory_generation,
         constraints,
-        crate::DestinationProcessAffinity::Any,
+        destination_process_affinity,
         carrier.local_node_id.clone(),
         carrier.peer_node_id.clone(),
         carrier.protection,
@@ -1793,7 +1821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_owned_carrier_supports_reverse_direction_streams() {
+    async fn accepted_main_daemon_carrier_supports_reverse_direction_streams_without_redial() {
         let (client_carrier, server_carrier) = carrier_pair();
         let client_node = client_carrier.local_node_id.clone();
         let server_node = client_carrier.peer_node_id.clone();
@@ -1813,6 +1841,7 @@ mod tests {
                 route_compatibility_generation,
                 1,
                 constraints,
+                crate::DestinationProcessAffinity::MainDaemon,
                 server_carrier,
                 move || route_compatibility_generation,
             )
@@ -1835,11 +1864,12 @@ mod tests {
                 .await
                 .expect("write initial response");
 
-            let mut reverse = open_test_pooled_routed_stream(
+            let mut reverse = open_test_pooled_routed_stream_with_affinity(
                 server_scope,
                 route_compatibility_generation,
                 2,
                 constraints,
+                crate::DestinationProcessAffinity::MainDaemon,
                 server_local,
                 server_peer,
                 Duration::from_secs(1),
@@ -1866,11 +1896,12 @@ mod tests {
             assert_eq!(&response, b"okay");
         });
 
-        let mut initial = open_test_pooled_routed_stream(
+        let mut initial = open_test_pooled_routed_stream_with_affinity(
             scope.clone(),
             route_compatibility_generation,
             1,
             constraints,
+            crate::DestinationProcessAffinity::MainDaemon,
             client_node.clone(),
             server_node.clone(),
             Duration::from_secs(1),
@@ -1928,6 +1959,7 @@ mod tests {
             route_compatibility_generation,
             1,
             constraints,
+            crate::DestinationProcessAffinity::Any,
             server_carrier,
             move || route_compatibility_generation,
         )

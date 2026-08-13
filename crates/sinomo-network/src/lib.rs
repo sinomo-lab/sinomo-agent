@@ -244,13 +244,14 @@ pub use route_graph_read_model::{
 pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
     RoutedStreamAcceptor, RoutedStreamIncoming, accept_local_object_rpc_stream_carrier,
-    accept_pooled_routed_stream_carrier, accept_routed_stream_carrier,
-    local_object_rpc_carrier_prelude_prefix_matches, open_pooled_local_object_rpc_stream,
-    open_pooled_routed_stream, open_pooled_routed_stream_with_protection,
-    pooled_routed_relationship_is_active, read_local_object_rpc_carrier_prelude,
-    register_routed_stream_incoming, retire_pooled_routed_streams,
-    serve_local_object_rpc_stream_carrier, serve_routed_stream_carrier,
-    write_local_object_rpc_carrier_prelude,
+    accept_pooled_routed_stream_carrier,
+    accept_pooled_routed_stream_carrier_with_destination_process_affinity,
+    accept_routed_stream_carrier, local_object_rpc_carrier_prelude_prefix_matches,
+    open_pooled_local_object_rpc_stream, open_pooled_routed_stream,
+    open_pooled_routed_stream_with_protection, pooled_routed_relationship_is_active,
+    read_local_object_rpc_carrier_prelude, register_routed_stream_incoming,
+    retire_pooled_routed_streams, serve_local_object_rpc_stream_carrier,
+    serve_routed_stream_carrier, write_local_object_rpc_carrier_prelude,
 };
 pub use routing::{
     CandidatePath, ConnectOptions, DestinationProcessAffinity, DirectRoutedConnector,
