@@ -5536,155 +5536,199 @@ pub(crate) fn handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
     request
         .validate()
         .map_err(daemon_dfs_mounted_mutation_protocol_error)?;
+    let (request_phase, request_marker_id) = match &request {
+        crate::DaemonDfsMountedMutationHandoffRequest::Probe => ("probe", None),
+        crate::DaemonDfsMountedMutationHandoffRequest::Arm { marker_id, .. } => {
+            ("arm", Some(marker_id.to_string()))
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied { marker_id, .. } => {
+            ("commit-applied", Some(marker_id.to_string()))
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown { marker_id, .. } => {
+            ("commit-unknown", Some(marker_id.to_string()))
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::ProveNoWrite { marker_id, .. } => {
+            ("prove-no-write", Some(marker_id.to_string()))
+        }
+        crate::DaemonDfsMountedMutationHandoffRequest::AbortUnstarted { marker_id, .. } => {
+            ("abort-unstarted", Some(marker_id.to_string()))
+        }
+    };
+    tracing::debug!(
+        target: "sinomo.dfs.mounted_mutation",
+        phase = request_phase,
+        marker_id = request_marker_id.as_deref(),
+        "main daemon received a mounted-mutation handoff request"
+    );
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
     let cluster_paths = ClusterPaths::new(&data_dir);
     let store = sinomo_dfs::MountedSifsMutationOutboxStore::new(&data_dir)?;
-    match request {
-        crate::DaemonDfsMountedMutationHandoffRequest::Probe => {
-            // Opening and classifying the bounded outbox is the readiness
-            // proof; a corrupt or unavailable durability root fails closed.
-            let status = store.status()?;
-            if status.pending_marker_count > 0 || status.requires_full_recovery() {
-                return Err(daemon_dfs_mounted_mutation_protocol_error(format!(
-                    "mounted-mutation handoff is not ready: pending={}, live={}, exact_recovery={}, full_recovery={}, unproven={}, malformed={}, overflow={}, directory_scan_overflow={}",
-                    status.pending_marker_count,
-                    status.live_marker_count,
-                    status.exact_recovery_marker_count,
-                    status.full_recovery_marker_count,
-                    status.unproven_session_marker_count,
-                    status.malformed_marker_count,
-                    status.marker_limit_exceeded,
-                    status.directory_scan_limit_exceeded,
-                )));
+    let response: Result<crate::DaemonDfsMountedMutationHandoffResponse, DaemonError> =
+        match request {
+            crate::DaemonDfsMountedMutationHandoffRequest::Probe => {
+                // Opening and classifying the bounded outbox is the readiness
+                // proof; a corrupt or unavailable durability root fails closed.
+                let status = store.status()?;
+                if status.pending_marker_count > 0 || status.requires_full_recovery() {
+                    return Err(daemon_dfs_mounted_mutation_protocol_error(format!(
+                        "mounted-mutation handoff is not ready: pending={}, live={}, exact_recovery={}, full_recovery={}, unproven={}, malformed={}, overflow={}, directory_scan_overflow={}",
+                        status.pending_marker_count,
+                        status.live_marker_count,
+                        status.exact_recovery_marker_count,
+                        status.full_recovery_marker_count,
+                        status.unproven_session_marker_count,
+                        status.malformed_marker_count,
+                        status.marker_limit_exceeded,
+                        status.directory_scan_limit_exceeded,
+                    )));
+                }
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: None,
+                    arm_request_id: None,
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::Ready,
+                    appended_repair_record_count: 0,
+                })
             }
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: None,
-                arm_request_id: None,
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::Ready,
-                appended_repair_record_count: 0,
-            })
-        }
-        crate::DaemonDfsMountedMutationHandoffRequest::Arm {
-            marker_id,
-            marker_nonce,
-            arm_request_id,
-        } => {
-            store.arm_live(&marker_id, &marker_nonce, &arm_request_id)?;
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: Some(marker_id),
-                arm_request_id: Some(arm_request_id),
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
-                appended_repair_record_count: 0,
-            })
-        }
-        crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied {
-            marker_id,
-            marker_nonce,
-            arm_request_id,
-            captured_work,
-        } => {
-            require_daemon_dfs_mounted_mutation_captured_marker(
-                &store,
-                &marker_id,
-                &marker_nonce,
-                &arm_request_id,
-                &captured_work,
-                None,
-            )?;
-            let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
-                &data_dir,
-                captured_work.committed_repair_records.clone(),
-            )?;
-            #[cfg(test)]
-            inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
-            store.accept_captured_live(
-                &marker_id,
-                &marker_nonce,
-                &arm_request_id,
-                &captured_work,
-            )?;
-            emit_daemon_dfs_committed_edges(
-                &data_dir,
-                &cluster_paths,
-                &DfsMessageExecutionScope::GlobalExclusive,
-                runtime,
-                traceparent,
-                captured_work.committed_work,
-                &[],
-            );
-            notify_daemon_dfs_maintenance_work();
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: Some(marker_id),
-                arm_request_id: Some(arm_request_id),
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
-                appended_repair_record_count,
-            })
-        }
-        crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
-            marker_id,
-            marker_nonce,
-            arm_request_id,
-            observation,
-        } => {
-            require_daemon_dfs_mounted_mutation_captured_marker(
-                &store,
-                &marker_id,
-                &marker_nonce,
-                &arm_request_id,
-                &observation.captured_work,
-                Some(&observation),
-            )?;
-            let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
-                &data_dir,
-                observation.captured_work.committed_repair_records.clone(),
-            )?;
-            #[cfg(test)]
-            inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
-            store.accept_unknown_live(&marker_id, &marker_nonce, &arm_request_id, &observation)?;
-            emit_daemon_dfs_committed_edges(
-                &data_dir,
-                &cluster_paths,
-                &DfsMessageExecutionScope::GlobalExclusive,
-                runtime,
-                traceparent,
-                observation.captured_work.committed_work,
-                &[],
-            );
-            notify_daemon_dfs_maintenance_work();
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: Some(marker_id),
-                arm_request_id: Some(arm_request_id),
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
-                appended_repair_record_count,
-            })
-        }
-        crate::DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
-            marker_id,
-            marker_nonce,
-            arm_request_id,
-            proof_code,
-        } => {
-            store.prove_no_write_live(&marker_id, &marker_nonce, &arm_request_id, &proof_code)?;
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: Some(marker_id),
-                arm_request_id: Some(arm_request_id),
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
-                appended_repair_record_count: 0,
-            })
-        }
-        crate::DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
-            marker_id,
-            marker_nonce,
-        } => {
-            store.abort_unstarted_live(&marker_id, &marker_nonce)?;
-            Ok(crate::DaemonDfsMountedMutationHandoffResponse {
-                marker_id: Some(marker_id),
-                arm_request_id: None,
-                phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
-                appended_repair_record_count: 0,
-            })
-        }
-    }
+            crate::DaemonDfsMountedMutationHandoffRequest::Arm {
+                marker_id,
+                marker_nonce,
+                arm_request_id,
+            } => {
+                store.arm_live(&marker_id, &marker_nonce, &arm_request_id)?;
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: Some(marker_id),
+                    arm_request_id: Some(arm_request_id),
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+                    appended_repair_record_count: 0,
+                })
+            }
+            crate::DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+                marker_id,
+                marker_nonce,
+                arm_request_id,
+                captured_work,
+            } => {
+                require_daemon_dfs_mounted_mutation_captured_marker(
+                    &store,
+                    &marker_id,
+                    &marker_nonce,
+                    &arm_request_id,
+                    &captured_work,
+                    None,
+                )?;
+                let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
+                    &data_dir,
+                    captured_work.committed_repair_records.clone(),
+                )?;
+                #[cfg(test)]
+                inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
+                store.accept_captured_live(
+                    &marker_id,
+                    &marker_nonce,
+                    &arm_request_id,
+                    &captured_work,
+                )?;
+                emit_daemon_dfs_committed_edges(
+                    &data_dir,
+                    &cluster_paths,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                    runtime,
+                    traceparent,
+                    captured_work.committed_work,
+                    &[],
+                );
+                notify_daemon_dfs_maintenance_work();
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: Some(marker_id),
+                    arm_request_id: Some(arm_request_id),
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                    appended_repair_record_count,
+                })
+            }
+            crate::DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+                marker_id,
+                marker_nonce,
+                arm_request_id,
+                observation,
+            } => {
+                require_daemon_dfs_mounted_mutation_captured_marker(
+                    &store,
+                    &marker_id,
+                    &marker_nonce,
+                    &arm_request_id,
+                    &observation.captured_work,
+                    Some(&observation),
+                )?;
+                let appended_repair_record_count = persist_daemon_dfs_repair_queue_records(
+                    &data_dir,
+                    observation.captured_work.committed_repair_records.clone(),
+                )?;
+                #[cfg(test)]
+                inject_daemon_dfs_mounted_mutation_crash_cut_after_repair_persist(&data_dir)?;
+                store.accept_unknown_live(
+                    &marker_id,
+                    &marker_nonce,
+                    &arm_request_id,
+                    &observation,
+                )?;
+                emit_daemon_dfs_committed_edges(
+                    &data_dir,
+                    &cluster_paths,
+                    &DfsMessageExecutionScope::GlobalExclusive,
+                    runtime,
+                    traceparent,
+                    observation.captured_work.committed_work,
+                    &[],
+                );
+                notify_daemon_dfs_maintenance_work();
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: Some(marker_id),
+                    arm_request_id: Some(arm_request_id),
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                    appended_repair_record_count,
+                })
+            }
+            crate::DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+                marker_id,
+                marker_nonce,
+                arm_request_id,
+                proof_code,
+            } => {
+                store.prove_no_write_live(
+                    &marker_id,
+                    &marker_nonce,
+                    &arm_request_id,
+                    &proof_code,
+                )?;
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: Some(marker_id),
+                    arm_request_id: Some(arm_request_id),
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
+                    appended_repair_record_count: 0,
+                })
+            }
+            crate::DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+                marker_id,
+                marker_nonce,
+            } => {
+                store.abort_unstarted_live(&marker_id, &marker_nonce)?;
+                Ok(crate::DaemonDfsMountedMutationHandoffResponse {
+                    marker_id: Some(marker_id),
+                    arm_request_id: None,
+                    phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+                    appended_repair_record_count: 0,
+                })
+            }
+        };
+    let response = response?;
+    tracing::debug!(
+        target: "sinomo.dfs.mounted_mutation",
+        phase = request_phase,
+        marker_id = request_marker_id.as_deref(),
+        response_phase = ?response.phase,
+        "main daemon completed a mounted-mutation handoff request"
+    );
+    Ok(response)
 }
 
 fn daemon_dfs_completed_promoted_primary_handoff_matches(
