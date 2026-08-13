@@ -4526,17 +4526,14 @@ unsafe extern "system" fn fetch_placeholders_callback(
     let prospective_entries_processed = page_state
         .entries_processed
         .saturating_add(placeholder_count);
-    let placeholder_total_count = if next_cursor.is_some() {
-        i64::from(prospective_entries_processed).saturating_add(1)
-    } else {
-        i64::from(prospective_entries_processed)
-    };
+    let (placeholder_total_count, transfer_flags) =
+        placeholder_page_transfer_plan(prospective_entries_processed, next_cursor.is_some());
     let page_outcome = unsafe {
         transfer_placeholders(
             info,
             placeholders,
             placeholder_total_count,
-            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+            transfer_flags,
             STATUS_SUCCESS,
         )
     };
@@ -4551,28 +4548,24 @@ unsafe extern "system" fn fetch_placeholders_callback(
     let next_entries_processed = page_state
         .entries_processed
         .saturating_add(page_outcome.entries_processed);
-    let committed = if next_cursor.is_none() {
-        let terminal_outcome = unsafe {
-            transfer_placeholders(
-                info,
-                Vec::new(),
-                i64::from(next_entries_processed),
-                CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
-                STATUS_SUCCESS,
-            )
-        };
-        let terminal_succeeded = terminal_outcome.fully_succeeded();
-        if !terminal_succeeded {
-            host_log(&format!(
-                "Cloud Files terminal placeholder population was not committed for `{path}`: {}",
-                terminal_outcome.detail()
-            ));
-        }
-        terminal_succeeded
+    provider.finish_placeholder_page(&path, next_cursor, next_entries_processed, true);
+}
+
+fn placeholder_page_transfer_plan(
+    prospective_entries_processed: u32,
+    has_next_cursor: bool,
+) -> (i64, CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAGS) {
+    if has_next_cursor {
+        (
+            i64::from(prospective_entries_processed).saturating_add(1),
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE,
+        )
     } else {
-        true
-    };
-    provider.finish_placeholder_page(&path, next_cursor, next_entries_processed, committed);
+        (
+            i64::from(prospective_entries_processed),
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION,
+        )
+    }
 }
 
 unsafe fn transfer_data(
@@ -7338,6 +7331,20 @@ mod tests {
     use super::*;
     use sinomo_runtime::dfs::DfsMessageResponse;
     use sinomo_runtime::network::{ObjectRpcCall, ObjectRpcResponse, ObjectRpcResult};
+
+    #[test]
+    fn terminal_placeholder_page_completes_in_one_transfer() {
+        let (paged_total, paged_flags) = placeholder_page_transfer_plan(64, true);
+        assert_eq!(paged_total, 65);
+        assert_eq!(paged_flags, CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_NONE);
+
+        let (terminal_total, terminal_flags) = placeholder_page_transfer_plan(64, false);
+        assert_eq!(terminal_total, 64);
+        assert_eq!(
+            terminal_flags,
+            CF_OPERATION_TRANSFER_PLACEHOLDERS_FLAG_DISABLE_ON_DEMAND_POPULATION
+        );
+    }
 
     struct CursorRecoveryTestDir(PathBuf);
 
