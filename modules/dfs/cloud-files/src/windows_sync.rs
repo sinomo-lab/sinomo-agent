@@ -3194,13 +3194,10 @@ where
         // durable.
         if self.state.cursor_recovery_module_namespace_finalized {
             self.ensure_cursor_recovery_queue_settled()?;
-            if !self.state.reconciler.cursor_recovery_terminal()
-                || self.state.reconciler.materialized_directories()
-                    != &BTreeSet::from([self.state.root.clone()])
-            {
+            if !self.state.reconciler.cursor_recovery_terminal() {
                 return Err(sync_error(
                     "cursor-recovery-namespace-finalized-invalid",
-                    "NamespaceFinalized recovery lost its exact terminal root-only state",
+                    "NamespaceFinalized recovery lost its exact terminal sparse state",
                 ));
             }
             return self.establish_cursor_recovery_terminal_proof(cancelled, &control);
@@ -3234,13 +3231,10 @@ where
         if !scan_complete {
             return Ok(progress);
         }
-        if !self.state.reconciler.cursor_recovery_terminal()
-            || self.state.reconciler.materialized_directories()
-                != &BTreeSet::from([self.state.root.clone()])
-        {
+        if !self.state.reconciler.cursor_recovery_terminal() {
             return Err(sync_error(
                 "cursor-recovery-terminal-incomplete",
-                "terminal cursor recovery did not durably clear the full-scan request, materialize only the depth-0 root, and leave no inflight namespace effect",
+                "terminal cursor recovery did not durably clear the full-scan request, retain its authorized sparse materialization ledger, and leave no inflight namespace effect",
             ));
         }
         self.ensure_cursor_recovery_queue_settled()?;
@@ -6364,6 +6358,55 @@ mod tests {
         assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn authorized_cursor_recovery_accepts_a_retained_sparse_directory() {
+        let root = TestRoot::new("cursor-recovery-retained-sparse-directory");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        let directory = CloudFilesReconciledManifestEntry {
+            path: "/services/materialized".to_string(),
+            object_id: "materialized-object".to_string(),
+            version: "materialized-version".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
+        state
+            .reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(directory.path.clone(), directory.clone())]),
+                Vec::new(),
+                vec![directory.path.clone()],
+                BTreeMap::new(),
+                false,
+            )
+            .expect("seed retained sparse directory");
+        state.authorize_cursor_recovery_for_test();
+        let mut terminal = cursor_recovery_snapshot(1, true);
+        terminal
+            .manifest
+            .insert(directory.path.clone(), directory.clone());
+        terminal
+            .materialized_directories
+            .push(directory.path.clone());
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([terminal]),
+            FakeEffects::default(),
+        );
+
+        let progress = worker
+            .startup(&AtomicBool::new(false))
+            .expect("terminal recovery retains sparse directory");
+        assert!(progress.cursor_recovery_terminal);
+        assert_eq!(
+            worker.state().reconciler().materialized_directories(),
+            &BTreeSet::from(["/services".to_string(), directory.path])
+        );
     }
 
     #[test]

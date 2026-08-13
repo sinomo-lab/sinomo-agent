@@ -5017,8 +5017,7 @@ pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
             "terminal successor state is not authorized scan progress",
         ));
     }
-    let terminal_state = cursor_recovery_progress_state_is_valid(&state, &validated, true)?
-        && state.materialized_directories == BTreeSet::from([root.clone()]);
+    let terminal_state = cursor_recovery_progress_state_is_valid(&state, &validated, true)?;
     let audit = load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
     let rewrite_path = reconciliation_dir.join(CURSOR_RECOVERY_REWRITE_FILE);
     let mut rewrite = load_required_cursor_recovery_rewrite(&rewrite_path, plan)?;
@@ -5431,6 +5430,9 @@ fn cursor_recovery_progress_state_is_valid_with_suppressions(
         || !state.conflicts.is_empty()
         || !state.startup_conflicts.is_empty()
         || !state.materialized_directories.contains(&state.root)
+        || !state
+            .materialized_directories
+            .is_subset(&plan.expected.materialized_directories)
         || state.inflight_effect.is_some()
         || !state.applied_events.is_empty()
     {
@@ -6560,6 +6562,67 @@ mod tests {
         CursorRecoveryFixture { root, scope, plan }
     }
 
+    fn cursor_recovery_fixture_with_materialized_directory(
+        name: &str,
+    ) -> (CursorRecoveryFixture, CloudFilesReconciledManifestEntry) {
+        let root = TestRoot::new(name);
+        let mut reconciler = open_reconciler(&root);
+        let scope = reconciler
+            .state_path()
+            .parent()
+            .expect("reconciliation scope")
+            .to_path_buf();
+        let boundary = cursor(41);
+        reconciler
+            .state
+            .cursors
+            .insert(boundary.shard_key().expect("shard key"), boundary);
+        let directory = CloudFilesReconciledManifestEntry {
+            path: "/services/materialized".to_string(),
+            object_id: "retained-directory-object".to_string(),
+            version: "retained-directory-version".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
+        reconciler
+            .state
+            .materialized_directories
+            .insert(directory.path.clone());
+        reconciler
+            .manifest
+            .insert(directory.path.clone(), directory.clone());
+        reconciler
+            .manifest_store
+            .append_mutations(
+                vec![CloudFilesManifestMutation::Upsert {
+                    entry: directory.clone(),
+                }],
+                &reconciler.manifest,
+            )
+            .expect("persist retained directory manifest");
+        reconciler
+            .persist()
+            .expect("persist cursor-only sparse state");
+        drop(reconciler);
+        drop(
+            CloudFilesMaterializationAuditIntentStore::open(
+                &root.data_dir(),
+                "mount-a",
+                "/services",
+            )
+            .expect("create empty audit state"),
+        );
+        let guard =
+            inspect_cursor_only_reconciliation_state(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect cursor-only sparse state");
+        let plan = guard
+            .authoritative_reconciliation_plan("recovery-a", "token-a", "nonce-a")
+            .expect("build sparse recovery plan");
+        drop(guard);
+        (CursorRecoveryFixture { root, scope, plan }, directory)
+    }
+
     #[test]
     fn cursor_recovery_inspection_retains_strict_manifest_history() {
         let root = TestRoot::new("recovery-manifest-history");
@@ -7232,6 +7295,133 @@ mod tests {
         drop(
             CloudFilesNamespaceReconciler::open(&fixture.root.data_dir(), "mount-a", "/services")
                 .expect("ordinary open after exact finalized Terminal"),
+        );
+    }
+
+    #[test]
+    fn recovery_terminal_retains_the_plan_authorized_sparse_directory_ledger() {
+        let (fixture, directory) =
+            cursor_recovery_fixture_with_materialized_directory("recovery-terminal-sparse-ledger");
+        let expected: CloudFilesNamespaceReconciliationState =
+            decode_sobj(&fixture.plan.expected_state).expect("decode expected sparse state");
+        assert_eq!(
+            expected.materialized_directories,
+            BTreeSet::from(["/services".to_string(), directory.path.clone()])
+        );
+
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open sparse cursor recovery");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply sparse recovery rewrite");
+        drop(guard);
+        let mut reconciler = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open sparse recovery progress");
+        let original: CloudFilesNamespaceReconciliationState =
+            decode_sobj(&fixture.plan.original_state).expect("decode original sparse state");
+        reconciler
+            .install_full_scan_delta(
+                BTreeMap::from([(directory.path.clone(), directory.clone())]),
+                Vec::new(),
+                vec!["/services".to_string(), directory.path.clone()],
+                original.cursors,
+                true,
+            )
+            .expect("install terminal sparse scan");
+        let mut audits = CloudFilesMaterializationAuditIntentStore::open(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+        )
+        .expect("open sparse recovery audits");
+        audits
+            .acknowledge_directories(["/services"])
+            .expect("acknowledge required root audit");
+        drop(audits);
+        reconciler
+            .mark_authorized_cursor_recovery_terminal(&fixture.plan)
+            .expect("persist terminal sparse state");
+        assert_eq!(
+            reconciler.materialized_directories(),
+            &BTreeSet::from(["/services".to_string(), directory.path])
+        );
+        drop(reconciler);
+        assert!(
+            acquire_authorized_cursor_recovery_terminal_successor(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("reopen exact terminal sparse state")
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn recovery_progress_rejects_a_materialized_directory_outside_the_plan() {
+        let fixture = cursor_recovery_fixture("recovery-unplanned-sparse-directory");
+        let guard = resume_authorized_cursor_recovery(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open cursor recovery");
+        guard
+            .apply_authoritative_reconciliation_plan(&fixture.plan)
+            .expect("apply recovery rewrite");
+        drop(guard);
+        let mut reconciler = open_authorized_cursor_recovery_progress(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+        )
+        .expect("open recovery progress");
+        let forged = CloudFilesReconciledManifestEntry {
+            path: "/services/forged".to_string(),
+            object_id: "forged-directory-object".to_string(),
+            version: "forged-directory-version".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
+        reconciler
+            .state
+            .materialized_directories
+            .insert(forged.path.clone());
+        reconciler
+            .manifest
+            .insert(forged.path.clone(), forged.clone());
+        reconciler
+            .manifest_store
+            .append_mutations(
+                vec![CloudFilesManifestMutation::Upsert { entry: forged }],
+                &reconciler.manifest,
+            )
+            .expect("persist forged directory manifest");
+        reconciler.persist().expect("persist forged sparse state");
+        drop(reconciler);
+        assert!(
+            open_authorized_cursor_recovery_progress(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .is_err(),
+            "a canonical manifest entry cannot expand the plan-bound sparse ledger"
         );
     }
 
