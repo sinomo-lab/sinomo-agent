@@ -3837,7 +3837,7 @@ fn cloud_files_completed_artifacts_fingerprint(
 fn cloud_files_module_marker_raw_fingerprint(data_dir: &SinomoDataDir) -> Result<String, String> {
     let bytes = read_bounded_plain_host_file(
         &cloud_files_module_runtime_path(data_dir, CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE),
-        1024 * 1024,
+        sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES,
         "Cloud Files cursor-recovery module marker",
     )?
     .ok_or_else(|| "Cloud Files cursor-recovery module marker is absent".to_string())?;
@@ -9353,6 +9353,34 @@ mod tests {
             ],
             surfaces: Default::default(),
         }
+    }
+
+    #[test]
+    fn host_fingerprints_native_cursor_recovery_markers_beyond_legacy_bound() {
+        let temp = TestDir::new("cursor-recovery-module-marker-bound");
+        let data_dir = SinomoDataDir::new(temp.path().join("data"));
+        let path = cloud_files_module_runtime_path(
+            &data_dir,
+            CLOUD_FILES_CURSOR_RECOVERY_MODULE_MARKER_FILE,
+        );
+        std::fs::create_dir_all(path.parent().expect("module runtime parent"))
+            .expect("module runtime directory");
+        let bytes = vec![0x5a; 1024 * 1024 + 4096];
+        std::fs::write(&path, &bytes).expect("large canonical marker fixture");
+        assert!(
+            cloud_files_module_marker_raw_fingerprint(&data_dir).is_ok(),
+            "the host must admit the native owner's shared marker bound"
+        );
+
+        let oversized = std::fs::File::create(&path).expect("oversized marker fixture");
+        oversized
+            .set_len(
+                sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES
+                    + 1,
+            )
+            .expect("oversized marker length");
+        drop(oversized);
+        assert!(cloud_files_module_marker_raw_fingerprint(&data_dir).is_err());
     }
 
     #[test]

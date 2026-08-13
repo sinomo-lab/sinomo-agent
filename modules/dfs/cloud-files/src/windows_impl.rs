@@ -17,16 +17,17 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_dfs_cloud_files_api::{
     CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION, CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN,
-    CloudFilesCursorOnlyRecoveryApplied, CloudFilesCursorOnlyRecoveryApplyRequest,
-    CloudFilesCursorOnlyRecoveryIdentity, CloudFilesCursorOnlyRecoveryInspectRequest,
-    CloudFilesCursorOnlyRecoveryInspection, CloudFilesCursorRecoveryContext,
-    CloudFilesFetchDataError, CloudFilesLocalChangeSyncMode, CloudFilesLocalChangeSyncStatus,
-    CloudFilesModuleError, CloudFilesModuleEvent, CloudFilesMountLifecycleEvent,
-    CloudFilesMountRequest, CloudFilesMountResponse, CloudFilesPlaceholderIdentity,
-    CloudFilesPreserveStateUnregisterOutcome, CloudFilesPreserveStateUnregisterResponse,
-    CloudFilesRegistrationReceipt, CloudFilesStaleIdentityReason,
-    CloudFilesStalePlaceholderIdentity, CloudFilesUnregisterRequest, CloudFilesUnregisterResponse,
-    SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+    CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES, CloudFilesCursorOnlyRecoveryApplied,
+    CloudFilesCursorOnlyRecoveryApplyRequest, CloudFilesCursorOnlyRecoveryIdentity,
+    CloudFilesCursorOnlyRecoveryInspectRequest, CloudFilesCursorOnlyRecoveryInspection,
+    CloudFilesCursorRecoveryContext, CloudFilesFetchDataError, CloudFilesLocalChangeSyncMode,
+    CloudFilesLocalChangeSyncStatus, CloudFilesModuleError, CloudFilesModuleEvent,
+    CloudFilesMountLifecycleEvent, CloudFilesMountRequest, CloudFilesMountResponse,
+    CloudFilesPlaceholderIdentity, CloudFilesPreserveStateUnregisterOutcome,
+    CloudFilesPreserveStateUnregisterResponse, CloudFilesRegistrationReceipt,
+    CloudFilesStaleIdentityReason, CloudFilesStalePlaceholderIdentity, CloudFilesUnregisterRequest,
+    CloudFilesUnregisterResponse, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+    SINOMO_DFS_CLOUD_FILES_MODULE_ID,
 };
 use sinomo_module_api::{decode_sobj, encode_sobj};
 use sinomo_runtime::api::DaemonDfsPeerTransport;
@@ -105,7 +106,6 @@ const CLOUD_FILES_REGISTRATION_JOURNAL_FILE: &str = "registration-journal.sobj";
 const CLOUD_FILES_REGISTRATION_LOCK_FILE: &str = "registration.lock";
 const CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE: &str = "cursor-recovery-control.sobj";
 const CLOUD_FILES_CURSOR_RECOVERY_MODULE_TEMP_LABEL: &str = "cursor-recovery-marker-next";
-const CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 const CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
 /// One Cloud Files DFS call must yield to cancellation promptly. Higher-level

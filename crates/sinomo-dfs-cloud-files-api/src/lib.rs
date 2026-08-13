@@ -12,6 +12,9 @@ pub const SINOMO_DFS_CLOUD_FILES_MODULE_ID: &str = "module.dfs.cloud-files";
 pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_V1: &str = "sinomo.dfs.cloud-files.v1";
 pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_V2: &str = "sinomo.dfs.cloud-files.v2";
 pub const SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION: &str = "sinomo.dfs.cloud-files.v3";
+/// Shared bound for the canonical, plan-bearing cursor-recovery marker. Both
+/// the native owner and the host fingerprint reader must admit the same bytes.
+pub const CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES: u64 = 16 * 1024 * 1024;
 pub const SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME: &str = "Sinomo SIFS";
 pub const SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION: &str = "sifs.cloud-files.mount";
 pub const SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION: &str = "sifs.cloud-files.unregister";
