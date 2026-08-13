@@ -2195,9 +2195,21 @@ impl WindowsLocalStartupScanPlan {
                         .map_err(|_| format!("{} escaped the sync root", path.display()))?
                         .to_path_buf();
                     let sifs_path = local_relative_to_sifs(root_path, &relative)?;
-                    let metadata = fs::symlink_metadata(&path)
-                        .map_err(|error| format!("stat local path {}: {error}", path.display()))?;
-                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                    // Windows includes the entry metadata in the directory
+                    // enumeration. Reopening a newly projected Cloud Files
+                    // placeholder with `symlink_metadata` asks the filter for
+                    // reparse-point metadata and can fail with
+                    // ERROR_CLOUD_FILE_INVALID_REQUEST. Use the metadata from
+                    // the same enumeration cut instead, which also avoids a
+                    // path-based TOCTOU between discovery and classification.
+                    let metadata = entry.metadata().map_err(|error| {
+                        format!("read enumerated metadata for {}: {error}", path.display())
+                    })?;
+                    let is_directory = metadata.is_dir();
+                    let placeholder = query_placeholder_state(&path, is_directory)?;
+                    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+                        && placeholder.is_none()
+                    {
                         self.blocked_paths.insert(sifs_path.clone());
                         output.conflicts.push(startup_conflict(
                             &sifs_path,
@@ -2218,11 +2230,9 @@ impl WindowsLocalStartupScanPlan {
                         );
                         continue;
                     }
-                    let is_directory = metadata.is_dir();
                     if is_directory {
                         self.pending_directories.push_back(path.clone());
                     }
-                    let placeholder = query_placeholder_state(&path, is_directory)?;
                     self.local.insert(
                         sifs_path.clone(),
                         LocalPlaceholderState {
@@ -3626,11 +3636,12 @@ fn query_placeholder_state(
     is_directory: bool,
 ) -> Result<Option<(bool, Option<CloudFilesPlaceholderIdentity>)>, String> {
     let wide = wide_path(path);
-    let flags = if is_directory {
-        FILE_FLAG_BACKUP_SEMANTICS
-    } else {
-        Default::default()
-    };
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if is_directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            Default::default()
+        };
     let handle = unsafe {
         CreateFileW(
             PCWSTR(wide.as_ptr()),
