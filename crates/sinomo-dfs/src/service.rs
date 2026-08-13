@@ -132,6 +132,7 @@ fn dfs_route_accepts_request_body(route: &str) -> bool {
             | crate::DFS_DATA_STAGE_BLOB_ROUTE
             | crate::DFS_DATA_STAGE_PATCH_ROUTE
             | crate::DFS_DATA_REPAIR_REPLICA_ROUTE
+            | crate::DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE
             | crate::DFS_DATA_METADATA_SNAPSHOT_INSTALL_ROUTE
     )
 }
@@ -1836,6 +1837,15 @@ mod tests {
             namespace.request_body_mode,
             ServiceBodyMode::Optional,
             "namespace commands use the canonical value path; explicit DFS attachments remain optional"
+        );
+
+        let fetch_blob_response = service_routes
+            .get(crate::DFS_DATA_FETCH_BLOB_RESPONSE_ROUTE)
+            .expect("fetch blob response route");
+        assert_eq!(
+            fetch_blob_response.request_body_mode,
+            ServiceBodyMode::Optional,
+            "a fetch response carries the requested blob as a streamed request attachment"
         );
     }
 
