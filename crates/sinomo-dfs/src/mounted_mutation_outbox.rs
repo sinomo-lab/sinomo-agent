@@ -314,7 +314,7 @@ pub struct MountedSifsMutationOutboxCursorRecoveryInspection {
 #[derive(Debug)]
 pub struct MountedSifsMutationOutboxCursorRecoveryGuard {
     inspection: MountedSifsMutationOutboxCursorRecoveryInspection,
-    _store_lock: Option<File>,
+    _store_lock: Option<CursorRecoveryStoreLock>,
 }
 
 impl MountedSifsMutationOutboxCursorRecoveryGuard {
@@ -381,6 +381,16 @@ pub fn inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(
             "mounted-mutation outbox is not globally quiescent: {source}"
         ))
     })?;
+    tracing::info!(
+        target: "sinomo.dfs.mounted_mutation.lock",
+        lock_path = %lock_path.display(),
+        thread_name = std::thread::current().name(),
+        "acquired mounted-mutation cursor-recovery store lock"
+    );
+    let store_lock = CursorRecoveryStoreLock {
+        file: store_lock,
+        path: lock_path.clone(),
+    };
 
     let expected_directories = BTreeSet::from([
         SESSIONS_DIRECTORY.to_string(),
@@ -493,6 +503,31 @@ pub fn inspect_mounted_sifs_mutation_outbox_for_cursor_recovery(
         },
         _store_lock: Some(store_lock),
     })
+}
+
+#[derive(Debug)]
+struct CursorRecoveryStoreLock {
+    file: File,
+    path: PathBuf,
+}
+
+impl Drop for CursorRecoveryStoreLock {
+    fn drop(&mut self) {
+        match FileExt::unlock(&self.file) {
+            Ok(()) => tracing::info!(
+                target: "sinomo.dfs.mounted_mutation.lock",
+                lock_path = %self.path.display(),
+                thread_name = std::thread::current().name(),
+                "released mounted-mutation cursor-recovery store lock"
+            ),
+            Err(source) => tracing::warn!(
+                target: "sinomo.dfs.mounted_mutation.lock",
+                lock_path = %self.path.display(),
+                error = %source,
+                "failed to release mounted-mutation cursor-recovery store lock"
+            ),
+        }
+    }
 }
 
 #[cfg(windows)]
