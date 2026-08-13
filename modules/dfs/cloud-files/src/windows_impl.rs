@@ -593,7 +593,7 @@ fn acquire_cursor_recovery_terminal_owner_guards(
     {
         return Err(CloudFilesModuleError {
             code: "cursor-recovery-queue-drift".to_string(),
-            detail: "terminal successor queue is neither the token-bound snapshot nor its exact fully reconciled successor".to_string(),
+            detail: "terminal successor queue is neither the exact empty token-bound snapshot nor an exact scan-reconciled terminal cut".to_string(),
         });
     }
     Ok(CursorRecoveryOwnerGuards {

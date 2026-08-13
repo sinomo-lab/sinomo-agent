@@ -3058,11 +3058,23 @@ where
             .is_some_and(|control| control.phase.load(Ordering::SeqCst) != CURSOR_RECOVERY_COMPLETE)
     }
 
-    fn ensure_cursor_recovery_queue_empty(&self) -> Result<(), CloudFilesWindowsSyncError> {
-        if self.state.queue.operations().next().is_some() {
+    fn ensure_cursor_recovery_queue_settled(&self) -> Result<(), CloudFilesWindowsSyncError> {
+        if let Some(operation) = self.state.queue.operations().find(|operation| {
+            operation.status != CloudFilesLocalOperationStatus::Superseded
+                || operation.remote_evidence.is_none()
+                || operation.conflict.is_some()
+                || operation.last_error.is_some()
+                || self
+                    .state
+                    .reconciler
+                    .has_suppression(&operation.request.operation_id)
+        }) {
             return Err(sync_error(
                 "cursor-recovery-queue-not-empty",
-                "authorized cursor recovery cannot run while any local operation exists",
+                format!(
+                    "authorized cursor recovery cannot finalize while operation `{}` is {:?} or still retains unreconciled evidence",
+                    operation.request.operation_id, operation.status
+                ),
             ));
         }
         Ok(())
@@ -3117,15 +3129,15 @@ where
         })?;
 
         if control.released() {
-            self.ensure_cursor_recovery_queue_empty()?;
+            self.ensure_cursor_recovery_queue_settled()?;
             return self.finish_released_cursor_recovery(cancelled, &control);
         }
         if control.active_parked() {
-            self.ensure_cursor_recovery_queue_empty()?;
+            self.ensure_cursor_recovery_queue_settled()?;
             return Ok(CloudFilesWritableSyncProgress::default());
         }
         if control.terminal() {
-            self.ensure_cursor_recovery_queue_empty()?;
+            self.ensure_cursor_recovery_queue_settled()?;
             return Ok(CloudFilesWritableSyncProgress {
                 cursor_recovery_terminal: true,
                 ..CloudFilesWritableSyncProgress::default()
@@ -3138,7 +3150,7 @@ where
         // never rerun or mutate the authoritative scan after the successor is
         // durable.
         if self.state.cursor_recovery_module_namespace_finalized {
-            self.ensure_cursor_recovery_queue_empty()?;
+            self.ensure_cursor_recovery_queue_settled()?;
             if !self.state.reconciler.cursor_recovery_terminal()
                 || self.state.reconciler.materialized_directories()
                     != &BTreeSet::from([self.state.root.clone()])
@@ -3188,7 +3200,7 @@ where
                 "terminal cursor recovery did not durably clear the full-scan request, materialize only the depth-0 root, and leave no inflight namespace effect",
             ));
         }
-        self.ensure_cursor_recovery_queue_empty()?;
+        self.ensure_cursor_recovery_queue_settled()?;
         self.state
             .queue
             .prune_released_blobs()
@@ -3203,7 +3215,7 @@ where
         cancelled: &AtomicBool,
         control: &CloudFilesCursorRecoveryControl,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
-        self.ensure_cursor_recovery_queue_empty()?;
+        self.ensure_cursor_recovery_queue_settled()?;
         self.capture
             .arm_cursor_recovery_observer()
             .map_err(capture_sync_error("cursor-recovery-observer-start"))?;
@@ -3273,7 +3285,7 @@ where
             ));
         }
         check_cancelled(cancelled)?;
-        self.ensure_cursor_recovery_queue_empty()?;
+        self.ensure_cursor_recovery_queue_settled()?;
         self.state.mark_cursor_recovery_terminal()?;
         control.mark_terminal()?;
         Ok(CloudFilesWritableSyncProgress {
@@ -3288,7 +3300,7 @@ where
         control: &CloudFilesCursorRecoveryControl,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         check_cancelled(cancelled)?;
-        self.ensure_cursor_recovery_queue_empty()?;
+        self.ensure_cursor_recovery_queue_settled()?;
         self.mutations.ensure_contracts_ready().map_err(|detail| {
             sync_error(CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE, detail)
         })?;
@@ -6309,6 +6321,62 @@ mod tests {
         assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cursor_recovery_terminal_handoff_accepts_only_reconciled_superseded_queue_records() {
+        let root = TestRoot::new("cursor-recovery-superseded-handoff");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("state");
+        let operation = state
+            .enqueue_capture(create_capture("terminal-superseded", b"retained bytes"))
+            .expect("enqueue retained capture");
+        state.authorize_cursor_recovery_for_test();
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([]),
+            FakeEffects::default(),
+        );
+
+        let queued = worker
+            .ensure_cursor_recovery_queue_settled()
+            .expect_err("queued operation must block the terminal handoff");
+        assert_eq!(queued.code, "cursor-recovery-queue-not-empty");
+
+        worker
+            .state
+            .queue
+            .mark_in_flight(&operation.request.operation_id)
+            .expect("mark in flight");
+        worker
+            .state
+            .queue
+            .mark_remote_applied_with_evidence(CloudFilesRemoteMutationEvidence {
+                operation_id: operation.request.operation_id.clone(),
+                object_id: Some("01object".to_string()),
+                version: Some("01version".to_string()),
+                content_hash: None,
+                content_size_bytes: None,
+                kind: Some("file".to_string()),
+                detail: "authoritative terminal scan confirmed the stable request".to_string(),
+            })
+            .expect("mark remote applied");
+        worker
+            .state
+            .queue
+            .mark_completed(&operation.request.operation_id)
+            .expect("mark completed");
+        worker
+            .state
+            .queue
+            .retire_terminal_operation(&operation.request.operation_id)
+            .expect("mark superseded");
+
+        worker
+            .ensure_cursor_recovery_queue_settled()
+            .expect("terminal handoff may retain the exact scan-reconciled predecessor");
     }
 
     #[test]

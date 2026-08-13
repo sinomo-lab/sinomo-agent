@@ -1526,32 +1526,57 @@ impl CloudFilesCursorOnlyQueueInspectionGuard {
         &self.inspection
     }
 
-    /// Accept either the byte-identical token snapshot or the one monotonic
-    /// terminal successor produced when every captured operation has been
-    /// acknowledged by an authoritative scan. The successor retains an exact
-    /// request-digest tombstone for every original operation and no active
-    /// journal/blob evidence.
+    /// Accept the exact monotonic cuts produced after the token snapshot when
+    /// an authoritative terminal scan reconciles every captured operation.
+    ///
+    /// The namespace state is persisted before its queue acknowledgement, so
+    /// a crash may leave every original operation durably `Superseded` with
+    /// exact remote evidence while the original retirement ledger is still
+    /// current. The following ordinary startup pass can compact that bounded
+    /// predecessor after the cursor-recovery authority is released. The fully
+    /// acknowledged successor instead retains an exact request-digest
+    /// tombstone for every original operation and no active journal/blob
+    /// evidence.
     pub(crate) fn matches_original_or_reconciled_successor(
         &self,
         original_raw_files: &BTreeMap<String, Vec<u8>>,
         mount: &str,
         root: &str,
     ) -> Result<bool, CloudFilesLocalChangeQueueError> {
-        if &self.inspection.raw_files == original_raw_files {
-            return Ok(true);
-        }
         let Some(current) = self.replay.as_ref() else {
             return Ok(false);
         };
         let original = replay_exact_queue_raw_files(original_raw_files, mount, root)?;
-        if !current.operations.is_empty()
-            || current.journal_bytes != 0
-            || self
-                .inspection
-                .raw_files
-                .keys()
-                .any(|name| name.starts_with(&format!("{QUEUE_BLOBS_DIR}/")))
-        {
+        if &self.inspection.raw_files == original_raw_files && original.operations.is_empty() {
+            return Ok(true);
+        }
+        let has_blob = self
+            .inspection
+            .raw_files
+            .keys()
+            .any(|name| name.starts_with(&format!("{QUEUE_BLOBS_DIR}/")));
+        if has_blob {
+            return Ok(false);
+        }
+        let terminal_acknowledgement_predecessor = !current.operations.is_empty()
+            && current.retired_ledger == original.retired_ledger
+            && current.operations.len() == original.operations.len()
+            && current.operations.iter().all(|(operation_id, operation)| {
+                original
+                    .operations
+                    .get(operation_id)
+                    .is_some_and(|original| {
+                        operation.request_digest == original.request_digest
+                            && operation.status == CloudFilesLocalOperationStatus::Superseded
+                            && operation.remote_evidence.is_some()
+                            && operation.conflict.is_none()
+                            && operation.last_error.is_none()
+                    })
+            });
+        if terminal_acknowledgement_predecessor {
+            return Ok(true);
+        }
+        if !current.operations.is_empty() || current.journal_bytes != 0 {
             return Ok(false);
         }
         let expected = original
@@ -2639,6 +2664,20 @@ mod tests {
         completed
             .retire_terminal_operation("op-retained")
             .expect("retire terminal operation");
+        drop(completed);
+
+        let acknowledgement_predecessor =
+            inspect_cursor_only_local_change_queue(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect terminal acknowledgement predecessor");
+        assert!(
+            acknowledgement_predecessor
+                .matches_original_or_reconciled_successor(&original_raw, "mount-a", "/services",)
+                .expect("classify terminal acknowledgement predecessor"),
+            "a crash after the terminal namespace state and Superseded queue records must resume without another remote scan"
+        );
+        drop(acknowledgement_predecessor);
+
+        let mut completed = queue(&root);
         completed
             .acknowledge_reconciled_retirements(&["op-retained".to_string()])
             .expect("authoritative scan acknowledgement");
