@@ -307,8 +307,13 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
     }
 
     fn gate<T>(&self, detail: impl Into<String>) -> Result<T, String> {
+        let detail = detail.into();
         self.gated.store(true, Ordering::Release);
-        Err(detail.into())
+        #[cfg(windows)]
+        super::host_log(&format!(
+            "Cloud Files mounted-mutation handoff entered its ambiguity gate: {detail}"
+        ));
+        Err(detail)
     }
 
     /// Open and bootstrap the writable DFS service behind one durable mount
