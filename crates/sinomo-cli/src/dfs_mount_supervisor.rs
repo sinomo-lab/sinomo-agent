@@ -8377,8 +8377,8 @@ fn start_platform_mount(
 ) -> Result<ActiveMount, String> {
     use sinomo_runtime::dfs_cloud_files_api::{
         CloudFilesModuleRequest, CloudFilesModuleResponse, CloudFilesMountRequest,
-        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        CloudFilesProviderReplacementContext, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
+        SINOMO_DFS_CLOUD_FILES_MODULE_ID, SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
     };
     use sinomo_runtime::module::{
         ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
@@ -8631,6 +8631,23 @@ fn start_platform_mount(
             }
         },
     )?;
+    let provider_replacement = if host_cursor_recovery.is_none() {
+        let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+        let active = read_native_dylib_module_loader_state(&data_dir_root, &module_id)
+            .map_err(|error| format!("read Cloud Files module loader state: {error}"))?;
+        active.and_then(|active| {
+            let predecessor = active.replaces_content_hash.clone()?;
+            let active_provenance = CloudFilesModuleProvenance::from_loader_state(&active);
+            (active_provenance == module_provenance && predecessor != active.content_hash)
+                .then_some(CloudFilesProviderReplacementContext {
+                    predecessor_content_hash: predecessor,
+                    successor_content_hash: active.content_hash,
+                })
+        })
+    } else {
+        None
+    };
     let request = CloudFilesMountRequest {
         sync_root: mount_point.to_path_buf(),
         root_path: config.root_path.clone(),
@@ -8650,6 +8667,7 @@ fn start_platform_mount(
                 native_successor_fingerprint: marker.native_successor_fingerprint.clone(),
             }
         }),
+        provider_replacement,
     };
     if host_cursor_recovery.is_some() {
         let current: SifsMountConfig = sifs_mount_config_store()?

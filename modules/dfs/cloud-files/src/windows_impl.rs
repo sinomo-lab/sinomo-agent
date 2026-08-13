@@ -1924,6 +1924,7 @@ fn cursor_recovery_mount_request(marker: &CursorRecoveryModuleMarker) -> CloudFi
             recovery_cycle: marker.recovery_cycle,
             native_successor_fingerprint: None,
         }),
+        provider_replacement: None,
     }
 }
 
@@ -3460,6 +3461,7 @@ where
 
 fn verify_fresh_state_owned_boundary_with<FEmpty, FScopes, FFileId>(
     fresh: bool,
+    adopt_replaced_provider_state: bool,
     sync_root: &Path,
     expected_file_id: u64,
     ensure_empty: FEmpty,
@@ -3474,13 +3476,15 @@ where
     if !fresh {
         return Ok(());
     }
-    ensure_empty()?;
-    if !scopes_are_absent()? {
-        return Err(CloudFilesModuleError {
-            code: "unowned-sync-root-state-not-pristine".to_string(),
-            detail: "Fresh Cloud Files activation found a queue or reconciliation scope created before durable StateOwned; refusing to open or reinterpret it"
-                .to_string(),
-        });
+    if !adopt_replaced_provider_state {
+        ensure_empty()?;
+        if !scopes_are_absent()? {
+            return Err(CloudFilesModuleError {
+                code: "unowned-sync-root-state-not-pristine".to_string(),
+                detail: "Fresh Cloud Files activation found a queue or reconciliation scope created before durable StateOwned; refusing to open or reinterpret it"
+                    .to_string(),
+            });
+        }
     }
     if current_file_id()? != expected_file_id {
         return Err(CloudFilesModuleError {
@@ -3492,6 +3496,40 @@ where
         });
     }
     Ok(())
+}
+
+fn validate_provider_replacement_context(
+    request: &CloudFilesMountRequest,
+) -> Result<bool, CloudFilesModuleError> {
+    let Some(replacement) = request.provider_replacement.as_ref() else {
+        return Ok(false);
+    };
+    if request.cursor_recovery.is_some() {
+        return Err(CloudFilesModuleError {
+            code: "provider-replacement-cursor-recovery".to_string(),
+            detail: "provider replacement and cursor recovery cannot share one mount authorization"
+                .to_string(),
+        });
+    }
+    let canonical = |value: &str| {
+        value.strip_prefix("blake3:").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+    };
+    if !canonical(&replacement.predecessor_content_hash)
+        || !canonical(&replacement.successor_content_hash)
+        || replacement.predecessor_content_hash == replacement.successor_content_hash
+    {
+        return Err(CloudFilesModuleError {
+            code: "provider-replacement-context-invalid".to_string(),
+            detail: "provider replacement requires distinct canonical predecessor and successor content hashes"
+                .to_string(),
+        });
+    }
+    Ok(true)
 }
 
 pub fn mount_sifs_cloud_files(
@@ -3690,6 +3728,7 @@ fn mount_sifs_cloud_files_inner(
                 .to_string(),
         });
     }
+    let provider_replacement = validate_provider_replacement_context(&request)?;
     let _cursor_recovery_root_fence = cursor_recovery_root_fence;
     if !request.connect {
         return Err(CloudFilesModuleError {
@@ -3717,22 +3756,26 @@ fn mount_sifs_cloud_files_inner(
             ),
         })?;
         verify_fresh_registration_absent(&request)?;
-        ensure_new_sync_root_is_empty(&request.sync_root)?;
-        let scopes_absent = fresh_writable_scopes_are_absent(
-            &data_dir,
-            &request.sync_root.to_string_lossy(),
-            &request.root_path,
-        )
-        .map_err(|error| CloudFilesModuleError {
-            code: error.code.to_string(),
-            detail: error.detail,
-        })?;
-        if !scopes_absent {
-            return Err(CloudFilesModuleError {
-                code: "unowned-sync-root-state-not-pristine".to_string(),
-                detail: "new or unowned Cloud Files activation found a pre-existing exact queue or reconciliation scope; refusing to open, repair, or reinterpret retained state without verified registration ownership"
-                    .to_string(),
-            });
+        if provider_replacement {
+            ensure_owned_sync_root_is_plain_directory(&request.sync_root)?;
+        } else {
+            ensure_new_sync_root_is_empty(&request.sync_root)?;
+            let scopes_absent = fresh_writable_scopes_are_absent(
+                &data_dir,
+                &request.sync_root.to_string_lossy(),
+                &request.root_path,
+            )
+            .map_err(|error| CloudFilesModuleError {
+                code: error.code.to_string(),
+                detail: error.detail,
+            })?;
+            if !scopes_absent {
+                return Err(CloudFilesModuleError {
+                    code: "unowned-sync-root-state-not-pristine".to_string(),
+                    detail: "new or unowned Cloud Files activation found a pre-existing exact queue or reconciliation scope; refusing to open, repair, or reinterpret retained state without verified registration ownership"
+                        .to_string(),
+                });
+            }
         }
     }
     let terminal_ready_handoff = cursor_recovery_marker.as_ref().is_some_and(|marker| {
@@ -3760,6 +3803,7 @@ fn mount_sifs_cloud_files_inner(
         |activation| {
             verify_fresh_state_owned_boundary_with(
                 !existing_owned_root,
+                provider_replacement,
                 &request.sync_root,
                 activation.journal().sync_root_file_id,
                 || ensure_new_sync_root_is_empty(&request.sync_root),
@@ -8918,6 +8962,38 @@ mod tests {
     }
 
     #[test]
+    fn exact_provider_replacement_adopts_nonempty_root_and_retained_writable_scopes() {
+        let mut request = CloudFilesMountRequest::new(PathBuf::from(r"C:\SinomoSIFS"));
+        request.provider_replacement = Some(
+            sinomo_dfs_cloud_files_api::CloudFilesProviderReplacementContext {
+                predecessor_content_hash: format!("blake3:{}", "1".repeat(64)),
+                successor_content_hash: format!("blake3:{}", "2".repeat(64)),
+            },
+        );
+        assert!(validate_provider_replacement_context(&request).expect("replacement context"));
+
+        verify_fresh_state_owned_boundary_with(
+            true,
+            true,
+            &request.sync_root,
+            42,
+            || panic!("replacement adoption must not require an empty root"),
+            || panic!("replacement adoption must retain its durable writable scopes"),
+            || Ok(42),
+        )
+        .expect("replacement adoption still verifies the root file identity");
+
+        request
+            .provider_replacement
+            .as_mut()
+            .expect("replacement")
+            .successor_content_hash = format!("blake3:{}", "1".repeat(64));
+        let error = validate_provider_replacement_context(&request)
+            .expect_err("same provider image is not a replacement");
+        assert_eq!(error.code, "provider-replacement-context-invalid");
+    }
+
+    #[test]
     fn journal_free_preserve_replay_releases_a_missing_root_without_cfapi_query() {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -8984,6 +9060,7 @@ mod tests {
                 |_| {
                     verify_fresh_state_owned_boundary_with(
                         true,
+                        false,
                         Path::new(r"C:\SinomoSIFS"),
                         42,
                         || {

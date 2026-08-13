@@ -797,6 +797,17 @@ pub struct CloudFilesMountRequest {
     pub max_run_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
+    /// Explicit host-authorized transfer from one exact v3 provider image to
+    /// another. The native provider may adopt a non-empty unregistered root
+    /// and its durable writable scopes only for this content-bound handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replacement: Option<CloudFilesProviderReplacementContext>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct CloudFilesProviderReplacementContext {
+    pub predecessor_content_hash: String,
+    pub successor_content_hash: String,
 }
 
 impl CloudFilesMountRequest {
@@ -813,6 +824,7 @@ impl CloudFilesMountRequest {
             connect: default_connect(),
             max_run_seconds: None,
             cursor_recovery: None,
+            provider_replacement: None,
         }
     }
 
@@ -973,6 +985,7 @@ mod tests {
         assert!(request.connect);
         assert!(request.read_only);
         assert!(!request.sync_local_changes);
+        assert!(request.provider_replacement.is_none());
         assert_eq!(
             request
                 .validate_supported_mode()
