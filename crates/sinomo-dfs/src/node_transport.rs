@@ -3815,6 +3815,83 @@ mod tests {
         assert_eq!(transport.finish_message(), expected);
     }
 
+    #[derive(Default)]
+    struct RecordingAsyncMessagePeerTransport {
+        calls: AtomicUsize,
+    }
+
+    impl RecordingAsyncMessagePeerTransport {
+        fn respond(&self, call: ObjectRpcCall) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let request = materialize_dfs_value_call_sync(call, usize::MAX)?;
+            let command = request
+                .decode_body::<DfsMessageCommand>()
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))?;
+            ObjectRpcResponse::encode_body(
+                &request.route,
+                &DfsMessageResponse {
+                    request_id: command.request_id,
+                    outbound_messages: Vec::new(),
+                },
+            )
+            .map(ObjectRpcResult::value)
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        }
+    }
+
+    impl DfsPeerTransport for RecordingAsyncMessagePeerTransport {
+        fn call_object_rpc(
+            &self,
+            _target_node_id: &NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
+            self.respond(call)
+        }
+    }
+
+    impl AsyncDfsPeerTransport for RecordingAsyncMessagePeerTransport {
+        fn call_object_rpc_async<'a>(
+            &'a self,
+            _target_node_id: &'a NodeId,
+            call: ObjectRpcCall,
+            _options: DfsObjectRpcSendOptions,
+        ) -> DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>> {
+            Box::pin(async move { self.respond(call) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn served_transport_uses_async_peer_for_non_return_traffic() {
+        let local = node_id("node_served_async_local");
+        let caller = node_id("node_served_async_caller");
+        let replica = node_id("node_served_async_replica");
+        let peer = Arc::new(RecordingAsyncMessagePeerTransport::default());
+        let sync_peer: Arc<dyn DfsPeerTransport> = peer.clone();
+        let async_peer: Arc<dyn AsyncDfsPeerTransport> = peer.clone();
+        let mut transport = DfsNodeServedMessageTransport::new_with_peer_transports_for_nodes(
+            local.clone(),
+            [caller.clone(), replica.clone()],
+            sync_peer,
+            async_peer,
+            Duration::from_secs(1),
+        );
+        transport
+            .begin_message(&test_namespace_message(&caller, &local, 1))
+            .expect("begin served caller request");
+
+        transport
+            .send_routed_call_async(
+                &replica,
+                DfsRoutedCall::value(test_namespace_message(&local, &replica, 2)),
+            )
+            .await
+            .expect("served request must retain its async peer sender");
+
+        assert_eq!(peer.calls.load(Ordering::SeqCst), 1);
+        assert!(transport.finish_message().is_empty());
+    }
+
     fn node_id(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
     }
@@ -7427,12 +7504,15 @@ impl DfsNodeServedMessageTransport {
         connect_timeout: Duration,
         detached_send_state: DfsNodeDetachedSendState,
     ) -> Self {
+        let async_sender = async_peer_transport
+            .as_ref()
+            .map(|transport| async_dfs_message_sender_from_peer_transport(Arc::clone(transport)));
         let node_transport = DfsNodeTransport::with_senders_for_nodes_and_detached_state(
             local_node_id.clone(),
             peer_node_ids,
             connect_timeout,
             Some(sender),
-            None,
+            async_sender,
             None,
             None,
             peer_transport,
