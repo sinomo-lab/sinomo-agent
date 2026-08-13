@@ -332,6 +332,8 @@ pub(crate) struct CloudFilesCursorOnlyReconciliationInspection {
     pub scope_path: PathBuf,
     pub raw_files: BTreeMap<String, Vec<u8>>,
     pub cursors: BTreeMap<String, CloudFilesNamespaceCursor>,
+    pub startup_conflict_count: u64,
+    pub materialized_directory_count: u64,
 }
 
 pub(crate) struct CloudFilesCursorOnlyReconciliationInspectionGuard {
@@ -399,6 +401,11 @@ impl CloudFilesCursorOnlyReconciliationInspectionGuard {
             .cloned()
             .expect("nonempty cursor-only inspection");
         state.cursors.clear();
+        // Startup conflicts are derived pre-activation diagnostics, not local
+        // mutation authority. The exact original bytes remain bound into the
+        // recovery plan while retained queue operations are reconciled first;
+        // the post-recovery local scan recreates any conflict that still holds.
+        state.startup_conflicts.clear();
         state.materialized_directories.insert(state.root.clone());
         state.full_scan_request = Some(CloudFilesFullScanRequest {
             shard_key: boundary.shard_key()?,
@@ -703,6 +710,7 @@ fn validate_cursor_recovery_plan(
         )
     })?;
     recomputed.cursors.clear();
+    recomputed.startup_conflicts.clear();
     recomputed.materialized_directories.insert(root.to_string());
     recomputed.full_scan_request = Some(CloudFilesFullScanRequest {
         shard_key: boundary.shard_key()?,
@@ -719,17 +727,7 @@ fn validate_cursor_recovery_plan(
         || original.schema_version != RECONCILIATION_SCHEMA_VERSION
         || original.mount != mount
         || original.root != root
-        || original.cursors.is_empty()
-        || !original.legacy_manifest.is_empty()
-        || !original.suppressions.is_empty()
-        || !original.conflicts.is_empty()
-        || !original.startup_conflicts.is_empty()
-        || !original.materialized_directories.is_empty()
-        || original.unsupported_projection_count != 0
-        || !original.unsupported_projection_examples.is_empty()
-        || original.full_scan_request.is_some()
-        || original.inflight_effect.is_some()
-        || !original.applied_events.is_empty()
+        || !cursor_recovery_original_state_is_valid(&original, mount, root)?
         || expected.schema_version != RECONCILIATION_SCHEMA_VERSION
         || expected.mount != mount
         || expected.root != root
@@ -758,6 +756,49 @@ fn validate_cursor_recovery_plan(
         }
     }
     Ok(ValidatedCursorRecoveryPlan { original, expected })
+}
+
+fn cursor_recovery_original_state_is_valid(
+    state: &CloudFilesNamespaceReconciliationState,
+    mount: &str,
+    root: &str,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    if state.schema_version != RECONCILIATION_SCHEMA_VERSION
+        || state.mount != mount
+        || state.root != root
+        || state.cursors.is_empty()
+        || !state.legacy_manifest.is_empty()
+        || !state.suppressions.is_empty()
+        || !state.conflicts.is_empty()
+        || state.unsupported_projection_count != 0
+        || !state.unsupported_projection_examples.is_empty()
+        || state.full_scan_request.is_some()
+        || state.inflight_effect.is_some()
+        || !state.applied_events.is_empty()
+    {
+        return Ok(false);
+    }
+    for (key, cursor) in &state.cursors {
+        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
+            return Ok(false);
+        }
+    }
+    for (path, conflict) in &state.startup_conflicts {
+        if path != &conflict.path
+            || conflict.detail.trim().is_empty()
+            || canonical_sifs_path(path)? != *path
+        {
+            return Ok(false);
+        }
+        ensure_within_root(path, root)?;
+    }
+    for directory in &state.materialized_directories {
+        if canonical_sifs_path(directory)? != *directory {
+            return Ok(false);
+        }
+        ensure_within_root(directory, root)?;
+    }
+    Ok(true)
 }
 
 pub(crate) fn validate_authorized_cursor_recovery_plan(
@@ -993,7 +1034,7 @@ fn inspect_authorized_cursor_recovery_cut(
                 saw_lock = true;
             }
             MANIFEST_DIR if metadata.file_type().is_dir() => {
-                inspect_cursor_recovery_manifest(&path, &mut raw_files)?;
+                let _ = inspect_cursor_recovery_manifest(&path, &mut raw_files)?;
                 saw_manifest = true;
             }
             CURSOR_RECOVERY_REWRITE_FILE if metadata.file_type().is_file() => {
@@ -4464,6 +4505,7 @@ pub(crate) fn inspect_cursor_only_reconciliation_state(
 
     let mut raw_files = BTreeMap::new();
     let mut state = None;
+    let mut manifest = None;
     let mut saw_lock = false;
     let mut saw_manifest = false;
     let mut saw_materialization_audit = false;
@@ -4552,7 +4594,7 @@ pub(crate) fn inspect_cursor_only_reconciliation_state(
                 saw_materialization_audit = true;
             }
             MANIFEST_DIR if metadata.file_type().is_dir() => {
-                inspect_cursor_recovery_manifest(&path, &mut raw_files)?;
+                manifest = Some(inspect_cursor_recovery_manifest(&path, &mut raw_files)?);
                 saw_manifest = true;
             }
             _ => {
@@ -4575,39 +4617,37 @@ pub(crate) fn inspect_cursor_only_reconciliation_state(
             "reconciliation scope is missing state.sobj",
         )
     })?;
-    if state.schema_version != RECONCILIATION_SCHEMA_VERSION
-        || state.mount != mount
-        || state.root != root
-        || state.cursors.is_empty()
-        || !state.legacy_manifest.is_empty()
-        || !state.suppressions.is_empty()
-        || !state.conflicts.is_empty()
-        || !state.startup_conflicts.is_empty()
-        || !state.materialized_directories.is_empty()
-        || state.unsupported_projection_count != 0
-        || !state.unsupported_projection_examples.is_empty()
-        || state.full_scan_request.is_some()
-        || state.inflight_effect.is_some()
-        || !state.applied_events.is_empty()
-    {
+    if !cursor_recovery_original_state_is_valid(&state, mount, &root)? {
         return Err(reconcile_error(
             "cursor-recovery-not-cursor-only",
-            "reconciliation state contains non-cursor history or lacks a valid cursor set",
+            "reconciliation state contains mutable history outside the bounded cursor recovery set",
         ));
     }
-    for (key, cursor) in &state.cursors {
-        if key != &cursor.shard_key()? || cursor.authority_epoch == 0 {
-            return Err(reconcile_error(
-                "cursor-recovery-invalid-cursor",
-                format!("cursor `{key}` has an invalid shard key or authority epoch"),
-            ));
-        }
-    }
+    validate_recovery_manifest(
+        &manifest.expect("manifest presence checked above"),
+        &state,
+        &root,
+    )?;
+    let startup_conflict_count = u64::try_from(state.startup_conflicts.len()).map_err(|_| {
+        reconcile_error(
+            "cursor-recovery-startup-conflict-count",
+            "startup conflict count overflowed u64",
+        )
+    })?;
+    let materialized_directory_count = u64::try_from(state.materialized_directories.len())
+        .map_err(|_| {
+            reconcile_error(
+                "cursor-recovery-materialized-directory-count",
+                "materialized directory count overflowed u64",
+            )
+        })?;
     Ok(CloudFilesCursorOnlyReconciliationInspectionGuard {
         inspection: CloudFilesCursorOnlyReconciliationInspection {
             scope_path: scope,
             raw_files,
             cursors: state.cursors,
+            startup_conflict_count,
+            materialized_directory_count,
         },
         _lock: reconciliation_lock,
     })
@@ -4696,6 +4736,12 @@ pub(crate) fn resume_authorized_cursor_recovery(
         inspection: CloudFilesCursorOnlyReconciliationInspection {
             scope_path: scope,
             raw_files: cut.raw_files,
+            startup_conflict_count: u64::try_from(validated.original.startup_conflicts.len())
+                .unwrap_or(u64::MAX),
+            materialized_directory_count: u64::try_from(
+                validated.original.materialized_directories.len(),
+            )
+            .unwrap_or(u64::MAX),
             cursors: validated.original.cursors,
         },
         _lock: lock,
@@ -5485,14 +5531,15 @@ fn resume_terminal_rewrite_stage(
 fn inspect_cursor_recovery_manifest(
     manifest_dir: &Path,
     raw_files: &mut BTreeMap<String, Vec<u8>>,
-) -> Result<(), CloudFilesNamespaceReconcileError> {
+) -> Result<BTreeMap<String, CloudFilesReconciledManifestEntry>, CloudFilesNamespaceReconcileError>
+{
     let reconciliation_dir = manifest_dir.parent().ok_or_else(|| {
         reconcile_error(
             "cursor-recovery-manifest-topology",
             "manifest directory has no reconciliation owner",
         )
     })?;
-    let (store, _) =
+    let (store, manifest) =
         CloudFilesManifestStore::open_authorized_cursor_recovery_terminal(reconciliation_dir)?;
     let mut expected = BTreeMap::from([
         (MANIFEST_INDEX_FILE.to_string(), MANIFEST_INDEX_MAX_BYTES),
@@ -5513,7 +5560,7 @@ fn inspect_cursor_recovery_manifest(
         )?;
         raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
     }
-    Ok(())
+    Ok(manifest)
 }
 
 #[cfg(windows)]
@@ -6391,8 +6438,16 @@ mod tests {
             .state
             .cursors
             .insert(boundary.shard_key().expect("shard key"), boundary);
+        let directory = CloudFilesReconciledManifestEntry {
+            path: "/services/directory".to_string(),
+            object_id: "retained-directory-object".to_string(),
+            version: "retained-directory-version".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "directory".to_string(),
+        };
         let entry = CloudFilesReconciledManifestEntry {
-            path: "/services/retained.txt".to_string(),
+            path: "/services/directory/retained.txt".to_string(),
             object_id: "retained-object".to_string(),
             version: "retained-version".to_string(),
             content_hash: Some("blake3:retained".to_string()),
@@ -6400,12 +6455,29 @@ mod tests {
             kind: "file".to_string(),
         };
         reconciler
+            .state
+            .materialized_directories
+            .extend(["/services".to_string(), directory.path.clone()]);
+        reconciler.state.startup_conflicts.insert(
+            entry.path.clone(),
+            CloudFilesNamespaceStartupConflict {
+                path: entry.path.clone(),
+                detail: "retained local startup evidence".to_string(),
+            },
+        );
+        reconciler
+            .manifest
+            .insert(directory.path.clone(), directory.clone());
+        reconciler
             .manifest
             .insert(entry.path.clone(), entry.clone());
         reconciler
             .manifest_store
             .append_mutations(
-                vec![CloudFilesManifestMutation::Upsert { entry }],
+                vec![
+                    CloudFilesManifestMutation::Upsert { entry: directory },
+                    CloudFilesManifestMutation::Upsert { entry },
+                ],
                 &reconciler.manifest,
             )
             .expect("append retained manifest history");
@@ -6433,6 +6505,21 @@ mod tests {
                 .get(&format!("{MANIFEST_DIR}/{MANIFEST_JOURNAL_FILE}")),
             Some(&journal_before),
             "the recovery token must bind the exact retained manifest journal"
+        );
+        assert_eq!(guard.inspection().startup_conflict_count, 1);
+        assert_eq!(guard.inspection().materialized_directory_count, 2);
+        let plan = guard
+            .authoritative_reconciliation_plan("recovery-a", "token-a", "nonce-a")
+            .expect("build retained-history recovery plan");
+        let expected: CloudFilesNamespaceReconciliationState =
+            decode_sobj(&plan.expected_state).expect("decode expected recovery state");
+        assert!(
+            expected.startup_conflicts.is_empty(),
+            "derived startup diagnostics must be reclassified by the fresh local audit"
+        );
+        assert_eq!(
+            expected.materialized_directories,
+            BTreeSet::from(["/services".to_string(), "/services/directory".to_string()])
         );
         drop(guard);
         assert_eq!(

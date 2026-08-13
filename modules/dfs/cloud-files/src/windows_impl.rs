@@ -1052,6 +1052,14 @@ pub(crate) fn inspect_cursor_only_recovery(
             code: "cursor-recovery-cursor-count".to_string(),
             detail: "cursor count overflowed u64".to_string(),
         })?;
+    let startup_conflict_count = inspection
+        .reconciliation
+        .inspection()
+        .startup_conflict_count;
+    let materialized_directory_count = inspection
+        .reconciliation
+        .inspection()
+        .materialized_directory_count;
     Ok(CloudFilesCursorOnlyRecoveryInspection {
         schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
         sync_root: inspection.identity.sync_root.clone(),
@@ -1060,7 +1068,10 @@ pub(crate) fn inspect_cursor_only_recovery(
         cursor_count,
         raw_state_fingerprint: inspection.raw_state_fingerprint,
         recovery_token: inspection.recovery_token,
-        detail: "exact cursor-only state is eligible; applying this token authorizes a full authoritative reconciliation and local startup audit before readiness".to_string(),
+        detail: format!(
+            "exact recovery state is eligible with {} retained startup conflict diagnostic(s) and {} materialized-directory marker(s); applying this token clears the stale cursors and derived startup conflicts, then requires retained writeback, full authoritative reconciliation, and a fresh local startup audit before readiness",
+            startup_conflict_count, materialized_directory_count,
+        ),
     })
 }
 
