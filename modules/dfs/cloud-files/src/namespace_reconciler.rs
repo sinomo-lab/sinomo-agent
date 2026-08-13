@@ -2254,6 +2254,7 @@ fn validate_cursor_recovery_page_intent(
     intent: &CloudFilesCursorRecoveryPageIntent,
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
     actual_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    allowed_suppressions: Option<&BTreeMap<String, CloudFilesNamespaceSuppression>>,
 ) -> Result<ValidatedCursorRecoveryPageIntent, CloudFilesNamespaceReconcileError> {
     let validated_plan = validate_cursor_recovery_plan(plan, &intent.mount, &intent.root)?;
     if intent.schema_version != CURSOR_RECOVERY_PAGE_INTENT_SCHEMA_VERSION
@@ -2287,8 +2288,18 @@ fn validate_cursor_recovery_page_intent(
         })?;
     if encode_reconciliation_state(&before_state)? != intent.before_state
         || encode_reconciliation_state(&after_state)? != intent.after_state
-        || !cursor_recovery_progress_state_is_valid(&before_state, &validated_plan, false)?
-        || !cursor_recovery_progress_state_is_valid(&after_state, &validated_plan, false)?
+        || !cursor_recovery_progress_state_is_valid_with_suppressions(
+            &before_state,
+            &validated_plan,
+            false,
+            allowed_suppressions,
+        )?
+        || !cursor_recovery_progress_state_is_valid_with_suppressions(
+            &after_state,
+            &validated_plan,
+            false,
+            allowed_suppressions,
+        )?
         || !before_state.cursors.is_empty()
         || before_state.full_scan_request != validated_plan.expected.full_scan_request
     {
@@ -2452,6 +2463,17 @@ fn validate_cursor_recovery_page_intent(
         expected_after.full_scan_request = None;
         expected_after.applied_events.clear();
     }
+    let reconciled_suppressions = expected_after
+        .suppressions
+        .iter()
+        .filter(|(_, suppression)| {
+            suppression_action_matches_manifest(&suppression.expected_action, &after_manifest)
+        })
+        .map(|(operation_id, _)| operation_id.clone())
+        .collect::<Vec<_>>();
+    for operation_id in reconciled_suppressions {
+        expected_after.suppressions.remove(&operation_id);
+    }
     let (unsupported_count, unsupported_examples) = unsupported_projection_summary(&after_manifest);
     expected_after.unsupported_projection_count = unsupported_count;
     expected_after.unsupported_projection_examples = unsupported_examples;
@@ -2483,6 +2505,7 @@ fn repair_authorized_cursor_recovery_page_intent(
     state_bytes: &[u8],
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
     manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    allowed_suppressions: Option<&BTreeMap<String, CloudFilesNamespaceSuppression>>,
 ) -> Result<CloudFilesNamespaceReconciliationState, CloudFilesNamespaceReconcileError> {
     let decoded_state: CloudFilesNamespaceReconciliationState = decode_sobj(state_bytes)
         .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
@@ -2497,7 +2520,12 @@ fn repair_authorized_cursor_recovery_page_intent(
             "cursor recovery page intent is admissible only while ReconcileArmed",
         ));
     }
-    let validated = validate_cursor_recovery_page_intent(&evidence.intent, plan, manifest)?;
+    let validated = validate_cursor_recovery_page_intent(
+        &evidence.intent,
+        plan,
+        manifest,
+        allowed_suppressions,
+    )?;
     let state_is_before = state_bytes == evidence.intent.before_state;
     let state_is_after = state_bytes == evidence.intent.after_state;
     if !state_is_before && !state_is_after {
@@ -3121,6 +3149,23 @@ impl CloudFilesNamespaceReconciler {
     ) -> Result<Self, CloudFilesNamespaceReconcileError> {
         open_authorized_cursor_recovery_progress(data_dir, mount, root, plan)
     }
+
+    pub(crate) fn open_authorized_cursor_recovery_with_suppressions(
+        data_dir: &SinomoDataDir,
+        mount: impl Into<String>,
+        root: impl Into<String>,
+        plan: &CloudFilesCursorRecoveryReconciliationPlan,
+        allowed_suppressions: &BTreeMap<String, CloudFilesNamespaceSuppression>,
+    ) -> Result<Self, CloudFilesNamespaceReconcileError> {
+        open_authorized_cursor_recovery_progress_with_suppressions(
+            data_dir,
+            mount,
+            root,
+            plan,
+            allowed_suppressions,
+        )
+    }
+
     pub fn state_path(&self) -> &Path {
         &self.state_path
     }
@@ -4283,7 +4328,12 @@ impl CloudFilesNamespaceReconciler {
             cursors: page.cursors,
             scan_complete: page.scan_complete,
         };
-        if let Err(error) = validate_cursor_recovery_page_intent(&intent, plan, &self.manifest) {
+        if let Err(error) = validate_cursor_recovery_page_intent(
+            &intent,
+            plan,
+            &self.manifest,
+            Some(&previous.suppressions),
+        ) {
             self.state = previous;
             restore_manifest(&mut self.manifest, undo);
             return Err(error);
@@ -4757,8 +4807,33 @@ pub(crate) fn open_authorized_cursor_recovery_progress(
     root: impl Into<String>,
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
 ) -> Result<CloudFilesNamespaceReconciler, CloudFilesNamespaceReconcileError> {
-    open_authorized_cursor_recovery_progress_inner(data_dir, mount.into(), root.into(), plan, false)
-        .map(|(reconciler, _)| reconciler)
+    open_authorized_cursor_recovery_progress_inner(
+        data_dir,
+        mount.into(),
+        root.into(),
+        plan,
+        false,
+        None,
+    )
+    .map(|(reconciler, _)| reconciler)
+}
+
+pub(crate) fn open_authorized_cursor_recovery_progress_with_suppressions(
+    data_dir: &SinomoDataDir,
+    mount: impl Into<String>,
+    root: impl Into<String>,
+    plan: &CloudFilesCursorRecoveryReconciliationPlan,
+    allowed_suppressions: &BTreeMap<String, CloudFilesNamespaceSuppression>,
+) -> Result<CloudFilesNamespaceReconciler, CloudFilesNamespaceReconcileError> {
+    open_authorized_cursor_recovery_progress_inner(
+        data_dir,
+        mount.into(),
+        root.into(),
+        plan,
+        false,
+        Some(allowed_suppressions),
+    )
+    .map(|(reconciler, _)| reconciler)
 }
 
 /// Acquires the reconciliation owner lock and returns a positive successor
@@ -4908,12 +4983,38 @@ pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
     )?;
     let state: CloudFilesNamespaceReconciliationState = decode_sobj(&state_bytes)
         .map_err(|source| reconcile_error("decode-reconciliation-state", source.to_string()))?;
-    if encode_reconciliation_state(&state)? != state_bytes
-        || !cursor_recovery_progress_state_is_valid(&state, &validated, false)?
-    {
+    if encode_reconciliation_state(&state)? != state_bytes {
         return Err(reconcile_error(
             "cursor-recovery-progress-invalid",
-            "terminal successor state is noncanonical or not authorized scan progress",
+            "terminal successor state is not canonical",
+        ));
+    }
+    if !state.suppressions.is_empty() {
+        if cursor_recovery_progress_state_is_valid_with_suppressions(
+            &state,
+            &validated,
+            false,
+            Some(&state.suppressions),
+        )? && state.cursors.is_empty()
+            && state.full_scan_request == validated.expected.full_scan_request
+        {
+            // Successful retained mutations can durably install exact no-echo
+            // suppressions before the authoritative scan starts. This strict
+            // terminal probe has no queue authority with which to authenticate
+            // them, so it may classify the cut only as earlier progress. The
+            // writable recovery opener binds every suppression to its locked
+            // queue record before any worker effect is admitted.
+            return Ok(None);
+        }
+        return Err(reconcile_error(
+            "cursor-recovery-progress-invalid",
+            "terminal successor state contains suppressions outside authorized pre-scan progress",
+        ));
+    }
+    if !cursor_recovery_progress_state_is_valid(&state, &validated, false)? {
+        return Err(reconcile_error(
+            "cursor-recovery-progress-invalid",
+            "terminal successor state is not authorized scan progress",
         ));
     }
     let terminal_state = cursor_recovery_progress_state_is_valid(&state, &validated, true)?
@@ -5020,7 +5121,14 @@ pub(crate) fn open_authorized_cursor_recovery_namespace_finalized(
     root: impl Into<String>,
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
 ) -> Result<(CloudFilesNamespaceReconciler, bool), CloudFilesNamespaceReconcileError> {
-    open_authorized_cursor_recovery_progress_inner(data_dir, mount.into(), root.into(), plan, true)
+    open_authorized_cursor_recovery_progress_inner(
+        data_dir,
+        mount.into(),
+        root.into(),
+        plan,
+        true,
+        None,
+    )
 }
 
 fn open_authorized_cursor_recovery_progress_inner(
@@ -5029,6 +5137,7 @@ fn open_authorized_cursor_recovery_progress_inner(
     root: String,
     plan: &CloudFilesCursorRecoveryReconciliationPlan,
     namespace_finalized: bool,
+    allowed_suppressions: Option<&BTreeMap<String, CloudFilesNamespaceSuppression>>,
 ) -> Result<(CloudFilesNamespaceReconciler, bool), CloudFilesNamespaceReconcileError> {
     if mount.trim().is_empty() {
         return Err(reconcile_error(
@@ -5132,6 +5241,7 @@ fn open_authorized_cursor_recovery_progress_inner(
             &state_bytes,
             plan,
             &manifest,
+            allowed_suppressions,
         )?
     };
     let require_terminal = if let Some(rewrite) = rewrite {
@@ -5147,7 +5257,12 @@ fn open_authorized_cursor_recovery_progress_inner(
     } else {
         true
     };
-    if !cursor_recovery_progress_state_is_valid(&state, &validated, require_terminal)? {
+    if !cursor_recovery_progress_state_is_valid_with_suppressions(
+        &state,
+        &validated,
+        require_terminal,
+        allowed_suppressions,
+    )? {
         return Err(reconcile_error(
             "cursor-recovery-progress-invalid",
             "recovery state did not evolve solely through the authoritative scan protocol",
@@ -5300,11 +5415,19 @@ fn cursor_recovery_progress_state_is_valid(
     plan: &ValidatedCursorRecoveryPlan,
     require_terminal: bool,
 ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+    cursor_recovery_progress_state_is_valid_with_suppressions(state, plan, require_terminal, None)
+}
+
+fn cursor_recovery_progress_state_is_valid_with_suppressions(
+    state: &CloudFilesNamespaceReconciliationState,
+    plan: &ValidatedCursorRecoveryPlan,
+    require_terminal: bool,
+    allowed_suppressions: Option<&BTreeMap<String, CloudFilesNamespaceSuppression>>,
+) -> Result<bool, CloudFilesNamespaceReconcileError> {
     if state.schema_version != RECONCILIATION_SCHEMA_VERSION
         || state.mount != plan.expected.mount
         || state.root != plan.expected.root
         || !state.legacy_manifest.is_empty()
-        || !state.suppressions.is_empty()
         || !state.conflicts.is_empty()
         || !state.startup_conflicts.is_empty()
         || !state.materialized_directories.contains(&state.root)
@@ -5312,6 +5435,19 @@ fn cursor_recovery_progress_state_is_valid(
         || !state.applied_events.is_empty()
     {
         return Ok(false);
+    }
+    if require_terminal && !state.suppressions.is_empty() {
+        return Ok(false);
+    }
+    for (operation_id, suppression) in &state.suppressions {
+        if operation_id != &suppression.operation_id
+            || suppression.operation_id.trim().is_empty()
+            || allowed_suppressions.and_then(|allowed| allowed.get(operation_id))
+                != Some(suppression)
+        {
+            return Ok(false);
+        }
+        validate_action(&suppression.expected_action, &state.root)?;
     }
     for directory in &state.materialized_directories {
         if canonical_sifs_path(directory)? != *directory {
@@ -7148,6 +7284,112 @@ mod tests {
         assert!(reopened.cursors().is_empty());
         assert!(reopened.full_scan_request().is_some());
         assert!(reopened.manifest().contains_key("/services/remote.txt"));
+    }
+
+    #[test]
+    fn retained_mutation_suppressions_reopen_only_with_exact_queue_authority() {
+        let fixture = cursor_recovery_fixture("recovery-retained-suppressions");
+        let mut reconciler = open_armed_cursor_recovery(&fixture);
+        let suppression = CloudFilesNamespaceSuppression {
+            operation_id: "operation-retained".to_string(),
+            expected_action: CloudFilesNamespaceAction::Upsert {
+                path: "/services/retained.txt".to_string(),
+                object_id: "object-retained".to_string(),
+                version: "version-retained".to_string(),
+                content_hash: Some("blake3:retained".to_string()),
+                content_size_bytes: Some(8),
+                kind: "file".to_string(),
+            },
+        };
+        reconciler
+            .record_local_application(suppression.clone())
+            .expect("persist retained mutation suppression");
+        drop(reconciler);
+
+        assert!(
+            acquire_authorized_cursor_recovery_terminal_successor(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .expect("classify retained pre-scan progress")
+            .is_none(),
+            "a retained pre-scan mutation is earlier progress, never terminal proof"
+        );
+        assert!(
+            open_authorized_cursor_recovery_progress(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+            )
+            .is_err(),
+            "namespace evidence alone must not authorize a retained suppression"
+        );
+
+        let allowed = BTreeMap::from([(suppression.operation_id.clone(), suppression.clone())]);
+        let reopened = open_authorized_cursor_recovery_progress_with_suppressions(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+            &allowed,
+        )
+        .expect("reopen with exact durable queue authority");
+        assert!(reopened.cursors().is_empty());
+        assert!(reopened.full_scan_request().is_some());
+        assert!(reopened.has_suppression(&suppression.operation_id));
+        drop(reopened);
+
+        let mut changed = suppression;
+        changed.expected_action = CloudFilesNamespaceAction::Remove {
+            path: "/services/retained.txt".to_string(),
+            object_id: "object-retained".to_string(),
+            version: "version-retained".to_string(),
+            content_hash: Some("blake3:retained".to_string()),
+        };
+        assert!(
+            open_authorized_cursor_recovery_progress_with_suppressions(
+                &fixture.root.data_dir(),
+                "mount-a",
+                "/services",
+                &fixture.plan,
+                &BTreeMap::from([(changed.operation_id.clone(), changed)]),
+            )
+            .is_err(),
+            "changed queue evidence must not authorize the durable suppression"
+        );
+
+        let mut reopened = open_authorized_cursor_recovery_progress_with_suppressions(
+            &fixture.root.data_dir(),
+            "mount-a",
+            "/services",
+            &fixture.plan,
+            &allowed,
+        )
+        .expect("reopen exact suppression for authoritative page");
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/retained.txt".to_string(),
+            object_id: "object-retained".to_string(),
+            version: "version-retained".to_string(),
+            content_hash: Some("blake3:retained".to_string()),
+            content_size_bytes: Some(8),
+            kind: "file".to_string(),
+        };
+        assert_eq!(
+            reopened
+                .install_full_scan_delta(
+                    BTreeMap::from([(entry.path.clone(), entry)]),
+                    Vec::new(),
+                    vec!["/services".to_string()],
+                    BTreeMap::new(),
+                    false,
+                )
+                .expect("consume retained suppression with authoritative page"),
+            vec!["operation-retained".to_string()]
+        );
+        assert!(!reopened.has_suppression("operation-retained"));
     }
 
     #[test]

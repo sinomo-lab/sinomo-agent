@@ -2103,6 +2103,46 @@ pub struct CloudFilesWritableSyncState {
     last_error: Option<CloudFilesModuleError>,
 }
 
+fn authorized_cursor_recovery_suppressions(
+    queue: &CloudFilesLocalChangeQueue,
+) -> Result<BTreeMap<String, CloudFilesNamespaceSuppression>, CloudFilesWindowsSyncError> {
+    let mut suppressions = BTreeMap::new();
+    for operation in queue.operations().filter(|operation| {
+        matches!(
+            operation.status,
+            CloudFilesLocalOperationStatus::Completed | CloudFilesLocalOperationStatus::Superseded
+        ) && operation.conflict.is_none()
+            && operation.last_error.is_none()
+    }) {
+        let Some(evidence) = operation.remote_evidence.as_ref() else {
+            continue;
+        };
+        let command = CloudFilesDfsMutationCommand {
+            operation_id: operation.request.operation_id.clone(),
+            request_digest: operation.request_digest.clone(),
+            kind: operation.request.kind.clone(),
+            source_path: operation.request.source_path.clone(),
+            destination_path: operation.request.destination_path.clone(),
+            preconditions: operation.request.preconditions.clone(),
+            // Completed and superseded records may have released their blobs.
+            // The no-echo proof depends only on immutable request metadata and
+            // authoritative remote evidence.
+            staged_content: None,
+        };
+        let suppression = suppression_for_completed_mutation(&command, evidence)?;
+        if suppressions
+            .insert(operation.request.operation_id.clone(), suppression)
+            .is_some()
+        {
+            return Err(sync_error(
+                "cursor-recovery-suppression-duplicate",
+                "two durable queue records name the same suppression operation ID",
+            ));
+        }
+    }
+    Ok(suppressions)
+}
+
 impl CloudFilesWritableSyncState {
     pub fn open(
         data_dir: &SinomoDataDir,
@@ -2151,13 +2191,16 @@ impl CloudFilesWritableSyncState {
             root.clone(),
         )
         .map_err(queue_error)?;
-        let reconciler = CloudFilesNamespaceReconciler::open_authorized_cursor_recovery(
-            data_dir,
-            mount.clone(),
-            root.clone(),
-            plan,
-        )
-        .map_err(reconcile_error)?;
+        let allowed_suppressions = authorized_cursor_recovery_suppressions(&queue)?;
+        let reconciler =
+            CloudFilesNamespaceReconciler::open_authorized_cursor_recovery_with_suppressions(
+                data_dir,
+                mount.clone(),
+                root.clone(),
+                plan,
+                &allowed_suppressions,
+            )
+            .map_err(reconcile_error)?;
         let materialization_audit_intents = Arc::new(Mutex::new(
             CloudFilesMaterializationAuditIntentStore::open(data_dir, mount.clone(), root.clone())
                 .map_err(reconcile_error)?,
@@ -6903,6 +6946,64 @@ mod tests {
         invalid.staged_content = None;
         assert!(adapter.apply(&invalid).is_err());
         assert_eq!(adapter.backend().calls.len(), kinds.len());
+    }
+
+    #[test]
+    fn cursor_recovery_suppressions_are_reconstructed_from_terminal_queue_evidence() {
+        let root = TestRoot::new("cursor-recovery-suppression-authority");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        let operation = state
+            .enqueue_capture(create_capture("capture-recovery-suppression", b"retained"))
+            .expect("enqueue retained mutation");
+        let operation_id = operation.request.operation_id.clone();
+        let evidence = CloudFilesRemoteMutationEvidence {
+            operation_id: operation_id.clone(),
+            object_id: Some("object-retained".to_string()),
+            version: Some("version-retained".to_string()),
+            content_hash: Some("blake3:retained".to_string()),
+            content_size_bytes: Some(8),
+            kind: Some("file".to_string()),
+            detail: "stable DFS mutation applied".to_string(),
+        };
+        state
+            .queue
+            .mark_remote_applied_with_evidence(evidence.clone())
+            .expect("mark remote applied");
+        state
+            .queue
+            .mark_completed(&operation_id)
+            .expect("mark completed");
+
+        let completed = authorized_cursor_recovery_suppressions(&state.queue)
+            .expect("derive completed suppression");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[&operation_id].operation_id, operation_id);
+
+        state
+            .queue
+            .retire_terminal_operation(&operation_id)
+            .expect("retain superseded queue evidence");
+        let superseded = authorized_cursor_recovery_suppressions(&state.queue)
+            .expect("derive superseded suppression");
+        assert_eq!(superseded, completed);
+        assert_eq!(
+            superseded[&operation_id].expected_action,
+            suppression_for_completed_mutation(
+                &CloudFilesDfsMutationCommand {
+                    operation_id: operation.request.operation_id,
+                    request_digest: operation.request_digest,
+                    kind: operation.request.kind,
+                    source_path: operation.request.source_path,
+                    destination_path: operation.request.destination_path,
+                    preconditions: operation.request.preconditions,
+                    staged_content: None,
+                },
+                &evidence,
+            )
+            .expect("derive expected suppression")
+            .expected_action
+        );
     }
 
     #[test]
