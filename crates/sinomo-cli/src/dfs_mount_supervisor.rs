@@ -3965,6 +3965,23 @@ fn recover_pending_cloud_unregister_from_staged_with(
     let registration_is_current =
         registration_request_matches_config(&record.recovery.request, config)?;
     let provider_is_current = active_module.is_none_or(|active| active == &record.recovery.module);
+    if registration_is_current
+        && !provider_is_current
+        && record.recovery.legacy_prejournal_origin.is_none()
+        && record.recovery.request.cursor_recovery.is_none()
+        && record.recovery.module.interface_version
+            == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
+    {
+        // A newly activated provider is an explicit replacement request, but
+        // it must never inherit an old provider's durable ownership by loader
+        // drift alone. Replay the exact old pinned provider's idempotent
+        // Release first. The Released response clears the old stage and pin;
+        // only a later supervisor turn may stage and mount the new provider.
+        // RetainedAbsent is already physically unregistered. MayBeRegistered
+        // is also safe here because Release re-proves CFAPI, receipt, and
+        // journal absence before the host discards the old authority.
+        return Ok(Some(record.recovery.clone()));
+    }
     if registration_is_current && (provider_is_current || !config.enabled) {
         if config.enabled {
             if record.state == StagedCloudRegistrationState::RetainedAbsent {
@@ -4006,6 +4023,58 @@ fn recover_pending_cloud_unregister_from_staged_with(
         record.recovery.request.root_path,
         record.recovery.module.content_hash
     ))
+}
+
+#[cfg(windows)]
+fn active_cloud_files_replacement_provider(
+    data_dir: &SinomoDataDir,
+    staged_provider: &CloudFilesModuleProvenance,
+) -> Result<Option<CloudFilesModuleProvenance>, String> {
+    use sinomo_runtime::dfs_cloud_files_api::{
+        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
+    };
+    use sinomo_runtime::module::{
+        ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
+    };
+
+    let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
+    let Some(active) = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
+        .map_err(|error| format!("read active Cloud Files replacement provider: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if active.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
+        return Err(format!(
+            "active Cloud Files replacement interface mismatch: expected {}, got {}",
+            SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, active.interface_version
+        ));
+    }
+    let provenance = CloudFilesModuleProvenance::from_loader_state(&active);
+    if &provenance == staged_provider {
+        return Ok(Some(provenance));
+    }
+    let library_path = native_module_cache_path(
+        &data_dir.root(),
+        &active.cache_key,
+        &active.content_hash,
+        &active.library_name,
+    );
+    let module = unsafe {
+        NativeModule::load_from_content_addressed_path(&library_path, &active.content_hash)
+    }
+    .map_err(|error| format!("load active Cloud Files replacement provider: {error}"))?;
+    admit_cloud_files_provider_before_effect_with(
+        &provenance,
+        module.descriptor(),
+        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
+        Some(SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY),
+        || Ok(()),
+    )?;
+    drop(module);
+    Ok(Some(provenance))
 }
 
 #[cfg(any(windows, test))]
@@ -4163,10 +4232,16 @@ fn recover_pending_cloud_unregister_from_staged(
                 &may_be_registered,
             )?;
         }
-        // A canonical v3 stage is the provider-selection authority for both
-        // enabled restart and disabled Preserve(None). Loader drift cannot
-        // replace it and a missing/tampered pin has no fallback.
-        return recover_pending_cloud_unregister_from_staged_with(data_dir, config, None);
+        // A canonical v3 stage remains the provider-selection authority until
+        // a different, fully validated active provider requests replacement.
+        // Replacement first invokes Release through the old pinned provider;
+        // there is no direct loader fallback or ownership substitution.
+        let active = active_cloud_files_replacement_provider(data_dir, &record.recovery.module)?;
+        return recover_pending_cloud_unregister_from_staged_with(
+            data_dir,
+            config,
+            active.as_ref(),
+        );
     }
     require_physically_absent(
         &cursor_recovery_staged_temp_path(data_dir),
@@ -8571,7 +8646,7 @@ fn complete_pending_cloud_unregister(
         ensure_cloud_unregister_recovery_module(data_dir, &pending.record.module)?;
     }
     let staged_snapshot = inspect_cursor_recovery_staged_record_snapshot(data_dir)?;
-    let staged = staged_snapshot.current.ok_or_else(|| {
+    let mut staged = staged_snapshot.current.ok_or_else(|| {
         "pending Cloud Files unregister has no authoritative staged ownership record".to_string()
     })?;
     if let Some(context) = pending.record.request.cursor_recovery.as_ref() {
@@ -8732,11 +8807,37 @@ fn complete_pending_cloud_unregister(
         if staged_snapshot.temporary.is_some() {
             persist_or_promote_cursor_recovery_staged_record(data_dir, &expected_stage)?;
         }
-    } else if staged_snapshot.temporary.is_some() {
-        return Err(
-            "ordinary pending unregister found cursor-recovery staged temporary evidence"
-                .to_string(),
-        );
+    } else {
+        if staged_snapshot.temporary.is_some() {
+            return Err(
+                "ordinary pending unregister found cursor-recovery staged temporary evidence"
+                    .to_string(),
+            );
+        }
+        let retained = staged_cloud_registration_record(
+            &pending.record,
+            StagedCloudRegistrationState::RetainedAbsent,
+        )?;
+        if staged == retained
+            && pending.record.operation
+                == sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+        {
+            // Provider rollout while quiescent persists the Release intent
+            // before changing RetainedAbsent. Replay that exact cut by moving
+            // to MayBeRegistered, then let the old pinned provider prove the
+            // registration/journal/receipt are absent. No new provider is
+            // loaded until Released clears this stage.
+            let may_be_registered = staged_cloud_registration_record(
+                &pending.record,
+                StagedCloudRegistrationState::MayBeRegistered,
+            )?;
+            transition_or_promote_cursor_recovery_staged_record(
+                data_dir,
+                &staged,
+                &may_be_registered,
+            )?;
+            staged = may_be_registered;
+        }
     }
     if finish_already_applied_retained_completion(data_dir, &pending.record, &staged)? {
         return Ok(());
@@ -11299,36 +11400,43 @@ mod tests {
     }
 
     #[test]
-    fn disabled_v3_cleanup_uses_pinned_stage_when_selected_loader_differs() {
-        let temp = TestDir::new("sifs-cloud-disabled-pinned-provider");
-        let data_dir = SinomoDataDir::new(temp.path().join("data"));
-        let mount_point = temp.path().join("mount");
-        std::fs::create_dir_all(&mount_point).expect("mount point");
-        let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
-        let staged = may_be_registered_stage(&recovery);
-        persist_staged_cloud_registration_record(&data_dir, &staged).expect("persist old stage");
-        let mut selected = recovery.module.clone();
-        selected.content_hash = "different-selected-v3-provider".to_string();
-        let mut disabled = windows_mount_config(&mount_point, "/root");
-        disabled.enabled = false;
+    fn provider_replacement_releases_pinned_stage_before_new_loader() {
+        for state in [
+            StagedCloudRegistrationState::MayBeRegistered,
+            StagedCloudRegistrationState::RetainedAbsent,
+        ] {
+            let temp = TestDir::new(&format!("sifs-cloud-provider-replacement-{state:?}"));
+            let data_dir = SinomoDataDir::new(temp.path().join("data"));
+            let mount_point = temp.path().join("mount");
+            std::fs::create_dir_all(&mount_point).expect("mount point");
+            let recovery = staged_record_fixture(&data_dir, &mount_point, "/root");
+            let staged =
+                staged_cloud_registration_record(&recovery, state).expect("old provider stage");
+            persist_staged_cloud_registration_record(&data_dir, &staged)
+                .expect("persist old stage");
+            let mut selected = recovery.module.clone();
+            selected.content_hash = "different-selected-v3-provider".to_string();
+            let config = windows_mount_config(&mount_point, "/root");
 
-        let pending = recover_pending_cloud_unregister_from_staged_with(
-            &data_dir,
-            &disabled,
-            Some(&selected),
-        )
-        .expect("pinned provider remains cleanup authority")
-        .expect("disabled stage requires cleanup");
+            let pending = recover_pending_cloud_unregister_from_staged_with(
+                &data_dir,
+                &config,
+                Some(&selected),
+            )
+            .expect("validated replacement requests old-provider release")
+            .expect("old provider release intent");
 
-        assert_eq!(pending.module, recovery.module);
-        assert_eq!(
-            pending.operation,
-            sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
-        );
-        assert_eq!(
-            load_staged_cloud_registration_record(&data_dir).expect("stage remains exact"),
-            Some(staged)
-        );
+            assert_eq!(pending, recovery);
+            assert_eq!(
+                pending.operation,
+                sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
+            );
+            assert_eq!(
+                load_staged_cloud_registration_record(&data_dir).expect("stage remains exact"),
+                Some(staged),
+                "the durable pending intent must precede any staged-state change"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -11458,7 +11566,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn ordinary_v3_stage_is_public_restart_and_mount_provider_authority_despite_loader_drift() {
+    fn ordinary_v3_stage_rejects_invalid_replacement_without_loader_fallback() {
         use sinomo_runtime::module::{
             NativeDylibModuleLoaderState, native_module_cache_path,
             write_native_dylib_module_loader_state,
@@ -11500,45 +11608,18 @@ mod tests {
         std::fs::write(&loader_path, loader_bytes).expect("drifted loader bytes");
 
         let config = windows_mount_config(&mount_point, "/root");
+        let error = recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+            .expect_err("invalid active replacement must fail before old-provider release");
         assert!(
-            recover_pending_cloud_unregister_from_staged(&data_dir, &config)
-                .expect("ordinary enabled restart bypasses loader drift")
-                .is_none()
+            error.contains("load active Cloud Files replacement provider"),
+            "replacement validation error: {error}"
         );
-        let pin = verify_cloud_unregister_recovery_module(&data_dir, &recovery.module)
-            .expect("ordinary staged provider pin");
-        let lease = SifsMountLease::try_acquire(&data_dir, "option B mount selector")
-            .expect("option B mount lease");
-        let error = match start_platform_mount(
-            &data_dir,
-            &config,
-            &mount_point,
-            Arc::new(AtomicBool::new(false)),
-            &Mutex::new(None),
-            lease,
-        ) {
-            Ok(mut mount) => {
-                let _ = mount.stop();
-                panic!("fake staged dylib unexpectedly mounted")
-            }
-            Err(error) => error,
-        };
-        assert!(
-            error.contains(&pin.display().to_string()),
-            "mount must try the authoritative staged pin: {error}"
+        assert_eq!(
+            load_staged_cloud_registration_record(&data_dir)
+                .expect("old staged provider remains authoritative"),
+            Some(stage)
         );
-        assert!(
-            !error.contains(&loader_path.display().to_string()),
-            "mount must not fall back to the drifted loader: {error}"
-        );
-
-        let mut disabled = config;
-        disabled.enabled = false;
-        let pending = recover_pending_cloud_unregister_from_staged(&data_dir, &disabled)
-            .expect("ordinary disabled restart bypasses loader drift")
-            .expect("disabled ordinary authority produces Preserve(None)");
-        assert_eq!(pending.module, recovery.module);
-        assert!(pending.request.cursor_recovery.is_none());
+        assert!(!pending_cloud_unregister_path(&data_dir).exists());
     }
 
     #[test]
