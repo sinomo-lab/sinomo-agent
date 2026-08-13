@@ -2697,19 +2697,6 @@ fn physical_directory_children(path: &Path) -> Result<Vec<OsString>, String> {
     })
 }
 
-fn validate_physically_empty_recovery_directory(
-    sifs_path: &str,
-    children: &[OsString],
-) -> Result<(), String> {
-    if let Some(name) = children.first() {
-        return Err(format!(
-            "recovery-root directory `{sifs_path}` contains physical child `{}`",
-            name.to_string_lossy()
-        ));
-    }
-    Ok(())
-}
-
 fn select_stale_cursor_recovery_sentinel(
     entries: &[PhysicalDirectoryEntryName],
     specs: &[CursorRecoverySentinelSpec],
@@ -2814,6 +2801,285 @@ fn verify_held_cursor_recovery_child(child: &CursorRecoveryHeldChild) -> Result<
     Ok(())
 }
 
+fn hash_cursor_recovery_file_handle(
+    handle: HANDLE,
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<CloudFilesStagedContent, String> {
+    unsafe { SetFilePointerEx(handle, 0, None, FILE_BEGIN) }
+        .map_err(|error| format!("rewind recovery-root file {}: {error}", path.display()))?;
+    let mut before = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut before) }.map_err(|error| {
+        format!(
+            "read initial recovery-root file identity {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    let mut length = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err("sync-cancelled".to_string());
+        }
+        let mut read = 0_u32;
+        unsafe { ReadFile(handle, Some(&mut buffer), Some(&mut read), None) }.map_err(|error| {
+            format!(
+                "hash recovery-root file {} through its retained handle: {error}",
+                path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        let read = read as usize;
+        length = length.checked_add(read as u64).ok_or_else(|| {
+            format!(
+                "recovery-root file length overflowed u64 while hashing {}",
+                path.display()
+            )
+        })?;
+        hasher.update(&buffer[..read]);
+    }
+    let mut after = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle, &mut after) }.map_err(|error| {
+        format!(
+            "read final recovery-root file identity {}: {error}",
+            path.display()
+        )
+    })?;
+    if stable_file_information(&before) != stable_file_information(&after)
+        || length != file_size(&after)
+    {
+        return Err(format!(
+            "recovery-root file {} changed while its authoritative bytes were verified",
+            path.display()
+        ));
+    }
+    Ok(CloudFilesStagedContent {
+        content_hash: format!("blake3:{}", hasher.finalize().to_hex()),
+        length,
+    })
+}
+
+fn cursor_recovery_authoritative_entry<'a>(
+    root: &str,
+    relative: &Path,
+    remote_manifest: &'a BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) -> Result<(String, &'a CloudFilesReconciledManifestEntry), String> {
+    let sifs_path = local_relative_to_sifs(root, relative)?;
+    let authoritative = remote_manifest.get(&sifs_path).ok_or_else(|| {
+        format!(
+            "recovery root contains local child `{sifs_path}` without an authoritative projectable identity"
+        )
+    })?;
+    if !matches!(authoritative.kind.as_str(), "file" | "directory" | "mount") {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` has unsupported authoritative kind `{}`",
+            authoritative.kind
+        ));
+    }
+    Ok((sifs_path, authoritative))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_cursor_recovery_entry(
+    sync_root: &Path,
+    relative: &Path,
+    mount: &str,
+    root: &str,
+    expected_sync_root_file_id: u64,
+    remote_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    cancelled: &AtomicBool,
+    handles: &mut Vec<CursorRecoveryHeldChild>,
+) -> Result<String, String> {
+    if cancelled.load(Ordering::SeqCst) {
+        return Err("sync-cancelled".to_string());
+    }
+    let (sifs_path, authoritative) =
+        cursor_recovery_authoritative_entry(root, relative, remote_manifest)?;
+    let authoritative_is_directory = matches!(authoritative.kind.as_str(), "directory" | "mount");
+    let child_path = sync_root.join(relative);
+    let child_wide = wide_path(&child_path);
+    let desired_access = if authoritative_is_directory {
+        FILE_READ_ATTRIBUTES.0 | FILE_LIST_DIRECTORY.0 | FILE_WRITE_DATA.0
+    } else {
+        GENERIC_READ.0 | FILE_WRITE_DATA.0
+    };
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if authoritative_is_directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            Default::default()
+        };
+    let handle = unsafe {
+        CreateFileW(
+            PCWSTR(child_wide.as_ptr()),
+            desired_access,
+            // Existing writers make this open fail, and new write/delete
+            // handles cannot open until the audit guard is released.
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            flags,
+            None,
+        )
+    }
+    .map(OwnedWin32Handle)
+    .map_err(|error| {
+        format!(
+            "open recovery-root child fence {}: {error}",
+            child_path.display()
+        )
+    })?;
+    let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut handle_info) }.map_err(|error| {
+        format!(
+            "read recovery-root child metadata {}: {error}",
+            child_path.display()
+        )
+    })?;
+    let is_directory = handle_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+    if is_directory != authoritative_is_directory {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` has the wrong local object kind"
+        ));
+    }
+
+    let mut placeholder = query_placeholder_state_handle(handle.0, &child_path)?;
+    if placeholder.is_none() {
+        if handle_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(format!(
+                "recovery-root child `{sifs_path}` is an unowned reparse point"
+            ));
+        }
+        if is_directory {
+            for name in physical_directory_children(&child_path)? {
+                let name = name.to_str().ok_or_else(|| {
+                    format!("recovery directory `{sifs_path}` contains a non-Unicode child")
+                })?;
+                audit_cursor_recovery_entry(
+                    sync_root,
+                    &relative.join(name),
+                    mount,
+                    root,
+                    expected_sync_root_file_id,
+                    remote_manifest,
+                    cancelled,
+                    handles,
+                )?;
+            }
+        } else {
+            let observed = hash_cursor_recovery_file_handle(handle.0, &child_path, cancelled)?;
+            if !staged_content_matches_manifest_entry(&observed, authoritative) {
+                return Err(format!(
+                    "ordinary recovery-root file `{sifs_path}` does not match its authoritative content"
+                ));
+            }
+        }
+        let identity = CloudFilesPlaceholderIdentity::new(
+            mount,
+            root,
+            &authoritative.path,
+            &authoritative.object_id,
+            &authoritative.version,
+            authoritative.content_hash.clone(),
+        );
+        let identity_bytes =
+            encode_placeholder_identity(&identity).map_err(|error| error.to_string())?;
+        unsafe {
+            CfConvertToPlaceholder(
+                handle.0,
+                Some(identity_bytes.as_ptr().cast::<c_void>()),
+                identity_bytes.len() as u32,
+                CF_CONVERT_FLAG_MARK_IN_SYNC,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| {
+            format!(
+                "adopt authoritative recovery-root child `{sifs_path}` as a placeholder: {error}"
+            )
+        })?;
+        placeholder = query_placeholder_state_handle(handle.0, &child_path)?;
+    } else if is_directory {
+        for name in physical_directory_children(&child_path)? {
+            let name = name.to_str().ok_or_else(|| {
+                format!("recovery directory `{sifs_path}` contains a non-Unicode child")
+            })?;
+            audit_cursor_recovery_entry(
+                sync_root,
+                &relative.join(name),
+                mount,
+                root,
+                expected_sync_root_file_id,
+                remote_manifest,
+                cancelled,
+                handles,
+            )?;
+        }
+    }
+
+    let placeholder = placeholder.ok_or_else(|| {
+        format!("recovery-root child `{sifs_path}` is not a Cloud Files placeholder")
+    })?;
+    if !placeholder.in_sync {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` is not marked in sync"
+        ));
+    }
+    if placeholder.modified_data_size != 0 {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` has {} modified bytes",
+            placeholder.modified_data_size
+        ));
+    }
+    let handle_file_id =
+        ((handle_info.nFileIndexHigh as u64) << 32) | handle_info.nFileIndexLow as u64;
+    if placeholder.file_id != handle_file_id {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` CFAPI file ID does not match its held handle"
+        ));
+    }
+    if placeholder.sync_root_file_id != expected_sync_root_file_id {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` belongs to sync-root file ID {}, expected {}",
+            placeholder.sync_root_file_id, expected_sync_root_file_id
+        ));
+    }
+    let identity = placeholder.identity.ok_or_else(|| {
+        format!("recovery-root child `{sifs_path}` has no current versioned placeholder identity")
+    })?;
+    if identity.mount != mount
+        || identity.root != root
+        || !identity_matches_manifest(&identity, authoritative)
+    {
+        return Err(format!(
+            "recovery-root child `{sifs_path}` does not match its authoritative placeholder identity"
+        ));
+    }
+    if !is_directory {
+        let logical_size =
+            ((handle_info.nFileSizeHigh as u64) << 32) | handle_info.nFileSizeLow as u64;
+        let expected_size = authoritative.content_size_bytes.ok_or_else(|| {
+            format!("authoritative recovery-root file `{sifs_path}` has no exact logical size")
+        })?;
+        if logical_size != expected_size {
+            return Err(format!(
+                "recovery-root file `{sifs_path}` logical size {logical_size} does not match authoritative size {expected_size}"
+            ));
+        }
+    }
+    handles.push(CursorRecoveryHeldChild {
+        handle,
+        sifs_path: sifs_path.clone(),
+        is_directory,
+        file_id: handle_file_id,
+    });
+    Ok(sifs_path)
+}
+
 fn audit_cursor_recovery_root(
     sync_root: &Path,
     mount: &str,
@@ -2829,7 +3095,7 @@ fn audit_cursor_recovery_root(
         .map(|entry| (entry.path.clone(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut observed = BTreeSet::new();
-    let mut handles = Vec::with_capacity(expected.len());
+    let mut handles = Vec::with_capacity(remote_manifest.len());
     for name in physical_directory_children(sync_root)? {
         if cancelled.load(Ordering::SeqCst) {
             return Err("sync-cancelled".to_string());
@@ -2840,125 +3106,17 @@ fn audit_cursor_recovery_root(
                 sync_root.display()
             )
         })?;
-        let sifs_path = local_relative_to_sifs(root, Path::new(name))?;
-        let authoritative = expected.get(&sifs_path).ok_or_else(|| {
-            format!(
-                "recovery root contains local child `{sifs_path}` without an authoritative projectable identity"
-            )
-        })?;
-        let authoritative_is_directory =
-            matches!(authoritative.kind.as_str(), "directory" | "mount");
-        let child_path = sync_root.join(name);
-        let child_wide = wide_path(&child_path);
-        let desired_access = FILE_READ_ATTRIBUTES.0
-            | if authoritative_is_directory {
-                FILE_LIST_DIRECTORY.0
-            } else {
-                0
-            };
-        let flags = FILE_FLAG_OPEN_REPARSE_POINT
-            | if authoritative_is_directory {
-                FILE_FLAG_BACKUP_SEMANTICS
-            } else {
-                Default::default()
-            };
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(child_wide.as_ptr()),
-                desired_access,
-                // Existing writers make this open fail, and new write/delete
-                // handles cannot open until the audit guard is released.
-                FILE_SHARE_READ,
-                None,
-                OPEN_EXISTING,
-                flags,
-                None,
-            )
-        }
-        .map(OwnedWin32Handle)
-        .map_err(|error| {
-            format!(
-                "open recovery-root child fence {}: {error}",
-                child_path.display()
-            )
-        })?;
-        let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
-        unsafe { GetFileInformationByHandle(handle.0, &mut handle_info) }.map_err(|error| {
-            format!(
-                "read recovery-root child metadata {}: {error}",
-                child_path.display()
-            )
-        })?;
-        let is_directory = handle_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
-        if is_directory != authoritative_is_directory {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` has the wrong local object kind"
-            ));
-        }
-        let Some(placeholder) = query_placeholder_state_handle(handle.0, &child_path)? else {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` is not a Cloud Files placeholder"
-            ));
-        };
-        if !placeholder.in_sync {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` is not marked in sync"
-            ));
-        }
-        if placeholder.modified_data_size != 0 {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` has {} modified bytes",
-                placeholder.modified_data_size
-            ));
-        }
-        let handle_file_id =
-            ((handle_info.nFileIndexHigh as u64) << 32) | handle_info.nFileIndexLow as u64;
-        if placeholder.file_id != handle_file_id {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` CFAPI file ID does not match its held handle"
-            ));
-        }
-        if placeholder.sync_root_file_id != expected_sync_root_file_id {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` belongs to sync-root file ID {}, expected {}",
-                placeholder.sync_root_file_id, expected_sync_root_file_id
-            ));
-        }
-        let identity = placeholder.identity.ok_or_else(|| {
-            format!(
-                "recovery-root child `{sifs_path}` has no current versioned placeholder identity"
-            )
-        })?;
-        if identity.mount != mount
-            || identity.root != root
-            || !identity_matches_manifest(&identity, authoritative)
-        {
-            return Err(format!(
-                "recovery-root child `{sifs_path}` does not match its authoritative placeholder identity"
-            ));
-        }
-        if is_directory {
-            let nested = physical_directory_children(&child_path)?;
-            validate_physically_empty_recovery_directory(&sifs_path, &nested)?;
-        } else {
-            let logical_size =
-                ((handle_info.nFileSizeHigh as u64) << 32) | handle_info.nFileSizeLow as u64;
-            let expected_size = authoritative.content_size_bytes.ok_or_else(|| {
-                format!("authoritative recovery-root file `{sifs_path}` has no exact logical size")
-            })?;
-            if logical_size != expected_size {
-                return Err(format!(
-                    "recovery-root file `{sifs_path}` logical size {logical_size} does not match authoritative size {expected_size}"
-                ));
-            }
-        }
-        observed.insert(sifs_path.clone());
-        handles.push(CursorRecoveryHeldChild {
-            handle,
-            sifs_path,
-            is_directory,
-            file_id: handle_file_id,
-        });
+        let sifs_path = audit_cursor_recovery_entry(
+            sync_root,
+            Path::new(name),
+            mount,
+            root,
+            expected_sync_root_file_id,
+            remote_manifest,
+            cancelled,
+            &mut handles,
+        )?;
+        observed.insert(sifs_path);
     }
     if let Some(missing) = expected.keys().find(|path| !observed.contains(*path)) {
         return Err(format!(
@@ -5121,14 +5279,42 @@ mod tests {
     }
 
     #[test]
-    fn recovery_directory_audit_requires_physical_emptiness() {
-        assert!(validate_physically_empty_recovery_directory("/root/empty", &[]).is_ok());
-        assert!(
-            validate_physically_empty_recovery_directory(
-                "/root/nonempty",
-                &[OsString::from("nested-placeholder")],
+    fn recovery_tree_audit_accepts_only_authoritative_projectable_descendants() {
+        let file = CloudFilesReconciledManifestEntry {
+            path: "/root/materialized/nested.txt".to_string(),
+            object_id: "object-a".to_string(),
+            version: "version-a".to_string(),
+            content_hash: Some("blake3:abc".to_string()),
+            content_size_bytes: Some(3),
+            kind: "file".to_string(),
+        };
+        let unsupported = CloudFilesReconciledManifestEntry {
+            path: "/root/link".to_string(),
+            object_id: "object-b".to_string(),
+            version: "version-b".to_string(),
+            content_hash: None,
+            content_size_bytes: None,
+            kind: "symlink".to_string(),
+        };
+        let manifest = BTreeMap::from([
+            (file.path.clone(), file.clone()),
+            (unsupported.path.clone(), unsupported),
+        ]);
+        assert_eq!(
+            cursor_recovery_authoritative_entry(
+                "/root",
+                Path::new("materialized/nested.txt"),
+                &manifest,
             )
-            .is_err()
+            .expect("accept nested authoritative file"),
+            (file.path.clone(), &file),
+        );
+        assert!(
+            cursor_recovery_authoritative_entry("/root", Path::new("extra.txt"), &manifest)
+                .is_err()
+        );
+        assert!(
+            cursor_recovery_authoritative_entry("/root", Path::new("link"), &manifest).is_err()
         );
     }
 }
