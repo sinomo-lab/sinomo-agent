@@ -30,9 +30,9 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Storage::CloudFilters::{
     CF_CONVERT_FLAG_MARK_IN_SYNC, CF_CONVERT_FLAG_NONE, CF_IN_SYNC_STATE_IN_SYNC,
-    CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO, CF_UPDATE_FLAG_DEHYDRATE,
-    CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_NONE, CfConvertToPlaceholder, CfGetPlaceholderInfo,
-    CfUpdatePlaceholder,
+    CF_OPEN_FILE_FLAG_NONE, CF_PLACEHOLDER_INFO_STANDARD, CF_PLACEHOLDER_STANDARD_INFO,
+    CF_UPDATE_FLAG_DEHYDRATE, CF_UPDATE_FLAG_MARK_IN_SYNC, CF_UPDATE_FLAG_NONE, CfCloseHandle,
+    CfConvertToPlaceholder, CfGetPlaceholderInfo, CfOpenFileWithOplock, CfUpdatePlaceholder,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, DELETE, FILE_ACTION_ADDED,
@@ -617,6 +617,16 @@ impl Drop for OwnedFindHandle {
     fn drop(&mut self) {
         unsafe {
             let _ = FindClose(self.0);
+        }
+    }
+}
+
+struct OwnedCloudFilesHandle(HANDLE);
+
+impl Drop for OwnedCloudFilesHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CfCloseHandle(self.0);
         }
     }
 }
@@ -3636,30 +3646,28 @@ fn query_placeholder_state(
     path: &Path,
 ) -> Result<Option<(bool, Option<CloudFilesPlaceholderIdentity>)>, String> {
     let wide = wide_path(path);
-    // BACKUP_SEMANTICS permits directory handles and is harmless for files;
-    // OPEN_REPARSE_POINT ensures Cloud placeholders are inspected without
-    // triggering hydration or an invalid filter-manager name reopen.
-    let flags = FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS;
-    let handle = match unsafe {
-        CreateFileW(
-            PCWSTR(wide.as_ptr()),
-            FILE_READ_ATTRIBUTES.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            flags,
-            None,
-        )
-    } {
-        Ok(handle) => OwnedWin32Handle(handle),
-        Err(error)
-            if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
-                || error.code() == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(format!("open placeholder {}: {error}", path.display())),
-    };
+    // A projected directory can exist in the Cloud Files namespace without a
+    // normal NTFS name-open being available yet. CreateFileW then fails with
+    // ERROR_CLOUD_FILE_INVALID_REQUEST even when OPEN_REPARSE_POINT is used.
+    // The provider API's protected opener is defined for both normal and
+    // placeholder files/directories and does not turn this metadata probe into
+    // a foreground hydration or reparse-point open.
+    let handle =
+        match unsafe { CfOpenFileWithOplock(PCWSTR(wide.as_ptr()), CF_OPEN_FILE_FLAG_NONE) } {
+            Ok(handle) => OwnedCloudFilesHandle(handle),
+            Err(error)
+                if error.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+                    || error.code() == HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(format!(
+                    "open placeholder {} through Cloud Files: {error}",
+                    path.display()
+                ));
+            }
+        };
     let state = query_placeholder_state_handle(handle.0, path)?;
     Ok(state.map(|state| (state.in_sync, state.identity)))
 }
