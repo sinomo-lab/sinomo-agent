@@ -4219,58 +4219,6 @@ fn recover_pending_cloud_unregister_from_staged_with(
     ))
 }
 
-#[cfg(windows)]
-fn active_cloud_files_replacement_provider(
-    data_dir: &SinomoDataDir,
-    staged_provider: &CloudFilesModuleProvenance,
-) -> Result<Option<CloudFilesModuleProvenance>, String> {
-    use sinomo_runtime::dfs_cloud_files_api::{
-        SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-        SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY,
-    };
-    use sinomo_runtime::module::{
-        ModuleId, NativeModule, native_module_cache_path, read_native_dylib_module_loader_state,
-    };
-
-    let module_id = ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
-        .map_err(|error| format!("invalid Cloud Files module id: {error}"))?;
-    let Some(active) = read_native_dylib_module_loader_state(&data_dir.root(), &module_id)
-        .map_err(|error| format!("read active Cloud Files replacement provider: {error}"))?
-    else {
-        return Ok(None);
-    };
-    if active.interface_version != SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION {
-        return Err(format!(
-            "active Cloud Files replacement interface mismatch: expected {}, got {}",
-            SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION, active.interface_version
-        ));
-    }
-    let provenance = CloudFilesModuleProvenance::from_loader_state(&active);
-    if &provenance == staged_provider {
-        return Ok(Some(provenance));
-    }
-    let library_path = native_module_cache_path(
-        &data_dir.root(),
-        &active.cache_key,
-        &active.content_hash,
-        &active.library_name,
-    );
-    let module = unsafe {
-        NativeModule::load_from_content_addressed_path(&library_path, &active.content_hash)
-    }
-    .map_err(|error| format!("load active Cloud Files replacement provider: {error}"))?;
-    admit_cloud_files_provider_before_effect_with(
-        &provenance,
-        module.descriptor(),
-        SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION,
-        Some(SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_CAPABILITY),
-        || Ok(()),
-    )?;
-    drop(module);
-    Ok(Some(provenance))
-}
-
 #[cfg(any(windows, test))]
 fn legacy_staged_provider_upgrade_record(
     record: &StagedCloudRegistrationRecord,
@@ -4426,16 +4374,12 @@ fn recover_pending_cloud_unregister_from_staged(
                 &may_be_registered,
             )?;
         }
-        // A canonical v3 stage remains the provider-selection authority until
-        // a different, fully validated active provider requests replacement.
-        // Replacement first invokes Release through the old pinned provider;
-        // there is no direct loader fallback or ownership substitution.
-        let active = active_cloud_files_replacement_provider(data_dir, &record.recovery.module)?;
-        return recover_pending_cloud_unregister_from_staged_with(
-            data_dir,
-            config,
-            active.as_ref(),
-        );
+        // A canonical ordinary v3 stage is the provider-selection authority.
+        // Loader drift alone is not a replacement request: use the verified
+        // pinned provider until this owned registration is explicitly retired.
+        // In particular, do not Release the sync root merely because rollout
+        // activated a newer loader while the staged provider was still alive.
+        return recover_pending_cloud_unregister_from_staged_with(data_dir, config, None);
     }
     require_physically_absent(
         &cursor_recovery_staged_temp_path(data_dir),
@@ -11967,7 +11911,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn ordinary_v3_stage_rejects_invalid_replacement_without_loader_fallback() {
+    fn ordinary_v3_stage_ignores_loader_drift_without_releasing_owned_registration() {
         use sinomo_runtime::module::{
             NativeDylibModuleLoaderState, native_module_cache_path,
             write_native_dylib_module_loader_state,
@@ -12009,12 +11953,9 @@ mod tests {
         std::fs::write(&loader_path, loader_bytes).expect("drifted loader bytes");
 
         let config = windows_mount_config(&mount_point, "/root");
-        let error = recover_pending_cloud_unregister_from_staged(&data_dir, &config)
-            .expect_err("invalid active replacement must fail before old-provider release");
-        assert!(
-            error.contains("load active Cloud Files replacement provider"),
-            "replacement validation error: {error}"
-        );
+        let pending = recover_pending_cloud_unregister_from_staged(&data_dir, &config)
+            .expect("loader drift must not replace staged provider authority");
+        assert!(pending.is_none());
         assert_eq!(
             load_staged_cloud_registration_record(&data_dir)
                 .expect("old staged provider remains authoritative"),
