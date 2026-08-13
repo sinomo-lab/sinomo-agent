@@ -2183,7 +2183,13 @@ impl WindowsLocalStartupScanPlan {
                     work += 1;
                     let entry =
                         entry.map_err(|error| format!("read local directory entry: {error}"))?;
-                    let path = entry.path();
+                    // `std::fs::ReadDir` can retain the trailing separator from
+                    // the Win32 enumeration root when it reconstructs an entry
+                    // path. Cloud Files rejects such paths (for example,
+                    // `D:\\sinomo\\\\users`) even though ordinary NTFS APIs
+                    // commonly accept them. Rebuild the physical path from its
+                    // components before it crosses any Cloud Files boundary.
+                    let path = normalize_enumerated_local_path(&entry.path())?;
                     let relative = path
                         .strip_prefix(sync_root)
                         .map_err(|_| format!("{} escaped the sync root", path.display()))?
@@ -3581,6 +3587,19 @@ fn local_relative_to_sifs(root_path: &str, relative: &Path) -> Result<String, St
     Ok(result)
 }
 
+fn normalize_enumerated_local_path(path: &Path) -> Result<PathBuf, String> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(format!(
+            "enumerated local path {} contains a parent component",
+            path.display()
+        ));
+    }
+    Ok(path.components().collect())
+}
+
 fn sifs_to_local(sync_root: &Path, root_path: &str, path: &str) -> Result<PathBuf, String> {
     let root = normalize_sifs_root(root_path).map_err(|error| error.to_string())?;
     let path = normalize_sifs_root(path).map_err(|error| error.to_string())?;
@@ -4712,6 +4731,15 @@ mod tests {
             record.extend_from_slice(&unit.to_le_bytes());
         }
         record
+    }
+
+    #[test]
+    fn enumerated_local_path_collapses_redundant_windows_separators() {
+        assert_eq!(
+            normalize_enumerated_local_path(Path::new(r"D:\sinomo\\users"))
+                .expect("normalize enumerated path"),
+            PathBuf::from(r"D:\sinomo\users")
+        );
     }
 
     #[test]
