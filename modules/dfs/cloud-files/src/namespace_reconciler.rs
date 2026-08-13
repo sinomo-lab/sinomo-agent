@@ -993,7 +993,7 @@ fn inspect_authorized_cursor_recovery_cut(
                 saw_lock = true;
             }
             MANIFEST_DIR if metadata.file_type().is_dir() => {
-                inspect_empty_cursor_recovery_manifest(&path, &mut raw_files)?;
+                inspect_cursor_recovery_manifest(&path, &mut raw_files)?;
                 saw_manifest = true;
             }
             CURSOR_RECOVERY_REWRITE_FILE if metadata.file_type().is_file() => {
@@ -4552,7 +4552,7 @@ pub(crate) fn inspect_cursor_only_reconciliation_state(
                 saw_materialization_audit = true;
             }
             MANIFEST_DIR if metadata.file_type().is_dir() => {
-                inspect_empty_cursor_recovery_manifest(&path, &mut raw_files)?;
+                inspect_cursor_recovery_manifest(&path, &mut raw_files)?;
                 saw_manifest = true;
             }
             _ => {
@@ -5482,96 +5482,36 @@ fn resume_terminal_rewrite_stage(
     Ok(terminal)
 }
 
-fn inspect_empty_cursor_recovery_manifest(
+fn inspect_cursor_recovery_manifest(
     manifest_dir: &Path,
     raw_files: &mut BTreeMap<String, Vec<u8>>,
 ) -> Result<(), CloudFilesNamespaceReconcileError> {
-    let metadata = fs::symlink_metadata(manifest_dir)
-        .map_err(io_error("inspect cursor-only manifest directory"))?;
-    if !metadata.file_type().is_dir() || metadata_is_reparse(&metadata) {
-        return Err(reconcile_error(
+    let reconciliation_dir = manifest_dir.parent().ok_or_else(|| {
+        reconcile_error(
             "cursor-recovery-manifest-topology",
-            "manifest path is not a plain directory",
-        ));
+            "manifest directory has no reconciliation owner",
+        )
+    })?;
+    let (store, _) =
+        CloudFilesManifestStore::open_authorized_cursor_recovery_terminal(reconciliation_dir)?;
+    let mut expected = BTreeMap::from([
+        (MANIFEST_INDEX_FILE.to_string(), MANIFEST_INDEX_MAX_BYTES),
+        (
+            MANIFEST_JOURNAL_FILE.to_string(),
+            MANIFEST_JOURNAL_MAX_BYTES,
+        ),
+    ]);
+    for reference in &store.index.chunks {
+        expected.insert(reference.file_name.clone(), MANIFEST_CHUNK_MAX_BYTES as u64);
     }
-    let mut saw_index = false;
-    let mut saw_journal = false;
-    for entry in fs::read_dir(manifest_dir).map_err(io_error("list cursor-only manifest"))? {
-        let entry = entry.map_err(io_error("read cursor-only manifest entry"))?;
-        let path = entry.path();
-        let name = entry.file_name().into_string().map_err(|_| {
-            reconcile_error(
-                "cursor-recovery-manifest-topology",
-                "manifest contains a non-UTF-8 entry",
-            )
-        })?;
-        let metadata =
-            fs::symlink_metadata(&path).map_err(io_error("inspect cursor-only manifest entry"))?;
-        if !metadata.file_type().is_file() || metadata_is_reparse(&metadata) {
-            return Err(reconcile_error(
-                "cursor-recovery-manifest-topology",
-                format!("manifest entry `{name}` is not a plain file"),
-            ));
-        }
-        match name.as_str() {
-            MANIFEST_INDEX_FILE => {
-                if metadata.len() > MANIFEST_INDEX_MAX_BYTES {
-                    return Err(reconcile_error(
-                        "cursor-recovery-manifest-too-large",
-                        "manifest index exceeds its recovery bound",
-                    ));
-                }
-                let bytes = fs::read(&path).map_err(io_error("read cursor-only manifest index"))?;
-                let index: CloudFilesManifestIndex = decode_sobj(&bytes).map_err(|source| {
-                    reconcile_error("decode-manifest-index", source.to_string())
-                })?;
-                if index.schema_version != MANIFEST_SCHEMA_VERSION
-                    || index.generation != 1
-                    || index.applied_through_sequence != 0
-                    || !index.chunks.is_empty()
-                    || encode_sobj(&index).map_err(|source| {
-                        reconcile_error("encode-manifest-index", source.to_string())
-                    })? != bytes
-                {
-                    return Err(reconcile_error(
-                        "cursor-recovery-manifest-not-empty",
-                        "manifest index is nonempty or noncanonical",
-                    ));
-                }
-                raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
-                saw_index = true;
-            }
-            MANIFEST_JOURNAL_FILE => {
-                if metadata.len() > MANIFEST_JOURNAL_MAX_BYTES {
-                    return Err(reconcile_error(
-                        "cursor-recovery-manifest-too-large",
-                        "manifest journal exceeds its owner bound",
-                    ));
-                }
-                let bytes =
-                    fs::read(&path).map_err(io_error("read cursor-only manifest journal"))?;
-                if !bytes.is_empty() {
-                    return Err(reconcile_error(
-                        "cursor-recovery-manifest-not-empty",
-                        "manifest journal contains retained history",
-                    ));
-                }
-                raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
-                saw_journal = true;
-            }
-            _ => {
-                return Err(reconcile_error(
-                    "cursor-recovery-manifest-not-empty",
-                    format!("manifest contains history, temporary, or unknown entry `{name}`"),
-                ));
-            }
-        }
-    }
-    if !saw_index || !saw_journal {
-        return Err(reconcile_error(
-            "cursor-recovery-manifest-topology",
-            "manifest is missing its canonical empty index or journal",
-        ));
+    drop(store);
+    for (name, max_bytes) in expected {
+        let bytes = read_bounded_plain_file(
+            &manifest_dir.join(&name),
+            max_bytes,
+            "cursor-recovery manifest owner file",
+        )?;
+        raw_files.insert(format!("{MANIFEST_DIR}/{name}"), bytes);
     }
     Ok(())
 }
@@ -6435,6 +6375,88 @@ mod tests {
             .expect("build recovery plan");
         drop(guard);
         CursorRecoveryFixture { root, scope, plan }
+    }
+
+    #[test]
+    fn cursor_recovery_inspection_retains_strict_manifest_history() {
+        let root = TestRoot::new("recovery-manifest-history");
+        let mut reconciler = open_reconciler(&root);
+        let scope = reconciler
+            .state_path()
+            .parent()
+            .expect("reconciliation scope")
+            .to_path_buf();
+        let boundary = cursor(41);
+        reconciler
+            .state
+            .cursors
+            .insert(boundary.shard_key().expect("shard key"), boundary);
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/retained.txt".to_string(),
+            object_id: "retained-object".to_string(),
+            version: "retained-version".to_string(),
+            content_hash: Some("blake3:retained".to_string()),
+            content_size_bytes: Some(8),
+            kind: "file".to_string(),
+        };
+        reconciler
+            .manifest
+            .insert(entry.path.clone(), entry.clone());
+        reconciler
+            .manifest_store
+            .append_mutations(
+                vec![CloudFilesManifestMutation::Upsert { entry }],
+                &reconciler.manifest,
+            )
+            .expect("append retained manifest history");
+        reconciler.persist().expect("persist cursor-only state");
+        drop(reconciler);
+        drop(
+            CloudFilesMaterializationAuditIntentStore::open(
+                &root.data_dir(),
+                "mount-a",
+                "/services",
+            )
+            .expect("create empty audit state"),
+        );
+
+        let journal_path = scope.join(MANIFEST_DIR).join(MANIFEST_JOURNAL_FILE);
+        let journal_before = fs::read(&journal_path).expect("read retained manifest journal");
+        assert!(!journal_before.is_empty());
+        let guard =
+            inspect_cursor_only_reconciliation_state(&root.data_dir(), "mount-a", "/services")
+                .expect("inspect cursor state with retained manifest history");
+        assert_eq!(
+            guard
+                .inspection()
+                .raw_files
+                .get(&format!("{MANIFEST_DIR}/{MANIFEST_JOURNAL_FILE}")),
+            Some(&journal_before),
+            "the recovery token must bind the exact retained manifest journal"
+        );
+        drop(guard);
+        assert_eq!(
+            fs::read(&journal_path).expect("reread retained manifest journal"),
+            journal_before,
+            "strict inspection must not repair or compact retained history"
+        );
+
+        let unexpected = scope.join(MANIFEST_DIR).join("unexpected-history");
+        fs::write(&unexpected, b"retained-unknown-evidence")
+            .expect("write unexpected manifest evidence");
+        assert!(
+            inspect_cursor_only_reconciliation_state(&root.data_dir(), "mount-a", "/services")
+                .is_err(),
+            "unknown manifest evidence must fail closed"
+        );
+        assert_eq!(
+            fs::read(&unexpected).expect("retain unexpected manifest evidence"),
+            b"retained-unknown-evidence"
+        );
+        assert_eq!(
+            fs::read(&journal_path).expect("retain manifest journal after rejection"),
+            journal_before
+        );
     }
 
     fn persist_armed_rewrite(fixture: &CursorRecoveryFixture) {
