@@ -3507,7 +3507,12 @@ async fn handle_daemon_authenticated_transport_stream_async(
         state: &state,
         directory: &directory,
     };
-    let routed_pool_scope = state.cluster_id.to_string();
+    let routed_pool_scopes =
+        sinomo_core::network::cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
+            &state,
+        )?
+        .into_iter()
+        .collect::<Vec<_>>();
     match sinomo_core::network::accept_or_relay_routed_session(
         direct_stream,
         &directory,
@@ -3532,7 +3537,7 @@ async fn handle_daemon_authenticated_transport_stream_async(
                 paths,
                 service_host,
                 service_runtime,
-                routed_pool_scope,
+                routed_pool_scopes,
             )
             .await
         }
@@ -3559,15 +3564,15 @@ async fn handle_daemon_routed_stream_carrier_async(
     paths: DaemonPaths,
     service_host: crate::service_adapter::DaemonServiceRegistryHost,
     service_runtime: tokio::runtime::Handle,
-    routed_pool_scope: String,
+    routed_pool_scopes: Vec<String>,
 ) -> Result<bool, DaemonError> {
     let destination_process_affinity = if daemon_paths_are_shadow(&paths) {
         sinomo_core::network::DestinationProcessAffinity::Any
     } else {
         sinomo_core::network::DestinationProcessAffinity::MainDaemon
     };
-    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier_with_destination_process_affinity(
-        routed_pool_scope,
+    let mut acceptor = sinomo_core::network::accept_pooled_routed_stream_carrier_for_scopes_with_destination_process_affinity(
+        routed_pool_scopes,
         directory.version().0,
         sinomo_core::network::stream_native_service_route_constraints(),
         destination_process_affinity,

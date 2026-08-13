@@ -939,6 +939,23 @@ fn fenced_bootstrap_route_fingerprint(
     Ok(*hasher.finalize().as_bytes())
 }
 
+/// Returns the exact pool scopes under which this process may reuse one
+/// accepted full-duplex cluster carrier.
+///
+/// The dynamic scope serves ordinary cluster routing. The second scope is
+/// fenced to the caller's authoritative bootstrap routing inputs, including
+/// the local node identity, and is the only alias consensus/KV traffic may
+/// use. Callers must not synthesize a broader prefix match from these values.
+pub fn cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(
+    state: &ClusterBootstrapState,
+) -> Result<[String; 2], NetworkError> {
+    Ok([
+        RouteDirectoryCacheIdentity::Dynamic.routed_stream_scope(&state.cluster_id),
+        RouteDirectoryCacheIdentity::FencedBootstrap(fenced_bootstrap_route_fingerprint(state)?)
+            .routed_stream_scope(&state.cluster_id),
+    ])
+}
+
 impl ClusterObjectRpcRouteContext<'_> {
     fn directory(
         &self,
@@ -1882,6 +1899,27 @@ mod tests {
         let original_identity = RouteDirectoryCacheIdentity::FencedBootstrap(stable_fingerprint);
         let updated_identity =
             RouteDirectoryCacheIdentity::FencedBootstrap(stable_after_non_routing);
+        let [dynamic_scope, fenced_scope] =
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&state)
+                .expect("accepted carrier scopes");
+        assert_eq!(
+            dynamic_scope,
+            RouteDirectoryCacheIdentity::Dynamic.routed_stream_scope(&cluster_id)
+        );
+        assert_eq!(
+            fenced_scope,
+            original_identity.routed_stream_scope(&cluster_id),
+            "the accepted-carrier alias must exactly match the fenced caller scope"
+        );
+        let mut different_receiver = state.clone();
+        different_receiver.local_node_id = target_node_id.clone();
+        let [_, different_receiver_scope] =
+            cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state(&different_receiver)
+                .expect("different receiver scopes");
+        assert_ne!(
+            different_receiver_scope, fenced_scope,
+            "a receiver-local fence must not be reusable by another node identity"
+        );
         assert_eq!(
             original_identity.routed_stream_scope(&cluster_id),
             updated_identity.routed_stream_scope(&cluster_id)

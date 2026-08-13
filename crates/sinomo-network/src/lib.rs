@@ -245,6 +245,7 @@ pub use routed_identity::DaemonRoutedSessionIdentity;
 pub use routed_stream_pool::{
     RoutedStreamAcceptor, RoutedStreamIncoming, accept_local_object_rpc_stream_carrier,
     accept_pooled_routed_stream_carrier,
+    accept_pooled_routed_stream_carrier_for_scopes_with_destination_process_affinity,
     accept_pooled_routed_stream_carrier_with_destination_process_affinity,
     accept_routed_stream_carrier, local_object_rpc_carrier_prelude_prefix_matches,
     open_pooled_local_object_rpc_stream, open_pooled_routed_stream,
@@ -285,7 +286,9 @@ pub use peer::{
 pub use roaming::open_daemon_rpc_stream_to_cluster_endpoint_async;
 pub use route::{
     ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcFuture,
-    ClusterObjectRpcObservation, ClusterObjectRpcOptions, stream_native_service_route_constraints,
+    ClusterObjectRpcObservation, ClusterObjectRpcOptions,
+    cluster_routed_stream_pool_scopes_from_fenced_bootstrap_state,
+    stream_native_service_route_constraints,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use route::{

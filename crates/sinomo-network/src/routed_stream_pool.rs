@@ -1124,6 +1124,35 @@ pub async fn accept_pooled_routed_stream_carrier_with_destination_process_affini
     .await
 }
 
+/// Converts one accepted authenticated routed stream into an owned logical-
+/// stream acceptor and publishes the same carrier under every exact routing
+/// scope supplied by the accepting authority.
+///
+/// This is used when one authenticated cluster carrier is valid for both the
+/// dynamic cluster directory and one exact fenced-bootstrap directory. Scope
+/// aliases remain ordinary, exact pool keys: an unrelated cluster, direct
+/// endpoint scope, or different fenced-bootstrap fingerprint cannot reuse the
+/// carrier.
+pub async fn accept_pooled_routed_stream_carrier_for_scopes_with_destination_process_affinity(
+    scopes: Vec<String>,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
+    carrier: PeerStream,
+) -> Result<RoutedStreamAcceptor, NetworkError> {
+    let route_compatibility_generation = crate::network_module_routing_generation();
+    accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source(
+        scopes,
+        route_compatibility_generation,
+        directory_generation,
+        constraints,
+        destination_process_affinity,
+        carrier,
+        crate::network_module_routing_generation,
+    )
+    .await
+}
+
 async fn accept_pooled_routed_stream_carrier_with_route_compatibility(
     scope: String,
     route_compatibility_generation: u64,
@@ -1156,41 +1185,114 @@ async fn accept_pooled_routed_stream_carrier_with_route_compatibility_source<G>(
 where
     G: Fn() -> u64,
 {
-    let key = PoolKey::new(
-        scope,
+    accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source(
+        vec![scope],
         route_compatibility_generation,
         directory_generation,
         constraints,
         destination_process_affinity,
-        carrier.local_node_id.clone(),
-        carrier.peer_node_id.clone(),
-        carrier.protection,
-    );
+        carrier,
+        current_route_compatibility_generation,
+    )
+    .await
+}
+
+async fn accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source<G>(
+    mut scopes: Vec<String>,
+    route_compatibility_generation: u64,
+    directory_generation: u64,
+    constraints: RouteConstraints,
+    destination_process_affinity: crate::DestinationProcessAffinity,
+    carrier: PeerStream,
+    current_route_compatibility_generation: G,
+) -> Result<RoutedStreamAcceptor, NetworkError>
+where
+    G: Fn() -> u64,
+{
+    scopes.sort_unstable();
+    scopes.dedup();
+    if scopes.is_empty() {
+        return Err(NetworkError::Directory {
+            detail: "accepted routed carrier requires at least one pool scope".to_string(),
+        });
+    }
+    let keys = scopes
+        .into_iter()
+        .map(|scope| {
+            PoolKey::new(
+                scope,
+                route_compatibility_generation,
+                directory_generation,
+                constraints,
+                destination_process_affinity,
+                carrier.local_node_id.clone(),
+                carrier.peer_node_id.clone(),
+                carrier.protection,
+            )
+        })
+        .collect::<Vec<_>>();
     let observed_generation = current_route_compatibility_generation();
-    if observed_generation != key.route_compatibility_generation {
+    if observed_generation != route_compatibility_generation {
         return Err(stale_route_compatibility_error(
-            key.route_compatibility_generation,
+            route_compatibility_generation,
             observed_generation,
         ));
     }
     let (acceptor, client) = routed_stream_acceptor_and_client(carrier)?;
     let observed_generation = current_route_compatibility_generation();
-    if observed_generation != key.route_compatibility_generation {
+    if observed_generation != route_compatibility_generation {
         return Err(stale_route_compatibility_error(
-            key.route_compatibility_generation,
+            route_compatibility_generation,
             observed_generation,
         ));
     }
+
+    let mut published_keys = Vec::new();
+    for key in &keys {
+        match publish_accepted_pooled_routed_stream_scope(
+            key,
+            &client,
+            &current_route_compatibility_generation,
+        )
+        .await
+        {
+            Ok(true) => published_keys.push(key.clone()),
+            Ok(false) => {}
+            Err(error) => {
+                let mut pool = lock_routed_stream_pool();
+                for published_key in &published_keys {
+                    if pool
+                        .get(published_key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &client))
+                    {
+                        pool.remove(published_key);
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(acceptor)
+}
+
+async fn publish_accepted_pooled_routed_stream_scope<G>(
+    key: &PoolKey,
+    client: &Arc<PooledCarrier>,
+    current_route_compatibility_generation: &G,
+) -> Result<bool, NetworkError>
+where
+    G: Fn() -> u64,
+{
     let connect_lock = {
         let mut locks = lock_routed_stream_connect_locks();
-        if let Some(newer_generation) = newer_route_compatibility_generation(&locks, &key) {
+        if let Some(newer_generation) = newer_route_compatibility_generation(&locks, key) {
             return Err(stale_route_compatibility_error(
                 key.route_compatibility_generation,
                 newer_generation,
             ));
         }
         locks.retain(|lock_key, _| {
-            if !lock_key.same_base_relationship(&key) {
+            if !lock_key.same_base_relationship(key) {
                 return true;
             }
             match lock_key
@@ -1199,7 +1301,7 @@ where
             {
                 std::cmp::Ordering::Less => false,
                 std::cmp::Ordering::Greater => true,
-                std::cmp::Ordering::Equal => lock_key == &key,
+                std::cmp::Ordering::Equal => lock_key == key,
             }
         });
         Arc::clone(
@@ -1219,7 +1321,7 @@ where
     let mut pool = lock_routed_stream_pool();
     pool.retain(|candidate, pooled| {
         !pooled.is_closed()
-            && if !candidate.same_base_relationship(&key) {
+            && if !candidate.same_base_relationship(key) {
                 true
             } else {
                 match candidate
@@ -1228,20 +1330,20 @@ where
                 {
                     std::cmp::Ordering::Less => false,
                     std::cmp::Ordering::Greater => true,
-                    std::cmp::Ordering::Equal => candidate == &key,
+                    std::cmp::Ordering::Equal => candidate == key,
                 }
             }
     });
-    if let Some(newer_generation) = newer_route_compatibility_generation(&pool, &key) {
+    if let Some(newer_generation) = newer_route_compatibility_generation(&pool, key) {
         return Err(stale_route_compatibility_error(
             key.route_compatibility_generation,
             newer_generation,
         ));
     }
-    let published = if pool.get(&key).is_some_and(|pooled| !pooled.is_closed()) {
+    let published = if pool.get(key).is_some_and(|pooled| !pooled.is_closed()) {
         false
     } else {
-        pool.insert(key.clone(), Arc::clone(&client));
+        pool.insert(key.clone(), Arc::clone(client));
         true
     };
     drop(pool);
@@ -1250,10 +1352,10 @@ where
         if published {
             let mut pool = lock_routed_stream_pool();
             if pool
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &client))
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, client))
             {
-                pool.remove(&key);
+                pool.remove(key);
             }
         }
         return Err(stale_route_compatibility_error(
@@ -1261,7 +1363,7 @@ where
             observed_generation,
         ));
     }
-    Ok(acceptor)
+    Ok(published)
 }
 
 /// Converts one accepted authenticated routed stream into an owned logical-stream
@@ -1821,32 +1923,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_main_daemon_carrier_supports_reverse_direction_streams_without_redial() {
+    async fn accepted_main_daemon_carrier_supports_fenced_reverse_streams_without_redial() {
         let (client_carrier, server_carrier) = carrier_pair();
         let client_node = client_carrier.local_node_id.clone();
         let server_node = client_carrier.peer_node_id.clone();
-        let scope = Id::generate().to_string();
+        let dynamic_scope = Id::generate().to_string();
+        let fenced_scope = format!("{dynamic_scope}:fenced-bootstrap:{}", "5a".repeat(32));
+        let foreign_fenced_scope = format!("{dynamic_scope}:fenced-bootstrap:{}", "a5".repeat(32));
         let route_compatibility_generation = crate::network_module_routing_generation();
         let constraints = RouteConstraints::default();
         let mut client_incoming =
             register_routed_stream_incoming(client_node.clone()).expect("incoming dispatcher");
         let reverse_establishments = Arc::new(AtomicUsize::new(0));
-        let server_scope = scope.clone();
+        let foreign_establishments = Arc::new(AtomicUsize::new(0));
+        let server_dynamic_scope = dynamic_scope.clone();
+        let server_fenced_scope = fenced_scope.clone();
+        let server_foreign_fenced_scope = foreign_fenced_scope.clone();
         let server_local = server_node.clone();
         let server_peer = client_node.clone();
         let reverse_count = Arc::clone(&reverse_establishments);
+        let foreign_count = Arc::clone(&foreign_establishments);
         let server = tokio::spawn(async move {
-            let mut acceptor = accept_pooled_routed_stream_carrier_with_route_compatibility_source(
-                server_scope.clone(),
-                route_compatibility_generation,
-                1,
-                constraints,
-                crate::DestinationProcessAffinity::MainDaemon,
-                server_carrier,
-                move || route_compatibility_generation,
-            )
-            .await
-            .expect("accept pooled carrier");
+            let mut acceptor =
+                accept_pooled_routed_stream_carrier_for_scopes_with_route_compatibility_source(
+                    vec![server_dynamic_scope, server_fenced_scope.clone()],
+                    route_compatibility_generation,
+                    1,
+                    constraints,
+                    crate::DestinationProcessAffinity::MainDaemon,
+                    server_carrier,
+                    move || route_compatibility_generation,
+                )
+                .await
+                .expect("accept pooled carrier");
             let mut initial = acceptor
                 .accept()
                 .await
@@ -1865,13 +1974,13 @@ mod tests {
                 .expect("write initial response");
 
             let mut reverse = open_test_pooled_routed_stream_with_affinity(
-                server_scope,
+                server_fenced_scope,
                 route_compatibility_generation,
                 2,
                 constraints,
                 crate::DestinationProcessAffinity::MainDaemon,
-                server_local,
-                server_peer,
+                server_local.clone(),
+                server_peer.clone(),
                 Duration::from_secs(1),
                 async move {
                     reverse_count.fetch_add(1, Ordering::Relaxed);
@@ -1894,10 +2003,38 @@ mod tests {
                 .await
                 .expect("read reverse response");
             assert_eq!(&response, b"okay");
+
+            let result = open_test_pooled_routed_stream_with_affinity(
+                server_foreign_fenced_scope,
+                route_compatibility_generation,
+                2,
+                constraints,
+                crate::DestinationProcessAffinity::MainDaemon,
+                server_local,
+                server_peer,
+                Duration::from_secs(1),
+                async move {
+                    foreign_count.fetch_add(1, Ordering::Relaxed);
+                    Err(NetworkError::Io {
+                        operation: "expected foreign fenced carrier establishment".to_string(),
+                        detail: "a different fenced fingerprint must not reuse the alias"
+                            .to_string(),
+                    })
+                },
+            )
+            .await;
+            let error = match result {
+                Ok(_) => panic!("foreign fenced scope must miss the accepted alias"),
+                Err(error) => error,
+            };
+            assert!(
+                error.to_string().contains("different fenced fingerprint"),
+                "unexpected foreign-scope error: {error}"
+            );
         });
 
         let mut initial = open_test_pooled_routed_stream_with_affinity(
-            scope.clone(),
+            dynamic_scope.clone(),
             route_compatibility_generation,
             1,
             constraints,
@@ -1940,9 +2077,11 @@ mod tests {
         server.await.expect("server task");
 
         assert_eq!(reverse_establishments.load(Ordering::Relaxed), 0);
-        assert_eq!(retire_pooled_routed_streams(&scope).await, 2);
+        assert_eq!(foreign_establishments.load(Ordering::Relaxed), 1);
+        assert_eq!(retire_pooled_routed_streams(&dynamic_scope).await, 2);
+        assert_eq!(retire_pooled_routed_streams(&fenced_scope).await, 1);
         assert_eq!(
-            pooled_routed_relationship_is_active(&scope, &client_node, &server_node),
+            pooled_routed_relationship_is_active(&dynamic_scope, &client_node, &server_node),
             Some(false),
         );
     }
