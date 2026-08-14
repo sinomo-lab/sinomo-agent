@@ -4171,6 +4171,48 @@ fn query_placeholder_state(
     Ok(state.map(|state| (state.in_sync, state.identity)))
 }
 
+fn blocking_local_placeholder_ancestor(
+    sync_root: &Path,
+    local: &Path,
+) -> Result<Option<String>, String> {
+    let mut current = local.parent();
+    while let Some(ancestor) = current {
+        if ancestor == sync_root {
+            return Ok(None);
+        }
+        match query_placeholder_state(ancestor)? {
+            Some((true, _)) => {}
+            Some((false, _)) => {
+                return Ok(Some(format!(
+                    "Cloud Files ancestor {} is not in sync",
+                    ancestor.display()
+                )));
+            }
+            None => match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    return Ok(Some(format!(
+                        "local ancestor {} is not a Cloud Files placeholder",
+                        ancestor.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "stat local Cloud Files ancestor {}: {error}",
+                        ancestor.display()
+                    ));
+                }
+            },
+        }
+        current = ancestor.parent();
+    }
+    Err(format!(
+        "local placeholder {} escaped Cloud Files root {} while inspecting ancestors",
+        local.display(),
+        sync_root.display()
+    ))
+}
+
 fn query_placeholder_state_handle(
     handle: HANDLE,
     path: &Path,
@@ -4589,7 +4631,12 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceEffectAdapter for WindowsPlaceho
         match fs::symlink_metadata(&local) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CloudFilesLocalPathState::Clean);
+                return Ok(
+                    match blocking_local_placeholder_ancestor(&self.sync_root, &local)? {
+                        Some(detail) => CloudFilesLocalPathState::Dirty { detail },
+                        None => CloudFilesLocalPathState::Clean,
+                    },
+                );
             }
             Err(error) => return Err(format!("stat local path {}: {error}", local.display())),
         }
@@ -5373,6 +5420,20 @@ mod tests {
         let timeouts = namespace_event_stream_timeouts();
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(3)));
         assert_eq!(timeouts.idle_timeout, None);
+    }
+
+    #[test]
+    fn absent_child_under_ordinary_local_directory_is_a_subtree_collision() {
+        let root = WindowsFilesystemTestDir::new("ordinary-ancestor-collision");
+        let ordinary = root.path().join("ordinary");
+        fs::create_dir(&ordinary).expect("create ordinary local ancestor");
+        let child = ordinary.join("remote-child");
+
+        let detail = blocking_local_placeholder_ancestor(root.path(), &child)
+            .expect("inspect local ancestors")
+            .expect("ordinary ancestor blocks placeholder creation");
+        assert!(detail.contains(&ordinary.display().to_string()), "{detail}");
+        assert!(detail.contains("not a Cloud Files placeholder"), "{detail}");
     }
 
     #[test]
