@@ -3051,7 +3051,30 @@ where
         }
         check_cancelled(cancelled)?;
         if self.full_scan_pending {
+            // A sparse authoritative scan is deliberately cooperative and may
+            // take many passes for a large materialized namespace. Keep
+            // draining the already-active directory watcher while that scan is
+            // in progress. Otherwise the bounded notification channel can sit
+            // unread for the entire scan, and an apparently healthy worker can
+            // starve local writeback indefinitely. Captured mutations remain
+            // safe against the older scan boundary: their exact CAS
+            // preconditions either publish or retain a conflict, and the feed
+            // is replayed from the scan's earlier boundary afterward.
+            let captures = self
+                .capture
+                .drain_changes(self.state.reconciler.manifest(), cancelled)
+                .map_err(capture_sync_error("read-directory-changes"))?;
             let mut progress = CloudFilesWritableSyncProgress::default();
+            if !captures.overflowed {
+                self.resolve_sparse_placeholders(captures.sparse_placeholders)?;
+                for capture in captures.changes {
+                    check_cancelled(cancelled)?;
+                    self.state.enqueue_capture(capture)?;
+                    progress.captures_enqueued += 1;
+                }
+                check_cancelled(cancelled)?;
+                progress.mutation_progress = self.execute_mutations()?;
+            }
             let snapshot = self.full_scan_snapshot(cancelled)?;
             let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
             progress.full_scan_applied = true;
@@ -8263,6 +8286,53 @@ mod tests {
                 .after_sequence,
             17
         );
+    }
+
+    #[test]
+    fn pending_sparse_scan_does_not_starve_local_change_capture() {
+        let root = TestRoot::new("pending-scan-local-capture");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let drain_calls = Arc::new(AtomicUsize::new(0));
+        let capture = FakeCapture {
+            batches: VecDeque::from([Ok(CloudFilesCapturedChangeBatch {
+                changes: vec![create_capture("during-pending-scan", b"local")],
+                sparse_placeholders: Vec::new(),
+                overflowed: false,
+            })]),
+            drain_calls: Arc::clone(&drain_calls),
+            ..FakeCapture::default()
+        };
+        let backend = FakeBackend::default();
+        let mutation_calls = Arc::clone(&backend.call_count);
+        let mut partial = snapshot(2);
+        partial.scan_complete = false;
+        partial.cursors.clear();
+        let namespace = FakeNamespace::with_scans([snapshot(1), partial]);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            capture,
+            CloudFilesConcreteDfsAdapter::new(backend),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("startup");
+        worker.full_scan_pending = true;
+        worker.startup_scan_baseline = Some(worker.state().reconciler().manifest().clone());
+
+        let progress = worker
+            .run_once(&cancelled)
+            .expect("capture while sparse scan remains pending");
+
+        assert_eq!(drain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(progress.captures_enqueued, 1);
+        assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+        assert!(progress.full_scan_applied);
+        assert!(worker.full_scan_pending);
+        assert!(worker.state().queue().operations().any(|operation| {
+            operation.request.capture_id.as_deref() == Some("during-pending-scan")
+        }));
     }
 
     #[test]
