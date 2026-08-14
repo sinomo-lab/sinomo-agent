@@ -3626,15 +3626,19 @@ mod tests {
             &"request",
         )
         .expect("request");
-        let result = crate::cluster::call_node_object_rpc_with_cluster_paths_on_runtime(
+        let result = crate::cluster::call_node_object_rpc_with_cluster_paths_async_on_runtime(
             &cluster_paths,
             &state,
             &local_node,
-            &request,
+            sinomo_core::network::ObjectRpcCall::value(request.clone()),
             sinomo_core::network::ClusterObjectRpcOptions::default()
                 .with_overall_timeout(Duration::from_secs(2)),
             &tokio::runtime::Handle::current(),
         )
+        .await
+        .expect("local target uses explicit daemon service path")
+        .into_materialized_value_response(usize::MAX)
+        .await
         .expect("local target uses explicit daemon service path");
         assert_eq!(
             result.decode_body::<String>().expect("response body"),
@@ -3644,15 +3648,16 @@ mod tests {
 
         status.cluster.as_mut().expect("cluster status").process = "daemon-shadow".to_string();
         crate::write_daemon_status(&daemon_paths, &status).expect("shadow daemon status");
-        let error = crate::cluster::call_node_object_rpc_with_cluster_paths_on_runtime(
+        let error = crate::cluster::call_node_object_rpc_with_cluster_paths_async_on_runtime(
             &cluster_paths,
             &state,
             &local_node,
-            &request,
+            sinomo_core::network::ObjectRpcCall::value(request),
             sinomo_core::network::ClusterObjectRpcOptions::default()
                 .with_overall_timeout(Duration::from_secs(2)),
             &tokio::runtime::Handle::current(),
         )
+        .await
         .expect_err("shadow daemon status must not authorize the local main service path");
         assert!(
             error

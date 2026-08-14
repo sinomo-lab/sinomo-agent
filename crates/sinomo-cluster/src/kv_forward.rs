@@ -766,11 +766,10 @@ async fn forward_cluster_kv_txn_compact_to_node_async_with_host<H>(
 where
     H: ClusterObjectRpcAsyncHost + Send,
 {
-    let mut client =
-        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
     let response = await_authenticated_cluster_kv_target(
         target_node_id,
-        client.call_target(
+        host.call_node_object_rpc_async(
+            paths,
             state,
             target_node_id,
             ObjectRpcCall::encode_borrowed_value(
@@ -922,14 +921,13 @@ where
         call.request = call.request.with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
-        let mut client =
-            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
         match decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<KvSnapshot>, _>(
             target,
             "forward authoritative cluster KV snapshot",
             attempt_deadline,
             timeout,
-            client.call_target(
+            host.call_node_object_rpc_async(
+                paths,
                 state,
                 target,
                 call,
@@ -1014,14 +1012,13 @@ where
         let call = cluster_kv_request_outcome_forward_call(request_id)?;
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
-        let mut client =
-            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
         match decode_forwarded_cluster_kv_authority_before::<ClusterKvRequestOutcomeRead, _>(
             target,
             "forward authoritative cluster KV request outcome",
             attempt_deadline,
             timeout,
-            client.call_target(
+            host.call_node_object_rpc_async(
+                paths,
                 state,
                 target,
                 call,
@@ -1240,8 +1237,6 @@ where
         let call = cluster_kv_authoritative_entry_forward_call(key)?;
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
-        let mut client =
-            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
         match decode_forwarded_cluster_kv_authority_before::<
             KvAuthoritativeRead<Option<KvEntry>>,
             _,
@@ -1250,7 +1245,8 @@ where
             "forward authoritative cluster KV point read",
             attempt_deadline,
             timeout,
-            client.call_target(
+            host.call_node_object_rpc_async(
+                paths,
                 state,
                 target,
                 call,
@@ -1394,8 +1390,6 @@ where
         let call = cluster_kv_authoritative_entries_forward_call(keys)?;
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
-        let mut client =
-            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
         match decode_forwarded_cluster_kv_authority_before::<
             sinomo_kv::ClusterKvAuthoritativeEntriesResponse,
             _,
@@ -1404,7 +1398,8 @@ where
             "forward authoritative cluster KV exact-key-set read",
             attempt_deadline,
             timeout,
-            client.call_target(
+            host.call_node_object_rpc_async(
+                paths,
                 state,
                 target,
                 call,
@@ -1552,14 +1547,13 @@ where
         call.request = call.request.with_response_retry_safe();
         let timeout = options.routed_node_attempt_timeout(remaining, targets.len() - index);
         let attempt_deadline = cluster_kv_forward_attempt_deadline(deadline, timeout);
-        let mut client =
-            ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
         match decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<Vec<KvEntry>>, _>(
             target,
             "forward authoritative cluster KV prefix read",
             attempt_deadline,
             timeout,
-            client.call_target(
+            host.call_node_object_rpc_async(
+                paths,
                 state,
                 target,
                 call,
@@ -1799,12 +1793,11 @@ where
 {
     let kv_paths = paths.kv_paths();
     let mut observed_generation = sinomo_kv::cluster_kv_watch_generation(&kv_paths);
-    let mut client =
-        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
     let rpc_timeout = forwarded_cluster_kv_txn_remaining(deadline, timeout)?;
     let txn_response = await_authenticated_cluster_kv_target(
         target_node_id,
-        client.call_target(
+        host.call_node_object_rpc_async(
+            paths,
             state,
             target_node_id,
             ObjectRpcCall::encode_borrowed_value(
@@ -2197,6 +2190,57 @@ mod tests {
     struct FencedForwardDispatchHost;
 
     impl ClusterObjectRpcAsyncHost for FencedForwardDispatchHost {}
+
+    #[derive(Default)]
+    struct RecordingNodeDispatchHost {
+        calls: usize,
+    }
+
+    impl ClusterObjectRpcAsyncHost for RecordingNodeDispatchHost {
+        fn call_node_object_rpc_async<'a>(
+            &'a mut self,
+            _paths: &'a ClusterPaths,
+            _state: &'a ClusterBootstrapState,
+            _target_node_id: &'a NodeId,
+            _call: ObjectRpcCall,
+            _options: ClusterObjectRpcOptions,
+        ) -> sinomo_network::ClusterObjectRpcFuture<'a, sinomo_network::ObjectRpcResult> {
+            self.calls = self.calls.saturating_add(1);
+            Box::pin(async {
+                Err(NetworkError::delivery_failed(
+                    "test host node dispatch",
+                    NetworkDeliveryState::DefinitelyNotSent,
+                    "host dispatch seam reached",
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn async_txn_forward_uses_host_node_dispatch_seam() {
+        let (root, state) = forward_test_state(false);
+        let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(root.path()));
+        paths.ensure().expect("cluster paths");
+        let target = state.members[1].node_id.clone();
+        let request = KvTxnRequest::generated(test_txn());
+        let timeout = Duration::from_secs(1);
+        let mut host = RecordingNodeDispatchHost::default();
+
+        let error = forward_cluster_kv_txn_to_state_authority_node_async_with_host(
+            &paths,
+            &state,
+            &target,
+            &request,
+            timeout,
+            Instant::now() + timeout,
+            &mut host,
+        )
+        .await
+        .expect_err("recording dispatch rejects the forwarded transaction");
+
+        assert_eq!(host.calls, 1);
+        assert!(error.to_string().contains("host dispatch seam reached"));
+    }
 
     #[test]
     fn authenticated_forwarded_non_leader_response_retains_responder_identity() {

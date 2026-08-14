@@ -760,6 +760,32 @@ pub trait ClusterObjectRpcAsyncHost: Send {
             crate::roaming::open_daemon_rpc_stream_to_cluster_endpoint_async(endpoint, health).await
         })
     }
+
+    /// Dispatches one node-addressed call through the host's service boundary.
+    ///
+    /// The default remains the fenced routed carrier. Daemon hosts override
+    /// this seam for the one node that a routed client deliberately cannot
+    /// address: the local node, whose exact main-daemon listener must be
+    /// selected explicitly rather than inferred from cluster identity.
+    fn call_node_object_rpc_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcCall,
+        options: ClusterObjectRpcOptions,
+    ) -> ClusterObjectRpcFuture<'a, ObjectRpcResult>
+    where
+        Self: Sized,
+    {
+        Box::pin(async move {
+            let mut client =
+                ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(self, paths, state)?;
+            client
+                .call_target(state, target_node_id, call, options)
+                .await
+        })
+    }
 }
 
 fn cluster_endpoint_rpc_observation(

@@ -2397,55 +2397,70 @@ pub(crate) fn call_node_object_rpc_with_cluster_paths_on_runtime(
     options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
 ) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
-    if target_node_id == &state.local_node_id {
-        let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
-            path: paths.root.display().to_string(),
-            detail: "cluster paths have no data directory parent".to_string(),
-        })?;
-        let daemon_paths = DaemonPaths::new(&SinomoDataDir::new(data_dir));
-        return block_on_daemon_cluster_future_on_owner_runtime(
-            runtime,
-            Box::pin(materialize_daemon_client_value_call_with_options(
-                "local cluster node object RPC value call",
-                options,
-                crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_options(
-                    &daemon_paths,
-                    target_node_id,
-                    sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
-                    options,
-                    runtime,
-                    true,
-                ),
-            )),
-        );
-    }
-    let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    // This bridge is used by KV authority forwarding/snapshot refresh. The
-    // caller has already projected the exact Raft membership fence carried in
-    // `state`; resolving the route through the KV-backed directory would make
-    // recovery of that KV recursively depend on materializing it first.
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
-            &mut host, paths, state,
-        )?;
     block_on_daemon_cluster_future_on_owner_runtime(
         runtime,
         Box::pin(materialize_daemon_client_value_call_with_options(
             "cluster node object RPC value call",
             options,
             async {
-                client
-                    .call_target(
-                        state,
-                        target_node_id,
-                        sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
-                        options,
-                    )
-                    .await
-                    .map_err(DaemonError::from)
+                call_node_object_rpc_with_cluster_paths_async_on_runtime(
+                    paths,
+                    state,
+                    target_node_id,
+                    sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                    options,
+                    runtime,
+                )
+                .await
+                .map_err(DaemonError::from)
             },
         )),
     )
+}
+
+pub(crate) async fn call_node_object_rpc_with_cluster_paths_async_on_runtime(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    call: sinomo_core::network::ObjectRpcCall,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResult, sinomo_core::network::NetworkError> {
+    if target_node_id == &state.local_node_id {
+        let data_dir =
+            paths
+                .root
+                .parent()
+                .ok_or_else(|| sinomo_core::network::NetworkError::Io {
+                    operation: "resolve local cluster node service path".to_string(),
+                    detail: format!(
+                        "cluster path {} has no data directory parent",
+                        paths.root.display()
+                    ),
+                })?;
+        let daemon_paths = DaemonPaths::new(&SinomoDataDir::new(data_dir));
+        return crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
+            &daemon_paths,
+            target_node_id,
+            call,
+            options,
+            runtime,
+            true,
+        )
+        .await;
+    }
+
+    let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
+    // KV authority forwarding already carries the exact Raft membership fence
+    // in `state`; remote dispatch must retain it rather than recursively
+    // consulting the KV-backed dynamic route directory.
+    let mut client =
+        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
+            &mut host, paths, state,
+        )?;
+    client
+        .call_target(state, target_node_id, call, options)
+        .await
 }
 
 #[cfg(test)]
@@ -9444,6 +9459,29 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonClusterControlPla
                 host = host.with_cluster_paths(paths);
             }
             host.open_object_rpc_stream_async(endpoint, health).await
+        })
+    }
+
+    fn call_node_object_rpc_async<'a>(
+        &'a mut self,
+        paths: &'a ClusterPaths,
+        state: &'a ClusterBootstrapState,
+        target_node_id: &'a NodeId,
+        call: sinomo_core::network::ObjectRpcCall,
+        options: sinomo_core::network::ClusterObjectRpcOptions,
+    ) -> sinomo_core::network::ClusterObjectRpcFuture<'a, sinomo_core::network::ObjectRpcResult>
+    {
+        let runtime = self.rpc_mode.runtime().clone();
+        Box::pin(async move {
+            call_node_object_rpc_with_cluster_paths_async_on_runtime(
+                paths,
+                state,
+                target_node_id,
+                call,
+                options,
+                &runtime,
+            )
+            .await
         })
     }
 }
