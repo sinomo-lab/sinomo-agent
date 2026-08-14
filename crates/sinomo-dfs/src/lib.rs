@@ -448,8 +448,8 @@ pub use mounted_mutation_outbox::{
 pub use mounted_sifs::{
     MountedSifsContentReadContext, MountedSifsControlPlaneKvClient, MountedSifsMutationReport,
     MountedSifsService, OpenedMountedSifsService, discover_mounted_sifs_content_replica_candidates,
-    open_mounted_sifs_service, open_mounted_sifs_service_with_cancellation,
-    open_mounted_sifs_service_with_peer_transports,
+    discover_mounted_sifs_content_replica_candidates_with_control_plane, open_mounted_sifs_service,
+    open_mounted_sifs_service_with_cancellation, open_mounted_sifs_service_with_peer_transports,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane,
     open_mounted_sifs_service_with_peer_transports_and_default_control_plane_and_cancellation,
 };

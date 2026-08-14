@@ -387,6 +387,18 @@ fn mounted_sifs_replica_candidates_from_context(
                 .to_string(),
         })
     })?;
+    discover_mounted_sifs_content_replica_candidates_with_control_plane(control_plane)
+}
+
+/// Returns the current content-service nodes using a caller-owned control-plane client.
+///
+/// Daemon-hosted adapters use this seam so refreshes stay on the daemon's retained
+/// cluster transports. In particular, this function never constructs a standalone
+/// router, which would be unable to dispatch a same-node authority call through the
+/// daemon's explicit local service path.
+pub fn discover_mounted_sifs_content_replica_candidates_with_control_plane(
+    control_plane: &dyn DfsControlPlaneKvClient,
+) -> Result<Vec<DfsNodeId>, DfsError> {
     let advertisements = control_plane
         .range_prefix(content_services_prefix())
         .map_err(DfsError::from)?
@@ -415,14 +427,7 @@ pub fn discover_mounted_sifs_content_replica_candidates(
     });
     let control_plane =
         MountedSifsControlPlaneKvClient::new_authoritative(cluster_paths, peer_transport);
-    let entries = control_plane
-        .range_prefix(content_services_prefix())
-        .map_err(DfsError::from)?;
-    Ok(mounted_sifs_content_replica_candidates(
-        entries
-            .into_iter()
-            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok()),
-    ))
+    discover_mounted_sifs_content_replica_candidates_with_control_plane(&control_plane)
 }
 
 #[cfg(test)]
@@ -1127,6 +1132,73 @@ mod tests {
                 DfsNodeAdvertisement::content(second_server.clone()),
             ]),
             vec![first_server, second_server]
+        );
+    }
+
+    #[derive(Debug)]
+    struct RecordingReplicaDiscoveryControlPlane {
+        entries: Vec<KvEntry>,
+        prefixes: Mutex<Vec<String>>,
+    }
+
+    impl DfsControlPlaneKvClient for RecordingReplicaDiscoveryControlPlane {
+        fn get(&self, _key: &str) -> Result<Option<KvEntry>, KvError> {
+            Ok(None)
+        }
+
+        fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+            self.prefixes
+                .lock()
+                .expect("replica discovery prefixes")
+                .push(prefix.to_string());
+            Ok(self.entries.clone())
+        }
+
+        fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
+            panic!("replica discovery must not write the control plane")
+        }
+
+        fn txn(&mut self, _txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+            panic!("replica discovery must not transact against the control plane")
+        }
+    }
+
+    #[test]
+    fn replica_discovery_uses_the_supplied_control_plane() {
+        let client = NodeId::from_legacy_named("node_replica_discovery_client").expect("client");
+        let server = NodeId::from_legacy_named("node_replica_discovery_server").expect("server");
+        let mut client_advertisement = DfsNodeAdvertisement::metadata(client.clone());
+        client_advertisement.accepts_content = false;
+        let revision = KvRevision(7);
+        let entry = |advertisement: &DfsNodeAdvertisement| KvEntry {
+            key: crate::content_service_key(&advertisement.node_id),
+            value: sinomo_core::kv::encode_kv_value(advertisement)
+                .expect("encode DFS advertisement"),
+            create_revision: revision,
+            modify_revision: revision,
+            version: sinomo_core::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let control_plane = RecordingReplicaDiscoveryControlPlane {
+            entries: vec![
+                entry(&client_advertisement),
+                entry(&DfsNodeAdvertisement::content(server.clone())),
+            ],
+            prefixes: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            discover_mounted_sifs_content_replica_candidates_with_control_plane(&control_plane)
+                .expect("discover content replicas"),
+            vec![server]
+        );
+        assert_eq!(
+            control_plane
+                .prefixes
+                .lock()
+                .expect("replica discovery prefixes")
+                .as_slice(),
+            [content_services_prefix()]
         );
     }
 

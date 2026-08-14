@@ -3098,6 +3098,7 @@ struct DaemonDfsBrowserService {
 struct DaemonDfsBrowserBackend {
     data_dir: SinomoDataDir,
     service: Mutex<sinomo_dfs::MountedSifsService>,
+    replica_control_plane: Mutex<Option<Box<dyn sinomo_dfs::DfsControlPlaneKvClient>>>,
     peer_targets_refreshed_at: Mutex<Option<Instant>>,
     stat_cache: Mutex<HashMap<String, DaemonDfsBrowserCachedStat>>,
 }
@@ -3279,6 +3280,8 @@ impl DaemonDfsBrowserBackend {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let control_plane =
             daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
+        let replica_control_plane =
+            daemon_dfs_control_plane_client_on_runtime(&cluster_paths, Some(runtime));
         let (peer_transport, async_peer_transport) =
             daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
         let opened = sinomo_dfs::open_mounted_sifs_service_with_peer_transports(
@@ -3291,6 +3294,7 @@ impl DaemonDfsBrowserBackend {
         Ok(Self {
             data_dir,
             service: Mutex::new(opened.service),
+            replica_control_plane: Mutex::new(replica_control_plane),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
         })
@@ -3389,6 +3393,21 @@ impl DaemonDfsBrowserBackend {
 
     fn node_id(&self) -> Result<String, ServiceError> {
         Ok(self.lock_service_for_read()?.node_id().to_string())
+    }
+
+    fn content_replica_candidates(&self) -> Result<Vec<sinomo_core::node::NodeId>, ServiceError> {
+        let control_plane = self.replica_control_plane.lock().map_err(|_| {
+            ServiceError::Service("daemon DFS browser control-plane mutex poisoned".to_string())
+        })?;
+        match control_plane.as_deref() {
+            Some(control_plane) => {
+                sinomo_dfs::discover_mounted_sifs_content_replica_candidates_with_control_plane(
+                    control_plane,
+                )
+                .map_err(dfs_browser_service_error)
+            }
+            None => Ok(vec![sinomo_dfs::fallback_dfs_node_id()]),
+        }
     }
 
     fn event_origin_node_id(&self) -> Result<sinomo_core::Id, ServiceError> {
@@ -3689,9 +3708,7 @@ impl DaemonDfsBrowserBackend {
                 .posix_mkdir_all(&parent)
                 .map_err(dfs_browser_service_error)?;
         }
-        let replica_candidates =
-            sinomo_dfs::discover_mounted_sifs_content_replica_candidates(&self.data_dir)
-                .map_err(dfs_browser_service_error)?;
+        let replica_candidates = self.content_replica_candidates()?;
         let options = sifs_browser_write_options(&mut service, &path, &replica_candidates)?;
         service
             .posix_write_file(&path, &request.bytes, options)
@@ -3737,9 +3754,7 @@ impl DaemonDfsBrowserBackend {
             }
         };
         let mut service = self.lock_service()?;
-        let replica_candidates =
-            sinomo_dfs::discover_mounted_sifs_content_replica_candidates(&self.data_dir)
-                .map_err(dfs_browser_service_error)?;
+        let replica_candidates = self.content_replica_candidates()?;
         let options = match sifs_browser_write_options(&mut service, &path, &replica_candidates) {
             Ok(options) => options,
             Err(error) => {
