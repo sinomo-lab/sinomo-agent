@@ -853,6 +853,51 @@ pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_n
     let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?;
+    // Same-node DFS authority still crosses the main-daemon service boundary,
+    // but the routed client intentionally rejects local targets. Resolve that
+    // process explicitly; remote targets continue through the routed carrier.
+    if target_node_id == &state.local_node_id {
+        let status = crate::read_daemon_status(daemon_paths).map_err(|source| {
+            sinomo_core::network::NetworkError::delivery_failed(
+                "resolve explicit local main-daemon service path",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                source.to_string(),
+            )
+        })?;
+        let cluster = status.cluster.as_ref().ok_or_else(|| {
+            sinomo_core::network::NetworkError::delivery_failed(
+                "resolve explicit local main-daemon service path",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                "local main-daemon status has no cluster authority",
+            )
+        })?;
+        let exact_local_main = daemon_paths.lock.exists()
+            && status.data_dir == data_dir.root()
+            && status.lock_file == daemon_paths.lock
+            && cluster.cluster_id == state.cluster_id
+            && cluster.node_id == state.local_node_id
+            && cluster.process == "daemon-main";
+        if !exact_local_main {
+            return Err(sinomo_core::network::NetworkError::delivery_failed(
+                "resolve explicit local main-daemon service path",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                format!(
+                    "local main-daemon status does not own cluster {} node {} at {}",
+                    state.cluster_id,
+                    state.local_node_id,
+                    daemon_paths.root.display(),
+                ),
+            ));
+        }
+        return send_object_rpc_call_to_local_daemon_address_with_daemon_paths_and_network_error(
+            daemon_paths,
+            &status.address,
+            call,
+            options,
+            runtime,
+        )
+        .await;
+    }
     let mut host =
         DaemonObjectRpcAsyncHost::new(runtime, observe_connectivity).with_paths(daemon_paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
@@ -3471,6 +3516,162 @@ mod tests {
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn daemon_paths_target_uses_explicit_local_main_service_path() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-target-service-path");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_local_target")
+                .expect("cluster id");
+        let local_node = sinomo_core::node::NodeId::from_legacy_named("node_daemon_local_target")
+            .expect("local node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "daemon local target",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let daemon_paths = crate::DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        std::fs::write(&daemon_paths.lock, []).expect("daemon authority lock evidence");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("local daemon listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let port = address
+            .parse::<std::net::SocketAddr>()
+            .expect("listener socket address")
+            .port();
+        let local_member = state
+            .members
+            .iter()
+            .find(|member| member.node_id == local_node)
+            .expect("local member");
+        let mut status = crate::DaemonStatus::new(
+            &crate::DaemonRunOptions {
+                host: "127.0.0.1".to_string(),
+                port,
+            },
+            &daemon_paths,
+            Some(crate::DaemonClusterStatus {
+                cluster_id,
+                node_id: local_node.clone(),
+                process: "daemon-main".to_string(),
+                member_role: local_member.role.clone(),
+                member_state: local_member.state.clone(),
+            }),
+        );
+        status.address = address;
+        crate::write_daemon_status(&daemon_paths, &status).expect("daemon status");
+
+        let server = tokio::spawn(async move {
+            let mut carrier = listener
+                .accept()
+                .await
+                .expect("accept local daemon carrier")
+                .into_inner();
+            let carrier_context =
+                sinomo_core::network::read_local_object_rpc_carrier_prelude(&mut carrier)
+                    .await
+                    .expect("local carrier prelude");
+            let mut acceptor = sinomo_core::network::accept_local_object_rpc_stream_carrier(
+                Box::new(carrier),
+                &carrier_context,
+            )
+            .expect("accept local carrier");
+            let stream = acceptor
+                .accept()
+                .await
+                .expect("accept local logical stream")
+                .expect("local carrier closed before request");
+            let context = sinomo_core::network::RpcPeerContext::unauthenticated_local(
+                stream.session_id.clone(),
+                stream.channel_binding,
+            );
+            sinomo_core::network::serve_service_rpc_peer_stream(
+                stream,
+                &context,
+                sinomo_core::network::ObjectFrameIoOptions::default(),
+                |incoming, peer| async move {
+                    assert!(matches!(
+                        peer.identity,
+                        sinomo_core::network::RpcPeerIdentity::UnauthenticatedLocal
+                    ));
+                    assert_eq!(incoming.request.route, "/test/daemon-local-target");
+                    assert!(incoming.request.auth.is_none());
+                    Ok::<_, sinomo_core::network::NetworkError>(
+                        sinomo_core::network::ObjectRpcOutgoingResponse::value(
+                            sinomo_core::network::ObjectRpcResponse::encode_body(
+                                "/test/daemon-local-target",
+                                &"local-main",
+                            )?,
+                        ),
+                    )
+                },
+            )
+            .await
+            .expect("serve local target request");
+        });
+
+        let result =
+            super::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
+                &daemon_paths,
+                &local_node,
+                sinomo_core::network::ObjectRpcCall::encode_value(
+                    "/test/daemon-local-target",
+                    "test",
+                    "request",
+                )
+                .expect("request"),
+                sinomo_core::network::ClusterObjectRpcOptions::default()
+                    .with_overall_timeout(Duration::from_secs(2)),
+                &tokio::runtime::Handle::current(),
+                true,
+            )
+            .await
+            .expect("local target uses explicit daemon service path");
+        assert_eq!(
+            result.decode_body::<String>().await.expect("response body"),
+            "local-main"
+        );
+        server.await.expect("local daemon server");
+
+        status.cluster.as_mut().expect("cluster status").process = "daemon-shadow".to_string();
+        crate::write_daemon_status(&daemon_paths, &status).expect("shadow daemon status");
+        let error =
+            super::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
+                &daemon_paths,
+                &local_node,
+                sinomo_core::network::ObjectRpcCall::encode_value(
+                    "/test/daemon-local-target",
+                    "test",
+                    "request",
+                )
+                .expect("request"),
+                sinomo_core::network::ClusterObjectRpcOptions::default()
+                    .with_overall_timeout(Duration::from_secs(2)),
+                &tokio::runtime::Handle::current(),
+                true,
+            )
+            .await
+            .expect_err("shadow daemon status must not authorize the local main service path");
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("local main-daemon status does not own cluster")
+        );
+    }
 
     #[test]
     fn synchronous_client_runtime_keeps_background_tasks_alive_between_calls() {
