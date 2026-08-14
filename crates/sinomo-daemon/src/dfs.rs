@@ -5674,6 +5674,19 @@ pub(crate) fn handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
                 // proof; a corrupt or unavailable durability root fails closed.
                 let status = store.status()?;
                 if status.pending_marker_count > 0 || status.requires_full_recovery() {
+                    // A marker can become recoverable solely because the
+                    // adapter process released its session/operation locks.
+                    // That transition has no in-process producer to wake the
+                    // reactive maintenance scheduler. The next mount probe is
+                    // therefore the causal edge which requests recovery. Do
+                    // not wake for live/deferred markers: their bounded
+                    // re-probe deadline remains the owner of that wait.
+                    if status.exact_recovery_marker_count > 0
+                        || status.full_recovery_marker_count > 0
+                        || status.malformed_marker_count > 0
+                    {
+                        notify_daemon_dfs_maintenance_work();
+                    }
                     return Err(daemon_dfs_mounted_mutation_protocol_error(format!(
                         "mounted-mutation handoff is not ready: pending={}, live={}, exact_recovery={}, full_recovery={}, unproven={}, malformed={}, overflow={}, directory_scan_overflow={}",
                         status.pending_marker_count,
@@ -13295,6 +13308,21 @@ mod tests {
             .expect("dead-session classifier");
         assert_eq!(dead.mounted_mutation_recoverable_full_count, 1);
         assert!(dead.should_trigger_background_maintenance());
+        let wake_count = daemon_dfs_maintenance_wake_count();
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .is_err(),
+            "a recoverable marker still gates the replacement mount"
+        );
+        assert!(
+            daemon_dfs_maintenance_wake_count() > wake_count,
+            "the readiness probe must wake reactive recovery after the mount locks disappear"
+        );
         let claim = store
             .try_claim_recovery(&marker_id)
             .expect("dead-session claim")
