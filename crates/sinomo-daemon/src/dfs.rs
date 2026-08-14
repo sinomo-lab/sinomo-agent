@@ -7327,16 +7327,22 @@ fn daemon_dfs_perf_trace_with_traceparent(
 fn read_daemon_dfs_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
 ) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
     // The cluster state is immutable for the duration of this request. Reuse
     // the cluster-owned resident snapshot instead of reopening and decoding
     // state.sobj for every routed DFS message. In-process writers invalidate
     // this cache immediately, while external replacements are fenced by the
-    // existing short file-generation validation lease.
-    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)
-        .map_err(daemon_dfs_network_error)?;
+    // existing short file-generation validation lease. Do not probe `exists`
+    // first: on Windows, a concurrent durable ReplaceFileW publication can
+    // make that independent namespace query briefly report the destination as
+    // absent even though the resident snapshot remains valid for the lease.
+    // The cache reader owns the absent-state decision and still reports a true
+    // orphan once no current or leased snapshot exists.
+    let state =
+        match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
+            Ok(state) => state,
+            Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
+            Err(error) => return Err(daemon_dfs_network_error(error)),
+        };
     let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
     Ok(Some(DaemonDfsMessagePeerSnapshot {
         cluster_id: state.cluster_id.clone(),
@@ -12580,6 +12586,38 @@ mod tests {
             Arc::as_ptr(&async_peer_transport) as *const (),
             "blocking and async DFS calls must reuse one peer transport adapter"
         );
+    }
+
+    #[test]
+    fn daemon_dfs_peer_snapshot_retains_the_leased_state_during_replacement() {
+        let root = temp_root("daemon-dfs-peer-snapshot-replacement");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_daemon_dfs_peer_snapshot_replacement")
+                .expect("cluster id"),
+            "daemon DFS peer snapshot replacement",
+            NodeId::from_legacy_named("node_daemon_dfs_peer_snapshot_replacement")
+                .expect("node id"),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+
+        let first = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read initial peer snapshot")
+            .expect("initial peer snapshot");
+        fs::remove_file(&cluster_paths.state).expect("simulate replacement namespace cut");
+        let leased = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read leased peer snapshot")
+            .expect("leased peer snapshot must survive the replacement cut");
+
+        assert_eq!(leased.cluster_id, first.cluster_id);
+        assert_eq!(leased.local_node_id, first.local_node_id);
+        assert_eq!(leased.peer_node_ids, first.peer_node_ids);
     }
 
     #[test]
