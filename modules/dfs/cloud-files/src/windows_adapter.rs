@@ -52,7 +52,10 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::IO::{
     CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+    WaitForMultipleObjects,
+};
 use windows::core::{HRESULT, PCWSTR};
 
 use super::{
@@ -101,6 +104,8 @@ const DIRECTORY_CHANGES_PER_PASS: usize = 64;
 const DEFERRED_CAPTURE_RETRIES_MAX: usize = 4_096;
 const LOCAL_STARTUP_SCAN_WORK_PER_PASS: usize = 32;
 const WORKER_HEARTBEAT_MILLIS: u64 = 1_000;
+const PENDING_RECONCILIATION_DELAY_MILLIS: u64 = 100;
+const WORKER_WAIT_SLICE_MILLIS: u64 = 50;
 const SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CURSOR_RECOVERY_SENTINEL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -112,6 +117,27 @@ fn adapter_error(code: &str, detail: impl Into<String>) -> CloudFilesModuleError
         code: code.to_string(),
         detail: detail.into(),
     }
+}
+
+fn writable_worker_poll_delay_millis(
+    ordinary_reconciliation_pending: bool,
+    cursor_recovery_immediate: bool,
+) -> u64 {
+    if cursor_recovery_immediate {
+        0
+    } else if ordinary_reconciliation_pending {
+        PENDING_RECONCILIATION_DELAY_MILLIS
+    } else {
+        WORKER_HEARTBEAT_MILLIS
+    }
+}
+
+fn enter_writable_worker_background_mode() -> Result<(), String> {
+    // SAFETY: GetCurrentThread returns the pseudo-handle for this worker, and
+    // THREAD_MODE_BACKGROUND_BEGIN is defined specifically for the calling
+    // thread. The mode lasts only until this dedicated worker exits.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) }
+        .map_err(|error| format!("set Cloud Files reconciliation thread background mode: {error}"))
 }
 
 fn lock_service<T>(
@@ -4610,8 +4636,8 @@ impl WindowsWritableWorkerHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_alive = Arc::clone(&alive);
-        let immediate_reconciliation = Arc::new(AtomicBool::new(false));
-        let thread_immediate_reconciliation = Arc::clone(&immediate_reconciliation);
+        let ordinary_reconciliation_pending = Arc::new(AtomicBool::new(false));
+        let thread_ordinary_reconciliation_pending = Arc::clone(&ordinary_reconciliation_pending);
         let failure_emitter = emitter.clone();
         let (failure_sender, failure) = mpsc::channel();
         let (progress_sender, progress) = mpsc::sync_channel(1);
@@ -4621,6 +4647,9 @@ impl WindowsWritableWorkerHandle {
         let worker_join = thread::Builder::new()
             .name("sinomo-cloud-files-writable-sync".to_string())
             .spawn(move || {
+                if let Err(error) = enter_writable_worker_background_mode() {
+                    super::host_log(&error);
+                }
                 let progress_emitter = emitter;
                 let last_generation = AtomicU64::new(initial_generation);
                 let mut cursor_recovery_terminal_emitted = false;
@@ -4639,8 +4668,8 @@ impl WindowsWritableWorkerHandle {
                                 &thread_cancelled,
                                 || {
                                     let result = worker.run_once(&thread_cancelled);
-                                    thread_immediate_reconciliation.store(
-                                        worker.ordinary_reconciliation_should_run_immediately(),
+                                    thread_ordinary_reconciliation_pending.store(
+                                        worker.ordinary_reconciliation_remains_pending(),
                                         Ordering::SeqCst,
                                     );
                                     result.map(|_| worker.state().status())
@@ -4674,23 +4703,25 @@ impl WindowsWritableWorkerHandle {
                             }
                         },
                         |cancelled| {
-                            let should_run_immediately = || {
-                                thread_immediate_reconciliation.load(Ordering::SeqCst)
-                                    || thread_cursor_recovery.as_ref().is_some_and(
-                                        CloudFilesCursorRecoveryControl::should_run_immediately,
-                                    )
+                            let cursor_recovery_should_run_immediately = || {
+                                thread_cursor_recovery.as_ref().is_some_and(
+                                    CloudFilesCursorRecoveryControl::should_run_immediately,
+                                )
                             };
-                            if should_run_immediately() {
-                                return;
-                            }
-                            for _ in 0..(WORKER_HEARTBEAT_MILLIS / 50) {
+                            let wait_millis = writable_worker_poll_delay_millis(
+                                thread_ordinary_reconciliation_pending.load(Ordering::SeqCst),
+                                cursor_recovery_should_run_immediately(),
+                            );
+                            for _ in 0..wait_millis.div_ceil(WORKER_WAIT_SLICE_MILLIS) {
                                 if cancelled.load(Ordering::SeqCst) {
                                     break;
                                 }
-                                if should_run_immediately() {
+                                if cursor_recovery_should_run_immediately() {
                                     break;
                                 }
-                                thread::sleep(std::time::Duration::from_millis(50));
+                                thread::sleep(std::time::Duration::from_millis(
+                                    WORKER_WAIT_SLICE_MILLIS,
+                                ));
                             }
                         },
                     )
@@ -4935,6 +4966,14 @@ mod tests {
             changes,
             overflowed: false,
         }
+    }
+
+    #[test]
+    fn pending_reconciliation_is_paced_but_cursor_recovery_remains_immediate() {
+        assert_eq!(writable_worker_poll_delay_millis(false, false), 1_000);
+        assert_eq!(writable_worker_poll_delay_millis(true, false), 100);
+        assert_eq!(writable_worker_poll_delay_millis(false, true), 0);
+        assert_eq!(writable_worker_poll_delay_millis(true, true), 0);
     }
 
     fn directory_change_record(action: u32, name: &[u16]) -> Vec<u8> {

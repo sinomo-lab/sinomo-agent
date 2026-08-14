@@ -2940,7 +2940,7 @@ where
         self.cursor_recovery.clone()
     }
 
-    pub(crate) fn ordinary_reconciliation_should_run_immediately(&self) -> bool {
+    pub(crate) fn ordinary_reconciliation_remains_pending(&self) -> bool {
         self.full_scan_pending || self.startup_scan_baseline.is_some()
     }
 
@@ -8334,7 +8334,7 @@ mod tests {
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
         assert!(progress.full_scan_applied);
         assert!(worker.full_scan_pending);
-        assert!(worker.ordinary_reconciliation_should_run_immediately());
+        assert!(worker.ordinary_reconciliation_remains_pending());
         assert!(worker.state().queue().operations().any(|operation| {
             operation.request.capture_id.as_deref() == Some("during-pending-scan")
         }));
