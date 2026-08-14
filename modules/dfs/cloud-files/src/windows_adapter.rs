@@ -646,6 +646,22 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
             if let Some(active) = plan.active_page.as_mut()
                 && let Some(child) = active.entries.pop_front()
             {
+                // A crash can persist an already-open directory page before
+                // the parent placeholder effect completes. Carry the parent
+                // in every resumed page snapshot so recovery still orders the
+                // directory before the next child.
+                if active.task.path != root {
+                    let stat = lock_service(&self.service)?
+                        .posix_lstat_distributed(&active.task.path)
+                        .map_err(|error| {
+                            format!(
+                                "authoritative stat of resumed materialized Cloud Files directory `{}`: {error}",
+                                active.task.path
+                            )
+                        })?;
+                    let entry = materialized_directory_manifest_entry(stat)?;
+                    manifest.insert(entry.path.clone(), entry);
+                }
                 match lock_service(&self.service)?.posix_lstat_distributed(&child.path) {
                     Ok(stat) if stat.kind != DfsObjectKind::Tombstone => {
                         if cloud_files_object_projection(&stat.kind)
