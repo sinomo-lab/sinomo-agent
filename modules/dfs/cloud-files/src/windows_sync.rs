@@ -2940,6 +2940,10 @@ where
         self.cursor_recovery.clone()
     }
 
+    pub(crate) fn ordinary_reconciliation_should_run_immediately(&self) -> bool {
+        self.full_scan_pending || self.startup_scan_baseline.is_some()
+    }
+
     pub(crate) fn finalize_cursor_recovery_after_host_ready(
         &mut self,
     ) -> Result<bool, CloudFilesWindowsSyncError> {
@@ -8330,6 +8334,7 @@ mod tests {
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
         assert!(progress.full_scan_applied);
         assert!(worker.full_scan_pending);
+        assert!(worker.ordinary_reconciliation_should_run_immediately());
         assert!(worker.state().queue().operations().any(|operation| {
             operation.request.capture_id.as_deref() == Some("during-pending-scan")
         }));

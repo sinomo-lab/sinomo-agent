@@ -4610,6 +4610,8 @@ impl WindowsWritableWorkerHandle {
         let alive = Arc::new(AtomicBool::new(true));
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_alive = Arc::clone(&alive);
+        let immediate_reconciliation = Arc::new(AtomicBool::new(false));
+        let thread_immediate_reconciliation = Arc::clone(&immediate_reconciliation);
         let failure_emitter = emitter.clone();
         let (failure_sender, failure) = mpsc::channel();
         let (progress_sender, progress) = mpsc::sync_channel(1);
@@ -4636,9 +4638,12 @@ impl WindowsWritableWorkerHandle {
                             run_retrying_namespace_read_pass(
                                 &thread_cancelled,
                                 || {
-                                    worker
-                                        .run_once(&thread_cancelled)
-                                        .map(|_| worker.state().status())
+                                    let result = worker.run_once(&thread_cancelled);
+                                    thread_immediate_reconciliation.store(
+                                        worker.ordinary_reconciliation_should_run_immediately(),
+                                        Ordering::SeqCst,
+                                    );
+                                    result.map(|_| worker.state().status())
                                 },
                                 |cancelled| {
                                     for _ in 0..5 {
@@ -4669,18 +4674,20 @@ impl WindowsWritableWorkerHandle {
                             }
                         },
                         |cancelled| {
-                            if thread_cursor_recovery.as_ref().is_some_and(
-                                CloudFilesCursorRecoveryControl::should_run_immediately,
-                            ) {
+                            let should_run_immediately = || {
+                                thread_immediate_reconciliation.load(Ordering::SeqCst)
+                                    || thread_cursor_recovery.as_ref().is_some_and(
+                                        CloudFilesCursorRecoveryControl::should_run_immediately,
+                                    )
+                            };
+                            if should_run_immediately() {
                                 return;
                             }
                             for _ in 0..(WORKER_HEARTBEAT_MILLIS / 50) {
                                 if cancelled.load(Ordering::SeqCst) {
                                     break;
                                 }
-                                if thread_cursor_recovery.as_ref().is_some_and(
-                                    CloudFilesCursorRecoveryControl::should_run_immediately,
-                                ) {
+                                if should_run_immediately() {
                                     break;
                                 }
                                 thread::sleep(std::time::Duration::from_millis(50));
