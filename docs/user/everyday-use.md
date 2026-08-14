@@ -82,11 +82,14 @@ In the graphical app, open **Settings > Agents** to manage the same package
 surface. The tool picker includes provider-backed web search and image
 generation, and lists whether every packaged tool works in chat, realtime
 voice, or both. Its **External integrations** area manages per-agent Streamable
-HTTP MCP servers. MCP credentials are environment-variable references rather
+HTTP MCP servers. Each server has a **Protocol** setting that defaults to
+detecting whether the endpoint speaks the stateless MCP revision (2026-07-28) or
+the older `initialize` handshake, and can be pinned to either when an endpoint
+mishandles the probe. MCP credentials are environment-variable references rather
 than stored secret values. Granting or revoking the required node-local
 permission is an explicit, confirmed action in the same area; after saving an
-agent, **Test readiness** connects to enabled servers and reports the discovered
-tool names. Realtime voice can also hand coding, research, or longer work to the
+agent, **Test readiness** connects to enabled servers and reports the negotiated
+protocol version, the server that answered, and the discovered tool names. Realtime voice can also hand coding, research, or longer work to the
 same regular agent and bring the result back into the live conversation.
 
 Live sessions expose explicit control commands:

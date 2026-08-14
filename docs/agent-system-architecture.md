@@ -425,7 +425,7 @@ individual tool names:
 ## MCP Tools
 
 Agent packages may declare bounded Streamable HTTP MCP servers under
-`tool_runtime.mcp_servers`. Sinomo initializes each enabled server, discovers
+`tool_runtime.mcp_servers`. Sinomo connects to each enabled server, discovers
 its tools, and registers namespaced tools such as `mcp__docs__search` in the
 ordinary `AgentToolRegistry`. The same executor is consequently available to
 turn-based chat and realtime voice; MCP is not a second tool implementation
@@ -440,6 +440,7 @@ An agent package can contain a runtime fragment like:
       {
         "name": "docs",
         "url": "https://mcp.example.net/v1",
+        "protocol_era": "auto",
         "required": false,
         "allowed_tools": ["search", "fetch"],
         "bearer_token_env": "SINOMO_MCP_DOCS_TOKEN"
@@ -448,6 +449,35 @@ An agent package can contain a runtime fragment like:
   }
 }
 ```
+
+### Protocol eras
+
+MCP revision `2026-07-28` removed the `initialize` handshake and protocol-level
+sessions. Sinomo's client speaks both generations and `protocol_era` selects
+which:
+
+- `auto` (the default) opens with `server/discover`, the RPC every stateless
+  server must implement. A reply, or one of the error codes the specification
+  reserves for itself (`-32020` header mismatch, `-32021` missing client
+  capability, `-32022` unsupported version), settles the endpoint as stateless.
+  Anything else identifies a handshake-era server and the client falls back to
+  `initialize`. The era is decided once per connection.
+- `modern` pins the stateless protocol and reports an error rather than falling
+  back, for endpoints that must not be probed twice.
+- `legacy` skips the probe entirely and negotiates `2025-06-18`, with
+  `2025-03-26` and `2024-11-05` accepted if the server selects them.
+
+Stateless requests carry `io.modelcontextprotocol/protocolVersion`,
+`clientInfo`, and `clientCapabilities` in every `params._meta`, and mirror
+`Mcp-Method`, `Mcp-Name`, and any `x-mcp-header`-annotated tool arguments into
+`Mcp-Param-*` request headers so intermediaries can route without parsing
+bodies. Header values that are not plain visible ASCII travel Base64-wrapped in
+the specification's `=?base64?…?=` sentinel. Sinomo declares no client
+capabilities: it provides no roots, sampling, or elicitation, so a server that
+answers with an `input_required` result — the multi round-trip request pattern —
+is reported as an error rather than driven. A tool whose `x-mcp-header`
+annotations are malformed is dropped on its own and reported in the readiness
+check; the rest of the server's catalog still registers.
 
 Definitions contain only environment-variable names; values are resolved on
 the executing node and credential references must use the dedicated
@@ -464,9 +494,10 @@ an unavailable server marked `required` prevents that agent registry from
 being reconfigured. Server responses, tool counts, pagination, startup, and
 calls are bounded. This implementation supports Streamable HTTP JSON/SSE;
 non-loopback endpoints must use HTTPS and redirects are rejected. Stdio process
-spawning and OAuth negotiation are not part of this host path. After granting a
-previously denied integration, reopen or otherwise reconfigure the agent
-session so tool discovery can run.
+spawning, OAuth negotiation, resources, prompts, and `subscriptions/listen`
+change streams are not part of this host path. After granting a previously
+denied integration, reopen or otherwise reconfigure the agent session so tool
+discovery can run.
 
 ## Runtime Services and Live Control
 

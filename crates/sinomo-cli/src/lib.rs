@@ -4140,20 +4140,28 @@ pub(crate) fn agent_package_inspection_text(definition: &AgentDefinition) -> Str
     } else {
         output.push_str("    MCP servers:\n");
         for server in &definition.tool_runtime.mcp_servers {
-            output.push_str(&format!(
-                "      {}: {} ({}, {})\n",
-                server.name,
-                server.url,
+            let mut facets = vec![
                 if server.enabled {
                     "enabled"
                 } else {
                     "disabled"
-                },
+                }
+                .to_string(),
                 if server.required {
                     "required"
                 } else {
                     "optional"
                 }
+                .to_string(),
+            ];
+            if !server.protocol_era.is_default() {
+                facets.push(format!("{} protocol", server.protocol_era.as_str()));
+            }
+            output.push_str(&format!(
+                "      {}: {} ({})\n",
+                server.name,
+                server.url,
+                facets.join(", ")
             ));
         }
     }

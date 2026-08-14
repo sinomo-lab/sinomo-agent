@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use sinomo_agent::{
     AgentCatalog, AgentDefinition, AgentDefinitionSifsStore, AgentDefinitionStore,
-    AgentPackageProvenance, AgentPackageSource, AgentRole, AgentToolRegistry,
+    AgentMcpRegistration, AgentPackageProvenance, AgentPackageSource, AgentRole, AgentToolRegistry,
     register_mcp_server_tools,
 };
 use sinomo_runtime::node::LocalNodePermissionStore;
@@ -343,24 +343,7 @@ impl Backend {
                     let registry = AgentToolRegistry::new();
                     let result = register_mcp_server_tools(&registry, server);
                     let (passed, detail) = match result {
-                        Ok(registration) => {
-                            let tools = registration.tools;
-                            let detail = if tools.is_empty() {
-                                "Connected successfully; the configured allow-list exposes no tools"
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "Connected and discovered {}: {}",
-                                    if tools.len() == 1 {
-                                        "1 tool".to_string()
-                                    } else {
-                                        format!("{} tools", tools.len())
-                                    },
-                                    tools.join(", ")
-                                )
-                            };
-                            (true, detail)
-                        }
+                        Ok(registration) => (true, mcp_registration_detail(&registration)),
                         Err(error) if !server.required => (
                             true,
                             format!("Optional server is currently unavailable: {error}"),
@@ -414,6 +397,36 @@ impl AgentConfigSummary {
             sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
         }
     }
+}
+
+/// Readiness detail for one MCP server: which protocol revision the transport
+/// settled on, who answered, what it exposed, and anything the client refused.
+fn mcp_registration_detail(registration: &AgentMcpRegistration) -> String {
+    let mut connected = format!("Connected over MCP {}", registration.protocol_version);
+    if let Some(server_info) = registration.server_info.as_deref() {
+        connected.push_str(&format!(" to {server_info}"));
+    }
+    let mut parts = vec![connected];
+    parts.push(if registration.tools.is_empty() {
+        "the configured allow-list exposes no tools".to_string()
+    } else {
+        format!(
+            "discovered {}: {}",
+            if registration.tools.len() == 1 {
+                "1 tool".to_string()
+            } else {
+                format!("{} tools", registration.tools.len())
+            },
+            registration.tools.join(", ")
+        )
+    });
+    if !registration.rejected_tools.is_empty() {
+        parts.push(format!(
+            "skipped {}",
+            registration.rejected_tools.join(", ")
+        ));
+    }
+    parts.join("; ")
 }
 
 fn agent_default_model_label(definition: &AgentDefinition) -> String {

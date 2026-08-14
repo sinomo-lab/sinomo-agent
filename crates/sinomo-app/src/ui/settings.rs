@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sinomo_agent::{
-    AgentDefinition, AgentMcpServerDefinition, AgentOutputFormat, AgentPackageDefinition,
-    AgentRole, AgentToolDescriptor, AgentToolInvocationMode, AgentToolSpec,
+    AgentDefinition, AgentMcpProtocolEra, AgentMcpServerDefinition, AgentOutputFormat,
+    AgentPackageDefinition, AgentRole, AgentToolDescriptor, AgentToolInvocationMode, AgentToolSpec,
     agent_home_sifs_path_for_id, default_agent_tool_descriptors, image_generation_descriptor,
     web_search_descriptor,
 };
@@ -1375,6 +1375,7 @@ struct AgentMcpServerForm {
     url: String,
     enabled: bool,
     required: bool,
+    protocol_era_index: usize,
     allowed_tools_text: String,
     bearer_token_env: String,
     headers_from_env_text: String,
@@ -1390,6 +1391,7 @@ impl AgentMcpServerForm {
             url: server.url.clone(),
             enabled: server.enabled,
             required: server.required,
+            protocol_era_index: mcp_protocol_era_index(server.protocol_era),
             allowed_tools_text: server.allowed_tools.join("\n"),
             bearer_token_env: server.bearer_token_env.clone().unwrap_or_default(),
             headers_from_env_text: server
@@ -1418,6 +1420,7 @@ impl AgentMcpServerForm {
             name: self.name.trim().to_string(),
             url: self.url.trim().to_string(),
             enabled: self.enabled,
+            protocol_era: mcp_protocol_era_for_index(self.protocol_era_index),
             required: self.required,
             allowed_tools: parse_agent_list(&self.allowed_tools_text),
             bearer_token_env: optional_trimmed_string(&self.bearer_token_env),
@@ -1508,6 +1511,11 @@ enum DeviceLoginEvent {
     Failed(String),
 }
 
+const AGENT_MCP_PROTOCOL_ERA_OPTIONS: &[&str] = &[
+    "Detect automatically",
+    "Stateless (2026-07-28)",
+    "Handshake (2025-11-25 and earlier)",
+];
 const AGENT_ROLE_OPTIONS: &[&str] = &["Main", "Background", "Deliberation", "Evolution"];
 const AGENT_OUTPUT_FORMAT_OPTIONS: &[&str] = &["JSON decision", "Plain text"];
 
@@ -5106,6 +5114,22 @@ fn role_for_index(index: usize) -> AgentRole {
         2 => AgentRole::Deliberation,
         3 => AgentRole::Evolution,
         _ => AgentRole::Main,
+    }
+}
+
+fn mcp_protocol_era_index(era: AgentMcpProtocolEra) -> usize {
+    match era {
+        AgentMcpProtocolEra::Auto => 0,
+        AgentMcpProtocolEra::Modern => 1,
+        AgentMcpProtocolEra::Legacy => 2,
+    }
+}
+
+fn mcp_protocol_era_for_index(index: usize) -> AgentMcpProtocolEra {
+    match index {
+        1 => AgentMcpProtocolEra::Modern,
+        2 => AgentMcpProtocolEra::Legacy,
+        _ => AgentMcpProtocolEra::Auto,
     }
 }
 
@@ -11036,7 +11060,7 @@ fn agent_external_integrations_sections(
                 shared,
                 reader,
                 "Transport",
-                "Streamable HTTP · Chat + voice",
+                "Streamable HTTP · MCP 2026-07-28 with handshake fallback · Chat + voice",
             ))
             .with_child(value_row(shared, reader, "Servers", server_summary))
             .with_child(
@@ -11046,7 +11070,7 @@ fn agent_external_integrations_sections(
             ),
     )
     .description(
-        "Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Save the agent, then run its readiness test to connect and discover exposed tools.",
+        "Each server is stored in this agent package. Secrets remain node-local environment variables beginning with SINOMO_MCP_. Leave the protocol on automatic unless an endpoint mishandles the stateless probe. Save the agent, then run its readiness test to connect and discover exposed tools.",
     )
     .theme_when(clone_reader(reader));
 
@@ -11111,6 +11135,35 @@ fn agent_mcp_server_section(
             },
         ));
     let url_id = server.ui_id;
+    let protocol_id = server.ui_id;
+    let protocol = {
+        let selected = shared.clone();
+        let s = shared.clone();
+        select_row(
+            reader,
+            &input_name("protocol"),
+            "Protocol",
+            AGENT_MCP_PROTOCOL_ERA_OPTIONS,
+            move || {
+                Some(
+                    selected
+                        .settings()
+                        .agent_form
+                        .mcp_servers
+                        .iter()
+                        .find(|server| server.ui_id == protocol_id)
+                        .map_or(0, |server| server.protocol_era_index),
+                )
+            },
+            move |index, _label| {
+                s.settings_mut()
+                    .update_agent_mcp_server(protocol_id, |server| {
+                        server.protocol_era_index =
+                            index.min(AGENT_MCP_PROTOCOL_ERA_OPTIONS.len().saturating_sub(1));
+                    });
+            },
+        )
+    };
     body = body
         .with_child(agent_text_row(
             shared,
@@ -11123,6 +11176,7 @@ fn agent_mcp_server_section(
                 settings.update_agent_mcp_server(url_id, |server| server.url = value)
             },
         ))
+        .with_child(protocol)
         .with_child(enabled)
         .with_child(required);
     let allowed_id = server.ui_id;
@@ -11748,7 +11802,11 @@ fn agent_mcp_servers_summary(definition: &AgentDefinition) -> String {
             } else {
                 "optional"
             };
-            format!("{} ({state}, {requirement})", server.name)
+            let mut facets = vec![state.to_string(), requirement.to_string()];
+            if !server.protocol_era.is_default() {
+                facets.push(format!("{} protocol", server.protocol_era.as_str()));
+            }
+            format!("{} ({})", server.name, facets.join(", "))
         })
         .collect::<Vec<_>>()
         .join(" · ")
@@ -17586,10 +17644,16 @@ mod tests {
         state.create_agent();
         state.add_agent_mcp_server();
         let ui_id = state.agent_form.mcp_servers[0].ui_id;
+        assert_eq!(
+            state.agent_form.mcp_servers[0].protocol_era_index,
+            mcp_protocol_era_index(AgentMcpProtocolEra::Auto),
+            "new servers probe for the stateless protocol by default"
+        );
         state.update_agent_mcp_server(ui_id, |server| {
             server.name = "workspace".to_string();
             server.url = "https://mcp.example.test/tools".to_string();
             server.required = true;
+            server.protocol_era_index = mcp_protocol_era_index(AgentMcpProtocolEra::Legacy);
             server.allowed_tools_text = "read_file\nedit_file".to_string();
             server.bearer_token_env = "SINOMO_MCP_WORKSPACE_TOKEN".to_string();
             server.headers_from_env_text = "X-Tenant: SINOMO_MCP_WORKSPACE_TENANT".to_string();
@@ -17618,6 +17682,17 @@ mod tests {
         );
         assert_eq!(server.startup_timeout_ms, 2500);
         assert_eq!(server.tool_timeout_ms, 45000);
+        assert_eq!(server.protocol_era, AgentMcpProtocolEra::Legacy);
+        assert!(
+            agent_mcp_servers_summary(&definition).contains("legacy protocol"),
+            "a pinned protocol is visible without opening the editor"
+        );
+
+        let reloaded = AgentMcpServerForm::from_definition(ui_id, server);
+        assert_eq!(
+            reloaded.protocol_era_index,
+            mcp_protocol_era_index(AgentMcpProtocolEra::Legacy)
+        );
 
         state.remove_agent_mcp_server(ui_id);
         assert!(state.agent_form.mcp_servers.is_empty());

@@ -699,12 +699,48 @@ impl AgentToolRuntimeDefinition {
     }
 }
 
+/// Which generation of the MCP wire protocol a server is expected to speak.
+///
+/// Revision `2026-07-28` removed the `initialize` handshake and protocol-level
+/// sessions: version, identity, and capabilities travel in every request's
+/// `_meta`. Earlier revisions negotiate once and keep session state. A single
+/// endpoint may implement either, or both.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMcpProtocolEra {
+    /// Probe for the stateless protocol and fall back to the handshake when the
+    /// endpoint does not answer `server/discover`.
+    #[default]
+    Auto,
+    /// Require the stateless per-request protocol (`2026-07-28` or later).
+    Modern,
+    /// Use the `initialize` handshake without probing (`2025-11-25` or earlier).
+    Legacy,
+}
+
+impl AgentMcpProtocolEra {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Modern => "modern",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct AgentMcpServerDefinition {
     pub name: String,
     pub url: String,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub enabled: bool,
+    /// Wire-protocol generation to use for this endpoint. Defaults to probing.
+    #[serde(default, skip_serializing_if = "AgentMcpProtocolEra::is_default")]
+    pub protocol_era: AgentMcpProtocolEra,
     /// When true, an unavailable server prevents the agent tool registry from
     /// being configured. Optional servers are skipped with an operator warning.
     #[serde(default)]
@@ -733,6 +769,7 @@ impl AgentMcpServerDefinition {
             name: name.into(),
             url: url.into(),
             enabled: true,
+            protocol_era: AgentMcpProtocolEra::default(),
             required: false,
             allowed_tools: Vec::new(),
             bearer_token_env: None,
@@ -1524,11 +1561,13 @@ pub(crate) fn mcp_header_name_is_transport_controlled(value: &str) -> bool {
             | "content-length"
             | "content-type"
             | "host"
+            | "mcp-method"
+            | "mcp-name"
             | "mcp-protocol-version"
             | "mcp-session-id"
             | "transfer-encoding"
             | "user-agent"
-    )
+    ) || value.starts_with("mcp-param-")
 }
 
 pub(crate) fn validate_mcp_env_name(value: &str) -> Result<(), String> {
