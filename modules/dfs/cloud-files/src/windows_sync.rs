@@ -1515,6 +1515,44 @@ impl<R: Read> Read for CancellationReader<R> {
     }
 }
 
+fn definitive_namespace_conflict(error: &dfs::DfsPosixError) -> Option<CloudFilesConflictEvidence> {
+    let code = match error {
+        dfs::DfsPosixError::NotFound { .. } => "namespace-not-found",
+        dfs::DfsPosixError::AlreadyExists { .. } => "namespace-already-exists",
+        dfs::DfsPosixError::NotDirectory { .. } => "namespace-not-directory",
+        dfs::DfsPosixError::IsDirectory { .. } => "namespace-is-directory",
+        dfs::DfsPosixError::NotSymlink { .. } => "namespace-not-symlink",
+        dfs::DfsPosixError::MissingParent { .. } => "namespace-missing-parent",
+        dfs::DfsPosixError::InvalidPath { .. } => "namespace-invalid-path",
+        dfs::DfsPosixError::Conflict { .. } => "namespace-generation-conflict",
+        dfs::DfsPosixError::DirectoryNotEmpty { .. } => "namespace-directory-not-empty",
+        dfs::DfsPosixError::Dfs(_)
+        | dfs::DfsPosixError::Metadata(_)
+        | dfs::DfsPosixError::PendingWrite { .. }
+        | dfs::DfsPosixError::SymlinkContentPending { .. }
+        | dfs::DfsPosixError::PartialBulkCommit { .. } => return None,
+    };
+    Some(conflict_evidence(code, error.to_string()))
+}
+
+fn classify_definitive_namespace_mutation_report<R>(
+    report: dfs::MountedSifsMutationReport<Result<R, dfs::DfsPosixError>>,
+) -> dfs::MountedSifsMutationReport<Result<Result<R, CloudFilesConflictEvidence>, dfs::DfsPosixError>>
+{
+    let outcome = match report.outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) => match definitive_namespace_conflict(&error) {
+            Some(conflict) => Ok(Err(conflict)),
+            None => Err(error),
+        },
+    };
+    dfs::MountedSifsMutationReport {
+        outcome,
+        committed_work: report.committed_work,
+        committed_repair_records: report.committed_repair_records,
+    }
+}
+
 impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
     for CloudFilesDfsServiceMutationBackend<T>
 {
@@ -1561,20 +1599,27 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         &mut self,
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service
-                        .posix_mkdir_with_operation_id(&command.source_path, &command.operation_id)
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_mkdir_with_operation_id(
+                            &command.source_path,
+                            &command.operation_id,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn replace_file(
@@ -1620,23 +1665,28 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_unlink_if_generation(
-                        &command.source_path,
-                        command.operation_id.clone(),
-                        expected,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_unlink_if_generation(
+                            &command.source_path,
+                            command.operation_id.clone(),
+                            expected,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn rmdir(
@@ -1644,23 +1694,28 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_rmdir_if_generation(
-                        &command.source_path,
-                        command.operation_id.clone(),
-                        expected,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_rmdir_if_generation(
+                            &command.source_path,
+                            command.operation_id.clone(),
+                            expected,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn rename(
@@ -1673,25 +1728,30 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
             .ok_or_else(|| "rename command has no destination path".to_string())?;
         let source = namespace_object_precondition(required_source_precondition(command)?)?;
         let destination = namespace_destination_precondition(&command.preconditions.destination)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_rename_if_generation(
-                        &command.source_path,
-                        destination_path,
-                        command.operation_id.clone(),
-                        source,
-                        destination,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_rename_if_generation(
+                            &command.source_path,
+                            destination_path,
+                            command.operation_id.clone(),
+                            source,
+                            destination,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn reconcile(
@@ -5884,7 +5944,7 @@ mod tests {
     }
 
     #[test]
-    fn every_service_error_is_unknown_and_requires_full_recovery() {
+    fn unclassified_service_error_is_unknown_and_requires_full_recovery() {
         let root = TestRoot::new("handoff-service-error");
         let service = Arc::new(Mutex::new(0_u64));
         let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
@@ -5922,6 +5982,43 @@ mod tests {
             .ensure_ready()
             .expect_err("service error leaves the original ambiguity gated");
         assert!(gated.contains("service returned conflict"), "{gated}");
+    }
+
+    #[test]
+    fn definitive_namespace_conflict_commits_capture_without_gating_handoff() {
+        let root = TestRoot::new("handoff-definitive-namespace-conflict");
+        let service = Arc::new(Mutex::new(()));
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let outcome = handoff
+            .run_captured_mutation(
+                &service,
+                "cloud-operation-directory-not-empty",
+                "cloud-files.rmdir",
+                |_| {
+                    classify_definitive_namespace_mutation_report(empty_mutation_report(
+                        Err::<(), _>(dfs::DfsPosixError::DirectoryNotEmpty {
+                            path: "/services/non-empty".to_string(),
+                        }),
+                    ))
+                },
+            )
+            .expect("typed namespace conflict has a definitive handoff outcome")
+            .expect_err("directory-not-empty remains a user-visible conflict");
+        assert_eq!(outcome.code, "namespace-directory-not-empty");
+        assert!(outcome.detail.contains("directory is not empty"));
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "commit-applied"]
+        );
+        assert!(
+            store
+                .pending_marker_ids()
+                .expect("pending marker IDs")
+                .is_empty()
+        );
+        handoff
+            .ensure_ready()
+            .expect("definitive conflict leaves later mutations admitted");
     }
 
     #[test]
