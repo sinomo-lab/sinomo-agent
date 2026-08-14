@@ -1398,7 +1398,10 @@ where
         if target_node_id == &state.local_node_id {
             return Err(NetworkError::Io {
                 operation: "establish routed service RPC stream".to_string(),
-                detail: "local-node calls require the explicit local service path".to_string(),
+                detail: format!(
+                    "local-node calls require the explicit local service path for route {} in category {}",
+                    call.request.route, call.request.category,
+                ),
             });
         }
         let policy = options.call_policy();
