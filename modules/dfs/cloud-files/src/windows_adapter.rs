@@ -268,8 +268,7 @@ pub(super) fn subscribe_namespace_changes(
                         data_dir,
                         &address,
                         &request,
-                        DaemonRpcTimeouts::default()
-                            .with_connect_timeout(Some(Duration::from_secs(3))),
+                        namespace_event_stream_timeouts(),
                         |response| {
                             response.error_detail()?;
                             match response.decode_body::<sinomo_runtime::api::DaemonEventStreamItem>()? {
@@ -324,6 +323,15 @@ pub(super) fn subscribe_namespace_changes(
             ))
         }
     }
+}
+
+fn namespace_event_stream_timeouts() -> DaemonRpcTimeouts {
+    // Silence is the successful steady state for this subscription. Bound
+    // connection establishment, then let the already-established transport
+    // block until an event, explicit stop, or actual stream failure arrives.
+    // An idle transfer timeout would turn every quiet mount into a periodic
+    // provider restart and full reconciliation.
+    DaemonRpcTimeouts::connect_only(Duration::from_secs(3))
 }
 
 fn enter_writable_worker_background_mode() -> Result<(), String> {
@@ -5342,6 +5350,13 @@ mod tests {
         let error = materialized_directory_manifest_entry(test_stat(path, DfsObjectKind::File))
             .expect_err("a stale materialization path cannot silently become a file");
         assert!(error.contains("resolved as File"), "{error}");
+    }
+
+    #[test]
+    fn namespace_event_subscription_treats_idle_as_success() {
+        let timeouts = namespace_event_stream_timeouts();
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(timeouts.idle_timeout, None);
     }
 
     #[test]
