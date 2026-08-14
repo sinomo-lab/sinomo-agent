@@ -1901,6 +1901,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     // The service host is built before the maintenance loop so the loop can
     // publish the active service-registry snapshot's instances on its cluster
     // tick.
+    let service_host_ready_hooks = service_hooks.clone();
     let service_host = daemon_runtime.block_on(
         crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
             paths.clone(),
@@ -1995,6 +1996,12 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         )),
     ));
 
+    // The listener is already bound and will accept queued connections as
+    // soon as the runtime enters the loop below. Notify service-owned workers
+    // through an in-process edge so startup never depends on a polling timer.
+    for hook in &service_host_ready_hooks {
+        hook.notify_host_ready();
+    }
     daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),

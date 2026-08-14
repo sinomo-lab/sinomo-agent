@@ -117,6 +117,7 @@ pub struct DaemonServiceRegistryHook {
         >,
     >,
     register_observe_metric_exporters: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    host_ready: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl DaemonServiceRegistryHook {
@@ -132,6 +133,7 @@ impl DaemonServiceRegistryHook {
             register: std::sync::Arc::new(register),
             register_config_definitions: None,
             register_observe_metric_exporters: None,
+            host_ready: None,
         }
     }
 
@@ -156,6 +158,17 @@ impl DaemonServiceRegistryHook {
         self
     }
 
+    /// Registers a non-blocking notification fired immediately before the
+    /// daemon begins accepting service RPCs.
+    ///
+    /// Service-owned workers use this edge to leave startup states without a
+    /// timer. The callback must only signal already-created work; it must not
+    /// synchronously call back into the daemon that is about to serve it.
+    pub fn with_host_ready(mut self, notify: impl Fn() + Send + Sync + 'static) -> Self {
+        self.host_ready = Some(std::sync::Arc::new(notify));
+        self
+    }
+
     pub fn register_config_definitions(
         &self,
         builder: sinomo_config::ConfigRegistryBuilder,
@@ -176,6 +189,12 @@ impl DaemonServiceRegistryHook {
     pub fn register_observe_metric_exporters(&self) {
         if let Some(register) = &self.register_observe_metric_exporters {
             register();
+        }
+    }
+
+    pub fn notify_host_ready(&self) {
+        if let Some(notify) = &self.host_ready {
+            notify();
         }
     }
 }
@@ -359,4 +378,31 @@ pub fn register_storage_paths(
         "startup",
         "installed OS boot entries and launch scripts",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::DaemonServiceRegistryHook;
+
+    #[test]
+    fn service_registry_host_ready_is_an_explicit_one_shot_edge() {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&notifications);
+        let hook = DaemonServiceRegistryHook::new(|builder| builder).with_host_ready(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+
+        // Building the registry does not imply that its transport accepts
+        // requests yet. The daemon emits the readiness edge at that boundary.
+        let _ = hook.register(sinomo_core::service::ServiceRegistry::builder());
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+
+        hook.notify_host_ready();
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+    }
 }
