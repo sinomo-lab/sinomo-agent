@@ -108,10 +108,12 @@ const CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE: &str = "cursor-recovery-control.s
 const CLOUD_FILES_CURSOR_RECOVERY_MODULE_TEMP_LABEL: &str = "cursor-recovery-marker-next";
 const CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 const CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
-/// One Cloud Files DFS call must yield to cancellation promptly. Higher-level
-/// DFS operations may request longer deadlines, but this provider clamps each
-/// routed call and observes cancellation between bounded work items.
-const CLOUD_FILES_DFS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// One Cloud Files DFS call remains bounded so cancellation can make progress,
+/// but the bound must cover the daemon loopback hop plus a reused routed
+/// cluster stream and the authority's durable commit. Two seconds was shorter
+/// than a healthy routed namespace commit under load and converted successful
+/// stable operations into `PossiblyApplied` recovery cycles.
+const CLOUD_FILES_DFS_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_FILES_DFS_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_DFS_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_TRANSFER_ALIGNMENT_BYTES: u64 = 4 * 1024;
