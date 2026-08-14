@@ -597,6 +597,25 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
                     })?;
                 match page {
                     Ok(page) => {
+                        // A durable materialization ledger can outlive the
+                        // physical directory placeholder (for example, when a
+                        // provider restart follows a rolled-back registration).
+                        // Re-establish the enumerated directory itself before
+                        // later snapshots try to create any of its children.
+                        // The root is the registered sync-root directory and is
+                        // therefore not created as a child placeholder.
+                        if task.path != root {
+                            let stat = lock_service(&self.service)?
+                                .posix_lstat_distributed(&task.path)
+                                .map_err(|error| {
+                                    format!(
+                                        "authoritative stat of materialized Cloud Files directory `{}`: {error}",
+                                        task.path
+                                    )
+                                })?;
+                            let entry = materialized_directory_manifest_entry(stat)?;
+                            manifest.insert(entry.path.clone(), entry);
+                        }
                         audited_materialized_directories.push(task.path.clone());
                         plan.active_page = Some(WindowsActiveDirectoryPage {
                             task,
@@ -764,6 +783,18 @@ fn relative_depth(root: &str, path: &str) -> u32 {
         .count()
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+fn materialized_directory_manifest_entry(
+    stat: dfs::DfsStat,
+) -> Result<CloudFilesReconciledManifestEntry, String> {
+    if !matches!(stat.kind, DfsObjectKind::Directory | DfsObjectKind::Mount) {
+        return Err(format!(
+            "materialized Cloud Files directory `{}` resolved as {:?}",
+            stat.path, stat.kind
+        ));
+    }
+    Ok(manifest_entry_from_stat(stat))
 }
 
 fn manifest_entry_from_stat(stat: dfs::DfsStat) -> CloudFilesReconciledManifestEntry {
@@ -5269,6 +5300,48 @@ mod tests {
             changes,
             overflowed: false,
         }
+    }
+
+    fn test_stat(path: &str, kind: DfsObjectKind) -> dfs::DfsStat {
+        dfs::DfsStat {
+            file_system_id: dfs::sifs_file_system_id(),
+            object_id: sinomo_runtime::core::Id::derived(
+                "test.cloud-files.materialized-directory.object",
+                path.as_bytes(),
+            ),
+            path: path.to_string(),
+            kind,
+            version: sinomo_runtime::core::Id::derived(
+                "test.cloud-files.materialized-directory.version",
+                path.as_bytes(),
+            ),
+            content_hash: None,
+            size_bytes: None,
+            link_count: 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 2,
+            created_at_unix_nanos: 3,
+            changed_at_unix_nanos: 4,
+            policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            current_locations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn materialized_directory_scan_reintroduces_its_parent_manifest_entry() {
+        let path = "/services/sinomo-agent/channels";
+        let entry =
+            materialized_directory_manifest_entry(test_stat(path, DfsObjectKind::Directory))
+                .expect("materialized directory is projectable before its children");
+        assert_eq!(entry.path, path);
+        assert_eq!(entry.kind, "directory");
+
+        let error = materialized_directory_manifest_entry(test_stat(path, DfsObjectKind::File))
+            .expect_err("a stale materialization path cannot silently become a file");
+        assert!(error.contains("resolved as File"), "{error}");
     }
 
     #[test]
