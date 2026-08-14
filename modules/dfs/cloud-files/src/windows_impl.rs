@@ -1918,6 +1918,7 @@ fn cursor_recovery_mount_request(marker: &CursorRecoveryModuleMarker) -> CloudFi
         prepopulate_depth: identity.prepopulate_depth,
         connect: true,
         max_run_seconds: identity.max_run_seconds,
+        cancellation_event_handle: None,
         cursor_recovery: Some(CloudFilesCursorRecoveryContext {
             recovery_id: marker.recovery_id.clone(),
             recovery_token: marker.recovery_token.clone(),
@@ -3670,6 +3671,13 @@ fn mount_sifs_cloud_files_inner(
     lifecycle: &mut MountLifecycleState,
 ) -> Result<CloudFilesMountResponse, CloudFilesModuleError> {
     request.validate_supported_mode()?;
+    let cancellation_event_handle =
+        request
+            .cancellation_event_handle
+            .ok_or_else(|| CloudFilesModuleError {
+                code: "mount-cancellation-event".to_string(),
+                detail: "Cloud Files mount requires a host-owned cancellation event".to_string(),
+            })?;
     request.root_path = normalize_sifs_root(&request.root_path)?;
     lifecycle.root_path.clone_from(&request.root_path);
     let data_dir = resolve_data_dir(request.data_dir_root.clone())?;
@@ -3907,6 +3915,15 @@ fn mount_sifs_cloud_files_inner(
         };
     let shared_service = Arc::new(Mutex::new(opened.service));
     let materialized_directories = Arc::new(Mutex::new(BTreeSet::new()));
+    let writable_worker_wake = Arc::new(windows_adapter::WindowsWorkerWake::default());
+    let _namespace_event_subscription = match windows_adapter::subscribe_namespace_changes(
+        data_dir.clone(),
+        &request.root_path,
+        Arc::clone(&writable_worker_wake),
+    ) {
+        Ok(subscription) => subscription,
+        Err(error) => return Err(activation.fail(error, lifecycle)),
+    };
     // Existing placeholders need a connected provider before CFAPI can open
     // and validate their identities. Keep nested population parked until the
     // worker has re-established its durable Ready proof; cursor recovery keeps
@@ -3923,6 +3940,7 @@ fn mount_sifs_cloud_files_inner(
         cursor_recovery_marker.is_some(),
         Arc::clone(&materialized_directories),
         materialization_audit_intents,
+        Arc::clone(&writable_worker_wake),
     ));
 
     let write_options = dfs::DfsWriteOptions::replicated_eventual(opened.replica_candidates);
@@ -3931,6 +3949,7 @@ fn mount_sifs_cloud_files_inner(
         Arc::clone(&shared_service),
         write_options,
         Arc::clone(&mounted_mutation_handoff),
+        Arc::clone(&writable_worker_wake),
         windows_adapter::WindowsWritableWorkerOptions {
             sync_root: request.sync_root.clone(),
             root_path: request.root_path.clone(),
@@ -4005,6 +4024,7 @@ fn mount_sifs_cloud_files_inner(
     let mut writable_worker = match windows_adapter::WindowsWritableWorkerHandle::spawn(
         writable_worker,
         writable_worker_cancelled,
+        writable_worker_wake,
         emitter,
         1,
     ) {
@@ -4242,28 +4262,27 @@ fn mount_sifs_cloud_files_inner(
     ));
     let started = Instant::now();
     loop {
-        if host_is_cancelled() {
-            break;
+        let timeout = request.max_run_seconds.map(|max_run_seconds| {
+            Duration::from_secs(max_run_seconds).saturating_sub(started.elapsed())
+        });
+        match writable_worker.wait_for_stop_or_cancellation(cancellation_event_handle, timeout)? {
+            windows_adapter::WindowsWritableWorkerWait::Cancelled => break,
+            windows_adapter::WindowsWritableWorkerWait::TimedOut => break,
+            windows_adapter::WindowsWritableWorkerWait::Stopped => {
+                let failure =
+                    writable_worker
+                        .take_failure()
+                        .unwrap_or_else(|| CloudFilesModuleError {
+                            code: "writable-worker-stopped".to_string(),
+                            detail: "writable Cloud Files worker stopped without a terminal status"
+                                .to_string(),
+                        });
+                writable_worker.stop_and_join()?;
+                connection.disconnect()?;
+                lifecycle.connected = false;
+                return Err(failure);
+            }
         }
-        if !writable_worker.is_alive() {
-            let failure = writable_worker
-                .take_failure()
-                .unwrap_or_else(|| CloudFilesModuleError {
-                    code: "writable-worker-stopped".to_string(),
-                    detail: "writable Cloud Files worker stopped without a terminal status"
-                        .to_string(),
-                });
-            writable_worker.stop_and_join()?;
-            connection.disconnect()?;
-            lifecycle.connected = false;
-            return Err(failure);
-        }
-        if let Some(max_run_seconds) = request.max_run_seconds
-            && started.elapsed() >= Duration::from_secs(max_run_seconds)
-        {
-            break;
-        }
-        thread::sleep(Duration::from_millis(250));
     }
     writable_worker.stop_and_join()?;
     connection.disconnect()?;
@@ -4551,7 +4570,9 @@ unsafe extern "system" fn fetch_placeholders_callback(
             windows_adapter::record_materialization_audit_intent(
                 &provider.materialization_audit_intents,
                 &path,
-            )
+            )?;
+            provider.writable_worker_wake.signal_materialization();
+            Ok::<(), String>(())
         },
         || provider.begin_placeholder_page(&path),
     ) {
@@ -4873,6 +4894,7 @@ struct CloudFilesProvider {
     placeholder_page_leases: Mutex<BTreeSet<String>>,
     materialized_directories: Arc<Mutex<BTreeSet<String>>>,
     materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
+    writable_worker_wake: Arc<windows_adapter::WindowsWorkerWake>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -4909,6 +4931,7 @@ impl CloudFilesProvider {
         block_root_population_until_released: bool,
         materialized_directories: Arc<Mutex<BTreeSet<String>>>,
         materialization_audit_intents: Arc<Mutex<CloudFilesMaterializationAuditIntentStore>>,
+        writable_worker_wake: Arc<windows_adapter::WindowsWorkerWake>,
     ) -> Self {
         let mount_identity = sync_root.to_string_lossy().into_owned();
         Self {
@@ -4925,6 +4948,7 @@ impl CloudFilesProvider {
             placeholder_page_leases: Mutex::new(BTreeSet::new()),
             materialized_directories,
             materialization_audit_intents,
+            writable_worker_wake,
         }
     }
 

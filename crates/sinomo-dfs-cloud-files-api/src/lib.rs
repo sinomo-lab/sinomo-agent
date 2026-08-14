@@ -795,6 +795,11 @@ pub struct CloudFilesMountRequest {
     pub connect: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_run_seconds: Option<u64>,
+    /// Borrowed process-local Win32 event handle. The host signals it when the
+    /// blocking mount invocation must stop, allowing the provider to wait in
+    /// the kernel instead of polling `is_cancelled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_event_handle: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_recovery: Option<CloudFilesCursorRecoveryContext>,
     /// Explicit host-authorized transfer from one exact v3 provider image to
@@ -823,6 +828,7 @@ impl CloudFilesMountRequest {
             prepopulate_depth: default_prepopulate_depth(),
             connect: default_connect(),
             max_run_seconds: None,
+            cancellation_event_handle: None,
             cursor_recovery: None,
             provider_replacement: None,
         }

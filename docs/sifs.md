@@ -78,6 +78,17 @@ sinomo dfs mount <mount-point> [--root <sifs-path>]
 Unix uses FUSE where supported. Windows uses the Cloud Files integration. Both
 adapters preserve the same SIFS namespace and policy model.
 
+Mounted SIFS adapters are reactive at rest. FUSE blocks in the kernel until a
+filesystem request or shutdown arrives. The Windows Cloud Files projection
+blocks on NTFS directory-change notifications, the daemon's DFS namespace
+event stream, and explicit configuration, lifecycle, or shutdown signals. It
+does not run a periodic scan, heartbeat, cancellation poll, or mount-config
+poll. With no local access, no committed remote mutation beneath the mounted
+root, and no retry or recovery caused by an earlier operation, the mount owns
+no scheduled disk I/O. A local or remote namespace change wakes one bounded
+reconciliation pass; a stable-read retry wakes only at the deadline created by
+the write that required it.
+
 Canonical DFS content writes and namespace mutations route to the responsible
 metadata-shard primary. Once an adapter publishes an operation through that
 path, a successful response carries enough metadata progress for the caller to

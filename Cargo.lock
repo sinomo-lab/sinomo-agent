@@ -8712,6 +8712,7 @@ dependencies = [
  "candle-core",
  "crossterm",
  "libc",
+ "notify",
  "ratatui",
  "ring",
  "serde",

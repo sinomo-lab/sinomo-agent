@@ -1378,7 +1378,7 @@ impl DfsMetadataMutation {
     /// carry an object identity for recovery or GC, but do not publish a new
     /// object row. Keeping that distinction here lets both replica index repair
     /// and the service mirror avoid an all-shard object reload for those rows.
-    pub(crate) fn changes_visible_object_placement(&self) -> bool {
+    pub fn changes_visible_object_placement(&self) -> bool {
         matches!(
             self,
             Self::PutObject { .. }
@@ -1394,6 +1394,31 @@ impl DfsMetadataMutation {
                 }
                 | Self::CommitNamespacePrepare { .. }
         )
+    }
+
+    /// Paths carried directly by a mutation that can change the visible
+    /// namespace. Compact prepare-commit records intentionally return no path;
+    /// callers must use a conservative root notification for those records.
+    pub fn visible_namespace_paths(&self) -> Vec<&str> {
+        match self {
+            Self::PutObject { path, .. } => vec![path.as_str()],
+            Self::FinalizeCrossShardSourceEviction { tombstone, .. } => {
+                vec![tombstone.path.as_str()]
+            }
+            Self::CommitVisibleVersion {
+                committed_object: Some(object),
+                ..
+            } => vec![object.path.as_str()],
+            Self::ApplyNamespaceTransaction {
+                transaction: Some(transaction),
+                ..
+            } => transaction
+                .objects
+                .iter()
+                .map(|object| object.path.as_str())
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     fn visit_affected_object_ids(&self, mut visit: impl FnMut(&DfsObjectId)) {

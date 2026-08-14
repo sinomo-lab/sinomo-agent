@@ -3211,6 +3211,7 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
 pub(crate) struct DaemonDfsDataPlaneHost {
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
+    event_hub: Option<Arc<crate::event_stream::DaemonEventHub>>,
 }
 
 impl DaemonDfsDataPlaneHost {
@@ -3218,6 +3219,19 @@ impl DaemonDfsDataPlaneHost {
         Self {
             paths,
             runtime: runtime.clone(),
+            event_hub: None,
+        }
+    }
+
+    pub(crate) fn new_on_runtime_with_event_hub(
+        paths: DaemonPaths,
+        runtime: &tokio::runtime::Handle,
+        event_hub: Arc<crate::event_stream::DaemonEventHub>,
+    ) -> Self {
+        Self {
+            paths,
+            runtime: runtime.clone(),
+            event_hub: Some(event_hub),
         }
     }
 
@@ -3700,6 +3714,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let validation = self.validate_data_dir(data_dir.as_ref());
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
+        let event_hub = self.event_hub.clone();
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
@@ -3733,6 +3748,22 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     "metadata journal command does not match the authorized shard identity",
                 ));
             }
+            let namespace_changed = command
+                .batch
+                .entries
+                .iter()
+                .any(|entry| entry.mutation.changes_visible_object_placement());
+            let mut namespace_paths = command
+                .batch
+                .entries
+                .iter()
+                .flat_map(|entry| entry.mutation.visible_namespace_paths())
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>();
+            if namespace_changed && namespace_paths.is_empty() {
+                namespace_paths.insert("/".to_string());
+            }
+            let event_origin_node_id = context.local_node_id.clone();
             let may_have_deferred_materialization = command.durable_replication.is_some()
                 || command
                     .authority_probe
@@ -3784,6 +3815,17 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     ));
                 }
             };
+            if namespace_changed
+                && response.applied_entries > 0
+                && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
+                && let Some(event_hub) = event_hub
+            {
+                event_hub.publish_dfs_namespace_change(
+                    event_origin_node_id,
+                    "metadata-journal-applied",
+                    namespace_paths.into_iter().collect(),
+                );
+            }
             Ok(response)
         })
     }
@@ -3872,13 +3914,75 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
+        let event_hub = self.event_hub.clone();
+        let namespace_event = daemon_dfs_visible_mutation_event(&command);
         Box::pin(async move {
             let _data_owner = data_owner?;
-            handle_daemon_dfs_message_async(&paths, command, attachment, traceparent, &runtime)
-                .await
-                .map_err(daemon_dfs_data_plane_error)
+            let response =
+                handle_daemon_dfs_message_async(&paths, command, attachment, traceparent, &runtime)
+                    .await
+                    .map_err(daemon_dfs_data_plane_error)?;
+            if daemon_dfs_response_committed_visible_mutation(&response)
+                && let (Some(event_hub), Some((origin_node_id, operation, paths))) =
+                    (event_hub, namespace_event)
+            {
+                event_hub.publish_dfs_namespace_change(origin_node_id, operation, paths);
+            }
+            Ok(response)
         })
     }
+}
+
+fn daemon_dfs_visible_mutation_event(
+    command: &DfsMessageCommand,
+) -> Option<(NodeId, &'static str, Vec<String>)> {
+    let origin_node_id = command.routed_message.target_node_id.clone();
+    match &command.routed_message.message {
+        sinomo_dfs::DfsNetworkMessage::NamespaceRequest(command)
+            if command.operation.changes_visible_namespace() =>
+        {
+            Some((
+                origin_node_id,
+                "namespace-operation",
+                command
+                    .operation
+                    .involved_paths()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            ))
+        }
+        sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(command)
+        | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(command) => Some((
+            origin_node_id,
+            "distributed-write",
+            command
+                .object_metadata
+                .as_ref()
+                .map(|object| vec![object.path.clone()])
+                .unwrap_or_else(|| vec!["/".to_string()]),
+        )),
+        _ => None,
+    }
+}
+
+fn daemon_dfs_response_committed_visible_mutation(response: &DfsDataPlaneResponse) -> bool {
+    response
+        .response
+        .outbound_messages
+        .iter()
+        .any(|message| match &message.message {
+            sinomo_dfs::DfsNetworkMessage::NamespaceResponse(response) => {
+                response.result == sinomo_dfs::DfsNamespaceResult::Applied
+            }
+            sinomo_dfs::DfsNetworkMessage::DistributedWriteResponse(response) => matches!(
+                response.result,
+                sinomo_dfs::DfsDistributedWriteResult::Outcome {
+                    outcome: sinomo_dfs::NetworkedDfsWriteOutcome::Committed { .. }
+                }
+            ),
+            _ => false,
+        })
 }
 
 fn daemon_dfs_metadata_journal_rejection(
@@ -12432,9 +12536,9 @@ mod tests {
     use sinomo_dfs::{
         DfsBlobTransferResult, DfsDistributedWriteCommand, DfsFileSystemId,
         DfsMetadataJournalReplicationOutcome, DfsMetadataReplicaLagStatus, DfsNamespaceCommand,
-        DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNetworkMessage, DfsObjectId,
-        DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy, DfsRoutedMessage,
-        DfsStageBlobCommand, DfsVersion, DfsWriteOptions, DistributedRepairJob,
+        DfsNamespaceJobStatus, DfsNamespaceOperation, DfsNamespaceResponse, DfsNamespaceResult,
+        DfsNetworkMessage, DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsReplicationPolicy,
+        DfsRoutedMessage, DfsStageBlobCommand, DfsVersion, DfsWriteOptions, DistributedRepairJob,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -12476,6 +12580,76 @@ mod tests {
             Arc::as_ptr(&async_peer_transport) as *const (),
             "blocking and async DFS calls must reuse one peer transport adapter"
         );
+    }
+
+    #[test]
+    fn reactive_namespace_events_require_a_committed_visible_mutation() {
+        let source = NodeId::from_legacy_named("node_reactive_event_source").expect("source");
+        let target = NodeId::from_legacy_named("node_reactive_event_target").expect("target");
+        let command_for = |operation| DfsMessageCommand {
+            request_id: "reactive-event-request".to_string(),
+            routed_message: DfsRoutedMessage {
+                source_node_id: source.clone(),
+                target_node_id: target.clone(),
+                frame_id: 1,
+                message_id: 1,
+                message: DfsNetworkMessage::NamespaceRequest(DfsNamespaceCommand {
+                    request_id: "reactive-event-namespace".to_string(),
+                    file_system_id: sinomo_dfs::sifs_file_system_id(),
+                    requesting_node_id: source.clone(),
+                    include_metadata_journal_batches: false,
+                    metadata_journal_after_sequences: Vec::new(),
+                    authority_shards: Vec::new(),
+                    operation,
+                }),
+            },
+        };
+
+        assert!(
+            daemon_dfs_visible_mutation_event(&command_for(DfsNamespaceOperation::LookupPath {
+                path: "/services/reactive".to_string(),
+            }))
+            .is_none(),
+            "read-only namespace traffic must not wake a mounted projection"
+        );
+        let event = daemon_dfs_visible_mutation_event(&command_for(DfsNamespaceOperation::Mkdir {
+            path: "/services/reactive".to_string(),
+        }))
+        .expect("visible namespace mutation event");
+        assert_eq!(event.0, target);
+        assert_eq!(event.1, "namespace-operation");
+        assert_eq!(event.2, vec!["/services/reactive".to_string()]);
+
+        let response_for = |result| {
+            DfsDataPlaneResponse::value(DfsMessageResponse {
+                request_id: "reactive-event-response".to_string(),
+                outbound_messages: vec![DfsRoutedMessage {
+                    source_node_id: target.clone(),
+                    target_node_id: source.clone(),
+                    frame_id: 2,
+                    message_id: 2,
+                    message: DfsNetworkMessage::NamespaceResponse(DfsNamespaceResponse {
+                        request_id: "reactive-event-namespace".to_string(),
+                        result,
+                        synced_path_object: None,
+                        synced_path_objects: Vec::new(),
+                        metadata_journal_batches: Vec::new(),
+                        metadata_journal_has_more: Some(false),
+                        posix_coordination_result: None,
+                    }),
+                }],
+            })
+        };
+        assert!(daemon_dfs_response_committed_visible_mutation(
+            &response_for(DfsNamespaceResult::Applied)
+        ));
+        assert!(!daemon_dfs_response_committed_visible_mutation(
+            &response_for(DfsNamespaceResult::Rejected {
+                reason: "not applied".to_string(),
+                posix_error: None,
+                current_primary_node_id: None,
+            })
+        ));
     }
 
     fn mounted_mutation_test_repair_record(label: &str) -> DfsRepairAttemptRecord {

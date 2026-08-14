@@ -1183,6 +1183,13 @@ impl CloudFilesLocalCaptureRetries {
         self.deferred.len()
     }
 
+    pub(crate) fn next_due_in(&self, now: Duration) -> Option<Duration> {
+        self.deferred
+            .values()
+            .map(|retry| retry.retry_at.saturating_sub(now))
+            .min()
+    }
+
     pub(crate) fn clear(&mut self, path: &PathBuf) {
         self.deferred.remove(path);
     }
@@ -1293,6 +1300,13 @@ pub trait CloudFilesLocalChangeAccelerator {
         manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesCapturedChangeBatch, String>;
+
+    /// Deadline for local paths whose stable-read capture was deferred by a
+    /// live writer. `None` means the observer has no timer-owned work and the
+    /// worker may block indefinitely until an explicit notification arrives.
+    fn next_capture_retry_in(&self) -> Option<Duration> {
+        None
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2944,6 +2958,47 @@ where
         self.full_scan_pending || self.startup_scan_baseline.is_some()
     }
 
+    pub(crate) fn request_authoritative_rescan(&mut self) {
+        if self.startup_scan_baseline.is_none() {
+            self.startup_scan_baseline = Some(self.state.reconciler.manifest().clone());
+        }
+        self.full_scan_pending = true;
+    }
+
+    /// Return only work which already owns a causal reason to run. An idle
+    /// mount has no deadline and can remain blocked until a local or remote
+    /// notification arrives.
+    pub(crate) fn next_scheduled_work_in(&self) -> Option<Duration> {
+        if self.ordinary_reconciliation_remains_pending()
+            || self.cursor_recovery_is_armed()
+                && self
+                    .cursor_recovery
+                    .as_ref()
+                    .is_some_and(CloudFilesCursorRecoveryControl::should_run_immediately)
+            || self.state.queue.operations().any(|operation| {
+                matches!(
+                    operation.status,
+                    CloudFilesLocalOperationStatus::Queued
+                        | CloudFilesLocalOperationStatus::InFlight
+                        | CloudFilesLocalOperationStatus::RemoteApplied
+                )
+            })
+        {
+            return Some(Duration::ZERO);
+        }
+        let durable_retry = self
+            .state
+            .queue
+            .operations()
+            .any(|operation| operation.status == CloudFilesLocalOperationStatus::Retrying)
+            .then_some(Duration::from_secs(1));
+        match (durable_retry, self.capture.next_capture_retry_in()) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(delay), None) | (None, Some(delay)) => Some(delay),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn finalize_cursor_recovery_after_host_ready(
         &mut self,
     ) -> Result<bool, CloudFilesWindowsSyncError> {
@@ -3840,6 +3895,7 @@ fn capture_sync_error(code: &'static str) -> impl FnOnce(String) -> CloudFilesWi
 /// Drive a worker loop whose health generation advances only after one whole
 /// pass completes successfully. A blocked DFS/capture/effect phase therefore
 /// cannot manufacture fresh liveness while it is making no progress.
+#[cfg(test)]
 pub(crate) fn run_progress_gated_worker_loop<S, E>(
     cancelled: &AtomicBool,
     initial_generation: u64,

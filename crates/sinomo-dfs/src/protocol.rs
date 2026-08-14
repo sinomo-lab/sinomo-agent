@@ -707,6 +707,26 @@ pub enum DfsNamespaceOperation {
 }
 
 impl DfsNamespaceOperation {
+    /// Whether a successful operation can change the namespace projection
+    /// observed by mounted filesystems. Coordination reads, durability
+    /// barriers, and lock-only protocol messages deliberately do not wake
+    /// reactive namespace consumers.
+    pub fn changes_visible_namespace(&self) -> bool {
+        !matches!(
+            self,
+            Self::PollNamespaceChanges { .. }
+                | Self::SyncPath { .. }
+                | Self::LookupPath { .. }
+                | Self::LookupPaths { .. }
+                | Self::AdvisoryLock { .. }
+                | Self::FileSync { .. }
+                | Self::DirectorySync { .. }
+                | Self::AdvisoryLockMigrationPrepare { .. }
+                | Self::InstallHardlinkTargetFence { .. }
+                | Self::VerifyObjectFamilyAdoption { .. }
+        )
+    }
+
     /// The path whose shard authority selects the routed coordinator. For
     /// compound operations this is the source/first path; other involved
     /// shards remain independently authoritative for their own journal lanes.
@@ -1485,4 +1505,44 @@ pub enum DfsNetworkMessage {
     MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
     ContentRootCatalogPageRequest(DfsContentRootCatalogPageRequest),
     ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
+}
+
+#[cfg(test)]
+mod reactive_namespace_event_tests {
+    use super::DfsNamespaceOperation;
+
+    #[test]
+    fn only_visible_namespace_mutations_wake_reactive_mounts() {
+        assert!(
+            DfsNamespaceOperation::Mkdir {
+                path: "/services/reactive".to_string(),
+            }
+            .changes_visible_namespace()
+        );
+        assert!(
+            DfsNamespaceOperation::Unlink {
+                path: "/services/reactive/file".to_string(),
+            }
+            .changes_visible_namespace()
+        );
+
+        assert!(
+            !DfsNamespaceOperation::LookupPath {
+                path: "/services/reactive".to_string(),
+            }
+            .changes_visible_namespace()
+        );
+        assert!(
+            !DfsNamespaceOperation::SyncPath {
+                path: "/services/reactive".to_string(),
+            }
+            .changes_visible_namespace()
+        );
+        assert!(
+            !DfsNamespaceOperation::LookupPaths {
+                paths: vec!["/services/reactive".to_string()],
+            }
+            .changes_visible_namespace()
+        );
+    }
 }

@@ -14,7 +14,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -23,6 +23,8 @@ use sinomo_dfs_cloud_files_api::{
     CloudFilesPlaceholderIdentity,
 };
 use sinomo_runtime::dfs::{self, DfsMessageTransport, DfsObjectKind, NetworkedDfsService};
+use sinomo_runtime::local::SinomoDataDir;
+use sinomo_runtime::network::{DaemonRpcTimeouts, ObjectRpcRequest};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_LOCK_VIOLATION, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND,
     ERROR_SHARING_VIOLATION, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
@@ -53,7 +55,7 @@ use windows::Win32::System::IO::{
     CancelIoEx, CancelSynchronousIo, GetOverlappedResult, OVERLAPPED,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+    CreateEventW, GetCurrentThread, INFINITE, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
     WaitForMultipleObjects,
 };
 use windows::core::{HRESULT, PCWSTR};
@@ -93,7 +95,7 @@ use crate::windows_sync::{
     cloud_files_root_kind_is_supported, cloud_namespace_batch_from_dfs,
     cloud_namespace_cursor_from_dfs, completion_follow_up_request, dfs_namespace_cursor_from_cloud,
     local_capture_retry_delay, next_sparse_known_path, plan_directory_changes,
-    plan_owned_offline_create, run_progress_gated_worker_loop, run_retrying_namespace_read_pass,
+    plan_owned_offline_create, run_retrying_namespace_read_pass,
     sparse_child_directory_is_enumerated, sparse_root_is_enumerated,
     staged_content_matches_manifest_entry, suppression_for_completed_mutation,
 };
@@ -103,9 +105,6 @@ const DIRECTORY_CHANGE_CHANNEL_CAPACITY: usize = 8;
 const DIRECTORY_CHANGES_PER_PASS: usize = 64;
 const DEFERRED_CAPTURE_RETRIES_MAX: usize = 4_096;
 const LOCAL_STARTUP_SCAN_WORK_PER_PASS: usize = 32;
-const WORKER_HEARTBEAT_MILLIS: u64 = 1_000;
-const PENDING_RECONCILIATION_DELAY_MILLIS: u64 = 100;
-const WORKER_WAIT_SLICE_MILLIS: u64 = 50;
 const SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CURSOR_RECOVERY_SENTINEL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,16 +118,211 @@ fn adapter_error(code: &str, detail: impl Into<String>) -> CloudFilesModuleError
     }
 }
 
-fn writable_worker_poll_delay_millis(
-    ordinary_reconciliation_pending: bool,
-    cursor_recovery_immediate: bool,
-) -> u64 {
-    if cursor_recovery_immediate {
-        0
-    } else if ordinary_reconciliation_pending {
-        PENDING_RECONCILIATION_DELAY_MILLIS
-    } else {
-        WORKER_HEARTBEAT_MILLIS
+const WORKER_WAKE_LOCAL_CHANGE: u8 = 1 << 0;
+const WORKER_WAKE_NAMESPACE_CHANGE: u8 = 1 << 1;
+const WORKER_WAKE_AUTHORITATIVE_RESCAN: u8 = 1 << 2;
+const WORKER_WAKE_MATERIALIZATION: u8 = 1 << 3;
+const WORKER_WAKE_CONTROL: u8 = 1 << 4;
+
+#[derive(Default)]
+struct WindowsWorkerWakeState {
+    generation: u64,
+    reasons: u8,
+    failure: Option<String>,
+}
+
+/// Process-local reactive gate for the writable provider. Producers only set
+/// an in-memory bit and notify the condition variable; no idle timer, status
+/// file, or namespace poll is required to keep the mount alive.
+#[derive(Default)]
+pub(super) struct WindowsWorkerWake {
+    state: Mutex<WindowsWorkerWakeState>,
+    changed: Condvar,
+}
+
+impl WindowsWorkerWake {
+    fn signal(&self, reason: u8) {
+        if let Ok(mut state) = self.state.lock() {
+            state.generation = state.generation.saturating_add(1);
+            state.reasons |= reason;
+            self.changed.notify_all();
+        }
+    }
+
+    pub(super) fn signal_namespace_change(&self) {
+        self.signal(WORKER_WAKE_NAMESPACE_CHANGE);
+    }
+
+    pub(super) fn signal_authoritative_rescan(&self) {
+        self.signal(WORKER_WAKE_AUTHORITATIVE_RESCAN);
+    }
+
+    fn signal_failure(&self, detail: String) {
+        if let Ok(mut state) = self.state.lock() {
+            state.failure = Some(detail);
+            state.generation = state.generation.saturating_add(1);
+            state.reasons |= WORKER_WAKE_CONTROL;
+            self.changed.notify_all();
+        }
+    }
+
+    fn take_failure(&self) -> Option<String> {
+        self.state.lock().ok()?.failure.take()
+    }
+
+    pub(super) fn signal_materialization(&self) {
+        self.signal(WORKER_WAKE_MATERIALIZATION);
+    }
+
+    fn signal_control(&self) {
+        self.signal(WORKER_WAKE_CONTROL);
+    }
+
+    fn wait(&self, cancelled: &AtomicBool, deadline: Option<Duration>) -> u8 {
+        let Ok(mut state) = self.state.lock() else {
+            return WORKER_WAKE_CONTROL;
+        };
+        if state.reasons != 0 {
+            return std::mem::take(&mut state.reasons);
+        }
+        if cancelled.load(Ordering::SeqCst) {
+            return WORKER_WAKE_CONTROL;
+        }
+        state = match deadline {
+            Some(delay) => self
+                .changed
+                .wait_timeout(state, delay)
+                .map(|(state, _)| state)
+                .unwrap_or_else(|error| error.into_inner().0),
+            None => self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner()),
+        };
+        std::mem::take(&mut state.reasons)
+    }
+}
+
+pub(super) struct WindowsNamespaceEventSubscription {
+    stop: tokio::sync::watch::Sender<bool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for WindowsNamespaceEventSubscription {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Subscribe before the startup snapshot so every later remote mutation either
+/// participates in that snapshot or leaves a process-local wake bit. The
+/// stream blocks inside the daemon transport and performs no periodic probe or
+/// reconnect I/O; a broken stream fails the provider so authority can recover
+/// explicitly instead of silently polling.
+pub(super) fn subscribe_namespace_changes(
+    data_dir: SinomoDataDir,
+    root_path: &str,
+    wake: Arc<WindowsWorkerWake>,
+) -> Result<WindowsNamespaceEventSubscription, CloudFilesModuleError> {
+    let address = match sinomo_runtime::api::probe_daemon_status(
+        &sinomo_runtime::api::DaemonPaths::new(&data_dir),
+        Duration::from_secs(3),
+    ) {
+        sinomo_runtime::api::DaemonProbeStatus::Running(status) => status.address,
+        status => {
+            return Err(adapter_error(
+                "namespace-event-daemon-unavailable",
+                format!("local daemon is not available for namespace events: {status:?}"),
+            ));
+        }
+    };
+    let request = ObjectRpcRequest::encode_body(
+        sinomo_runtime::api::DAEMON_EVENT_SUBSCRIBE_ROUTE,
+        sinomo_runtime::api::DAEMON_RPC_CATEGORY,
+        &sinomo_runtime::api::DaemonEventSubscribeRequest::for_path_prefix(root_path),
+    )
+    .map_err(|error| adapter_error("namespace-event-request", error.to_string()))?;
+    let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+    let (stop, mut stop_receiver) = tokio::sync::watch::channel(false);
+    let join = thread::Builder::new()
+        .name("sinomo-cloud-files-namespace-events".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = ready_sender.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            let mut ready_sender = Some(ready_sender);
+            let result = runtime.block_on(async {
+                tokio::select! {
+                    result = sinomo_runtime::api::send_daemon_rpc_stream_from_data_dir_async(
+                        data_dir,
+                        &address,
+                        &request,
+                        DaemonRpcTimeouts::default()
+                            .with_connect_timeout(Some(Duration::from_secs(3))),
+                        |response| {
+                            response.error_detail()?;
+                            match response.decode_body::<sinomo_runtime::api::DaemonEventStreamItem>()? {
+                                sinomo_runtime::api::DaemonEventStreamItem::Ready { .. } => {
+                                    if let Some(sender) = ready_sender.take() {
+                                        let _ = sender.send(Ok(()));
+                                    }
+                                }
+                                sinomo_runtime::api::DaemonEventStreamItem::Event { .. } => {
+                                    wake.signal_namespace_change();
+                                }
+                                sinomo_runtime::api::DaemonEventStreamItem::Lagged { .. } => {
+                                    wake.signal_authoritative_rescan();
+                                }
+                            }
+                            Ok(true)
+                        },
+                    ) => Some(result),
+                    _ = stop_receiver.changed() => None,
+                }
+            });
+            let Some(result) = result else {
+                return;
+            };
+            let detail = match result {
+                Ok(()) => "local daemon closed the namespace event stream".to_string(),
+                Err(error) => format!("local daemon namespace event stream failed: {error}"),
+            };
+            if let Some(sender) = ready_sender.take() {
+                let _ = sender.send(Err(detail));
+            } else {
+                wake.signal_failure(detail);
+            }
+        })
+        .map_err(|error| adapter_error("namespace-event-spawn", error.to_string()))?;
+    match ready_receiver.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(())) => Ok(WindowsNamespaceEventSubscription {
+            stop,
+            join: Some(join),
+        }),
+        Ok(Err(detail)) => {
+            let _ = stop.send(true);
+            let _ = join.join();
+            Err(adapter_error("namespace-event-subscribe", detail))
+        }
+        Err(error) => {
+            let _ = stop.send(true);
+            let _ = join.join();
+            Err(adapter_error(
+                "namespace-event-ready-timeout",
+                format!("namespace event subscription did not become ready: {error}"),
+            ))
+        }
     }
 }
 
@@ -850,8 +1044,17 @@ fn validate_cursor_recovery_final_snapshot(
     Ok(())
 }
 
+struct OwnedCrossThreadEvent(OwnedWin32Handle);
+
+// Win32 event handles are kernel objects whose SetEvent/Wait operations are
+// explicitly thread-safe. `windows` leaves raw HANDLE Send/Sync unconstrained,
+// so this narrow owner documents and contains the cross-thread use.
+unsafe impl Send for OwnedCrossThreadEvent {}
+unsafe impl Sync for OwnedCrossThreadEvent {}
+
 struct DirectoryWatcherThread {
     stop: Arc<AtomicBool>,
+    stop_event: Arc<OwnedCrossThreadEvent>,
     raw_handle: Arc<AtomicIsize>,
     sync_root_file_id: u64,
     join: Option<JoinHandle<()>>,
@@ -861,6 +1064,9 @@ struct DirectoryWatcherThread {
 impl DirectoryWatcherThread {
     fn stop_and_join(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        unsafe {
+            let _ = windows::Win32::System::Threading::SetEvent(self.stop_event.0.0);
+        }
         let raw = self.raw_handle.load(Ordering::SeqCst);
         if raw != 0 {
             let handle = HANDLE(raw as *mut c_void);
@@ -897,6 +1103,7 @@ pub(super) struct WindowsDirectoryChangeAccelerator {
     capture_retry_epoch: Instant,
     capture_retries: CloudFilesLocalCaptureRetries,
     content_stager: CloudFilesContentStager,
+    worker_wake: Arc<WindowsWorkerWake>,
 }
 
 impl WindowsDirectoryChangeAccelerator {
@@ -907,6 +1114,7 @@ impl WindowsDirectoryChangeAccelerator {
         expected_cursor_recovery_sync_root_file_id: Option<u64>,
         suppressed_paths: Arc<Mutex<BTreeSet<PathBuf>>>,
         content_stager: CloudFilesContentStager,
+        worker_wake: Arc<WindowsWorkerWake>,
     ) -> Self {
         Self {
             sync_root,
@@ -925,6 +1133,7 @@ impl WindowsDirectoryChangeAccelerator {
             capture_retry_epoch: Instant::now(),
             capture_retries: CloudFilesLocalCaptureRetries::default(),
             content_stager,
+            worker_wake,
         }
     }
 }
@@ -1170,6 +1379,10 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let (sentinel_sender, sentinel_receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
+        let stop_event = Arc::new(OwnedCrossThreadEvent(OwnedWin32Handle(
+            unsafe { CreateEventW(None, false, false, None) }
+                .map_err(|error| format!("create ReadDirectoryChangesW stop event: {error}"))?,
+        )));
         let raw_handle = Arc::new(AtomicIsize::new(0));
         let sync_root = self.sync_root.clone();
         let thread_stop = Arc::clone(&stop);
@@ -1178,12 +1391,15 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
         let notification_epoch = Arc::clone(&self.notification_epoch);
         let watcher_failure = Arc::clone(&self.watcher_failure);
         let cursor_recovery = self.expected_cursor_recovery_sync_root_file_id.is_some();
+        let thread_stop_event = Arc::clone(&stop_event);
+        let worker_wake = Arc::clone(&self.worker_wake);
         let join = thread::Builder::new()
             .name("sinomo-cloud-files-directory-changes".to_string())
             .spawn(move || {
                 watch_directory_changes(
                     sync_root,
                     thread_stop,
+                    thread_stop_event,
                     thread_handle,
                     sender,
                     ready_sender,
@@ -1192,6 +1408,7 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
                     watcher_failure,
                     sentinel_receiver,
                     cursor_recovery,
+                    worker_wake,
                 )
             })
             .map_err(|error| format!("spawn ReadDirectoryChangesW worker: {error}"))?;
@@ -1200,6 +1417,7 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
             Ok(Err(error)) => {
                 let mut watcher = DirectoryWatcherThread {
                     stop,
+                    stop_event,
                     raw_handle,
                     sync_root_file_id: 0,
                     join: Some(join),
@@ -1211,6 +1429,7 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
             Err(error) => {
                 let mut watcher = DirectoryWatcherThread {
                     stop,
+                    stop_event,
                     raw_handle,
                     sync_root_file_id: 0,
                     join: Some(join),
@@ -1227,6 +1446,7 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
         {
             let mut watcher = DirectoryWatcherThread {
                 stop,
+                stop_event,
                 raw_handle,
                 sync_root_file_id: observed_sync_root_file_id,
                 join: Some(join),
@@ -1240,6 +1460,7 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
         self.receiver = Some(receiver);
         self.watcher = Some(DirectoryWatcherThread {
             stop,
+            stop_event,
             raw_handle,
             sync_root_file_id: observed_sync_root_file_id,
             join: Some(join),
@@ -1372,6 +1593,11 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
             overflowed: false,
         })
     }
+
+    fn next_capture_retry_in(&self) -> Option<Duration> {
+        self.capture_retries
+            .next_due_in(self.capture_retry_epoch.elapsed())
+    }
 }
 
 fn raw_change_paths(change: &CloudFilesDirectoryChange) -> Vec<&PathBuf> {
@@ -1399,6 +1625,7 @@ fn suppression_matches_current(sync_root: &Path, relative: &Path) -> bool {
 fn watch_directory_changes(
     sync_root: PathBuf,
     stop: Arc<AtomicBool>,
+    stop_event: Arc<OwnedCrossThreadEvent>,
     raw_handle: Arc<AtomicIsize>,
     sender: mpsc::SyncSender<RawDirectoryChangeBatch>,
     ready: mpsc::SyncSender<Result<u64, String>>,
@@ -1407,6 +1634,7 @@ fn watch_directory_changes(
     watcher_failure: Arc<Mutex<Option<String>>>,
     sentinel: mpsc::Receiver<CursorRecoverySentinelCommand>,
     cursor_recovery: bool,
+    worker_wake: Arc<WindowsWorkerWake>,
 ) {
     let root_wide = wide_path(&sync_root);
     let handle = match unsafe {
@@ -1430,6 +1658,7 @@ fn watch_directory_changes(
             if let Ok(mut failure) = watcher_failure.lock() {
                 *failure = Some(detail);
             }
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             return;
         }
     };
@@ -1442,6 +1671,7 @@ fn watch_directory_changes(
             if let Ok(mut failure) = watcher_failure.lock() {
                 *failure = Some(detail);
             }
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             raw_handle.store(0, Ordering::SeqCst);
             return;
         }
@@ -1457,6 +1687,7 @@ fn watch_directory_changes(
             if let Ok(mut failure) = watcher_failure.lock() {
                 *failure = Some(detail);
             }
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             raw_handle.store(0, Ordering::SeqCst);
             return;
         }
@@ -1502,6 +1733,7 @@ fn watch_directory_changes(
             if let Ok(mut failure) = watcher_failure.lock() {
                 *failure = Some(detail);
             }
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             break;
         }
         if first_request {
@@ -1564,8 +1796,17 @@ fn watch_directory_changes(
                     }
                 }
             }
-            let completion = unsafe { WaitForMultipleObjects(&[event.0], false, 50) };
+            let timeout = if cursor_recovery { 50 } else { INFINITE };
+            let completion =
+                unsafe { WaitForMultipleObjects(&[event.0, stop_event.0.0], false, timeout) };
             if completion == WAIT_OBJECT_0 {
+                break;
+            }
+            if completion.0 == WAIT_OBJECT_0.0 + 1 {
+                stop.store(true, Ordering::SeqCst);
+                unsafe {
+                    let _ = CancelIoEx(owned.0, Some(&overlapped));
+                }
                 break;
             }
             if completion == WAIT_FAILED {
@@ -1577,6 +1818,7 @@ fn watch_directory_changes(
                 if let Ok(mut failure) = watcher_failure.lock() {
                     *failure = Some(detail);
                 }
+                worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
                 stop.store(true, Ordering::SeqCst);
                 unsafe {
                     let _ = CancelIoEx(owned.0, Some(&overlapped));
@@ -1592,6 +1834,7 @@ fn watch_directory_changes(
                 if let Ok(mut failure) = watcher_failure.lock() {
                     *failure = Some(detail);
                 }
+                worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
                 stop.store(true, Ordering::SeqCst);
                 unsafe {
                     let _ = CancelIoEx(owned.0, Some(&overlapped));
@@ -1621,12 +1864,14 @@ fn watch_directory_changes(
             if let Ok(mut failure) = watcher_failure.lock() {
                 *failure = Some(detail);
             }
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             break;
         }
         if bytes_returned == 0 {
             notification_epoch.fetch_add(1, Ordering::SeqCst);
             rename_pairing.reset_for_overflow();
             notification_overflow.store(true, Ordering::SeqCst);
+            worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
             fail_active_cursor_recovery_sentinel(
                 &mut active_sentinel,
                 "ReadDirectoryChangesW overflowed during cursor recovery fence".to_string(),
@@ -1645,10 +1890,11 @@ fn watch_directory_changes(
                         if !batch.changes.is_empty() || batch.overflowed {
                             notification_epoch.fetch_add(1, Ordering::SeqCst);
                             match sender.try_send(batch) {
-                                Ok(()) => {}
+                                Ok(()) => worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE),
                                 Err(mpsc::TrySendError::Full(_)) => {
                                     rename_pairing.reset_for_overflow();
                                     notification_overflow.store(true, Ordering::SeqCst);
+                                    worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
                                 }
                                 Err(mpsc::TrySendError::Disconnected(_)) => break,
                             }
@@ -1665,6 +1911,7 @@ fn watch_directory_changes(
                         if let Ok(mut failure) = watcher_failure.lock() {
                             *failure = Some(error);
                         }
+                        worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
                         break;
                     }
                 }
@@ -1675,6 +1922,7 @@ fn watch_directory_changes(
                 if let Ok(mut failure) = watcher_failure.lock() {
                     *failure = Some(error);
                 }
+                worker_wake.signal(WORKER_WAKE_LOCAL_CHANGE);
                 break;
             }
         }
@@ -4499,6 +4747,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
     service: Arc<Mutex<NetworkedDfsService<T>>>,
     write_options: dfs::DfsWriteOptions,
     mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
+    worker_wake: Arc<WindowsWorkerWake>,
     options: WindowsWritableWorkerOptions,
 ) -> (ConcreteWindowsWritableWorker<T>, Arc<AtomicBool>) {
     let materialization_audit_intents = state.materialization_audit_intents();
@@ -4522,6 +4771,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
             expected_cursor_recovery_sync_root_file_id,
             Arc::clone(&suppressed_paths),
             content_stager.clone(),
+            worker_wake,
         ),
         CloudFilesConcreteDfsAdapter::new(
             CloudFilesDfsServiceMutationBackend::new_with_cancellation(
@@ -4605,6 +4855,7 @@ impl WorkerLifecycleEmitter {
 
 pub(super) struct WindowsWritableWorkerHandle {
     cancelled: Arc<AtomicBool>,
+    wake: Arc<WindowsWorkerWake>,
     alive: Arc<AtomicBool>,
     failure: mpsc::Receiver<CloudFilesModuleError>,
     progress: mpsc::Receiver<u64>,
@@ -4614,6 +4865,13 @@ pub(super) struct WindowsWritableWorkerHandle {
     cursor_recovery_finalize:
         mpsc::SyncSender<mpsc::SyncSender<Result<bool, CloudFilesModuleError>>>,
     worker_join: Option<JoinHandle<()>>,
+    stopped_event: Arc<OwnedCrossThreadEvent>,
+}
+
+pub(super) enum WindowsWritableWorkerWait {
+    Cancelled,
+    Stopped,
+    TimedOut,
 }
 
 enum CursorRecoveryWorkerProgress {
@@ -4625,6 +4883,7 @@ impl WindowsWritableWorkerHandle {
     pub(super) fn spawn<T>(
         mut worker: ConcreteWindowsWritableWorker<T>,
         cancelled: Arc<AtomicBool>,
+        wake: Arc<WindowsWorkerWake>,
         emitter: WorkerLifecycleEmitter,
         initial_generation: u64,
     ) -> Result<Self, CloudFilesModuleError>
@@ -4632,12 +4891,16 @@ impl WindowsWritableWorkerHandle {
         T: DfsMessageTransport + Send + 'static,
     {
         let cursor_recovery = worker.cursor_recovery_control();
+        let stopped_event = Arc::new(OwnedCrossThreadEvent(OwnedWin32Handle(
+            unsafe { CreateEventW(None, true, false, None) }
+                .map_err(|error| adapter_error("writable-worker-event", error.to_string()))?,
+        )));
+        let thread_stopped_event = Arc::clone(&stopped_event);
         let thread_cursor_recovery = cursor_recovery.clone();
         let alive = Arc::new(AtomicBool::new(true));
         let thread_cancelled = Arc::clone(&cancelled);
+        let thread_wake = Arc::clone(&wake);
         let thread_alive = Arc::clone(&alive);
-        let ordinary_reconciliation_pending = Arc::new(AtomicBool::new(false));
-        let thread_ordinary_reconciliation_pending = Arc::clone(&ordinary_reconciliation_pending);
         let failure_emitter = emitter.clone();
         let (failure_sender, failure) = mpsc::channel();
         let (progress_sender, progress) = mpsc::sync_channel(1);
@@ -4654,77 +4917,69 @@ impl WindowsWritableWorkerHandle {
                 let last_generation = AtomicU64::new(initial_generation);
                 let mut cursor_recovery_terminal_emitted = false;
                 let run_result = catch_unwind(AssertUnwindSafe(|| {
-                    run_progress_gated_worker_loop(
-                        &thread_cancelled,
-                        initial_generation,
-                        || {
-                            if let Ok(reply) = cursor_recovery_finalize_receiver.try_recv() {
-                                let finalized = worker
-                                    .finalize_cursor_recovery_after_host_ready()
-                                    .map_err(|error| adapter_error(error.code, error.detail));
-                                let _ = reply.send(finalized);
-                            }
-                            run_retrying_namespace_read_pass(
-                                &thread_cancelled,
-                                || {
-                                    let result = worker.run_once(&thread_cancelled);
-                                    thread_ordinary_reconciliation_pending.store(
-                                        worker.ordinary_reconciliation_remains_pending(),
-                                        Ordering::SeqCst,
-                                    );
-                                    result.map(|_| worker.state().status())
-                                },
-                                |cancelled| {
-                                    for _ in 0..5 {
-                                        if cancelled.load(Ordering::SeqCst) {
-                                            break;
-                                        }
-                                        thread::sleep(Duration::from_millis(50));
+                    let mut generation = initial_generation;
+                    while !thread_cancelled.load(Ordering::SeqCst) {
+                        if let Some(detail) = thread_wake.take_failure() {
+                            return Err(crate::windows_sync::CloudFilesWindowsSyncError {
+                                code: "namespace-event-stream",
+                                detail,
+                            });
+                        }
+                        if let Ok(reply) = cursor_recovery_finalize_receiver.try_recv() {
+                            let finalized = worker
+                                .finalize_cursor_recovery_after_host_ready()
+                                .map_err(|error| adapter_error(error.code, error.detail));
+                            let _ = reply.send(finalized);
+                        }
+                        let status = run_retrying_namespace_read_pass(
+                            &thread_cancelled,
+                            || {
+                                worker
+                                    .run_once(&thread_cancelled)
+                                    .map(|_| worker.state().status())
+                            },
+                            |cancelled| {
+                                for _ in 0..5 {
+                                    if cancelled.load(Ordering::SeqCst) {
+                                        break;
                                     }
-                                },
-                            )
-                        },
-                        |status, generation| {
-                            let ready = status.mode == CloudFilesLocalChangeSyncMode::Active;
-                            last_generation.store(generation, Ordering::SeqCst);
-                            progress_emitter.emit(status, true, ready, generation);
-                            if ready {
-                                let _ = progress_sender.try_send(generation);
-                            }
-                            if let Some(control) = thread_cursor_recovery.as_ref() {
-                                if control.terminal() && !cursor_recovery_terminal_emitted {
-                                    let _ = cursor_recovery_progress_sender
-                                        .send(CursorRecoveryWorkerProgress::Terminal(generation));
-                                    cursor_recovery_terminal_emitted = true;
-                                } else if !control.terminal() && control.should_run_immediately() {
-                                    let _ = cursor_recovery_progress_sender
-                                        .send(CursorRecoveryWorkerProgress::Advanced(generation));
+                                    thread::sleep(Duration::from_millis(50));
                                 }
+                            },
+                        )?;
+                        if thread_cancelled.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        generation = generation.saturating_add(1);
+                        let ready = status.mode == CloudFilesLocalChangeSyncMode::Active;
+                        last_generation.store(generation, Ordering::SeqCst);
+                        progress_emitter.emit(status, true, ready, generation);
+                        if ready {
+                            let _ = progress_sender.try_send(generation);
+                        }
+                        if let Some(control) = thread_cursor_recovery.as_ref() {
+                            if control.terminal() && !cursor_recovery_terminal_emitted {
+                                let _ = cursor_recovery_progress_sender
+                                    .send(CursorRecoveryWorkerProgress::Terminal(generation));
+                                cursor_recovery_terminal_emitted = true;
+                            } else if !control.terminal() && control.should_run_immediately() {
+                                let _ = cursor_recovery_progress_sender
+                                    .send(CursorRecoveryWorkerProgress::Advanced(generation));
                             }
-                        },
-                        |cancelled| {
-                            let cursor_recovery_should_run_immediately = || {
-                                thread_cursor_recovery.as_ref().is_some_and(
-                                    CloudFilesCursorRecoveryControl::should_run_immediately,
-                                )
-                            };
-                            let wait_millis = writable_worker_poll_delay_millis(
-                                thread_ordinary_reconciliation_pending.load(Ordering::SeqCst),
-                                cursor_recovery_should_run_immediately(),
-                            );
-                            for _ in 0..wait_millis.div_ceil(WORKER_WAIT_SLICE_MILLIS) {
-                                if cancelled.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                if cursor_recovery_should_run_immediately() {
-                                    break;
-                                }
-                                thread::sleep(std::time::Duration::from_millis(
-                                    WORKER_WAIT_SLICE_MILLIS,
-                                ));
-                            }
-                        },
-                    )
+                        }
+                        let reasons =
+                            thread_wake.wait(&thread_cancelled, worker.next_scheduled_work_in());
+                        if let Some(detail) = thread_wake.take_failure() {
+                            return Err(crate::windows_sync::CloudFilesWindowsSyncError {
+                                code: "namespace-event-stream",
+                                detail,
+                            });
+                        }
+                        if reasons & WORKER_WAKE_AUTHORITATIVE_RESCAN != 0 {
+                            worker.request_authoritative_rescan();
+                        }
+                    }
+                    Ok::<(), crate::windows_sync::CloudFilesWindowsSyncError>(())
                 }));
                 match run_result {
                     Ok(Ok(())) => {}
@@ -4752,10 +5007,14 @@ impl WindowsWritableWorkerHandle {
                     }
                 }
                 thread_alive.store(false, Ordering::SeqCst);
+                unsafe {
+                    let _ = windows::Win32::System::Threading::SetEvent(thread_stopped_event.0.0);
+                }
             })
             .map_err(|error| adapter_error("writable-worker-spawn", error.to_string()))?;
         Ok(Self {
             cancelled,
+            wake,
             alive,
             failure,
             progress,
@@ -4764,7 +5023,43 @@ impl WindowsWritableWorkerHandle {
             cursor_recovery_terminal_observed: AtomicBool::new(false),
             cursor_recovery_finalize: cursor_recovery_finalize_sender,
             worker_join: Some(worker_join),
+            stopped_event,
         })
+    }
+
+    pub(super) fn wait_for_stop_or_cancellation(
+        &self,
+        cancellation_event_handle: u64,
+        timeout: Option<Duration>,
+    ) -> Result<WindowsWritableWorkerWait, CloudFilesModuleError> {
+        if cancellation_event_handle == 0 {
+            return Err(adapter_error(
+                "mount-cancellation-event",
+                "host supplied a null Cloud Files cancellation event handle",
+            ));
+        }
+        let timeout = timeout
+            .map(|timeout| timeout.as_millis().min(u32::MAX as u128) as u32)
+            .unwrap_or(INFINITE);
+        let cancellation = HANDLE(cancellation_event_handle as usize as *mut c_void);
+        let result = unsafe {
+            WaitForMultipleObjects(&[cancellation, self.stopped_event.0.0], false, timeout)
+        };
+        if result == WAIT_OBJECT_0 {
+            Ok(WindowsWritableWorkerWait::Cancelled)
+        } else if result.0 == WAIT_OBJECT_0.0 + 1 {
+            Ok(WindowsWritableWorkerWait::Stopped)
+        } else if result == WAIT_TIMEOUT {
+            Ok(WindowsWritableWorkerWait::TimedOut)
+        } else {
+            Err(adapter_error(
+                "mount-reactive-wait",
+                format!(
+                    "wait for Cloud Files cancellation/worker event returned {}",
+                    result.0
+                ),
+            ))
+        }
     }
 
     pub(super) fn is_alive(&self) -> bool {
@@ -4859,7 +5154,9 @@ impl WindowsWritableWorkerHandle {
         }
         control
             .release()
-            .map_err(|detail| adapter_error("cursor-recovery-release-rejected", detail))
+            .map_err(|detail| adapter_error("cursor-recovery-release-rejected", detail))?;
+        self.wake.signal_control();
+        Ok(())
     }
 
     pub(super) fn complete_cursor_recovery_after_host_active(
@@ -4874,7 +5171,11 @@ impl WindowsWritableWorkerHandle {
                 )
             })?
             .complete_after_host_active()
-            .map_err(|detail| adapter_error("cursor-recovery-active-completion-rejected", detail))
+            .map_err(|detail| {
+                adapter_error("cursor-recovery-active-completion-rejected", detail)
+            })?;
+        self.wake.signal_control();
+        Ok(())
     }
 
     pub(super) fn finalize_cursor_recovery_after_host_ready(
@@ -4897,6 +5198,7 @@ impl WindowsWritableWorkerHandle {
                 "cursor recovery worker stopped before marker finalization",
             )
         })?;
+        self.wake.signal_control();
         response.recv_timeout(timeout).map_err(|error| {
             adapter_error(
                 "cursor-recovery-finalize-timeout",
@@ -4907,6 +5209,7 @@ impl WindowsWritableWorkerHandle {
 
     pub(super) fn stop_and_join(&mut self) -> Result<(), CloudFilesModuleError> {
         self.cancelled.store(true, Ordering::SeqCst);
+        self.wake.signal_control();
         if let Some(join) = self.worker_join.as_ref() {
             // Interrupt a worker blocked in a synchronous local filesystem or
             // CFAPI call. Routed DFS calls carry their own hard deadline and
@@ -4969,11 +5272,29 @@ mod tests {
     }
 
     #[test]
-    fn pending_reconciliation_is_paced_but_cursor_recovery_remains_immediate() {
-        assert_eq!(writable_worker_poll_delay_millis(false, false), 1_000);
-        assert_eq!(writable_worker_poll_delay_millis(true, false), 100);
-        assert_eq!(writable_worker_poll_delay_millis(false, true), 0);
-        assert_eq!(writable_worker_poll_delay_millis(true, true), 0);
+    fn idle_worker_gate_blocks_until_an_explicit_notification() {
+        let wake = Arc::new(WindowsWorkerWake::default());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (completed, observed) = mpsc::sync_channel(1);
+        let thread_wake = Arc::clone(&wake);
+        let thread_cancelled = Arc::clone(&cancelled);
+        let join = thread::spawn(move || {
+            completed
+                .send(thread_wake.wait(&thread_cancelled, None))
+                .expect("report wake reason");
+        });
+        assert!(matches!(
+            observed.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        wake.signal_namespace_change();
+        assert_eq!(
+            observed
+                .recv_timeout(Duration::from_secs(1))
+                .expect("explicit namespace notification wakes worker"),
+            WORKER_WAKE_NAMESPACE_CHANGE
+        );
+        join.join().expect("join reactive worker gate");
     }
 
     fn directory_change_record(action: u32, name: &[u16]) -> Vec<u8> {

@@ -25,7 +25,7 @@ const DAEMON_EVENT_BUFFER_CAPACITY: usize = 1_024;
 const DAEMON_EVENT_STREAM_BODY_BUFFER_BYTES: usize = 64 * 1_024;
 const DAEMON_EVENT_MAX_FILTERS: usize = 64;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct DaemonEventHub {
     sender: broadcast::Sender<EventEnvelope>,
 }

@@ -30,11 +30,8 @@ use sinomo_runtime::service::{
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SUPERVISOR_DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const MOUNT_START_RETRY_INITIAL: Duration = Duration::from_secs(1);
-#[cfg(windows)]
-const CLOUD_FILES_WORKER_STALE_AFTER: Duration = Duration::from_secs(3);
 const MOUNT_START_RETRY_MAX: Duration = Duration::from_secs(30);
 #[cfg(any(windows, test))]
 const PENDING_CLOUD_UNREGISTER_FILE: &str = "cloud-files-unregister.pending.sobj";
@@ -94,7 +91,53 @@ struct SifsMountSupervisorInner {
     shutdown: Arc<AtomicBool>,
     mount_cancellation: Arc<Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>>,
     cursor_recovery: mpsc::SyncSender<SifsMountCursorRecoveryControl>,
+    wake: Arc<SupervisorWake>,
     worker: Mutex<Option<SifsMountSupervisorWorker>>,
+}
+
+#[derive(Default)]
+struct SupervisorWake {
+    pending: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl SupervisorWake {
+    fn signal(&self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            *pending = true;
+            self.changed.notify_all();
+        }
+    }
+
+    fn wait(&self, shutdown: &AtomicBool, deadline: Option<Instant>) {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(mut pending) = self.pending.lock() else {
+            return;
+        };
+        if *pending {
+            *pending = false;
+            return;
+        }
+        match deadline {
+            Some(deadline) => {
+                let delay = deadline.saturating_duration_since(Instant::now());
+                let (mut observed, _) = self
+                    .changed
+                    .wait_timeout(pending, delay)
+                    .unwrap_or_else(|error| error.into_inner());
+                *observed = false;
+            }
+            None => {
+                let mut observed = self
+                    .changed
+                    .wait(pending)
+                    .unwrap_or_else(|error| error.into_inner());
+                *observed = false;
+            }
+        }
+    }
 }
 
 struct SifsMountCursorRecoveryControl {
@@ -4794,10 +4837,12 @@ impl SifsMountSupervisorService {
     fn new(data_dir: SinomoDataDir, daemon_paths: DaemonPaths, daemon_pid: u32) -> Self {
         let status = Arc::new(RwLock::new(SifsMountRuntimeStatus::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(SupervisorWake::default());
         let mount_cancellation = Arc::new(Mutex::new(None));
         let worker_status = Arc::clone(&status);
         let worker_shutdown = Arc::clone(&shutdown);
         let worker_mount_cancellation = Arc::clone(&mount_cancellation);
+        let worker_wake = Arc::clone(&wake);
         let (cursor_recovery, worker_cursor_recovery) = mpsc::sync_channel(1);
         let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -4811,6 +4856,7 @@ impl SifsMountSupervisorService {
                     worker_shutdown,
                     worker_mount_cancellation,
                     worker_cursor_recovery,
+                    worker_wake,
                 );
                 let _ = stopped_tx.send(());
             })
@@ -4821,6 +4867,7 @@ impl SifsMountSupervisorService {
                 shutdown,
                 mount_cancellation,
                 cursor_recovery,
+                wake,
                 worker: Mutex::new(Some(SifsMountSupervisorWorker {
                     thread: Some(thread),
                     stopped: stopped_rx,
@@ -4846,6 +4893,7 @@ impl SifsMountSupervisorService {
 impl Drop for SifsMountSupervisorInner {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        self.wake.signal();
         if let Ok(cancellation) = self.mount_cancellation.lock()
             && let Some(cancellation) = cancellation.as_ref()
         {
@@ -4857,9 +4905,6 @@ impl Drop for SifsMountSupervisorInner {
         let Some(mut worker) = worker.take() else {
             return;
         };
-        if let Some(handle) = worker.thread.as_ref() {
-            handle.thread().unpark();
-        }
         if worker
             .stopped
             .recv_timeout(SUPERVISOR_SHUTDOWN_TIMEOUT)
@@ -4886,6 +4931,7 @@ impl Service for SifsMountSupervisorService {
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         let status = self.status();
         let cursor_recovery = self.inner.cursor_recovery.clone();
+        let wake = Arc::clone(&self.inner.wake);
         Box::pin(async move {
             match request.route.as_str() {
                 SIFS_MOUNT_STATUS_ROUTE => {
@@ -4904,6 +4950,7 @@ impl Service for SifsMountSupervisorService {
                         .map_err(|_| {
                             ServiceError::Service("SIFS mount supervisor stopped".to_string())
                         })?;
+                    wake.signal();
                     let response = response_rx
                         .recv_timeout(Duration::from_secs(60))
                         .map_err(|_| {
@@ -4942,6 +4989,55 @@ where
     retire()
 }
 
+fn start_mount_config_watcher(
+    data_dir: &SinomoDataDir,
+    wake: Arc<SupervisorWake>,
+) -> Result<notify::RecommendedWatcher, String> {
+    use notify::Watcher as _;
+
+    let config_path = sifs_mount_config_definition().local_path(data_dir);
+    let configs_dir = sinomo_runtime::config::configs_dir(data_dir);
+    std::fs::create_dir_all(&configs_dir).map_err(|error| {
+        format!(
+            "create SIFS mount configuration watch directory {}: {error}",
+            configs_dir.display()
+        )
+    })?;
+    let mut watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+        match result {
+            Ok(event) if event.paths.iter().any(|path| path == &config_path) => wake.signal(),
+            Ok(_) => {}
+            // A watcher fault invalidates the cached observation. Wake the
+            // supervisor so its authoritative config read fails closed.
+            Err(_) => wake.signal(),
+        }
+    })
+    .map_err(|error| format!("create SIFS mount configuration watcher: {error}"))?;
+    watcher
+        .watch(&configs_dir, notify::RecursiveMode::Recursive)
+        .map_err(|error| {
+            format!(
+                "watch SIFS mount configuration directory {}: {error}",
+                configs_dir.display()
+            )
+        })?;
+    Ok(watcher)
+}
+
+fn supervisor_retry_deadline(
+    start_retry: &MountStartRetry,
+    pending: Option<&PendingCloudUnregister>,
+) -> Option<Instant> {
+    match (
+        start_retry.next_attempt_at,
+        pending.and_then(|pending| pending.next_attempt_at),
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}
+
 fn run_mount_supervisor(
     data_dir: &SinomoDataDir,
     daemon_paths: &DaemonPaths,
@@ -4950,6 +5046,7 @@ fn run_mount_supervisor(
     shutdown: Arc<AtomicBool>,
     mount_cancellation: Arc<Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>>,
     cursor_recovery: mpsc::Receiver<SifsMountCursorRecoveryControl>,
+    wake: Arc<SupervisorWake>,
 ) {
     let store = match sifs_mount_config_store() {
         Ok(store) => store,
@@ -4966,6 +5063,16 @@ fn run_mount_supervisor(
     let mut last_persisted_status = None;
     let mut start_retry = MountStartRetry::default();
     let mut pending_cloud_unregister = None;
+    let _config_watcher = match start_mount_config_watcher(data_dir, Arc::clone(&wake)) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            publish_status_without_store(
+                &observed_status,
+                status_error(&SifsMountConfig::default(), None, daemon_pid, 0, error),
+            );
+            return;
+        }
+    };
     #[cfg(windows)]
     let mut pending_unregister_recovery_loaded = false;
     while !shutdown.load(Ordering::SeqCst) {
@@ -5007,7 +5114,14 @@ fn run_mount_supervisor(
                             &mut last_persisted_status,
                             blocked,
                         );
-                        supervisor_wait(&shutdown);
+                        supervisor_wait(
+                            &shutdown,
+                            &wake,
+                            supervisor_retry_deadline(
+                                &start_retry,
+                                pending_cloud_unregister.as_ref(),
+                            ),
+                        );
                         continue;
                     }
                 }
@@ -5057,7 +5171,14 @@ fn run_mount_supervisor(
                                 }),
                             ),
                         );
-                        supervisor_wait(&shutdown);
+                        supervisor_wait(
+                            &shutdown,
+                            &wake,
+                            supervisor_retry_deadline(
+                                &start_retry,
+                                pending_cloud_unregister.as_ref(),
+                            ),
+                        );
                         continue;
                     }
                     pending_cloud_unregister
@@ -5081,7 +5202,11 @@ fn run_mount_supervisor(
                         &mut last_persisted_status,
                         pending_cloud_unregister_status(pending, daemon_pid, restart_count, error),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5119,7 +5244,11 @@ fn run_mount_supervisor(
                         error,
                     ),
                 );
-                supervisor_wait(&shutdown);
+                supervisor_wait(
+                    &shutdown,
+                    &wake,
+                    supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                );
                 continue;
             }
         };
@@ -5131,7 +5260,11 @@ fn run_mount_supervisor(
                     // Cleanup is a standalone serialized supervisor turn. Do
                     // not start a mount in the same turn after removing the
                     // durable provider-selection marker.
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
                 Ok(false) => {}
@@ -5149,7 +5282,11 @@ fn run_mount_supervisor(
                             format!("resume completed cursor-recovery cleanup: {error}"),
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5173,7 +5310,11 @@ fn run_mount_supervisor(
                             format!("admit cursor-recovery mount enable: {error}"),
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5218,7 +5359,14 @@ fn run_mount_supervisor(
                                 ),
                             ),
                         );
-                        supervisor_wait(&shutdown);
+                        supervisor_wait(
+                            &shutdown,
+                            &wake,
+                            supervisor_retry_deadline(
+                                &start_retry,
+                                pending_cloud_unregister.as_ref(),
+                            ),
+                        );
                         continue;
                     }
                 }
@@ -5251,7 +5399,14 @@ fn run_mount_supervisor(
                                 ),
                             ),
                         );
-                        supervisor_wait(&shutdown);
+                        supervisor_wait(
+                            &shutdown,
+                            &wake,
+                            supervisor_retry_deadline(
+                                &start_retry,
+                                pending_cloud_unregister.as_ref(),
+                            ),
+                        );
                         continue;
                     }
                     let lease = if cursor_recovery_host_owned {
@@ -5279,7 +5434,11 @@ fn run_mount_supervisor(
                             ),
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5301,7 +5460,14 @@ fn run_mount_supervisor(
                                 ),
                             ),
                         );
-                        supervisor_wait(&shutdown);
+                        supervisor_wait(
+                            &shutdown,
+                            &wake,
+                            supervisor_retry_deadline(
+                                &start_retry,
+                                pending_cloud_unregister.as_ref(),
+                            ),
+                        );
                         continue;
                     }
                     pending_cloud_unregister = Some(PendingCloudUnregister::new(record, None));
@@ -5324,7 +5490,11 @@ fn run_mount_supervisor(
                             ),
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5354,7 +5524,11 @@ fn run_mount_supervisor(
                         error,
                     ),
                 );
-                supervisor_wait(&shutdown);
+                supervisor_wait(
+                    &shutdown,
+                    &wake,
+                    supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                );
                 continue;
             }
             publish_status(
@@ -5371,7 +5545,11 @@ fn run_mount_supervisor(
                     "SIFS host mount is disabled",
                 ),
             );
-            supervisor_wait(&shutdown);
+            supervisor_wait(
+                &shutdown,
+                &wake,
+                supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+            );
             continue;
         }
 
@@ -5418,7 +5596,11 @@ fn run_mount_supervisor(
                         error,
                     ),
                 );
-                supervisor_wait(&shutdown);
+                supervisor_wait(
+                    &shutdown,
+                    &wake,
+                    supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                );
                 continue;
             }
         };
@@ -5497,7 +5679,11 @@ fn run_mount_supervisor(
                             error,
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
                 restart_count = restart_count.saturating_add(1);
@@ -5533,7 +5719,11 @@ fn run_mount_supervisor(
                         error,
                     ),
                 );
-                supervisor_wait(&shutdown);
+                supervisor_wait(
+                    &shutdown,
+                    &wake,
+                    supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                );
                 continue;
             }
             publish_status(
@@ -5550,7 +5740,11 @@ fn run_mount_supervisor(
                     "waiting for this main daemon to accept object RPCs",
                 ),
             );
-            supervisor_wait(&shutdown);
+            supervisor_wait(
+                &shutdown,
+                &wake,
+                supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+            );
             continue;
         }
 
@@ -5571,7 +5765,11 @@ fn run_mount_supervisor(
                             .unwrap_or("mount start is waiting for its retry deadline"),
                     ),
                 );
-                supervisor_wait(&shutdown);
+                supervisor_wait(
+                    &shutdown,
+                    &wake,
+                    supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                );
                 continue;
             }
             publish_status(
@@ -5599,6 +5797,7 @@ fn run_mount_supervisor(
                         &config,
                         &mount_point,
                         Arc::clone(&shutdown),
+                        Arc::clone(&wake),
                         &mount_cancellation,
                         lease,
                     )
@@ -5623,7 +5822,11 @@ fn run_mount_supervisor(
                             error,
                         ),
                     );
-                    supervisor_wait(&shutdown);
+                    supervisor_wait(
+                        &shutdown,
+                        &wake,
+                        supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+                    );
                     continue;
                 }
             }
@@ -5644,7 +5847,11 @@ fn run_mount_supervisor(
                 status,
             );
         }
-        supervisor_wait(&shutdown);
+        supervisor_wait(
+            &shutdown,
+            &wake,
+            supervisor_retry_deadline(&start_retry, pending_cloud_unregister.as_ref()),
+        );
     }
 
     if active.is_some() {
@@ -6477,10 +6684,8 @@ fn admit_host_cursor_recovery_enable(
     Ok((true, Some(lease)))
 }
 
-fn supervisor_wait(shutdown: &AtomicBool) {
-    if !shutdown.load(Ordering::SeqCst) {
-        thread::park_timeout(SUPERVISOR_POLL_INTERVAL);
-    }
+fn supervisor_wait(shutdown: &AtomicBool, wake: &SupervisorWake, deadline: Option<Instant>) {
+    wake.wait(shutdown, deadline);
 }
 
 fn daemon_is_ready(paths: &DaemonPaths, daemon_pid: u32) -> bool {
@@ -7309,6 +7514,7 @@ fn start_platform_mount(
     config: &SifsMountConfig,
     mount_point: &Path,
     _shutdown: Arc<AtomicBool>,
+    _supervisor_wake: Arc<SupervisorWake>,
     mount_cancellation: &Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>,
     lease: SifsMountLease,
 ) -> Result<ActiveMount, String> {
@@ -7370,6 +7576,7 @@ fn start_platform_mount(
     _config: &SifsMountConfig,
     _mount_point: &Path,
     _shutdown: Arc<AtomicBool>,
+    _supervisor_wake: Arc<SupervisorWake>,
     _mount_cancellation: &Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>,
     _lease: SifsMountLease,
 ) -> Result<ActiveMount, String> {
@@ -7377,10 +7584,92 @@ fn start_platform_mount(
 }
 
 #[cfg(windows)]
+mod cloud_files_cancellation_event {
+    use std::ffi::c_void;
+    use std::io;
+    use std::ptr;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateEventW(
+            event_attributes: *const c_void,
+            manual_reset: i32,
+            initial_state: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn SetEvent(event: *mut c_void) -> i32;
+        fn CloseHandle(object: *mut c_void) -> i32;
+    }
+
+    pub(super) fn create() -> io::Result<*mut c_void> {
+        let event = unsafe { CreateEventW(ptr::null(), 1, 0, ptr::null()) };
+        if event.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(event)
+        }
+    }
+
+    pub(super) fn signal(event: *mut c_void) {
+        unsafe {
+            let _ = SetEvent(event);
+        }
+    }
+
+    pub(super) fn close(event: *mut c_void) {
+        unsafe {
+            let _ = CloseHandle(event);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct CloudFilesCancellation {
+    cancelled: AtomicBool,
+    event: *mut std::ffi::c_void,
+}
+
+#[cfg(windows)]
+unsafe impl Send for CloudFilesCancellation {}
+#[cfg(windows)]
+unsafe impl Sync for CloudFilesCancellation {}
+
+#[cfg(windows)]
+impl CloudFilesCancellation {
+    fn new() -> Result<Self, String> {
+        Ok(Self {
+            cancelled: AtomicBool::new(false),
+            event: cloud_files_cancellation_event::create()
+                .map_err(|error| format!("create Cloud Files cancellation event: {error}"))?,
+        })
+    }
+
+    fn signal(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        cloud_files_cancellation_event::signal(self.event);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn raw_handle(&self) -> u64 {
+        self.event as usize as u64
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CloudFilesCancellation {
+    fn drop(&mut self) {
+        cloud_files_cancellation_event::close(self.event);
+    }
+}
+
+#[cfg(windows)]
 struct ActiveMount {
     config: SifsMountConfig,
     mount_point: PathBuf,
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<CloudFilesCancellation>,
     events: mpsc::Receiver<sinomo_runtime::dfs_cloud_files_api::CloudFilesMountLifecycleEvent>,
     finished: mpsc::Receiver<Result<(), String>>,
     thread: Option<thread::JoinHandle<()>>,
@@ -7611,22 +7900,11 @@ impl ActiveMount {
                     .to_string(),
             );
         }
-        if status.phase == SifsMountRuntimePhase::Connected
-            && self
-                .last_health_observed
-                .is_none_or(|observed| observed.elapsed() >= CLOUD_FILES_WORKER_STALE_AFTER)
-        {
-            status.phase = SifsMountRuntimePhase::Error;
-            status.last_error = Some(format!(
-                "Cloud Files worker heartbeat is stale for at least {} seconds",
-                CLOUD_FILES_WORKER_STALE_AFTER.as_secs()
-            ));
-        }
         status
     }
 
     fn stop(&mut self) -> Result<(), String> {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel.signal();
         self.refresh();
         if self.finished_result.is_none() {
             match self.finished.recv_timeout(MOUNT_STOP_TIMEOUT) {
@@ -7663,18 +7941,19 @@ impl ActiveMount {
 #[cfg(windows)]
 impl Drop for ActiveMount {
     fn drop(&mut self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel.signal();
     }
 }
 
 #[cfg(windows)]
 struct CloudFilesSupervisorCallbacks {
-    cancel: Arc<AtomicBool>,
+    cancel: Arc<CloudFilesCancellation>,
     supervisor_shutdown: Arc<AtomicBool>,
     events: mpsc::SyncSender<sinomo_runtime::dfs_cloud_files_api::CloudFilesMountLifecycleEvent>,
     data_dir: SinomoDataDir,
     cursor_recovery: Option<HostCursorRecoveryMarker>,
     operation_fence: Arc<Mutex<()>>,
+    supervisor_wake: Arc<SupervisorWake>,
 }
 
 #[cfg(windows)]
@@ -7695,6 +7974,7 @@ impl CloudFilesSupervisorCallbacks {
                     );
                 }
                 let _ = self.events.try_send(event);
+                self.supervisor_wake.signal();
                 true
             }
             Ok(CloudFilesModuleEvent::CursorRecoveryReadyObserved(request)) => {
@@ -7768,7 +8048,7 @@ fn acknowledge_host_cursor_recovery_active_observed(
     data_dir: &SinomoDataDir,
     expected: &HostCursorRecoveryMarker,
     request: &sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest,
-    cancel: &AtomicBool,
+    cancel: &CloudFilesCancellation,
     supervisor_shutdown: &AtomicBool,
 ) -> Result<(), String> {
     use sinomo_runtime::dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION;
@@ -7872,7 +8152,7 @@ fn acknowledge_host_cursor_recovery_active_observed(
             .get_typed(data_dir, None, SIFS_MOUNT_CONFIG_KEY)
             .map_err(|error| format!("revalidate completed cursor-recovery config: {error}"))?;
         if observed == expected.disabled_config || supervisor_shutdown.load(Ordering::SeqCst) {
-            cancel.store(true, Ordering::SeqCst);
+            cancel.signal();
         } else if observed != enabled {
             return Err("completed cursor-recovery configuration changed".to_string());
         }
@@ -8110,7 +8390,7 @@ fn acknowledge_host_cursor_recovery_active_observed(
             )
             .map_err(|error| format!("remove completed host cursor-recovery marker: {error}"))?;
             if consent_disabled || supervisor_shutdown.load(Ordering::SeqCst) {
-                cancel.store(true, Ordering::SeqCst);
+                cancel.signal();
             }
             Ok(())
         }
@@ -8362,7 +8642,7 @@ impl sinomo_runtime::module::NativeModuleHostCallbacks for CloudFilesSupervisorC
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst) || self.supervisor_shutdown.load(Ordering::SeqCst)
+        self.cancel.is_cancelled() || self.supervisor_shutdown.load(Ordering::SeqCst)
     }
 }
 
@@ -8372,6 +8652,7 @@ fn start_platform_mount(
     config: &SifsMountConfig,
     mount_point: &Path,
     supervisor_shutdown: Arc<AtomicBool>,
+    supervisor_wake: Arc<SupervisorWake>,
     _mount_cancellation: &Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>,
     lease: SifsMountLease,
 ) -> Result<ActiveMount, String> {
@@ -8648,6 +8929,7 @@ fn start_platform_mount(
     } else {
         None
     };
+    let cancel = Arc::new(CloudFilesCancellation::new()?);
     let request = CloudFilesMountRequest {
         sync_root: mount_point.to_path_buf(),
         root_path: config.root_path.clone(),
@@ -8659,6 +8941,7 @@ fn start_platform_mount(
         prepopulate_depth: 0,
         connect: true,
         max_run_seconds: None,
+        cancellation_event_handle: Some(cancel.raw_handle()),
         cursor_recovery: host_cursor_recovery.as_ref().map(|marker| {
             sinomo_runtime::dfs_cloud_files_api::CloudFilesCursorRecoveryContext {
                 recovery_id: marker.recovery_id.clone(),
@@ -8773,7 +9056,6 @@ fn start_platform_mount(
         request_body: None,
         response_body_path: None,
     });
-    let cancel = Arc::new(AtomicBool::new(false));
     let operation_fence = Arc::new(Mutex::new(()));
     let (event_tx, event_rx) = mpsc::sync_channel(32);
     let callbacks: Arc<dyn sinomo_runtime::module::NativeModuleHostCallbacks> =
@@ -8784,6 +9066,7 @@ fn start_platform_mount(
             data_dir: data_dir.clone(),
             cursor_recovery: host_cursor_recovery.clone(),
             operation_fence: Arc::clone(&operation_fence),
+            supervisor_wake: Arc::clone(&supervisor_wake),
         });
     let (finished_tx, finished_rx) = mpsc::sync_channel(1);
     let lease = Arc::new(lease);
@@ -8828,6 +9111,7 @@ fn start_platform_mount(
                     )),
                 });
             let _ = finished_tx.send(result);
+            supervisor_wake.signal();
         })
         .map_err(|error| format!("start Cloud Files provider thread: {error}"))?;
     Ok(ActiveMount {
@@ -9243,6 +9527,7 @@ fn start_platform_mount(
     _config: &SifsMountConfig,
     _mount_point: &Path,
     _shutdown: Arc<AtomicBool>,
+    _supervisor_wake: Arc<SupervisorWake>,
     _mount_cancellation: &Mutex<Option<sinomo_runtime::dfs::DfsCancellationFlag>>,
     _lease: SifsMountLease,
 ) -> Result<ActiveMount, String> {
@@ -9257,6 +9542,28 @@ mod tests {
     const MOUNT_LEASE_PROBE_ROOT: &str = "SINOMO_TEST_SIFS_MOUNT_LEASE_ROOT";
     const MOUNT_LEASE_PROBE_EXPECT_AVAILABLE: &str =
         "SINOMO_TEST_SIFS_MOUNT_LEASE_EXPECT_AVAILABLE";
+
+    #[test]
+    fn supervisor_idle_gate_blocks_until_an_explicit_signal() {
+        let wake = Arc::new(SupervisorWake::default());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (completed, observed) = mpsc::sync_channel(1);
+        let thread_wake = Arc::clone(&wake);
+        let thread_shutdown = Arc::clone(&shutdown);
+        let join = thread::spawn(move || {
+            thread_wake.wait(&thread_shutdown, None);
+            completed.send(()).expect("report supervisor wake");
+        });
+        assert!(matches!(
+            observed.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        wake.signal();
+        observed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("explicit signal wakes supervisor");
+        join.join().expect("join supervisor gate");
+    }
 
     fn retired_mount_fixture() -> RetiredMount {
         RetiredMount {
@@ -9819,7 +10126,7 @@ mod tests {
             SifsMountLease::try_acquire_existing_for_cursor_recovery(&fixture.data_dir)
                 .expect("terminal active fixture existing lease");
         let lease = Arc::new(lease);
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(CloudFilesCancellation::new().expect("cancellation event"));
         let supervisor_shutdown = Arc::new(AtomicBool::new(false));
         let operation_fence = Arc::new(Mutex::new(()));
         let (event_tx, event_rx) = mpsc::sync_channel(8);
@@ -9837,7 +10144,7 @@ mod tests {
             let thread = thread::Builder::new()
                 .name("cursor-terminal-fixture-worker".to_string())
                 .spawn(move || {
-                    while !worker_cancel.load(Ordering::SeqCst) {
+                    while !worker_cancel.is_cancelled() {
                         thread::yield_now();
                     }
                     let _ = finished_tx.send(Ok(()));
@@ -9874,6 +10181,7 @@ mod tests {
             data_dir: fixture.data_dir.clone(),
             cursor_recovery: Some(fixture.marker.clone()),
             operation_fence,
+            supervisor_wake: Arc::new(SupervisorWake::default()),
         };
         (active, callbacks)
     }
@@ -9895,7 +10203,7 @@ mod tests {
     fn active_callback_drives_authority_finalized_normalization_and_release_cuts() {
         let temp = TestDir::new("sifs-cursor-terminal-active-callback");
         let mut fixture = host_terminal_fixture(&temp);
-        let cancel = AtomicBool::new(false);
+        let cancel = CloudFilesCancellation::new().expect("cancellation event");
         let shutdown = AtomicBool::new(false);
 
         acknowledge_host_cursor_recovery_active_observed(
@@ -10003,11 +10311,11 @@ mod tests {
                 .is_none()
         );
         assert!(!host_cursor_recovery_provider_bundle_path(&fixture.data_dir).exists());
-        assert!(!cancel.load(Ordering::SeqCst));
+        assert!(!cancel.is_cancelled());
 
         let temp = TestDir::new("sifs-cursor-terminal-disabled-final-ack");
         let mut fixture = host_terminal_fixture(&temp);
-        let cancel = AtomicBool::new(false);
+        let cancel = CloudFilesCancellation::new().expect("cancellation event");
         let shutdown = AtomicBool::new(false);
         acknowledge_host_cursor_recovery_active_observed(
             &fixture.data_dir,
@@ -10057,7 +10365,7 @@ mod tests {
             &shutdown,
         )
         .expect("disabled fixture final ACK");
-        assert!(cancel.load(Ordering::SeqCst));
+        assert!(cancel.is_cancelled());
     }
 
     #[cfg(windows)]
@@ -10182,7 +10490,7 @@ mod tests {
         ))
         .expect("AF-first native authority release");
         assert!(callbacks.handle_output(&ca_payload));
-        assert!(callbacks.cancel.load(Ordering::SeqCst));
+        assert!(callbacks.cancel.is_cancelled());
         stop_active_mount(&mut active, &mount_cancellation).expect("join cancelled AF worker");
 
         let temp = TestDir::new("sifs-cursor-terminal-fence-af-finished");
@@ -10264,11 +10572,12 @@ mod tests {
                 .expect("host marker before rejection");
             let stage_before = inspect_cursor_recovery_staged_record_snapshot(&fixture.data_dir)
                 .expect("stage before rejection");
+            let cancel = CloudFilesCancellation::new().expect("cancellation event");
             acknowledge_host_cursor_recovery_active_observed(
                 &fixture.data_dir,
                 &fixture.marker,
                 &fixture.active_request,
-                &AtomicBool::new(false),
+                &cancel,
                 &AtomicBool::new(false),
             )
             .expect_err("terminal ambiguity must fail closed");
@@ -10294,7 +10603,7 @@ mod tests {
                 "sifs-cursor-terminal-restart-bundle-absent"
             });
             let mut fixture = host_terminal_fixture(&temp);
-            let cancel = AtomicBool::new(false);
+            let cancel = CloudFilesCancellation::new().expect("cancellation event");
             let shutdown = AtomicBool::new(false);
             acknowledge_host_cursor_recovery_active_observed(
                 &fixture.data_dir,
@@ -10352,7 +10661,7 @@ mod tests {
 
         let temp = TestDir::new("sifs-cursor-terminal-disabled-restart");
         let mut fixture = host_terminal_fixture(&temp);
-        let cancel = AtomicBool::new(false);
+        let cancel = CloudFilesCancellation::new().expect("cancellation event");
         let shutdown = AtomicBool::new(false);
         acknowledge_host_cursor_recovery_active_observed(
             &fixture.data_dir,
@@ -10404,7 +10713,7 @@ mod tests {
 
         let temp = TestDir::new("sifs-cursor-terminal-restart-stage-temp");
         let mut fixture = host_terminal_fixture(&temp);
-        let cancel = AtomicBool::new(false);
+        let cancel = CloudFilesCancellation::new().expect("cancellation event");
         let shutdown = AtomicBool::new(false);
         acknowledge_host_cursor_recovery_active_observed(
             &fixture.data_dir,
@@ -10479,7 +10788,7 @@ mod tests {
         ] {
             let temp = TestDir::new(&format!("sifs-cursor-terminal-af-restart-{cut}"));
             let mut fixture = host_terminal_fixture(&temp);
-            let cancel = AtomicBool::new(false);
+            let cancel = CloudFilesCancellation::new().expect("cancellation event");
             let shutdown = AtomicBool::new(false);
             acknowledge_host_cursor_recovery_active_observed(
                 &fixture.data_dir,

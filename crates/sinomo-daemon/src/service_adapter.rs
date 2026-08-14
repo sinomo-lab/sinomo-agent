@@ -5877,9 +5877,10 @@ fn daemon_service_registry(
     builder = if let Some(runtime) = service_runtime {
         sinomo_dfs::register_services_with_data_plane_host(
             builder,
-            Arc::new(DaemonDfsDataPlaneHost::new_on_runtime(
+            Arc::new(DaemonDfsDataPlaneHost::new_on_runtime_with_event_hub(
                 paths.clone(),
                 runtime,
+                Arc::clone(&event_hub),
             )),
         )
     } else {
