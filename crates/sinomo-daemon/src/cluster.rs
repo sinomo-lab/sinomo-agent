@@ -9295,9 +9295,10 @@ impl sinomo_core::cluster::ClusterStateAuthorityReachabilityAsyncHost
             let Some(paths) = paths else {
                 return Ok(false);
             };
-            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
-            let result = client
-                .call_target(
+            let result =
+                sinomo_core::network::ClusterObjectRpcAsyncHost::call_node_object_rpc_async(
+                    self,
+                    &paths,
                     state,
                     target_node_id,
                     sinomo_core::network::ObjectRpcCall::encode_value(
@@ -9732,9 +9733,10 @@ impl sinomo_core::cluster::ClusterKvCommittedFanoutAsyncHost
                         .to_string(),
                 });
             };
-            let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(self, &paths);
-            let response = client
-                .call_target(
+            let response =
+                sinomo_core::network::ClusterObjectRpcAsyncHost::call_node_object_rpc_async(
+                    self,
+                    &paths,
                     state,
                     target_node_id,
                     sinomo_core::network::ObjectRpcCall::encode_borrowed_value(

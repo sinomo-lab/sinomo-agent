@@ -8,7 +8,7 @@ use sinomo_kv::{
     KvTxnRequest,
 };
 use sinomo_network::ClusterPaths;
-use sinomo_network::{ClusterObjectRpcAsyncHost, ClusterObjectRpcClient, ClusterObjectRpcOptions};
+use sinomo_network::{ClusterObjectRpcAsyncHost, ClusterObjectRpcOptions};
 use sinomo_network::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use sinomo_network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse};
 use sinomo_node::NodeId;
@@ -2103,14 +2103,13 @@ where
         sinomo_kv::ClusterKvAuthoritativeSnapshotRequest,
     )?;
     call.request = call.request.with_response_retry_safe();
-    let mut client =
-        ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(host, paths, state)?;
     let read = decode_forwarded_cluster_kv_authority_before::<KvAuthoritativeRead<KvSnapshot>, _>(
         target_node_id,
         "fetch authoritative cluster KV snapshot",
         cluster_kv_forward_deadline(timeout),
         timeout,
-        client.call_target(
+        host.call_node_object_rpc_async(
+            paths,
             state,
             target_node_id,
             call,
@@ -2217,7 +2216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_txn_forward_uses_host_node_dispatch_seam() {
+    async fn async_txn_and_snapshot_forward_use_host_node_dispatch_seam() {
         let (root, state) = forward_test_state(false);
         let paths = ClusterPaths::new(&sinomo_local::SinomoDataDir::new(root.path()));
         paths.ensure().expect("cluster paths");
@@ -2239,6 +2238,15 @@ mod tests {
         .expect_err("recording dispatch rejects the forwarded transaction");
 
         assert_eq!(host.calls, 1);
+        assert!(error.to_string().contains("host dispatch seam reached"));
+
+        let error = fetch_cluster_kv_snapshot_from_node_async_with_host(
+            &paths, &state, &target, timeout, &mut host,
+        )
+        .await
+        .expect_err("recording dispatch rejects the snapshot fallback");
+
+        assert_eq!(host.calls, 2);
         assert!(error.to_string().contains("host dispatch seam reached"));
     }
 
