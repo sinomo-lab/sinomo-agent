@@ -2379,14 +2379,54 @@ fn call_node_object_rpc_on_runtime(
         address: target_node_id.to_string(),
         detail: "cluster paths are unavailable for node object RPC".to_string(),
     })?;
-    let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(&paths);
+    call_node_object_rpc_with_cluster_paths_on_runtime(
+        &paths,
+        state,
+        target_node_id,
+        rpc_request,
+        options,
+        runtime,
+    )
+}
+
+pub(crate) fn call_node_object_rpc_with_cluster_paths_on_runtime(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    rpc_request: &sinomo_core::network::ObjectRpcRequest,
+    options: sinomo_core::network::ClusterObjectRpcOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<sinomo_core::network::ObjectRpcResponse, DaemonError> {
+    if target_node_id == &state.local_node_id {
+        let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+            path: paths.root.display().to_string(),
+            detail: "cluster paths have no data directory parent".to_string(),
+        })?;
+        let daemon_paths = DaemonPaths::new(&SinomoDataDir::new(data_dir));
+        return block_on_daemon_cluster_future_on_owner_runtime(
+            runtime,
+            Box::pin(materialize_daemon_client_value_call_with_options(
+                "local cluster node object RPC value call",
+                options,
+                crate::client::send_object_rpc_call_to_target_async_with_daemon_paths_and_options(
+                    &daemon_paths,
+                    target_node_id,
+                    sinomo_core::network::ObjectRpcCall::value(rpc_request.clone()),
+                    options,
+                    runtime,
+                    true,
+                ),
+            )),
+        );
+    }
+    let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
     // This bridge is used by KV authority forwarding/snapshot refresh. The
     // caller has already projected the exact Raft membership fence carried in
     // `state`; resolving the route through the KV-backed directory would make
     // recovery of that KV recursively depend on materializing it first.
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
-            &mut host, &paths, state,
+            &mut host, paths, state,
         )?;
     block_on_daemon_cluster_future_on_owner_runtime(
         runtime,

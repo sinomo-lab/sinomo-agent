@@ -3517,8 +3517,8 @@ mod tests {
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
 
-    #[tokio::test]
-    async fn daemon_paths_target_uses_explicit_local_main_service_path() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cluster_node_target_uses_explicit_local_main_service_path() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-target-service-path");
         let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data directory");
@@ -3620,57 +3620,46 @@ mod tests {
             .expect("serve local target request");
         });
 
-        let result =
-            super::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
-                &daemon_paths,
-                &local_node,
-                sinomo_core::network::ObjectRpcCall::encode_value(
-                    "/test/daemon-local-target",
-                    "test",
-                    "request",
-                )
-                .expect("request"),
-                sinomo_core::network::ClusterObjectRpcOptions::default()
-                    .with_overall_timeout(Duration::from_secs(2)),
-                &tokio::runtime::Handle::current(),
-                true,
-            )
-            .await
-            .expect("local target uses explicit daemon service path");
+        let request = sinomo_core::network::ObjectRpcRequest::encode_body(
+            "/test/daemon-local-target",
+            "test",
+            &"request",
+        )
+        .expect("request");
+        let result = crate::cluster::call_node_object_rpc_with_cluster_paths_on_runtime(
+            &cluster_paths,
+            &state,
+            &local_node,
+            &request,
+            sinomo_core::network::ClusterObjectRpcOptions::default()
+                .with_overall_timeout(Duration::from_secs(2)),
+            &tokio::runtime::Handle::current(),
+        )
+        .expect("local target uses explicit daemon service path");
         assert_eq!(
-            result.decode_body::<String>().await.expect("response body"),
+            result.decode_body::<String>().expect("response body"),
             "local-main"
         );
         server.await.expect("local daemon server");
 
         status.cluster.as_mut().expect("cluster status").process = "daemon-shadow".to_string();
         crate::write_daemon_status(&daemon_paths, &status).expect("shadow daemon status");
-        let error =
-            super::send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
-                &daemon_paths,
-                &local_node,
-                sinomo_core::network::ObjectRpcCall::encode_value(
-                    "/test/daemon-local-target",
-                    "test",
-                    "request",
-                )
-                .expect("request"),
-                sinomo_core::network::ClusterObjectRpcOptions::default()
-                    .with_overall_timeout(Duration::from_secs(2)),
-                &tokio::runtime::Handle::current(),
-                true,
-            )
-            .await
-            .expect_err("shadow daemon status must not authorize the local main service path");
-        assert_eq!(
-            error.delivery_state(),
-            Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
-        );
+        let error = crate::cluster::call_node_object_rpc_with_cluster_paths_on_runtime(
+            &cluster_paths,
+            &state,
+            &local_node,
+            &request,
+            sinomo_core::network::ClusterObjectRpcOptions::default()
+                .with_overall_timeout(Duration::from_secs(2)),
+            &tokio::runtime::Handle::current(),
+        )
+        .expect_err("shadow daemon status must not authorize the local main service path");
         assert!(
             error
                 .to_string()
                 .contains("local main-daemon status does not own cluster")
         );
+        assert!(error.to_string().contains("DefinitelyNotSent"));
     }
 
     #[test]
