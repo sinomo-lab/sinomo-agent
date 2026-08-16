@@ -18120,6 +18120,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let associated_index;
+        let cloud_files_index;
         let unmatched_index;
         {
             let mut app = shared.borrow_mut();
@@ -18141,17 +18142,30 @@ mod tests {
                     error: None,
                 }),
                 nodes: vec![node_summary],
-                modules: vec![crate::backend::modules::ModuleConfigModuleSummary {
-                    module_id: "module.sandbox.wasix".to_string(),
-                    label: "WASIX Sandbox".to_string(),
-                    backend: "wasix".to_string(),
-                    detail: "WASIX sandbox runtime module".to_string(),
-                    desired_enabled: Some(true),
-                    effective_enabled: false,
-                    effective_source: ModuleRuntimeConfigSource::Node,
-                    observed: ModuleObservedState::Running,
-                    observed_detail: "Runtime process is active".to_string(),
-                }],
+                modules: vec![
+                    crate::backend::modules::ModuleConfigModuleSummary {
+                        module_id: "module.sandbox.wasix".to_string(),
+                        label: "WASIX Sandbox".to_string(),
+                        backend: "wasix".to_string(),
+                        detail: "WASIX sandbox runtime module".to_string(),
+                        desired_enabled: Some(true),
+                        effective_enabled: false,
+                        effective_source: ModuleRuntimeConfigSource::Node,
+                        observed: ModuleObservedState::Running,
+                        observed_detail: "Runtime process is active".to_string(),
+                    },
+                    crate::backend::modules::ModuleConfigModuleSummary {
+                        module_id: "module.dfs.cloud-files".to_string(),
+                        label: "Cloud Files".to_string(),
+                        backend: "native-dylib".to_string(),
+                        detail: "Windows SIFS filesystem projection".to_string(),
+                        desired_enabled: Some(true),
+                        effective_enabled: true,
+                        effective_source: ModuleRuntimeConfigSource::Node,
+                        observed: ModuleObservedState::Running,
+                        observed_detail: "Native provider is active".to_string(),
+                    },
+                ],
                 warnings: Vec::new(),
             };
             associated_index = settings.config_items.len();
@@ -18184,6 +18198,23 @@ mod tests {
                 ],
             ));
             settings.config_items.push(associated);
+
+            cloud_files_index = settings.config_items.len();
+            let definition = sinomo_runtime::dfs::sifs_mount_config_definition_for_module(
+                "module.dfs.cloud-files",
+            );
+            let default_value = definition.default_value.expect("mount mapping default");
+            let default_json = serde_json::to_string(&default_value).expect("mount mapping JSON");
+            let mut cloud_files = test_config_item(
+                sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY,
+                ConfigEditKind::Json,
+                &default_json,
+            );
+            cloud_files.owner = definition.owner;
+            cloud_files.module_id = definition.module_id;
+            cloud_files.description = definition.description;
+            cloud_files.schema = definition.schema;
+            settings.config_items.push(cloud_files);
 
             unmatched_index = settings.config_items.len();
             let mut unmatched = test_config_item(
@@ -18252,6 +18283,24 @@ mod tests {
             .with_name(format!("config-{associated_index}-schema-endpoint"))
             .expect()
             .to_have_value("https://sandbox.test")?;
+        window.get_by_text("Cloud Files").expect().to_be_visible()?;
+        assert!(
+            window
+                .get_by_text("Settings · storage.sifs-mount")
+                .count()?
+                >= 1,
+            "the Cloud Files descriptor must render the shared mount mapping on its module card"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{cloud_files_index}-schema-mount_point"))
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{cloud_files_index}-schema-root_path"))
+            .expect()
+            .to_have_value("/")?;
         window
             .get_by_text("Additional module settings")
             .expect()

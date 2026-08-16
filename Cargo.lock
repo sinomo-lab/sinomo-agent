@@ -8875,6 +8875,7 @@ dependencies = [
  "serde_json",
  "sinomo-config",
  "sinomo-core",
+ "sinomo-dfs-cloud-files-api",
  "sinomo-module",
  "sinomo-testdir",
  "thiserror 2.0.19",
@@ -8898,6 +8899,7 @@ dependencies = [
  "tokio",
  "ulid",
  "windows",
+ "windows-collections",
 ]
 
 [[package]]

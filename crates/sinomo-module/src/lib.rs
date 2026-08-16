@@ -3414,6 +3414,32 @@ fn native_descriptor_surfaces_to_module_surfaces(
             .with_declarative_resource(native_descriptor_resource_to_module_resource(resource)?);
     }
     surfaces.settings = descriptor.surfaces.settings.clone();
+    let descriptor_module_id = parse_native_dylib_module_id(&descriptor.module_id)?;
+    for definition in surfaces.config_definitions().map_err(|source| {
+        NativeDylibModuleInstallError::Descriptor {
+            detail: source.to_string(),
+        }
+    })? {
+        let declared_module_id = definition.module_id.as_deref().ok_or_else(|| {
+            NativeDylibModuleInstallError::Descriptor {
+                detail: format!(
+                    "native module `{}` setting `{}` has no module identity",
+                    descriptor.module_id, definition.key
+                ),
+            }
+        })?;
+        let declared_module_id = parse_native_dylib_module_id(declared_module_id)?;
+        if declared_module_id != descriptor_module_id {
+            return Err(NativeDylibModuleInstallError::Descriptor {
+                detail: format!(
+                    "native module `{}` cannot declare setting `{}` for module `{}`",
+                    descriptor.module_id,
+                    definition.key,
+                    definition.module_id.as_deref().unwrap_or("<missing>")
+                ),
+            });
+        }
+    }
     for transport in &descriptor.surfaces.network_transports {
         surfaces = surfaces.with_network_transport(transport.clone());
     }
@@ -6195,6 +6221,17 @@ mod tests {
         let error = native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
             .expect_err("native interface target must name a supported operation");
         assert!(error.to_string().contains("supported_operations"));
+
+        descriptor.supported_operations = vec!["dynamic.native.inspect".to_string()];
+        let foreign_definition = test_module_settings_definition("module.foreign");
+        descriptor.surfaces.settings = vec![sinomo_module_api::ModuleSettingsExport::new(
+            foreign_definition.key.as_str(),
+            sinomo_module_api::encode_sobj(&foreign_definition)
+                .expect("encode foreign native module setting"),
+        )];
+        let error = native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
+            .expect_err("native descriptor must not declare another module's setting");
+        assert!(error.to_string().contains("cannot declare setting"));
     }
 
     #[test]

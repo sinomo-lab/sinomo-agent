@@ -279,6 +279,12 @@ mod tests {
         assert_eq!(mount.cluster_mode, ConfigClusterMode::LocalOnly);
         assert!(!mount.read_only);
         assert!(mount.schema.is_some());
+        let expected_module_id = sinomo_runtime::dfs::sifs_mount_settings_module_id();
+        assert_eq!(
+            mount.module_id.as_deref(),
+            Some(expected_module_id.as_str()),
+            "the generic module settings UI must place the mount editor on the active platform adapter card"
+        );
 
         let status = store
             .registry()
@@ -287,6 +293,7 @@ mod tests {
         assert_eq!(status.cluster_mode, ConfigClusterMode::LocalOnly);
         assert!(status.read_only);
         assert!(status.schema.is_some());
+        assert_eq!(status.module_id, mount.module_id);
     }
 
     #[test]

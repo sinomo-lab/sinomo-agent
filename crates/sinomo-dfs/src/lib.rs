@@ -426,7 +426,9 @@ pub use mount_config::{
     SifsMountAttentionSummary, SifsMountConfig, SifsMountCursorOnlyRecoveryRequest,
     SifsMountCursorOnlyRecoveryResponse, SifsMountPlatform, SifsMountRetainedLocalEvidence,
     SifsMountRuntimePhase, SifsMountRuntimeStatus, SifsMountStatusRequest, SifsMountStatusResponse,
-    SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_status_config_definition,
+    SifsMountWritebackMode, sifs_mount_config_definition, sifs_mount_config_definition_for_module,
+    sifs_mount_settings_module_id, sifs_mount_status_config_definition,
+    sifs_mount_status_config_definition_for_module,
 };
 pub use mounted_mutation_outbox::{
     MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES, MOUNTED_SIFS_MUTATION_OUTBOX_MAX_PENDING_MARKERS,

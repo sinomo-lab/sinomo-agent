@@ -3946,23 +3946,24 @@ fn mount_sifs_cloud_files_inner(
     ));
 
     let write_options = dfs::DfsWriteOptions::replicated_eventual(opened.replica_candidates);
-    let (mut writable_worker, writable_worker_cancelled) = windows_adapter::build_writable_worker(
-        writable_state,
-        Arc::clone(&shared_service),
-        write_options,
-        Arc::clone(&mounted_mutation_handoff),
-        Arc::clone(&writable_worker_wake),
-        windows_adapter::WindowsWritableWorkerOptions {
-            sync_root: request.sync_root.clone(),
-            root_path: request.root_path.clone(),
-            existing_owned_root,
-            expected_cursor_recovery_sync_root_file_id: cursor_recovery_marker
-                .as_ref()
-                .map(|marker| marker.sync_root_file_id),
-            prepopulate_depth: request.prepopulate_depth,
-            materialized_directories,
-        },
-    );
+    let (mut writable_worker, writable_worker_cancelled, explorer_status) =
+        windows_adapter::build_writable_worker(
+            writable_state,
+            Arc::clone(&shared_service),
+            write_options,
+            Arc::clone(&mounted_mutation_handoff),
+            Arc::clone(&writable_worker_wake),
+            windows_adapter::WindowsWritableWorkerOptions {
+                sync_root: request.sync_root.clone(),
+                root_path: request.root_path.clone(),
+                existing_owned_root,
+                expected_cursor_recovery_sync_root_file_id: cursor_recovery_marker
+                    .as_ref()
+                    .map(|marker| marker.sync_root_file_id),
+                prepopulate_depth: request.prepopulate_depth,
+                materialized_directories,
+            },
+        );
     let connect_provider = || {
         let callback_table = callback_table();
         let sync_root_wide = wide_path(&request.sync_root);
@@ -4002,6 +4003,7 @@ fn mount_sifs_cloud_files_inner(
         }
         return Err(activation.fail(error, lifecycle));
     }
+    crate::windows_shell::observe_explorer_state(&explorer_status, writable_worker.state());
     lifecycle.local_change_sync = writable_worker.state().status();
     lifecycle.placeholders_created = writable_worker.state().reconciler().manifest().len() as u64;
     let placeholders_created = lifecycle.placeholders_created;
@@ -4029,6 +4031,7 @@ fn mount_sifs_cloud_files_inner(
         writable_worker_wake,
         emitter,
         1,
+        explorer_status,
     ) {
         Ok(worker) => worker,
         Err(error) => {
@@ -4253,6 +4256,12 @@ fn mount_sifs_cloud_files_inner(
         generation
     };
     activation.disarm();
+    match crate::windows_shell::configure_sync_root_status_schema(&request.sync_root) {
+        Ok(()) => writable_worker.enable_explorer_status(),
+        Err(error) => host_log(&format!(
+            "Cloud Files Explorer custom status is unavailable: {error}"
+        )),
+    }
     host_log(&format!(
         "Cloud Files registration became ready after worker progress generation {first_progress_generation}"
     ));

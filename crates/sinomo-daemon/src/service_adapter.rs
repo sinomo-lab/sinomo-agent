@@ -6195,6 +6195,15 @@ fn register_module_surface_config_definitions(
         }
     };
     for definition in definitions {
+        if builder
+            .get(definition.key.as_str())
+            .is_ok_and(|existing| existing == &definition)
+        {
+            // Native modules may repeat an identical definition that is also
+            // present in the host's fallback catalog. Keep the already-owned
+            // static entry without treating the declaration as a collision.
+            continue;
+        }
         match builder.clone().register(definition) {
             Ok(next) => builder = next,
             Err(error) => tracing::warn!(
@@ -12121,6 +12130,51 @@ mod tests {
                 .expect("static definition remains")
                 .owner,
             "application-hook"
+        );
+    }
+
+    #[test]
+    fn identical_dynamic_module_settings_are_idempotent_with_the_static_catalog() {
+        let module_id = sinomo_module::ModuleId::from_legacy_named("module.dynamic-identical")
+            .expect("module id");
+        let definition = sinomo_config::ConfigDefinition::new(
+            "test.config-identical",
+            "dynamic-module",
+            sinomo_config::ConfigValueType::Object {
+                schema_name: "DynamicIdenticalConfig".to_string(),
+            },
+            "dynamic module config",
+            sinomo_config::ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(sinomo_config::ConfigSchema::object(
+            "DynamicIdenticalConfig",
+            "Dynamic module settings declared by both the fallback and native catalogs.",
+            vec![sinomo_config::ConfigSchemaField::new(
+                "enabled",
+                "Enabled",
+                "Whether the test behavior is enabled.",
+                sinomo_config::ConfigSchemaValue::bool(),
+            )],
+        ))
+        .expect("schema")
+        .with_module_id(module_id.to_string())
+        .expect("module ownership");
+        let builder = sinomo_config::ConfigRegistry::builder()
+            .register(definition.clone())
+            .expect("static definition registration");
+        let surfaces = sinomo_module::ModuleSurfaces::default()
+            .with_config_definition(definition.clone())
+            .expect("dynamic settings surface");
+
+        let registry =
+            register_module_surface_config_definitions(builder, &module_id, &surfaces).build();
+
+        assert_eq!(
+            registry
+                .get("test.config-identical")
+                .expect("identical definition remains"),
+            &definition
         );
     }
 

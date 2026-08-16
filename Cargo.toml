@@ -130,3 +130,4 @@ notify = "8.2.0"
 ulid = "3.0.0"
 v4l = "0.14.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-collections = "0.3.2"

@@ -27,12 +27,13 @@ use sinomo_dfs_cloud_files_api::{
     SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
 };
 use sinomo_module_api::{
-    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
-    NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
-    NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    ModuleSettingsExport, NativeModuleBackend, NativeModuleCapabilitiesResponse,
+    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationRequest,
+    NativeModuleInvocationResponse, NativeModuleRequest, NativeModuleResponse,
+    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 
 pub mod local_change_queue;
@@ -42,6 +43,8 @@ mod registration_journal;
 pub mod sync_executor;
 #[cfg(windows)]
 mod windows_impl;
+#[cfg(windows)]
+mod windows_shell;
 pub mod windows_sync;
 
 #[cfg(any(windows, test))]
@@ -293,8 +296,30 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
             "dfs.sifs.cloud-files.lifecycle-status".to_string(),
             "dfs.sifs.cloud-files.writable-sync-v2".to_string(),
         ],
-        surfaces: Default::default(),
+        surfaces: NativeModuleSurfaces {
+            settings: cloud_files_settings_exports(),
+            ..Default::default()
+        },
     }
+}
+
+fn cloud_files_settings_exports() -> Vec<ModuleSettingsExport> {
+    [
+        sinomo_runtime::dfs::sifs_mount_config_definition_for_module(
+            SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        ),
+        sinomo_runtime::dfs::sifs_mount_status_config_definition_for_module(
+            SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+        ),
+    ]
+    .into_iter()
+    .map(|definition| {
+        let key = definition.key.as_str().to_string();
+        let definition_sobj = encode_sobj(&definition)
+            .expect("Cloud Files module settings definitions must encode as SOBJ");
+        ModuleSettingsExport::new(key, definition_sobj)
+    })
+    .collect()
 }
 
 fn invoke_unchecked(
@@ -716,6 +741,39 @@ mod tests {
                 .capabilities
                 .contains(&"dfs.sifs.write".to_string())
         );
+        let definitions = descriptor
+            .surfaces
+            .settings
+            .iter()
+            .map(|export| {
+                decode_sobj::<sinomo_runtime::config::ConfigDefinition>(&export.definition_sobj)
+                    .expect("decode Cloud Files module setting")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(definitions.len(), 2);
+        let expected_module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+                .expect("Cloud Files module id")
+                .to_string();
+        assert!(definitions.iter().all(|definition| {
+            definition.module_id.as_deref() == Some(expected_module_id.as_str())
+        }));
+        let mount = definitions
+            .iter()
+            .find(|definition| {
+                definition.key.as_str() == sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY
+            })
+            .expect("editable mount mapping setting");
+        assert!(!mount.read_only);
+        assert!(mount.schema.is_some());
+        let status = definitions
+            .iter()
+            .find(|definition| {
+                definition.key.as_str() == sinomo_runtime::dfs::SIFS_MOUNT_STATUS_CONFIG_KEY
+            })
+            .expect("read-only mount status setting");
+        assert!(status.read_only);
+        assert!(status.schema.is_some());
     }
 
     #[test]
