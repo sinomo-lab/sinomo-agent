@@ -6,15 +6,34 @@ use crate::{AgentToolKind, AgentToolSpec};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use sinomo_lm::{
-    LanguageModelProviderCapabilities, OpenAiImageRequest, OpenAiImageResponse, OpenAiProvider,
-    OpenAiWebSearchContextSize, OpenAiWebSearchRequest, OpenAiWebSearchResponse,
+    LanguageModelProviderCapabilities, OPENAI_MAX_IMAGE_REFERENCES, OpenAiImageRequest,
+    OpenAiImageResponse, OpenAiProvider, OpenAiResponsesCodexClient, OpenAiWebSearchContextSize,
+    OpenAiWebSearchRequest, OpenAiWebSearchResponse,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-const MAX_REFERENCE_IMAGES: usize = 5;
+const MAX_REFERENCE_IMAGES: usize = OPENAI_MAX_IMAGE_REFERENCES;
 const MAX_REFERENCE_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+const IMAGE_GENERATION_DESCRIPTION: &str = "\
+Generate an image from a description, or edit existing images with specific instructions. Use it when:
+
+- The user asks for an image of a described scene, such as a diagram, portrait, comic, meme, or any other visual.
+- The user wants an existing image modified, including adding or removing elements, altering colors, \
+improving quality, or transforming the style (for example cartoon or oil painting).
+
+Guidelines:
+- Image generation takes a while to finish; treat a call as long-running rather than retrying it.
+- Omit `referenced_image_paths` when generating a brand new image.
+- For edits, pass every target image through `referenced_image_paths`, up to five paths that resolve \
+inside the granted workspace roots.
+- If you have not seen a referenced image yet, inspect it before editing so the prompt describes the \
+intended change.
+- If a target image has no path inside the workspace, ask the user to save or attach it before editing.
+- Generate the image directly without asking for confirmation unless a required image must be supplied again.
+- Prefer this tool over shell or scripting tools for image editing unless the user explicitly asks otherwise.";
 
 pub trait HostedModelToolBackend: Send + Sync {
     fn capabilities(&self) -> LanguageModelProviderCapabilities;
@@ -47,6 +66,29 @@ impl HostedModelToolBackend for OpenAiProvider {
         request: &OpenAiImageRequest,
     ) -> Result<OpenAiImageResponse, String> {
         OpenAiProvider::generate_or_edit_image(self, request).map_err(|error| error.to_string())
+    }
+}
+
+/// A ChatGPT sign-in reaches the same image model and a standalone web search endpoint through the
+/// Codex backend, so both hosted tools resolve against it.
+impl HostedModelToolBackend for OpenAiResponsesCodexClient {
+    fn capabilities(&self) -> LanguageModelProviderCapabilities {
+        LanguageModelProviderCapabilities::codex()
+    }
+
+    fn web_search(
+        &self,
+        request: &OpenAiWebSearchRequest,
+    ) -> Result<OpenAiWebSearchResponse, String> {
+        OpenAiResponsesCodexClient::web_search(self, request).map_err(|error| error.to_string())
+    }
+
+    fn generate_or_edit_image(
+        &self,
+        request: &OpenAiImageRequest,
+    ) -> Result<OpenAiImageResponse, String> {
+        OpenAiResponsesCodexClient::generate_or_edit_image(self, request)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -250,6 +292,7 @@ impl AgentTool for ImageGenerationTool {
             "bytes": result.bytes.len(),
             "size": result.size,
             "operation": if reference_paths.is_empty() { "generation" } else { "edit" },
+            "output_hint": image_generation_output_hint(&path),
         });
         AgentToolResult::succeeded(
             format!("saved generated image to {}", path.display()),
@@ -320,7 +363,7 @@ pub fn image_generation_descriptor() -> AgentToolDescriptor {
     AgentToolDescriptor::new(AgentToolSpec::new(
         AgentToolKind::ImageGeneration,
         "image_generation",
-        "Generate an image from a prompt, or edit up to five workspace images using the same implementation in chat and realtime modes.",
+        IMAGE_GENERATION_DESCRIPTION,
         false,
     ))
     .with_input_schema(serde_json::json!({
@@ -331,11 +374,11 @@ pub fn image_generation_descriptor() -> AgentToolDescriptor {
             "referenced_image_paths": {
                 "type": "array",
                 "items": { "type": "string" },
-                "maxItems": 5
+                "maxItems": MAX_REFERENCE_IMAGES
             },
             "size": { "type": "string", "enum": ["auto", "1024x1024", "1024x1536", "1536x1024"] },
             "quality": { "type": "string", "enum": ["auto", "low", "medium", "high"] },
-            "background": { "type": "string", "enum": ["auto", "opaque"] }
+            "background": { "type": "string", "enum": ["auto", "opaque", "transparent"] }
         },
         "additionalProperties": false
     }))
@@ -349,6 +392,16 @@ pub fn image_generation_descriptor() -> AgentToolDescriptor {
         AgentToolCapability::ReadWorkspace,
     ])
     .with_invocation_modes(AgentToolInvocationMode::all())
+}
+
+/// Tells the model what already happened to the image so it neither re-saves nor re-renders it.
+fn image_generation_output_hint(path: &Path) -> String {
+    format!(
+        "The generated image is saved at {} and is already surfaced to the user as tool evidence. \
+Copy it if you need it at another path, and leave the original in place unless the user asks for it \
+to be removed. There is no need to render it again in the final response.",
+        path.display()
+    )
 }
 
 fn load_reference_images(
@@ -480,6 +533,66 @@ fn normalized_image_extension(value: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A backend that registers tools without reaching a provider, so registration is tested
+    /// purely against the declared capabilities.
+    struct CapabilityOnlyBackend(LanguageModelProviderCapabilities);
+
+    impl HostedModelToolBackend for CapabilityOnlyBackend {
+        fn capabilities(&self) -> LanguageModelProviderCapabilities {
+            self.0
+        }
+
+        fn web_search(
+            &self,
+            _request: &OpenAiWebSearchRequest,
+        ) -> Result<OpenAiWebSearchResponse, String> {
+            unreachable!("registration must not call the backend")
+        }
+
+        fn generate_or_edit_image(
+            &self,
+            _request: &OpenAiImageRequest,
+        ) -> Result<OpenAiImageResponse, String> {
+            unreachable!("registration must not call the backend")
+        }
+    }
+
+    fn registered_hosted_tools(
+        capabilities: LanguageModelProviderCapabilities,
+    ) -> AgentToolRegistry {
+        let registry = AgentToolRegistry::new();
+        register_hosted_model_tools(
+            &registry,
+            HostedModelAgentToolConfig::new(
+                Arc::new(CapabilityOnlyBackend(capabilities)),
+                PathBuf::from("/tmp/sinomo-hosted-tools-test"),
+            ),
+        );
+        registry
+    }
+
+    #[test]
+    fn hosted_tools_register_for_every_provider_that_declares_the_capability() {
+        // An OpenAI API key and a Codex ChatGPT sign-in both reach gpt-image-2 and a hosted search,
+        // so both credentials expose the same pair of tools through different backends.
+        for capabilities in [
+            LanguageModelProviderCapabilities::openai(),
+            LanguageModelProviderCapabilities::codex(),
+        ] {
+            let registry = registered_hosted_tools(capabilities);
+            assert!(registry.contains("image_generation"));
+            assert!(registry.contains("web_search"));
+        }
+    }
+
+    #[test]
+    fn image_generation_stays_unregistered_without_a_supporting_credential() {
+        let unsupported =
+            registered_hosted_tools(LanguageModelProviderCapabilities::local_responses());
+        assert!(!unsupported.contains("image_generation"));
+        assert!(!unsupported.contains("web_search"));
+    }
 
     #[test]
     fn hosted_descriptors_are_shared_across_turn_based_and_realtime_modes() {

@@ -11,18 +11,28 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r2"
 
+[features]
+default = []
+# Carries realtime audio over a WebRTC peer connection for providers that negotiate one.
+# Off by default: it pulls in a full WebRTC stack and a C Opus codec that most builds never use.
+webrtc-media = ["dep:webrtc", "dep:rtc", "dep:audiopus", "dep:async-trait"]
+
 [dependencies]
+async-trait = { version = "0.1", optional = true }
+audiopus = { version = "0.2.0", features = ["coder"], optional = true }
 base64.workspace = true
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 http = "1.4.2"
 image = { workspace = true, features = ["jpeg", "png"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "query", "rustls", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "multipart", "query", "rustls", "stream"] }
 ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+rtc = { version = "0.20.2", optional = true }
+webrtc = { version = "0.20.2", optional = true }
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["client", "getrandom", "ring", "rustls-native-roots"] }
 sinomo-runtime = { path = "../sinomo-runtime" }
 

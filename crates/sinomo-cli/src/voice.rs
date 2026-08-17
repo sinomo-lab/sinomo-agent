@@ -35,6 +35,9 @@ pub(crate) struct VoiceCallOptions {
     pub video_frame_ms: u64,
     pub session_id: Option<SessionId>,
     pub endpoint: Option<String>,
+    /// Path to a WebRTC SDP offer, or `-` for stdin, selecting the WebRTC transport.
+    pub webrtc_offer: Option<PathBuf>,
+    pub webrtc_offer_stdin: bool,
     pub voice: Option<String>,
     pub chunk_ms: u64,
     pub input_sample_rate_hz: Option<u32>,
@@ -45,10 +48,14 @@ pub(crate) struct VoiceCallOptions {
     pub audio_input: bool,
     pub native_microphone: bool,
     pub microphone_device: Option<String>,
+    /// Node the microphone is attached to; `None` means the node running the call.
+    pub microphone_node: Option<String>,
     pub native_camera: bool,
     pub camera_device: Option<String>,
     pub native_speaker: bool,
     pub speaker_device: Option<String>,
+    /// Node the speaker is attached to; `None` means the node running the call.
+    pub speaker_node: Option<String>,
     pub call_ms: Option<u64>,
     pub receive_timeout_ms: Option<u64>,
 }
@@ -68,6 +75,8 @@ impl Default for VoiceCallOptions {
             video_frame_ms: 500,
             session_id: None,
             endpoint: None,
+            webrtc_offer: None,
+            webrtc_offer_stdin: false,
             voice: None,
             chunk_ms: 100,
             input_sample_rate_hz: None,
@@ -78,10 +87,12 @@ impl Default for VoiceCallOptions {
             audio_input: true,
             native_microphone: false,
             microphone_device: None,
+            microphone_node: None,
             native_camera: false,
             camera_device: None,
             native_speaker: false,
             speaker_device: None,
+            speaker_node: None,
             call_ms: None,
             receive_timeout_ms: None,
         }
@@ -148,6 +159,11 @@ fn voice_cli_spec() -> CliCommandSpec {
                 free("--video-frame-ms", "video frame interval", "milliseconds"),
                 free("--session", "session id", "session-id").with_aliases(["--session-id"]),
                 free("--endpoint", "realtime endpoint URL", "url").with_aliases(["--url"]),
+                free(
+                    "--webrtc-offer",
+                    "WebRTC SDP offer path or - for stdin",
+                    "path|-",
+                ),
                 free("--voice", "voice id or reference audio", "voice"),
                 free("--chunk-ms", "audio chunk duration", "milliseconds"),
                 free("--sample-rate", "input sample rate", "hz")
@@ -179,12 +195,23 @@ fn voice_cli_spec() -> CliCommandSpec {
                     .with_aliases(["--microphone"]),
                 free("--mic-device", "microphone selector", "selector")
                     .with_aliases(["--microphone-device"]),
+                free(
+                    "--mic-node",
+                    "node the microphone is attached to",
+                    "node-id",
+                )
+                .with_aliases(["--microphone-node"]),
                 CliOptionSpec::flag("--native-camera", "use a native camera")
                     .with_aliases(["--camera"]),
                 free("--camera-device", "camera selector", "selector"),
                 CliOptionSpec::flag("--native-speaker", "use a native speaker")
                     .with_aliases(["--speaker"]),
                 free("--speaker-device", "speaker selector", "selector"),
+                free(
+                    "--speaker-node",
+                    "node the speaker is attached to",
+                    "node-id",
+                ),
                 free("--call-ms", "maximum call duration", "milliseconds")
                     .with_aliases(["--duration-ms"]),
                 CliOptionSpec::flag("--no-pacing", "disable realtime input pacing"),
@@ -247,6 +274,10 @@ fn parse_voice_call_matches(
         })
         .transpose()?;
     options.endpoint = matches.value("--endpoint").map(str::to_string);
+    options.webrtc_offer_stdin = matches.value("--webrtc-offer") == Some("-");
+    options.webrtc_offer = matches
+        .value("--webrtc-offer")
+        .and_then(|value| (value != "-").then(|| PathBuf::from(value)));
     options.voice = matches.value("--voice").map(str::to_string);
     if let Some(value) = matches.value("--chunk-ms") {
         options.chunk_ms = parse_u64_value("--chunk-ms", value)?;
@@ -271,6 +302,7 @@ fn parse_voice_call_matches(
         || matches.contains("--native-mic")
         || matches.contains("--mic-device");
     options.microphone_device = matches.value("--mic-device").map(str::to_string);
+    options.microphone_node = matches.value("--mic-node").map(str::to_string);
     options.native_camera =
         matches.contains("--native-camera") || matches.contains("--camera-device");
     options.camera_device = matches.value("--camera-device").map(str::to_string);
@@ -278,6 +310,7 @@ fn parse_voice_call_matches(
         || matches.contains("--native-speaker")
         || matches.contains("--speaker-device");
     options.speaker_device = matches.value("--speaker-device").map(str::to_string);
+    options.speaker_node = matches.value("--speaker-node").map(str::to_string);
     options.call_ms = matches
         .value("--call-ms")
         .map(|value| parse_u64_value("--call-ms", value))
@@ -410,6 +443,47 @@ fn run_voice_devices() -> Result<(), CliError> {
     for issue in inventory.issues {
         println!("  warning: {issue}");
     }
+    print_cluster_audio_devices(&data_dir, &inventory.node_id)?;
+    Ok(())
+}
+
+/// Lists the audio devices other nodes serve to this cluster.
+///
+/// Only devices those nodes have exposed appear, so this is what is actually usable from here
+/// rather than an inventory of everyone's hardware.
+fn print_cluster_audio_devices(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+) -> Result<(), CliError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| CliError::Io {
+            path: "tokio runtime".to_string(),
+            detail: source.to_string(),
+        })?;
+    let discovered = runtime.block_on(crate::media_transport::discover_cluster_audio_devices(
+        data_dir, None,
+    ))?;
+    let remote = discovered
+        .into_iter()
+        .filter(|found| &found.node_id != local_node_id)
+        .collect::<Vec<_>>();
+    if remote.is_empty() {
+        return Ok(());
+    }
+    println!("cluster audio devices served by other nodes");
+    for found in remote {
+        println!(
+            "  {}{}@{} [{}] {} ({})",
+            if found.device.is_default { "* " } else { "  " },
+            found.device.selector,
+            found.node_id,
+            found.device.kind,
+            found.device.name,
+            found.device.operations.join(", "),
+        );
+    }
     Ok(())
 }
 
@@ -490,7 +564,10 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
             config.api_base_url = Some(endpoint.to_string());
         }
     }
-    config.api_key = realtime_voice_api_key(&data_dir, provider)?;
+    if let Some(offer) = read_webrtc_offer(&options)? {
+        config.transport = sinomo_lm::RealtimeAudioTransport::webrtc(offer);
+    }
+    authorize_realtime_voice_config(&data_dir, &mut config)?;
 
     let default_output = sinomo_agent::AgentStoragePaths::from_data_dir(&data_dir)
         .session_audio_dir_for_session(&session_id)
@@ -528,20 +605,226 @@ fn run_voice_call(options: VoiceCallOptions) -> Result<(), CliError> {
     Ok(())
 }
 
-fn realtime_voice_api_key(
+/// Opens the capture device this call reads from, wherever it is attached.
+///
+/// Device selectors are node-scoped: a locator naming another node opens a routed capture stream
+/// on that node instead of silently resolving against this node's microphones.
+async fn open_voice_audio_source(
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+) -> Result<Option<Box<dyn sinomo_audio::RealtimeAudioSource>>, CliError> {
+    if !options.native_microphone {
+        return Ok(None);
+    }
+    let locator =
+        resolve_voice_device_locator(voice_microphone_locator(options), "microphone").await?;
+    if let Some(node_id) = remote_media_node(&locator)? {
+        let source = crate::media_transport::open_remote_audio_source(
+            &SinomoDataDir::from_env_or_home()?,
+            &node_id,
+            sinomo_audio::service::MediaAudioCaptureRequest {
+                device: locator.device,
+                sample_rate_hz: config.input_sample_rate_hz,
+                sample_format: native_audio_format(config.input_format),
+                chunk_ms: options.chunk_ms,
+                max_chunks: None,
+            },
+        )
+        .await?;
+        return Ok(Some(Box::new(source)));
+    }
+    let mut capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
+        config.input_sample_rate_hz,
+        native_audio_format(config.input_format),
+    );
+    capture_config.device = locator.device;
+    capture_config.chunk_ms = options.chunk_ms;
+    let capture = sinomo_audio::start_native_microphone_capture(capture_config)
+        .map_err(native_audio_error)?;
+    Ok(Some(Box::new(capture)))
+}
+
+/// Opens the playback device this call writes to, wherever it is attached.
+async fn open_voice_audio_sink(
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+) -> Result<Option<Box<dyn sinomo_audio::RealtimeAudioSink>>, CliError> {
+    if !options.native_speaker {
+        return Ok(None);
+    }
+    let locator = resolve_voice_device_locator(voice_speaker_locator(options), "speaker").await?;
+    if let Some(node_id) = remote_media_node(&locator)? {
+        let sink = crate::media_transport::open_remote_audio_sink(
+            &SinomoDataDir::from_env_or_home()?,
+            &node_id,
+            sinomo_audio::service::MediaAudioPlaybackRequest {
+                device: locator.device,
+                input_sample_rate_hz: config.output_sample_rate_hz,
+                input_sample_format: native_audio_format(config.output_format),
+            },
+        )
+        .await?;
+        return Ok(Some(Box::new(sink)));
+    }
+    let playback =
+        sinomo_audio::start_native_speaker_playback(sinomo_audio::NativeSpeakerPlaybackConfig {
+            device: locator.device,
+            input_sample_rate_hz: config.output_sample_rate_hz,
+            input_sample_format: native_audio_format(config.output_format),
+        })
+        .map_err(native_audio_error)?;
+    Ok(Some(Box::new(playback)))
+}
+
+fn voice_microphone_locator(options: &VoiceCallOptions) -> sinomo_audio::MediaDeviceLocator {
+    match options.microphone_node.clone() {
+        Some(node_id) => {
+            sinomo_audio::MediaDeviceLocator::on_node(node_id, options.microphone_device.clone())
+        }
+        None => sinomo_audio::MediaDeviceLocator::local(options.microphone_device.clone()),
+    }
+}
+
+fn voice_speaker_locator(options: &VoiceCallOptions) -> sinomo_audio::MediaDeviceLocator {
+    match options.speaker_node.clone() {
+        Some(node_id) => {
+            sinomo_audio::MediaDeviceLocator::on_node(node_id, options.speaker_device.clone())
+        }
+        None => sinomo_audio::MediaDeviceLocator::local(options.speaker_device.clone()),
+    }
+}
+
+/// Fills in the node a named device lives on when the caller did not say.
+///
+/// A device already attached to this node wins without consulting the cluster, so an operator who
+/// names a local device never depends on a daemon or on discovery. Only a name this node does not
+/// have is looked up across the cluster.
+async fn resolve_voice_device_locator(
+    locator: sinomo_audio::MediaDeviceLocator,
+    kind: &str,
+) -> Result<sinomo_audio::MediaDeviceLocator, CliError> {
+    if locator.node_id.is_some() {
+        return Ok(locator);
+    }
+    let Some(selector) = locator
+        .device
+        .as_deref()
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    else {
+        return Ok(locator);
+    };
+    if local_audio_device_exists(kind, selector) {
+        return Ok(locator);
+    }
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let Some(found) =
+        crate::media_transport::resolve_cluster_audio_device(&data_dir, kind, selector).await?
+    else {
+        return Ok(locator);
+    };
+    Ok(sinomo_audio::MediaDeviceLocator::on_node(
+        found.node_id.to_string(),
+        Some(found.device.selector),
+    ))
+}
+
+/// Reports whether this node has an audio device matching a selector or display name.
+fn local_audio_device_exists(kind: &str, selector: &str) -> bool {
+    let Ok(data_dir) = SinomoDataDir::from_env_or_home() else {
+        return false;
+    };
+    let inventory =
+        sinomo_runtime::device::enumerate_native_devices(voice_local_node_id(&data_dir));
+    inventory.devices.iter().any(|device| {
+        native_device_kind_label(&device.profile.kind) == kind
+            && (device.native_id.eq_ignore_ascii_case(selector)
+                || device.profile.display_name.eq_ignore_ascii_case(selector))
+    })
+}
+
+/// Returns the node a device stream must be opened on, or `None` when it is attached here.
+///
+/// A locator naming this node resolves to the local device rather than routing a call back to
+/// ourselves.
+fn remote_media_node(
+    locator: &sinomo_audio::MediaDeviceLocator,
+) -> Result<Option<NodeId>, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let local_node_id = voice_local_node_id(&data_dir).to_string();
+    if !locator.is_remote(&local_node_id) {
+        return Ok(None);
+    }
+    let node_id = locator.node_id.as_deref().unwrap_or_default();
+    NodeId::from_legacy_named(node_id)
+        .or_else(|_| NodeId::new(node_id))
+        .map(Some)
+        .map_err(|source| CliError::Parse {
+            detail: format!("invalid media device node id `{node_id}`: {source}"),
+        })
+}
+
+/// Reads the SDP offer that selects the WebRTC transport, if one was supplied.
+fn read_webrtc_offer(options: &VoiceCallOptions) -> Result<Option<String>, CliError> {
+    let offer = if options.webrtc_offer_stdin {
+        let mut offer = String::new();
+        io::stdin()
+            .read_to_string(&mut offer)
+            .map_err(|source| CliError::Io {
+                path: "-".to_string(),
+                detail: source.to_string(),
+            })?;
+        offer
+    } else {
+        let Some(path) = options.webrtc_offer.as_deref() else {
+            return Ok(None);
+        };
+        fs::read_to_string(path).map_err(|source| CliError::Io {
+            path: path.display().to_string(),
+            detail: source.to_string(),
+        })?
+    };
+    if offer.trim().is_empty() {
+        return Err(CliError::Parse {
+            detail: "the WebRTC SDP offer is empty".to_string(),
+        });
+    }
+    Ok(Some(offer))
+}
+
+/// Applies the active credential for the session's provider.
+///
+/// A Codex sign-in carries more than a key — the account it acts for travels as a header — so the
+/// provider authorizes the whole configuration rather than returning a bare token.
+fn authorize_realtime_voice_config(
     data_dir: &SinomoDataDir,
-    provider: sinomo_lm::RealtimeAudioProvider,
-) -> Result<Option<String>, CliError> {
+    config: &mut sinomo_lm::RealtimeAudioSessionConfig,
+) -> Result<(), CliError> {
+    let provider = config.provider;
     match provider {
-        sinomo_lm::RealtimeAudioProvider::OpenAi => Ok(Some(OpenAiProvider::default().api_key()?)),
+        sinomo_lm::RealtimeAudioProvider::Codex => {
+            let client = OpenAiResponsesCodexClient::new(OpenAiResponsesCodexConfig {
+                credentials_path: Some(codex_credentials_file_in_data_dir(data_dir)),
+                ..OpenAiResponsesCodexConfig::default()
+            });
+            client
+                .authorize_realtime_session(config)
+                .map_err(CliError::LanguageModel)?;
+        }
+        sinomo_lm::RealtimeAudioProvider::OpenAi => {
+            config.api_key = Some(OpenAiProvider::default().api_key()?);
+        }
         sinomo_lm::RealtimeAudioProvider::MiniCpmO => {
-            if let Some((api_key, _source)) = provider_api_key_from_env(provider.provider_id()) {
-                return Ok(Some(api_key));
-            }
-            sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
-                .map_err(CliError::LanguageModel)
+            config.api_key = match provider_api_key_from_env(provider.provider_id()) {
+                Some((api_key, _source)) => Some(api_key),
+                None => {
+                    sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
+                        .map_err(CliError::LanguageModel)?
+                }
+            };
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -576,27 +859,30 @@ async fn run_voice_call_async(
     let provider_id = config.provider.provider_id().to_string();
     let model = config.model.clone();
     let store = sinomo_agent::FileAgentSessionStore::for_data_dir(&data_dir);
-    let mut session = sinomo_lm::RealtimeAudioSession::connect(config.clone())
+    let mut session = sinomo_lm::connect_realtime_session(config.clone())
         .await
         .map_err(realtime_audio_error)?;
     let mut state = VoiceCallState::default();
     let mut output = open_voice_output(&output_path)?;
-    let speaker = if options.native_speaker {
-        Some(
-            sinomo_audio::start_native_speaker_playback(
-                sinomo_audio::NativeSpeakerPlaybackConfig {
-                    device: options.speaker_device.clone(),
-                    input_sample_rate_hz: config.output_sample_rate_hz,
-                    input_sample_format: native_audio_format(config.output_format),
-                },
-            )
-            .map_err(native_audio_error)?,
+    if let Some(call) = session.negotiated_call().cloned() {
+        return run_webrtc_voice_call(
+            session,
+            call,
+            state,
+            output,
+            &data_dir,
+            session_id,
+            provider_id,
+            model,
+            &config,
+            &options,
+            &output_path,
         )
-    } else {
-        None
-    };
+        .await;
+    }
+    let speaker = open_voice_audio_sink(&config, &options).await?;
     let input_video_frames = send_voice_video_frames(
-        &mut session,
+        session.as_mut(),
         &mut state,
         &store,
         &session_id,
@@ -606,14 +892,14 @@ async fn run_voice_call_async(
         &options,
         output.as_mut(),
         &output_path,
-        speaker.as_ref(),
+        speaker.as_deref(),
     )
     .await?;
     let input_sequence;
     let mut input_video_frames = input_video_frames;
     if options.native_microphone || options.native_camera {
         let native_report = run_native_voice_loop(
-            &mut session,
+            session.as_mut(),
             &mut state,
             &store,
             &session_id,
@@ -623,7 +909,7 @@ async fn run_voice_call_async(
             &options,
             output.as_mut(),
             &output_path,
-            speaker.as_ref(),
+            speaker.as_deref(),
             input_video_frames,
         )
         .await?;
@@ -631,7 +917,7 @@ async fn run_voice_call_async(
         input_video_frames = native_report.input_video_frames;
     } else {
         input_sequence = run_raw_voice_input_loop(
-            &mut session,
+            session.as_mut(),
             &mut state,
             &store,
             &session_id,
@@ -641,7 +927,7 @@ async fn run_voice_call_async(
             &options,
             output.as_mut(),
             &output_path,
-            speaker.as_ref(),
+            speaker.as_deref(),
         )
         .await?;
     }
@@ -669,7 +955,7 @@ async fn run_voice_call_async(
             &config,
             output.as_mut(),
             &output_path,
-            speaker.as_ref(),
+            speaker.as_deref(),
             true,
         )? {
             break;
@@ -690,8 +976,61 @@ async fn run_voice_call_async(
     })
 }
 
+/// Runs a call whose media rides a WebRTC peer connection.
+///
+/// The answer is reported before events are drained because negotiation is only half finished
+/// until the peer connection owner applies it — nothing arrives on the sideband until it does.
+#[allow(clippy::too_many_arguments)]
+async fn run_webrtc_voice_call(
+    mut session: Box<dyn sinomo_lm::RealtimeSession>,
+    call: sinomo_lm::RealtimeWebrtcCall,
+    mut state: VoiceCallState,
+    mut output: Box<dyn Write>,
+    data_dir: &SinomoDataDir,
+    session_id: SessionId,
+    provider_id: String,
+    model: String,
+    config: &sinomo_lm::RealtimeAudioSessionConfig,
+    options: &VoiceCallOptions,
+    output_path: &Path,
+) -> Result<VoiceCallReport, CliError> {
+    let store = sinomo_agent::FileAgentSessionStore::for_data_dir(data_dir);
+    let speaker = open_voice_audio_sink(config, options).await?;
+    ::std::eprintln!("webrtc call id: {}", call.call_id);
+    ::std::eprintln!("webrtc answer sdp:\n{}", call.answer_sdp);
+    let duration = Duration::from_millis(options.call_ms.unwrap_or(30_000));
+    receive_voice_events_for(
+        session.as_mut(),
+        &mut state,
+        &store,
+        &session_id,
+        &provider_id,
+        &model,
+        config,
+        output.as_mut(),
+        output_path,
+        speaker.as_deref(),
+        duration,
+        /*stop_on_turn_end*/ false,
+    )
+    .await?;
+    let _ = session.close().await;
+    output.flush().map_err(|source| CliError::Io {
+        path: output_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    Ok(VoiceCallReport {
+        session_id,
+        provider: provider_id,
+        model,
+        input_chunks: 0,
+        input_video_frames: 0,
+        output_chunks: state.output_sequence,
+    })
+}
+
 async fn run_raw_voice_input_loop(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -701,7 +1040,7 @@ async fn run_raw_voice_input_loop(
     options: &VoiceCallOptions,
     output: &mut dyn Write,
     output_path: &Path,
-    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    speaker: Option<&dyn sinomo_audio::RealtimeAudioSink>,
 ) -> Result<u64, CliError> {
     let mut input = if options.audio_input {
         Some(open_voice_input(options.input.as_ref())?)
@@ -794,7 +1133,7 @@ async fn run_raw_voice_input_loop(
 }
 
 async fn run_native_voice_loop(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -804,23 +1143,10 @@ async fn run_native_voice_loop(
     options: &VoiceCallOptions,
     output: &mut dyn Write,
     output_path: &Path,
-    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    speaker: Option<&dyn sinomo_audio::RealtimeAudioSink>,
     initial_video_frames: u64,
 ) -> Result<NativeVoiceLoopReport, CliError> {
-    let microphone = if options.native_microphone {
-        let mut capture_config = sinomo_audio::NativeAudioCaptureConfig::new(
-            config.input_sample_rate_hz,
-            native_audio_format(config.input_format),
-        );
-        capture_config.device = options.microphone_device.clone();
-        capture_config.chunk_ms = options.chunk_ms;
-        Some(
-            sinomo_audio::start_native_microphone_capture(capture_config)
-                .map_err(native_audio_error)?,
-        )
-    } else {
-        None
-    };
+    let microphone = open_voice_audio_source(config, options).await?;
     let camera = if options.native_camera {
         let camera_config = native_voice_camera_capture_config(options);
         Some(sinomo_video::start_native_camera_capture(camera_config).map_err(native_video_error)?)
@@ -838,7 +1164,7 @@ async fn run_native_voice_loop(
         let mut progressed = false;
         if let Some(microphone) = &microphone {
             if let Some(chunk) = microphone
-                .recv_timeout(Duration::from_millis(5))
+                .recv_chunk(Duration::from_millis(5))
                 .map_err(native_audio_error)?
             {
                 send_voice_audio_chunk(
@@ -968,7 +1294,7 @@ fn native_voice_model_frame_interval(
 }
 
 async fn send_voice_audio_chunk(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -1007,7 +1333,7 @@ async fn send_voice_audio_chunk(
 
 #[allow(clippy::too_many_arguments)]
 async fn send_voice_raw_video_frame(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -1062,7 +1388,7 @@ async fn send_voice_raw_video_frame(
 }
 
 async fn send_voice_video_frames(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -1072,7 +1398,7 @@ async fn send_voice_video_frames(
     options: &VoiceCallOptions,
     output: &mut dyn Write,
     output_path: &Path,
-    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    speaker: Option<&dyn sinomo_audio::RealtimeAudioSink>,
 ) -> Result<u64, CliError> {
     let mut sequence = 0_u64;
     for frame_path in &options.video_frames {
@@ -1135,7 +1461,7 @@ async fn send_voice_video_frames(
 }
 
 async fn receive_voice_events_for(
-    session: &mut sinomo_lm::RealtimeAudioSession,
+    session: &mut dyn sinomo_lm::RealtimeSession,
     state: &mut VoiceCallState,
     store: &sinomo_agent::FileAgentSessionStore,
     session_id: &SessionId,
@@ -1144,7 +1470,7 @@ async fn receive_voice_events_for(
     config: &sinomo_lm::RealtimeAudioSessionConfig,
     output: &mut dyn Write,
     output_path: &Path,
-    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    speaker: Option<&dyn sinomo_audio::RealtimeAudioSink>,
     duration: Duration,
     stop_on_turn_end: bool,
 ) -> Result<bool, CliError> {
@@ -1187,7 +1513,7 @@ fn handle_voice_event(
     config: &sinomo_lm::RealtimeAudioSessionConfig,
     output: &mut dyn Write,
     output_path: &Path,
-    speaker: Option<&sinomo_audio::NativeSpeakerPlayback>,
+    speaker: Option<&dyn sinomo_audio::RealtimeAudioSink>,
     stop_on_turn_end: bool,
 ) -> Result<bool, CliError> {
     match event {
@@ -1212,7 +1538,7 @@ fn handle_voice_event(
                 detail: source.to_string(),
             })?;
             if let Some(speaker) = speaker {
-                speaker.write(&audio).map_err(native_audio_error)?;
+                speaker.write_chunk(&audio).map_err(native_audio_error)?;
             }
             let mut segment = sinomo_agent::AgentAudioSegmentInput::new(
                 sinomo_agent::AgentAudioDirection::Output,
@@ -1391,6 +1717,154 @@ mod tests {
         assert_eq!(options.input_sample_rate_hz, Some(16_000));
         assert_eq!(options.chunk_ms, 100);
         assert!(!options.pace);
+    }
+
+    #[test]
+    fn voice_call_options_select_the_webrtc_transport_from_an_offer_file() {
+        let dir = sinomo_testdir::TestDir::new("voice-webrtc-offer");
+        let offer_path = dir.path().join("offer.sdp");
+        fs::write(&offer_path, "v=0\r\no=- offer\r\n").expect("write offer");
+        let command = parse_voice_schema_for_test(&[
+            "call".to_string(),
+            "--provider".to_string(),
+            "codex".to_string(),
+            "--webrtc-offer".to_string(),
+            offer_path.display().to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+        assert_eq!(options.provider, "codex");
+        assert_eq!(options.webrtc_offer.as_deref(), Some(offer_path.as_path()));
+        assert!(!options.webrtc_offer_stdin);
+        assert_eq!(
+            read_webrtc_offer(&options).expect("read offer"),
+            Some("v=0\r\no=- offer\r\n".to_string())
+        );
+
+        // Without the option the session keeps the socket transport.
+        let default_options = VoiceCallOptions::default();
+        assert_eq!(read_webrtc_offer(&default_options).expect("no offer"), None);
+    }
+
+    #[test]
+    fn voice_call_options_carry_the_node_each_device_is_attached_to() {
+        let command = parse_voice_schema_for_test(&[
+            "call".to_string(),
+            "--native".to_string(),
+            "--mic-node".to_string(),
+            "node_edge".to_string(),
+            "--mic-device".to_string(),
+            "usb-mic".to_string(),
+            "--speaker-node".to_string(),
+            "node_edge".to_string(),
+        ])
+        .expect("voice command");
+        let VoiceCliCommand::Call(options) = command else {
+            panic!("expected call");
+        };
+
+        let microphone = voice_microphone_locator(&options);
+        assert_eq!(microphone.node_id.as_deref(), Some("node_edge"));
+        assert_eq!(microphone.device.as_deref(), Some("usb-mic"));
+        assert!(microphone.is_remote("node_agent"));
+        assert!(!microphone.is_remote("node_edge"));
+
+        let speaker = voice_speaker_locator(&options);
+        assert_eq!(speaker.node_id.as_deref(), Some("node_edge"));
+        assert!(speaker.device.is_none());
+
+        // Device selectors without a node stay on the node running the call.
+        let local = VoiceCallOptions {
+            microphone_device: Some("default".to_string()),
+            ..VoiceCallOptions::default()
+        };
+        assert!(!voice_microphone_locator(&local).is_remote("node_agent"));
+    }
+
+    #[test]
+    fn an_explicit_node_or_an_unnamed_device_never_consults_cluster_discovery() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+
+        // A locator that already names a node is returned untouched.
+        let pinned =
+            sinomo_audio::MediaDeviceLocator::on_node("node_edge", Some("mic".to_string()));
+        let resolved = runtime
+            .block_on(resolve_voice_device_locator(pinned.clone(), "microphone"))
+            .expect("an explicit node needs no lookup");
+        assert_eq!(resolved, pinned);
+
+        // A locator naming no device has nothing to look up, so it stays local and default.
+        let unnamed = sinomo_audio::MediaDeviceLocator::local(None);
+        let resolved = runtime
+            .block_on(resolve_voice_device_locator(unnamed.clone(), "microphone"))
+            .expect("an unnamed device needs no lookup");
+        assert_eq!(resolved, unnamed);
+        assert!(resolved.node_id.is_none());
+
+        // A blank selector is treated as unnamed rather than searched for.
+        let blank = sinomo_audio::MediaDeviceLocator::local(Some("   ".to_string()));
+        let resolved = runtime
+            .block_on(resolve_voice_device_locator(blank.clone(), "microphone"))
+            .expect("a blank selector needs no lookup");
+        assert_eq!(resolved, blank);
+    }
+
+    #[test]
+    fn a_device_on_this_node_resolves_locally_rather_than_routing_back_to_us() {
+        let dir = sinomo_testdir::TestDir::new("voice-local-media-node");
+        // SAFETY: the CLI resolves its data directory from the environment, and this test owns
+        // the variable for the duration of the resolution it exercises.
+        unsafe { std::env::set_var("SINOMO_DATA_DIR", dir.path()) };
+        let local_node_id =
+            voice_local_node_id(&SinomoDataDir::from_env_or_home().expect("data dir")).to_string();
+
+        // No node at all, and this node by name, are both local.
+        assert!(
+            remote_media_node(&sinomo_audio::MediaDeviceLocator::local(None))
+                .expect("resolve a local locator")
+                .is_none()
+        );
+        assert!(
+            remote_media_node(&sinomo_audio::MediaDeviceLocator::on_node(
+                local_node_id.clone(),
+                None
+            ))
+            .expect("resolve this node by name")
+            .is_none()
+        );
+
+        // Another node resolves to a routable node id the media call is opened against.
+        let remote = remote_media_node(&sinomo_audio::MediaDeviceLocator::on_node(
+            "node_edge",
+            None,
+        ))
+        .expect("resolve another node")
+        .expect("another node is remote");
+        assert_ne!(remote.to_string(), local_node_id);
+
+        let error = remote_media_node(&sinomo_audio::MediaDeviceLocator::on_node("!!", None))
+            .expect_err("an unusable node id is reported rather than routed");
+        assert!(error.to_string().contains("node id"), "{error}");
+        unsafe { std::env::remove_var("SINOMO_DATA_DIR") };
+    }
+
+    #[test]
+    fn voice_call_rejects_an_empty_webrtc_offer() {
+        let dir = sinomo_testdir::TestDir::new("voice-webrtc-offer-empty");
+        let offer_path = dir.path().join("offer.sdp");
+        fs::write(&offer_path, "   \n").expect("write offer");
+        let options = VoiceCallOptions {
+            webrtc_offer: Some(offer_path),
+            ..VoiceCallOptions::default()
+        };
+
+        let error = read_webrtc_offer(&options).expect_err("empty offer is refused");
+
+        assert!(error.to_string().contains("empty"), "{error}");
     }
 
     #[test]

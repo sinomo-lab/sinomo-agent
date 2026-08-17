@@ -1,5 +1,8 @@
 //! Audio perception event producer skeleton.
 
+pub mod remote;
+pub mod service;
+
 use serde::{Deserialize, Serialize};
 use sinomo_gateway::{InputChunk, InputModality};
 use sinomo_runtime::core::{
@@ -155,9 +158,80 @@ impl NativeSpeakerPlaybackConfig {
     }
 }
 
+/// Names the device a call should use and the node it is attached to.
+///
+/// Sinomo runs agents and devices on separate nodes, so a device selector alone is ambiguous:
+/// the same name can exist on several nodes. `node_id` of `None` means the node running the call.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct MediaDeviceLocator {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+impl MediaDeviceLocator {
+    /// Selects a device on the node running the call.
+    pub fn local(device: Option<String>) -> Self {
+        Self {
+            node_id: None,
+            device,
+        }
+    }
+
+    /// Selects a device attached to a named node.
+    pub fn on_node(node_id: impl Into<String>, device: Option<String>) -> Self {
+        Self {
+            node_id: Some(node_id.into()),
+            device,
+        }
+    }
+
+    /// Returns whether this locator names a node other than the one running the call.
+    pub fn is_remote(&self, local_node_id: &str) -> bool {
+        self.node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|node_id| !node_id.is_empty())
+            .is_some_and(|node_id| node_id != local_node_id)
+    }
+}
+
+/// A source of realtime capture audio, wherever the capturing device lives.
+///
+/// Call paths read frames through this rather than from a device handle so the same loop drives a
+/// microphone on this node and one attached to another node.
+pub trait RealtimeAudioSource: Send {
+    fn recv_chunk(&self, timeout: Duration) -> Result<Option<NativeAudioChunk>, NativeAudioError>;
+
+    fn check_health(&self) -> Result<(), NativeAudioError> {
+        Ok(())
+    }
+}
+
+/// A sink for realtime playback audio, wherever the playing device lives.
+pub trait RealtimeAudioSink: Send + Sync {
+    fn write_chunk(&self, bytes: &[u8]) -> Result<(), NativeAudioError>;
+
+    fn check_health(&self) -> Result<(), NativeAudioError> {
+        Ok(())
+    }
+}
+
 pub struct NativeAudioCapture {
     raw: device::NativeMicrophoneCapture,
     state: Mutex<AudioCaptureState>,
+}
+
+impl RealtimeAudioSource for NativeAudioCapture {
+    fn recv_chunk(&self, timeout: Duration) -> Result<Option<NativeAudioChunk>, NativeAudioError> {
+        self.recv_timeout(timeout)
+    }
+
+    fn check_health(&self) -> Result<(), NativeAudioError> {
+        self.raw.check_health()?;
+        Ok(())
+    }
 }
 
 impl NativeAudioCapture {
@@ -198,6 +272,16 @@ pub struct NativeSpeakerPlayback {
     raw: device::NativeSpeakerPlayback,
     input_sample_rate_hz: u32,
     input_sample_format: NativeAudioSampleFormat,
+}
+
+impl RealtimeAudioSink for NativeSpeakerPlayback {
+    fn write_chunk(&self, bytes: &[u8]) -> Result<(), NativeAudioError> {
+        self.write(bytes)
+    }
+
+    fn check_health(&self) -> Result<(), NativeAudioError> {
+        NativeSpeakerPlayback::check_health(self)
+    }
 }
 
 impl NativeSpeakerPlayback {
@@ -527,6 +611,85 @@ mod tests {
     use sinomo_runtime::device::DeviceProfile;
     use sinomo_runtime::events::SessionId;
     use sinomo_runtime::node::NodeId;
+
+    /// A source and sink pair standing in for devices attached to some node.
+    #[derive(Default)]
+    struct RecordingDevice {
+        captured: Mutex<VecDeque<NativeAudioChunk>>,
+        played: Mutex<Vec<Vec<u8>>>,
+    }
+
+    impl RealtimeAudioSource for RecordingDevice {
+        fn recv_chunk(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Option<NativeAudioChunk>, NativeAudioError> {
+            Ok(self.captured.lock().expect("captured lock").pop_front())
+        }
+    }
+
+    impl RealtimeAudioSink for RecordingDevice {
+        fn write_chunk(&self, bytes: &[u8]) -> Result<(), NativeAudioError> {
+            self.played
+                .lock()
+                .expect("played lock")
+                .push(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_locator_is_remote_only_when_it_names_another_node() {
+        let local = MediaDeviceLocator::local(Some("default".to_string()));
+        assert!(!local.is_remote("node_a"));
+        assert_eq!(local.device.as_deref(), Some("default"));
+
+        let same_node = MediaDeviceLocator::on_node("node_a", None);
+        assert!(!same_node.is_remote("node_a"));
+
+        let other_node = MediaDeviceLocator::on_node("node_b", Some("usb-mic".to_string()));
+        assert!(other_node.is_remote("node_a"));
+
+        // A blank node id names no node at all rather than a node called "".
+        assert!(!MediaDeviceLocator::on_node("   ", None).is_remote("node_a"));
+    }
+
+    #[test]
+    fn call_paths_drive_capture_and_playback_through_the_device_plane() {
+        let device = RecordingDevice::default();
+        device
+            .captured
+            .lock()
+            .expect("captured lock")
+            .push_back(NativeAudioChunk {
+                sequence: 0,
+                sample_rate_hz: 24_000,
+                sample_format: NativeAudioSampleFormat::Pcm16Le,
+                channels: 1,
+                captured_at_unix_ms: 0,
+                audio: vec![1, 2, 3, 4],
+            });
+
+        let source: &dyn RealtimeAudioSource = &device;
+        let chunk = source
+            .recv_chunk(Duration::from_millis(1))
+            .expect("read a chunk")
+            .expect("a chunk is pending");
+        assert_eq!(chunk.audio, vec![1, 2, 3, 4]);
+        assert!(
+            source
+                .recv_chunk(Duration::from_millis(1))
+                .expect("read again")
+                .is_none()
+        );
+
+        let sink: &dyn RealtimeAudioSink = &device;
+        sink.write_chunk(&chunk.audio).expect("play the chunk");
+        assert_eq!(
+            device.played.lock().expect("played lock").as_slice(),
+            [vec![1, 2, 3, 4]]
+        );
+    }
 
     #[test]
     fn audio_worker_emits_vad_and_transcript_events() {

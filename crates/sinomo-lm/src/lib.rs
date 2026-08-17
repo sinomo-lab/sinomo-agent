@@ -13,6 +13,8 @@ mod local_responses;
 mod nvidia;
 mod openai;
 mod realtime_audio;
+#[cfg(feature = "webrtc-media")]
+pub mod realtime_webrtc;
 mod test_cases;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -25,12 +27,13 @@ pub use claude_code::{
     CLAUDE_CODE_DEFAULT_MODEL, ClaudeCodeConfig, ClaudeCodeProvider, ClaudePermissionMode,
 };
 pub use codex::{
-    CODEX_AUTH_CLIENT_ID, CODEX_AUTH_ISSUER, CODEX_CHATGPT_API_BASE_URL, CODEX_DEFAULT_MODEL,
-    CODEX_PROVIDER_ID, CodexChatGptTokens, CodexClient, CodexConfig, CodexContextManager,
-    CodexDeviceCode, CodexDevicePoll, CodexMessage, CodexModelRequest, CodexModelResponse,
-    CodexPromptBuilder, CodexProvider, CodexRole, CodexTool, CodexToolCall, CodexToolDescriptor,
-    CodexToolRegistry, CodexToolResult, DefaultCodexContextManager, DefaultCodexPromptBuilder,
-    OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig, SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR,
+    CODEX_AUTH_CLIENT_ID, CODEX_AUTH_ISSUER, CODEX_CHATGPT_API_BASE_URL, CODEX_DEFAULT_IMAGE_MODEL,
+    CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CodexChatGptTokens, CodexClient, CodexConfig,
+    CodexContextManager, CodexDeviceCode, CodexDevicePoll, CodexMessage, CodexModelRequest,
+    CodexModelResponse, CodexPromptBuilder, CodexProvider, CodexRole, CodexTool, CodexToolCall,
+    CodexToolDescriptor, CodexToolRegistry, CodexToolResult, DefaultCodexContextManager,
+    DefaultCodexPromptBuilder, OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig,
+    SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR, codex_credentials_file_in_data_dir,
 };
 pub use codex_cli::{
     CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,
@@ -55,22 +58,26 @@ pub use local_responses::{
 };
 pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
 pub use openai::{
-    OPENAI_DEFAULT_IMAGE_MODEL, OPENAI_DEFAULT_WEB_SEARCH_MODEL, OpenAiConfig, OpenAiImageRequest,
-    OpenAiImageResponse, OpenAiProvider, OpenAiWebSearchContextSize, OpenAiWebSearchRequest,
-    OpenAiWebSearchResponse, OpenAiWebSearchSource,
+    OPENAI_DEFAULT_IMAGE_MODEL, OPENAI_DEFAULT_WEB_SEARCH_MODEL, OPENAI_MAX_IMAGE_REFERENCES,
+    OpenAiConfig, OpenAiImageRequest, OpenAiImageResponse, OpenAiProvider,
+    OpenAiWebSearchContextSize, OpenAiWebSearchRequest, OpenAiWebSearchResponse,
+    OpenAiWebSearchSource,
 };
 pub use realtime_audio::{
-    RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioProvider,
-    RealtimeAudioSampleFormat, RealtimeAudioSession, RealtimeAudioSessionConfig,
-    RealtimeAudioToolDefinition, RealtimeAudioTranscript, RealtimeAudioTranscriptEntry,
-    RealtimeAudioTranscriptRole, RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput,
-    RealtimeVideoFrameDetail, RealtimeVideoFrameFormat, RealtimeVideoFrameInput,
-    RealtimeVideoInputConfig, RealtimeVideoPixelFormat, minicpm_input_audio_append_payload,
-    minicpm_input_video_frame_payload, minicpm_realtime_ws_url, minicpm_realtime_ws_url_for_video,
-    minicpm_session_update_payload, openai_input_audio_append_payload,
-    openai_input_video_frame_payload, openai_output_truncate_payload, openai_realtime_ws_url,
-    openai_response_cancel_payload, openai_session_update_payload, openai_tool_result_payload,
-    parse_realtime_audio_event, realtime_audio_event_from_value,
+    RealtimeAudioError, RealtimeAudioEvent, RealtimeAudioInputChunk, RealtimeAudioPlane,
+    RealtimeAudioProvider, RealtimeAudioSampleFormat, RealtimeAudioSession,
+    RealtimeAudioSessionConfig, RealtimeAudioToolDefinition, RealtimeAudioTranscript,
+    RealtimeAudioTranscriptEntry, RealtimeAudioTranscriptRole, RealtimeAudioTransport,
+    RealtimeAudioTurnDetection, RealtimeEncodedVideoFrameInput, RealtimeMediaTransport,
+    RealtimeSession, RealtimeSessionFuture, RealtimeVideoFrameDetail, RealtimeVideoFrameFormat,
+    RealtimeVideoFrameInput, RealtimeVideoInputConfig, RealtimeVideoPixelFormat,
+    RealtimeWebrtcCall, connect_realtime_session, create_realtime_webrtc_call,
+    minicpm_input_audio_append_payload, minicpm_input_video_frame_payload, minicpm_realtime_ws_url,
+    minicpm_realtime_ws_url_for_video, minicpm_session_update_payload,
+    openai_input_audio_append_payload, openai_input_video_frame_payload,
+    openai_output_truncate_payload, openai_realtime_ws_url, openai_response_cancel_payload,
+    openai_session_update_payload, openai_tool_result_payload, parse_realtime_audio_event,
+    realtime_audio_event_from_value, realtime_call_session_payload, realtime_sideband_ws_url,
 };
 pub use test_cases::register_lm_test_cases;
 
@@ -2334,7 +2341,7 @@ pub fn provider_capabilities(provider: &str) -> LanguageModelProviderCapabilitie
         return provider.capabilities();
     }
     match normalize_model_provider(provider).as_deref() {
-        Some(CODEX_PROVIDER_ID) => LanguageModelProviderCapabilities::responses_http(),
+        Some(CODEX_PROVIDER_ID) => LanguageModelProviderCapabilities::codex(),
         Some(OpenAiProvider::PROVIDER_ID) => LanguageModelProviderCapabilities::openai(),
         Some(OLLAMA_PROVIDER_ID | LM_STUDIO_PROVIDER_ID) => {
             LanguageModelProviderCapabilities::local_responses()
@@ -3886,6 +3893,26 @@ impl LanguageModelProviderCapabilities {
             transcription: true,
             local_model_management: false,
             mcp: true,
+        }
+    }
+
+    /// The Codex backend reached through a ChatGPT sign-in.
+    ///
+    /// It serves the same image model as the OpenAI API and a standalone web search endpoint.
+    /// Realtime is not served by the Codex backend at all: the sign-in token reaches the OpenAI
+    /// realtime API directly, so both of its transports are available.
+    pub const fn codex() -> Self {
+        Self {
+            responses_http: true,
+            responses_websocket: false,
+            realtime_websocket: true,
+            realtime_webrtc: true,
+            web_search: true,
+            image_generation: true,
+            image_editing: true,
+            transcription: false,
+            local_model_management: false,
+            mcp: false,
         }
     }
 

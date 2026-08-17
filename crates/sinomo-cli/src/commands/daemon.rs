@@ -319,6 +319,11 @@ pub(crate) fn run_daemon_with_paths(
                 register_cli_runtime_config_definitions(builder)
             })
             .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
+        // Serves this node's own microphones and speakers to authorized peers. Registration only
+        // publishes the routes; each request is still checked against node-local device exposure.
+        sinomo_runtime::daemon::DaemonServiceRegistryHook::new(
+            sinomo_audio::service::register_services,
+        ),
     ];
     if label == "daemon" {
         let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {

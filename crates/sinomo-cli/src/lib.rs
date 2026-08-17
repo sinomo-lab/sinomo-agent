@@ -42,11 +42,11 @@ use sinomo_agent::{
     AgentSessionTerminalResultsResponse, AgentTaskTerminalResult, AgentTool, AgentToolDescriptor,
     AgentToolEvidence, AgentToolKind, AgentToolProgressEvent, AgentToolRegistry, AgentToolRequest,
     AgentToolResult, AgentToolSpec, ConfigAgentToolConfig, EventEnvelopeExt, FileAgentSessionStore,
-    FileAgentTraceStore, HostedModelAgentToolConfig, InteractionModel, InteractionOutput,
-    InteractionSession, InteractionSurface, InteractionSurfaceKind, LocalWorkspaceAgentConfig,
-    SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore, SkillCatalogSource,
-    SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId, WorkspaceRef,
-    interaction_event, read_agent_skill_package, register_hosted_model_tools,
+    FileAgentTraceStore, HostedModelAgentToolConfig, HostedModelToolBackend, InteractionModel,
+    InteractionOutput, InteractionSession, InteractionSurface, InteractionSurfaceKind,
+    LocalWorkspaceAgentConfig, SkillActivationScope, SkillCatalogEntry, SkillCatalogSifsStore,
+    SkillCatalogSource, SkillCatalogSourceKind, SkillCatalogStore, SkillCatalogWrite, TaskId,
+    WorkspaceRef, interaction_event, read_agent_skill_package, register_hosted_model_tools,
     render_common_skill_markdown, run_local_agent_readiness_gate, user_interaction_input_event,
     write_agent_skill_package,
 };
@@ -58,8 +58,9 @@ use sinomo_lm::{
     LanguageModelModelOptions, LanguageModelProviderOptions, LanguageModelProviderUsage,
     LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, LocalResponsesConfig,
     LocalResponsesProvider, LocalResponsesRuntime, ModelConfig, ModelPaths, ModelRuntimeConfig,
-    NvidiaProvider, OLLAMA_PROVIDER_ID, OpenAiConfig, OpenAiProvider, ProviderAccountConfig,
-    ProviderReasoningEffort, ProviderTextVerbosity, claude_provider, codex_provider,
+    NvidiaProvider, OLLAMA_PROVIDER_ID, OpenAiConfig, OpenAiProvider, OpenAiResponsesCodexClient,
+    OpenAiResponsesCodexConfig, ProviderAccountConfig, ProviderReasoningEffort,
+    ProviderTextVerbosity, claude_provider, codex_credentials_file_in_data_dir, codex_provider,
     collect_provider_model_catalogs, collect_provider_usage,
     complete_configured_model_request_streaming_events_with_account,
     complete_configured_model_request_streaming_events_with_account_and_cancellation,
@@ -282,6 +283,7 @@ pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
 mod help;
+mod media_transport;
 mod providers;
 mod sandbox_host;
 #[cfg(test)]
@@ -5484,7 +5486,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         registry,
         sinomo_agent::SkillAgentToolConfig::new(data_dir.clone()),
     );
-    register_openai_hosted_tools_for_workspace(registry, data_dir, resolved_workspace_roots);
+    register_hosted_model_tools_for_workspace(registry, data_dir, resolved_workspace_roots);
     registry.replace_registered_tools_from(&mcp_tools);
     registry.replace_registered_tools_from(&recall_tools);
     let remote_transport: Arc<dyn sinomo_agent::AgentRemoteObjectRpcTransport> = Arc::new(
@@ -5581,29 +5583,20 @@ fn agent_mcp_tool_registry(
     Ok(registry)
 }
 
-fn register_openai_hosted_tools_for_workspace(
+/// Registers the hosted model tools backed by whichever supported provider credential is active.
+///
+/// An OpenAI API key is preferred because it serves both hosted web search and image generation. A
+/// Codex ChatGPT sign-in reaches the same image model and is used when no OpenAI key is present, so
+/// device-authenticated installs still get image generation. With neither credential the hosted
+/// tools stay unregistered rather than failing at call time.
+fn register_hosted_model_tools_for_workspace(
     registry: &AgentToolRegistry,
     data_dir: &SinomoDataDir,
     workspace_roots: &[PathBuf],
 ) {
-    let api_key = provider_api_key_from_env(OpenAiProvider::PROVIDER_ID)
-        .map(|(api_key, _source)| api_key)
-        .or_else(|| {
-            stored_provider_api_key_in_data_dir(data_dir, OpenAiProvider::PROVIDER_ID)
-                .ok()
-                .flatten()
-        });
-    let Some(api_key) = api_key else {
+    let Some(backend) = active_hosted_model_backend(data_dir) else {
         return;
     };
-    let defaults = OpenAiConfig::default();
-    let provider = OpenAiProvider::new(OpenAiConfig {
-        api_base_url: defaults.api_base_url,
-        default_model: defaults.default_model,
-        api_key: Some(api_key),
-        credentials_path: None,
-        options: defaults.options,
-    });
     let artifact_root = data_dir
         .root()
         .join("events")
@@ -5612,9 +5605,40 @@ fn register_openai_hosted_tools_for_workspace(
         .join("generated-images");
     register_hosted_model_tools(
         registry,
-        HostedModelAgentToolConfig::new(Arc::new(provider), artifact_root)
+        HostedModelAgentToolConfig::new(backend, artifact_root)
             .with_allowed_image_roots(workspace_roots.iter().cloned()),
     );
+}
+
+fn active_hosted_model_backend(
+    data_dir: &SinomoDataDir,
+) -> Option<Arc<dyn HostedModelToolBackend>> {
+    if let Some(api_key) = provider_api_key_from_env(OpenAiProvider::PROVIDER_ID)
+        .map(|(api_key, _source)| api_key)
+        .or_else(|| {
+            stored_provider_api_key_in_data_dir(data_dir, OpenAiProvider::PROVIDER_ID)
+                .ok()
+                .flatten()
+        })
+    {
+        let defaults = OpenAiConfig::default();
+        return Some(Arc::new(OpenAiProvider::new(OpenAiConfig {
+            api_base_url: defaults.api_base_url,
+            default_model: defaults.default_model,
+            api_key: Some(api_key),
+            credentials_path: None,
+            options: defaults.options,
+        })));
+    }
+
+    let client = OpenAiResponsesCodexClient::new(OpenAiResponsesCodexConfig {
+        credentials_path: Some(codex_credentials_file_in_data_dir(data_dir)),
+        ..OpenAiResponsesCodexConfig::default()
+    });
+    // A stored sign-in is what makes the image tool available, so resolve it now rather than
+    // advertising a tool that every call would reject.
+    client.chatgpt_tokens().ok()?;
+    Some(Arc::new(client))
 }
 
 fn agent_recall_tool_registry(

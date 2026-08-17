@@ -950,7 +950,7 @@ struct ChatRealtimeSessionRuntime {
 
 #[cfg(not(test))]
 impl ChatRealtimeSessionRuntime {
-    fn spawn(session: sinomo_lm::RealtimeAudioSession) -> Self {
+    fn spawn(session: Box<dyn sinomo_lm::RealtimeSession>) -> Self {
         let (audio_tx, audio_rx) = tokio::sync::mpsc::channel(CHAT_MEDIA_AUDIO_SEND_QUEUE_CAPACITY);
         let (event_tx, event_rx) =
             tokio::sync::mpsc::channel(CHAT_MEDIA_SESSION_EVENT_QUEUE_CAPACITY);
@@ -8301,7 +8301,7 @@ where
 
 #[cfg(not(test))]
 async fn run_chat_realtime_session_pump(
-    mut session: sinomo_lm::RealtimeAudioSession,
+    mut session: Box<dyn sinomo_lm::RealtimeSession>,
     mut audio_rx: tokio::sync::mpsc::Receiver<sinomo_lm::RealtimeAudioInputChunk>,
     mut tool_result_rx: tokio::sync::mpsc::Receiver<ChatRealtimeToolResult>,
     latest_video: Arc<ChatMediaLatestVideoSlot<Arc<sinomo_video::NativeVideoSurfaceFrame>>>,
@@ -8461,7 +8461,7 @@ async fn run_chat_media_call_async(
     };
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
-    config.api_key = chat_media_realtime_api_key(&data_dir, provider)?;
+    authorize_chat_media_realtime_config(&data_dir, &mut config)?;
     let tool_context = if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
         tool_context
     } else {
@@ -8676,7 +8676,7 @@ async fn run_chat_media_call_async(
         )),
     );
     let Some(connect_result) = await_chat_media_operation(
-        sinomo_lm::RealtimeAudioSession::connect(config.clone()),
+        sinomo_lm::connect_realtime_session(config.clone()),
         &cancelled,
         || {
             release_chat_media_microphone_if_unrequested(
@@ -9458,24 +9458,42 @@ fn chat_media_ready_notice(
     }
 }
 
+/// Applies the active credential for the session's provider.
+///
+/// A Codex sign-in carries more than a key — the account it acts for travels as a header — so the
+/// provider authorizes the whole configuration rather than returning a bare token.
 #[cfg(not(test))]
-fn chat_media_realtime_api_key(
+fn authorize_chat_media_realtime_config(
     data_dir: &SinomoDataDir,
-    provider: sinomo_lm::RealtimeAudioProvider,
-) -> Result<Option<String>, String> {
+    config: &mut sinomo_lm::RealtimeAudioSessionConfig,
+) -> Result<(), String> {
+    let provider = config.provider;
     match provider {
-        sinomo_lm::RealtimeAudioProvider::OpenAi => sinomo_lm::OpenAiProvider::default()
-            .api_key()
-            .map(Some)
-            .map_err(|error| error.to_string()),
+        sinomo_lm::RealtimeAudioProvider::Codex => {
+            sinomo_lm::OpenAiResponsesCodexClient::new(sinomo_lm::OpenAiResponsesCodexConfig {
+                credentials_path: Some(sinomo_lm::codex_credentials_file_in_data_dir(data_dir)),
+                ..sinomo_lm::OpenAiResponsesCodexConfig::default()
+            })
+            .authorize_realtime_session(config)
+            .map_err(|error| error.to_string())
+        }
+        sinomo_lm::RealtimeAudioProvider::OpenAi => {
+            config.api_key = Some(
+                sinomo_lm::OpenAiProvider::default()
+                    .api_key()
+                    .map_err(|error| error.to_string())?,
+            );
+            Ok(())
+        }
         sinomo_lm::RealtimeAudioProvider::MiniCpmO => {
-            if let Some((api_key, _source)) =
-                sinomo_lm::provider_api_key_from_env(provider.provider_id())
-            {
-                return Ok(Some(api_key));
-            }
-            sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
-                .map_err(|error| error.to_string())
+            config.api_key = match sinomo_lm::provider_api_key_from_env(provider.provider_id()) {
+                Some((api_key, _source)) => Some(api_key),
+                None => {
+                    sinomo_lm::stored_provider_api_key_in_data_dir(data_dir, provider.provider_id())
+                        .map_err(|error| error.to_string())?
+                }
+            };
+            Ok(())
         }
     }
 }

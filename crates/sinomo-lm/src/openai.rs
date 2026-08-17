@@ -20,6 +20,8 @@ use std::path::PathBuf;
 
 pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-5.6-luna";
 pub const OPENAI_DEFAULT_IMAGE_MODEL: &str = "gpt-image-2";
+/// Reference images accepted by one `images/edits` request.
+pub const OPENAI_MAX_IMAGE_REFERENCES: usize = 5;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OpenAiConfig {
@@ -212,25 +214,9 @@ impl OpenAiProvider {
         &self,
         request: &OpenAiImageRequest,
     ) -> Result<OpenAiImageResponse, LanguageModelError> {
-        let prompt = request.prompt.trim();
-        if prompt.is_empty() {
-            return Err(openai_hosted_tool_error(
-                OPENAI_DEFAULT_IMAGE_MODEL,
-                "image prompt must not be empty",
-            ));
-        }
-        if request.referenced_images.len() > 5 {
-            return Err(openai_hosted_tool_error(
-                OPENAI_DEFAULT_IMAGE_MODEL,
-                "image edits accept at most five reference images",
-            ));
-        }
+        let operation =
+            image_request_operation(request, Self::PROVIDER_ID, OPENAI_DEFAULT_IMAGE_MODEL)?;
         let api_key = self.api_key()?;
-        let operation = if request.referenced_images.is_empty() {
-            "generations"
-        } else {
-            "edits"
-        };
         let url = format!(
             "{}/images/{operation}",
             self.config.api_base_url.trim_end_matches('/')
@@ -243,7 +229,7 @@ impl OpenAiProvider {
                 Self::PROVIDER_ID,
                 OPENAI_DEFAULT_IMAGE_MODEL,
             )?)
-            .json(&openai_image_payload(request))
+            .json(&image_payload(request, OPENAI_DEFAULT_IMAGE_MODEL))
             .send()
             .map_err(|source| openai_hosted_tool_error(OPENAI_DEFAULT_IMAGE_MODEL, source))?;
         if !response.status().is_success() {
@@ -257,7 +243,7 @@ impl OpenAiProvider {
         let value = response
             .json::<serde_json::Value>()
             .map_err(|source| openai_hosted_tool_error(OPENAI_DEFAULT_IMAGE_MODEL, source))?;
-        openai_image_response(&value)
+        image_response(&value, Self::PROVIDER_ID, OPENAI_DEFAULT_IMAGE_MODEL)
     }
 }
 
@@ -570,6 +556,24 @@ fn extract_openai_web_search_sources(value: &serde_json::Value) -> Vec<OpenAiWeb
             }
         }
     }
+    web_search_sources(sources)
+}
+
+/// Collects citation objects that carry a `url` into deduplicated sources.
+///
+/// The Codex backend returns a flat result list rather than Responses API output items, so the
+/// per-source shape is shared while the traversal that reaches it is not.
+pub(crate) fn collect_web_search_sources<'a>(
+    values: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Vec<OpenAiWebSearchSource> {
+    let mut sources = BTreeMap::<String, Option<String>>::new();
+    for value in values {
+        insert_openai_web_source(&mut sources, value);
+    }
+    web_search_sources(sources)
+}
+
+fn web_search_sources(sources: BTreeMap<String, Option<String>>) -> Vec<OpenAiWebSearchSource> {
     sources
         .into_iter()
         .map(|(url, title)| OpenAiWebSearchSource { url, title })
@@ -604,9 +608,52 @@ fn insert_openai_web_source(
         .or_insert(title);
 }
 
-fn openai_image_payload(request: &OpenAiImageRequest) -> serde_json::Value {
+/// Builds the error every hosted image caller reports, tagged with the provider that ran it.
+pub(crate) fn image_tool_error(
+    provider: &str,
+    model: &str,
+    detail: impl std::fmt::Display,
+) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// Validates a hosted image request and resolves the images endpoint operation it maps to.
+///
+/// Generation and editing share one tool surface: a request that carries reference images is an
+/// edit, and one without them is a generation.
+pub(crate) fn image_request_operation(
+    request: &OpenAiImageRequest,
+    provider: &str,
+    model: &str,
+) -> Result<&'static str, LanguageModelError> {
+    if request.prompt.trim().is_empty() {
+        return Err(image_tool_error(
+            provider,
+            model,
+            "image prompt must not be empty",
+        ));
+    }
+    if request.referenced_images.len() > OPENAI_MAX_IMAGE_REFERENCES {
+        return Err(image_tool_error(
+            provider,
+            model,
+            format!("image edits accept at most {OPENAI_MAX_IMAGE_REFERENCES} reference images"),
+        ));
+    }
+    Ok(if request.referenced_images.is_empty() {
+        "generations"
+    } else {
+        "edits"
+    })
+}
+
+pub(crate) fn image_payload(request: &OpenAiImageRequest, model: &str) -> serde_json::Value {
     let mut payload = serde_json::json!({
-        "model": OPENAI_DEFAULT_IMAGE_MODEL,
+        "model": model,
         "prompt": request.prompt.trim(),
     });
     if !request.referenced_images.is_empty() {
@@ -645,8 +692,10 @@ fn openai_image_payload(request: &OpenAiImageRequest) -> serde_json::Value {
     payload
 }
 
-fn openai_image_response(
+pub(crate) fn image_response(
     value: &serde_json::Value,
+    provider: &str,
+    model: &str,
 ) -> Result<OpenAiImageResponse, LanguageModelError> {
     let encoded = value
         .get("data")
@@ -655,15 +704,13 @@ fn openai_image_response(
         .and_then(|data| data.get("b64_json"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            openai_hosted_tool_error(
-                OPENAI_DEFAULT_IMAGE_MODEL,
-                "OpenAI image response did not include image data",
-            )
+            image_tool_error(provider, model, "image response did not include image data")
         })?;
     let bytes = BASE64_STANDARD.decode(encoded.trim()).map_err(|source| {
-        openai_hosted_tool_error(
-            OPENAI_DEFAULT_IMAGE_MODEL,
-            format!("OpenAI image response contained invalid base64 data: {source}"),
+        image_tool_error(
+            provider,
+            model,
+            format!("image response contained invalid base64 data: {source}"),
         )
     })?;
     let output_format = value
@@ -679,7 +726,7 @@ fn openai_image_response(
     }
     .to_string();
     Ok(OpenAiImageResponse {
-        model: OPENAI_DEFAULT_IMAGE_MODEL.to_string(),
+        model: model.to_string(),
         bytes,
         media_type,
         output_format,
@@ -1525,7 +1572,16 @@ mod tests {
             quality: Some("medium".to_string()),
             background: Some("auto".to_string()),
         };
-        let payload = openai_image_payload(&request);
+        assert_eq!(
+            image_request_operation(
+                &request,
+                OpenAiProvider::PROVIDER_ID,
+                OPENAI_DEFAULT_IMAGE_MODEL
+            )
+            .expect("a referenced image selects the edit endpoint"),
+            "edits"
+        );
+        let payload = image_payload(&request, OPENAI_DEFAULT_IMAGE_MODEL);
         assert_eq!(payload["model"], OPENAI_DEFAULT_IMAGE_MODEL);
         assert_eq!(payload["prompt"], "add a hat");
         assert_eq!(
@@ -1533,12 +1589,36 @@ mod tests {
             "data:image/png;base64,AA=="
         );
 
-        let response = openai_image_response(&serde_json::json!({
-            "data": [{ "b64_json": "aW1hZ2U=" }],
-            "output_format": "webp",
-            "size": "1024x1024"
-        }))
+        let generation = OpenAiImageRequest {
+            referenced_images: Vec::new(),
+            ..request
+        };
+        assert_eq!(
+            image_request_operation(
+                &generation,
+                OpenAiProvider::PROVIDER_ID,
+                OPENAI_DEFAULT_IMAGE_MODEL
+            )
+            .expect("no referenced images selects the generation endpoint"),
+            "generations"
+        );
+        assert!(
+            image_payload(&generation, OPENAI_DEFAULT_IMAGE_MODEL)
+                .get("images")
+                .is_none()
+        );
+
+        let response = image_response(
+            &serde_json::json!({
+                "data": [{ "b64_json": "aW1hZ2U=" }],
+                "output_format": "webp",
+                "size": "1024x1024"
+            }),
+            OpenAiProvider::PROVIDER_ID,
+            OPENAI_DEFAULT_IMAGE_MODEL,
+        )
         .expect("decode image response");
+        assert_eq!(response.model, OPENAI_DEFAULT_IMAGE_MODEL);
         assert_eq!(response.bytes, b"image");
         assert_eq!(response.media_type, "image/webp");
         assert_eq!(response.size.as_deref(), Some("1024x1024"));

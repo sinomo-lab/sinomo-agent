@@ -6,7 +6,9 @@ use image::codecs::{jpeg::JpegEncoder, png::PngEncoder};
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageEncoder, RgbImage, RgbaImage};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -17,6 +19,14 @@ const OPENAI_REALTIME_DEFAULT_MODEL: &str = "gpt-realtime-2";
 const MINICPM_REALTIME_DEFAULT_MODEL: &str = "MiniCPM-o-4.5";
 const OPENAI_DEFAULT_REALTIME_BASE_URL: &str = "https://api.openai.com/v1";
 const MINICPM_DEFAULT_REALTIME_BASE_URL: &str = "https://minicpmo45.modelbest.cn";
+/// The realtime sideband socket always lives on the realtime API host.
+///
+/// It stays independent of the base URL that created the call, so pointing a session at a proxy for
+/// negotiation does not drag the control socket along with it.
+const DEFAULT_REALTIME_SIDEBAND_BASE_URL: &str = OPENAI_DEFAULT_REALTIME_BASE_URL;
+const REALTIME_CALL_PATH: &str = "realtime/calls";
+/// Slice of a receive budget spent on each inbound direction of a negotiated session.
+const MEDIA_POLL_SLICE: Duration = Duration::from_millis(5);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_VIDEO_ENCODING_QUALITY: u8 = 85;
@@ -29,6 +39,13 @@ type RealtimeWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 pub enum RealtimeAudioProvider {
     OpenAi,
     MiniCpmO,
+    /// The Codex backend reached through a ChatGPT sign-in.
+    ///
+    /// Realtime is the one surface a ChatGPT sign-in does not reach through the Codex backend: the
+    /// access token is audienced for the OpenAI API, and the realtime API accepts it there directly.
+    /// So a Codex realtime session speaks the same protocol as [`Self::OpenAi`] against the same
+    /// host, and only the credential behind it differs.
+    Codex,
 }
 
 impl RealtimeAudioProvider {
@@ -36,6 +53,7 @@ impl RealtimeAudioProvider {
         match value.trim().to_ascii_lowercase().as_str() {
             "openai" => Some(Self::OpenAi),
             "minicpm" | "minicpm-o" | "modelbest" | "minicpm-o-4.5" => Some(Self::MiniCpmO),
+            crate::codex::CODEX_PROVIDER_ID => Some(Self::Codex),
             _ => None,
         }
     }
@@ -44,19 +62,21 @@ impl RealtimeAudioProvider {
         match self {
             Self::OpenAi => "openai",
             Self::MiniCpmO => "minicpm-o",
+            Self::Codex => crate::codex::CODEX_PROVIDER_ID,
         }
     }
 
     pub fn default_model(self) -> &'static str {
         match self {
-            Self::OpenAi => OPENAI_REALTIME_DEFAULT_MODEL,
+            // Codex realtime is the OpenAI realtime API, so it runs the same model.
+            Self::OpenAi | Self::Codex => OPENAI_REALTIME_DEFAULT_MODEL,
             Self::MiniCpmO => MINICPM_REALTIME_DEFAULT_MODEL,
         }
     }
 
     pub fn default_base_url(self) -> &'static str {
         match self {
-            Self::OpenAi => OPENAI_DEFAULT_REALTIME_BASE_URL,
+            Self::OpenAi | Self::Codex => OPENAI_DEFAULT_REALTIME_BASE_URL,
             Self::MiniCpmO => MINICPM_DEFAULT_REALTIME_BASE_URL,
         }
     }
@@ -65,8 +85,44 @@ impl RealtimeAudioProvider {
         match self {
             Self::OpenAi => crate::LanguageModelProviderCapabilities::openai(),
             Self::MiniCpmO => crate::LanguageModelProviderCapabilities::minicpm_realtime(),
+            Self::Codex => crate::LanguageModelProviderCapabilities::codex(),
         }
     }
+}
+
+/// How realtime media reaches the provider.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum RealtimeAudioTransport {
+    /// Audio rides the same socket as control events, encoded into the realtime protocol.
+    #[default]
+    WebSocket,
+    /// Audio rides a WebRTC peer connection while this session carries only control events.
+    ///
+    /// The offer is produced by whoever owns the peer connection and the media devices; this
+    /// session negotiates it with the provider and joins the resulting call's sideband socket.
+    WebRtc { offer_sdp: String },
+}
+
+impl RealtimeAudioTransport {
+    pub fn webrtc(offer_sdp: impl Into<String>) -> Self {
+        Self::WebRtc {
+            offer_sdp: offer_sdp.into(),
+        }
+    }
+
+    pub fn is_webrtc(&self) -> bool {
+        matches!(self, Self::WebRtc { .. })
+    }
+}
+
+/// A negotiated WebRTC realtime call.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct RealtimeWebrtcCall {
+    /// The provider's SDP answer, which the peer connection owner applies to finish negotiation.
+    pub answer_sdp: String,
+    /// Identifies the call so its sideband control socket can be joined.
+    pub call_id: String,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -253,6 +309,14 @@ pub struct RealtimeAudioSessionConfig {
     pub connect_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receive_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub transport: RealtimeAudioTransport,
+    /// Overrides the host that serves the WebRTC sideband control socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sideband_base_url: Option<String>,
+    /// Provider-specific request headers, such as the account a ChatGPT sign-in acts for.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 impl RealtimeAudioSessionConfig {
@@ -277,6 +341,14 @@ impl RealtimeAudioSessionConfig {
                     24_000,
                     RealtimeAudioSampleFormat::F32Le,
                 ),
+                // The negotiated call declares PCM16 at 24 kHz even though Opus carries it on the
+                // wire, so the capture pipeline is configured the same as the socket transport.
+                RealtimeAudioProvider::Codex => (
+                    24_000,
+                    RealtimeAudioSampleFormat::Pcm16Le,
+                    24_000,
+                    RealtimeAudioSampleFormat::Pcm16Le,
+                ),
             };
         Self {
             provider,
@@ -300,7 +372,20 @@ impl RealtimeAudioSessionConfig {
             tool_choice: None,
             connect_timeout_ms: None,
             receive_timeout_ms: None,
+            transport: RealtimeAudioTransport::default(),
+            sideband_base_url: None,
+            headers: BTreeMap::new(),
         }
+    }
+
+    pub fn with_transport(mut self, transport: RealtimeAudioTransport) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
     }
 
     pub fn connect_timeout(&self) -> Duration {
@@ -329,11 +414,38 @@ impl RealtimeAudioSessionConfig {
             .as_deref()
             .unwrap_or_else(|| self.provider.default_base_url());
         match self.provider {
-            RealtimeAudioProvider::OpenAi => openai_realtime_ws_url(base_url, &self.model),
+            // A Codex sign-in reaches the same realtime socket an API key does.
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => {
+                openai_realtime_ws_url(base_url, &self.model)
+            }
             RealtimeAudioProvider::MiniCpmO => {
                 minicpm_realtime_ws_url_for_video(base_url, self.input_video.is_some())
             }
         }
+    }
+
+    /// Returns the URL of the WebRTC call negotiation endpoint.
+    pub fn realtime_call_url(&self) -> String {
+        let base_url = self
+            .api_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| self.provider.default_base_url())
+            .trim_end_matches('/');
+        format!("{base_url}/{REALTIME_CALL_PATH}")
+    }
+
+    /// Returns the sideband control socket URL for an established call.
+    pub fn sideband_websocket_url(&self, call_id: &str) -> Result<String, RealtimeAudioError> {
+        realtime_sideband_ws_url(
+            self.sideband_base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .unwrap_or(DEFAULT_REALTIME_SIDEBAND_BASE_URL),
+            call_id,
+        )
     }
 
     pub fn validate(&self) -> Result<(), RealtimeAudioError> {
@@ -397,6 +509,31 @@ impl RealtimeAudioSessionConfig {
                         detail: "MiniCPM-o realtime audio input must be 16 kHz".to_string(),
                     });
                 }
+            }
+            RealtimeAudioProvider::Codex => {
+                if self.input_format != RealtimeAudioSampleFormat::Pcm16Le {
+                    return Err(RealtimeAudioError::InvalidConfig {
+                        detail: "Codex realtime audio input must be 16-bit PCM little-endian"
+                            .to_string(),
+                    });
+                }
+                if self.input_video.is_some() {
+                    return Err(RealtimeAudioError::InvalidConfig {
+                        detail: "Codex realtime sessions do not accept video input".to_string(),
+                    });
+                }
+            }
+        }
+        if let RealtimeAudioTransport::WebRtc { offer_sdp } = &self.transport {
+            if offer_sdp.trim().is_empty() {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "realtime WebRTC transport requires a non-empty SDP offer".to_string(),
+                });
+            }
+            if self.provider == RealtimeAudioProvider::MiniCpmO {
+                return Err(RealtimeAudioError::InvalidConfig {
+                    detail: "MiniCPM-o realtime does not support the WebRTC transport".to_string(),
+                });
             }
         }
         Ok(())
@@ -818,16 +955,241 @@ pub enum RealtimeAudioError {
     VideoEncode { detail: String },
 }
 
+/// Where a session's audio frames actually travel.
+///
+/// Callers pump capture frames into the session only when it carries them; a negotiated plane
+/// means the provider agreed a separate media path and the session is control-only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RealtimeAudioPlane {
+    /// Audio frames are encoded into the session protocol itself.
+    Session,
+    /// Audio travels on a media path the provider negotiated separately.
+    Negotiated,
+}
+
+impl RealtimeAudioPlane {
+    pub fn carries_audio_in_session(self) -> bool {
+        matches!(self, Self::Session)
+    }
+}
+
+pub type RealtimeSessionFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, RealtimeAudioError>> + Send + 'a>>;
+
+/// Carries a session's audio when the provider negotiated a media path beside its control socket.
+///
+/// Attaching one keeps the call path unchanged: frames still go in through
+/// [`RealtimeSession::send_audio`] and come back as [`RealtimeAudioEvent::OutputAudioDelta`], so a
+/// provider that speaks WebRTC drives the same capture and playback devices, over the same device
+/// plane, as one that carries audio inside its socket. Only this transport differs.
+///
+/// Implementations exchange the session's configured PCM format; any codec or packetization the
+/// provider requires belongs behind this trait.
+pub trait RealtimeMediaTransport: Send {
+    /// Sends one captured PCM chunk toward the provider.
+    fn send_audio<'a>(&'a mut self, audio: &'a [u8]) -> RealtimeSessionFuture<'a, ()>;
+
+    /// Returns the next decoded PCM chunk, or `None` if none arrived within `timeout`.
+    fn recv_audio(&mut self, timeout: Duration) -> RealtimeSessionFuture<'_, Option<Vec<u8>>>;
+
+    /// Releases the media path. The control socket is closed separately by the session.
+    fn close(&mut self) -> RealtimeSessionFuture<'_, ()>;
+}
+
+/// One realtime conversation with a provider, independent of how it reaches that provider.
+///
+/// Implementations own their wire protocol and media transport, so a caller drives a MiniCPM-o
+/// socket, an OpenAI socket, and a negotiated Codex call through exactly the same sequence of
+/// calls. Anything a given provider cannot do reports
+/// [`RealtimeAudioError::UnsupportedOperation`] rather than being absent from the interface.
+pub trait RealtimeSession: Send {
+    fn config(&self) -> &RealtimeAudioSessionConfig;
+
+    /// Reports whether capture frames should be pumped into this session.
+    fn audio_plane(&self) -> RealtimeAudioPlane;
+
+    /// Returns the negotiated call when the provider agreed a separate media path.
+    fn negotiated_call(&self) -> Option<&RealtimeWebrtcCall> {
+        None
+    }
+
+    fn send_audio<'a>(
+        &'a mut self,
+        chunk: &'a RealtimeAudioInputChunk,
+    ) -> RealtimeSessionFuture<'a, ()>;
+
+    fn send_video_frame<'a>(
+        &'a mut self,
+        frame: &'a RealtimeVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, ()>;
+
+    /// Sends a raw frame and returns the exact encoded image the provider received.
+    fn send_video_frame_and_return_encoded<'a>(
+        &'a mut self,
+        frame: &'a RealtimeVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, RealtimeEncodedVideoFrameInput>;
+
+    fn send_encoded_video_frame<'a>(
+        &'a mut self,
+        frame: &'a RealtimeEncodedVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, ()>;
+
+    fn send_tool_result<'a>(
+        &'a mut self,
+        call_id: &'a str,
+        output: &'a str,
+        request_response: bool,
+    ) -> RealtimeSessionFuture<'a, ()>;
+
+    fn flush_turn(&mut self) -> RealtimeSessionFuture<'_, ()>;
+
+    fn request_response(&mut self) -> RealtimeSessionFuture<'_, ()>;
+
+    fn receive_event(&mut self) -> RealtimeSessionFuture<'_, RealtimeAudioEvent>;
+
+    fn receive_event_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> RealtimeSessionFuture<'_, RealtimeAudioEvent>;
+
+    fn close(&mut self) -> RealtimeSessionFuture<'_, ()>;
+}
+
+/// Connects the session implementation that serves a configuration.
+///
+/// This is the seam that keeps transport choice out of call paths: the configuration names a
+/// provider and a transport, and the returned session hides which wire protocol answers.
+pub async fn connect_realtime_session(
+    config: RealtimeAudioSessionConfig,
+) -> Result<Box<dyn RealtimeSession>, RealtimeAudioError> {
+    Ok(Box::new(RealtimeAudioSession::connect(config).await?))
+}
+
 pub struct RealtimeAudioSession {
     config: RealtimeAudioSessionConfig,
     ws: RealtimeWs,
     pending: VecDeque<RealtimeAudioEvent>,
+    webrtc_call: Option<RealtimeWebrtcCall>,
+    media: Option<Box<dyn RealtimeMediaTransport>>,
+}
+
+impl RealtimeSession for RealtimeAudioSession {
+    fn config(&self) -> &RealtimeAudioSessionConfig {
+        RealtimeAudioSession::config(self)
+    }
+
+    fn audio_plane(&self) -> RealtimeAudioPlane {
+        // An attached media transport carries audio for this session, so callers pump frames in
+        // exactly as they do for a socket-carried session. Only a negotiated call with no
+        // transport attached leaves the audio plane outside the session.
+        if self.webrtc_call.is_some() && self.media.is_none() {
+            RealtimeAudioPlane::Negotiated
+        } else {
+            RealtimeAudioPlane::Session
+        }
+    }
+
+    fn negotiated_call(&self) -> Option<&RealtimeWebrtcCall> {
+        RealtimeAudioSession::webrtc_call(self)
+    }
+
+    fn send_audio<'a>(
+        &'a mut self,
+        chunk: &'a RealtimeAudioInputChunk,
+    ) -> RealtimeSessionFuture<'a, ()> {
+        Box::pin(RealtimeAudioSession::send_audio(self, chunk))
+    }
+
+    fn send_video_frame<'a>(
+        &'a mut self,
+        frame: &'a RealtimeVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, ()> {
+        Box::pin(RealtimeAudioSession::send_video_frame(self, frame))
+    }
+
+    fn send_video_frame_and_return_encoded<'a>(
+        &'a mut self,
+        frame: &'a RealtimeVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, RealtimeEncodedVideoFrameInput> {
+        Box::pin(RealtimeAudioSession::send_video_frame_and_return_encoded(
+            self, frame,
+        ))
+    }
+
+    fn send_encoded_video_frame<'a>(
+        &'a mut self,
+        frame: &'a RealtimeEncodedVideoFrameInput,
+    ) -> RealtimeSessionFuture<'a, ()> {
+        Box::pin(RealtimeAudioSession::send_encoded_video_frame(self, frame))
+    }
+
+    fn send_tool_result<'a>(
+        &'a mut self,
+        call_id: &'a str,
+        output: &'a str,
+        request_response: bool,
+    ) -> RealtimeSessionFuture<'a, ()> {
+        Box::pin(RealtimeAudioSession::send_tool_result(
+            self,
+            call_id,
+            output,
+            request_response,
+        ))
+    }
+
+    fn flush_turn(&mut self) -> RealtimeSessionFuture<'_, ()> {
+        Box::pin(RealtimeAudioSession::flush_turn(self))
+    }
+
+    fn request_response(&mut self) -> RealtimeSessionFuture<'_, ()> {
+        Box::pin(RealtimeAudioSession::request_response(self))
+    }
+
+    fn receive_event(&mut self) -> RealtimeSessionFuture<'_, RealtimeAudioEvent> {
+        Box::pin(RealtimeAudioSession::receive_event(self))
+    }
+
+    fn receive_event_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> RealtimeSessionFuture<'_, RealtimeAudioEvent> {
+        Box::pin(RealtimeAudioSession::receive_event_with_timeout(
+            self, timeout,
+        ))
+    }
+
+    fn close(&mut self) -> RealtimeSessionFuture<'_, ()> {
+        Box::pin(RealtimeAudioSession::close(self))
+    }
 }
 
 impl RealtimeAudioSession {
     pub async fn connect(config: RealtimeAudioSessionConfig) -> Result<Self, RealtimeAudioError> {
         config.validate()?;
+        if config.transport.is_webrtc() {
+            return Self::connect_webrtc(config).await;
+        }
         let url = config.websocket_url()?;
+        Self::connect_socket(config, url, None).await
+    }
+
+    /// Negotiates a WebRTC call, then joins its sideband socket for control events.
+    ///
+    /// The session is configured when the call is created, so joining the sideband must not send a
+    /// second session update — doing so would reconfigure a call whose media is already flowing.
+    async fn connect_webrtc(
+        config: RealtimeAudioSessionConfig,
+    ) -> Result<Self, RealtimeAudioError> {
+        let call = create_realtime_webrtc_call(&config).await?;
+        let url = config.sideband_websocket_url(&call.call_id)?;
+        Self::connect_socket(config, url, Some(call)).await
+    }
+
+    async fn connect_socket(
+        config: RealtimeAudioSessionConfig,
+        url: String,
+        webrtc_call: Option<RealtimeWebrtcCall>,
+    ) -> Result<Self, RealtimeAudioError> {
         let uri: Uri =
             url.parse()
                 .map_err(|source: http::uri::InvalidUri| RealtimeAudioError::Url {
@@ -872,6 +1234,23 @@ impl RealtimeAudioSession {
                     detail: source.to_string(),
                 })?;
         }
+        for (name, value) in &config.headers {
+            let name = HeaderName::try_from(name.as_str()).map_err(|source| {
+                RealtimeAudioError::Header {
+                    detail: source.to_string(),
+                }
+            })?;
+            builder = builder
+                .add_header(
+                    name,
+                    HeaderValue::from_str(value).map_err(|source| RealtimeAudioError::Header {
+                        detail: source.to_string(),
+                    })?,
+                )
+                .map_err(|source| RealtimeAudioError::Header {
+                    detail: source.to_string(),
+                })?;
+        }
         let connect = builder.connect();
         let (ws, _) = tokio::time::timeout(config.connect_timeout(), connect)
             .await
@@ -885,9 +1264,14 @@ impl RealtimeAudioSession {
             config,
             ws,
             pending: VecDeque::new(),
+            webrtc_call,
+            media: None,
         };
+        if session.webrtc_call.is_some() {
+            return Ok(session);
+        }
         match session.config.provider {
-            RealtimeAudioProvider::OpenAi => {
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => {
                 session
                     .send_json(openai_session_update_payload(&session.config))
                     .await?;
@@ -903,12 +1287,39 @@ impl RealtimeAudioSession {
         &self.config
     }
 
+    /// Returns the negotiated call when this session rides a WebRTC peer connection.
+    ///
+    /// The answer SDP belongs to the peer connection owner, which must apply it to complete
+    /// negotiation before media flows.
+    pub fn webrtc_call(&self) -> Option<&RealtimeWebrtcCall> {
+        self.webrtc_call.as_ref()
+    }
+
+    /// Attaches the media path a negotiated session carries its audio on.
+    ///
+    /// Once attached, capture frames go to the transport instead of the control socket and remote
+    /// audio is surfaced through the ordinary event stream, so callers keep pumping audio exactly
+    /// as they do for a socket-carried session.
+    pub fn attach_media_transport(&mut self, media: Box<dyn RealtimeMediaTransport>) {
+        self.media = Some(media);
+    }
+
     pub async fn send_audio(
         &mut self,
         chunk: &RealtimeAudioInputChunk,
     ) -> Result<(), RealtimeAudioError> {
+        if let Some(media) = self.media.as_mut() {
+            return media.send_audio(&chunk.audio).await;
+        }
+        if self.webrtc_call.is_some() {
+            return Err(RealtimeAudioError::InvalidConfig {
+                detail: "this realtime session negotiated a media path but none is attached, so audio has nowhere to go".to_string(),
+            });
+        }
         let payload = match self.config.provider {
-            RealtimeAudioProvider::OpenAi => openai_input_audio_append_payload(chunk),
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => {
+                openai_input_audio_append_payload(chunk)
+            }
             RealtimeAudioProvider::MiniCpmO => minicpm_input_audio_append_payload(chunk),
         };
         self.send_json(payload).await
@@ -959,12 +1370,27 @@ impl RealtimeAudioSession {
         let payload = match self.config.provider {
             RealtimeAudioProvider::OpenAi => openai_input_video_frame_payload(frame),
             RealtimeAudioProvider::MiniCpmO => minicpm_input_video_frame_payload(frame),
+            RealtimeAudioProvider::Codex => {
+                return Err(RealtimeAudioError::UnsupportedOperation {
+                    operation: "video input",
+                    provider: RealtimeAudioProvider::Codex.provider_id(),
+                });
+            }
         };
         self.send_json(payload).await
     }
 
+    /// Ends the caller's turn when audio is buffered on the socket.
+    ///
+    /// A WebRTC call has no socket-side input buffer to commit — the peer connection streams
+    /// continuously and the provider detects turns itself — so this is a no-op there.
     pub async fn flush_turn(&mut self) -> Result<(), RealtimeAudioError> {
-        if self.config.provider == RealtimeAudioProvider::OpenAi
+        let carries_audio_on_the_socket = self.webrtc_call.is_none();
+        if carries_audio_on_the_socket
+            && matches!(
+                self.config.provider,
+                RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex
+            )
             && self.config.turn_detection == RealtimeAudioTurnDetection::Manual
         {
             self.send_json(serde_json::json!({ "type": "input_audio_buffer.commit" }))
@@ -1019,8 +1445,14 @@ impl RealtimeAudioSession {
     }
 
     pub async fn close(&mut self) -> Result<(), RealtimeAudioError> {
+        // The media path is released first so the provider stops sending audio before the control
+        // socket goes away.
+        if let Some(mut media) = self.media.take() {
+            media.close().await?;
+        }
         match self.config.provider {
-            RealtimeAudioProvider::OpenAi => {
+            // Closing a sideband socket leaves the peer connection to its owner to tear down.
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => {
                 self.ws
                     .close()
                     .await
@@ -1051,6 +1483,39 @@ impl RealtimeAudioSession {
         if let Some(event) = self.pending.pop_front() {
             return Ok(event);
         }
+        if self.media.is_none() {
+            return self.receive_socket_event(timeout).await;
+        }
+        // A negotiated session has two inbound directions: control events on the socket and audio
+        // on the media path. Neither may starve the other, so the budget is spent in small slices
+        // alternating between them and the first thing to arrive wins.
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self.receive_media_audio(MEDIA_POLL_SLICE).await? {
+                return Ok(event);
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(RealtimeAudioError::Timeout {
+                    timeout_ms: timeout.as_millis(),
+                });
+            }
+            match self
+                .receive_socket_event(remaining.min(MEDIA_POLL_SLICE))
+                .await
+            {
+                Ok(event) => return Ok(event),
+                Err(RealtimeAudioError::Timeout { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Reads one control event from the session socket.
+    async fn receive_socket_event(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<RealtimeAudioEvent, RealtimeAudioError> {
         let message = tokio::time::timeout(timeout, self.ws.next())
             .await
             .map_err(|_| RealtimeAudioError::Timeout {
@@ -1068,6 +1533,30 @@ impl RealtimeAudioSession {
                 detail: "server sent a non-text websocket frame".to_string(),
             })?;
         parse_realtime_audio_event(self.config.provider, text)
+    }
+
+    /// Reads decoded audio from the media path and presents it as an ordinary output event.
+    ///
+    /// Surfacing media as [`RealtimeAudioEvent::OutputAudioDelta`] is what lets one playback path
+    /// serve every provider: the caller writes the delta to its speaker without knowing whether it
+    /// came off a socket or a peer connection.
+    async fn receive_media_audio(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<RealtimeAudioEvent>, RealtimeAudioError> {
+        let Some(media) = self.media.as_mut() else {
+            return Ok(None);
+        };
+        Ok(media
+            .recv_audio(timeout)
+            .await?
+            .map(|audio| RealtimeAudioEvent::OutputAudioDelta {
+                text: String::new(),
+                audio,
+                end_of_turn: false,
+                item_id: None,
+                kv_cache_length: None,
+            }))
     }
 
     async fn wait_minicpm_ready_and_update(&mut self) -> Result<(), RealtimeAudioError> {
@@ -1103,16 +1592,176 @@ impl RealtimeAudioSession {
             })
     }
 
+    /// Requires a provider that speaks the OpenAI realtime control protocol.
+    ///
+    /// The Codex sideband carries the same control messages as the OpenAI socket, so it accepts
+    /// these operations even though its audio rides a peer connection.
     fn require_openai(&self, operation: &'static str) -> Result<(), RealtimeAudioError> {
-        if self.config.provider == RealtimeAudioProvider::OpenAi {
-            Ok(())
-        } else {
-            Err(RealtimeAudioError::UnsupportedOperation {
+        match self.config.provider {
+            RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => Ok(()),
+            RealtimeAudioProvider::MiniCpmO => Err(RealtimeAudioError::UnsupportedOperation {
                 operation,
                 provider: self.config.provider.provider_id(),
-            })
+            }),
         }
     }
+}
+
+/// Negotiates a WebRTC realtime call and returns the provider's answer.
+///
+/// The caller owns the peer connection: it produces the offer, applies the answer, and carries the
+/// media. This exchange only establishes the call that the sideband control socket then joins.
+pub async fn create_realtime_webrtc_call(
+    config: &RealtimeAudioSessionConfig,
+) -> Result<RealtimeWebrtcCall, RealtimeAudioError> {
+    config.validate()?;
+    let RealtimeAudioTransport::WebRtc { offer_sdp } = &config.transport else {
+        return Err(RealtimeAudioError::InvalidConfig {
+            detail: "realtime call negotiation requires the WebRTC transport".to_string(),
+        });
+    };
+    let url = config.realtime_call_url();
+    let session = realtime_call_session_payload(config);
+    let client = reqwest::Client::builder()
+        .connect_timeout(config.connect_timeout())
+        .build()
+        .map_err(|source| RealtimeAudioError::WebSocket {
+            detail: source.to_string(),
+        })?;
+    let mut request = client.post(&url);
+    if let Some(api_key) = config
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|api_key| !api_key.is_empty())
+    {
+        request = request.bearer_auth(api_key);
+    }
+    for (name, value) in &config.headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    // The realtime API takes the offer and the session as separate parts of one form, so the SDP
+    // stays a document of its own rather than a string inside JSON.
+    let request = request.multipart(
+        reqwest::multipart::Form::new()
+            .part(
+                "sdp",
+                reqwest::multipart::Part::text(offer_sdp.clone())
+                    .mime_str("application/sdp")
+                    .map_err(|source| RealtimeAudioError::InvalidConfig {
+                        detail: source.to_string(),
+                    })?,
+            )
+            .part(
+                "session",
+                reqwest::multipart::Part::text(session.to_string())
+                    .mime_str("application/json")
+                    .map_err(|source| RealtimeAudioError::InvalidConfig {
+                        detail: source.to_string(),
+                    })?,
+            ),
+    );
+    let response = tokio::time::timeout(config.connect_timeout(), request.send())
+        .await
+        .map_err(|_| RealtimeAudioError::Timeout {
+            timeout_ms: config.connect_timeout().as_millis(),
+        })?
+        .map_err(|source| RealtimeAudioError::WebSocket {
+            detail: source.to_string(),
+        })?;
+    let status = response.status();
+    let call_id = response
+        .headers()
+        .get(http::header::LOCATION)
+        .and_then(|location| location.to_str().ok())
+        .map(realtime_call_id_from_location)
+        .and_then(|call_id| (!call_id.is_empty()).then_some(call_id));
+    let body = response
+        .text()
+        .await
+        .map_err(|source| RealtimeAudioError::WebSocket {
+            detail: source.to_string(),
+        })?;
+    if !status.is_success() {
+        return Err(RealtimeAudioError::Protocol {
+            detail: format!("realtime call failed: HTTP {status}: {body}"),
+        });
+    }
+    let Some(call_id) = call_id else {
+        return Err(RealtimeAudioError::Protocol {
+            detail: "realtime call response did not carry a Location call id".to_string(),
+        });
+    };
+    if body.trim().is_empty() {
+        return Err(RealtimeAudioError::Protocol {
+            detail: "realtime call response did not carry an SDP answer".to_string(),
+        });
+    }
+    Ok(RealtimeWebrtcCall {
+        answer_sdp: body,
+        call_id,
+    })
+}
+
+/// Extracts the call id from the `Location` header of a realtime call response.
+fn realtime_call_id_from_location(location: &str) -> String {
+    location
+        .split('?')
+        .next()
+        .unwrap_or(location)
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Builds the session document sent when a WebRTC call is created.
+///
+/// A WebRTC call is configured once, at creation, because media can start flowing as soon as the
+/// peer connection comes up — there is no later `session.update` to wait for. It is the same
+/// document a socket session sends, so a negotiated call is configured identically rather than by a
+/// second builder that drifts from it.
+pub fn realtime_call_session_payload(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
+    let mut session = openai_realtime_session_document(config);
+    // A socket session names its model in the URL query. A call has no query to carry it, and the
+    // endpoint refuses a session document that does not name one.
+    session["model"] = serde_json::json!(config.model);
+    session
+}
+
+/// Builds the sideband control socket URL that joins an established WebRTC call.
+pub fn realtime_sideband_ws_url(
+    base_url: &str,
+    call_id: &str,
+) -> Result<String, RealtimeAudioError> {
+    let call_id = call_id.trim();
+    if call_id.is_empty() {
+        return Err(RealtimeAudioError::Url {
+            detail: "realtime sideband URL requires a call id".to_string(),
+        });
+    }
+    let mut base = base_url.trim().trim_end_matches('/').to_string();
+    if base.is_empty() {
+        base = DEFAULT_REALTIME_SIDEBAND_BASE_URL.to_string();
+    }
+    let base = if base.starts_with("wss://") || base.starts_with("ws://") {
+        base
+    } else if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        return Err(RealtimeAudioError::Url {
+            detail: format!("unsupported realtime sideband base URL `{base_url}`"),
+        });
+    };
+    let base = if base.ends_with("/realtime") {
+        base
+    } else {
+        format!("{base}/realtime")
+    };
+    Ok(format!("{base}?call_id={call_id}"))
 }
 
 pub fn openai_realtime_ws_url(base_url: &str, model: &str) -> Result<String, RealtimeAudioError> {
@@ -1167,7 +1816,11 @@ pub fn minicpm_realtime_ws_url_for_video(
     Ok(format!("{base}/v1/realtime?mode={mode}"))
 }
 
-pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
+/// Builds the realtime session document that configures a session, whatever transport carries it.
+///
+/// A socket session sends it inside a `session.update`; a WebRTC call sends it when the call is
+/// created. Both transports are the same API, so both are configured by this one document.
+fn openai_realtime_session_document(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
     let mut session = serde_json::json!({
         "type": "realtime",
         "instructions": config.instructions,
@@ -1180,8 +1833,11 @@ pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> ser
                 }
             },
             "output": {
+                // Both the type and the rate are required; a format naming only the type is
+                // refused outright, which discards the whole session update.
                 "format": {
-                    "type": "audio/pcm"
+                    "type": "audio/pcm",
+                    "rate": config.output_sample_rate_hz
                 },
                 "voice": config.voice.as_deref().unwrap_or("marin")
             }
@@ -1246,9 +1902,13 @@ pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> ser
                 .unwrap_or("auto")
         );
     }
+    session
+}
+
+pub fn openai_session_update_payload(config: &RealtimeAudioSessionConfig) -> serde_json::Value {
     serde_json::json!({
         "type": "session.update",
-        "session": session
+        "session": openai_realtime_session_document(config)
     })
 }
 
@@ -1737,7 +2397,8 @@ fn output_audio_delta(
     value: &serde_json::Value,
 ) -> Result<RealtimeAudioEvent, RealtimeAudioError> {
     let audio_text = match provider {
-        RealtimeAudioProvider::OpenAi => value
+        // The Codex sideband speaks the same realtime event protocol as the OpenAI socket.
+        RealtimeAudioProvider::OpenAi | RealtimeAudioProvider::Codex => value
             .get("delta")
             .or_else(|| value.get("audio"))
             .and_then(serde_json::Value::as_str),
@@ -1774,6 +2435,411 @@ fn output_audio_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(future)
+    }
+
+    struct CapturedCall {
+        request_line: String,
+        headers: String,
+        body: String,
+    }
+
+    /// Serves one realtime call negotiation and captures what the client sent.
+    fn realtime_call_server(
+        status_line: &'static str,
+        location: Option<&'static str>,
+        body: &'static str,
+    ) -> (
+        String,
+        StdArc<Mutex<Option<CapturedCall>>>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind call server");
+        let address = listener.local_addr().expect("call server address");
+        let captured = StdArc::new(Mutex::new(None));
+        let server_captured = StdArc::clone(&captured);
+        let worker = std::thread::spawn(move || {
+            // Bounded rather than a bare `accept`: a client that fails validation never connects, and
+            // a blocking accept would then wedge this thread — and, through the join below, the whole
+            // test binary — with nothing to time it out.
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking call server");
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "no client connected to the realtime call server"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept call request: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let mut bytes = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                assert!(read > 0, "request closed before headers");
+                bytes.extend_from_slice(&buffer[..read]);
+                if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]).to_string();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while bytes.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).expect("read request body");
+                assert!(read > 0, "request closed before body");
+                bytes.extend_from_slice(&buffer[..read]);
+            }
+            *server_captured.lock().expect("captured lock") = Some(CapturedCall {
+                request_line: headers.lines().next().expect("request line").to_string(),
+                headers: headers.clone(),
+                body: String::from_utf8_lossy(&bytes[header_end..]).to_string(),
+            });
+            let location = location
+                .map(|location| format!("Location: {location}\r\n"))
+                .unwrap_or_default();
+            write!(
+                stream,
+                "HTTP/1.1 {status_line}\r\n{location}Content-Type: application/sdp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write call response");
+            stream.flush().expect("flush call response");
+        });
+        (format!("http://{address}"), captured, worker)
+    }
+
+    fn webrtc_config(base_url: &str) -> RealtimeAudioSessionConfig {
+        let mut config = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .with_transport(RealtimeAudioTransport::webrtc("v=0\r\no=- offer\r\n"));
+        config.api_base_url = Some(format!("{base_url}/v1"));
+        config.api_key = Some("chatgpt-access-token".to_string());
+        config
+    }
+
+    #[test]
+    fn realtime_call_negotiates_a_webrtc_session_and_reads_the_call_id() {
+        let (base_url, captured, server) = realtime_call_server(
+            "201 Created",
+            Some("/v1/realtime/calls/rtc_sinomo?foo=bar"),
+            "v=0\r\no=- answer\r\n",
+        );
+        let mut config = webrtc_config(&base_url);
+        config
+            .headers
+            .insert("ChatGPT-Account-ID".to_string(), "acct_1".to_string());
+
+        let call = block_on(create_realtime_webrtc_call(&config)).expect("negotiate call");
+
+        server.join().expect("server thread");
+        assert_eq!(call.call_id, "rtc_sinomo");
+        assert_eq!(call.answer_sdp, "v=0\r\no=- answer\r\n");
+        let captured = captured.lock().expect("captured lock");
+        let captured = captured.as_ref().expect("captured call");
+        assert!(
+            captured
+                .request_line
+                .starts_with("POST /v1/realtime/calls "),
+            "{}",
+            captured.request_line
+        );
+        assert!(
+            captured
+                .headers
+                .contains("authorization: Bearer chatgpt-access-token")
+                || captured
+                    .headers
+                    .contains("Authorization: Bearer chatgpt-access-token"),
+            "{}",
+            captured.headers
+        );
+        assert!(
+            captured
+                .headers
+                .to_ascii_lowercase()
+                .contains("chatgpt-account-id: acct_1"),
+            "{}",
+            captured.headers
+        );
+        // The realtime API takes the offer and the session as separate form parts, each with its
+        // own media type.
+        assert!(
+            captured
+                .headers
+                .to_ascii_lowercase()
+                .contains("content-type: multipart/form-data"),
+            "{}",
+            captured.headers
+        );
+        assert_eq!(
+            multipart_part(&captured.body, "sdp"),
+            "v=0\r\no=- offer\r\n"
+        );
+        let session =
+            serde_json::from_str::<serde_json::Value>(&multipart_part(&captured.body, "session"))
+                .expect("session part is JSON");
+        // The call has no URL query to name the model in, so the document must carry it.
+        assert_eq!(session["type"], "realtime");
+        assert_eq!(session["model"], OPENAI_REALTIME_DEFAULT_MODEL);
+        assert_eq!(session["audio"]["input"]["format"]["rate"], 24_000);
+        assert_eq!(session["audio"]["output"]["format"]["rate"], 24_000);
+        assert_eq!(session["audio"]["output"]["voice"], "marin");
+        // `delegation` belonged to the withdrawn preview shape; the realtime API refuses it.
+        assert!(session.get("delegation").is_none(), "{session}");
+    }
+
+    /// Returns the body of one named part of a captured multipart form.
+    ///
+    /// The delimiter comes from the form's own opening line rather than a guess, so a part whose
+    /// content happens to contain dashes is still split correctly.
+    fn multipart_part(body: &str, name: &str) -> String {
+        let boundary = body
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("empty multipart body"));
+        let disposition = format!("name=\"{name}\"");
+        let part = body
+            .split(boundary)
+            .find(|part| part.contains(&disposition))
+            .unwrap_or_else(|| panic!("no `{name}` part in:\n{body}"));
+        let (_, value) = part
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("`{name}` part has no body in:\n{part}"));
+        // One CRLF separates a part's content from the delimiter that follows it, and content that
+        // ends in a newline of its own must keep it.
+        value.strip_suffix("\r\n").unwrap_or(value).to_string()
+    }
+
+    #[test]
+    fn realtime_call_without_a_location_header_is_a_protocol_error() {
+        let (base_url, _captured, server) =
+            realtime_call_server("201 Created", None, "v=0\r\no=- answer\r\n");
+        let config = webrtc_config(&base_url);
+
+        let error = block_on(create_realtime_webrtc_call(&config)).expect_err("missing call id");
+
+        server.join().expect("server thread");
+        assert!(error.to_string().contains("Location call id"), "{error}");
+    }
+
+    #[test]
+    fn realtime_call_surfaces_the_provider_error_body() {
+        let (base_url, _captured, server) = realtime_call_server(
+            "403 Forbidden",
+            Some("/realtime/calls/rtc_denied"),
+            "realtime is not enabled for this account",
+        );
+        let config = webrtc_config(&base_url);
+
+        let error = block_on(create_realtime_webrtc_call(&config)).expect_err("provider refusal");
+
+        server.join().expect("server thread");
+        let detail = error.to_string();
+        assert!(detail.contains("403 Forbidden"), "{detail}");
+        assert!(detail.contains("not enabled for this account"), "{detail}");
+    }
+
+    #[test]
+    fn realtime_sideband_url_joins_a_call_on_the_realtime_host() {
+        assert_eq!(
+            realtime_sideband_ws_url("https://api.openai.com/v1", "rtc_test").expect("url"),
+            "wss://api.openai.com/v1/realtime?call_id=rtc_test"
+        );
+        // A base that already names the realtime path must not gain a second one.
+        assert_eq!(
+            realtime_sideband_ws_url("wss://api.openai.com/v1/realtime", "rtc_test").expect("url"),
+            "wss://api.openai.com/v1/realtime?call_id=rtc_test"
+        );
+        assert!(realtime_sideband_ws_url("https://api.openai.com/v1", "  ").is_err());
+    }
+
+    #[test]
+    fn codex_realtime_addresses_the_openai_realtime_api() {
+        let config = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .with_transport(RealtimeAudioTransport::webrtc("v=0"));
+
+        // Realtime is not served by the Codex backend: a ChatGPT sign-in reaches the OpenAI
+        // realtime API with no preview query and no alpha header.
+        assert_eq!(
+            config.realtime_call_url(),
+            "https://api.openai.com/v1/realtime/calls"
+        );
+        assert_eq!(
+            config.sideband_websocket_url("rtc_test").expect("url"),
+            "wss://api.openai.com/v1/realtime?call_id=rtc_test"
+        );
+        assert_eq!(
+            RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+                .websocket_url()
+                .expect("url"),
+            format!("wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_DEFAULT_MODEL}")
+        );
+    }
+
+    #[test]
+    fn codex_realtime_accepts_either_transport() {
+        // A Codex sign-in drives the realtime socket as well as a negotiated call, so a session
+        // without an SDP offer is valid rather than refused.
+        RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .validate()
+            .expect("a socket Codex session is valid");
+
+        let empty_offer = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .with_transport(RealtimeAudioTransport::webrtc("   "));
+        let error = empty_offer.validate().expect_err("empty offer is refused");
+        assert!(error.to_string().contains("non-empty SDP offer"), "{error}");
+
+        let minicpm = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::MiniCpmO, "")
+            .with_transport(RealtimeAudioTransport::webrtc("v=0"));
+        let error = minicpm.validate().expect_err("MiniCPM-o has no WebRTC");
+        assert!(
+            error
+                .to_string()
+                .contains("does not support the WebRTC transport"),
+            "{error}"
+        );
+
+        RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .with_transport(RealtimeAudioTransport::webrtc("v=0"))
+            .validate()
+            .expect("a WebRTC Codex session is valid");
+    }
+
+    #[test]
+    fn realtime_call_session_payload_carries_tools_and_voice() {
+        let mut config = RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+            .with_transport(RealtimeAudioTransport::webrtc("v=0"));
+        config.voice = Some("cove".to_string());
+        config.tools = vec![RealtimeAudioToolDefinition::new(
+            "lookup",
+            serde_json::json!({ "type": "object" }),
+        )];
+        config.tool_choice = Some("auto".to_string());
+
+        let payload = realtime_call_session_payload(&config);
+
+        assert_eq!(payload["audio"]["output"]["voice"], "cove");
+        assert_eq!(payload["tools"][0]["name"], "lookup");
+        assert_eq!(payload["tools"][0]["type"], "function");
+        assert_eq!(payload["tool_choice"], "auto");
+
+        // A call is the same session as a socket, configured up front instead of by an update, so
+        // the only difference is the model the query would otherwise have carried.
+        let mut socket_session = openai_session_update_payload(&config)["session"].clone();
+        socket_session["model"] = serde_json::json!(config.model);
+        assert_eq!(payload, socket_session);
+
+        let without_tools = realtime_call_session_payload(
+            &RealtimeAudioSessionConfig::new(RealtimeAudioProvider::Codex, "")
+                .with_transport(RealtimeAudioTransport::webrtc("v=0")),
+        );
+        assert!(without_tools.get("tools").is_none(), "{without_tools}");
+        assert!(
+            without_tools.get("tool_choice").is_none(),
+            "{without_tools}"
+        );
+    }
+
+    /// A media path that records what a session sent and replays queued audio back.
+    #[derive(Default)]
+    struct FakeMediaTransport {
+        sent: StdArc<Mutex<Vec<Vec<u8>>>>,
+        inbound: StdArc<Mutex<std::collections::VecDeque<Vec<u8>>>>,
+        closed: StdArc<Mutex<bool>>,
+    }
+
+    impl RealtimeMediaTransport for FakeMediaTransport {
+        fn send_audio<'a>(&'a mut self, audio: &'a [u8]) -> RealtimeSessionFuture<'a, ()> {
+            let sent = StdArc::clone(&self.sent);
+            let audio = audio.to_vec();
+            Box::pin(async move {
+                sent.lock().expect("sent lock").push(audio);
+                Ok(())
+            })
+        }
+
+        fn recv_audio(&mut self, _timeout: Duration) -> RealtimeSessionFuture<'_, Option<Vec<u8>>> {
+            let inbound = StdArc::clone(&self.inbound);
+            Box::pin(async move { Ok(inbound.lock().expect("inbound lock").pop_front()) })
+        }
+
+        fn close(&mut self) -> RealtimeSessionFuture<'_, ()> {
+            let closed = StdArc::clone(&self.closed);
+            Box::pin(async move {
+                *closed.lock().expect("closed lock") = true;
+                Ok(())
+            })
+        }
+    }
+
+    #[test]
+    fn an_attached_media_path_carries_audio_without_changing_the_call_path() {
+        let transport = FakeMediaTransport::default();
+        let sent = StdArc::clone(&transport.sent);
+        let inbound = StdArc::clone(&transport.inbound);
+        inbound
+            .lock()
+            .expect("inbound lock")
+            .push_back(vec![7, 7, 7]);
+        let mut transport: Box<dyn RealtimeMediaTransport> = Box::new(transport);
+
+        // Capture frames reach the media path rather than the control socket.
+        block_on(transport.send_audio(&[1, 2, 3])).expect("send audio");
+        assert_eq!(sent.lock().expect("sent lock").as_slice(), [vec![1, 2, 3]]);
+
+        // Remote audio comes back as ordinary PCM the playback path already understands.
+        let received = block_on(transport.recv_audio(Duration::from_millis(1)))
+            .expect("receive audio")
+            .expect("audio is queued");
+        assert_eq!(received, vec![7, 7, 7]);
+        assert!(
+            block_on(transport.recv_audio(Duration::from_millis(1)))
+                .expect("an empty media path is not a failure")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_negotiated_session_reports_a_session_audio_plane_once_media_is_attached() {
+        // Without a transport the audio plane is outside the session, so a caller must not pump
+        // frames into it; attaching one makes the session carry audio like any other provider.
+        assert!(!RealtimeAudioPlane::Negotiated.carries_audio_in_session());
+        assert!(RealtimeAudioPlane::Session.carries_audio_in_session());
+    }
+
+    #[test]
+    fn codex_realtime_capability_covers_both_transports() {
+        let capabilities = RealtimeAudioProvider::Codex.capabilities();
+        assert!(capabilities.realtime_webrtc);
+        assert!(capabilities.realtime_websocket);
+        assert_eq!(capabilities, crate::provider_capabilities("codex"));
+    }
 
     #[test]
     fn openai_realtime_url_converts_https_base() {

@@ -1,3 +1,4 @@
+use crate::openai::{image_payload, image_request_operation, image_response, image_tool_error};
 use crate::{
     LanguageModelCancellation, LanguageModelCreditUsage, LanguageModelError,
     LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
@@ -6,7 +7,8 @@ use crate::{
     LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
     LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
     LanguageModelToolSpec, LanguageModelUsage, LanguageModelUsageLimit, LanguageModelUsageProvider,
-    PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload,
+    OpenAiImageRequest, OpenAiImageResponse, OpenAiWebSearchContextSize, OpenAiWebSearchRequest,
+    OpenAiWebSearchResponse, PROVIDER_DEFAULT_MODEL, apply_provider_vendor_options_to_payload,
     read_provider_credentials_json_value, selected_model, unix_timestamp,
     write_provider_credentials_json_value,
 };
@@ -18,6 +20,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValu
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -34,6 +37,10 @@ pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 // Match the open-source Codex workspace version used by its models manager.
 pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.0.0";
+/// The image model the Codex backend serves to ChatGPT subscription sign-ins.
+pub const CODEX_DEFAULT_IMAGE_MODEL: &str = crate::openai::OPENAI_DEFAULT_IMAGE_MODEL;
+/// The Codex backend's standalone web search endpoint, relative to the API base URL.
+const CODEX_SEARCH_PATH: &str = "alpha/search";
 const CODEX_STREAM_MAX_TRANSPORT_RETRIES: usize = 2;
 const CODEX_STREAM_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
 const CODEX_STREAM_CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -85,16 +92,96 @@ impl Default for OpenAiResponsesCodexConfig {
 }
 
 fn default_codex_credentials_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var(SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Some(PathBuf::from(path));
+    if let Some(path) = codex_credentials_path_override() {
+        return Some(path);
     }
     sinomo_runtime::local::SinomoDataDir::from_env_or_home()
         .ok()
         .map(|dir| dir.provider_credentials_file(CODEX_PROVIDER_ID))
+}
+
+/// Resolves the Codex ChatGPT credentials file backing a specific data dir.
+///
+/// The credentials-file environment override still wins, so a caller that resolves credentials for
+/// a known data dir reads the same sign-in the default configuration would.
+pub fn codex_credentials_file_in_data_dir(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> PathBuf {
+    codex_credentials_path_override()
+        .unwrap_or_else(|| data_dir.provider_credentials_file(CODEX_PROVIDER_ID))
+}
+
+fn codex_credentials_path_override() -> Option<PathBuf> {
+    std::env::var(SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn codex_image_error(detail: impl std::fmt::Display) -> LanguageModelError {
+    image_tool_error(CODEX_PROVIDER_ID, CODEX_DEFAULT_IMAGE_MODEL, detail)
+}
+
+fn codex_search_error(detail: impl std::fmt::Display) -> LanguageModelError {
+    LanguageModelError::ProviderInvocationFailed {
+        provider: CODEX_PROVIDER_ID.to_string(),
+        model: CODEX_DEFAULT_MODEL.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+/// Builds the standalone search request the Codex backend expects.
+///
+/// The query is sent twice by design: as the `search_query` command that runs the search, and as
+/// the free-text `input` that gives the backend the intent behind it. `allowed_callers` marks this
+/// as a direct tool call rather than one relayed through a shell or interpreter.
+fn codex_search_payload(
+    request: &OpenAiWebSearchRequest,
+    query: &str,
+    model: &str,
+) -> serde_json::Value {
+    let allowed_domains = request
+        .allowed_domains
+        .iter()
+        .map(|domain| domain.trim())
+        .filter(|domain| !domain.is_empty())
+        .collect::<Vec<_>>();
+    let context_size = match request.context_size {
+        OpenAiWebSearchContextSize::Low => "low",
+        OpenAiWebSearchContextSize::Medium => "medium",
+        OpenAiWebSearchContextSize::High => "high",
+    };
+    let mut search_query = serde_json::json!({ "q": query });
+    let mut settings = serde_json::json!({
+        "search_context_size": context_size,
+        "allowed_callers": ["direct"],
+        "external_web_access": true,
+    });
+    if !allowed_domains.is_empty() {
+        search_query["domains"] = serde_json::json!(allowed_domains);
+        settings["filters"] = serde_json::json!({ "allowed_domains": allowed_domains });
+    }
+    serde_json::json!({
+        "id": codex_search_request_id(),
+        "model": model,
+        "input": query,
+        "commands": { "search_query": [search_query] },
+        "settings": settings,
+    })
+}
+
+/// Returns a unique id for one standalone search.
+///
+/// Codex scopes a search to its thread so follow-up `open`/`click` commands can resolve the result
+/// references. Sinomo's hosted search is single-shot, so each request stands alone.
+fn codex_search_request_id() -> String {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "sinomo-search-{}-{}",
+        unix_timestamp(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 fn missing_codex_chatgpt_auth() -> LanguageModelError {
@@ -291,6 +378,29 @@ fn tokens_from_response(
     }
 }
 
+/// How much life an access token needs left on it to open a realtime session with.
+///
+/// A session outlives the request that opened it, so a token expiring inside this window is renewed
+/// up front instead of expiring partway through a conversation.
+const REALTIME_TOKEN_MIN_REMAINING_SECS: i64 = 30 * 60;
+
+/// Returns whether an access token has enough life left to carry a realtime session.
+///
+/// A token whose expiry cannot be read is treated as spent, so an unreadable credential is renewed
+/// rather than presented to the provider and refused.
+fn realtime_token_outlives_a_session(access_token: &str) -> bool {
+    if access_token.trim().is_empty() {
+        return false;
+    }
+    let Some(expires_at) = jwt_auth_claims(access_token)
+        .get("exp")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return false;
+    };
+    expires_at - unix_timestamp() as i64 > REALTIME_TOKEN_MIN_REMAINING_SECS
+}
+
 fn jwt_auth_claims(jwt: &str) -> serde_json::Value {
     let Some(payload) = jwt.split('.').nth(1) else {
         return serde_json::Value::Null;
@@ -403,6 +513,168 @@ impl OpenAiResponsesCodexClient {
             }
         })?;
         Ok(codex_usage_from_value(&value, unix_timestamp()))
+    }
+
+    /// Applies this sign-in's credentials to a realtime session configuration.
+    ///
+    /// A realtime session is authorized once and then runs for as long as the conversation lasts,
+    /// so it cannot retry a refusal mid-call the way a request can — a token near its expiry is
+    /// renewed before the session opens rather than after it breaks. A token with life left in it
+    /// is used as it stands: refreshing rotates the refresh token, so renewing on every call would
+    /// invalidate the sign-in that other Codex requests share.
+    pub fn authorize_realtime_session(
+        &self,
+        config: &mut crate::RealtimeAudioSessionConfig,
+    ) -> Result<(), LanguageModelError> {
+        let tokens = match self.chatgpt_tokens() {
+            Ok(tokens) if realtime_token_outlives_a_session(&tokens.access_token) => tokens,
+            _ => self.refresh_chatgpt_tokens()?,
+        };
+        config.api_key = Some(tokens.access_token);
+        if let Some(account_id) = tokens
+            .account_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|account_id| !account_id.is_empty())
+        {
+            config
+                .headers
+                .insert("ChatGPT-Account-ID".to_string(), account_id.to_string());
+        }
+        if tokens.chatgpt_account_is_fedramp {
+            config
+                .headers
+                .insert("X-OpenAI-Fedramp".to_string(), "true".to_string());
+        }
+        Ok(())
+    }
+
+    /// Runs a standalone web search through the Codex backend.
+    ///
+    /// The Codex backend does not take the Responses API `web_search` tool. It exposes a dedicated
+    /// search endpoint that answers with rendered text plus the structured results behind it, so
+    /// the query becomes a `search_query` command rather than a tool definition on a turn.
+    pub fn web_search(
+        &self,
+        request: &OpenAiWebSearchRequest,
+    ) -> Result<OpenAiWebSearchResponse, LanguageModelError> {
+        let query = request.query.trim();
+        if query.is_empty() {
+            return Err(codex_search_error("web search query must not be empty"));
+        }
+        let model = request
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(self.config.default_model.as_str())
+            .to_string();
+        let payload = codex_search_payload(request, query, &model);
+        let mut tokens = self.chatgpt_tokens()?;
+        let mut response = self.post_search_request(&tokens, &payload)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tokens = self.refresh_chatgpt_tokens()?;
+            response = self.post_search_request(&tokens, &payload)?;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(codex_search_error(format!(
+                "Codex web search failed: HTTP {status}: {body}"
+            )));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| codex_search_error(source.to_string()))?;
+        let text = value
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok(OpenAiWebSearchResponse {
+            model,
+            text,
+            sources: crate::openai::collect_web_search_sources(
+                value
+                    .get("results")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten(),
+            ),
+        })
+    }
+
+    fn post_search_request(
+        &self,
+        tokens: &CodexChatGptTokens,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
+        let url = format!(
+            "{}/{CODEX_SEARCH_PATH}",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        self.http
+            .post(url)
+            .headers(codex_json_headers(
+                tokens,
+                CODEX_PROVIDER_ID,
+                &self.config.default_model,
+            )?)
+            .json(payload)
+            .send()
+            .map_err(|source| codex_search_error(source.to_string()))
+    }
+
+    /// Generates an image, or edits the supplied reference images, through the Codex backend.
+    ///
+    /// The ChatGPT sign-in is the credential here, so an expired access token is refreshed and the
+    /// request retried once — the same recovery `list_models` and `usage` perform.
+    pub fn generate_or_edit_image(
+        &self,
+        request: &OpenAiImageRequest,
+    ) -> Result<OpenAiImageResponse, LanguageModelError> {
+        let operation =
+            image_request_operation(request, CODEX_PROVIDER_ID, CODEX_DEFAULT_IMAGE_MODEL)?;
+        let payload = image_payload(request, CODEX_DEFAULT_IMAGE_MODEL);
+        let mut tokens = self.chatgpt_tokens()?;
+        let mut response = self.post_image_request(&tokens, operation, &payload)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            tokens = self.refresh_chatgpt_tokens()?;
+            response = self.post_image_request(&tokens, operation, &payload)?;
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            return Err(codex_image_error(format!(
+                "Codex image {operation} failed: HTTP {status}: {body}"
+            )));
+        }
+        let value = response
+            .json::<serde_json::Value>()
+            .map_err(|source| codex_image_error(source.to_string()))?;
+        image_response(&value, CODEX_PROVIDER_ID, CODEX_DEFAULT_IMAGE_MODEL)
+    }
+
+    fn post_image_request(
+        &self,
+        tokens: &CodexChatGptTokens,
+        operation: &str,
+        payload: &serde_json::Value,
+    ) -> Result<reqwest::blocking::Response, LanguageModelError> {
+        let url = format!(
+            "{}/images/{operation}",
+            self.config.api_base_url.trim_end_matches('/')
+        );
+        self.http
+            .post(url)
+            .headers(codex_json_headers(
+                tokens,
+                CODEX_PROVIDER_ID,
+                CODEX_DEFAULT_IMAGE_MODEL,
+            )?)
+            .json(payload)
+            .send()
+            .map_err(|source| codex_image_error(source.to_string()))
     }
 
     pub fn device_login_start(&self) -> Result<CodexDeviceCode, LanguageModelError> {
@@ -1418,7 +1690,7 @@ where
             default_model: self.config.default_model.clone(),
             invocation: LanguageModelInvocation::Http,
             host_access: crate::LanguageModelHostAccess::NetworkOnly,
-            capabilities: crate::LanguageModelProviderCapabilities::responses_http(),
+            capabilities: crate::LanguageModelProviderCapabilities::codex(),
             supports_json_object: true,
             supports_tool_permissions: true,
         }
@@ -2649,7 +2921,10 @@ fn parse_function_call_item(item: &serde_json::Value) -> Option<CodexToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort, ProviderTextVerbosity};
+    use crate::{
+        OpenAiWebSearchSource, PROVIDER_DEFAULT_MODEL, ProviderReasoningEffort,
+        ProviderTextVerbosity,
+    };
     use std::cell::RefCell;
     use std::fs;
     use std::io::{Read, Write};
@@ -2783,9 +3058,12 @@ mod tests {
         stream
     }
 
-
-
     fn read_http_request(stream: &mut TcpStream) -> String {
+        read_http_request_with_body(stream).0
+    }
+
+    /// Reads a request and keeps its body so payload-shaping assertions can inspect it.
+    fn read_http_request_with_body(stream: &mut TcpStream) -> (String, String) {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("request read timeout");
@@ -2814,7 +3092,10 @@ mod tests {
             assert!(read > 0, "request closed before body");
             bytes.extend_from_slice(&buffer[..read]);
         }
-        headers.lines().next().expect("request line").to_string()
+        (
+            headers.lines().next().expect("request line").to_string(),
+            String::from_utf8_lossy(&bytes[header_end..]).to_string(),
+        )
     }
 
     fn write_chunked_headers(stream: &mut TcpStream, content_type: &str) {
@@ -3596,6 +3877,397 @@ mod tests {
                 .expect("refreshed credentials")
                 .access_token,
             "refreshed-access"
+        );
+    }
+
+    #[test]
+    fn codex_web_search_posts_search_command_and_maps_results_to_sources() {
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let server_body = Arc::clone(&request_body);
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            let mut stream = accept_expected(&listener, "accept search request");
+            let (request_line, body) = read_http_request_with_body(&mut stream);
+            server_paths.lock().expect("paths lock").push(request_line);
+            *server_body.lock().expect("body lock") = body;
+            write_json_response(
+                &mut stream,
+                "200 OK",
+                "{\"encrypted_output\":\"ciphertext\",\"output\":\"rendered answer\",\"results\":[{\"type\":\"text_result\",\"ref_id\":\"turn0search0\",\"url\":\"https://example.com/a\",\"title\":\"Example A\"},{\"type\":\"text_result\",\"url\":\"https://example.com/b\"},{\"type\":\"text_result\",\"url\":\"https://example.com/a\"},{\"type\":\"image_result\"}]}",
+            );
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-web-search");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        let response = client
+            .web_search(&OpenAiWebSearchRequest {
+                query: "  latest rust release  ".to_string(),
+                model: None,
+                allowed_domains: vec!["rust-lang.org".to_string(), "  ".to_string()],
+                context_size: OpenAiWebSearchContextSize::High,
+            })
+            .expect("codex web search succeeds");
+
+        server.join().expect("server thread");
+        let paths = paths.lock().expect("paths lock");
+        assert!(paths[0].starts_with("POST /alpha/search "), "{paths:?}");
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &request_body.lock().expect("body lock").clone(),
+        )
+        .expect("search payload is JSON");
+        assert_eq!(
+            payload["commands"]["search_query"][0]["q"],
+            "latest rust release"
+        );
+        assert_eq!(
+            payload["commands"]["search_query"][0]["domains"],
+            serde_json::json!(["rust-lang.org"])
+        );
+        assert_eq!(payload["input"], "latest rust release");
+        assert_eq!(payload["model"], CODEX_DEFAULT_MODEL);
+        assert_eq!(payload["settings"]["search_context_size"], "high");
+        assert_eq!(
+            payload["settings"]["allowed_callers"],
+            serde_json::json!(["direct"])
+        );
+        assert_eq!(payload["settings"]["external_web_access"], true);
+        assert_eq!(
+            payload["settings"]["filters"]["allowed_domains"],
+            serde_json::json!(["rust-lang.org"])
+        );
+        assert!(
+            payload["id"].as_str().is_some_and(|id| !id.is_empty()),
+            "{payload}"
+        );
+
+        assert_eq!(response.text, "rendered answer");
+        assert_eq!(response.model, CODEX_DEFAULT_MODEL);
+        // Results without a URL are dropped and repeats collapse into one source.
+        assert_eq!(
+            response.sources,
+            vec![
+                OpenAiWebSearchSource {
+                    url: "https://example.com/a".to_string(),
+                    title: Some("Example A".to_string()),
+                },
+                OpenAiWebSearchSource {
+                    url: "https://example.com/b".to_string(),
+                    title: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_web_search_omits_domain_filters_when_none_are_requested() {
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let server_body = Arc::clone(&request_body);
+        let (base_url, server) = test_server(move |listener| {
+            let mut stream = accept_expected(&listener, "accept search request");
+            let (_, body) = read_http_request_with_body(&mut stream);
+            *server_body.lock().expect("body lock") = body;
+            write_json_response(&mut stream, "200 OK", "{\"output\":\"answer\"}");
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-web-search-unfiltered");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        let response = client
+            .web_search(&OpenAiWebSearchRequest {
+                query: "rust".to_string(),
+                model: Some("gpt-5.5-codex".to_string()),
+                allowed_domains: Vec::new(),
+                context_size: OpenAiWebSearchContextSize::Medium,
+            })
+            .expect("codex web search succeeds");
+
+        server.join().expect("server thread");
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &request_body.lock().expect("body lock").clone(),
+        )
+        .expect("search payload is JSON");
+        assert!(payload["settings"].get("filters").is_none(), "{payload}");
+        assert!(
+            payload["commands"]["search_query"][0]
+                .get("domains")
+                .is_none(),
+            "{payload}"
+        );
+        assert_eq!(payload["model"], "gpt-5.5-codex");
+        assert_eq!(response.model, "gpt-5.5-codex");
+        assert!(response.sources.is_empty());
+    }
+
+    #[test]
+    fn codex_web_search_refreshes_once_after_unauthorized_response() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            for index in 0..3 {
+                let mut stream = accept_expected(&listener, "accept search request");
+                let request_line = read_http_request(&mut stream);
+                server_paths.lock().expect("paths lock").push(request_line);
+                match index {
+                    0 => write_json_response(&mut stream, "401 Unauthorized", "{}"),
+                    1 => write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        "{\"access_token\":\"refreshed-access\",\"refresh_token\":\"refreshed-refresh\"}",
+                    ),
+                    _ => write_json_response(&mut stream, "200 OK", "{\"output\":\"answer\"}"),
+                }
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-search-unauthorized");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        let response = client
+            .web_search(&OpenAiWebSearchRequest {
+                query: "rust".to_string(),
+                model: None,
+                allowed_domains: Vec::new(),
+                context_size: OpenAiWebSearchContextSize::Medium,
+            })
+            .expect("search succeeds after refresh");
+
+        server.join().expect("server thread");
+        assert_eq!(response.text, "answer");
+        let paths = paths.lock().expect("paths lock");
+        assert!(paths[0].starts_with("POST /alpha/search "), "{paths:?}");
+        assert!(paths[1].starts_with("POST /oauth/token "), "{paths:?}");
+        assert!(paths[2].starts_with("POST /alpha/search "), "{paths:?}");
+    }
+
+    #[test]
+    fn codex_web_search_rejects_an_empty_query_before_reaching_the_backend() {
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-search-invalid");
+        let client = transport_client("http://127.0.0.1:1", UNTESTED_IDLE_WINDOW, &dir);
+
+        let error = client
+            .web_search(&OpenAiWebSearchRequest {
+                query: "   ".to_string(),
+                model: None,
+                allowed_domains: Vec::new(),
+                context_size: OpenAiWebSearchContextSize::Medium,
+            })
+            .expect_err("an empty query is rejected");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    #[test]
+    fn codex_search_request_ids_are_unique_per_request() {
+        assert_ne!(codex_search_request_id(), codex_search_request_id());
+    }
+
+    fn image_response_body() -> String {
+        // "png-bytes" base64-encoded, matching the images API `b64_json` contract.
+        "{\"created\":1,\"data\":[{\"b64_json\":\"cG5nLWJ5dGVz\"}],\"output_format\":\"png\",\"size\":\"1024x1024\"}"
+            .to_string()
+    }
+
+    #[test]
+    fn codex_image_generation_posts_prompt_to_generations_endpoint() {
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let server_body = Arc::clone(&request_body);
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            let mut stream = accept_expected(&listener, "accept image request");
+            let (request_line, body) = read_http_request_with_body(&mut stream);
+            server_paths.lock().expect("paths lock").push(request_line);
+            *server_body.lock().expect("body lock") = body;
+            write_json_response(&mut stream, "200 OK", &image_response_body());
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-image-generation");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        let response = client
+            .generate_or_edit_image(&OpenAiImageRequest {
+                prompt: "a red fox in a field".to_string(),
+                referenced_images: Vec::new(),
+                size: Some("1024x1024".to_string()),
+                quality: Some("high".to_string()),
+                background: None,
+            })
+            .expect("codex image generation succeeds");
+
+        server.join().expect("server thread");
+        let paths = paths.lock().expect("paths lock");
+        assert!(
+            paths[0].starts_with("POST /images/generations "),
+            "{paths:?}"
+        );
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &request_body.lock().expect("body lock").clone(),
+        )
+        .expect("image payload is JSON");
+        assert_eq!(payload["model"], CODEX_DEFAULT_IMAGE_MODEL);
+        assert_eq!(payload["prompt"], "a red fox in a field");
+        assert_eq!(payload["size"], "1024x1024");
+        assert_eq!(payload["quality"], "high");
+        assert!(payload.get("images").is_none(), "{payload}");
+        assert_eq!(response.model, CODEX_DEFAULT_IMAGE_MODEL);
+        assert_eq!(response.bytes, b"png-bytes");
+        assert_eq!(response.media_type, "image/png");
+        assert_eq!(response.size.as_deref(), Some("1024x1024"));
+    }
+
+    #[test]
+    fn codex_image_edit_sends_reference_images_to_edits_endpoint() {
+        let request_body = Arc::new(Mutex::new(String::new()));
+        let server_body = Arc::clone(&request_body);
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            let mut stream = accept_expected(&listener, "accept image edit request");
+            let (request_line, body) = read_http_request_with_body(&mut stream);
+            server_paths.lock().expect("paths lock").push(request_line);
+            *server_body.lock().expect("body lock") = body;
+            write_json_response(&mut stream, "200 OK", &image_response_body());
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-image-edit");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        client
+            .generate_or_edit_image(&OpenAiImageRequest {
+                prompt: "add a red hat".to_string(),
+                referenced_images: vec!["data:image/png;base64,Zm9v".to_string()],
+                size: None,
+                quality: None,
+                background: Some("transparent".to_string()),
+            })
+            .expect("codex image edit succeeds");
+
+        server.join().expect("server thread");
+        let paths = paths.lock().expect("paths lock");
+        assert!(paths[0].starts_with("POST /images/edits "), "{paths:?}");
+        let payload = serde_json::from_str::<serde_json::Value>(
+            &request_body.lock().expect("body lock").clone(),
+        )
+        .expect("image payload is JSON");
+        assert_eq!(
+            payload["images"],
+            serde_json::json!([{ "image_url": "data:image/png;base64,Zm9v" }])
+        );
+        assert_eq!(payload["background"], "transparent");
+    }
+
+    #[test]
+    fn codex_image_request_refreshes_once_after_unauthorized_response() {
+        let paths = Arc::new(Mutex::new(Vec::new()));
+        let server_paths = Arc::clone(&paths);
+        let (base_url, server) = test_server(move |listener| {
+            for index in 0..3 {
+                let mut stream = accept_expected(&listener, "accept image request");
+                let request_line = read_http_request(&mut stream);
+                server_paths.lock().expect("paths lock").push(request_line);
+                match index {
+                    0 => write_json_response(&mut stream, "401 Unauthorized", "{}"),
+                    1 => write_json_response(
+                        &mut stream,
+                        "200 OK",
+                        "{\"access_token\":\"refreshed-access\",\"refresh_token\":\"refreshed-refresh\"}",
+                    ),
+                    _ => write_json_response(&mut stream, "200 OK", &image_response_body()),
+                }
+            }
+        });
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-image-unauthorized");
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
+
+        let response = client
+            .generate_or_edit_image(&OpenAiImageRequest {
+                prompt: "a red fox in a field".to_string(),
+                referenced_images: Vec::new(),
+                size: None,
+                quality: None,
+                background: None,
+            })
+            .expect("image request succeeds after refresh");
+
+        server.join().expect("server thread");
+        assert_eq!(response.bytes, b"png-bytes");
+        let paths = paths.lock().expect("paths lock");
+        assert!(
+            paths[0].starts_with("POST /images/generations "),
+            "{paths:?}"
+        );
+        assert!(paths[1].starts_with("POST /oauth/token "), "{paths:?}");
+        assert!(
+            paths[2].starts_with("POST /images/generations "),
+            "{paths:?}"
+        );
+    }
+
+    #[test]
+    fn codex_image_requests_are_rejected_before_reaching_the_backend_when_malformed() {
+        let dir = sinomo_testdir::TestDir::new("sinomo-codex-image-invalid");
+        let client = transport_client("http://127.0.0.1:1", UNTESTED_IDLE_WINDOW, &dir);
+
+        let empty_prompt = client
+            .generate_or_edit_image(&OpenAiImageRequest {
+                prompt: "   ".to_string(),
+                referenced_images: Vec::new(),
+                size: None,
+                quality: None,
+                background: None,
+            })
+            .expect_err("an empty prompt is rejected");
+        assert!(
+            empty_prompt.to_string().contains("must not be empty"),
+            "{empty_prompt}"
+        );
+
+        let too_many = client
+            .generate_or_edit_image(&OpenAiImageRequest {
+                prompt: "edit these".to_string(),
+                referenced_images: vec!["data:image/png;base64,Zm9v".to_string(); 6],
+                size: None,
+                quality: None,
+                background: None,
+            })
+            .expect_err("more than five reference images is rejected");
+        assert!(
+            too_many.to_string().contains("at most 5 reference images"),
+            "{too_many}"
+        );
+    }
+
+    #[test]
+    fn a_realtime_session_reuses_a_token_that_outlives_it_and_renews_one_that_does_not() {
+        fn access_token(expires_in_secs: i64) -> String {
+            let claims = serde_json::json!({ "exp": unix_timestamp() as i64 + expires_in_secs });
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).expect("claims"))
+            )
+        }
+
+        // Refreshing rotates the refresh token, so a token with hours left on it must be used as it
+        // stands rather than renewed out from under the requests sharing the same sign-in.
+        assert!(realtime_token_outlives_a_session(&access_token(6 * 3600)));
+        // A session outlives the request that opened it, so a token about to expire is renewed.
+        assert!(!realtime_token_outlives_a_session(&access_token(60)));
+        assert!(!realtime_token_outlives_a_session(&access_token(-60)));
+        // An unreadable credential is renewed rather than presented and refused.
+        assert!(!realtime_token_outlives_a_session(""));
+        assert!(!realtime_token_outlives_a_session("not-a-jwt"));
+    }
+
+    #[test]
+    fn codex_capabilities_cover_the_backend_surface_this_runtime_can_reach() {
+        let capabilities = crate::provider_capabilities(CODEX_PROVIDER_ID);
+        assert!(capabilities.responses_http);
+        assert!(capabilities.image_generation);
+        assert!(capabilities.image_editing);
+        assert!(capabilities.web_search);
+        // Realtime rides the OpenAI API rather than the Codex backend, so both of its transports
+        // are reachable with a ChatGPT sign-in.
+        assert!(capabilities.realtime_webrtc);
+        assert!(capabilities.realtime_websocket);
+        assert_eq!(
+            CodexProvider::openai_responses().info().capabilities,
+            capabilities
         );
     }
 
