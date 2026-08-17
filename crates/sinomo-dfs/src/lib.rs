@@ -117,7 +117,10 @@ pub use advisory_lock::{
 pub use body_rpc::{
     DfsAttachmentMessageCommand, DfsAttachmentMessageResponse, DfsRpcAttachmentDescriptor,
 };
-pub use cluster_service::{cluster_dfs_peer_node_ids, discovered_cluster_dfs_peer_node_ids};
+pub use cluster_service::{
+    cluster_dfs_peer_node_ids, discovered_cluster_dfs_peer_node_ids,
+    discovered_cluster_dfs_provider_node_ids,
+};
 pub(crate) use cluster_service::{
     open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
