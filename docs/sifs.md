@@ -78,6 +78,12 @@ sinomo dfs mount <mount-point> [--root <sifs-path>]
 Unix uses FUSE where supported. Windows uses the Cloud Files integration. Both
 adapters preserve the same SIFS namespace and policy model.
 
+The [Windows Cloud Files architecture](cloud-files-architecture.md) defines
+the provider's placeholder identities, hydration, durable local writeback,
+remote-feed reconciliation, registration ownership, and crash recovery. It is
+the normative adapter-specific document; this page owns the shared SIFS
+namespace and policy contract.
+
 Mounted SIFS adapters are reactive at rest. FUSE blocks in the kernel until a
 filesystem request or shutdown arrives. The Windows Cloud Files projection
 blocks on NTFS directory-change notifications, the daemon's DFS namespace

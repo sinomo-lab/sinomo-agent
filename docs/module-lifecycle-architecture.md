@@ -137,6 +137,13 @@ restart. Correctness must come from routing and state transitions, not from an
 assumption that `dlclose` or the platform equivalent always fully reclaims the
 module.
 
+Windows Cloud Files is a native-dylib module whose durable CFAPI registration
+can outlive one loaded artifact. Its host supervisor therefore pins the exact
+content-addressed provider that owns the registration and rejects loader drift
+instead of falling back to a different DLL. See the
+[Windows Cloud Files architecture](cloud-files-architecture.md) for that
+provider-selection and recovery contract.
+
 ### Network Modules
 
 Network transport modules are native dynamic libraries with an additional,

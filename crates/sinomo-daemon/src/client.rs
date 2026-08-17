@@ -44,6 +44,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 const DAEMON_RPC_SUCCESS_OBSERVATION_INTERVAL: Duration = Duration::from_secs(1);
 const DAEMON_RPC_SUCCESS_OBSERVATION_MAX_ENDPOINTS: usize = 256;
 const DAEMON_RPC_OBSERVATION_MAX_IN_FLIGHT: usize = 8;
+const DAEMON_BUILD_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DAEMON_BUILD_TRANSFER_OVERALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 static DAEMON_RPC_OBSERVATION_COORDINATOR: OnceLock<Arc<DaemonRpcObservationCoordinator>> =
     OnceLock::new();
 
@@ -2617,6 +2619,21 @@ fn main_daemon_build_target_rpc_options(
     )
 }
 
+fn daemon_build_transfer_timeouts() -> sinomo_core::network::DaemonRpcTimeouts {
+    // Build submission and artifact delivery are bounded bulk transfers. A
+    // routed WAN carrier may legitimately pause longer than the five-second
+    // interactive default while the remote service opens its cached artifact
+    // or applies backpressure. Retain the ordinary connect bound, allow a
+    // longer no-progress interval, and keep a finite whole-operation budget.
+    sinomo_core::network::DaemonRpcTimeouts::default()
+        .with_idle_timeout(Some(DAEMON_BUILD_TRANSFER_IDLE_TIMEOUT))
+}
+
+fn daemon_build_transfer_rpc_options() -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::network::ClusterObjectRpcOptions::new(daemon_build_transfer_timeouts())
+        .with_overall_timeout(DAEMON_BUILD_TRANSFER_OVERALL_TIMEOUT)
+}
+
 pub fn send_daemon_build_submit(
     address: &str,
     request: &BuildSubmitRequest,
@@ -2639,7 +2656,7 @@ pub fn send_daemon_build_submit(
                     &data_dir,
                     &address,
                     call,
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                    daemon_build_transfer_rpc_options(),
                 )
                 .await?
         } else {
@@ -2648,12 +2665,7 @@ pub fn send_daemon_build_submit(
             let mut client =
                 sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
             client
-                .call_endpoint(
-                    &state,
-                    &endpoint,
-                    call,
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
-                )
+                .call_endpoint(&state, &endpoint, call, daemon_build_transfer_rpc_options())
                 .await?
         };
         decode_build_submit_rpc_result(result).await
@@ -2722,9 +2734,7 @@ pub fn send_daemon_build_submit_to_target(
                 &state,
                 &target_node_id,
                 build_submit_rpc_call(&request, source_bundle.as_deref())?,
-                main_daemon_build_target_rpc_options(
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
-                ),
+                main_daemon_build_target_rpc_options(daemon_build_transfer_rpc_options()),
             )
             .await?;
         decode_build_submit_rpc_result(result).await
@@ -2786,7 +2796,7 @@ pub fn send_daemon_build_artifact(
                     &data_dir,
                     &address,
                     call,
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
+                    daemon_build_transfer_rpc_options(),
                 )
                 .await?
         } else {
@@ -2795,12 +2805,7 @@ pub fn send_daemon_build_artifact(
             let mut client =
                 sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
             client
-                .call_endpoint(
-                    &state,
-                    &endpoint,
-                    call,
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
-                )
+                .call_endpoint(&state, &endpoint, call, daemon_build_transfer_rpc_options())
                 .await?
         };
         receive_build_artifact_rpc_result(result, &request, &destination_path).await
@@ -2869,9 +2874,7 @@ pub fn send_daemon_build_artifact_to_target(
                 &state,
                 &target_node_id,
                 build_artifact_rpc_call(&request)?,
-                main_daemon_build_target_rpc_options(
-                    sinomo_core::network::ClusterObjectRpcOptions::default(),
-                ),
+                main_daemon_build_target_rpc_options(daemon_build_transfer_rpc_options()),
             )
             .await?;
         receive_build_artifact_rpc_result(result, &request, &destination_path).await
@@ -3886,6 +3889,29 @@ mod tests {
         assert_eq!(
             timeouts.idle_timeout,
             Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn build_transfers_allow_routed_wan_backpressure_with_a_finite_deadline() {
+        let timeouts = super::daemon_build_transfer_timeouts();
+        assert_eq!(
+            timeouts.connect_timeout,
+            Some(sinomo_core::network::DEFAULT_NETWORK_TIMEOUT)
+        );
+        assert_eq!(
+            timeouts.idle_timeout,
+            Some(super::DAEMON_BUILD_TRANSFER_IDLE_TIMEOUT)
+        );
+
+        let options = super::daemon_build_transfer_rpc_options();
+        assert_eq!(
+            options.overall_timeout(),
+            Some(super::DAEMON_BUILD_TRANSFER_OVERALL_TIMEOUT)
+        );
+        assert_eq!(
+            super::main_daemon_build_target_rpc_options(options).destination_process_affinity(),
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon
         );
     }
 

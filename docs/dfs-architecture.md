@@ -951,6 +951,35 @@ new filesystem consistency rules.
 
 See [SIFS](sifs.md) for the full layout and platform access behavior.
 
+## Windows Cloud Files Adapter
+
+Windows exposes a SIFS subtree as a supervised CFAPI sync root. The adapter is
+a durable NTFS projection, not another DFS metadata implementation: DFS remains
+authoritative, placeholder hydration is bound to an exact object version, and
+the local queue and reconciliation manifest are replay evidence rather than a
+second visible history.
+
+Local NTFS changes are copied into immutable staging and appended to a durable
+operation queue before canonical DFS publication. Ambiguous outcomes reconcile
+by stable operation identity before retry. Committed remote namespace changes
+persist intent before their local placeholder effect and advance their shard
+cursor only after that effect and the manifest are durable. Dirty local paths
+become conflicts instead of being overwritten.
+
+The provider pushes queued, uploading, retrying, conflict, and failure state
+into Windows-owned File Explorer item properties. Completed paths clear that
+custom property and return to the standard CFAPI in-sync badge. This projection
+is equality-cached and one-way; Explorer does not load Sinomo provider code or
+query DFS while rendering a folder.
+
+Registration, provider replacement, state-preserving disable, and cursor
+recovery are jointly owned by the daemon supervisor and the native provider.
+They use pinned module provenance, physical sync-root identity, deterministic
+successor files, and fail-closed phase classifiers. The detailed data paths,
+reactive-at-rest contract, recovery commit protocol, and Windows verification
+boundary are defined in the
+[Windows Cloud Files architecture](cloud-files-architecture.md).
+
 ## Security and Policy
 
 Every node enforces local authority for bytes it stores or serves. Current

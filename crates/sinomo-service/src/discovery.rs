@@ -113,6 +113,32 @@ pub fn service_instances_from_entries(
     Ok(records)
 }
 
+/// Keeps only service instances which advertise `capability`.
+///
+/// Capabilities in discovery records describe provider operations. They are
+/// routing metadata, not caller authorization grants; the selected route is
+/// still authorized normally by the destination node.
+pub fn service_instances_providing_capability(
+    instances: impl IntoIterator<Item = ServiceInstanceRecord>,
+    capability: &str,
+) -> Vec<ServiceInstanceRecord> {
+    let mut providers = instances
+        .into_iter()
+        .filter(|instance| {
+            instance
+                .capabilities
+                .iter()
+                .any(|provided| provided == capability)
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.service.cmp(&right.service))
+    });
+    providers
+}
+
 /// Reads the registered instances of `service` through a [`ClusterAccess`].
 pub fn discover_service_instances(
     cluster: &dyn ClusterAccess,
@@ -526,6 +552,37 @@ mod tests {
             capabilities: Vec::new(),
             updated_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn capability_filter_returns_only_provider_instances_in_stable_node_order() {
+        let first = node("node_capability_first");
+        let second = node("node_capability_second");
+        let unrelated = node("node_capability_unrelated");
+        let mut first_provider = instance("daemon", &first);
+        first_provider.capabilities = vec!["sifs.path.access".to_string()];
+        let mut second_provider = instance("dfs", &second);
+        second_provider.capabilities = vec![
+            "dfs.object.transfer".to_string(),
+            "sifs.path.access".to_string(),
+        ];
+
+        let providers = service_instances_providing_capability(
+            [
+                second_provider.clone(),
+                instance("daemon", &unrelated),
+                first_provider.clone(),
+            ],
+            "sifs.path.access",
+        );
+
+        let mut expected = vec![first_provider, second_provider];
+        expected.sort_by(|left, right| {
+            left.node_id
+                .cmp(&right.node_id)
+                .then_with(|| left.service.cmp(&right.service))
+        });
+        assert_eq!(providers, expected);
     }
 
     #[tokio::test]

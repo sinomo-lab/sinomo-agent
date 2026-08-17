@@ -108,10 +108,12 @@ const CLOUD_FILES_CURSOR_RECOVERY_MARKER_FILE: &str = "cursor-recovery-control.s
 const CLOUD_FILES_CURSOR_RECOVERY_MODULE_TEMP_LABEL: &str = "cursor-recovery-marker-next";
 const CLOUD_FILES_REGISTRATION_JOURNAL_MAX_BYTES: u64 = 1024 * 1024;
 const CLOUD_FILES_REGISTRATION_RECEIPT_MAX_BYTES: u64 = 64 * 1024;
-/// One Cloud Files DFS call must yield to cancellation promptly. Higher-level
-/// DFS operations may request longer deadlines, but this provider clamps each
-/// routed call and observes cancellation between bounded work items.
-const CLOUD_FILES_DFS_CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// One Cloud Files DFS call remains bounded so cancellation can make progress,
+/// but the bound must cover the daemon loopback hop plus a reused routed
+/// cluster stream and the authority's durable commit. Two seconds was shorter
+/// than a healthy routed namespace commit under load and converted successful
+/// stable operations into `PossiblyApplied` recovery cycles.
+const CLOUD_FILES_DFS_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOUD_FILES_DFS_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const CLOUD_FILES_DFS_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_TRANSFER_ALIGNMENT_BYTES: u64 = 4 * 1024;
@@ -3944,23 +3946,24 @@ fn mount_sifs_cloud_files_inner(
     ));
 
     let write_options = dfs::DfsWriteOptions::replicated_eventual(opened.replica_candidates);
-    let (mut writable_worker, writable_worker_cancelled) = windows_adapter::build_writable_worker(
-        writable_state,
-        Arc::clone(&shared_service),
-        write_options,
-        Arc::clone(&mounted_mutation_handoff),
-        Arc::clone(&writable_worker_wake),
-        windows_adapter::WindowsWritableWorkerOptions {
-            sync_root: request.sync_root.clone(),
-            root_path: request.root_path.clone(),
-            existing_owned_root,
-            expected_cursor_recovery_sync_root_file_id: cursor_recovery_marker
-                .as_ref()
-                .map(|marker| marker.sync_root_file_id),
-            prepopulate_depth: request.prepopulate_depth,
-            materialized_directories,
-        },
-    );
+    let (mut writable_worker, writable_worker_cancelled, explorer_status) =
+        windows_adapter::build_writable_worker(
+            writable_state,
+            Arc::clone(&shared_service),
+            write_options,
+            Arc::clone(&mounted_mutation_handoff),
+            Arc::clone(&writable_worker_wake),
+            windows_adapter::WindowsWritableWorkerOptions {
+                sync_root: request.sync_root.clone(),
+                root_path: request.root_path.clone(),
+                existing_owned_root,
+                expected_cursor_recovery_sync_root_file_id: cursor_recovery_marker
+                    .as_ref()
+                    .map(|marker| marker.sync_root_file_id),
+                prepopulate_depth: request.prepopulate_depth,
+                materialized_directories,
+            },
+        );
     let connect_provider = || {
         let callback_table = callback_table();
         let sync_root_wide = wide_path(&request.sync_root);
@@ -4000,6 +4003,7 @@ fn mount_sifs_cloud_files_inner(
         }
         return Err(activation.fail(error, lifecycle));
     }
+    crate::windows_shell::observe_explorer_state(&explorer_status, writable_worker.state());
     lifecycle.local_change_sync = writable_worker.state().status();
     lifecycle.placeholders_created = writable_worker.state().reconciler().manifest().len() as u64;
     let placeholders_created = lifecycle.placeholders_created;
@@ -4027,6 +4031,7 @@ fn mount_sifs_cloud_files_inner(
         writable_worker_wake,
         emitter,
         1,
+        explorer_status,
     ) {
         Ok(worker) => worker,
         Err(error) => {
@@ -4251,6 +4256,12 @@ fn mount_sifs_cloud_files_inner(
         generation
     };
     activation.disarm();
+    match crate::windows_shell::configure_sync_root_status_schema(&request.sync_root) {
+        Ok(()) => writable_worker.enable_explorer_status(),
+        Err(error) => host_log(&format!(
+            "Cloud Files Explorer custom status is unavailable: {error}"
+        )),
+    }
     host_log(&format!(
         "Cloud Files registration became ready after worker progress generation {first_progress_generation}"
     ));

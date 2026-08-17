@@ -5674,6 +5674,19 @@ pub(crate) fn handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
                 // proof; a corrupt or unavailable durability root fails closed.
                 let status = store.status()?;
                 if status.pending_marker_count > 0 || status.requires_full_recovery() {
+                    // A marker can become recoverable solely because the
+                    // adapter process released its session/operation locks.
+                    // That transition has no in-process producer to wake the
+                    // reactive maintenance scheduler. The next mount probe is
+                    // therefore the causal edge which requests recovery. Do
+                    // not wake for live/deferred markers: their bounded
+                    // re-probe deadline remains the owner of that wait.
+                    if status.exact_recovery_marker_count > 0
+                        || status.full_recovery_marker_count > 0
+                        || status.malformed_marker_count > 0
+                    {
+                        notify_daemon_dfs_maintenance_work();
+                    }
                     return Err(daemon_dfs_mounted_mutation_protocol_error(format!(
                         "mounted-mutation handoff is not ready: pending={}, live={}, exact_recovery={}, full_recovery={}, unproven={}, malformed={}, overflow={}, directory_scan_overflow={}",
                         status.pending_marker_count,
@@ -6356,7 +6369,8 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
     runtime: &tokio::runtime::Handle,
     metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
 ) -> Result<DaemonDfsMaintenanceServiceLane, sinomo_dfs::DfsError> {
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(cluster_state);
+    let peer_node_ids =
+        sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, cluster_state)?;
     let metadata_authority_generation = match metadata_authority_preflight {
         Some(preflight)
             if preflight.authority.generation() == preflight.generation
@@ -7327,17 +7341,23 @@ fn daemon_dfs_perf_trace_with_traceparent(
 fn read_daemon_dfs_message_peer_snapshot(
     cluster_paths: &ClusterPaths,
 ) -> Result<Option<DaemonDfsMessagePeerSnapshot>, sinomo_dfs::DfsError> {
-    if !cluster_paths.state.exists() {
-        return Ok(None);
-    }
     // The cluster state is immutable for the duration of this request. Reuse
     // the cluster-owned resident snapshot instead of reopening and decoding
     // state.sobj for every routed DFS message. In-process writers invalidate
     // this cache immediately, while external replacements are fenced by the
-    // existing short file-generation validation lease.
-    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)
-        .map_err(daemon_dfs_network_error)?;
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
+    // existing short file-generation validation lease. Do not probe `exists`
+    // first: on Windows, a concurrent durable ReplaceFileW publication can
+    // make that independent namespace query briefly report the destination as
+    // absent even though the resident snapshot remains valid for the lease.
+    // The cache reader owns the absent-state decision and still reports a true
+    // orphan once no current or leased snapshot exists.
+    let state =
+        match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths) {
+            Ok(state) => state,
+            Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
+            Err(error) => return Err(daemon_dfs_network_error(error)),
+        };
+    let peer_node_ids = sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     Ok(Some(DaemonDfsMessagePeerSnapshot {
         cluster_id: state.cluster_id.clone(),
         local_node_id: state.local_node_id.clone(),
@@ -7647,7 +7667,8 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
         .recovery_scan_generation
         .load(Ordering::Acquire)
         != authority_generation;
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&cluster_state);
+    let peer_node_ids =
+        sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &cluster_state)?;
     let open_recovery_service = || {
         let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
         let (peer_transport, async_peer_transport) =
@@ -12583,6 +12604,38 @@ mod tests {
     }
 
     #[test]
+    fn daemon_dfs_peer_snapshot_retains_the_leased_state_during_replacement() {
+        let root = temp_root("daemon-dfs-peer-snapshot-replacement");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_daemon_dfs_peer_snapshot_replacement")
+                .expect("cluster id"),
+            "daemon DFS peer snapshot replacement",
+            NodeId::from_legacy_named("node_daemon_dfs_peer_snapshot_replacement")
+                .expect("node id"),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+
+        let first = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read initial peer snapshot")
+            .expect("initial peer snapshot");
+        fs::remove_file(&cluster_paths.state).expect("simulate replacement namespace cut");
+        let leased = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read leased peer snapshot")
+            .expect("leased peer snapshot must survive the replacement cut");
+
+        assert_eq!(leased.cluster_id, first.cluster_id);
+        assert_eq!(leased.local_node_id, first.local_node_id);
+        assert_eq!(leased.peer_node_ids, first.peer_node_ids);
+    }
+
+    #[test]
     fn reactive_namespace_events_require_a_committed_visible_mutation() {
         let source = NodeId::from_legacy_named("node_reactive_event_source").expect("source");
         let target = NodeId::from_legacy_named("node_reactive_event_target").expect("target");
@@ -13257,6 +13310,21 @@ mod tests {
             .expect("dead-session classifier");
         assert_eq!(dead.mounted_mutation_recoverable_full_count, 1);
         assert!(dead.should_trigger_background_maintenance());
+        let wake_count = daemon_dfs_maintenance_wake_count();
+        assert!(
+            handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
+                &paths,
+                runtime.handle(),
+                None,
+                crate::DaemonDfsMountedMutationHandoffRequest::Probe,
+            )
+            .is_err(),
+            "a recoverable marker still gates the replacement mount"
+        );
+        assert!(
+            daemon_dfs_maintenance_wake_count() > wake_count,
+            "the readiness probe must wake reactive recovery after the mount locks disappear"
+        );
         let claim = store
             .try_claim_recovery(&marker_id)
             .expect("dead-session claim")

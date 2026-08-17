@@ -2150,7 +2150,8 @@ fn dfs_reachability_findings(
         .filter(|row| row.availability == ClusterNodeAvailability::Online)
         .map(|row| row.member.node_id.clone())
         .collect::<BTreeSet<_>>();
-    dfs.nodes
+    let mut findings = dfs
+        .nodes
         .iter()
         .filter_map(|node| {
             let error = node.error.as_deref()?;
@@ -2165,7 +2166,16 @@ fn dfs_reachability_findings(
                     ),
                 })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if dfs.nodes.is_empty() && !online.is_empty() {
+        findings.push(ClusterDoctorFinding {
+            severity: "warning".to_string(),
+            code: "dfs-provider-unavailable".to_string(),
+            detail: "no online cluster service instance advertises a DFS provider capability"
+                .to_string(),
+        });
+    }
+    findings
 }
 
 fn cluster_doctor_summary_label(findings: &[ClusterDoctorFinding]) -> &'static str {
@@ -3695,6 +3705,37 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].code, "dfs-route-unavailable");
         assert!(findings[0].detail.contains("no healthy route"));
+    }
+
+    #[test]
+    fn cluster_doctor_warns_when_no_dfs_provider_is_discovered() {
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_cli_no_dfs_provider").expect("cluster id");
+        let node_id = NodeId::from_legacy_named("node_cli_no_dfs_provider").expect("node id");
+        let state = ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "cli no DFS provider",
+            node_id,
+            "online",
+            "public-key",
+            now,
+        );
+        let member = state.members[0].clone();
+        let mut status = cluster::unknown_cluster_node_status(&state, &member, now);
+        status.availability = ClusterNodeAvailability::Online;
+        let health = vec![ClusterHealthRow {
+            member,
+            status,
+            availability: ClusterNodeAvailability::Online,
+            live_probe_observed: true,
+        }];
+
+        let findings =
+            dfs_reachability_findings(&health, &DfsClusterStatusReport { nodes: Vec::new() });
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "dfs-provider-unavailable");
     }
 
     #[test]

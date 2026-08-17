@@ -106,7 +106,8 @@ use crate::backend::Backend;
 #[cfg(not(test))]
 use crate::backend::chat_engine::ChatRealtimeHandoff;
 use crate::backend::chat_engine::{
-    ChatCommand, ChatEvent, ChatEventWake, ChatHandle, ChatRole, RuntimeInfo,
+    ChatCommand, ChatEvent, ChatEventWake, ChatFilesystemProvider, ChatHandle, ChatRole,
+    RuntimeInfo,
 };
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::native_picker::{
@@ -2424,9 +2425,18 @@ impl ChatState {
             Err(error) if daemon_connected => (None, Some(error)),
             Err(_) => (None, None),
         };
-        let sifs_storage = daemon_address
-            .as_deref()
-            .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
+        let filesystem_provider = match daemon_address.as_deref() {
+            Some(address) => ChatFilesystemProvider::Cluster(AgentChatSifsStorage::new(
+                (*backend.data_dir).clone(),
+                address,
+                backend.app_runtime.handle(),
+            )),
+            None if daemon_connected => ChatFilesystemProvider::Unavailable(
+                "connected chat cannot resolve a filesystem provider without a daemon address"
+                    .to_string(),
+            ),
+            None => ChatFilesystemProvider::LocalSifs,
+        };
         let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
@@ -2435,7 +2445,7 @@ impl ChatState {
             (*backend.data_dir).clone(),
             daemon_connected,
             backend.agent_runtime_control.clone(),
-            sifs_storage,
+            filesystem_provider,
             event_wake,
         );
 
@@ -2624,18 +2634,28 @@ impl ChatState {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let tool_runtime = self.tool_runtime.clone();
-        let sifs_storage = daemon_address
-            .as_deref()
-            .map(|address| AgentChatSifsStorage::new(address, backend.app_runtime.handle()));
+        let daemon_connected = backend.connection.is_daemon();
+        let filesystem_provider = match daemon_address.as_deref() {
+            Some(address) => ChatFilesystemProvider::Cluster(AgentChatSifsStorage::new(
+                (*backend.data_dir).clone(),
+                address,
+                backend.app_runtime.handle(),
+            )),
+            None if daemon_connected => ChatFilesystemProvider::Unavailable(
+                "connected chat cannot resolve a filesystem provider without a daemon address"
+                    .to_string(),
+            ),
+            None => ChatFilesystemProvider::LocalSifs,
+        };
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
         let handle = ChatHandle::spawn(
             (*backend.data_dir).clone(),
-            backend.connection.is_daemon(),
+            daemon_connected,
             backend.agent_runtime_control.clone(),
-            sifs_storage,
+            filesystem_provider,
             event_wake,
         );
 

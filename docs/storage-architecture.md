@@ -107,6 +107,18 @@ Temporary workspaces are recoverable or safely disposable after a worker
 failure; durable job state and published artifacts remain independently
 inspectable.
 
+Windows Cloud Files state is split deliberately between the SIFS mount
+supervisor and the native provider. The supervisor owns mount consent, the
+process-wide lease, staged registration and pending unregister records, the
+pinned provider bundle, and host recovery authority. The provider owns its
+registration journal and receipt, local mutation queue and immutable blobs,
+namespace manifest and cursors, and native recovery authority. These are
+registered owner paths, not user-editable configuration. Their exact
+cross-owner lifecycle is defined in the
+[Windows Cloud Files architecture](cloud-files-architecture.md); unknown or
+apparently stale files are evidence to inspect, never cleanup candidates for a
+generic storage walker.
+
 ## Verification
 
 Verification can check an explicit set of paths or walk a data directory. A

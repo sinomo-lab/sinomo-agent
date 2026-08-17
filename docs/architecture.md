@@ -191,9 +191,16 @@ ephemeral-local are reserved modes tracked in the
 to an object or subtree, so sensitive local files and shared artifacts can use
 the same namespace without using the same placement rules.
 
-Every clustered main daemon runs the default SIFS bootstrap, placement
-reconciliation, metadata replication, and repair lifecycle. These are mandatory
-runtime responsibilities, not deployment or environment-controlled features.
+DFS is a built-in filesystem-provider module which is enabled by default but
+may be disabled on an individual node. Only nodes with an active DFS module
+publish its service routes and run SIFS bootstrap, placement reconciliation,
+metadata replication, and repair. Filesystem consumers discover providers by
+capability and select a node; once capability records exist, cluster membership
+alone does not make a node a DFS storage target. The destination still
+re-authorizes every selected route. The node-local toggle is
+`sinomo module native-rust disable module.dfs` (or `enable`); Settings → Modules
+exposes the same enable/disable override for a selected node. A change is
+applied when that node's daemon next constructs its active registry.
 
 The cluster KV stores compact filesystem configuration and shard placement.
 DFS metadata shards own paths, versions, intents, receipts, namespace
@@ -206,7 +213,9 @@ bounded, operation-specific permit and head watermark for the exact assignment
 and epoch. This deliberately reuses the cluster's existing Raft consensus to
 fence failover; it does not put DFS metadata or content in KV.
 
-See [DFS architecture](dfs-architecture.md) and the [SIFS layout](sifs.md).
+See [DFS architecture](dfs-architecture.md), the [SIFS layout](sifs.md), and
+the [Windows Cloud Files architecture](cloud-files-architecture.md) for the
+durable NTFS projection, writeback, and recovery boundary.
 
 ### Build and Artifact Distribution
 

@@ -497,10 +497,21 @@ fn run_routed_status(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             "cannot read live cluster membership before DFS routed status: {error}"
         ))
     })?;
+    let provider_node_ids = dfs::discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
+        .map_err(|error| {
+            SinomoTestError::failed(format!(
+                "cannot discover DFS providers before routed status: {error}"
+            ))
+        })?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let targets = filter_dfs_routed_status_targets(
         ctx,
         &state,
-        super::test::live_online_remote_main_test_targets(&data_dir, &state)?,
+        super::test::live_online_remote_main_test_targets(&data_dir, &state)?
+            .into_iter()
+            .filter(|node_id| provider_node_ids.contains(node_id))
+            .collect(),
     )?;
     let unavailable_repair_targets =
         dfs_unavailable_repair_targets_from_state(&cluster_paths, &state);

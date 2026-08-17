@@ -1408,6 +1408,11 @@ pub trait CloudFilesWritableMutationAdapter: CloudFilesDfsMutationAdapter {
 pub trait CloudFilesStableMutationBackend {
     fn ensure_contracts_ready(&self) -> Result<(), String>;
 
+    /// Reactive, non-authoritative notification emitted after the queue owns
+    /// durable InFlight state and immediately before the remote mutation.
+    /// Implementations must never make mutation success depend on decoration.
+    fn operation_started(&mut self, _command: &CloudFilesDfsMutationCommand) {}
+
     fn create_file(
         &mut self,
         command: &CloudFilesDfsMutationCommand,
@@ -1469,6 +1474,7 @@ pub struct CloudFilesDfsServiceMutationBackend<T> {
     write_options: dfs::DfsWriteOptions,
     cancelled: Arc<AtomicBool>,
     handoff: Arc<CloudFilesMountedMutationHandoff>,
+    operation_started: Arc<dyn Fn(&CloudFilesDfsMutationCommand) + Send + Sync>,
 }
 
 impl<T> CloudFilesDfsServiceMutationBackend<T> {
@@ -1478,12 +1484,14 @@ impl<T> CloudFilesDfsServiceMutationBackend<T> {
         write_options: dfs::DfsWriteOptions,
         cancelled: Arc<AtomicBool>,
         handoff: Arc<CloudFilesMountedMutationHandoff>,
+        operation_started: Arc<dyn Fn(&CloudFilesDfsMutationCommand) + Send + Sync>,
     ) -> Self {
         Self {
             service,
             write_options,
             cancelled,
             handoff,
+            operation_started,
         }
     }
 
@@ -1515,6 +1523,44 @@ impl<R: Read> Read for CancellationReader<R> {
     }
 }
 
+fn definitive_namespace_conflict(error: &dfs::DfsPosixError) -> Option<CloudFilesConflictEvidence> {
+    let code = match error {
+        dfs::DfsPosixError::NotFound { .. } => "namespace-not-found",
+        dfs::DfsPosixError::AlreadyExists { .. } => "namespace-already-exists",
+        dfs::DfsPosixError::NotDirectory { .. } => "namespace-not-directory",
+        dfs::DfsPosixError::IsDirectory { .. } => "namespace-is-directory",
+        dfs::DfsPosixError::NotSymlink { .. } => "namespace-not-symlink",
+        dfs::DfsPosixError::MissingParent { .. } => "namespace-missing-parent",
+        dfs::DfsPosixError::InvalidPath { .. } => "namespace-invalid-path",
+        dfs::DfsPosixError::Conflict { .. } => "namespace-generation-conflict",
+        dfs::DfsPosixError::DirectoryNotEmpty { .. } => "namespace-directory-not-empty",
+        dfs::DfsPosixError::Dfs(_)
+        | dfs::DfsPosixError::Metadata(_)
+        | dfs::DfsPosixError::PendingWrite { .. }
+        | dfs::DfsPosixError::SymlinkContentPending { .. }
+        | dfs::DfsPosixError::PartialBulkCommit { .. } => return None,
+    };
+    Some(conflict_evidence(code, error.to_string()))
+}
+
+fn classify_definitive_namespace_mutation_report<R>(
+    report: dfs::MountedSifsMutationReport<Result<R, dfs::DfsPosixError>>,
+) -> dfs::MountedSifsMutationReport<Result<Result<R, CloudFilesConflictEvidence>, dfs::DfsPosixError>>
+{
+    let outcome = match report.outcome {
+        Ok(value) => Ok(Ok(value)),
+        Err(error) => match definitive_namespace_conflict(&error) {
+            Some(conflict) => Ok(Err(conflict)),
+            None => Err(error),
+        },
+    };
+    dfs::MountedSifsMutationReport {
+        outcome,
+        committed_work: report.committed_work,
+        committed_repair_records: report.committed_repair_records,
+    }
+}
+
 impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
     for CloudFilesDfsServiceMutationBackend<T>
 {
@@ -1527,6 +1573,10 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
             );
         }
         Ok(())
+    }
+
+    fn operation_started(&mut self, command: &CloudFilesDfsMutationCommand) {
+        (self.operation_started)(command);
     }
 
     fn create_file(
@@ -1561,20 +1611,27 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         &mut self,
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service
-                        .posix_mkdir_with_operation_id(&command.source_path, &command.operation_id)
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_mkdir_with_operation_id(
+                            &command.source_path,
+                            &command.operation_id,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn replace_file(
@@ -1620,23 +1677,28 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_unlink_if_generation(
-                        &command.source_path,
-                        command.operation_id.clone(),
-                        expected,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_unlink_if_generation(
+                            &command.source_path,
+                            command.operation_id.clone(),
+                            expected,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn rmdir(
@@ -1644,23 +1706,28 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         let expected = namespace_object_precondition(required_source_precondition(command)?)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_rmdir_if_generation(
-                        &command.source_path,
-                        command.operation_id.clone(),
-                        expected,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_rmdir_if_generation(
+                            &command.source_path,
+                            command.operation_id.clone(),
+                            expected,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn rename(
@@ -1673,25 +1740,30 @@ impl<T: dfs::DfsMessageTransport> CloudFilesStableMutationBackend
             .ok_or_else(|| "rename command has no destination path".to_string())?;
         let source = namespace_object_precondition(required_source_precondition(command)?)?;
         let destination = namespace_destination_precondition(&command.preconditions.destination)?;
-        let stat = self.handoff.run_captured_mutation(
+        let result = self.handoff.run_captured_mutation(
             &self.service,
             &command.operation_id,
             cloud_files_mounted_mutation_label(&command.kind),
             |service| {
-                service.capture_mounted_mutation(|service| {
-                    service.posix_rename_if_generation(
-                        &command.source_path,
-                        destination_path,
-                        command.operation_id.clone(),
-                        source,
-                        destination,
-                    )
-                })
+                classify_definitive_namespace_mutation_report(service.capture_mounted_mutation(
+                    |service| {
+                        service.posix_rename_if_generation(
+                            &command.source_path,
+                            destination_path,
+                            command.operation_id.clone(),
+                            source,
+                            destination,
+                        )
+                    },
+                ))
             },
         )?;
-        Ok(CloudFilesDfsMutationOutcome::Applied(
-            mutation_evidence_from_stat(command, stat),
-        ))
+        Ok(match result {
+            Ok(stat) => {
+                CloudFilesDfsMutationOutcome::Applied(mutation_evidence_from_stat(command, stat))
+            }
+            Err(conflict) => CloudFilesDfsMutationOutcome::Conflict(conflict),
+        })
     }
 
     fn reconcile(
@@ -2059,6 +2131,7 @@ impl<B: CloudFilesStableMutationBackend> CloudFilesDfsMutationAdapter
         command: &CloudFilesDfsMutationCommand,
     ) -> Result<CloudFilesDfsMutationOutcome, String> {
         validate_mutation_command(command)?;
+        self.backend.operation_started(command);
         match command.kind {
             CloudFilesLocalOperationKind::CreateFile => self.backend.create_file(command),
             CloudFilesLocalOperationKind::CreateDirectory => self.backend.create_directory(command),
@@ -2153,6 +2226,32 @@ pub struct CloudFilesWritableSyncState {
     cursor_recovery_test_bypass: bool,
     ready: bool,
     last_error: Option<CloudFilesModuleError>,
+}
+
+/// Provider-specific state projected into File Explorer. Hydration and the
+/// final in-sync state remain owned by CFAPI; these values only explain local
+/// writeback work which the standard availability badge cannot distinguish.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum CloudFilesExplorerItemStatus {
+    WaitingToUpload,
+    Uploading,
+    Retrying,
+    Conflict,
+    Failed,
+}
+
+fn insert_explorer_item_status(
+    statuses: &mut BTreeMap<String, CloudFilesExplorerItemStatus>,
+    path: String,
+    status: CloudFilesExplorerItemStatus,
+) {
+    if path.is_empty() {
+        return;
+    }
+    statuses
+        .entry(path)
+        .and_modify(|current| *current = (*current).max(status))
+        .or_insert(status);
 }
 
 fn authorized_cursor_recovery_suppressions(
@@ -2494,6 +2593,69 @@ impl CloudFilesWritableSyncState {
             )
         };
         status.with_attention(attention, total_attention)
+    }
+
+    /// Return one bounded, current status per affected path. This is a pure
+    /// projection over already-open durable state: callers must not poll it or
+    /// perform DFS work from an Explorer query path.
+    pub(crate) fn explorer_item_statuses(&self) -> BTreeMap<String, CloudFilesExplorerItemStatus> {
+        let mut statuses = BTreeMap::new();
+        for operation in self.queue.operations() {
+            let status = match operation.status {
+                CloudFilesLocalOperationStatus::Queued => {
+                    CloudFilesExplorerItemStatus::WaitingToUpload
+                }
+                CloudFilesLocalOperationStatus::InFlight
+                | CloudFilesLocalOperationStatus::RemoteApplied => {
+                    CloudFilesExplorerItemStatus::Uploading
+                }
+                CloudFilesLocalOperationStatus::Retrying => CloudFilesExplorerItemStatus::Retrying,
+                CloudFilesLocalOperationStatus::Conflict => CloudFilesExplorerItemStatus::Conflict,
+                CloudFilesLocalOperationStatus::Failed => CloudFilesExplorerItemStatus::Failed,
+                CloudFilesLocalOperationStatus::Completed
+                | CloudFilesLocalOperationStatus::Superseded => continue,
+            };
+            let path = match operation.request.kind {
+                CloudFilesLocalOperationKind::DeleteFile
+                | CloudFilesLocalOperationKind::DeleteDirectory => {
+                    sifs_parent_path(&operation.request.source_path)
+                }
+                CloudFilesLocalOperationKind::Rename => Some(
+                    operation
+                        .request
+                        .destination_path
+                        .clone()
+                        .unwrap_or_else(|| operation.request.source_path.clone()),
+                ),
+                _ => Some(operation.request.source_path.clone()),
+            };
+            if let Some(path) = path {
+                insert_explorer_item_status(&mut statuses, path, status);
+            }
+        }
+        for conflict in self.reconciler.conflicts().values() {
+            let (path, _) = namespace_conflict_summary(conflict);
+            insert_explorer_item_status(
+                &mut statuses,
+                path,
+                CloudFilesExplorerItemStatus::Conflict,
+            );
+        }
+        for conflict in self.reconciler.startup_conflicts().values() {
+            insert_explorer_item_status(
+                &mut statuses,
+                conflict.path.clone(),
+                CloudFilesExplorerItemStatus::Conflict,
+            );
+        }
+        if self.last_error.is_some() {
+            insert_explorer_item_status(
+                &mut statuses,
+                self.root.clone(),
+                CloudFilesExplorerItemStatus::Failed,
+            );
+        }
+        statuses
     }
 
     fn attention_summaries(&self) -> (Vec<CloudFilesSyncAttentionSummary>, u64) {
@@ -5884,7 +6046,7 @@ mod tests {
     }
 
     #[test]
-    fn every_service_error_is_unknown_and_requires_full_recovery() {
+    fn unclassified_service_error_is_unknown_and_requires_full_recovery() {
         let root = TestRoot::new("handoff-service-error");
         let service = Arc::new(Mutex::new(0_u64));
         let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
@@ -5922,6 +6084,43 @@ mod tests {
             .ensure_ready()
             .expect_err("service error leaves the original ambiguity gated");
         assert!(gated.contains("service returned conflict"), "{gated}");
+    }
+
+    #[test]
+    fn definitive_namespace_conflict_commits_capture_without_gating_handoff() {
+        let root = TestRoot::new("handoff-definitive-namespace-conflict");
+        let service = Arc::new(Mutex::new(()));
+        let (handoff, store, events) = fake_handoff(&root, FakeCommitBehavior::Accept, None);
+        let outcome = handoff
+            .run_captured_mutation(
+                &service,
+                "cloud-operation-directory-not-empty",
+                "cloud-files.rmdir",
+                |_| {
+                    classify_definitive_namespace_mutation_report(empty_mutation_report(
+                        Err::<(), _>(dfs::DfsPosixError::DirectoryNotEmpty {
+                            path: "/services/non-empty".to_string(),
+                        }),
+                    ))
+                },
+            )
+            .expect("typed namespace conflict has a definitive handoff outcome")
+            .expect_err("directory-not-empty remains a user-visible conflict");
+        assert_eq!(outcome.code, "namespace-directory-not-empty");
+        assert!(outcome.detail.contains("directory is not empty"));
+        assert_eq!(
+            &*events.lock().expect("events"),
+            &["probe", "arm", "commit-applied"]
+        );
+        assert!(
+            store
+                .pending_marker_ids()
+                .expect("pending marker IDs")
+                .is_empty()
+        );
+        handoff
+            .ensure_ready()
+            .expect("definitive conflict leaves later mutations admitted");
     }
 
     #[test]
@@ -6131,6 +6330,7 @@ mod tests {
 
     struct FakeBackend {
         readiness_error: Option<String>,
+        started_calls: usize,
         calls: Vec<CloudFilesLocalOperationKind>,
         call_count: Arc<AtomicUsize>,
         reconcile_calls: usize,
@@ -6142,6 +6342,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 readiness_error: None,
+                started_calls: 0,
                 calls: Vec::new(),
                 call_count: Arc::new(AtomicUsize::new(0)),
                 reconcile_calls: 0,
@@ -6169,6 +6370,10 @@ mod tests {
     impl CloudFilesStableMutationBackend for FakeBackend {
         fn ensure_contracts_ready(&self) -> Result<(), String> {
             self.readiness_error.clone().map_or(Ok(()), Err)
+        }
+
+        fn operation_started(&mut self, _command: &CloudFilesDfsMutationCommand) {
+            self.started_calls += 1;
         }
 
         fn create_file(
@@ -7236,6 +7441,7 @@ mod tests {
             ));
         }
         assert_eq!(adapter.backend().calls, kinds);
+        assert_eq!(adapter.backend().started_calls, kinds.len());
 
         let valid = command(CloudFilesLocalOperationKind::CreateFile);
         assert!(matches!(
@@ -7248,6 +7454,7 @@ mod tests {
         invalid.staged_content = None;
         assert!(adapter.apply(&invalid).is_err());
         assert_eq!(adapter.backend().calls.len(), kinds.len());
+        assert_eq!(adapter.backend().started_calls, kinds.len());
     }
 
     #[test]
@@ -8493,5 +8700,61 @@ mod tests {
         assert_eq!(status.pending_operations, 1);
         assert_eq!(status.retrying_operations, 0);
         assert_eq!(status.conflict_count, 0);
+
+        assert_eq!(
+            state.explorer_item_statuses().get("/services/new.txt"),
+            Some(&CloudFilesExplorerItemStatus::WaitingToUpload)
+        );
+        state
+            .queue
+            .mark_in_flight(&operation.request.operation_id)
+            .expect("mark uploading");
+        assert_eq!(
+            state.explorer_item_statuses().get("/services/new.txt"),
+            Some(&CloudFilesExplorerItemStatus::Uploading)
+        );
+        state
+            .queue
+            .mark_retrying(&operation.request.operation_id, "network unavailable")
+            .expect("mark retrying");
+        assert_eq!(
+            state.explorer_item_statuses().get("/services/new.txt"),
+            Some(&CloudFilesExplorerItemStatus::Retrying)
+        );
+        state
+            .queue
+            .mark_conflict(
+                &operation.request.operation_id,
+                CloudFilesConflictEvidence {
+                    code: "version-changed".to_string(),
+                    detail: "remote object advanced".to_string(),
+                    observed_object_id: Some("01object".to_string()),
+                    observed_version: Some("01version".to_string()),
+                    observed_content_hash: Some("blake3:changed".to_string()),
+                },
+            )
+            .expect("mark conflict");
+        assert_eq!(
+            state.explorer_item_statuses().get("/services/new.txt"),
+            Some(&CloudFilesExplorerItemStatus::Conflict)
+        );
+        state
+            .queue
+            .mark_failed(&operation.request.operation_id, "operator action required")
+            .expect("mark failed");
+        assert_eq!(
+            state.explorer_item_statuses().get("/services/new.txt"),
+            Some(&CloudFilesExplorerItemStatus::Failed)
+        );
+        state
+            .queue
+            .mark_completed(&operation.request.operation_id)
+            .expect("mark completed");
+        assert!(
+            !state
+                .explorer_item_statuses()
+                .contains_key("/services/new.txt"),
+            "a completed operation returns to Windows' standard in-sync state"
+        );
     }
 }

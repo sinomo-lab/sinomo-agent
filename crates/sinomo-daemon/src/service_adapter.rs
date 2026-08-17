@@ -2756,6 +2756,220 @@ enum NetworkModuleServiceResponse {
     SetEnabled(NetworkModuleSetEnabledResponse),
 }
 
+const NATIVE_RUST_MODULES_RPC_ROUTES: &[&str] = &[
+    sinomo_module::MODULE_NATIVE_RUST_LIST_ROUTE,
+    sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE,
+];
+
+fn native_rust_module_service_route(route: &'static str) -> ServiceRoute {
+    let capability = if route == sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE {
+        sinomo_core::node::MODULE_NATIVE_RUST_ADMIN_CAPABILITY
+    } else {
+        sinomo_core::node::MODULE_NATIVE_RUST_READ_CAPABILITY
+    };
+    let route = ServiceRoute::from_route_metadata(
+        route,
+        sinomo_module::MODULE_NATIVE_RUST_RPC_CATEGORY,
+        "cluster-member",
+        [capability],
+    );
+    if route.route == sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE {
+        route.require_local_permission("remote-management")
+    } else {
+        route
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeRustModuleTarget {
+    legacy_id: &'static str,
+    active: bool,
+    default_enabled: bool,
+    detail: &'static str,
+}
+
+struct NativeRustModulesService {
+    paths: DaemonPaths,
+    dfs_active: bool,
+    observe_active: bool,
+}
+
+impl NativeRustModulesService {
+    fn new(paths: DaemonPaths) -> Self {
+        let dfs_active = dfs_module_should_register(&paths);
+        let observe_active = observe_module_should_register(&paths);
+        Self {
+            paths,
+            dfs_active,
+            observe_active,
+        }
+    }
+
+    fn targets(&self) -> [NativeRustModuleTarget; 2] {
+        [
+            NativeRustModuleTarget {
+                legacy_id: sinomo_dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                active: self.dfs_active,
+                default_enabled: true,
+                detail: "distributed filesystem provider module",
+            },
+            NativeRustModuleTarget {
+                legacy_id: sinomo_observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+                active: self.observe_active,
+                default_enabled: true,
+                detail: "operational observation module",
+            },
+        ]
+    }
+}
+
+impl Service for NativeRustModulesService {
+    fn name(&self) -> &'static str {
+        "native-rust-modules"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        NATIVE_RUST_MODULES_RPC_ROUTES
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        self.routes()
+            .iter()
+            .copied()
+            .map(native_rust_module_service_route)
+            .collect()
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        let targets = self.targets();
+        Box::pin(async move {
+            match request.route.as_str() {
+                sinomo_module::MODULE_NATIVE_RUST_LIST_ROUTE => {
+                    let _: sinomo_module::NativeRustModuleListRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let response = run_blocking_service_task(
+                        request.route.clone(),
+                        "native Rust module list",
+                        move || native_rust_module_list_response(&paths, &targets),
+                    )
+                    .await?;
+                    ctx.respond_value(sinomo_module::MODULE_NATIVE_RUST_LIST_ROUTE, response)?;
+                }
+                sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE => {
+                    let payload: sinomo_module::NativeRustModuleSetEnabledRequest =
+                        ctx.decode_request_body(&request).await?;
+                    let response = run_blocking_service_task(
+                        request.route.clone(),
+                        "native Rust module enablement",
+                        move || native_rust_module_set_enabled(&paths, &targets, payload),
+                    )
+                    .await?;
+                    ctx.respond_value(
+                        sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE,
+                        response,
+                    )?;
+                }
+                other => return Err(ServiceError::UnknownRoute(other.to_string())),
+            }
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+fn native_rust_module_list_response(
+    paths: &DaemonPaths,
+    targets: &[NativeRustModuleTarget],
+) -> Result<sinomo_module::NativeRustModuleListResponse, ServiceError> {
+    let data_dir_root = daemon_data_dir_path(paths).map_err(|error| {
+        ServiceError::Service(format!("native Rust module state unavailable: {error}"))
+    })?;
+    let modules = targets
+        .iter()
+        .copied()
+        .map(|target| native_rust_module_status(&data_dir_root, target))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(sinomo_module::NativeRustModuleListResponse { modules })
+}
+
+fn native_rust_module_set_enabled(
+    paths: &DaemonPaths,
+    targets: &[NativeRustModuleTarget],
+    payload: sinomo_module::NativeRustModuleSetEnabledRequest,
+) -> Result<sinomo_module::NativeRustModuleSetEnabledResponse, ServiceError> {
+    let requested_id = sinomo_module::ModuleId::new(payload.module_id.trim().to_string())
+        .or_else(|_| {
+            sinomo_module::ModuleId::from_legacy_named(payload.module_id.trim().to_string())
+        })
+        .map_err(|error| ServiceError::Service(format!("invalid module id: {error}")))?;
+    let target = targets
+        .iter()
+        .copied()
+        .find(|target| {
+            sinomo_module::ModuleId::from_legacy_named(target.legacy_id)
+                .is_ok_and(|module_id| module_id == requested_id)
+        })
+        .ok_or_else(|| {
+            ServiceError::Service(format!(
+                "module `{}` does not support native Rust enable/disable",
+                payload.module_id
+            ))
+        })?;
+    let data_dir_root = daemon_data_dir_path(paths).map_err(|error| {
+        ServiceError::Service(format!("native Rust module state unavailable: {error}"))
+    })?;
+    let reason = if payload.reason.trim().is_empty() {
+        "operator changed native Rust module state from the app".to_string()
+    } else {
+        payload.reason
+    };
+    sinomo_module::set_native_rust_module_enabled(
+        &data_dir_root,
+        &requested_id,
+        payload.enabled,
+        "daemon-module-service",
+        reason,
+    )
+    .map_err(|error| ServiceError::Service(error.to_string()))?;
+    Ok(sinomo_module::NativeRustModuleSetEnabledResponse {
+        module: native_rust_module_status(&data_dir_root, target)?,
+    })
+}
+
+fn native_rust_module_status(
+    data_dir_root: &std::path::Path,
+    target: NativeRustModuleTarget,
+) -> Result<sinomo_module::NativeRustModuleStatus, ServiceError> {
+    let module_id = sinomo_module::ModuleId::from_legacy_named(target.legacy_id)
+        .expect("built-in native Rust module id is valid");
+    let state = sinomo_module::read_native_rust_module_runtime_state(data_dir_root, &module_id)
+        .map_err(|error| ServiceError::Service(error.to_string()))?;
+    let configured_enabled = state
+        .as_ref()
+        .map(|state| state.enabled)
+        .unwrap_or(target.default_enabled);
+    let restart_required = configured_enabled != target.active;
+    let state_detail = if restart_required {
+        if configured_enabled {
+            "configured enabled; restart the daemon to start it"
+        } else {
+            "configured disabled; restart the daemon to stop it"
+        }
+    } else if target.active {
+        "active in this daemon"
+    } else {
+        "inactive in this daemon"
+    };
+    Ok(sinomo_module::NativeRustModuleStatus {
+        module_id: target.legacy_id.to_string(),
+        configured_enabled,
+        active: target.active,
+        explicit: state.is_some(),
+        restart_required,
+        detail: format!("{} · {state_detail}", target.detail),
+    })
+}
+
 impl NetworkModuleServiceResponse {
     fn respond(self, ctx: &mut ServiceContext) -> Result<(), ServiceError> {
         match self {
@@ -3387,7 +3601,12 @@ impl DaemonDfsBrowserBackend {
         let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) else {
             return false;
         };
-        service.refresh_peer_targets(sinomo_dfs::cluster_dfs_peer_node_ids(&state));
+        let Ok(peer_node_ids) =
+            sinomo_dfs::discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+        else {
+            return false;
+        };
+        service.refresh_peer_targets(peer_node_ids);
         true
     }
 
@@ -4373,11 +4592,21 @@ impl Service for DaemonDfsBrowserService {
             .iter()
             .copied()
             .map(|route| {
-                ServiceRoute::new(route, DAEMON_RPC_CATEGORY)
-                    .with_auth_scope("local-command")
+                let path_access = daemon_dfs_browser_route_is_path_access(route);
+                let mut descriptor = ServiceRoute::new(route, DAEMON_RPC_CATEGORY)
+                    .with_auth_scope(if path_access {
+                        sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope()
+                    } else {
+                        sinomo_module::ModuleRouteAuth::LocalCommand.as_scope()
+                    })
                     .require_capability("daemon.dfs.browser")
                     .with_concurrency_limit(4)
-                    .with_timeout(Duration::from_secs(60))
+                    .with_timeout(Duration::from_secs(60));
+                if path_access {
+                    descriptor =
+                        descriptor.require_capability(sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY);
+                }
+                descriptor
             })
             .collect()
     }
@@ -4847,6 +5076,24 @@ impl Service for DaemonDfsBrowserService {
             Ok(ServiceDisposition::Continue)
         })
     }
+}
+
+fn daemon_dfs_browser_route_is_path_access(route: &str) -> bool {
+    matches!(
+        route,
+        DAEMON_DFS_BROWSER_STATUS_ROUTE
+            | DAEMON_DFS_BROWSER_STAT_ROUTE
+            | DAEMON_DFS_BROWSER_LIST_ROUTE
+            | DAEMON_DFS_BROWSER_READ_FILE_ROUTE
+            | DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE
+            | DAEMON_DFS_BROWSER_READ_FILES_ROUTE
+            | DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+            | DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE
+            | DAEMON_DFS_BROWSER_CREATE_DIR_ALL_ROUTE
+            | DAEMON_DFS_BROWSER_RENAME_ROUTE
+            | DAEMON_DFS_BROWSER_DELETE_ROUTE
+    )
 }
 
 struct DaemonDfsPlacementAuthorityAdminService {
@@ -5815,6 +6062,7 @@ fn daemon_service_registry(
     service_hooks: &[crate::DaemonServiceRegistryHook],
 ) -> ServiceRegistry {
     let is_shadow = crate::daemon_paths_are_shadow(paths);
+    let dfs_enabled = dfs_module_should_register(paths);
     let event_hub = Arc::new(DaemonEventHub::new());
     let mut builder = ServiceRegistry::builder();
     if observe_module_should_register(paths) {
@@ -5841,6 +6089,7 @@ fn daemon_service_registry(
             runtime: service_runtime.cloned(),
             include_authority_health: !is_shadow,
         })
+        .register(NativeRustModulesService::new(paths.clone()))
         .register(NetworkModulesService {
             paths: paths.clone(),
         })
@@ -5869,36 +6118,40 @@ fn daemon_service_registry(
                 runtime: service_runtime.cloned(),
             });
     }
-    // Keep the peer DFS protocol routes on both registries as a fail-closed
-    // mixed-version surface. Current DFS callers require a main-daemon terminal;
-    // a legacy affinity-neutral replica mutation that reaches the shadow must
-    // receive the explicit data-owner rejection instead of an ambiguous
-    // "unknown route".
-    builder = if let Some(runtime) = service_runtime {
-        sinomo_dfs::register_services_with_data_plane_host(
-            builder,
-            Arc::new(DaemonDfsDataPlaneHost::new_on_runtime_with_event_hub(
-                paths.clone(),
-                runtime,
-                Arc::clone(&event_hub),
-            )),
-        )
-    } else {
-        register_dfs_services(builder)
-    };
+    if dfs_enabled {
+        // Keep the peer DFS protocol routes on both registries as a fail-closed
+        // mixed-version surface while the module is active. Current DFS callers
+        // require a main-daemon terminal; a legacy affinity-neutral replica
+        // mutation that reaches the shadow receives the explicit data-owner
+        // rejection instead of an ambiguous "unknown route".
+        builder = if let Some(runtime) = service_runtime {
+            sinomo_dfs::register_services_with_data_plane_host(
+                builder,
+                Arc::new(DaemonDfsDataPlaneHost::new_on_runtime_with_event_hub(
+                    paths.clone(),
+                    runtime,
+                    Arc::clone(&event_hub),
+                )),
+            )
+        } else {
+            register_dfs_services(builder)
+        };
+    }
     // Main and shadow share the data-dir build root. Only the main daemon owns
     // local UI/control services whose state is not part of the peer DFS protocol.
     if !is_shadow {
-        builder = builder
-            .register(DaemonDfsBrowserService {
-                runtime: service_runtime.cloned(),
-                event_hub: Arc::clone(&event_hub),
-            })
-            .register(crate::build_service::DaemonBuildService::new(paths))
-            .register(DaemonDfsPlacementAuthorityAdminService {
-                paths: paths.clone(),
-                runtime: service_runtime.cloned(),
-            });
+        if dfs_enabled {
+            builder = builder
+                .register(DaemonDfsBrowserService {
+                    runtime: service_runtime.cloned(),
+                    event_hub: Arc::clone(&event_hub),
+                })
+                .register(DaemonDfsPlacementAuthorityAdminService {
+                    paths: paths.clone(),
+                    runtime: service_runtime.cloned(),
+                });
+        }
+        builder = builder.register(crate::build_service::DaemonBuildService::new(paths));
         builder = sinomo_sandbox::register_services_with_factory(
             builder,
             Arc::new(DaemonSandboxBackendFactory {
@@ -6107,6 +6360,13 @@ fn observe_module_should_register(paths: &DaemonPaths) -> bool {
         .unwrap_or(true)
 }
 
+pub(crate) fn dfs_module_should_register(paths: &DaemonPaths) -> bool {
+    daemon_data_dir_path(paths)
+        .ok()
+        .and_then(|data_dir| sinomo_dfs::dfs_module_enabled(&data_dir).ok())
+        .unwrap_or(false)
+}
+
 fn daemon_config_registry(
     paths: &DaemonPaths,
     service_hooks: &[crate::DaemonServiceRegistryHook],
@@ -6195,6 +6455,15 @@ fn register_module_surface_config_definitions(
         }
     };
     for definition in definitions {
+        if builder
+            .get(definition.key.as_str())
+            .is_ok_and(|existing| existing == &definition)
+        {
+            // Native modules may repeat an identical definition that is also
+            // present in the host's fallback catalog. Keep the already-owned
+            // static entry without treating the declaration as a collision.
+            continue;
+        }
         match builder.clone().register(definition) {
             Ok(next) => builder = next,
             Err(error) => tracing::warn!(
@@ -6515,12 +6784,15 @@ fn daemon_internal_module_registry(
     register_observe_module: bool,
 ) -> Result<sinomo_module::ModuleRegistry, NetworkError> {
     let mut builder = sinomo_module::ModuleRegistry::builder()
-        .register(sinomo_dfs::dfs_module_registration())
-        .map_err(module_error_to_network_error)?
         .register(crate::registry::network_module_registration())
         .map_err(module_error_to_network_error)?
         .register(sinomo_rollout::rollout_module_registration())
         .map_err(module_error_to_network_error)?;
+    if sinomo_dfs::dfs_module_enabled(data_dir_root).unwrap_or(false) {
+        builder = builder
+            .register(sinomo_dfs::dfs_module_registration())
+            .map_err(module_error_to_network_error)?;
+    }
     if register_observe_module {
         builder = builder
             .register(sinomo_observe::observe_module_registration())
@@ -11984,6 +12256,71 @@ mod tests {
     }
 
     #[test]
+    fn dfs_service_registration_tracks_native_rust_enablement() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-module-toggle");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+
+        let registry = daemon_service_registry(&paths, None, &[]);
+        assert!(registry.owns(sinomo_dfs::DFS_STATUS_ROUTE));
+        assert!(registry.owns(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE));
+
+        sinomo_dfs::set_dfs_module_enabled(&root, false, "test", "disable DFS")
+            .expect("disable DFS");
+        let registry = daemon_service_registry(&paths, None, &[]);
+        assert!(!registry.owns(sinomo_dfs::DFS_STATUS_ROUTE));
+        assert!(!registry.owns(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE));
+        assert!(!registry.owns(crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE));
+
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("disabled DFS service host");
+        assert!(
+            host.object_rpc_route_descriptor(sinomo_dfs::DFS_STATUS_ROUTE)
+                .is_none(),
+            "disabled DFS must also be absent from the active module snapshot"
+        );
+    }
+
+    #[test]
+    fn native_rust_module_control_persists_dfs_state_and_survives_disabling_dfs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-native-rust-module-control");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let service = NativeRustModulesService::new(paths.clone());
+
+        let response = native_rust_module_set_enabled(
+            &paths,
+            &service.targets(),
+            sinomo_module::NativeRustModuleSetEnabledRequest {
+                module_id: sinomo_dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
+                enabled: false,
+                reason: "test disabled DFS".to_string(),
+            },
+        )
+        .expect("persist DFS module state");
+        assert!(!response.module.configured_enabled);
+        assert!(response.module.active);
+        assert!(response.module.restart_required);
+        assert!(!sinomo_dfs::dfs_module_enabled(&root).expect("read DFS module state"));
+
+        let registry = daemon_service_registry(&paths, None, &[]);
+        assert!(!registry.owns(sinomo_dfs::DFS_STATUS_ROUTE));
+        assert!(registry.owns(sinomo_module::MODULE_NATIVE_RUST_LIST_ROUTE));
+        assert!(registry.owns(sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE));
+
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("native Rust module control host");
+        let descriptor = host
+            .object_rpc_route_descriptor(sinomo_module::MODULE_NATIVE_RUST_SET_ENABLED_ROUTE)
+            .expect("native Rust set-enabled descriptor");
+        assert_eq!(descriptor.auth_scope.as_deref(), Some("cluster-member"));
+        assert_eq!(
+            descriptor.required_local_permissions,
+            vec!["remote-management".to_string()]
+        );
+    }
+
+    #[test]
     fn daemon_service_registry_accepts_application_service_hooks() {
         fn register_test_stop_service(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
             builder.register(TestStopService)
@@ -12121,6 +12458,51 @@ mod tests {
                 .expect("static definition remains")
                 .owner,
             "application-hook"
+        );
+    }
+
+    #[test]
+    fn identical_dynamic_module_settings_are_idempotent_with_the_static_catalog() {
+        let module_id = sinomo_module::ModuleId::from_legacy_named("module.dynamic-identical")
+            .expect("module id");
+        let definition = sinomo_config::ConfigDefinition::new(
+            "test.config-identical",
+            "dynamic-module",
+            sinomo_config::ConfigValueType::Object {
+                schema_name: "DynamicIdenticalConfig".to_string(),
+            },
+            "dynamic module config",
+            sinomo_config::ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_schema(sinomo_config::ConfigSchema::object(
+            "DynamicIdenticalConfig",
+            "Dynamic module settings declared by both the fallback and native catalogs.",
+            vec![sinomo_config::ConfigSchemaField::new(
+                "enabled",
+                "Enabled",
+                "Whether the test behavior is enabled.",
+                sinomo_config::ConfigSchemaValue::bool(),
+            )],
+        ))
+        .expect("schema")
+        .with_module_id(module_id.to_string())
+        .expect("module ownership");
+        let builder = sinomo_config::ConfigRegistry::builder()
+            .register(definition.clone())
+            .expect("static definition registration");
+        let surfaces = sinomo_module::ModuleSurfaces::default()
+            .with_config_definition(definition.clone())
+            .expect("dynamic settings surface");
+
+        let registry =
+            register_module_surface_config_definitions(builder, &module_id, &surfaces).build();
+
+        assert_eq!(
+            registry
+                .get("test.config-identical")
+                .expect("identical definition remains"),
+            &definition
         );
     }
 
@@ -12268,6 +12650,34 @@ mod tests {
         let status =
             sinomo_dfs::decode_dfs_status_rpc_response(&response).expect("dfs status response");
         assert_eq!(status.file_system_count, 0);
+    }
+
+    #[test]
+    fn dfs_path_provider_routes_allow_members_but_placement_control_stays_local() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-path-provider-auth");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_service_registry(&paths, None, &[]);
+        let host = DaemonServiceRegistryHost::from_registry_for_paths(registry, &paths)
+            .expect("service host");
+        let member = test_authenticated_command(DaemonSignerAuthority::Member);
+        let path_write = host
+            .object_rpc_route_descriptor(DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE)
+            .expect("path write route");
+        let placement_update = host
+            .object_rpc_route_descriptor(DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE)
+            .expect("placement update route");
+
+        assert!(daemon_authenticated_command_authorizes_route_descriptor(
+            &paths,
+            &member,
+            &path_write,
+        ));
+        assert!(!daemon_authenticated_command_authorizes_route_descriptor(
+            &paths,
+            &member,
+            &placement_update,
+        ));
     }
 
     #[test]
@@ -12630,15 +13040,21 @@ mod tests {
                 .iter()
                 .find(|metadata| metadata.route == *route)
                 .unwrap_or_else(|| panic!("daemon DFS browser service route metadata for {route}"));
+            let path_access = daemon_dfs_browser_route_is_path_access(route);
             assert_eq!(dfs_browser.category, DAEMON_RPC_CATEGORY);
             assert_eq!(
                 dfs_browser.auth_scope.as_deref(),
-                Some(sinomo_module::ModuleRouteAuth::LocalCommand.as_scope())
+                Some(if path_access {
+                    sinomo_module::ModuleRouteAuth::LocalOrClusterMember.as_scope()
+                } else {
+                    sinomo_module::ModuleRouteAuth::LocalCommand.as_scope()
+                })
             );
-            assert_eq!(
-                dfs_browser.required_capabilities,
-                vec!["daemon.dfs.browser".to_string()]
-            );
+            let mut expected_capabilities = vec!["daemon.dfs.browser".to_string()];
+            if path_access {
+                expected_capabilities.push("sifs.path.access".to_string());
+            }
+            assert_eq!(dfs_browser.required_capabilities, expected_capabilities);
         }
         let rollout_module_routes = rollout_module_surfaces()
             .object_rpc_route_descriptors()

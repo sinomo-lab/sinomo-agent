@@ -24,6 +24,7 @@ pub use discovery::{
     TargetSelectionPolicy, cluster_service_instance_key, cluster_service_prefix,
     discover_service_instances, publish_local_service_instances,
     service_instance_records_from_registry, service_instances_from_entries,
+    service_instances_providing_capability,
 };
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};

@@ -129,6 +129,64 @@ Never delete content-store or metadata files directly. A byte that appears
 unreferenced locally may still be required by a committed version, repair, or
 another member.
 
+## A Windows Cloud Files Mount Is Slow or Busy While Idle
+
+Start with the live supervisor and DFS state:
+
+```powershell
+sinomo dfs mount --status --json
+sinomo dfs status --cluster --json
+sinomo dfs conflicts --json
+```
+
+Inspect `worker_ready`, pending/retrying/failed operations, conflicts, attention
+records, provider connection state, and restart count. Startup reconciliation,
+an earlier local write, a committed remote namespace change, or a retry can
+legitimately perform finite work without a new Explorer access. Once those
+obligations settle, the Cloud Files layer has no periodic scan, heartbeat,
+config poll, or scheduled disk I/O. Persistent settled-idle I/O or Explorer
+latency outside the projected tree is a defect; record the exact build,
+`SINOMO_DATA_DIR`, mount status, relevant process I/O counters, and the affected
+paths and timestamps.
+
+To isolate the provider without losing its durable identity, use:
+
+```powershell
+sinomo dfs mount --disable --json
+```
+
+Do not manually delete the sync root, registration journal, queue, manifest,
+staged registration, pending unregister, provider bundle, or cursor-recovery
+files. Their presence and exact temporary successors distinguish safe replay
+from replacement or corruption. If status reports retained cursor-only state,
+inspect it without applying changes:
+
+```powershell
+sinomo dfs mount --recover-cursor-only-state --json
+```
+
+Applying that recovery is a break-glass reconciliation step requiring the exact
+returned token and explicit acknowledgement. Preserve the inspection output
+first. See the
+[Windows Cloud Files architecture](../cloud-files-architecture.md) for the
+ownership and recovery state machine.
+
+## Windows Explorer Does Not Show a Sinomo File Status
+
+The standard Cloud Files availability and in-sync badges come from CFAPI. The
+additional Sinomo labels appear only for outstanding local writeback, retry,
+conflict, or failure state; a healthy completed file deliberately has no custom
+label. Add the **Status** column in Explorer when the current layout does not
+show it.
+
+If a pending operation is visible in `sinomo dfs mount --status --json` but no
+custom label appears, inspect the daemon log for `Cloud Files Explorer custom
+status` or `Cloud Files Explorer status update`. Custom-property registration
+is ancillary, so its failure does not stop hydration or writeback and Sinomo
+does not poll or repeatedly write merely to recover decoration. Record the
+Windows version, exact build, mount path, affected item, and log message before
+remounting with a corrected build.
+
 ## A Rollout Is Stuck or Failed
 
 ```sh

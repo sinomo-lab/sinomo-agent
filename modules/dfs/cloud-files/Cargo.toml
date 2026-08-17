@@ -35,12 +35,18 @@ ulid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 tokio.workspace = true
+windows-collections.workspace = true
 windows = { version = "0.62.2", features = [
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_CloudFilters",
     "Win32_Storage_FileSystem",
     "Win32_System_CorrelationVector",
+    "Win32_System_Com",
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }

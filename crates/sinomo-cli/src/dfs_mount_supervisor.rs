@@ -4973,9 +4973,11 @@ pub(crate) fn sifs_mount_supervisor_service_hook(
     daemon_paths: DaemonPaths,
 ) -> DaemonServiceRegistryHook {
     let service = SifsMountSupervisorService::new(data_dir, daemon_paths, std::process::id());
+    let ready_service = service.clone();
     DaemonServiceRegistryHook::new(move |builder: ServiceRegistryBuilder| {
         builder.register(service.clone())
     })
+    .with_host_ready(move || ready_service.inner.wake.signal())
 }
 
 fn retire_after_exit_status_persisted<P, R>(persist_status: P, retire: R) -> Result<(), String>

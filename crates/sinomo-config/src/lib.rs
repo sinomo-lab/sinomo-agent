@@ -545,6 +545,20 @@ pub struct ConfigRegistryBuilder {
 }
 
 impl ConfigRegistryBuilder {
+    /// Returns a definition already staged in this builder without consuming it.
+    ///
+    /// Hosts that compose a static catalog with module-declared settings use
+    /// this to treat an identical declaration as idempotent while continuing
+    /// to reject or retain authority over conflicting declarations.
+    pub fn get(&self, key: &str) -> Result<&ConfigDefinition, ConfigError> {
+        let key = ConfigKey::new(key.to_string())?;
+        self.definitions
+            .get(&key)
+            .ok_or_else(|| ConfigError::UnknownKey {
+                key: key.to_string(),
+            })
+    }
+
     pub fn register(mut self, definition: ConfigDefinition) -> Result<Self, ConfigError> {
         definition.validate_contract()?;
         if self

@@ -10,13 +10,31 @@ use sinomo_config::{
     ConfigClusterMode, ConfigDefinition, ConfigSchema, ConfigSchemaField, ConfigSchemaValue,
     ConfigValueType,
 };
+#[cfg(windows)]
+use sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
 
-use crate::{SINOMO_DFS_MODULE_OWNER, dfs_module_id};
+use crate::SINOMO_DFS_MODULE_OWNER;
 
 pub const SIFS_MOUNT_CONFIG_KEY: &str = "storage.sifs-mount";
 pub const SIFS_MOUNT_STATUS_CONFIG_KEY: &str = "storage.sifs-mount-status";
 pub const SIFS_MOUNT_STATUS_ROUTE: &str = "/dfs/mount/status";
 pub const SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE: &str = "/dfs/mount/recover-cursor-only-state";
+
+/// Module card that owns the host-mount settings on this target. Unix FUSE is
+/// part of the built-in DFS module; Windows delegates the host adapter to the
+/// separately rolled out Cloud Files module.
+pub fn sifs_mount_settings_module_id() -> String {
+    #[cfg(windows)]
+    {
+        sinomo_core::Id::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
+            .expect("valid Cloud Files module id")
+            .to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        crate::dfs_module_id().to_string()
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SifsMountConfig {
@@ -273,6 +291,13 @@ pub enum SifsMountCursorOnlyRecoveryResponse {
 }
 
 pub fn sifs_mount_config_definition() -> ConfigDefinition {
+    sifs_mount_config_definition_for_module(sifs_mount_settings_module_id())
+}
+
+/// Build the shared host-mount setting for the platform adapter that declares
+/// it. The key and value stay owned by DFS/the mount supervisor; `module_id`
+/// controls which module card presents the setting in the generic catalog.
+pub fn sifs_mount_config_definition_for_module(module_id: impl Into<String>) -> ConfigDefinition {
     ConfigDefinition::new(
         SIFS_MOUNT_CONFIG_KEY,
         SINOMO_DFS_MODULE_OWNER,
@@ -334,11 +359,19 @@ pub fn sifs_mount_config_definition() -> ConfigDefinition {
         ],
     ))
     .expect("valid SIFS mount config schema")
-    .with_module_id(dfs_module_id().to_string())
-    .expect("valid DFS module id")
+    .with_module_id(module_id)
+    .expect("valid SIFS mount settings module id")
 }
 
 pub fn sifs_mount_status_config_definition() -> ConfigDefinition {
+    sifs_mount_status_config_definition_for_module(sifs_mount_settings_module_id())
+}
+
+/// Build the read-only mount status document for the same module card as the
+/// editable host-mount setting.
+pub fn sifs_mount_status_config_definition_for_module(
+    module_id: impl Into<String>,
+) -> ConfigDefinition {
     ConfigDefinition::new(
         SIFS_MOUNT_STATUS_CONFIG_KEY,
         SINOMO_DFS_MODULE_OWNER,
@@ -542,8 +575,8 @@ pub fn sifs_mount_status_config_definition() -> ConfigDefinition {
         ],
     ))
     .expect("valid SIFS mount status schema")
-    .with_module_id(dfs_module_id().to_string())
-    .expect("valid DFS module id")
+    .with_module_id(module_id)
+    .expect("valid SIFS mount status module id")
     .read_only()
 }
 
@@ -659,9 +692,10 @@ mod tests {
         let definition = sifs_mount_config_definition();
 
         assert_eq!(definition.cluster_mode, ConfigClusterMode::LocalOnly);
+        let expected_module_id = sifs_mount_settings_module_id();
         assert_eq!(
             definition.module_id.as_deref(),
-            Some(dfs_module_id().as_str())
+            Some(expected_module_id.as_str())
         );
         let default: SifsMountConfig =
             serde_json::from_value(definition.default_value.expect("mount config default"))
@@ -682,6 +716,29 @@ mod tests {
                 .expect("typed mount status default");
         assert_eq!(status.phase, SifsMountRuntimePhase::Disabled);
         assert_eq!(status.platform, SifsMountPlatform::current());
+    }
+
+    #[test]
+    fn mount_definitions_support_native_adapter_module_ownership() {
+        let module_id = "module.test.host-filesystem-adapter";
+        let expected_module_id = sinomo_core::Id::from_legacy_named(module_id)
+            .expect("test adapter module id")
+            .to_string();
+        let config = sifs_mount_config_definition_for_module(module_id);
+        let status = sifs_mount_status_config_definition_for_module(module_id);
+
+        assert_eq!(
+            config.module_id.as_deref(),
+            Some(expected_module_id.as_str())
+        );
+        assert!(!config.read_only);
+        assert_eq!(
+            status.module_id.as_deref(),
+            Some(expected_module_id.as_str())
+        );
+        assert!(status.read_only);
+        assert_eq!(config.key.as_str(), SIFS_MOUNT_CONFIG_KEY);
+        assert_eq!(status.key.as_str(), SIFS_MOUNT_STATUS_CONFIG_KEY);
     }
 
     #[test]

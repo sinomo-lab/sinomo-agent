@@ -1161,6 +1161,7 @@ fn set_native_rust_module_runtime_enabled(
     context.stdout_line(format_args!("backend: native-rust"))?;
     context.stdout_line(format_args!("enabled: {enabled}"))?;
     context.stdout_line(format_args!("state: {}", path.display()))?;
+    context.stdout_line(format_args!("restart-required: true"))?;
     Ok(())
 }
 

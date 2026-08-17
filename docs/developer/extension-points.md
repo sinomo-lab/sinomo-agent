@@ -99,7 +99,11 @@ module/rollout decision; loading a library from an arbitrary host path must not
 become a second production activation path.
 
 Representative packages include Iroh networking, remote management, Windows
-Cloud Files, and WASIX.
+Cloud Files, and WASIX. Cloud Files has an additional cross-owner registration
+and crash-recovery contract; read its
+[architecture](../cloud-files-architecture.md) and
+[module maintainer guide](../../modules/dfs/cloud-files/README.md) before
+changing its ABI, durable state, lifecycle callbacks, or provider selection.
 
 ## Network Transports
 
@@ -139,6 +143,16 @@ toolchain artifacts, not only the marker feature on `sinomo-sandbox`.
 Add validated configuration through `ConfigDefinition` and
 `ConfigRegistryBuilder`. Put distributed settings in cluster KV and retain
 secrets, host permissions, and device exposure as node-local state.
+
+A native module may declare settings through
+`NativeModuleDescriptor.surfaces.settings`. Each `ModuleSettingsExport`
+contains the SOBJ-encoded `ConfigDefinition` and must name the descriptor's
+own canonical module ID. The daemon composes those definitions into the same
+configuration catalog used by built-in settings, and the app's generic module
+settings editor renders the declared schema recursively. Do not add a second
+module-specific settings store or UI write path. An exact duplicate of a host
+fallback definition is idempotent; a different definition reusing a static
+key does not replace the static catalog entry.
 
 Resolve persistent paths through `SinomoDataDir`. Register exact files or
 reasoned escape subtrees in `StorageLayout`, including owner, ring, encoding,

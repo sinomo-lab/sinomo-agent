@@ -199,6 +199,7 @@ architecture requires.
 | KV/Raft or membership | Crate tests, cluster integration, relevant Quint refinement |
 | Network routing or transport | Network tests, routed multi-node scenario, relevant Quint refinement |
 | DFS metadata/content | DFS integration, restart/repair scenario, relevant formal slice |
+| Windows Cloud Files | API and platform-neutral state-machine tests, Windows target `--no-run`, and focused Windows execution for CFAPI, Explorer, notification, idle-I/O, or power behavior |
 | Daemon lifecycle or rollout | Daemon/rollout tests and process-level activation/recovery scenario |
 | Sandbox/toolchain | Actual backend build and matching verifier |
 | Provider or agent protocol | Deterministic fixtures; opt-in live smoke only when required |

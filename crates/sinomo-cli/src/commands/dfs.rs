@@ -3163,34 +3163,43 @@ pub(crate) fn inspect_cluster_dfs_status_with_data_dir(
             state.members.len()
         ),
     );
-    let local_status_started_at = std::time::Instant::now();
     let daemon_status = main_daemon_status_for_data_dir(&data_dir)?;
-    let local_status = inspect_local_cluster_dfs_status_from_owner(
-        daemon_status.as_ref().map(|status| status.address.as_str()),
-        |daemon_address| {
-            run_dfs_status_via_daemon_address(daemon_address, DFS_CLUSTER_STATUS_REMOTE_TIMEOUT)
-        },
-        || {
-            sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
-                .map_err(CliError::from)
-        },
-    )?;
-    trace_dfs_cluster_status(
-        trace,
-        started_at,
-        format_args!(
-            "local status complete in {}ms",
-            local_status_started_at.elapsed().as_millis()
-        ),
-    );
-    let mut nodes = vec![DfsClusterNodeStatus {
-        node_id: state.local_node_id.clone(),
-        local: true,
-        endpoint: Some("local-daemon".to_string()),
-        status: Some(local_status),
-        error: None,
-    }];
-    let remote_node_ids = dfs_cluster_status_remote_main_node_ids(&state);
+    let mut provider_node_ids =
+        sinomo_runtime::dfs::discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+    let mut nodes = Vec::new();
+    if provider_node_ids.remove(&state.local_node_id) {
+        let local_status_started_at = std::time::Instant::now();
+        let local_status = inspect_local_cluster_dfs_status_from_owner(
+            daemon_status.as_ref().map(|status| status.address.as_str()),
+            |daemon_address| {
+                run_dfs_status_via_daemon_address(daemon_address, DFS_CLUSTER_STATUS_REMOTE_TIMEOUT)
+            },
+            || {
+                sinomo_runtime::dfs::inspect_cluster_aware_dfs_status(&data_dir, &cluster_paths)
+                    .map_err(CliError::from)
+            },
+        )?;
+        trace_dfs_cluster_status(
+            trace,
+            started_at,
+            format_args!(
+                "local status complete in {}ms",
+                local_status_started_at.elapsed().as_millis()
+            ),
+        );
+        nodes.push(DfsClusterNodeStatus {
+            node_id: state.local_node_id.clone(),
+            local: true,
+            endpoint: Some("local-daemon".to_string()),
+            status: Some(local_status),
+            error: None,
+        });
+    } else {
+        trace_dfs_cluster_status(trace, started_at, "local node is not a DFS provider");
+    }
+    let remote_node_ids = provider_node_ids;
     trace_dfs_cluster_status(
         trace,
         started_at,
@@ -3463,23 +3472,6 @@ pub(crate) fn dfs_cluster_status_unavailable_reason(
         network::ClusterMemberMainDaemonConnectivity::Healthy
         | network::ClusterMemberMainDaemonConnectivity::Unknown => None,
     }
-}
-
-fn dfs_cluster_status_remote_main_node_ids(
-    state: &sinomo_runtime::core::ClusterBootstrapState,
-) -> std::collections::BTreeSet<NodeId> {
-    state
-        .members
-        .iter()
-        .filter(|member| {
-            member.node_id != state.local_node_id
-                && member.state.is_authorized()
-                && member.capabilities.iter().any(|capability| {
-                    capability.as_str() == sinomo_runtime::node::DAEMON_MAIN_RUN_CAPABILITY
-                })
-        })
-        .map(|member| member.node_id.clone())
-        .collect()
 }
 
 struct DfsStatusProbe {

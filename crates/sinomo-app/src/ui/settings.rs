@@ -79,7 +79,9 @@ use crate::backend::config::{
     set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
     text_verbosity_index,
 };
-use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
+use crate::backend::modules::{
+    ModuleConfigSnapshot, ModuleObservedState, module_ids_match, native_rust_module_is_toggleable,
+};
 use crate::backend::mounts::{
     SifsMountSettingsSnapshot, validate_connected_cloud_files_status_at, validate_sifs_mount_config,
 };
@@ -4349,7 +4351,7 @@ fn execute_settings_operation(
             enabled,
         } => SettingsOperationPayload::Modules((|| {
             backend.set_node_module_override(&node_id, &module_id, enabled)?;
-            let message = match enabled {
+            let mut message = match enabled {
                 Some(true) => format!(
                     "Node override enabled for {}",
                     module_display_id(&module_id)
@@ -4365,6 +4367,9 @@ fn execute_settings_operation(
                     module_display_id(&module_id)
                 ),
             };
+            if enabled.is_some() && native_rust_module_is_toggleable(&module_id) {
+                message.push_str("; restart that node's daemon to apply it");
+            }
             let snapshot = backend.module_config_snapshot(Some(&node_id));
             Ok(module_operation_success(backend, snapshot, Some(message)))
         })()),
@@ -18195,6 +18200,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let associated_index;
+        let cloud_files_index;
         let unmatched_index;
         {
             let mut app = shared.borrow_mut();
@@ -18216,17 +18222,30 @@ mod tests {
                     error: None,
                 }),
                 nodes: vec![node_summary],
-                modules: vec![crate::backend::modules::ModuleConfigModuleSummary {
-                    module_id: "module.sandbox.wasix".to_string(),
-                    label: "WASIX Sandbox".to_string(),
-                    backend: "wasix".to_string(),
-                    detail: "WASIX sandbox runtime module".to_string(),
-                    desired_enabled: Some(true),
-                    effective_enabled: false,
-                    effective_source: ModuleRuntimeConfigSource::Node,
-                    observed: ModuleObservedState::Running,
-                    observed_detail: "Runtime process is active".to_string(),
-                }],
+                modules: vec![
+                    crate::backend::modules::ModuleConfigModuleSummary {
+                        module_id: "module.sandbox.wasix".to_string(),
+                        label: "WASIX Sandbox".to_string(),
+                        backend: "wasix".to_string(),
+                        detail: "WASIX sandbox runtime module".to_string(),
+                        desired_enabled: Some(true),
+                        effective_enabled: false,
+                        effective_source: ModuleRuntimeConfigSource::Node,
+                        observed: ModuleObservedState::Running,
+                        observed_detail: "Runtime process is active".to_string(),
+                    },
+                    crate::backend::modules::ModuleConfigModuleSummary {
+                        module_id: "module.dfs.cloud-files".to_string(),
+                        label: "Cloud Files".to_string(),
+                        backend: "native-dylib".to_string(),
+                        detail: "Windows SIFS filesystem projection".to_string(),
+                        desired_enabled: Some(true),
+                        effective_enabled: true,
+                        effective_source: ModuleRuntimeConfigSource::Node,
+                        observed: ModuleObservedState::Running,
+                        observed_detail: "Native provider is active".to_string(),
+                    },
+                ],
                 warnings: Vec::new(),
             };
             associated_index = settings.config_items.len();
@@ -18259,6 +18278,23 @@ mod tests {
                 ],
             ));
             settings.config_items.push(associated);
+
+            cloud_files_index = settings.config_items.len();
+            let definition = sinomo_runtime::dfs::sifs_mount_config_definition_for_module(
+                "module.dfs.cloud-files",
+            );
+            let default_value = definition.default_value.expect("mount mapping default");
+            let default_json = serde_json::to_string(&default_value).expect("mount mapping JSON");
+            let mut cloud_files = test_config_item(
+                sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY,
+                ConfigEditKind::Json,
+                &default_json,
+            );
+            cloud_files.owner = definition.owner;
+            cloud_files.module_id = definition.module_id;
+            cloud_files.description = definition.description;
+            cloud_files.schema = definition.schema;
+            settings.config_items.push(cloud_files);
 
             unmatched_index = settings.config_items.len();
             let mut unmatched = test_config_item(
@@ -18327,6 +18363,24 @@ mod tests {
             .with_name(format!("config-{associated_index}-schema-endpoint"))
             .expect()
             .to_have_value("https://sandbox.test")?;
+        window.get_by_text("Cloud Files").expect().to_be_visible()?;
+        assert!(
+            window
+                .get_by_text("Settings · storage.sifs-mount")
+                .count()?
+                >= 1,
+            "the Cloud Files descriptor must render the shared mount mapping on its module card"
+        );
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{cloud_files_index}-schema-mount_point"))
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{cloud_files_index}-schema-root_path"))
+            .expect()
+            .to_have_value("/")?;
         window
             .get_by_text("Additional module settings")
             .expect()
@@ -18887,9 +18941,11 @@ mod tests {
                 .module_snapshot
                 .modules
                 .iter()
-                .any(|module| module.module_id
-                    == sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID),
-            "module settings should include built-in module targets"
+                .any(|module| module_ids_match(
+                    &module.module_id,
+                    sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                )),
+            "module settings should include the built-in DFS target"
         );
 
         let node_id = state
@@ -18902,8 +18958,8 @@ mod tests {
             SettingsOperationScope::Modules,
             SettingsOperation::SetNodeModuleOverride {
                 node_id,
-                module_id: sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID.to_string(),
-                enabled: Some(true),
+                module_id: sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
+                enabled: Some(false),
             },
         );
         let selected = state
@@ -18914,9 +18970,19 @@ mod tests {
         assert_eq!(
             selected
                 .config
-                .setting(sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID)
+                .setting(sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID)
                 .map(|setting| setting.enabled),
-            Some(true)
+            Some(false)
+        );
+        assert!(
+            !sinomo_runtime::dfs::dfs_module_enabled(&backend.data_dir.root())
+                .expect("read DFS module state")
+        );
+        assert!(
+            state
+                .module_action_status
+                .as_deref()
+                .is_some_and(|status| status.contains("restart that node's daemon"))
         );
     }
 

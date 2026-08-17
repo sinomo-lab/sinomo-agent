@@ -73,6 +73,7 @@ trust model, state ownership, execution model, and invariants.
 | Cluster identity, membership, KV/Raft authority, and failure | [Clustering](clustering-architecture.md) |
 | Direct links, connectivity, routed streams, relays, and object RPC | [Network](network-architecture.md) |
 | DFS metadata, content, placement, replication, repair, and POSIX semantics | [DFS](dfs-architecture.md) |
+| Windows SIFS projection, hydration, writeback, reconciliation, and recovery | [Windows Cloud Files](cloud-files-architecture.md) |
 | Indexed-file memory, retrieval, overlays, maintenance, and scope | [Memory](memory-architecture.md) |
 | Module identity, compatibility, activation, observation, and replacement | [Module lifecycle](module-lifecycle-architecture.md) |
 | Candidate generation, evaluation, promotion, rollback, and risk rings | [Self-evolution](self-evolution-architecture.md) |
@@ -96,7 +97,8 @@ The sandbox has its own [architecture document](../crates/sinomo-sandbox/docs/ar
 - [Cluster formal verification](formal/cluster-verification.md) documents the
   executable Quint specifications and their evidence boundaries.
 - Crate-specific operational or protocol references live with the owning crate,
-  including `crates/sinomo-dfs/README.md`, `crates/sinomo-daemon/README.md`,
+  including `crates/sinomo-dfs/README.md`,
+  `modules/dfs/cloud-files/README.md`, `crates/sinomo-daemon/README.md`,
   `crates/sinomo-object/README.md`, and sandbox/toolchain READMEs.
 
 Exact formats, schemas, model bounds, and benchmark protocols may be detailed.

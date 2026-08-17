@@ -81,6 +81,10 @@ use crate::namespace_reconciler::{
 use crate::sync_executor::{
     CloudFilesDfsMutationCommand, CloudFilesLocalCompletionEffect, CloudFilesLocalCompletionOutcome,
 };
+use crate::windows_shell::{
+    CloudFilesExplorerStatusProjector, SharedExplorerStatusProjector, enable_explorer_status,
+    observe_explorer_state, observe_explorer_upload,
+};
 use crate::windows_sync::{
     CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesCapturedChangeBatch, CloudFilesCapturedContent,
     CloudFilesCapturedLocalChange, CloudFilesConcreteDfsAdapter, CloudFilesCursorRecoveryControl,
@@ -268,8 +272,7 @@ pub(super) fn subscribe_namespace_changes(
                         data_dir,
                         &address,
                         &request,
-                        DaemonRpcTimeouts::default()
-                            .with_connect_timeout(Some(Duration::from_secs(3))),
+                        namespace_event_stream_timeouts(),
                         |response| {
                             response.error_detail()?;
                             match response.decode_body::<sinomo_runtime::api::DaemonEventStreamItem>()? {
@@ -324,6 +327,15 @@ pub(super) fn subscribe_namespace_changes(
             ))
         }
     }
+}
+
+fn namespace_event_stream_timeouts() -> DaemonRpcTimeouts {
+    // Silence is the successful steady state for this subscription. Bound
+    // connection establishment, then let the already-established transport
+    // block until an event, explicit stop, or actual stream failure arrives.
+    // An idle transfer timeout would turn every quiet mount into a periodic
+    // provider restart and full reconciliation.
+    DaemonRpcTimeouts::connect_only(Duration::from_secs(3))
 }
 
 fn enter_writable_worker_background_mode() -> Result<(), String> {
@@ -597,6 +609,25 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
                     })?;
                 match page {
                     Ok(page) => {
+                        // A durable materialization ledger can outlive the
+                        // physical directory placeholder (for example, when a
+                        // provider restart follows a rolled-back registration).
+                        // Re-establish the enumerated directory itself before
+                        // later snapshots try to create any of its children.
+                        // The root is the registered sync-root directory and is
+                        // therefore not created as a child placeholder.
+                        if task.path != root {
+                            let stat = lock_service(&self.service)?
+                                .posix_lstat_distributed(&task.path)
+                                .map_err(|error| {
+                                    format!(
+                                        "authoritative stat of materialized Cloud Files directory `{}`: {error}",
+                                        task.path
+                                    )
+                                })?;
+                            let entry = materialized_directory_manifest_entry(stat)?;
+                            manifest.insert(entry.path.clone(), entry);
+                        }
                         audited_materialized_directories.push(task.path.clone());
                         plan.active_page = Some(WindowsActiveDirectoryPage {
                             task,
@@ -619,6 +650,22 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
             if let Some(active) = plan.active_page.as_mut()
                 && let Some(child) = active.entries.pop_front()
             {
+                // A crash can persist an already-open directory page before
+                // the parent placeholder effect completes. Carry the parent
+                // in every resumed page snapshot so recovery still orders the
+                // directory before the next child.
+                if active.task.path != root {
+                    let stat = lock_service(&self.service)?
+                        .posix_lstat_distributed(&active.task.path)
+                        .map_err(|error| {
+                            format!(
+                                "authoritative stat of resumed materialized Cloud Files directory `{}`: {error}",
+                                active.task.path
+                            )
+                        })?;
+                    let entry = materialized_directory_manifest_entry(stat)?;
+                    manifest.insert(entry.path.clone(), entry);
+                }
                 match lock_service(&self.service)?.posix_lstat_distributed(&child.path) {
                     Ok(stat) if stat.kind != DfsObjectKind::Tombstone => {
                         if cloud_files_object_projection(&stat.kind)
@@ -764,6 +811,18 @@ fn relative_depth(root: &str, path: &str) -> u32 {
         .count()
         .try_into()
         .unwrap_or(u32::MAX)
+}
+
+fn materialized_directory_manifest_entry(
+    stat: dfs::DfsStat,
+) -> Result<CloudFilesReconciledManifestEntry, String> {
+    if !matches!(stat.kind, DfsObjectKind::Directory | DfsObjectKind::Mount) {
+        return Err(format!(
+            "materialized Cloud Files directory `{}` resolved as {:?}",
+            stat.path, stat.kind
+        ));
+    }
+    Ok(manifest_entry_from_stat(stat))
 }
 
 fn manifest_entry_from_stat(stat: dfs::DfsStat) -> CloudFilesReconciledManifestEntry {
@@ -1504,15 +1563,13 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
                 overflowed: true,
             });
         }
-        let mut raw = RawDirectoryChangeBatch::default();
-        match receiver.try_recv() {
-            Ok(batch) => raw = batch,
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Err("ReadDirectoryChangesW worker stopped unexpectedly".to_string());
-            }
-        }
-        if raw.overflowed || raw.changes.len() > DIRECTORY_CHANGES_PER_PASS {
+        // `WindowsWorkerWake` deliberately coalesces repeated local-change
+        // signals into one bit. Consume the complete bounded receiver backlog
+        // for that edge: reading only one batch can strand a later batch
+        // forever when several ReadDirectoryChangesW completions arrive before
+        // the worker takes the bit and no subsequent filesystem event occurs.
+        let mut raw = drain_directory_change_batches(receiver)?;
+        if raw.overflowed {
             return Ok(CloudFilesCapturedChangeBatch {
                 changes: Vec::new(),
                 sparse_placeholders: Vec::new(),
@@ -1597,6 +1654,44 @@ impl CloudFilesLocalChangeAccelerator for WindowsDirectoryChangeAccelerator {
     fn next_capture_retry_in(&self) -> Option<Duration> {
         self.capture_retries
             .next_due_in(self.capture_retry_epoch.elapsed())
+    }
+}
+
+fn drain_directory_change_batches(
+    receiver: &mpsc::Receiver<RawDirectoryChangeBatch>,
+) -> Result<RawDirectoryChangeBatch, String> {
+    let mut combined = RawDirectoryChangeBatch::default();
+    loop {
+        match receiver.try_recv() {
+            Ok(mut batch) => {
+                if batch.overflowed
+                    || combined.changes.len().saturating_add(batch.changes.len())
+                        > DIRECTORY_CHANGES_PER_PASS
+                {
+                    // The authoritative sparse scan will reconstruct the
+                    // current namespace. Discard the finite stale backlog so
+                    // it cannot survive the same coalesced wake and replay
+                    // observations from before that scan.
+                    for _ in 0..DIRECTORY_CHANGE_CHANNEL_CAPACITY {
+                        match receiver.try_recv() {
+                            Ok(_) => {}
+                            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(RawDirectoryChangeBatch {
+                        changes: Vec::new(),
+                        overflowed: true,
+                    });
+                }
+                combined.changes.append(&mut batch.changes);
+            }
+            Err(mpsc::TryRecvError::Empty) => return Ok(combined),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("ReadDirectoryChangesW worker stopped unexpectedly".to_string());
+            }
+        }
     }
 }
 
@@ -4116,6 +4211,48 @@ fn query_placeholder_state(
     Ok(state.map(|state| (state.in_sync, state.identity)))
 }
 
+fn blocking_local_placeholder_ancestor(
+    sync_root: &Path,
+    local: &Path,
+) -> Result<Option<String>, String> {
+    let mut current = local.parent();
+    while let Some(ancestor) = current {
+        if ancestor == sync_root {
+            return Ok(None);
+        }
+        match query_placeholder_state(ancestor)? {
+            Some((true, _)) => {}
+            Some((false, _)) => {
+                return Ok(Some(format!(
+                    "Cloud Files ancestor {} is not in sync",
+                    ancestor.display()
+                )));
+            }
+            None => match fs::symlink_metadata(ancestor) {
+                Ok(_) => {
+                    return Ok(Some(format!(
+                        "local ancestor {} is not a Cloud Files placeholder",
+                        ancestor.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "stat local Cloud Files ancestor {}: {error}",
+                        ancestor.display()
+                    ));
+                }
+            },
+        }
+        current = ancestor.parent();
+    }
+    Err(format!(
+        "local placeholder {} escaped Cloud Files root {} while inspecting ancestors",
+        local.display(),
+        sync_root.display()
+    ))
+}
+
 fn query_placeholder_state_handle(
     handle: HANDLE,
     path: &Path,
@@ -4534,7 +4671,12 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceEffectAdapter for WindowsPlaceho
         match fs::symlink_metadata(&local) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(CloudFilesLocalPathState::Clean);
+                return Ok(
+                    match blocking_local_placeholder_ancestor(&self.sync_root, &local)? {
+                        Some(detail) => CloudFilesLocalPathState::Dirty { detail },
+                        None => CloudFilesLocalPathState::Clean,
+                    },
+                );
             }
             Err(error) => return Err(format!("stat local path {}: {error}", local.display())),
         }
@@ -4749,7 +4891,11 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
     mounted_mutation_handoff: Arc<CloudFilesMountedMutationHandoff>,
     worker_wake: Arc<WindowsWorkerWake>,
     options: WindowsWritableWorkerOptions,
-) -> (ConcreteWindowsWritableWorker<T>, Arc<AtomicBool>) {
+) -> (
+    ConcreteWindowsWritableWorker<T>,
+    Arc<AtomicBool>,
+    SharedExplorerStatusProjector,
+) {
     let materialization_audit_intents = state.materialization_audit_intents();
     let WindowsWritableWorkerOptions {
         sync_root,
@@ -4762,6 +4908,14 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
     let suppressed_paths = Arc::new(Mutex::new(BTreeSet::new()));
     let content_stager = state.queue().content_stager();
     let cancelled = Arc::new(AtomicBool::new(false));
+    let explorer_status = Arc::new(Mutex::new(CloudFilesExplorerStatusProjector::new(
+        sync_root.clone(),
+        root_path.clone(),
+    )));
+    let operation_explorer_status = Arc::clone(&explorer_status);
+    let operation_started = Arc::new(move |command: &CloudFilesDfsMutationCommand| {
+        observe_explorer_upload(&operation_explorer_status, command);
+    });
     let worker = CloudFilesWritableSyncWorker::new(
         state,
         WindowsDirectoryChangeAccelerator::new(
@@ -4779,6 +4933,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
                 write_options,
                 Arc::clone(&cancelled),
                 Arc::clone(&mounted_mutation_handoff),
+                operation_started,
             ),
         ),
         WindowsDfsNamespaceSource::new(
@@ -4797,7 +4952,7 @@ pub(super) fn build_writable_worker<T: DfsMessageTransport>(
             content_stager,
         ),
     );
-    (worker, cancelled)
+    (worker, cancelled, explorer_status)
 }
 
 #[derive(Clone)]
@@ -4866,6 +5021,7 @@ pub(super) struct WindowsWritableWorkerHandle {
         mpsc::SyncSender<mpsc::SyncSender<Result<bool, CloudFilesModuleError>>>,
     worker_join: Option<JoinHandle<()>>,
     stopped_event: Arc<OwnedCrossThreadEvent>,
+    explorer_status: SharedExplorerStatusProjector,
 }
 
 pub(super) enum WindowsWritableWorkerWait {
@@ -4886,6 +5042,7 @@ impl WindowsWritableWorkerHandle {
         wake: Arc<WindowsWorkerWake>,
         emitter: WorkerLifecycleEmitter,
         initial_generation: u64,
+        explorer_status: SharedExplorerStatusProjector,
     ) -> Result<Self, CloudFilesModuleError>
     where
         T: DfsMessageTransport + Send + 'static,
@@ -4901,6 +5058,7 @@ impl WindowsWritableWorkerHandle {
         let thread_cancelled = Arc::clone(&cancelled);
         let thread_wake = Arc::clone(&wake);
         let thread_alive = Arc::clone(&alive);
+        let thread_explorer_status = Arc::clone(&explorer_status);
         let failure_emitter = emitter.clone();
         let (failure_sender, failure) = mpsc::channel();
         let (progress_sender, progress) = mpsc::sync_channel(1);
@@ -4950,6 +5108,7 @@ impl WindowsWritableWorkerHandle {
                         if thread_cancelled.load(Ordering::SeqCst) {
                             break;
                         }
+                        observe_explorer_state(&thread_explorer_status, worker.state());
                         generation = generation.saturating_add(1);
                         let ready = status.mode == CloudFilesLocalChangeSyncMode::Active;
                         last_generation.store(generation, Ordering::SeqCst);
@@ -4990,6 +5149,7 @@ impl WindowsWritableWorkerHandle {
                             .fetch_add(1, Ordering::SeqCst)
                             .saturating_add(1);
                         let status = worker.state().status();
+                        observe_explorer_state(&thread_explorer_status, worker.state());
                         failure_emitter.emit_failed(status, generation, &module_error);
                         let _ = failure_sender.send(module_error);
                     }
@@ -5002,6 +5162,7 @@ impl WindowsWritableWorkerHandle {
                             .fetch_add(1, Ordering::SeqCst)
                             .saturating_add(1);
                         let status = worker.state().status();
+                        observe_explorer_state(&thread_explorer_status, worker.state());
                         failure_emitter.emit_failed(status, generation, &module_error);
                         let _ = failure_sender.send(module_error);
                     }
@@ -5024,7 +5185,12 @@ impl WindowsWritableWorkerHandle {
             cursor_recovery_finalize: cursor_recovery_finalize_sender,
             worker_join: Some(worker_join),
             stopped_event,
+            explorer_status,
         })
+    }
+
+    pub(super) fn enable_explorer_status(&self) {
+        enable_explorer_status(&self.explorer_status);
     }
 
     pub(super) fn wait_for_stop_or_cancellation(
@@ -5269,6 +5435,135 @@ mod tests {
             changes,
             overflowed: false,
         }
+    }
+
+    #[test]
+    fn one_coalesced_wake_drains_every_queued_directory_change_batch() {
+        let (sender, receiver) = mpsc::sync_channel(DIRECTORY_CHANGE_CHANNEL_CAPACITY);
+        sender
+            .send(raw_batch(vec![CloudFilesDirectoryChange::Added(
+                PathBuf::from("first.txt"),
+            )]))
+            .expect("queue first directory-change batch");
+        sender
+            .send(raw_batch(vec![CloudFilesDirectoryChange::Modified(
+                PathBuf::from("second.txt"),
+            )]))
+            .expect("queue second directory-change batch");
+        sender
+            .send(raw_batch(vec![CloudFilesDirectoryChange::Added(
+                PathBuf::from("third.txt"),
+            )]))
+            .expect("queue third directory-change batch");
+
+        let drained = drain_directory_change_batches(&receiver)
+            .expect("drain every batch represented by one coalesced wake");
+        assert!(!drained.overflowed);
+        assert_eq!(
+            drained.changes,
+            vec![
+                CloudFilesDirectoryChange::Added(PathBuf::from("first.txt")),
+                CloudFilesDirectoryChange::Modified(PathBuf::from("second.txt")),
+                CloudFilesDirectoryChange::Added(PathBuf::from("third.txt")),
+            ]
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn coalesced_directory_change_backlog_over_budget_requires_full_scan() {
+        let (sender, receiver) = mpsc::sync_channel(DIRECTORY_CHANGE_CHANNEL_CAPACITY);
+        sender
+            .send(raw_batch(
+                (0..DIRECTORY_CHANGES_PER_PASS)
+                    .map(|index| {
+                        CloudFilesDirectoryChange::Added(PathBuf::from(format!(
+                            "first-{index}.txt"
+                        )))
+                    })
+                    .collect(),
+            ))
+            .expect("queue bounded directory-change batch");
+        sender
+            .send(raw_batch(vec![CloudFilesDirectoryChange::Added(
+                PathBuf::from("over-budget.txt"),
+            )]))
+            .expect("queue over-budget directory-change batch");
+
+        let drained = drain_directory_change_batches(&receiver)
+            .expect("classify over-budget coalesced backlog");
+        assert!(drained.overflowed);
+        assert!(drained.changes.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    fn test_stat(path: &str, kind: DfsObjectKind) -> dfs::DfsStat {
+        dfs::DfsStat {
+            file_system_id: dfs::sifs_file_system_id(),
+            object_id: sinomo_runtime::core::Id::derived(
+                "test.cloud-files.materialized-directory.object",
+                path.as_bytes(),
+            ),
+            path: path.to_string(),
+            kind,
+            version: sinomo_runtime::core::Id::derived(
+                "test.cloud-files.materialized-directory.version",
+                path.as_bytes(),
+            ),
+            content_hash: None,
+            size_bytes: None,
+            link_count: 1,
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 2,
+            created_at_unix_nanos: 3,
+            changed_at_unix_nanos: 4,
+            policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+            current_locations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn materialized_directory_scan_reintroduces_its_parent_manifest_entry() {
+        let path = "/services/sinomo-agent/channels";
+        let entry =
+            materialized_directory_manifest_entry(test_stat(path, DfsObjectKind::Directory))
+                .expect("materialized directory is projectable before its children");
+        assert_eq!(entry.path, path);
+        assert_eq!(entry.kind, "directory");
+
+        let error = materialized_directory_manifest_entry(test_stat(path, DfsObjectKind::File))
+            .expect_err("a stale materialization path cannot silently become a file");
+        assert!(error.contains("resolved as File"), "{error}");
+    }
+
+    #[test]
+    fn namespace_event_subscription_treats_idle_as_success() {
+        let timeouts = namespace_event_stream_timeouts();
+        assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(3)));
+        assert_eq!(timeouts.idle_timeout, None);
+    }
+
+    #[test]
+    fn absent_child_under_ordinary_local_directory_is_a_subtree_collision() {
+        let root = WindowsFilesystemTestDir::new("ordinary-ancestor-collision");
+        let ordinary = root.path().join("ordinary");
+        fs::create_dir(&ordinary).expect("create ordinary local ancestor");
+        let child = ordinary.join("remote-child");
+
+        let detail = blocking_local_placeholder_ancestor(root.path(), &child)
+            .expect("inspect local ancestors")
+            .expect("ordinary ancestor blocks placeholder creation");
+        assert!(detail.contains(&ordinary.display().to_string()), "{detail}");
+        assert!(detail.contains("not a Cloud Files placeholder"), "{detail}");
     }
 
     #[test]

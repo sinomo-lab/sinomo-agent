@@ -52,8 +52,8 @@ pub struct DfsDefaultClusterBootstrapOptions {
     pub materialize_local_metadata: bool,
     /// Failure domain advertised for this process's local DFS service.
     ///
-    /// Remote advertisements retain their previously published zones so a
-    /// bootstrap pass on one node cannot erase topology owned by another.
+    /// Each enabled DFS node owns only its local advertisement, so a bootstrap
+    /// pass cannot manufacture or overwrite another node's topology.
     pub local_zone: Option<String>,
 }
 
@@ -381,6 +381,15 @@ pub trait DfsDefaultClusterAsyncBootstrapHost: Send {
         service_node_ids
     }
 
+    fn metadata_service_node_ids_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> DfsDefaultClusterBootstrapFuture<'a, Vec<NodeId>> {
+        let service_node_ids = self.metadata_service_node_ids(state, service_node_ids);
+        Box::pin(async move { Ok(service_node_ids) })
+    }
+
     fn current_metadata_shard_async<'a>(
         &'a mut self,
         file_system_id: DfsFileSystemId,
@@ -655,6 +664,18 @@ impl DfsDefaultClusterBootstrapHost for DfsControlPlaneDefaultClusterBootstrapHo
         )
     }
 
+    fn metadata_service_node_ids(
+        &self,
+        state: &ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> Vec<NodeId> {
+        let entries = self
+            .control_plane
+            .range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+            .unwrap_or_default();
+        discovered_metadata_service_node_ids(state, service_node_ids, entries)
+    }
+
     fn current_metadata_shard(
         &self,
         file_system_id: &DfsFileSystemId,
@@ -837,6 +858,25 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             &self.local_node_id,
             node_id,
         )
+    }
+
+    fn metadata_service_node_ids_async<'a>(
+        &'a mut self,
+        state: &'a ClusterBootstrapState,
+        service_node_ids: Vec<NodeId>,
+    ) -> DfsDefaultClusterBootstrapFuture<'a, Vec<NodeId>> {
+        Box::pin(async move {
+            let entries = self
+                .control_plane
+                .range_prefix_async(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+                .await
+                .unwrap_or_default();
+            Ok(discovered_metadata_service_node_ids(
+                state,
+                service_node_ids,
+                entries,
+            ))
+        })
     }
 
     fn current_metadata_shard_async<'a>(
@@ -1772,7 +1812,10 @@ pub fn default_cluster_metadata_shard_with_host(
 ) -> Result<DfsMetadataShardConfig, DfsError> {
     let service_node_ids =
         host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
-    let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
+    let bootstrap_primary_node_id = service_node_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| state.local_node_id.clone());
     let default_target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
         &bootstrap_primary_node_id,
@@ -1849,9 +1892,13 @@ pub async fn default_cluster_metadata_shard_with_async_host(
     assignment: DfsMetadataShardAssignment,
     primary_offset: usize,
 ) -> Result<DfsMetadataShardConfig, DfsError> {
-    let service_node_ids =
-        host.metadata_service_node_ids(state, stable_dfs_service_node_ids(state));
-    let bootstrap_primary_node_id = default_cluster_sifs_owner(state);
+    let service_node_ids = host
+        .metadata_service_node_ids_async(state, stable_dfs_service_node_ids(state))
+        .await?;
+    let bootstrap_primary_node_id = service_node_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| state.local_node_id.clone());
     let default_target_primary_node_id = default_metadata_shard_primary_node_id(
         &service_node_ids,
         &bootstrap_primary_node_id,
@@ -2019,6 +2066,42 @@ fn select_metadata_namespace_prepare_codec(
     true
 }
 
+fn discovered_metadata_service_node_ids(
+    state: &ClusterBootstrapState,
+    service_node_ids: Vec<NodeId>,
+    entries: Vec<sinomo_core::kv::KvEntry>,
+) -> Vec<NodeId> {
+    if entries.is_empty() {
+        return service_node_ids;
+    }
+    let Ok(instances) = sinomo_core::service::service_instances_from_entries(&entries) else {
+        return service_node_ids;
+    };
+    let providers = sinomo_core::service::service_instances_providing_capability(
+        instances,
+        "dfs.metadata.replicate",
+    )
+    .into_iter()
+    .map(|instance| instance.node_id)
+    .collect::<BTreeSet<_>>();
+    if providers.is_empty() {
+        return service_node_ids;
+    }
+    let mut discovered = service_node_ids
+        .into_iter()
+        .filter(|node_id| node_id == &state.local_node_id || providers.contains(node_id))
+        .collect::<Vec<_>>();
+    if !discovered
+        .iter()
+        .any(|node_id| node_id == &state.local_node_id)
+    {
+        discovered.push(state.local_node_id.clone());
+    }
+    discovered.sort();
+    discovered.dedup();
+    discovered
+}
+
 pub fn stable_dfs_service_node_ids(state: &ClusterBootstrapState) -> Vec<NodeId> {
     let mut node_ids = dfs_service_members(state)
         .into_iter()
@@ -2044,22 +2127,10 @@ fn publish_dfs_service_advertisements_with_host(
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
 ) -> Result<(), DfsError> {
-    for member in dfs_service_members(state) {
-        let metadata_key = metadata_service_key(&member.node_id);
-        let content_key = content_service_key(&member.node_id);
-        let is_local = member.node_id == state.local_node_id;
-        let mut desired_metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
-        let mut desired_content = DfsNodeAdvertisement::content(member.node_id.clone());
-        if is_local {
-            desired_metadata.zone = local_zone.map(str::to_string);
-            desired_content.zone = local_zone.map(str::to_string);
-        }
-        let metadata = stable_dfs_advertisement(host, &metadata_key, desired_metadata, !is_local)?;
-        let content = stable_dfs_advertisement(host, &content_key, desired_content, !is_local)?;
-        host.put_node_advertisement(metadata_key, &metadata)?;
-        host.put_node_advertisement(content_key, &content)?;
-    }
-    Ok(())
+    // A node may advertise only the service it actually materialized. Cluster
+    // membership is not evidence that another member runs DFS; every enabled
+    // DFS module publishes its own record during its local lifecycle.
+    publish_local_dfs_service_advertisement_with_host(host, state, local_zone)
 }
 
 fn publish_local_dfs_service_advertisement_with_host(
@@ -2093,28 +2164,7 @@ async fn publish_dfs_service_advertisements_with_async_host(
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
 ) -> Result<(), DfsError> {
-    for member in dfs_service_members(state) {
-        let metadata_key = metadata_service_key(&member.node_id);
-        let content_key = content_service_key(&member.node_id);
-        let is_local = member.node_id == state.local_node_id;
-        let mut desired_metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
-        let mut desired_content = DfsNodeAdvertisement::content(member.node_id.clone());
-        if is_local {
-            desired_metadata.zone = local_zone.map(str::to_string);
-            desired_content.zone = local_zone.map(str::to_string);
-        }
-        let metadata =
-            stable_dfs_advertisement_async(host, metadata_key.clone(), desired_metadata, !is_local)
-                .await?;
-        let content =
-            stable_dfs_advertisement_async(host, content_key.clone(), desired_content, !is_local)
-                .await?;
-        host.put_node_advertisement_async(metadata_key, metadata)
-            .await?;
-        host.put_node_advertisement_async(content_key, content)
-            .await?;
-    }
-    Ok(())
+    publish_local_dfs_service_advertisement_with_async_host(host, state, local_zone).await
 }
 
 async fn publish_local_dfs_service_advertisement_with_async_host(
@@ -2200,6 +2250,65 @@ mod tests {
         DfsMetadataAuthorityAckFloor, LocalSobjMetadataBackend,
     };
     use sinomo_core::node::ClusterId;
+
+    #[test]
+    fn metadata_service_nodes_exclude_members_without_discovered_dfs_metadata() {
+        let state = test_cluster_state_with_members(
+            "cluster_dfs_metadata_provider_filter",
+            "node_dfs_metadata_provider_local",
+            &[
+                "node_dfs_metadata_provider_remote",
+                "node_dfs_metadata_provider_disabled",
+            ],
+        );
+        let remote = NodeId::from_legacy_named("node_dfs_metadata_provider_remote")
+            .expect("remote provider");
+        let disabled = NodeId::from_legacy_named("node_dfs_metadata_provider_disabled")
+            .expect("disabled member");
+        let now = OffsetDateTime::now_utc();
+        let records = [
+            sinomo_core::service::ServiceInstanceRecord {
+                service: "dfs".to_string(),
+                node_id: remote.clone(),
+                registry_version: 1,
+                routes: vec![crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.to_string()],
+                capabilities: vec!["dfs.metadata.replicate".to_string()],
+                updated_at: now,
+            },
+            sinomo_core::service::ServiceInstanceRecord {
+                service: "daemon".to_string(),
+                node_id: disabled,
+                registry_version: 1,
+                routes: vec!["/daemon/status".to_string()],
+                capabilities: vec!["daemon.status.read".to_string()],
+                updated_at: now,
+            },
+        ];
+        let entries = records
+            .into_iter()
+            .map(|record| sinomo_core::kv::KvEntry {
+                key: sinomo_core::service::cluster_service_instance_key(
+                    &record.service,
+                    &record.node_id,
+                ),
+                value: sinomo_core::kv::encode_kv_value(&record).expect("encode service"),
+                create_revision: sinomo_core::kv::KvRevision(1),
+                modify_revision: sinomo_core::kv::KvRevision(1),
+                version: sinomo_core::kv::KvVersion(1),
+                lease_id: None,
+            })
+            .collect();
+
+        let providers = discovered_metadata_service_node_ids(
+            &state,
+            stable_dfs_service_node_ids(&state),
+            entries,
+        );
+
+        assert!(providers.contains(&state.local_node_id));
+        assert!(providers.contains(&remote));
+        assert_eq!(providers.len(), 2);
+    }
 
     fn split_default_metadata_shards(
         file_system_id: &DfsFileSystemId,

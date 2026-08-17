@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{ClusterPaths, ObjectRpcRequest};
+use sinomo_core::node::NodeId;
 pub use sinomo_dfs::DfsCancellationFlag;
 use sinomo_dfs::{
     DfsDirEntry, DfsDirectoryPageCursor, DfsObjectId, DfsObjectKind, DfsPosixError, DfsStat,
@@ -54,6 +55,24 @@ pub fn daemon_sifs_with_timeout(
 ) -> Result<VfsHandle> {
     VfsHandle::new(
         Arc::new(DaemonSifsVfsBackend::new(address.into()).with_timeout(timeout)),
+        "/",
+    )
+}
+
+/// SIFS access through a connected daemon to an explicitly selected provider
+/// node. Node selection stays with the caller; this backend only delivers to
+/// that target through the daemon-owned cluster transport.
+pub fn daemon_sifs_on_node(
+    data_dir: SinomoDataDir,
+    address: impl Into<String>,
+    node_id: NodeId,
+) -> Result<VfsHandle> {
+    VfsHandle::new(
+        Arc::new(DaemonSifsVfsBackend::on_node(
+            data_dir,
+            address.into(),
+            node_id,
+        )),
         "/",
     )
 }
@@ -582,6 +601,7 @@ impl VfsBackend for MountedSifsVfsBackend {
 pub struct DaemonSifsVfsBackend {
     address: String,
     timeout: Duration,
+    target: Option<(SinomoDataDir, NodeId)>,
 }
 
 impl DaemonSifsVfsBackend {
@@ -589,12 +609,41 @@ impl DaemonSifsVfsBackend {
         Self {
             address,
             timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            target: None,
+        }
+    }
+
+    pub fn on_node(data_dir: SinomoDataDir, address: String, node_id: NodeId) -> Self {
+        Self {
+            address,
+            timeout: sinomo_core::network::DEFAULT_NETWORK_TIMEOUT,
+            target: Some((data_dir, node_id)),
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    fn send_rpc(
+        &self,
+        request: &ObjectRpcRequest,
+    ) -> std::result::Result<sinomo_core::network::ObjectRpcResponse, String> {
+        if let Some((data_dir, target_node_id)) = &self.target {
+            return sinomo_api::DaemonApiClient::at_address(self.address.clone())
+                .with_timeout(self.timeout)
+                .object_rpc_to_target_from_data_dir_with_affinity(
+                    data_dir,
+                    target_node_id,
+                    request.clone(),
+                    self.timeout,
+                    sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                )
+                .map_err(|source| source.to_string());
+        }
+        sinomo_api::send_daemon_rpc(&self.address, request, self.timeout)
+            .map_err(|source| source.to_string())
     }
 
     fn rpc<Request, Response>(
@@ -617,16 +666,9 @@ impl DaemonSifsVfsBackend {
                         source.to_string(),
                     )
                 })?;
-        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| {
-                daemon_non_absence_detail_to_vfs(
-                    self.backend_name(),
-                    path,
-                    route,
-                    source.to_string(),
-                )
-            },
-        )?;
+        let response = self.send_rpc(&request).map_err(|source| {
+            daemon_non_absence_detail_to_vfs(self.backend_name(), path, route, source)
+        })?;
         response.decode_body().map_err(|source| {
             daemon_non_absence_detail_to_vfs(self.backend_name(), path, route, source.to_string())
         })
@@ -643,9 +685,9 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string()),
-        )?;
+        let response = self
+            .send_rpc(&request)
+            .map_err(|source| daemon_read_file_detail_to_vfs(self.backend_name(), path, source))?;
         response.decode_body().map_err(|source| {
             daemon_read_file_detail_to_vfs(self.backend_name(), path, source.to_string())
         })
@@ -663,9 +705,9 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string()),
-        )?;
+        let response = self
+            .send_rpc(&request)
+            .map_err(|source| daemon_stat_detail_to_vfs(self.backend_name(), path, source))?;
         response.decode_body().map_err(|source| {
             daemon_stat_detail_to_vfs(self.backend_name(), path, source.to_string())
         })
@@ -687,11 +729,9 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| {
-                daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
-            },
-        )?;
+        let response = self.send_rpc(&request).map_err(|source| {
+            daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source)
+        })?;
         response.decode_body().map_err(|source| {
             daemon_read_file_prefix_detail_to_vfs(self.backend_name(), path, source.to_string())
         })
@@ -719,11 +759,9 @@ impl DaemonSifsVfsBackend {
         .map_err(|source| {
             daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
         })?;
-        let response = sinomo_api::send_daemon_rpc(&self.address, &request, self.timeout).map_err(
-            |source| {
-                daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
-            },
-        )?;
+        let response = self.send_rpc(&request).map_err(|source| {
+            daemon_list_directory_detail_to_vfs(self.backend_name(), path, source)
+        })?;
         response.decode_body().map_err(|source| {
             daemon_list_directory_detail_to_vfs(self.backend_name(), path, source.to_string())
         })

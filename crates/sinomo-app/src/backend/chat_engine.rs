@@ -32,6 +32,16 @@ use sinomo_runtime::local::SinomoDataDir;
 
 pub type ChatEventWake = Arc<dyn Fn() + Send + Sync + 'static>;
 
+/// Explicit filesystem provider required by every chat worker. Standalone
+/// mode deliberately opts into process-local SIFS; clustered mode carries a
+/// provider-discovering daemon transport and never silently falls back local.
+#[derive(Clone)]
+pub enum ChatFilesystemProvider {
+    LocalSifs,
+    Cluster(AgentChatSifsStorage),
+    Unavailable(String),
+}
+
 #[derive(Clone)]
 struct ChatEventSink {
     tx: Sender<ChatEvent>,
@@ -293,7 +303,7 @@ impl ChatHandle {
         data_dir: SinomoDataDir,
         daemon_connected: bool,
         runtime_control_registry: AgentRuntimeControlRegistry,
-        sifs_storage: Option<AgentChatSifsStorage>,
+        filesystem_provider: ChatFilesystemProvider,
         event_wake: Option<ChatEventWake>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<ChatCommand>();
@@ -303,7 +313,7 @@ impl ChatHandle {
         let tool_context = Arc::new(RwLock::new(None));
         let direct_control = DirectControl {
             data_dir: data_dir.clone(),
-            sifs_storage: sifs_storage.clone(),
+            filesystem_provider: filesystem_provider.clone(),
             runtime_control_registry: runtime_control_registry.clone(),
             active_session_id: active_session_id.clone(),
             evt_tx: evt_tx.clone(),
@@ -316,7 +326,7 @@ impl ChatHandle {
                     data_dir,
                     daemon_connected,
                     runtime_control_registry,
-                    sifs_storage,
+                    filesystem_provider,
                     active_session_id,
                     worker_tool_context,
                     cmd_rx,
@@ -394,7 +404,7 @@ impl Drop for ChatHandle {
 #[derive(Clone)]
 struct DirectControl {
     data_dir: SinomoDataDir,
-    sifs_storage: Option<AgentChatSifsStorage>,
+    filesystem_provider: ChatFilesystemProvider,
     runtime_control_registry: AgentRuntimeControlRegistry,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
     evt_tx: ChatEventSink,
@@ -454,9 +464,10 @@ impl DirectControl {
                 return;
             }
         };
-        let store = match &self.sifs_storage {
-            Some(storage) => storage.open_channel_store(),
-            None => SifsAgentChannelStore::open(&self.data_dir),
+        let store = match &self.filesystem_provider {
+            ChatFilesystemProvider::Cluster(storage) => storage.open_channel_store(),
+            ChatFilesystemProvider::LocalSifs => SifsAgentChannelStore::open(&self.data_dir),
+            ChatFilesystemProvider::Unavailable(detail) => Err(detail.clone()),
         };
         let projection = store
             .map_err(|detail| detail.to_string())
@@ -716,24 +727,29 @@ fn worker(
     data_dir: SinomoDataDir,
     daemon_connected: bool,
     runtime_control_registry: AgentRuntimeControlRegistry,
-    sifs_storage: Option<AgentChatSifsStorage>,
+    filesystem_provider: ChatFilesystemProvider,
     active_session_id: Arc<Mutex<Option<SessionId>>>,
     tool_context: Arc<RwLock<Option<AgentChatToolContext>>>,
     cmd_rx: Receiver<ChatCommand>,
     evt_tx: ChatEventSink,
 ) {
-    let chat_result = match sifs_storage {
-        Some(storage) => AgentChat::with_runtime_control_registry_and_sifs(
+    let chat_result = match filesystem_provider {
+        ChatFilesystemProvider::Cluster(storage) => {
+            AgentChat::with_runtime_control_registry_and_sifs(
+                data_dir,
+                daemon_connected,
+                runtime_control_registry,
+                storage,
+            )
+        }
+        ChatFilesystemProvider::LocalSifs => AgentChat::with_runtime_control_registry(
             data_dir,
             daemon_connected,
             runtime_control_registry,
-            storage,
         ),
-        None => AgentChat::with_runtime_control_registry(
-            data_dir,
-            daemon_connected,
-            runtime_control_registry,
-        ),
+        ChatFilesystemProvider::Unavailable(_) => {
+            AgentChat::with_runtime_control_registry(data_dir, true, runtime_control_registry)
+        }
     };
     let mut chat = match chat_result {
         Ok(chat) => chat,
@@ -1146,7 +1162,7 @@ mod tests {
             temp.data_dir.clone(),
             false,
             runtime_control.clone(),
-            None,
+            ChatFilesystemProvider::LocalSifs,
             None,
         );
         let ready = wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
@@ -1324,7 +1340,13 @@ mod tests {
     fn chat_worker_switches_agent_for_requested_new_session() {
         let temp = TempDataDir::new("chat-worker-agent-switch");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None, None);
+        let handle = ChatHandle::spawn(
+            temp.data_dir.clone(),
+            false,
+            runtime_control,
+            ChatFilesystemProvider::LocalSifs,
+            None,
+        );
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
 
@@ -1367,7 +1389,7 @@ mod tests {
             temp.data_dir.clone(),
             false,
             AgentRuntimeControlRegistry::new(),
-            None,
+            ChatFilesystemProvider::LocalSifs,
             None,
         );
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
@@ -1405,7 +1427,13 @@ mod tests {
         std::fs::create_dir_all(&workspace).expect("create workspace");
         let workspace = std::fs::canonicalize(workspace).expect("canonical workspace");
         let runtime_control = AgentRuntimeControlRegistry::new();
-        let handle = ChatHandle::spawn(temp.data_dir.clone(), false, runtime_control, None, None);
+        let handle = ChatHandle::spawn(
+            temp.data_dir.clone(),
+            false,
+            runtime_control,
+            ChatFilesystemProvider::LocalSifs,
+            None,
+        );
         wait_for_event(&handle, |event| matches!(event, ChatEvent::Ready { .. }))
             .expect("ready event");
 
@@ -1455,7 +1483,7 @@ mod tests {
             rx: evt_rx,
             direct_control: DirectControl {
                 data_dir: temp.data_dir.clone(),
-                sifs_storage: None,
+                filesystem_provider: ChatFilesystemProvider::LocalSifs,
                 runtime_control_registry: runtime_control,
                 active_session_id: Arc::new(Mutex::new(Some(session_id.clone()))),
                 evt_tx: ChatEventSink::new(evt_tx, None),

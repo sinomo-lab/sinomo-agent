@@ -3,18 +3,21 @@
 use crate::{
     DFS_DIRECT_READ_ROUTE, DFS_INSPECTION_ROUTE, DFS_MESSAGE_DATA_PLANE_ROUTES,
     DFS_METADATA_JOURNAL_BATCH_ROUTE, DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, DFS_RPC_CATEGORY,
-    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE, sifs_mount_config_definition,
-    sifs_mount_status_config_definition,
+    DFS_SMOKE_ROUTE, DFS_STATUS_ROUTE,
 };
+#[cfg(not(windows))]
+use crate::{sifs_mount_config_definition, sifs_mount_status_config_definition};
 use sinomo_core::{
     CapabilityName, FileSystemAccess, ModuleCapabilities, ModuleResourceLimits, NetworkAccess,
     TrustRing,
 };
+use std::path::{Path, PathBuf};
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
 pub const SINOMO_DFS_MODULE_LEGACY_ID: &str = "module.dfs";
 pub const SINOMO_DFS_MODULE_OWNER: &str = "sinomo-dfs";
 pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
+pub const SIFS_PATH_ACCESS_CAPABILITY: &str = "sifs.path.access";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 
 pub fn register_storage_paths(
@@ -125,6 +128,34 @@ pub fn dfs_module_id() -> sinomo_module::ModuleId {
         .expect("valid DFS module id")
 }
 
+/// Whether the built-in DFS module should be materialized in this node's
+/// runtime. DFS remains enabled by default for compatibility; an explicit
+/// native-Rust module state can disable it on an individual node.
+pub fn dfs_module_enabled(data_dir_root: impl AsRef<Path>) -> Result<bool, crate::DfsError> {
+    sinomo_module::native_rust_module_enabled(data_dir_root.as_ref(), &dfs_module_id(), true)
+        .map_err(|source| crate::DfsError::Metadata {
+            message: format!("cannot read DFS module runtime state: {source}"),
+        })
+}
+
+pub fn set_dfs_module_enabled(
+    data_dir_root: impl AsRef<Path>,
+    enabled: bool,
+    source: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<PathBuf, crate::DfsError> {
+    sinomo_module::set_native_rust_module_enabled(
+        data_dir_root.as_ref(),
+        &dfs_module_id(),
+        enabled,
+        source,
+        reason,
+    )
+    .map_err(|source| crate::DfsError::Metadata {
+        message: format!("cannot write DFS module runtime state: {source}"),
+    })
+}
+
 pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
     use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleSurfaces};
 
@@ -175,11 +206,19 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             ModuleRouteAuth::LocalOrClusterMember,
         ));
     }
-    surfaces = surfaces
-        .with_config_definition(sifs_mount_config_definition())
-        .expect("valid SIFS mount settings surface")
-        .with_config_definition(sifs_mount_status_config_definition())
-        .expect("valid SIFS mount status surface");
+    // Unix hosts mount SIFS through the built-in FUSE adapter, so the DFS
+    // registration owns the shared mount settings there. Windows delegates
+    // the adapter to the separately rolled out Cloud Files module, which must
+    // be the sole module-registry owner of these keys. Registering both owners
+    // makes a native-module refresh ambiguous and is rejected fail-closed.
+    #[cfg(not(windows))]
+    {
+        surfaces = surfaces
+            .with_config_definition(sifs_mount_config_definition())
+            .expect("valid SIFS mount settings surface")
+            .with_config_definition(sifs_mount_status_config_definition())
+            .expect("valid SIFS mount status surface");
+    }
     surfaces.capabilities = dfs_module_capabilities();
     surfaces
 }
@@ -308,6 +347,28 @@ mod tests {
                 .object_rpc_routes
                 .iter()
                 .all(|route| route.route != "/dfs/protocol/frame")
+        );
+
+        let settings = registration
+            .surfaces
+            .config_definitions()
+            .expect("decode DFS settings surfaces");
+        #[cfg(not(windows))]
+        assert_eq!(
+            settings
+                .iter()
+                .map(|definition| definition.key.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                crate::SIFS_MOUNT_CONFIG_KEY,
+                crate::SIFS_MOUNT_STATUS_CONFIG_KEY,
+            ],
+            "the built-in DFS module owns the FUSE mount settings on Unix"
+        );
+        #[cfg(windows)]
+        assert!(
+            settings.is_empty(),
+            "the native Cloud Files module must be the sole Windows mount-settings owner"
         );
     }
 

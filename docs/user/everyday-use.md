@@ -159,6 +159,36 @@ access is unnecessary, and choose a narrower SIFS root for everyday use. The
 `sinomo dfs help` lists inspection, pinning, conflict, and repair
 commands.
 
+On Windows, Cloud Files mounts are supervised by the main daemon and writable
+synchronization must be explicit:
+
+```powershell
+sinomo dfs mount 'D:\sinomo' --root / --background --sync-local-changes
+sinomo dfs mount --status --json
+```
+
+The same node-local mapping is available in the graphical app under
+**Settings > Modules > Cloud Files**. Set **Mount location** to the
+absolute host directory (for example `D:\sinomo`) and **SIFS root** to the DFS
+subtree to project (for example `/`). Enable local synchronization for a
+writable mount. The current supervisor supports one such mapping per node, and
+the read-only live mount status appears on the same module card.
+
+File Explorer continues to show Windows' standard Cloud Files availability and
+in-sync badges. For writable mounts it also shows **Waiting to upload**,
+**Uploading**, **Retrying**, **Conflict**, or **Sync failed** while Sinomo has
+matching durable work or attention evidence. A successfully completed item
+returns to the normal Windows in-sync status. These properties are pushed only
+when state changes; opening an Explorer folder does not query SIFS or start a
+background status scan.
+
+Disable the mount through `sinomo dfs mount --disable` rather than deleting the
+projected directory or unregistering it through Windows tools. The supervisor
+preserves registration identity, pending local evidence, and the exact provider
+needed after restart. The
+[Cloud Files architecture](../cloud-files-architecture.md) describes the
+Windows data paths and recovery model.
+
 ## Voice and Realtime Models
 
 List local microphones, cameras, and speakers:
