@@ -16,6 +16,9 @@ default = ["sandbox", "dfs-fuse"]
 sandbox = ["sinomo-cli/sandbox"]
 dfs-fuse = ["sinomo-cli/dfs-fuse"]
 native-devices = ["sinomo-cli/native-devices"]
+# Build the in-process model runtimes. Off by default: they pull in Candle and a
+# tokenizer, which most builds do not need.
+native-models = ["sinomo-cli/native-models"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli", default-features = false }

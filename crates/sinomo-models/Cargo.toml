@@ -24,3 +24,6 @@ safetensors = "0.8.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# A voice pack is a bare `torch.save(tensor)`, which Candle's state-dict loader skips, so the
+# archive is opened directly. This is the same version Candle itself already links.
+zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }

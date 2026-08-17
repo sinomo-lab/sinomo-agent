@@ -15,6 +15,8 @@ mod test_cases_agent;
 mod test_cases_cluster;
 mod test_cases_cluster_kv;
 mod test_cases_dfs;
+#[cfg(feature = "native-models")]
+mod test_cases_models;
 mod test_cases_network;
 
 pub(crate) use cluster::*;

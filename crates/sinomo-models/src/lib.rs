@@ -7,4 +7,5 @@
 //! pieces directly and returns explicit errors for pieces that still need a
 //! native implementation.
 
+pub mod kokoro;
 pub mod minicpm_v46;

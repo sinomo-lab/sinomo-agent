@@ -6,6 +6,111 @@ This crate is the home for model implementations that run directly inside the Si
 
 Each model module owns the details of its upstream checkpoint format and exposes Rust APIs that higher-level crates can use without knowing those checkpoint internals. Benchmark and validation binaries live here as support tooling for the native runtimes; they are not the purpose of the crate.
 
+## Kokoro-82M (text to speech)
+
+The `kokoro` module targets [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M), an
+Apache-licensed StyleTTS2 model with an ISTFTNet vocoder. It runs entirely in Rust on Candle: no
+Python bridge, no model server, no ONNX runtime.
+
+The model is **language-blind and takes phonemes, not text**. Grapheme-to-phoneme conversion is a
+separate concern and deliberately lives outside this crate, so `synthesize` takes a phoneme string
+and the checkpoint's own phoneme table is exposed as `PhonemeVocab`.
+
+Implemented pieces:
+
+- `config.json` parsing, including the ALBERT fields the file leaves at their defaults.
+- Weight loading straight from the upstream `kokoro-v1_0.pth`, reconstructing `weight_g`/`weight_v`
+  weight-normalized convolutions, and voice packs from the bare-tensor `voices/*.pt` files.
+- The phoneme-level ALBERT encoder, with the single shared layer group applied 12 times.
+- Bidirectional LSTMs, style-conditioned instance and layer norms, and both StyleTTS2 residual
+  blocks (`AdainResBlk1d` with its transposed-convolution upsample, `AdaInResBlock1` with learned
+  Snake activations).
+- The duration encoder and prosody predictor: per-phoneme durations, pitch and energy contours.
+- The ISTFTNet vocoder: harmonic-plus-noise excitation, the upsampling stack, and a centered STFT
+  pair implemented as a real-DFT matmul so it runs on any Candle device.
+- `atan2` and `align_corners=False` linear interpolation, neither of which Candle provides.
+
+Runtime commands:
+
+```sh
+# Fetch the checkpoint and one voice into the model cache (about 328 MB).
+cargo run -p sinomo-models --release --bin sinomo-models-kokoro -- --fetch
+
+# Synthesize phonemes to a WAV file.
+cargo run -p sinomo-models --release --bin sinomo-models-kokoro -- \
+  --phonemes "hɛlˈO fɹʌm sɪnˈOmO" --voice af_heart --output /tmp/speech.wav
+
+# Report what the runtime sees.
+cargo run -p sinomo-models --release --bin sinomo-models-kokoro -- --list-voices --json
+```
+
+Live end-to-end synthesis also runs through the runtime test registry. The cases are registered only
+when the CLI is built with `--features native-models`, and each reports what the synthesis cost in its
+own diagnostics:
+
+```sh
+sinomo test run models.kokoro.tts --live --json
+sinomo test run models.kokoro.tts-sentence --live --json
+sinomo test run models.kokoro.voices --live --json
+```
+
+Measured on this server (Core i9-12900H, CPU, `af_heart`):
+
+| Case | Result |
+| --- | --- |
+| `models.kokoro.tts` | 1.88 s of audio from 20 tokens in 2.04 s (0.92x real time) |
+| `models.kokoro.tts-sentence` | 4.93 s of audio from 79 tokens in 5.11 s (0.96x real time) |
+| `models.kokoro.voices` | 4 voices load, synthesize and differ in prosody |
+
+Each case also emits `sinomo.models.tts.*` metrics through `sinomo-observe`. Those reach
+`sinomo observe metrics` only when synthesis runs inside the daemon: that surface is served by
+daemon-registered exporters reading persisted state, so a short-lived `sinomo test run` process
+reports through its diagnostics instead.
+
+### Validation status
+
+`tests/kokoro_reference.rs` compares this runtime against the reference PyTorch implementation on the
+real checkpoint, stage by stage. Measured on the phonemes `hɛlˈO fɹʌm sɪnˈOmO` with the `af_heart`
+voice:
+
+| Stage | Max difference vs reference |
+| --- | ---: |
+| ALBERT last hidden state | 1.1e-6 relative |
+| Prosody conditioning (`bert_encoder`) | 4.5e-6 relative |
+| Pitch contour | 1.1e-5 relative |
+| Energy contour | 2.1e-6 relative |
+| Text encoder features | 1.6e-6 relative |
+| Aligned features | 1.6e-6 relative |
+| Decoder trunk (vocoder input) | 1.1e-5 relative |
+| Waveform | correlation 0.985, RMS within 0.7%, band energies within 8% |
+
+Predicted per-phoneme durations and the token sequence match exactly.
+
+The waveform is compared spectrally rather than sample by sample, and that is a property of the
+architecture rather than a weakened test. The vocoder's excitation integrates the pitch contour into
+a harmonic phase, and that integral amplifies single-precision differences without bound: perturbing
+the pitch contour by one part in 10^5 moves the excitation by several percent. That is the same
+magnitude as the difference between this runtime and the reference — and as the difference between
+two PyTorch runs on differently-vectorized CPUs. Two correct implementations therefore agree on what
+the audio sounds like, not on its individual samples. Where the two do differ in the interpolation
+itself, this runtime is the more accurate one: PyTorch computes `interpolate` source indices in
+`float32`, which is off by an ulp at large indices, while this implementation is exact.
+
+Reproducing the comparison needs a fixture set dumped from the reference with its stochastic
+excitation disabled; `SynthesisRequest::deterministic()` disables the same terms here.
+
+Current limitations:
+
+- Phonemes only; there is no grapheme-to-phoneme conversion in this crate.
+- One utterance at a time. Batched synthesis would work but the masking that padding requires is not
+  implemented, since inference never needs it.
+- CPU throughput is roughly real time for the whole model, so it is fast enough for offline synthesis
+  but leaves no headroom for streaming. The vocoder dominates: 108 dilated convolutions over one STFT
+  frame per five output samples.
+- Kokoro's phoneme table uses IPA letters, so the voiced velar stop is `ɡ` (U+0261) and not an ASCII
+  `g`. Phonemes outside the table are dropped and reported in `SynthesizedSpeech::unknown_phonemes`
+  rather than refused.
+
 ## MiniCPM-V 4.6
 
 The `minicpm_v46` module targets `openbmb/MiniCPM-V-4_6`.
