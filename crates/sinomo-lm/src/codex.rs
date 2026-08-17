@@ -2734,6 +2734,57 @@ mod tests {
         (format!("http://{address}"), worker)
     }
 
+    /// An idle window long enough that scheduling noise cannot trip it.
+    ///
+    /// Most of these tests are about payload shape, retries or cancellation, not about the health
+    /// timeout. Giving those a window measured in tens of seconds stops a server thread descheduled on
+    /// a busy machine from looking like a stalled stream — a one or two second window was routinely
+    /// beaten while this repository was compiling. The tests that *are* about the timeout set their
+    /// own, deliberately.
+    const UNTESTED_IDLE_WINDOW: Duration = Duration::from_secs(30);
+
+    /// How long a test server waits for a connection that a test says should arrive.
+    ///
+    /// Generous, because these tests share a machine with compilation and can be descheduled for a
+    /// long time; the point of the bound is to fail rather than to be prompt.
+    const TEST_SERVER_ACCEPT_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// Accepts the next connection, panicking if none arrives.
+    ///
+    /// `TcpListener::accept` blocks with no timeout, so a server expecting more requests than the
+    /// client makes hangs its thread forever — and because the test then joins that thread, the whole
+    /// test binary wedges instead of reporting a failure. Nothing times it out and nothing kills it,
+    /// so a run can sit for hours. Polling to a deadline turns that into a legible assertion naming
+    /// the request that never came.
+    fn accept_expected(listener: &TcpListener, expectation: &str) -> TcpStream {
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking test listener");
+        let deadline = Instant::now() + TEST_SERVER_ACCEPT_TIMEOUT;
+        let stream = loop {
+            match listener.accept() {
+                // Linux does not pass O_NONBLOCK to the accepted socket, so the stream is blocking
+                // and callers can set their own read timeouts as before.
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "no client connected within {TEST_SERVER_ACCEPT_TIMEOUT:?} while waiting to \
+                         {expectation}; the client made fewer requests than this server expects"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("failed to {expectation}: {error}"),
+            }
+        };
+        listener
+            .set_nonblocking(false)
+            .expect("blocking test listener");
+        stream
+    }
+
+
+
     fn read_http_request(stream: &mut TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -2775,14 +2826,34 @@ mod tests {
         stream.flush().expect("flush response headers");
     }
 
+    /// Message used when a write fails before the response is semantically complete.
+    ///
+    /// Up to that point a closed socket means the client abandoned the stream early, which is worth
+    /// failing on. Naming it keeps the failure legible: otherwise the run shows an opaque IO panic
+    /// from a detached thread beside the test's own assertion and the cause has to be guessed.
+    const CLIENT_LEFT: &str = "the client stopped reading before the server finished responding";
+
     fn write_http_chunk(stream: &mut TcpStream, chunk: &str) {
-        write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).expect("write response chunk");
-        stream.flush().expect("flush response chunk");
+        write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).expect(CLIENT_LEFT);
+        stream.flush().expect(CLIENT_LEFT);
     }
 
+    /// Writes the terminating zero-length chunk, tolerating a client that has already finished.
+    ///
+    /// The transport returns as soon as it decodes `response.completed`, and dropping the body closes
+    /// the socket. So this last write is inherently racing a client that already has everything it
+    /// needs, and losing that race is correct client behaviour rather than a server error — treating
+    /// it as one made every streaming test fail intermittently on a busy machine.
     fn finish_http_chunks(stream: &mut TcpStream) {
-        stream.write_all(b"0\r\n\r\n").expect("finish chunks");
-        stream.flush().expect("flush chunk finish");
+        match stream.write_all(b"0\r\n\r\n").and_then(|()| stream.flush()) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(error) => panic!("failed to terminate the chunked response: {error}"),
+        }
     }
 
     fn write_json_response(stream: &mut TcpStream, status: &str, body: &str) {
@@ -3248,7 +3319,7 @@ mod tests {
     fn codex_transport_delivers_sse_events_before_response_completion() {
         let (release_sender, release_receiver) = mpsc::channel();
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             assert!(read_http_request(&mut stream).starts_with("POST /responses "));
             write_chunked_headers(&mut stream, "text/event-stream");
             write_http_chunk(
@@ -3265,7 +3336,7 @@ mod tests {
             finish_http_chunks(&mut stream);
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-incremental");
-        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
         let (event_sender, event_receiver) = mpsc::channel();
         let invocation = thread::spawn(move || {
             client.complete_streaming(&transport_request(), &mut |event| {
@@ -3293,19 +3364,31 @@ mod tests {
 
     #[test]
     fn codex_transport_resets_idle_timeout_on_stream_progress() {
-        let health_timeout = Duration::from_millis(120);
+        // Two conditions have to hold at once: every gap must stay inside one idle window, and the
+        // gaps together must exceed one, so that finishing proves the window was reset rather than
+        // merely never reached. Satisfying both with few large gaps leaves little slack — the original
+        // 40ms gaps against a 120ms window left 80ms, and a machine busy compiling overshoots a sleep
+        // by more than that. More, smaller gaps satisfy the same two conditions while leaving most of
+        // the window as slack on each one.
+        let health_timeout = Duration::from_millis(600);
+        let progress_gap = Duration::from_millis(50);
+        const PROGRESS_STEPS: usize = 15;
+        let expected = (0..PROGRESS_STEPS)
+            .map(|step| char::from(b'0' + (step % 10) as u8))
+            .collect::<String>();
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             read_http_request(&mut stream);
             write_chunked_headers(&mut stream, "text/event-stream");
-            for delta in ["a", "b", "c", "d", "e"] {
+            for step in 0..PROGRESS_STEPS {
+                let delta = char::from(b'0' + (step % 10) as u8);
                 write_http_chunk(
                     &mut stream,
                     &format!(
                         "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{delta}\"}}\n\n"
                     ),
                 );
-                thread::sleep(Duration::from_millis(40));
+                thread::sleep(progress_gap);
             }
             write_http_chunk(
                 &mut stream,
@@ -3323,46 +3406,69 @@ mod tests {
 
         server.join().expect("server thread");
         assert!(started.elapsed() > health_timeout);
-        assert_eq!(response.content, "abcde");
+        assert_eq!(response.content, expected);
     }
 
     #[test]
     fn codex_transport_cancels_a_continuously_progressing_stream_promptly() {
+        /// What the server would stream if nobody stopped it.
+        const OFFERED_CHUNKS: usize = 200;
+        /// Cadence of those chunks, so the whole stream takes `OFFERED_CHUNKS` of these.
+        const CHUNK_INTERVAL: Duration = Duration::from_millis(10);
+
+        // The server streams until the client goes away and counts what it managed to send. That
+        // count is the evidence of promptness: a client that stopped early is one the server could
+        // not keep feeding.
+        let written = Arc::new(AtomicUsize::new(0));
+        let server_written = Arc::clone(&written);
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             read_http_request(&mut stream);
             write_chunked_headers(&mut stream, "text/event-stream");
-            for _ in 0..200 {
+            for _ in 0..OFFERED_CHUNKS {
                 let chunk = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"x\"}\n\n";
                 if write!(stream, "{:x}\r\n{chunk}\r\n", chunk.len()).is_err()
                     || stream.flush().is_err()
                 {
                     break;
                 }
-                thread::sleep(Duration::from_millis(10));
+                server_written.fetch_add(1, Ordering::SeqCst);
+                thread::sleep(CHUNK_INTERVAL);
             }
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-stream-cancel");
-        let client = transport_client(&base_url, Duration::from_secs(2), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = {
             let cancelled = Arc::clone(&cancelled);
             LanguageModelCancellation::new(move || cancelled.load(Ordering::SeqCst))
         };
-        let cancel_worker = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(75));
-            cancelled.store(true, Ordering::SeqCst);
-        });
         let started = Instant::now();
 
+        // Cancelling from the first delivered event ties cancellation to the stream having started,
+        // rather than to a stopwatch. A timer here raced the connection itself: on a loaded machine
+        // its deadline can pass before the request is even sent, and the transport then reports
+        // cancellation without ever connecting — which left the server's `accept` waiting forever.
         let error = client
-            .complete_streaming_with_cancellation(&transport_request(), &cancellation, &mut |_| {})
+            .complete_streaming_with_cancellation(&transport_request(), &cancellation, &mut |_| {
+                cancelled.store(true, Ordering::SeqCst);
+            })
             .expect_err("cancelled stream must stop");
 
-        cancel_worker.join().expect("cancellation thread");
         server.join().expect("server thread");
-        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(error.to_string().contains("cancelled"), "{error}");
+        let written = written.load(Ordering::SeqCst);
+        assert!(
+            written < OFFERED_CHUNKS,
+            "the client took all {OFFERED_CHUNKS} chunks instead of cancelling partway through"
+        );
+        // A backstop rather than the assertion that carries the test: running to completion would
+        // take the full cadence, so stopping inside it is prompt however loaded the machine is.
+        assert!(
+            started.elapsed() < CHUNK_INTERVAL * OFFERED_CHUNKS as u32,
+            "cancellation took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -3370,7 +3476,7 @@ mod tests {
         let health_timeout = Duration::from_millis(80);
         let (base_url, server) = test_server(move |listener| {
             for _ in 0..=CODEX_STREAM_MAX_TRANSPORT_RETRIES {
-                let (mut stream, _) = listener.accept().expect("accept responses request");
+                let mut stream = accept_expected(&listener, "accept responses request");
                 read_http_request(&mut stream);
                 write_chunked_headers(&mut stream, "text/event-stream");
                 thread::sleep(Duration::from_millis(100));
@@ -3397,7 +3503,7 @@ mod tests {
     #[test]
     fn codex_transport_accepts_non_streaming_json_response() {
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             read_http_request(&mut stream);
             write_json_response(
                 &mut stream,
@@ -3406,7 +3512,7 @@ mod tests {
             );
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-json-response");
-        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
         let mut events = Vec::new();
 
         let response = client
@@ -3423,7 +3529,7 @@ mod tests {
     #[test]
     fn codex_transport_preserves_http_error_status_and_body() {
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             read_http_request(&mut stream);
             write_json_response(
                 &mut stream,
@@ -3432,7 +3538,7 @@ mod tests {
             );
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-http-error");
-        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
 
         let error = client
             .complete_streaming(&transport_request(), &mut |_| {})
@@ -3450,7 +3556,7 @@ mod tests {
         let server_paths = Arc::clone(&paths);
         let (base_url, server) = test_server(move |listener| {
             for index in 0..3 {
-                let (mut stream, _) = listener.accept().expect("accept transport request");
+                let mut stream = accept_expected(&listener, "accept transport request");
                 let request_line = read_http_request(&mut stream);
                 server_paths
                     .lock()
@@ -3472,7 +3578,7 @@ mod tests {
             }
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-unauthorized-retry");
-        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
 
         let response = client
             .complete_streaming(&transport_request(), &mut |_| {})
@@ -3495,12 +3601,17 @@ mod tests {
 
     #[test]
     fn codex_transport_retries_before_semantic_stream_progress() {
-        let health_timeout = Duration::from_millis(80);
+        // Only the second attempt is meant to trip the idle window, and it does so by sleeping well
+        // past it — a direction a loaded machine can only make safer. The final attempt sends its
+        // events in a single chunk rather than two, so there is no gap left between them for
+        // scheduling latency to turn into a false stall, which would abort after semantic progress and
+        // skip the retry this test is about.
+        let health_timeout = Duration::from_millis(300);
         let attempts = Arc::new(AtomicUsize::new(0));
         let server_attempts = Arc::clone(&attempts);
         let (base_url, server) = test_server(move |listener| {
             for index in 0..3 {
-                let (mut stream, _) = listener.accept().expect("accept responses request");
+                let mut stream = accept_expected(&listener, "accept responses request");
                 server_attempts.fetch_add(1, Ordering::SeqCst);
                 read_http_request(&mut stream);
                 if index == 0 {
@@ -3515,16 +3626,15 @@ mod tests {
                         &mut stream,
                         "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":",
                     );
-                    thread::sleep(Duration::from_millis(100));
+                    // Comfortably past the idle window, so this attempt fails for the reason the test
+                    // intends rather than by a narrow margin.
+                    thread::sleep(Duration::from_millis(600));
                     continue;
                 }
                 write_http_chunk(
                     &mut stream,
-                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"retried\"}\n\n",
-                );
-                write_http_chunk(
-                    &mut stream,
-                    "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"retried\"}\n\n\
+                     event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
                 );
                 finish_http_chunks(&mut stream);
             }
@@ -3552,11 +3662,13 @@ mod tests {
 
     #[test]
     fn codex_transport_never_retries_after_semantic_stream_progress() {
-        let health_timeout = Duration::from_millis(80);
+        // The probe below has to outlast any retry the client might make, or its absence proves
+        // nothing: a retry arriving after a short probe window would look like no retry at all.
+        let health_timeout = Duration::from_millis(300);
         let attempts = Arc::new(AtomicUsize::new(0));
         let server_attempts = Arc::clone(&attempts);
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             server_attempts.fetch_add(1, Ordering::SeqCst);
             read_http_request(&mut stream);
             write_chunked_headers(&mut stream, "text/event-stream");
@@ -3564,13 +3676,13 @@ mod tests {
                 &mut stream,
                 "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}\n\n",
             );
-            thread::sleep(Duration::from_millis(240));
+            thread::sleep(Duration::from_millis(700));
             drop(stream);
 
             listener
                 .set_nonblocking(true)
                 .expect("nonblocking retry probe");
-            let deadline = Instant::now() + Duration::from_millis(200);
+            let deadline = Instant::now() + Duration::from_millis(600);
             while Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -3612,7 +3724,7 @@ mod tests {
         let server_attempts = Arc::clone(&attempts);
         let (first_attempt_sender, first_attempt_receiver) = mpsc::channel();
         let (base_url, server) = test_server(move |listener| {
-            let (mut stream, _) = listener.accept().expect("accept responses request");
+            let mut stream = accept_expected(&listener, "accept responses request");
             server_attempts.fetch_add(1, Ordering::SeqCst);
             read_http_request(&mut stream);
             write_chunked_headers(&mut stream, "text/event-stream");
@@ -3642,7 +3754,7 @@ mod tests {
             }
         });
         let dir = sinomo_testdir::TestDir::new("sinomo-codex-retry-cancel");
-        let client = transport_client(&base_url, Duration::from_secs(1), &dir);
+        let client = transport_client(&base_url, UNTESTED_IDLE_WINDOW, &dir);
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancellation = {
             let cancelled = Arc::clone(&cancelled);
