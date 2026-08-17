@@ -11,8 +11,11 @@ use sinomo_runtime::config::{
     ConfigSetRequest, ConfigSetResponse, ConfigWriteTarget,
 };
 use sinomo_runtime::module::{
-    MODULE_CLUSTER_CONFIG_KEY, MODULE_NODE_CONFIG_KEY, ModuleRuntimeConfig,
-    ModuleRuntimeConfigEntry, ModuleRuntimeConfigSource, read_declarative_module_loader_states,
+    MODULE_CLUSTER_CONFIG_KEY, MODULE_NATIVE_RUST_LIST_ROUTE, MODULE_NATIVE_RUST_SET_ENABLED_ROUTE,
+    MODULE_NODE_CONFIG_KEY, ModuleRuntimeConfig, ModuleRuntimeConfigEntry,
+    ModuleRuntimeConfigSource, NativeRustModuleListRequest, NativeRustModuleListResponse,
+    NativeRustModuleSetEnabledRequest, NativeRustModuleSetEnabledResponse,
+    read_declarative_module_loader_states,
     read_native_dylib_module_cache_entries_excluding_cache_keys,
     read_native_dylib_module_loader_states, read_native_rust_module_runtime_states,
 };
@@ -141,11 +144,18 @@ impl Backend {
         enabled: Option<bool>,
     ) -> Result<(), String> {
         if self.module_config_node_is_local(node_id) {
-            return self.set_local_module_override(module_id, enabled);
+            self.set_local_module_override(module_id, enabled)?;
+        } else {
+            let mut config = self.load_node_module_config(node_id)?;
+            apply_module_override(&mut config, module_id, enabled)?;
+            self.set_remote_node_module_config(node_id, &config)?;
         }
-        let mut config = self.load_node_module_config(node_id)?;
-        apply_module_override(&mut config, module_id, enabled)?;
-        self.set_remote_node_module_config(node_id, &config)
+        if let Some(enabled) = enabled
+            && native_rust_module_is_toggleable(module_id)
+        {
+            self.set_node_native_rust_module_enabled(node_id, module_id, enabled)?;
+        }
+        Ok(())
     }
 
     /// Writes a node override to the attached host's local configuration
@@ -232,6 +242,8 @@ impl Backend {
     ) -> Vec<ModuleConfigModuleSummary> {
         let mut modules = BTreeMap::<String, ModuleConfigModuleSummary>::new();
         let mut observations = BTreeMap::<String, (ModuleObservedState, String)>::new();
+        let mut selected_native_rust_observations =
+            BTreeMap::<String, (ModuleObservedState, String)>::new();
         let mut native_dylib_observations =
             BTreeMap::<String, (ModuleObservedState, String)>::new();
         let mut native_dylib_observation_error = None;
@@ -340,6 +352,52 @@ impl Backend {
                 );
             }
         }
+        if !observations.keys().any(|module_id| {
+            module_ids_match(module_id, sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID)
+        }) {
+            match sinomo_runtime::dfs::dfs_module_enabled(&self.data_dir.root()) {
+                Ok(enabled) => {
+                    observations.insert(
+                        sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
+                        (
+                            if enabled {
+                                ModuleObservedState::Running
+                            } else {
+                                ModuleObservedState::Stopped
+                            },
+                            format!(
+                                "Configured {} by the built-in native Rust default · restart the daemon after changing it",
+                                if enabled { "enabled" } else { "disabled" }
+                            ),
+                        ),
+                    );
+                }
+                Err(error) => warnings.push(format!("DFS module state unavailable: {error}")),
+            }
+        }
+        if let Some(node) = selected_node.filter(|_| self.connection.daemon_address().is_some()) {
+            match self.remote_native_rust_module_statuses(&node.summary.node_id) {
+                Ok(response) => {
+                    for module in response.modules {
+                        selected_native_rust_observations.insert(
+                            module.module_id,
+                            (
+                                if module.active {
+                                    ModuleObservedState::Running
+                                } else {
+                                    ModuleObservedState::Stopped
+                                },
+                                module.detail,
+                            ),
+                        );
+                    }
+                }
+                Err(error) => warnings.push(format!(
+                    "native Rust module observations unavailable on {}: {error}",
+                    node.summary.display_name
+                )),
+            }
+        }
         if let Ok(states) = read_declarative_module_loader_states(&self.data_dir.root()) {
             for state in states {
                 observations.insert(
@@ -364,6 +422,12 @@ impl Backend {
                 );
             }
         }
+        insert_module_summary(
+            &mut modules,
+            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+            "native-rust",
+            "Distributed filesystem provider module",
+        );
         insert_module_summary(
             &mut modules,
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
@@ -421,6 +485,12 @@ impl Backend {
             if selected_is_local {
                 let observation = if module.backend == "native-dylib" {
                     remove_matching_observation(&mut native_dylib_observations, &module.module_id)
+                } else if module.backend == "native-rust" {
+                    remove_matching_observation(
+                        &mut selected_native_rust_observations,
+                        &module.module_id,
+                    )
+                    .or_else(|| remove_matching_observation(&mut observations, &module.module_id))
                 } else {
                     remove_matching_observation(&mut observations, &module.module_id)
                 };
@@ -433,6 +503,23 @@ impl Backend {
                     (
                         ModuleObservedState::NotReported,
                         "The local loader has not published an observation".to_string(),
+                    )
+                });
+                module.observed = state;
+                module.observed_detail = detail;
+            } else if module.backend == "native-rust" {
+                let (state, detail) = remove_matching_observation(
+                    &mut selected_native_rust_observations,
+                    &module.module_id,
+                )
+                .unwrap_or_else(|| {
+                    (
+                        ModuleObservedState::Unavailable,
+                        if selected_node.is_some() {
+                            "This node did not report native Rust loader state".to_string()
+                        } else {
+                            "Select a node to inspect loader observations".to_string()
+                        },
                     )
                 });
                 module.observed = state;
@@ -479,6 +566,50 @@ impl Backend {
         Ok(())
     }
 
+    fn set_node_native_rust_module_enabled(
+        &self,
+        node_id: &str,
+        module_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if self.module_config_node_is_local(node_id) {
+            let module_id = parse_module_id(module_id)?;
+            sinomo_runtime::module::set_native_rust_module_enabled(
+                &self.data_dir.root(),
+                &module_id,
+                enabled,
+                "app-settings",
+                "operator changed node override from the Modules settings page",
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(());
+        }
+
+        let _: NativeRustModuleSetEnabledResponse = self.relay_rpc(
+            node_id,
+            MODULE_NATIVE_RUST_SET_ENABLED_ROUTE,
+            sinomo_runtime::module::MODULE_NATIVE_RUST_RPC_CATEGORY,
+            &NativeRustModuleSetEnabledRequest {
+                module_id: module_id.to_string(),
+                enabled,
+                reason: "operator changed node override from the Modules settings page".to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn remote_native_rust_module_statuses(
+        &self,
+        node_id: &str,
+    ) -> Result<NativeRustModuleListResponse, String> {
+        self.relay_rpc(
+            node_id,
+            MODULE_NATIVE_RUST_LIST_ROUTE,
+            sinomo_runtime::module::MODULE_NATIVE_RUST_RPC_CATEGORY,
+            &NativeRustModuleListRequest::default(),
+        )
+    }
+
     fn relay_config_rpc<Req, Resp>(
         &self,
         node_id: &str,
@@ -489,12 +620,26 @@ impl Backend {
         Req: serde::Serialize + ?Sized,
         Resp: DeserializeOwned,
     {
+        self.relay_rpc(node_id, route, CONFIG_RPC_CATEGORY, body)
+    }
+
+    fn relay_rpc<Req, Resp>(
+        &self,
+        node_id: &str,
+        route: &str,
+        category: &str,
+        body: &Req,
+    ) -> Result<Resp, String>
+    where
+        Req: serde::Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
         let address = self
             .connection
             .daemon_address()
-            .ok_or_else(|| "remote node module config requires a daemon connection".to_string())?;
+            .ok_or_else(|| "remote node module update requires a daemon connection".to_string())?;
         let target_node_id = parse_node_id(node_id)?;
-        let inner = ObjectRpcRequest::encode_body(route, CONFIG_RPC_CATEGORY, body)
+        let inner = ObjectRpcRequest::encode_body(route, category, body)
             .map_err(|error| error.to_string())?;
         let response = DaemonApiClient::at_address(address)
             .object_rpc_to_target_from_data_dir_with_affinity(
@@ -645,6 +790,22 @@ fn parse_node_id(node_id: &str) -> Result<NodeId, String> {
         .map_err(|error| format!("invalid node id `{node_id}`: {error}"))
 }
 
+fn parse_module_id(module_id: &str) -> Result<sinomo_runtime::module::ModuleId, String> {
+    let module_id = module_id.trim();
+    sinomo_runtime::module::ModuleId::new(module_id.to_string())
+        .or_else(|_| sinomo_runtime::module::ModuleId::from_legacy_named(module_id.to_string()))
+        .map_err(|error| format!("invalid module id `{module_id}`: {error}"))
+}
+
+pub(crate) fn native_rust_module_is_toggleable(module_id: &str) -> bool {
+    [
+        sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+        sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+    ]
+    .into_iter()
+    .any(|toggleable| module_ids_match(module_id, toggleable))
+}
+
 fn module_label(module_id: &str) -> String {
     match module_id {
         "module.observe" => return "Observability".to_string(),
@@ -688,6 +849,57 @@ mod tests {
         assert_eq!(module_label("module.sandbox.wasix"), "WASIX Sandbox");
         assert_eq!(module_label("module.dfs.cloud-files"), "Cloud Files");
         assert_eq!(module_label("module.custom-data_sync"), "Custom Data Sync");
+    }
+
+    #[test]
+    fn catalog_always_exposes_the_builtin_dfs_module() {
+        let backend = Backend::local_fallback();
+        let snapshot = backend.module_config_snapshot(None);
+        let dfs = snapshot
+            .modules
+            .iter()
+            .find(|module| {
+                module_ids_match(
+                    &module.module_id,
+                    sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                )
+            })
+            .expect("built-in DFS module");
+        assert_eq!(dfs.label, "Distributed Filesystem");
+        assert_eq!(dfs.backend, "native-rust");
+    }
+
+    #[test]
+    fn local_dfs_node_override_persists_native_rust_enablement() {
+        let backend = Backend::local_fallback();
+        let node_id = backend.node.node_id.to_string();
+
+        backend
+            .set_node_module_override(
+                &node_id,
+                sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                Some(false),
+            )
+            .expect("disable DFS from module settings");
+
+        assert!(
+            !sinomo_runtime::dfs::dfs_module_enabled(&backend.data_dir.root())
+                .expect("read DFS native Rust state")
+        );
+        let snapshot = backend.module_config_snapshot(Some(&node_id));
+        assert_eq!(
+            snapshot
+                .selected_node
+                .as_ref()
+                .and_then(|node| {
+                    module_config_setting(
+                        &node.config,
+                        sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                    )
+                })
+                .map(|setting| setting.enabled),
+            Some(false)
+        );
     }
 
     #[test]

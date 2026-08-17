@@ -19,9 +19,9 @@ use sinomo_runtime::dfs::{
     DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
     DfsPosixCreateAttrs, DfsPosixDistributedFilePrefixReadOutcome,
     DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, cluster_dfs_peer_node_ids,
-    content_services_prefix, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    default_dfs_pin_root, fallback_dfs_node_id, metadata_shards_prefix,
+    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
+    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
@@ -618,7 +618,10 @@ impl SifsFileManagerBackend {
         let Ok(state) = cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) else {
             return false;
         };
-        service.refresh_peer_targets(cluster_dfs_peer_node_ids(&state));
+        let Ok(peer_node_ids) = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state) else {
+            return false;
+        };
+        service.refresh_peer_targets(peer_node_ids);
         true
     }
 
@@ -2258,7 +2261,8 @@ impl SifsOneShotBulkWriteRequester {
         }
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+            .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
         let local_node_id = state.local_node_id;
 
         let peer_transport = sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
@@ -2351,7 +2355,9 @@ impl SifsOneShotBulkWriteRequester {
                 self.local_node_id, state.local_node_id
             ));
         }
-        Ok((cluster_dfs_peer_node_ids(&state), shards))
+        let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+            .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
+        Ok((peer_node_ids, shards))
     }
 
     fn lock_service_with_deadline(
@@ -2565,15 +2571,14 @@ fn open_sifs_service_read_only_until(
                 .map_err(|error| format!("cannot read local cluster state: {error}"))
         })
         .transpose()?;
-    let (local_node_id, peer_node_ids) = cluster_state.as_ref().map_or_else(
-        || (fallback_dfs_node_id(), Vec::new()),
-        |state| {
-            (
-                state.local_node_id.clone(),
-                cluster_dfs_peer_node_ids(state),
-            )
-        },
-    );
+    let (local_node_id, peer_node_ids) = match cluster_state.as_ref() {
+        Some(state) => (
+            state.local_node_id.clone(),
+            discovered_cluster_dfs_peer_node_ids(&cluster_paths, state)
+                .map_err(|error| format!("cannot discover DFS service peers: {error}"))?,
+        ),
+        None => (fallback_dfs_node_id(), Vec::new()),
+    };
     sifs_operation_remaining(operation_deadline, "opening the DFS content store")?;
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
@@ -2659,7 +2664,8 @@ fn open_sifs_service_with_hydration_until(
     let (local_node_id, peer_node_ids) = if cluster_paths.state.exists() {
         let state = cluster::read_cluster_state_without_kv(&cluster_paths)
             .map_err(|error| format!("cannot read local cluster state: {error}"))?;
-        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+            .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
         (state.local_node_id, peer_node_ids)
     } else {
         (fallback_dfs_node_id(), Vec::new())
@@ -4303,7 +4309,8 @@ fn sifs_replica_candidates(data_dir: &SinomoDataDir, local_node_id: &NodeId) -> 
     let Ok(state) = cluster::read_cluster_state_without_kv(&cluster_paths) else {
         return candidates;
     };
-    let routable_node_ids = cluster_dfs_peer_node_ids(&state)
+    let routable_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+        .unwrap_or_else(|_| vec![local_node_id.clone()])
         .into_iter()
         .collect::<BTreeSet<_>>();
     let graph = network::ClusterConnectivityGraph::read_for_local(&cluster_paths, &state);

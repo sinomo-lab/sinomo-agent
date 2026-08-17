@@ -59,6 +59,39 @@ pub const MODULE_POLICY_BLOCKED_EVENT_KIND: &str = "module.policy.blocked";
 pub const DECLARATIVE_MODULE_API_VERSION: &str = "sinomo.declarative.module.v1";
 pub const MODULE_RPC_CATEGORY: &str = "module";
 pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
+pub const MODULE_NATIVE_RUST_LIST_ROUTE: &str = "/module/native-rust";
+pub const MODULE_NATIVE_RUST_SET_ENABLED_ROUTE: &str = "/module/native-rust/set-enabled";
+pub const MODULE_NATIVE_RUST_RPC_CATEGORY: &str = "module.native-rust";
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleListRequest {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleStatus {
+    pub module_id: String,
+    pub configured_enabled: bool,
+    pub active: bool,
+    pub explicit: bool,
+    pub restart_required: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleListResponse {
+    pub modules: Vec<NativeRustModuleStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleSetEnabledRequest {
+    pub module_id: String,
+    pub enabled: bool,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeRustModuleSetEnabledResponse {
+    pub module: NativeRustModuleStatus,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SinomoModuleV1Context {

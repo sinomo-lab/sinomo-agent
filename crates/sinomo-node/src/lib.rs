@@ -246,7 +246,12 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "cluster.kv.vote")
         );
-        for capability in ["cluster.kv.read", "cluster.kv.write"] {
+        for capability in [
+            "cluster.kv.read",
+            "cluster.kv.write",
+            MODULE_NATIVE_RUST_READ_CAPABILITY,
+            MODULE_NATIVE_RUST_ADMIN_CAPABILITY,
+        ] {
             assert!(
                 voter_capabilities
                     .iter()

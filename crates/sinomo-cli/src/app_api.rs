@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sinomo_runtime::cluster;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,7 @@ type Handler = RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel>;
 const APP_CHAT_RUNTIME_DRAIN_INTERVAL: Duration = Duration::from_millis(25);
 const APP_CHAT_ATTACHMENT_TEXT_EXCERPT_BYTES: usize = 24 * 1024;
 pub const SIFS_AGENT_CHANNELS_ROOT: &str = "/services/sinomo-agent/channels";
+const SIFS_PATH_ACCESS_CAPABILITY: &str = sinomo_runtime::dfs::SIFS_PATH_ACCESS_CAPABILITY;
 const SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE: u64 = 128;
 const SIFS_AGENT_CHANNEL_METADATA_SCHEMA_VERSION: u32 = 1;
 const SIFS_AGENT_CHANNEL_HISTORY_METADATA_SCHEMA_VERSION: u32 = 1;
@@ -860,29 +861,143 @@ pub struct AppClusterInvite {
 /// Daemon-backed SIFS access for app agent-channel persistence.
 #[derive(Clone)]
 pub struct AgentChatSifsStorage {
+    data_dir: SinomoDataDir,
     address: String,
     runtime: tokio::runtime::Handle,
+    provider: Arc<OnceLock<AgentChatSifsProvider>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AgentChatSifsProvider {
+    LocalDaemon,
+    ClusterNode(NodeId),
 }
 
 impl AgentChatSifsStorage {
-    pub fn new(address: impl Into<String>, runtime: &tokio::runtime::Handle) -> Self {
+    pub fn new(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Self {
         Self {
+            data_dir,
             address: address.into(),
             runtime: runtime.clone(),
+            provider: Arc::new(OnceLock::new()),
         }
     }
 
-    pub fn open_channel_store(&self) -> Result<SifsAgentChannelStore, String> {
-        SifsAgentChannelStore::open_daemon_on_runtime(&self.address, &self.runtime)
+    fn provider(&self) -> Result<AgentChatSifsProvider, String> {
+        if let Some(provider) = self.provider.get() {
+            return Ok(provider.clone());
+        }
+        let provider = self.discover_provider()?;
+        let _ = self.provider.set(provider.clone());
+        Ok(provider)
     }
 
-    /// Build a cheap read transport into the SIFS service already owned by the
-    /// resident daemon. Keeping this handle beside the channel/checkpoint
-    /// stores prevents app catalog reads from mounting and hydrating a second
-    /// process-local DFS instance.
-    pub fn open_agent_catalog_vfs(&self) -> Result<VfsHandle, String> {
-        sinomo_runtime::vfs::daemon_sifs(self.address.clone()).map_err(|error| error.to_string())
+    fn discover_provider(&self) -> Result<AgentChatSifsProvider, String> {
+        let client = sinomo_runtime::api::DaemonApiClient::at_address(self.address.clone());
+        let status = client
+            .status()
+            .map_err(|error| format!("cannot read connected daemon status: {error}"))?;
+        let Some(cluster) = status.cluster else {
+            // Standalone daemons have no cluster KV in which to publish
+            // instances. The local registry is the only provider catalog.
+            return SifsBrowser::open_daemon_on_runtime(&self.address, &self.runtime)
+                .map(|_| AgentChatSifsProvider::LocalDaemon)
+                .map_err(|error| format!("local filesystem provider unavailable: {error}"));
+        };
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_runtime::kv::CLUSTER_KV_LOCAL_RANGE_PREFIX_ROUTE,
+            sinomo_runtime::kv::CLUSTER_KV_RPC_CATEGORY,
+            &sinomo_runtime::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
+        )
+        .map_err(|error| error.to_string())?;
+        let response = client
+            .call_request(&request)
+            .map_err(|error| format!("cannot discover filesystem providers: {error}"))?;
+        let read: sinomo_runtime::kv::KvLocalRead<Vec<sinomo_runtime::kv::KvEntry>> = response
+            .decode_body()
+            .map_err(|error| format!("cannot decode filesystem provider discovery: {error}"))?;
+        let providers = filesystem_provider_node_ids(&read.value, &cluster.node_id)?;
+        if providers.is_empty() {
+            return Err(format!(
+                "no cluster service instance provides {SIFS_PATH_ACCESS_CAPABILITY}"
+            ));
+        }
+        let mut failures = Vec::new();
+        for node_id in providers {
+            match SifsBrowser::open_daemon_node_on_runtime(
+                self.data_dir.clone(),
+                &self.address,
+                node_id.clone(),
+                &self.runtime,
+            ) {
+                Ok(_) => return Ok(AgentChatSifsProvider::ClusterNode(node_id)),
+                Err(error) => failures.push(format!("{node_id}: {error}")),
+            }
+        }
+        Err(format!(
+            "no discovered filesystem provider is reachable ({})",
+            failures.join("; ")
+        ))
     }
+
+    pub fn open_channel_store(&self) -> Result<SifsAgentChannelStore, String> {
+        match self.provider()? {
+            AgentChatSifsProvider::LocalDaemon => {
+                SifsAgentChannelStore::open_daemon_on_runtime(&self.address, &self.runtime)
+            }
+            AgentChatSifsProvider::ClusterNode(node_id) => {
+                SifsAgentChannelStore::open_daemon_node_on_runtime(
+                    self.data_dir.clone(),
+                    &self.address,
+                    node_id,
+                    &self.runtime,
+                )
+            }
+        }
+    }
+
+    /// Build a cheap read transport into the selected SIFS provider. Keeping
+    /// this handle beside the channel/checkpoint stores prevents app catalog
+    /// reads from mounting and hydrating a second process-local DFS instance.
+    pub fn open_agent_catalog_vfs(&self) -> Result<VfsHandle, String> {
+        match self.provider()? {
+            AgentChatSifsProvider::LocalDaemon => {
+                sinomo_runtime::vfs::daemon_sifs(self.address.clone())
+                    .map_err(|error| error.to_string())
+            }
+            AgentChatSifsProvider::ClusterNode(node_id) => {
+                sinomo_runtime::vfs::daemon_sifs_on_node(
+                    self.data_dir.clone(),
+                    self.address.clone(),
+                    node_id,
+                )
+                .map_err(|error| error.to_string())
+            }
+        }
+    }
+}
+
+fn filesystem_provider_node_ids(
+    entries: &[sinomo_runtime::kv::KvEntry],
+    local_node_id: &NodeId,
+) -> Result<Vec<NodeId>, String> {
+    let instances = sinomo_runtime::service::service_instances_from_entries(entries)
+        .map_err(|error| format!("cannot decode filesystem provider records: {error}"))?;
+    let mut providers = sinomo_runtime::service::service_instances_providing_capability(
+        instances,
+        SIFS_PATH_ACCESS_CAPABILITY,
+    )
+    .into_iter()
+    .map(|provider| provider.node_id)
+    .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    providers.sort_by_key(|provider| provider != local_node_id);
+    Ok(providers)
 }
 
 /// SIFS-backed channel store used by the app chat runtime.
@@ -909,6 +1024,16 @@ impl SifsAgentChannelStore {
         runtime: &tokio::runtime::Handle,
     ) -> Result<Self, String> {
         SifsBrowser::open_daemon_on_runtime(address, runtime).map(Self::from_browser)
+    }
+
+    pub fn open_daemon_node_on_runtime(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        node_id: NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        SifsBrowser::open_daemon_node_on_runtime(data_dir, address, node_id, runtime)
+            .map(Self::from_browser)
     }
 
     pub fn from_browser(browser: SifsBrowser) -> Self {
@@ -3203,6 +3328,16 @@ impl SifsAgentSessionCheckpointStore {
         SifsBrowser::open_daemon_on_runtime(address, runtime).map(|browser| Self { browser })
     }
 
+    fn open_daemon_node_on_runtime(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        node_id: NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        SifsBrowser::open_daemon_node_on_runtime(data_dir, address, node_id, runtime)
+            .map(|browser| Self { browser })
+    }
+
     fn checkpoint_dir(
         channel_id: &SessionId,
         participant_id: &TaskId,
@@ -3613,7 +3748,7 @@ impl AgentChat {
     ) -> Result<Self, CliError> {
         if daemon_connected {
             return Err(CliError::DaemonNotRunning {
-                detail: "connected GUI chat construction requires the resident daemon SIFS storage transport"
+                detail: "connected GUI chat construction requires a filesystem provider transport"
                     .to_string(),
             });
         }
@@ -3652,20 +3787,35 @@ impl AgentChat {
             storage
                 .open_agent_catalog_vfs()
                 .map_err(|detail| CliError::Parse {
-                    detail: format!("open resident daemon agent catalog SIFS failed: {detail}"),
+                    detail: format!("open filesystem provider agent catalog SIFS failed: {detail}"),
                 })?;
         let channel_store = storage
             .open_channel_store()
             .map_err(|detail| CliError::Parse {
                 detail: format!("open agent channel SIFS store failed: {detail}"),
             })?;
-        let session_checkpoint_store = SifsAgentSessionCheckpointStore::open_daemon_on_runtime(
-            &storage.address,
-            &storage.runtime,
-        )
-        .map_err(|detail| CliError::Parse {
-            detail: format!("open agent session checkpoint SIFS store failed: {detail}"),
-        })?;
+        let session_checkpoint_store =
+            match storage.provider().map_err(|detail| CliError::Parse {
+                detail: format!("resolve agent filesystem provider failed: {detail}"),
+            })? {
+                AgentChatSifsProvider::LocalDaemon => {
+                    SifsAgentSessionCheckpointStore::open_daemon_on_runtime(
+                        &storage.address,
+                        &storage.runtime,
+                    )
+                }
+                AgentChatSifsProvider::ClusterNode(node_id) => {
+                    SifsAgentSessionCheckpointStore::open_daemon_node_on_runtime(
+                        storage.data_dir.clone(),
+                        &storage.address,
+                        node_id,
+                        &storage.runtime,
+                    )
+                }
+            }
+            .map_err(|detail| CliError::Parse {
+                detail: format!("open agent session checkpoint SIFS store failed: {detail}"),
+            })?;
         Self::with_runtime_control_registry_and_stores(
             data_dir,
             daemon_connected,
@@ -7402,6 +7552,7 @@ struct RemoteSifsBrowser {
     address: String,
     timeout: Duration,
     runtime: Option<tokio::runtime::Handle>,
+    target: Option<(SinomoDataDir, NodeId)>,
 }
 
 impl SifsBrowser {
@@ -7435,6 +7586,7 @@ impl SifsBrowser {
             address: address.into(),
             timeout,
             runtime: None,
+            target: None,
         };
         Self::open_remote_backend(backend)
     }
@@ -7447,6 +7599,22 @@ impl SifsBrowser {
             address: address.into(),
             timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
             runtime: Some(runtime.clone()),
+            target: None,
+        };
+        Self::open_remote_backend(backend)
+    }
+
+    pub fn open_daemon_node_on_runtime(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        node_id: NodeId,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        let backend = RemoteSifsBrowser {
+            address: address.into(),
+            timeout: sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+            runtime: Some(runtime.clone()),
+            target: Some((data_dir, node_id)),
         };
         Self::open_remote_backend(backend)
     }
@@ -7830,6 +7998,20 @@ impl RemoteSifsBrowser {
         let request =
             ObjectRpcRequest::encode_body(route, sinomo_runtime::api::DAEMON_RPC_CATEGORY, body)
                 .map_err(|error| error.to_string())?;
+        if let Some((data_dir, target_node_id)) = &self.target {
+            return sinomo_runtime::api::DaemonApiClient::at_address(self.address.clone())
+                .with_timeout(self.timeout)
+                .object_rpc_to_target_from_data_dir_with_affinity(
+                    data_dir,
+                    target_node_id,
+                    request,
+                    self.timeout,
+                    sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                )
+                .map_err(|error| error.to_string())?
+                .decode_body()
+                .map_err(|error| error.to_string());
+        }
         let response = if let Some(runtime) = &self.runtime {
             runtime
                 .block_on(sinomo_runtime::api::send_daemon_rpc_async(
@@ -8773,6 +8955,48 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_provider_selection_filters_capability_and_prefers_local_node() {
+        let local = NodeId::from_legacy_named("node_app_sifs_provider_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_app_sifs_provider_remote").expect("remote");
+        let unrelated =
+            NodeId::from_legacy_named("node_app_sifs_provider_unrelated").expect("unrelated");
+        let now = OffsetDateTime::now_utc();
+        let entries = [
+            (
+                remote.clone(),
+                vec![SIFS_PATH_ACCESS_CAPABILITY.to_string()],
+            ),
+            (unrelated, vec!["daemon.status.read".to_string()]),
+            (local.clone(), vec![SIFS_PATH_ACCESS_CAPABILITY.to_string()]),
+        ]
+        .into_iter()
+        .map(|(node_id, capabilities)| {
+            let record = sinomo_runtime::service::ServiceInstanceRecord {
+                service: "daemon".to_string(),
+                node_id: node_id.clone(),
+                registry_version: 1,
+                routes: vec![sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE.to_string()],
+                capabilities,
+                updated_at: now,
+            };
+            sinomo_runtime::kv::KvEntry {
+                key: sinomo_runtime::service::cluster_service_instance_key("daemon", &node_id),
+                value: sinomo_runtime::kv::encode_kv_value(&record).expect("encode service"),
+                create_revision: sinomo_runtime::kv::KvRevision(1),
+                modify_revision: sinomo_runtime::kv::KvRevision(1),
+                version: sinomo_runtime::kv::KvVersion(1),
+                lease_id: None,
+            }
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            filesystem_provider_node_ids(&entries, &local).expect("provider selection"),
+            vec![local, remote]
+        );
+    }
+
+    #[test]
     fn app_catalog_summaries_use_the_supplied_read_transport() {
         let root = sinomo_testdir::TestDir::new("app-catalog-read-vfs");
         let vfs = VfsHandle::memory();
@@ -8808,8 +9032,8 @@ mod tests {
     }
 
     #[test]
-    fn connected_gui_chat_rejects_a_missing_resident_sifs_transport_before_local_mount() {
-        let root = sinomo_testdir::TestDir::new("connected-chat-missing-resident-sifs");
+    fn connected_gui_chat_rejects_a_missing_filesystem_provider_before_local_mount() {
+        let root = sinomo_testdir::TestDir::new("connected-chat-missing-filesystem-provider");
         let data_dir = SinomoDataDir::new(root.join("data"));
 
         let error = match AgentChat::with_runtime_control_registry(
@@ -8817,15 +9041,11 @@ mod tests {
             true,
             AgentRuntimeControlRegistry::new(),
         ) {
-            Ok(_) => panic!("connected chat must require resident daemon SIFS storage"),
+            Ok(_) => panic!("connected chat must require a filesystem provider"),
             Err(error) => error,
         };
 
-        assert!(
-            error
-                .to_string()
-                .contains("resident daemon SIFS storage transport")
-        );
+        assert!(error.to_string().contains("filesystem provider transport"));
         assert!(
             !data_dir.root().join("dfs").exists(),
             "a missing connected transport must fail before mounting local DFS"

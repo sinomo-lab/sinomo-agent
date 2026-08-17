@@ -1479,6 +1479,11 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
     let local_data_dir = SinomoDataDir::from_env_or_home().ok();
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
         .with_toggleable_native_rust_module_name(
+            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+            "distributed filesystem provider module",
+        )
+        .expect("DFS module id is valid")
+        .with_toggleable_native_rust_module_name(
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
             "operational observation module",
         )
@@ -5956,7 +5961,7 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const DAEMON_LOCKED_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DAEMON_LOCKED_REPROBE_INTERVAL: Duration = Duration::from_millis(50);
-// Candidate startup includes mandatory DFS recovery and native-module loading.
+// Candidate startup includes enabled-module recovery and native-module loading.
 // Cold, resource-constrained nodes can legitimately need more than one minute;
 // keep the controller and shadow supervisor on the same generous deadline.
 const DAEMON_ROLLOUT_TIMEOUT: Duration = Duration::from_secs(180);

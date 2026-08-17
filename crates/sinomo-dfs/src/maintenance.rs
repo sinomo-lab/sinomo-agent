@@ -35,12 +35,12 @@ use crate::{
     DfsTombstoneCompactionReport, DfsTransportIdentity, DfsVersion, DistributedRepairJob,
     LocalDfsMetadataJournalPublisherHost, NetworkedDfsService, NetworkedDfsServiceEvent,
     NetworkedDfsWriteOutcome, async_dfs_metadata_journal_batch_sender_from_peer_transport,
-    async_dfs_metadata_snapshot_install_sender_from_peer_transport, cluster_dfs_peer_node_ids,
+    async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     default_dfs_content_root_catalog_store, dfs_message_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport, dfs_metadata_replication_notice_lines,
     dfs_metadata_replication_sent_count, dfs_metadata_snapshot_install_sender_from_peer_transport,
-    dfs_now_unix_nanos, dfs_path_safe_segment, distributed_sifs,
-    open_cluster_dfs_service_with_message_sender,
+    dfs_now_unix_nanos, dfs_path_safe_segment, discovered_cluster_dfs_peer_node_ids,
+    distributed_sifs, open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_peer_transports_for_nodes,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state,
     open_cluster_dfs_service_with_peer_transports_for_nodes_and_recovery_state_until_cancelled,
@@ -128,7 +128,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         .map(|topology| topology.metadata_shards(&file_system.file_system_id))
         .transpose()?
         .unwrap_or_default();
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
@@ -376,7 +376,7 @@ where
             authoritative_prefix.clone(),
         )?;
     let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
 
     service.set_committed_work_tracker(committed_work_tracker);
     if !service.hydrate_from_metadata_backend_for_commit_promotion_recovery_until_cancelled(
@@ -450,7 +450,7 @@ where
             authoritative_prefix.clone(),
         )?;
     let metadata_shards = authoritative_topology.metadata_shards(&file_system.file_system_id)?;
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let mut maintenance_host = LocalDfsMaintenanceHost::new(data_dir.clone());
     let mut metadata_publisher_host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     let mut metadata_transport = AsyncDfsMetadataNodeTransport::new(
@@ -514,7 +514,7 @@ async fn run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_optional
         }
         None => Vec::new(),
     };
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let mut service = match (detached_send_state, should_cancel_hydration) {
         (Some(detached_send_state), Some(should_cancel_hydration)) => {
             let Some(service) =

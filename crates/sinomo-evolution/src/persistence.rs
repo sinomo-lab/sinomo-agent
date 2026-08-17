@@ -25,10 +25,10 @@ use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig,
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
     DfsPeerTransportFuture, DfsWriteOptions, LocalContentStore, NetworkedDfsService,
-    cluster_dfs_peer_node_ids, default_dfs_metadata_root, default_dfs_metadata_shards_root,
-    fallback_dfs_node_id, metadata_shards_prefix, open_local_sharded_metadata_backend,
-    open_root_local_metadata_backend, publish_cluster_dfs_metadata_journal_with_peer_transport,
-    sifs_file_system_id,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root,
+    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
+    open_local_sharded_metadata_backend, open_root_local_metadata_backend,
+    publish_cluster_dfs_metadata_journal_with_peer_transport, sifs_file_system_id,
 };
 use sinomo_runtime::eval::CommandRunResult;
 use sinomo_runtime::kv::read_cluster_kv_prefix_entries;
@@ -2700,7 +2700,13 @@ fn open_evolution_sifs_service(
                 detail: source.to_string(),
             }
         })?;
-        let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+        let peer_node_ids =
+            discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state).map_err(|source| {
+                EvolutionPersistenceError::Sifs {
+                    path: cluster_paths.root.display().to_string(),
+                    detail: source.to_string(),
+                }
+            })?;
         (state.local_node_id, peer_node_ids)
     } else {
         (fallback_dfs_node_id(), Vec::new())

@@ -11,11 +11,13 @@ use sinomo_core::{
     CapabilityName, FileSystemAccess, ModuleCapabilities, ModuleResourceLimits, NetworkAccess,
     TrustRing,
 };
+use std::path::{Path, PathBuf};
 
 pub const DFS_PROTOCOL: &str = "sinomo.dfs.v1";
 pub const SINOMO_DFS_MODULE_LEGACY_ID: &str = "module.dfs";
 pub const SINOMO_DFS_MODULE_OWNER: &str = "sinomo-dfs";
 pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
+pub const SIFS_PATH_ACCESS_CAPABILITY: &str = "sifs.path.access";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 
 pub fn register_storage_paths(
@@ -124,6 +126,34 @@ pub fn register_storage_paths(
 pub fn dfs_module_id() -> sinomo_module::ModuleId {
     sinomo_module::ModuleId::from_legacy_named(SINOMO_DFS_MODULE_LEGACY_ID)
         .expect("valid DFS module id")
+}
+
+/// Whether the built-in DFS module should be materialized in this node's
+/// runtime. DFS remains enabled by default for compatibility; an explicit
+/// native-Rust module state can disable it on an individual node.
+pub fn dfs_module_enabled(data_dir_root: impl AsRef<Path>) -> Result<bool, crate::DfsError> {
+    sinomo_module::native_rust_module_enabled(data_dir_root.as_ref(), &dfs_module_id(), true)
+        .map_err(|source| crate::DfsError::Metadata {
+            message: format!("cannot read DFS module runtime state: {source}"),
+        })
+}
+
+pub fn set_dfs_module_enabled(
+    data_dir_root: impl AsRef<Path>,
+    enabled: bool,
+    source: impl Into<String>,
+    reason: impl Into<String>,
+) -> Result<PathBuf, crate::DfsError> {
+    sinomo_module::set_native_rust_module_enabled(
+        data_dir_root.as_ref(),
+        &dfs_module_id(),
+        enabled,
+        source,
+        reason,
+    )
+    .map_err(|source| crate::DfsError::Metadata {
+        message: format!("cannot write DFS module runtime state: {source}"),
+    })
 }
 
 pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {

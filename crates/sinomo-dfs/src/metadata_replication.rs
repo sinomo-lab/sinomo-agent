@@ -25,6 +25,8 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
+#[cfg(test)]
+use crate::cluster_dfs_peer_node_ids;
 use crate::maintenance::{
     DfsMaintenanceExecutionExclusions, migrate_legacy_dfs_metadata_replication_cursor,
 };
@@ -43,13 +45,14 @@ use crate::{
     DfsObjectKind, DfsObjectRpcSendOptions, DfsObjectVersionRecord, DfsPeerTransport,
     DfsPeerTransportFuture, DfsVersion, LocalShardedMetadataBackend, LocalSobjMetadataBackend,
     NetworkedDfsServiceEvent, ResidentLocalMetadataShardLease, cluster_dfs_metadata_shards,
-    cluster_dfs_peer_node_ids, decode_dfs_metadata_journal_batch_rpc_response,
+    decode_dfs_metadata_journal_batch_rpc_response,
     decode_dfs_metadata_snapshot_install_rpc_response,
     default_dfs_metadata_replication_suppression_snapshot_path,
     dfs_metadata_journal_batch_rpc_call, dfs_metadata_snapshot_install_rpc_call,
-    dfs_now_unix_nanos, distributed_sifs, distributed_sifs_bootstrap_objects_for_nodes,
-    local_dfs_metadata_shard_path, metadata_shard_key, metadata_shard_membership_handoff_key,
-    open_local_metadata_shard_backend, put_local_dfs_metadata_replication_suppression,
+    dfs_now_unix_nanos, discovered_cluster_dfs_peer_node_ids, distributed_sifs,
+    distributed_sifs_bootstrap_objects_for_nodes, local_dfs_metadata_shard_path,
+    metadata_shard_key, metadata_shard_membership_handoff_key, open_local_metadata_shard_backend,
+    put_local_dfs_metadata_replication_suppression,
     read_dfs_metadata_replication_suppression_snapshot, sifs_file_system_id,
 };
 use crate::{metadata_cursor, metadata_lock};
@@ -378,7 +381,7 @@ pub fn publish_cluster_dfs_metadata_journal(
     let file_system = distributed_sifs(state.local_node_id.clone());
     let shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
 
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     let mut transport = DfsMetadataNodeTransport::new(peer_node_ids, sender, snapshot_sender);
     let mut host = LocalDfsMetadataJournalPublisherHost::new(data_dir.clone());
     publish_dfs_metadata_journal_with_host(
@@ -569,7 +572,7 @@ pub fn prepare_cluster_dfs_metadata_shard_publish_with_backend_and_execution_exc
     }
 
     let state = read_cluster_dfs_metadata_publish_state(cluster_paths)?;
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     let shard = cluster_dfs_metadata_shards(cluster_paths, &file_system_id)?
         .into_iter()
         .find(|shard| shard.shard_id == shard_id.0);
@@ -2809,7 +2812,7 @@ fn prepare_cluster_dfs_metadata_journal_publish(
     if let Some((_, only_shard_id)) = only_lane.as_ref() {
         shards.retain(|shard| shard.shard_id == only_shard_id.0);
     }
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let metadata_suppressions = read_dfs_metadata_replication_suppression_snapshot(
         &default_dfs_metadata_replication_suppression_snapshot_path(&data_dir),
     )?

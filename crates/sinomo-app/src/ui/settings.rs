@@ -79,7 +79,9 @@ use crate::backend::config::{
     set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
     text_verbosity_index,
 };
-use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
+use crate::backend::modules::{
+    ModuleConfigSnapshot, ModuleObservedState, module_ids_match, native_rust_module_is_toggleable,
+};
 use crate::backend::mounts::{
     SifsMountSettingsSnapshot, validate_connected_cloud_files_status_at, validate_sifs_mount_config,
 };
@@ -4341,7 +4343,7 @@ fn execute_settings_operation(
             enabled,
         } => SettingsOperationPayload::Modules((|| {
             backend.set_node_module_override(&node_id, &module_id, enabled)?;
-            let message = match enabled {
+            let mut message = match enabled {
                 Some(true) => format!(
                     "Node override enabled for {}",
                     module_display_id(&module_id)
@@ -4357,6 +4359,9 @@ fn execute_settings_operation(
                     module_display_id(&module_id)
                 ),
             };
+            if enabled.is_some() && native_rust_module_is_toggleable(&module_id) {
+                message.push_str("; restart that node's daemon to apply it");
+            }
             let snapshot = backend.module_config_snapshot(Some(&node_id));
             Ok(module_operation_success(backend, snapshot, Some(message)))
         })()),
@@ -18861,9 +18866,11 @@ mod tests {
                 .module_snapshot
                 .modules
                 .iter()
-                .any(|module| module.module_id
-                    == sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID),
-            "module settings should include built-in module targets"
+                .any(|module| module_ids_match(
+                    &module.module_id,
+                    sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                )),
+            "module settings should include the built-in DFS target"
         );
 
         let node_id = state
@@ -18876,8 +18883,8 @@ mod tests {
             SettingsOperationScope::Modules,
             SettingsOperation::SetNodeModuleOverride {
                 node_id,
-                module_id: sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID.to_string(),
-                enabled: Some(true),
+                module_id: sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
+                enabled: Some(false),
             },
         );
         let selected = state
@@ -18888,9 +18895,19 @@ mod tests {
         assert_eq!(
             selected
                 .config
-                .setting(sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID)
+                .setting(sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID)
                 .map(|setting| setting.enabled),
-            Some(true)
+            Some(false)
+        );
+        assert!(
+            !sinomo_runtime::dfs::dfs_module_enabled(&backend.data_dir.root())
+                .expect("read DFS module state")
+        );
+        assert!(
+            state
+                .module_action_status
+                .as_deref()
+                .is_some_and(|status| status.contains("restart that node's daemon"))
         );
     }
 

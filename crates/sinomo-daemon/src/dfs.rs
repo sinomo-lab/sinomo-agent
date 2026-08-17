@@ -6369,7 +6369,8 @@ fn take_daemon_dfs_message_mutation_service_for_maintenance(
     runtime: &tokio::runtime::Handle,
     metadata_authority_preflight: Option<&DaemonDfsMetadataAuthorityPreflight>,
 ) -> Result<DaemonDfsMaintenanceServiceLane, sinomo_dfs::DfsError> {
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(cluster_state);
+    let peer_node_ids =
+        sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, cluster_state)?;
     let metadata_authority_generation = match metadata_authority_preflight {
         Some(preflight)
             if preflight.authority.generation() == preflight.generation
@@ -7356,7 +7357,7 @@ fn read_daemon_dfs_message_peer_snapshot(
             Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
             Err(error) => return Err(daemon_dfs_network_error(error)),
         };
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     Ok(Some(DaemonDfsMessagePeerSnapshot {
         cluster_id: state.cluster_id.clone(),
         local_node_id: state.local_node_id.clone(),
@@ -7666,7 +7667,8 @@ fn prepare_daemon_dfs_commit_promotion_recovery(
         .recovery_scan_generation
         .load(Ordering::Acquire)
         != authority_generation;
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&cluster_state);
+    let peer_node_ids =
+        sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &cluster_state)?;
     let open_recovery_service = || {
         let content = sinomo_dfs::LocalContentStore::new(data_dir.dfs_dir().join("content"))?;
         let (peer_transport, async_peer_transport) =

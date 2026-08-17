@@ -399,12 +399,33 @@ fn mounted_sifs_replica_candidates_from_context(
 pub fn discover_mounted_sifs_content_replica_candidates_with_control_plane(
     control_plane: &dyn DfsControlPlaneKvClient,
 ) -> Result<Vec<DfsNodeId>, DfsError> {
-    let advertisements = control_plane
-        .range_prefix(content_services_prefix())
-        .map_err(DfsError::from)?
+    let mut candidates = mounted_sifs_content_replica_candidates(
+        control_plane
+            .range_prefix(content_services_prefix())
+            .map_err(DfsError::from)?
+            .into_iter()
+            .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok()),
+    );
+    let service_entries = control_plane
+        .range_prefix(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+        .map_err(DfsError::from)?;
+    if !service_entries.is_empty() {
+        let instances = sinomo_core::service::service_instances_from_entries(&service_entries)
+            .map_err(|source| DfsError::Metadata {
+                message: format!("cannot decode filesystem provider records: {source}"),
+            })?;
+        let providers = sinomo_core::service::service_instances_providing_capability(
+            instances,
+            "dfs.object.transfer",
+        )
         .into_iter()
-        .filter_map(|entry| entry.decode::<DfsNodeAdvertisement>().ok());
-    Ok(mounted_sifs_content_replica_candidates(advertisements))
+        .map(|instance| instance.node_id)
+        .collect::<std::collections::BTreeSet<_>>();
+        if !providers.is_empty() {
+            candidates.retain(|node_id| providers.contains(node_id));
+        }
+    }
+    Ok(candidates)
 }
 
 /// Returns the current content-service nodes eligible to store SIFS replicas.
@@ -1137,7 +1158,8 @@ mod tests {
 
     #[derive(Debug)]
     struct RecordingReplicaDiscoveryControlPlane {
-        entries: Vec<KvEntry>,
+        content_entries: Vec<KvEntry>,
+        service_entries: Vec<KvEntry>,
         prefixes: Mutex<Vec<String>>,
     }
 
@@ -1151,7 +1173,13 @@ mod tests {
                 .lock()
                 .expect("replica discovery prefixes")
                 .push(prefix.to_string());
-            Ok(self.entries.clone())
+            if prefix == content_services_prefix() {
+                Ok(self.content_entries.clone())
+            } else if prefix == sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX {
+                Ok(self.service_entries.clone())
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn put(&mut self, _key: String, _value: Vec<u8>) -> Result<KvRevision, KvError> {
@@ -1180,10 +1208,11 @@ mod tests {
             lease_id: None,
         };
         let control_plane = RecordingReplicaDiscoveryControlPlane {
-            entries: vec![
+            content_entries: vec![
                 entry(&client_advertisement),
                 entry(&DfsNodeAdvertisement::content(server.clone())),
             ],
+            service_entries: Vec::new(),
             prefixes: Mutex::new(Vec::new()),
         };
 
@@ -1198,7 +1227,56 @@ mod tests {
                 .lock()
                 .expect("replica discovery prefixes")
                 .as_slice(),
-            [content_services_prefix()]
+            [
+                content_services_prefix(),
+                sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
+            ]
+        );
+    }
+
+    #[test]
+    fn replica_discovery_excludes_stale_content_advertisements_for_disabled_dfs_nodes() {
+        let active = NodeId::from_legacy_named("node_replica_discovery_active").expect("active");
+        let disabled =
+            NodeId::from_legacy_named("node_replica_discovery_disabled").expect("disabled");
+        let revision = KvRevision(9);
+        let advertisement_entry = |node_id: &NodeId| KvEntry {
+            key: crate::content_service_key(node_id),
+            value: sinomo_core::kv::encode_kv_value(&DfsNodeAdvertisement::content(
+                node_id.clone(),
+            ))
+            .expect("encode DFS advertisement"),
+            create_revision: revision,
+            modify_revision: revision,
+            version: sinomo_core::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let service_record = sinomo_core::service::ServiceInstanceRecord {
+            service: "dfs".to_string(),
+            node_id: active.clone(),
+            registry_version: 1,
+            routes: vec![crate::DFS_STATUS_ROUTE.to_string()],
+            capabilities: vec!["dfs.object.transfer".to_string()],
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        let service_entry = KvEntry {
+            key: sinomo_core::service::cluster_service_instance_key("dfs", &active),
+            value: sinomo_core::kv::encode_kv_value(&service_record).expect("encode service"),
+            create_revision: revision,
+            modify_revision: revision,
+            version: sinomo_core::kv::KvVersion(1),
+            lease_id: None,
+        };
+        let control_plane = RecordingReplicaDiscoveryControlPlane {
+            content_entries: vec![advertisement_entry(&active), advertisement_entry(&disabled)],
+            service_entries: vec![service_entry],
+            prefixes: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            discover_mounted_sifs_content_replica_candidates_with_control_plane(&control_plane)
+                .expect("discover active content replicas"),
+            vec![active]
         );
     }
 

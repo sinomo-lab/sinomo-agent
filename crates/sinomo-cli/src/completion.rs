@@ -1356,6 +1356,12 @@ mod tests {
                 .iter()
                 .any(|item| item.label == "module.observe")
         );
+        assert!(
+            native_rust_modules
+                .items
+                .iter()
+                .any(|item| item.label == "module.dfs")
+        );
     }
 
     #[test]

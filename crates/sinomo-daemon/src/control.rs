@@ -153,11 +153,15 @@ const fn daemon_cluster_maintenance_request_plan(
     }
 }
 
-/// The main daemon owns the mandatory default DFS lifecycle. The shadow daemon
-/// is a supervisor and never owns cluster data; there is intentionally no
-/// configuration or environment input to this decision.
+/// The main daemon is the only process role which can own the default DFS
+/// lifecycle. Node-local module activation independently decides whether that
+/// role actually materializes DFS on this node.
 fn daemon_role_owns_default_dfs(label: &str) -> bool {
     label == "daemon"
+}
+
+fn daemon_owns_enabled_default_dfs(paths: &DaemonPaths, label: &str) -> bool {
+    daemon_role_owns_default_dfs(label) && crate::service_adapter::dfs_module_should_register(paths)
 }
 
 /// A settled one-node cluster has no peer whose later publication can repair
@@ -168,7 +172,7 @@ fn daemon_default_dfs_bootstrap_must_complete_before_serving(
     paths: &DaemonPaths,
     label: &str,
 ) -> Result<bool, DaemonError> {
-    if !daemon_role_owns_default_dfs(label) {
+    if !daemon_owns_enabled_default_dfs(paths, label) {
         return Ok(false);
     }
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
@@ -1858,7 +1862,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     }
 
     let mut default_dfs_reconciliation =
-        if daemon_role_owns_default_dfs(label) && startup_cluster_runtime_enabled {
+        if daemon_owns_enabled_default_dfs(&paths, label) && startup_cluster_runtime_enabled {
             let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
             let startup_cluster = cluster
                 .as_ref()
@@ -1921,7 +1925,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     // topology for their own network maintenance but must not schedule a DFS
     // lane, even when both roles share one data root during a handoff.
     let maintenance_default_dfs_enabled =
-        daemon_role_owns_default_dfs(label) && startup_cluster_runtime_enabled;
+        daemon_owns_enabled_default_dfs(&paths, label) && startup_cluster_runtime_enabled;
     let maintenance_connectivity_topology_subscription = if startup_cluster_runtime_enabled {
         Some(subscribe_daemon_connectivity_topology_sources(
             &paths,
@@ -2023,7 +2027,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
         );
     }
     drain_daemon_runtime_after_task_shutdown(&daemon_runtime);
-    if daemon_role_owns_default_dfs(label)
+    if daemon_owns_enabled_default_dfs(&paths, label)
         && let Err(error) = evict_daemon_dfs_message_service_cache_on_shutdown(&paths)
     {
         tracing::warn!(
@@ -6394,7 +6398,7 @@ fn open_daemon_sandbox_dfs_service_with_content_on_runtime(
     let data_dir = sinomo_core::local::SinomoDataDir::new(&data_dir);
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let peer_node_ids = sinomo_dfs::cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = sinomo_dfs::discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
     let transport = if let Some(runtime) = runtime {
         daemon_dfs_node_transport_on_runtime(
             state.local_node_id.clone(),
@@ -10067,7 +10071,7 @@ mod tests {
     }
 
     #[test]
-    fn mandatory_default_dfs_has_no_environment_disable_path() {
+    fn default_dfs_role_has_no_environment_disable_path() {
         for ignored_legacy_value in [None, Some("0"), Some("false"), Some("off")] {
             assert!(
                 daemon_role_owns_default_dfs("daemon"),
@@ -10075,6 +10079,14 @@ mod tests {
             );
         }
         assert!(!daemon_role_owns_default_dfs("shadow-daemon"));
+
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-default-dfs-module-toggle");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        assert!(daemon_owns_enabled_default_dfs(&paths, "daemon"));
+        sinomo_dfs::set_dfs_module_enabled(&root, false, "test", "disable DFS")
+            .expect("disable DFS");
+        assert!(!daemon_owns_enabled_default_dfs(&paths, "daemon"));
 
         let source = include_str!("control.rs");
         assert!(!source.contains(concat!("SINOMO_ENABLE_BACKGROUND_DFS_", "MAINTENANCE")));

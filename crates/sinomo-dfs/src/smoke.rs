@@ -15,7 +15,7 @@ use crate::{
     DfsMetadataShardConfig, DfsMetadataSnapshotInstallSender, DfsNodeAdvertisement, DfsObjectId,
     DfsPosixError, DfsVersion, DfsWriteOptions, LocalDfsMetadataJournalPublisherHost,
     NetworkedDfsService, NetworkedDfsServiceEvent, SIFS_SERVICES_PATH, SIFS_USERS_PATH,
-    cluster_dfs_metadata_shards, cluster_dfs_peer_node_ids, content_services_prefix,
+    cluster_dfs_metadata_shards, content_services_prefix, discovered_cluster_dfs_peer_node_ids,
     distributed_sifs, inspect_cluster_aware_dfs_status,
     open_cluster_dfs_service_with_message_sender_lazy, publish_dfs_metadata_journal_with_host,
 };
@@ -152,7 +152,7 @@ pub(crate) fn run_cluster_dfs_smoke_with_message_sender(
 
     let file_system = distributed_sifs(local_node_id.clone());
     let metadata_shards = cluster_dfs_metadata_shards(cluster_paths, &file_system.file_system_id)?;
-    let peer_node_ids = cluster_dfs_peer_node_ids(&state);
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     let routable_node_ids = dfs_smoke_routable_node_ids(&state.local_node_id, &peer_node_ids);
     let mut service = open_cluster_dfs_service_with_message_sender_lazy(
         data_dir,

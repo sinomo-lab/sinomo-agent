@@ -117,7 +117,7 @@ pub use advisory_lock::{
 pub use body_rpc::{
     DfsAttachmentMessageCommand, DfsAttachmentMessageResponse, DfsRpcAttachmentDescriptor,
 };
-pub use cluster_service::cluster_dfs_peer_node_ids;
+pub use cluster_service::{cluster_dfs_peer_node_ids, discovered_cluster_dfs_peer_node_ids};
 pub(crate) use cluster_service::{
     open_cluster_dfs_service_with_message_sender,
     open_cluster_dfs_service_with_message_sender_lazy,
@@ -416,9 +416,10 @@ pub use model::{
 };
 pub(crate) use model::{normalize_current_locations, path_index_key};
 pub use module_surface::{
-    DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, SINOMO_DFS_MODULE_LEGACY_ID,
-    SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_module_capabilities,
-    dfs_module_id, dfs_module_registration, dfs_module_surfaces, register_storage_paths,
+    DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, SIFS_PATH_ACCESS_CAPABILITY,
+    SINOMO_DFS_MODULE_LEGACY_ID, SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY,
+    dfs_module_capabilities, dfs_module_enabled, dfs_module_id, dfs_module_registration,
+    dfs_module_surfaces, register_storage_paths, set_dfs_module_enabled,
 };
 pub use mount_config::{
     SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE, SIFS_MOUNT_STATUS_CONFIG_KEY,

@@ -9,6 +9,11 @@ pub const DAEMON_SHADOW_SUPERVISE_CAPABILITY: &str = "daemon.shadow.supervise";
 /// Allows a current Raft voter to administer replicated cluster membership and
 /// identity through the daemon-owned cluster-control routes.
 pub const CLUSTER_CONTROL_ADMIN_CAPABILITY: &str = "cluster.control.admin";
+/// Allows a cluster member to inspect built-in native Rust module state.
+pub const MODULE_NATIVE_RUST_READ_CAPABILITY: &str = "module.native-rust.read";
+/// Allows a cluster member, subject to node-local remote-management consent,
+/// to change built-in native Rust module state on the target node.
+pub const MODULE_NATIVE_RUST_ADMIN_CAPABILITY: &str = "module.native-rust.admin";
 /// Advertised only by main daemons that understand snapshot-bound placement
 /// reconciliation jobs and their v1 control-plane namespace.
 pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reconciliation.v1";
@@ -37,6 +42,8 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new("cluster.kv.read").expect("static capability"),
         CapabilityName::new("cluster.kv.write").expect("static capability"),
         CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("static capability"),
+        CapabilityName::new(MODULE_NATIVE_RUST_READ_CAPABILITY).expect("static capability"),
+        CapabilityName::new(MODULE_NATIVE_RUST_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
             .expect("static capability"),
