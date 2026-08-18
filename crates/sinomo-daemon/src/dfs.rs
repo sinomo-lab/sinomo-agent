@@ -9388,6 +9388,7 @@ fn daemon_default_dfs_resident_reconciliation_projection(
         DAEMON_DEFAULT_DFS_MEMBER_PREFIX.to_string(),
         DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX.to_string(),
         DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX.to_string(),
+        sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX.to_string(),
         sinomo_dfs::metadata_services_prefix().to_string(),
         sinomo_dfs::content_services_prefix().to_string(),
     ];
@@ -9927,6 +9928,12 @@ struct DaemonDefaultDfsAdvertisementProjection<'a> {
     zone: &'a Option<String>,
 }
 
+#[derive(serde::Serialize)]
+struct DaemonDefaultDfsServiceInstanceProjection<'a> {
+    node_id: &'a NodeId,
+    capabilities: &'a [String],
+}
+
 fn daemon_default_dfs_reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
     if entry.key.starts_with(DAEMON_DEFAULT_DFS_MEMBER_PREFIX)
         && let Ok(member) = entry.decode::<sinomo_core::ClusterMemberRecord>()
@@ -9985,6 +9992,20 @@ fn daemon_default_dfs_reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
         .unwrap_or_else(|_| entry.value.clone());
         return value;
     }
+    if entry
+        .key
+        .starts_with(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
+        && let Ok(instance) = entry.decode::<sinomo_core::service::ServiceInstanceRecord>()
+    {
+        // Default placement discovers metadata providers from the generic
+        // service registry. Track exactly the fields consumed by that
+        // selection while excluding registry-version and refresh-time churn.
+        return sinomo_core::kv::encode_kv_value(&DaemonDefaultDfsServiceInstanceProjection {
+            node_id: &instance.node_id,
+            capabilities: &instance.capabilities,
+        })
+        .unwrap_or_else(|_| entry.value.clone());
+    }
     if (entry
         .key
         .starts_with(sinomo_dfs::metadata_services_prefix())
@@ -10033,6 +10054,7 @@ fn daemon_default_dfs_reconciliation_projection(
         DAEMON_DEFAULT_DFS_MEMBER_PREFIX,
         DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX,
         DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX,
+        sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX,
         sinomo_dfs::metadata_services_prefix(),
         sinomo_dfs::content_services_prefix(),
     ] {
@@ -10140,6 +10162,7 @@ fn daemon_default_dfs_reconciliation_key_is_relevant(key: &str) -> bool {
         || key.starts_with(DAEMON_DEFAULT_DFS_MEMBER_PREFIX)
         || key.starts_with(DAEMON_DEFAULT_DFS_ENDPOINT_PREFIX)
         || key.starts_with(DAEMON_DEFAULT_DFS_CONNECTIVITY_PREFIX)
+        || key.starts_with(sinomo_core::service::CLUSTER_SERVICES_KV_PREFIX)
         || key.starts_with(sinomo_dfs::metadata_services_prefix())
         || key.starts_with(sinomo_dfs::content_services_prefix())
 }
@@ -24575,6 +24598,85 @@ mod tests {
                 .pending_work()
                 .is_some_and(|work| work.reconcile_defaults),
             "endpoint address changes must rebuild failover placement"
+        );
+    }
+
+    #[test]
+    fn default_dfs_reactor_tracks_service_provider_semantics_without_refresh_loop() {
+        let root = temp_root("default-dfs-reactor-service-provider");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let local = NodeId::from_legacy_named("node_default_dfs_service_provider").expect("node");
+        let mut reactor =
+            DaemonDefaultDfsReconciliationReactor::new(&cluster_paths, &local).expect("reactor");
+        let startup = reactor.pending_work().expect("startup work");
+        reactor.complete_default_reconciliation(&startup);
+        reactor.complete_prior_process_recovery(&startup);
+
+        let key = sinomo_core::service::cluster_service_instance_key("dfs", &local);
+        let mut instance = sinomo_core::service::ServiceInstanceRecord {
+            service: "dfs".to_string(),
+            node_id: local.clone(),
+            registry_version: 1,
+            routes: vec!["dfs.metadata".to_string()],
+            capabilities: vec!["dfs.metadata.replicate".to_string()],
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                1,
+                vec![(
+                    key.clone(),
+                    sinomo_core::kv::encode_kv_value(&instance).expect("service instance"),
+                )],
+            ),
+        );
+        let discovered = reactor.pending_work().expect("provider discovery");
+        assert!(discovered.reconcile_defaults);
+        reactor.complete_default_reconciliation(&discovered);
+
+        instance.registry_version = 2;
+        instance.updated_at += time::Duration::seconds(30);
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                2,
+                vec![(
+                    key.clone(),
+                    sinomo_core::kv::encode_kv_value(&instance)
+                        .expect("refreshed service instance"),
+                )],
+            ),
+        );
+        assert_eq!(
+            reactor.pending_work(),
+            None,
+            "service registry refreshes are not placement topology"
+        );
+
+        instance.capabilities.clear();
+        observe_daemon_default_dfs_reconciliation(
+            &reactor._projection_tx,
+            &local,
+            &default_dfs_reactor_test_snapshot(
+                3,
+                vec![(
+                    key,
+                    sinomo_core::kv::encode_kv_value(&instance)
+                        .expect("changed service capabilities"),
+                )],
+            ),
+        );
+        assert!(
+            reactor
+                .pending_work()
+                .is_some_and(|work| work.reconcile_defaults),
+            "metadata-provider capability changes must rebuild placement"
         );
     }
 

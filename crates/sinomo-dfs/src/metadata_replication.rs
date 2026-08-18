@@ -1489,6 +1489,11 @@ pub struct DfsMetadataPublishScheduleOptions {
     pub max_retry_delay: Duration,
 }
 
+// Route-generation notifications are the fast path, but they are deliberately
+// coalesced process-local hints rather than a durable journal. Bound the safety
+// reprobe so a missed edge cannot strand metadata catch-up for minutes.
+const DFS_METADATA_MISSING_ROUTE_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+
 impl Default for DfsMetadataPublishScheduleOptions {
     fn default() -> Self {
         Self {
@@ -1657,7 +1662,8 @@ impl DfsMetadataPublishScheduler {
                 }
                 DfsMetadataPublishRetryClass::MissingRoute if options.max_retry_rounds > 0 => {
                     retry_rounds = 0;
-                    self.wait_for_retry_or_input(options.max_retry_delay).await;
+                    self.wait_for_retry_or_input(dfs_metadata_missing_route_retry_delay(&options))
+                        .await;
                     continue;
                 }
                 DfsMetadataPublishRetryClass::Complete
@@ -1697,6 +1703,12 @@ fn dfs_metadata_publish_retry_delay(
         .retry_delay
         .saturating_mul(multiplier)
         .min(options.max_retry_delay.max(options.retry_delay))
+}
+
+fn dfs_metadata_missing_route_retry_delay(options: &DfsMetadataPublishScheduleOptions) -> Duration {
+    options
+        .max_retry_delay
+        .min(DFS_METADATA_MISSING_ROUTE_RETRY_MAX_DELAY)
 }
 
 #[cfg(test)]
@@ -2028,6 +2040,24 @@ mod publish_scheduler_tests {
         assert_eq!(
             dfs_metadata_publish_retry_delay(&options, usize::MAX),
             Duration::from_millis(50)
+        );
+    }
+
+    #[test]
+    fn missing_route_safety_reprobe_has_a_short_hard_cap() {
+        let mut options = DfsMetadataPublishScheduleOptions {
+            max_retry_delay: Duration::from_secs(5 * 60),
+            ..DfsMetadataPublishScheduleOptions::default()
+        };
+        assert_eq!(
+            dfs_metadata_missing_route_retry_delay(&options),
+            Duration::from_secs(5)
+        );
+        options.max_retry_delay = Duration::from_millis(250);
+        assert_eq!(
+            dfs_metadata_missing_route_retry_delay(&options),
+            Duration::from_millis(250),
+            "an explicitly tighter retry remains authoritative"
         );
     }
 

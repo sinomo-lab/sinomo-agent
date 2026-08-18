@@ -42,6 +42,9 @@ static CLUSTER_KV_METADATA_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static CLUSTER_KV_READER_NODE_ID_CACHE: LazyLock<
     Mutex<HashMap<PathBuf, ClusterKvReaderNodeIdCacheEntry>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
+static CLUSTER_KV_CURRENT_SNAPSHOT_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, ClusterKvCurrentSnapshotCacheEntry>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(any(test, feature = "test-support"))]
 static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -50,6 +53,15 @@ static CLUSTER_KV_CACHED_SNAPSHOT_READS_FOR_TEST: LazyLock<Mutex<HashMap<PathBuf
 struct ClusterKvReaderNodeIdCacheEntry {
     mark: ClusterFileMark,
     node_id: NodeId,
+    last_used: u64,
+}
+
+#[derive(Clone)]
+struct ClusterKvCurrentSnapshotCacheEntry {
+    node_id: NodeId,
+    revision: KvRevision,
+    resident_lock_mark: ClusterFileMark,
+    snapshot: Arc<KvSnapshot>,
     last_used: u64,
 }
 
@@ -72,6 +84,63 @@ fn evict_cluster_kv_reader_node_id_cache_entry_if_needed(
     if let Some(path) = eviction_candidate {
         cache.remove(&path);
     }
+}
+
+fn evict_cluster_kv_current_snapshot_cache_entry_if_needed(
+    cache: &mut HashMap<PathBuf, ClusterKvCurrentSnapshotCacheEntry>,
+    protected: &PathBuf,
+) {
+    if cache.contains_key(protected) || cache.len() < FILE_CACHE_CAPACITY {
+        return;
+    }
+    let eviction_candidate = cache
+        .iter()
+        .filter(|(path, _)| *path != protected)
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(path, _)| path.clone());
+    if let Some(path) = eviction_candidate {
+        cache.remove(&path);
+    }
+}
+
+fn cached_cluster_kv_current_snapshot(
+    root: &PathBuf,
+    node_id: &NodeId,
+    revision: KvRevision,
+    resident_lock_mark: ClusterFileMark,
+) -> Option<Arc<KvSnapshot>> {
+    let mut cache = CLUSTER_KV_CURRENT_SNAPSHOT_CACHE.lock().ok()?;
+    let entry = cache.get_mut(root)?;
+    if entry.node_id != *node_id
+        || entry.revision != revision
+        || entry.resident_lock_mark != resident_lock_mark
+    {
+        return None;
+    }
+    entry.last_used = cluster_kv_metadata_cache_tick();
+    Some(Arc::clone(&entry.snapshot))
+}
+
+fn record_cluster_kv_current_snapshot(
+    root: PathBuf,
+    node_id: NodeId,
+    resident_lock_mark: ClusterFileMark,
+    snapshot: Arc<KvSnapshot>,
+) {
+    let Ok(mut cache) = CLUSTER_KV_CURRENT_SNAPSHOT_CACHE.lock() else {
+        return;
+    };
+    evict_cluster_kv_current_snapshot_cache_entry_if_needed(&mut cache, &root);
+    cache.insert(
+        root,
+        ClusterKvCurrentSnapshotCacheEntry {
+            node_id,
+            revision: snapshot.revision,
+            resident_lock_mark,
+            snapshot,
+            last_used: cluster_kv_metadata_cache_tick(),
+        },
+    );
 }
 
 fn cached_cluster_kv_reader_node_id(path: &PathBuf, mark: ClusterFileMark) -> Option<NodeId> {
@@ -519,8 +588,40 @@ pub(crate) fn read_cluster_kv_current_snapshot_arc(
     paths: &ClusterPaths,
 ) -> Result<Arc<KvSnapshot>, NetworkError> {
     let node_id = read_cluster_kv_reader_node_id(paths)?;
-    sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(&paths.kv_paths(), node_id)
-        .map_err(kv_err)
+    let kv_paths = paths.kv_paths();
+    let resident_revision = sinomo_kv::with_cluster_kv_resident_read_projection(
+        &kv_paths.raft_wal_paths(&node_id),
+        &node_id,
+        |projection| {
+            sinomo_kv::ClusterKvRaftResidentReadProjection::read_index_state(projection).revision
+        },
+    )
+    .transpose()
+    .map_err(kv_err)?
+    .map(|read| read.value);
+    let resident_lock_mark =
+        resident_revision.and_then(|_| cluster_file_mark(&kv_paths.raft_wal_paths(&node_id).lock));
+    if let (Some(revision), Some(resident_lock_mark)) = (resident_revision, resident_lock_mark)
+        && let Some(snapshot) =
+            cached_cluster_kv_current_snapshot(&paths.root, &node_id, revision, resident_lock_mark)
+    {
+        return Ok(snapshot);
+    }
+
+    let snapshot =
+        sinomo_kv::read_cluster_kv_current_snapshot_arc_for_node(&kv_paths, node_id.clone())
+            .map_err(kv_err)?;
+    if resident_revision.is_some_and(|revision| revision == snapshot.revision)
+        && let Some(resident_lock_mark) = resident_lock_mark
+    {
+        record_cluster_kv_current_snapshot(
+            paths.root.clone(),
+            node_id,
+            resident_lock_mark,
+            Arc::clone(&snapshot),
+        );
+    }
+    Ok(snapshot)
 }
 
 pub(crate) fn read_cluster_kv_current_or_cached_snapshot_arc_if_present(
@@ -1971,6 +2072,59 @@ mod tests {
             1,
             "a committed request with no events must not publish a false delta"
         );
+    }
+
+    #[test]
+    fn resident_current_snapshot_reuses_one_revision_projection() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cluster-resident-snapshot-reuse");
+        let data_dir = sinomo_local::SinomoDataDir::new(&root);
+        let paths = ClusterPaths::new(&data_dir);
+        paths.ensure().expect("cluster paths");
+        let node_id = NodeId::from_legacy_named("node_resident_snapshot_reuse").expect("node");
+        let state = ClusterBootstrapState::initialized_locally(
+            sinomo_node::ClusterId::from_legacy_named("cluster_resident_snapshot_reuse")
+                .expect("cluster"),
+            "resident snapshot reuse",
+            node_id.clone(),
+            "local",
+            "public-key",
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        crate::local_state_store::write_cluster_state(&paths, &state).expect("cluster state");
+
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Put {
+                key: "/cluster/services/reuse".to_string(),
+                value: b"value".to_vec(),
+                lease_id: None,
+            }),
+        )
+        .expect("seed resident raft");
+
+        let first = read_cluster_kv_current_snapshot_arc(&paths).expect("first snapshot");
+        let second = read_cluster_kv_current_snapshot_arc(&paths).expect("cached snapshot");
+
+        assert_eq!(first.revision, second.revision);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged resident revisions should not clone and canonicalize the complete KV snapshot"
+        );
+
+        append_cluster_raft_command(
+            &paths,
+            &node_id,
+            KvCommand::Op(KvOp::Put {
+                key: "/cluster/services/reuse".to_string(),
+                value: b"new-value".to_vec(),
+                lease_id: None,
+            }),
+        )
+        .expect("advance resident raft");
+        let advanced = read_cluster_kv_current_snapshot_arc(&paths).expect("advanced snapshot");
+        assert!(advanced.revision > second.revision);
+        assert!(!Arc::ptr_eq(&advanced, &second));
     }
 
     #[test]
