@@ -1050,6 +1050,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let full_shard_grace = DFS_POSIX_FULL_SHARD_ACK_GRACE.min(timeout);
         let mut freshly_acknowledged = BTreeSet::from([self.node_id.clone()]);
         let mut pending_prefix_probes = BTreeMap::<String, NodeId>::new();
+        let mut pending_catchup_batches = BTreeMap::<String, NodeId>::new();
         let mut pending_checkpoint_snapshots =
             BTreeMap::<String, MetadataCheckpointSnapshotAttempt>::new();
         // A caller can capture a target and then wait behind another DFS
@@ -1080,22 +1081,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // Ordinary durability barriers retain catch-up-first ordering:
             // unrelated incoming work may otherwise advance their live head
             // before the requested historical prefix is delivered.
+            let mut rejected_nodes = BTreeSet::new();
             if matches!(purpose, MetadataQuorumSyncPurpose::OrdinaryDurability) {
-                self.send_metadata_sync_catchup_batches(&target, probe_barrier_id)?;
+                rejected_nodes.extend(self.send_metadata_sync_catchup_batches(
+                    &target,
+                    probe_barrier_id,
+                    &mut pending_catchup_batches,
+                )?);
             }
-            let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
+            rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
                 &target,
                 probe_barrier_id,
                 &mut freshly_acknowledged,
                 &mut pending_prefix_probes,
                 purpose,
-            )?;
+            )?);
 
             let events = self.process_incoming()?;
             rejected_nodes.extend(record_metadata_sync_prefix_probe_events(
                 events,
                 &target,
                 &mut pending_prefix_probes,
+                &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -1103,6 +1110,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
+                    &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
                 freshly_acknowledged.clear();
@@ -1125,19 +1133,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &mut pending_checkpoint_snapshots,
                 purpose,
             )?;
-            self.send_metadata_sync_catchup_batches(&target, probe_barrier_id)?;
-            let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
+            let mut rejected_nodes = self.send_metadata_sync_catchup_batches(
+                &target,
+                probe_barrier_id,
+                &mut pending_catchup_batches,
+            )?;
+            rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
                 &target,
                 probe_barrier_id,
                 &mut freshly_acknowledged,
                 &mut pending_prefix_probes,
                 purpose,
-            )?;
+            )?);
             let events = self.process_incoming()?;
             rejected_nodes.extend(record_metadata_sync_prefix_probe_events(
                 events,
                 &target,
                 &mut pending_prefix_probes,
+                &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -1145,6 +1158,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
+                    &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
                 freshly_acknowledged.clear();
@@ -1172,19 +1186,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // exact probe immediately so a zero-wait caller does not need an
             // artificial extra loop; real network transports simply leave it
             // pending for the next wait/pump round.
-            self.send_metadata_sync_catchup_batches(&target, probe_barrier_id)?;
-            let mut rejected_nodes = self.send_metadata_sync_prefix_probes(
+            let mut rejected_nodes = self.send_metadata_sync_catchup_batches(
+                &target,
+                probe_barrier_id,
+                &mut pending_catchup_batches,
+            )?;
+            rejected_nodes.extend(self.send_metadata_sync_prefix_probes(
                 &target,
                 probe_barrier_id,
                 &mut freshly_acknowledged,
                 &mut pending_prefix_probes,
                 purpose,
-            )?;
+            )?);
             let events = self.process_incoming()?;
             rejected_nodes.extend(record_metadata_sync_prefix_probe_events(
                 events,
                 &target,
                 &mut pending_prefix_probes,
+                &mut pending_catchup_batches,
                 &mut freshly_acknowledged,
             ));
             if !rejected_nodes.is_empty()
@@ -1192,6 +1211,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 self.clear_superseded_metadata_sync_requests(
                     &mut pending_prefix_probes,
+                    &mut pending_catchup_batches,
                     &mut pending_checkpoint_snapshots,
                 );
                 freshly_acknowledged.clear();
@@ -1307,15 +1327,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn clear_superseded_metadata_sync_requests(
         &mut self,
         pending_prefix_probes: &mut BTreeMap<String, NodeId>,
+        pending_catchup_batches: &mut BTreeMap<String, NodeId>,
         pending_checkpoint_snapshots: &mut BTreeMap<String, MetadataCheckpointSnapshotAttempt>,
     ) {
         for request_id in pending_prefix_probes
             .keys()
+            .chain(pending_catchup_batches.keys())
             .chain(pending_checkpoint_snapshots.keys())
         {
             self.pending_metadata_replications.remove(request_id);
         }
         pending_prefix_probes.clear();
+        pending_catchup_batches.clear();
         pending_checkpoint_snapshots.clear();
     }
 
@@ -1332,11 +1355,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         target: &DfsMetadataQuorumSyncTarget,
         probe_barrier_id: &str,
-    ) -> Result<(), DfsError> {
+        pending_catchup_batches: &mut BTreeMap<String, NodeId>,
+    ) -> Result<BTreeSet<NodeId>, DfsError> {
         self.pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
         let Some(backend) = self.metadata_backend.as_deref() else {
-            return Ok(());
+            return Ok(BTreeSet::new());
         };
         let authority_epoch = target.authority_epoch.ok_or_else(|| DfsError::Metadata {
             message: format!(
@@ -1461,6 +1485,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .map(|(node_id, command, _)| (node_id.clone(), command.clone()))
             .collect::<Vec<_>>();
+        let mut directly_rejected_catchups = BTreeSet::new();
         let directly_accepted_catchups = if direct_requests.is_empty() {
             BTreeSet::new()
         } else {
@@ -1486,21 +1511,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         };
                         self.pending_metadata_replications
                             .insert(response.request_id.clone(), pending);
-                        let event =
-                            self.handle_metadata_journal_batch_response(source_node_id, response)?;
+                        let event = self.handle_metadata_journal_batch_response(
+                            source_node_id.clone(),
+                            response,
+                        )?;
                         // The direct lane is only authoritative after the
                         // common response validator accepts the exact durable
                         // sequence and confirmation identity. A completed but
                         // rejected/mismatched response must still use the
                         // routed compatibility path.
                         if matches!(
-                            event,
+                            &event,
                             Some(NetworkedDfsServiceEvent::MetadataJournalBatchApplied {
                                 verified_prefix_only: false,
                                 ..
                             })
                         ) {
                             accepted.insert(response_key);
+                        } else if matches!(
+                            event,
+                            Some(NetworkedDfsServiceEvent::MetadataJournalBatchRejected { .. })
+                        ) {
+                            directly_rejected_catchups.insert(source_node_id);
                         }
                     }
                     accepted
@@ -1521,15 +1553,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // cannot livelock a durability barrier.
             self.pending_metadata_replications
                 .insert(request_id.clone(), pending);
+            pending_catchup_batches.insert(request_id.clone(), target_node_id.clone());
             let sent = self.send_best_effort_message_if_routable(
                 &target_node_id,
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
             if !sent {
                 self.pending_metadata_replications.remove(&request_id);
+                pending_catchup_batches.remove(&request_id);
             }
         }
-        Ok(())
+        Ok(directly_rejected_catchups)
     }
 
     fn send_metadata_sync_prefix_probes(
@@ -2297,6 +2331,7 @@ fn record_metadata_sync_prefix_probe_events(
     events: Vec<NetworkedDfsServiceEvent>,
     target: &DfsMetadataQuorumSyncTarget,
     pending_prefix_probes: &mut BTreeMap<String, NodeId>,
+    pending_catchup_batches: &mut BTreeMap<String, NodeId>,
     freshly_acknowledged: &mut BTreeSet<NodeId>,
 ) -> BTreeSet<NodeId> {
     let mut rejected_node_ids = BTreeSet::new();
@@ -2310,6 +2345,7 @@ fn record_metadata_sync_prefix_probe_events(
                 verified_prefix_only,
                 ..
             } => {
+                pending_catchup_batches.remove(&request_id);
                 let Some(expected_node_id) = pending_prefix_probes.remove(&request_id) else {
                     continue;
                 };
@@ -2327,7 +2363,9 @@ fn record_metadata_sync_prefix_probe_events(
                 source_node_id,
                 ..
             } => {
-                if pending_prefix_probes.remove(&request_id).is_some() {
+                if pending_prefix_probes.remove(&request_id).is_some()
+                    || pending_catchup_batches.remove(&request_id).is_some()
+                {
                     rejected_node_ids.insert(source_node_id);
                 }
             }
@@ -2401,6 +2439,7 @@ mod tests {
         routed_fanout_targets: Vec<Vec<NodeId>>,
         catchup_rpc_requests: Vec<(usize, ObjectRpcRequest)>,
         snapshot_install_count: usize,
+        reject_catchup_batches: bool,
         reject_prefix_probes: bool,
         reject_snapshot_installs: bool,
         unroutable_nodes: BTreeSet<NodeId>,
@@ -2435,6 +2474,7 @@ mod tests {
                 routed_fanout_targets: Vec::new(),
                 catchup_rpc_requests: Vec::new(),
                 snapshot_install_count: 0,
+                reject_catchup_batches: false,
                 reject_prefix_probes: false,
                 reject_snapshot_installs: false,
                 unroutable_nodes: BTreeSet::new(),
@@ -2531,22 +2571,27 @@ mod tests {
             self.next_frame_id += 1;
             let response = match message.message {
                 DfsNetworkMessage::MetadataJournalBatch(command) => {
-                    let rejected = command.verify_prefix_only && self.reject_prefix_probes;
-                    let verified_authority_probe_id = command
-                        .durable_replication
-                        .as_ref()
-                        .map(|replication| replication.confirmation_id.clone())
-                        .or_else(|| {
+                    let rejected = (command.verify_prefix_only && self.reject_prefix_probes)
+                        || (!command.verify_prefix_only && self.reject_catchup_batches);
+                    let verified_authority_probe_id = (!rejected)
+                        .then(|| {
                             command
-                                .prefix_probe
+                                .durable_replication
                                 .as_ref()
-                                .and_then(|probe| probe.primary_handoff_id.clone())
+                                .map(|replication| replication.confirmation_id.clone())
+                                .or_else(|| {
+                                    command
+                                        .prefix_probe
+                                        .as_ref()
+                                        .and_then(|probe| probe.primary_handoff_id.clone())
+                                })
+                                .or_else(|| {
+                                    command.authority_probe.as_ref().and_then(
+                                        crate::service_replica::metadata_authority_probe_confirmation_id,
+                                    )
+                                })
                         })
-                        .or_else(|| {
-                            command.authority_probe.as_ref().and_then(
-                                crate::service_replica::metadata_authority_probe_confirmation_id,
-                            )
-                        });
+                        .flatten();
                     DfsNetworkMessage::MetadataJournalBatchResponse(
                         DfsMetadataJournalBatchResponse {
                             request_id: command.request_id,
@@ -2569,7 +2614,7 @@ mod tests {
                             verified_authority_probe_id,
                             result: if rejected {
                                 DfsMetadataJournalBatchResult::Rejected {
-                                    reason: "test prefix rejection".to_string(),
+                                    reason: "test metadata journal rejection".to_string(),
                                 }
                             } else {
                                 DfsMetadataJournalBatchResult::Applied
@@ -3057,9 +3102,14 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture direct catch-up target");
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "direct-catchup-probe")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "direct-catchup-probe",
+                &mut pending_catchups,
+            )
             .expect("send concurrent direct catch-up batch");
 
         assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
@@ -3105,9 +3155,14 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture partial direct catch-up target");
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "partial-direct-catchup-probe")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "partial-direct-catchup-probe",
+                &mut pending_catchups,
+            )
             .expect("fall back omitted direct catch-ups to routed sends");
 
         assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
@@ -3159,9 +3214,14 @@ mod tests {
             .service
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture partial direct prefix target");
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "partial-direct-prefix-catchup")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "partial-direct-prefix-catchup",
+                &mut pending_catchups,
+            )
             .expect("prime every replica cursor");
 
         fixture.service.transport.direct_prefix_nodes = BTreeSet::from([replicas[0].clone()]);
@@ -3207,9 +3267,14 @@ mod tests {
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture direct-error fallback target");
 
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "direct-error-catchup")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "direct-error-catchup",
+                &mut pending_catchups,
+            )
             .expect("route catch-up after the direct lane fails");
         assert_eq!(
             fixture.service.transport.catchup_rpc_requests.len(),
@@ -3258,9 +3323,14 @@ mod tests {
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture confirmation fallback target");
 
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "direct-confirmation-fallback")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "direct-confirmation-fallback",
+                &mut pending_catchups,
+            )
             .expect("route catch-up after an unconfirmed direct response");
 
         assert_eq!(fixture.service.transport.direct_catchup_batch_count, 1);
@@ -3370,9 +3440,14 @@ mod tests {
             .capture_metadata_quorum_sync_target(&fixture.object)
             .expect("capture target");
 
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "large-catchup-probe")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "large-catchup-probe",
+                &mut pending_catchups,
+            )
             .expect("send large POSIX catch-up");
         let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
         else {
@@ -3426,9 +3501,14 @@ mod tests {
             .capture_metadata_quorum_sync_target(&large)
             .expect("capture large target");
 
+        let mut pending_catchups = BTreeMap::new();
         fixture
             .service
-            .send_metadata_sync_catchup_batches(&target, "single-large-catchup-probe")
+            .send_metadata_sync_catchup_batches(
+                &target,
+                "single-large-catchup-probe",
+                &mut pending_catchups,
+            )
             .expect("route the large entry");
 
         let [(batch_bytes, request)] = fixture.service.transport.catchup_rpc_requests.as_slice()
@@ -5487,6 +5567,32 @@ mod tests {
     }
 
     #[test]
+    fn rejected_catchup_escalates_to_checkpoint_snapshot() {
+        let replica = node("node_sync_rejected_catchup_replica");
+        let mut fixture = configured_sync_fixture(
+            "rejected_catchup",
+            vec![replica.clone()],
+            vec![replica.clone()],
+        );
+        fixture.service.transport.reject_catchup_batches = true;
+        let target = fixture
+            .service
+            .capture_metadata_quorum_sync_target(&fixture.object)
+            .expect("capture rejected catch-up target");
+
+        let certificate = fixture
+            .service
+            .sync_metadata_shard_to_quorum(&target, Duration::from_millis(35))
+            .expect("a checkpoint snapshot must recover a rejected journal catch-up");
+
+        assert!(certificate.acknowledged_node_ids.contains(&replica));
+        assert_eq!(
+            fixture.service.transport.snapshot_install_count, 1,
+            "one catch-up rejection must trigger one exact checkpoint repair"
+        );
+    }
+
+    #[test]
     fn rejected_checkpoint_snapshot_is_built_and_sent_once_per_frozen_target() {
         let replica = node("node_sync_rejected_checkpoint_replica");
         let mut fixture =
@@ -5585,9 +5691,12 @@ mod tests {
                 .expect("refresh exact metadata target")
         );
         let mut pending_prefix_probes = BTreeMap::new();
-        fixture
-            .service
-            .clear_superseded_metadata_sync_requests(&mut pending_prefix_probes, &mut attempts);
+        let mut pending_catchups = BTreeMap::new();
+        fixture.service.clear_superseded_metadata_sync_requests(
+            &mut pending_prefix_probes,
+            &mut pending_catchups,
+            &mut attempts,
+        );
         fixture
             .service
             .send_metadata_sync_checkpoint_snapshots(
