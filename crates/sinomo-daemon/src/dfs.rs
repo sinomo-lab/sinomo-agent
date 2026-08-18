@@ -9345,6 +9345,42 @@ impl DaemonDefaultDfsParkedHandoff {
     }
 }
 
+fn daemon_default_dfs_locally_owned_pending_handoff(
+    local_node_id: &NodeId,
+    inputs: &[(String, Vec<u8>)],
+) -> Option<DaemonDefaultDfsParkedHandoff> {
+    let file_system_id = sinomo_dfs::sifs_file_system_id();
+    ["root", "services", "users"]
+        .into_iter()
+        .find_map(|shard_id| {
+            let key = sinomo_dfs::metadata_shard_membership_handoff_key(&file_system_id, shard_id);
+            let handoff = inputs
+                .iter()
+                .find(|(input_key, _)| input_key == &key)
+                .and_then(|(_, value)| {
+                    sinomo_core::kv::decode_kv_value::<DfsMetadataShardMembershipHandoff>(value)
+                        .ok()
+                })?;
+            if handoff.retiring_shard.file_system_id != file_system_id
+                || handoff.retiring_shard.shard_id != shard_id
+                || handoff.desired_shard.file_system_id != file_system_id
+                || handoff.desired_shard.shard_id != shard_id
+            {
+                return None;
+            }
+            let parked = DaemonDefaultDfsParkedHandoff::new(
+                file_system_id.clone(),
+                shard_id.to_string(),
+                handoff.handoff_id,
+                handoff.retiring_shard.epoch,
+                handoff.desired_shard.epoch,
+            );
+            parked
+                .is_owned_by_retiring_primary(local_node_id, inputs)
+                .then_some(parked)
+        })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DaemonDefaultDfsParkedGeneration {
     handoff: DaemonDefaultDfsParkedHandoff,
@@ -9794,6 +9830,15 @@ impl DaemonDefaultDfsReconciliationReactor {
         }
 
         if work.reconcile_defaults {
+            // The placement writer can be the sole KV voter while the
+            // retiring metadata primary is a learner. The learner deliberately
+            // does not publish cluster-control state, so its lifecycle pass
+            // returns `Completed` instead of rediscovering the authoritative
+            // parked handoff. Transfer the already-committed exact handoff
+            // edge to that node's local maintenance executor before consuming
+            // the projection generation.
+            let locally_owned_pending_handoff =
+                daemon_default_dfs_locally_owned_pending_handoff(expected_node_id, &work.inputs);
             match ensure_default_distributed_dfs_outcome_async_on_runtime(
                 paths,
                 options,
@@ -9803,6 +9848,14 @@ impl DaemonDefaultDfsReconciliationReactor {
             .await?
             {
                 DaemonDefaultDfsLifecycleOutcome::Completed => {
+                    if let Some(handoff) = locally_owned_pending_handoff {
+                        self.park_default_reconciliation(&work, handoff);
+                        notify_daemon_dfs_maintenance_work();
+                        if let Some(error) = deferred_recovery_error {
+                            return Err(error);
+                        }
+                        return Ok(DaemonDefaultDfsReconciliationStep::Parked);
+                    }
                     self.complete_default_reconciliation_after_control_plane_observation(
                         &work,
                         expected_node_id,
@@ -24266,6 +24319,16 @@ mod tests {
             handoff.handoff_id.clone(),
             retiring.epoch,
             desired.epoch,
+        );
+        assert_eq!(
+            daemon_default_dfs_locally_owned_pending_handoff(&retiring_primary, &work.inputs),
+            Some(parked.clone()),
+            "a non-voter retiring primary must inherit the committed handoff maintenance edge"
+        );
+        assert_eq!(
+            daemon_default_dfs_locally_owned_pending_handoff(&local, &work.inputs),
+            None,
+            "the promoted node must not consume retiring-primary maintenance work"
         );
         assert!(parked.is_owned_by_retiring_primary(&retiring_primary, &work.inputs));
         assert!(

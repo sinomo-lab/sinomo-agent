@@ -2336,15 +2336,17 @@ fn daemon_dfs_maintenance_revalidation_decision(
 
 fn daemon_dfs_failed_maintenance_decision(
     observed_at: Instant,
-    triggered_maintenance_requested: bool,
     next_probe_at: Option<Instant>,
 ) -> DaemonDfsMaintenanceProbeDecision {
     let error_retry_at = observed_at
         .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
         .unwrap_or(observed_at);
     DaemonDfsMaintenanceProbeDecision {
-        // Task failure must not consume an already-classified request.
-        trigger_maintenance: triggered_maintenance_requested,
+        // A maintenance task exists only after a durable request was
+        // classified and launched. Launch clears the mutable request latch so
+        // notifications arriving while the task runs can own a newer edge;
+        // task failure must nevertheless retain the launched request itself.
+        trigger_maintenance: true,
         // A failed pass is no longer a successful bounded continuation. Its
         // next attempt uses the ordinary admission and error-backoff path.
         immediate_continuation: false,
@@ -2722,7 +2724,6 @@ async fn run_daemon_background_maintenance_loop(
                 None => {
                     let decision = daemon_dfs_failed_maintenance_decision(
                         Instant::now(),
-                        dfs_triggered_maintenance_requested,
                         next_dfs_maintenance_probe,
                     );
                     dfs_triggered_maintenance_requested = decision.trigger_maintenance;
@@ -9301,8 +9302,7 @@ mod tests {
         let future_probe = observed_at
             .checked_add(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL)
             .expect("future probe");
-        let decision =
-            daemon_dfs_failed_maintenance_decision(observed_at, true, Some(future_probe));
+        let decision = daemon_dfs_failed_maintenance_decision(observed_at, Some(future_probe));
 
         assert!(
             decision.trigger_maintenance,
@@ -9357,11 +9357,7 @@ mod tests {
             "reactive work must not wait for startup phasing or the generic maintenance interval"
         );
 
-        let decision = daemon_dfs_failed_maintenance_decision(
-            observed_at,
-            notification.trigger_maintenance,
-            next_probe_at,
-        );
+        let decision = daemon_dfs_failed_maintenance_decision(observed_at, next_probe_at);
         assert_eq!(
             decision.next_probe_at,
             observed_at.checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL),
