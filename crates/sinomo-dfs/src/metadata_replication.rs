@@ -10515,6 +10515,8 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
         || (reason.contains("metadata journal sequence")
             && reason.contains("already exists with a different entry"))
         || (reason.contains("metadata journal sequence")
+            && reason.contains("already exists with different exact bytes"))
+        || (reason.contains("metadata journal sequence")
             && reason.contains("within durable prefix")
             && reason.contains("is missing while replaying shard"))
         // A routed response can materialize a newer authoritative namespace
@@ -13140,6 +13142,9 @@ mod cursor_update_tests {
     #[test]
     fn journal_discontinuity_rejection_allows_snapshot_repair() {
         assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata journal sequence 1 already exists with a different entry while replaying shard root"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: metadata journal batch for shard services starts unseen history at sequence 7722 but durable replay requires 1"
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
@@ -13150,6 +13155,9 @@ mod cursor_update_tests {
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: metadata journal sequence 14159 is within durable prefix 14162 but is missing while replaying shard root"
+        ));
+        assert!(metadata_journal_rejection_allows_snapshot_repair(
+            "metadata serialization error: metadata journal sequence 468 already exists with different exact bytes while replaying shard users"
         ));
         assert!(metadata_journal_rejection_allows_snapshot_repair(
             "metadata serialization error: DFS metadata table snapshot semantic checksum mismatch"

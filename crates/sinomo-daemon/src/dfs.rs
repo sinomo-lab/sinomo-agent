@@ -11,7 +11,7 @@ use sinomo_core::kv::KvSnapshot;
 use sinomo_core::kv::{KvEntry, KvError, KvOp, KvRevision, KvTxn, KvTxnResponse, KvVersion};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
-    ClusterConnectivityGraph, ClusterPaths, ObjectRpcCall, ObjectRpcResult,
+    ClusterConnectivityGraph, ClusterPaths, ObjectRpcBodyChunk, ObjectRpcCall, ObjectRpcResult,
     cluster_nodes_share_healthy_component,
 };
 use sinomo_core::node::NodeId;
@@ -99,6 +99,7 @@ const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
 const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
+const DAEMON_DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
 const DAEMON_DFS_MOUNTED_MUTATION_REPROBE_INTERVAL: Duration = Duration::from_secs(5);
@@ -8755,7 +8756,7 @@ async fn ingest_daemon_dfs_message_attachment(
     content: Option<sinomo_dfs::LocalContentStore>,
     mut command: DfsMessageCommand,
     attachment: Option<DfsInboundAttachment>,
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
 ) -> Result<
     (
         DfsMessageCommand,
@@ -8769,69 +8770,86 @@ async fn ingest_daemon_dfs_message_attachment(
     let content = content.ok_or_else(|| DaemonError::Parse {
         detail: "streamed DFS attachment is missing its shared content store".to_string(),
     })?;
-    let task_runtime = runtime.clone();
-    tokio::task::spawn_blocking(move || {
-        let (expected_hash, stage_blob) = match &command.routed_message.message {
-            sinomo_dfs::DfsNetworkMessage::StageBlob(stage) => {
-                (Some(stage.content_hash.clone()), true)
+    let (expected_hash, stage_blob) = match &command.routed_message.message {
+        sinomo_dfs::DfsNetworkMessage::StageBlob(stage) => (Some(stage.content_hash.clone()), true),
+        sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(_)
+        | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(_) => {
+            (attachment.descriptor.content_hash.clone(), false)
+        }
+        other => {
+            return Err(sinomo_dfs::DfsError::Distributed {
+                message: format!("streamed DFS attachment is not supported for {other:?}"),
             }
-            sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(_)
-            | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(_) => {
-                (attachment.descriptor.content_hash.clone(), false)
-            }
-            other => {
-                return Err(sinomo_dfs::DfsError::Distributed {
-                    message: format!("streamed DFS attachment is not supported for {other:?}"),
+            .into());
+        }
+    };
+    if stage_blob
+        && let Some(descriptor_hash) = attachment.descriptor.content_hash.as_deref()
+        && Some(descriptor_hash) != expected_hash.as_deref()
+    {
+        return Err(sinomo_dfs::DfsError::ContentHashMismatch {
+            expected: expected_hash.unwrap_or_default(),
+            actual: descriptor_hash.to_string(),
+        }
+        .into());
+    }
+
+    let total_size_bytes = attachment.descriptor.total_size_bytes;
+    let mut body = attachment.body;
+    // Keep network receive and blocking content hashing/storage overlapped while
+    // retaining transport chunk ownership. Four maximum-sized body chunks cap
+    // the additional in-flight storage at 1 MiB and preserve backpressure.
+    let (chunk_sender, mut chunk_receiver) = tokio::sync::mpsc::channel::<ObjectRpcBodyChunk>(
+        DAEMON_DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS,
+    );
+    let ingest_worker = tokio::task::spawn_blocking(move || -> Result<_, sinomo_dfs::DfsError> {
+        let mut ingest =
+            content.begin_quarantined_blob_ingest(total_size_bytes, expected_hash.as_deref())?;
+        while let Some(chunk) = chunk_receiver.blocking_recv() {
+            ingest.write_chunk(chunk.as_ref())?;
+        }
+        ingest.finish_quarantined().map_err(Into::into)
+    });
+
+    let feed_result = loop {
+        let chunk = match body.next_chunk().await {
+            Ok(chunk) => chunk,
+            Err(source) => {
+                break Err(sinomo_dfs::DfsError::Network {
+                    message: format!("read streamed DFS request attachment: {source}"),
                 });
             }
         };
-        if stage_blob
-            && let Some(descriptor_hash) = attachment.descriptor.content_hash.as_deref()
-            && Some(descriptor_hash) != expected_hash.as_deref()
-        {
-            return Err(sinomo_dfs::DfsError::ContentHashMismatch {
-                expected: expected_hash.unwrap_or_default(),
-                actual: descriptor_hash.to_string(),
-            });
+        let Some(chunk) = chunk else {
+            break Ok(());
+        };
+        if chunk_sender.send(chunk).await.is_err() {
+            // The ingest worker owns the authoritative storage error.
+            break Ok(());
         }
-
-        let mut ingest = content.begin_quarantined_blob_ingest(
-            attachment.descriptor.total_size_bytes,
-            expected_hash.as_deref(),
-        )?;
-        let mut body = attachment.body;
-        loop {
-            let chunk = task_runtime.block_on(body.next_chunk()).map_err(|source| {
-                sinomo_dfs::DfsError::Network {
-                    message: format!("read streamed DFS request attachment: {source}"),
-                }
-            })?;
-            let Some(chunk) = chunk else {
-                break;
-            };
-            ingest.write_chunk(chunk.as_ref())?;
-        }
-        let blob = ingest.finish_quarantined()?;
-        if !stage_blob {
-            match &mut command.routed_message.message {
-                sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(write)
-                | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(write) => {
-                    write.bytes.clear();
-                    write.content_hash = Some(blob.content_hash.clone());
-                    write.content_size_bytes = Some(blob.size_bytes);
-                    write.requester_blob_pre_staged = false;
-                }
-                _ => unreachable!("streamed distributed write kind was checked before ingest"),
-            }
-        }
-        Ok((command, Some(blob)))
-    })
-    .await
-    .map_err(|source| DaemonError::Network {
+    };
+    drop(chunk_sender);
+    let ingest_result = ingest_worker.await.map_err(|source| DaemonError::Network {
         address: "DFS streamed attachment ingest".to_string(),
         detail: format!("DFS streamed attachment task failed: {source}"),
-    })?
-    .map_err(Into::into)
+    })?;
+    if let Err(source) = feed_result {
+        return Err(source.into());
+    }
+    let blob = ingest_result.map_err(DaemonError::from)?;
+    if !stage_blob {
+        match &mut command.routed_message.message {
+            sinomo_dfs::DfsNetworkMessage::DistributedWriteRequest(write)
+            | sinomo_dfs::DfsNetworkMessage::ExclusiveCreateRequest(write) => {
+                write.bytes.clear();
+                write.content_hash = Some(blob.content_hash.clone());
+                write.content_size_bytes = Some(blob.size_bytes);
+                write.requester_blob_pre_staged = false;
+            }
+            _ => unreachable!("streamed distributed write kind was checked before ingest"),
+        }
+    }
+    Ok((command, Some(blob)))
 }
 
 async fn handle_daemon_dfs_message_async(
@@ -15404,16 +15422,27 @@ mod tests {
         let version = write.request.target_version.clone();
         write.requester_blob_pre_staged = false;
         let command = test_dfs_message_command("streamed-primary-content-ingest", routed);
+        let (body_sender, body) =
+            sinomo_core::network::ObjectRpcIncomingBody::test_channel(Some(bytes.len() as u64), 1);
         let attachment = DfsInboundAttachment {
             descriptor: sinomo_dfs::DfsRpcAttachmentDescriptor {
                 total_size_bytes: bytes.len() as u64,
                 content_hash: None,
             },
-            body: sinomo_core::network::ObjectRpcIncomingBody::bytes(bytes.clone()),
+            body,
         };
         let runtime = daemon_test_runtime("daemon-dfs-streamed-primary-content-ingest");
         let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
             .expect("shared content store");
+        let streamed_bytes = bytes.clone();
+        let producer = runtime.spawn(async move {
+            for chunk in streamed_bytes.chunks(8 * 1024) {
+                body_sender
+                    .send(chunk.to_vec())
+                    .await
+                    .expect("stream attachment chunk");
+            }
+        });
 
         let (command, preingested_blob) = runtime
             .block_on(ingest_daemon_dfs_message_attachment(
@@ -15423,6 +15452,9 @@ mod tests {
                 runtime.handle(),
             ))
             .expect("stream attachment into content store");
+        runtime
+            .block_on(producer)
+            .expect("join attachment producer");
 
         let preingested_blob = preingested_blob.expect("quarantined attachment");
         let DfsNetworkMessage::DistributedWriteRequest(write) = command.routed_message.message

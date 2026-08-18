@@ -1856,14 +1856,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map(|intent| &intent.state),
             Some(DfsWriteIntentState::Committed)
         );
-        let local_desired_copy_missing = desired_replica_nodes.contains(&self.node_id)
-            && self
-                .local_object_version_manifest_size_if_matches(
-                    &request.object_id,
-                    &request.target_version,
-                    &content_hash,
-                )
-                .is_none();
         if let Some(pending) = self.pending_writes.get(&updated_intent.intent_id).cloned() {
             if !is_committed {
                 if self.open_pending_write_blob_stream(&pending).is_ok() {
@@ -1874,7 +1866,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 } else {
                     let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
                 }
-            } else if foreground_replica_repair && local_desired_copy_missing {
+            } else if foreground_replica_repair
+                && desired_replica_nodes.contains(&self.node_id)
+                // This verifies the complete local blob. Normal background
+                // repair must not pay that O(file-size) read after the same
+                // request already hashed and durably ingested the attachment.
+                && self
+                    .local_object_version_manifest_size_if_matches(
+                        &request.object_id,
+                        &request.target_version,
+                        &content_hash,
+                    )
+                    .is_none()
+            {
                 let _ = self.request_stage_blob_from_alternate(&updated_intent, &pending)?;
             }
         }

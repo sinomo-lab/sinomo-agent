@@ -448,23 +448,43 @@ fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     ctx.record("path", &path);
     ctx.record("renamed", &renamed);
 
+    let stage_started = Instant::now();
     retry_bulk_mutation(
         deadline,
         || backend.write_file_wait_for_commit_with_deadline(&path, payload.as_bytes(), deadline),
         || format!("cannot write SIFS file {path}"),
     )?;
+    ctx.record("write_ms", stage_started.elapsed().as_millis());
+    let stage_started = Instant::now();
     expect_payload_now(&backend, &path, payload.as_bytes(), "after write")?;
+    ctx.record("read_after_write_ms", stage_started.elapsed().as_millis());
 
+    let stage_started = Instant::now();
     backend
         .rename_with_deadline(&path, &renamed, deadline)
         .map_err(SinomoTestError::failed)?;
+    ctx.record("rename_ms", stage_started.elapsed().as_millis());
+    let stage_started = Instant::now();
     expect_payload_now(&backend, &renamed, payload.as_bytes(), "after rename")?;
+    ctx.record("read_after_rename_ms", stage_started.elapsed().as_millis());
+    let stage_started = Instant::now();
     expect_absent_now(&backend, &path, "after rename")?;
+    ctx.record(
+        "absent_after_rename_ms",
+        stage_started.elapsed().as_millis(),
+    );
 
+    let stage_started = Instant::now();
     backend
         .delete_file_with_deadline(&renamed, deadline)
         .map_err(SinomoTestError::failed)?;
+    ctx.record("delete_ms", stage_started.elapsed().as_millis());
+    let stage_started = Instant::now();
     expect_absent_now(&backend, &renamed, "after delete")?;
+    ctx.record(
+        "absent_after_delete_ms",
+        stage_started.elapsed().as_millis(),
+    );
 
     Ok(SinomoTestOutcome::passed(format!(
         "write/read/rename/delete roundtrip held read-your-write on node {node}"
@@ -5431,7 +5451,7 @@ fn parent_probe_path(path: &str) -> Option<String> {
     let path = path.trim_end_matches('/');
     let slash = path.rfind('/')?;
     if slash == 0 {
-        Some("/".to_string())
+        None
     } else {
         Some(path[..slash].to_string())
     }
@@ -5634,6 +5654,16 @@ mod tests {
         assert!(latency_reaches_exclusive_limit(100_000, 100_000));
         assert!(latency_reaches_exclusive_limit(100_001, 100_000));
         assert!(!latency_reaches_exclusive_limit(u64::MAX, 0));
+    }
+
+    #[test]
+    fn root_level_probe_paths_do_not_repeat_root_creation() {
+        assert_eq!(parent_probe_path("/large.bin"), None);
+        assert_eq!(parent_probe_path("/large.bin/"), None);
+        assert_eq!(
+            parent_probe_path("/services/large.bin"),
+            Some("/services".to_string())
+        );
     }
 
     fn shard_layout_probe(

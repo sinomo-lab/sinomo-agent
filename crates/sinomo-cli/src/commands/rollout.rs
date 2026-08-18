@@ -1855,6 +1855,8 @@ fn supporting_build_capability(
     matches.into_iter().next()
 }
 
+const CLUSTER_ROLLOUT_BUILD_PROFILE: &str = "release";
+
 fn build_plan_for_capability(
     source: &ClusterBuildSourceInput,
     capability: &BuildTargetCapability,
@@ -1868,7 +1870,10 @@ fn build_plan_for_capability(
             source_revision: source.source.revision.clone(),
             lockfile_hash: source.lockfile_hash.clone(),
             target: capability.target.clone(),
-            profile: "dev".to_string(),
+            // Rollout artifacts are runtime candidates, and may be used for
+            // performance acceptance. A debug artifact is neither comparable
+            // with a raw-device baseline nor suitable for production rollout.
+            profile: CLUSTER_ROLLOUT_BUILD_PROFILE.to_string(),
             features: features.to_vec(),
             toolchain_fingerprint: capability.toolchain_fingerprint.clone(),
             outputs: outputs.to_vec(),
@@ -2735,6 +2740,39 @@ mod cluster_build_service_tests {
             cache_hit: false,
             transfer_cost: 1,
         }
+    }
+
+    #[test]
+    fn cluster_rollout_build_plan_uses_release_profile() {
+        let target = exact_linux_target();
+        let source_hash = build_content_hash(b"source");
+        let source = ClusterBuildSourceInput {
+            source: BuildSource {
+                label: "test-source".to_string(),
+                revision: Some("test-revision".to_string()),
+                bundle_hash: source_hash,
+                bundle_bytes: 6,
+            },
+            source_repo: PathBuf::from("test-source"),
+            source_bundle: PathBuf::from("test-source.bundle"),
+            lockfile_hash: build_content_hash(b"lockfile"),
+        };
+        let capability = BuildTargetCapability {
+            target,
+            artifact_kinds: vec![BuildArtifactKind::Binary],
+            toolchain_fingerprint: "test-toolchain".to_string(),
+        };
+
+        let plan = build_plan_for_capability(
+            &source,
+            &capability,
+            &[],
+            &[BuildOutputRequest::binary("sinomo", "sinomo")],
+        )
+        .expect("build plan");
+
+        assert_eq!(plan.input.profile, CLUSTER_ROLLOUT_BUILD_PROFILE);
+        assert_eq!(plan.input.profile, "release");
     }
 
     #[test]

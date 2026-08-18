@@ -6059,7 +6059,7 @@ impl SequenceConflictMetadataJournalTransport {
     fn new(target_node_id: NodeId) -> Self {
         Self::new_with_reason(
             target_node_id,
-            "metadata journal sequence 1 already exists with a different entry",
+            "metadata journal sequence 1 already exists with different exact bytes while replaying shard root",
         )
     }
 
