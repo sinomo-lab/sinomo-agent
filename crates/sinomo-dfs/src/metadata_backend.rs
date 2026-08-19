@@ -82,7 +82,7 @@ use crate::metadata_read_snapshot;
 use crate::metadata_receipt::{receipt_for_replica_from_backend, replay_receipt_matches_existing};
 use crate::metadata_records::*;
 use crate::metadata_replay::{
-    borrowed_namespace_prepare_payload, decoded_normalized_namespace_prepare_payload,
+    decoded_normalized_namespace_prepare_payload,
     decoded_normalized_namespace_prepare_payload_from_validated_ref,
     decoded_normalized_namespace_prepare_payload_with_ref, hydrate_journal_entry_payloads,
     journal_entry_has_replay_payloads, require_journal_entry_replay_payloads,
@@ -274,6 +274,7 @@ fn metadata_recovery_file_fingerprint(
 #[cfg(test)]
 thread_local! {
     static METADATA_BEGIN_WRITE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static METADATA_DURABLE_TABLE_RELOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_CURRENT_TABLES_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_BACKEND_OPEN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static METADATA_EXPORT_TABLE_SNAPSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -294,6 +295,16 @@ fn reset_metadata_begin_write_calls() {
 #[cfg(test)]
 fn metadata_begin_write_calls() -> usize {
     METADATA_BEGIN_WRITE_CALLS.get()
+}
+
+#[cfg(test)]
+fn reset_metadata_durable_table_reloads() {
+    METADATA_DURABLE_TABLE_RELOADS.set(0);
+}
+
+#[cfg(test)]
+fn metadata_durable_table_reloads() -> usize {
+    METADATA_DURABLE_TABLE_RELOADS.get()
 }
 
 #[cfg(test)]
@@ -3894,6 +3905,7 @@ impl LocalSobjMetadataBackend {
         metadata_cursor::write_journal_head(&self.root, self.next_sequence)
     }
 
+    #[cfg(test)]
     fn materialize_replayed_journal_entry_unlocked(
         &mut self,
         entry: &DfsMetadataJournalEntry,
@@ -5793,33 +5805,52 @@ impl LocalSobjMetadataBackend {
                 break;
             }
             let mut advanced = false;
-            for entry in entries {
-                self.advance_metadata_prefix_proof_unlocked(std::slice::from_ref(&entry))?;
-                if matches!(
-                    &entry.mutation,
-                    DfsMetadataMutation::PutNamespacePrepare { .. }
-                ) {
-                    if let Some(prepare) = borrowed_namespace_prepare_payload(&entry)? {
-                        self.materialize_replayed_journal_entry_unlocked(&entry, Some(prepare))?;
-                    } else {
-                        self.materialize_local_journal_entry(&entry)?;
+            let mut index = 0usize;
+            while index < entries.len() {
+                if journal_entry_has_replay_payloads(&entries[index]) {
+                    let start = index;
+                    while index < entries.len()
+                        && journal_entry_has_replay_payloads(&entries[index])
+                    {
+                        index = index.saturating_add(1);
                     }
-                } else if journal_entry_has_replay_payloads(&entry) {
-                    self.materialize_replayed_journal_entry_unlocked(&entry, None)?;
-                } else {
-                    self.materialize_local_journal_entry(&entry)?;
+                    let replayable = &entries[start..index];
+                    self.advance_metadata_prefix_proof_unlocked(replayable)?;
+                    self.materialize_written_journal_entries_unlocked(replayable)?;
+                    let last_sequence = replayable
+                        .last()
+                        .expect("non-empty replayable metadata journal suffix")
+                        .sequence;
+                    if last_sequence > cursor.last_sequence {
+                        cursor.last_sequence = last_sequence;
+                        advanced = true;
+                    }
+                    continue;
                 }
+
+                // Legacy journal records can omit their replay payload. Keep
+                // their compatibility materializer one record at a time so
+                // the durable table proof never advances past an entry whose
+                // state still has to be reconstructed from the old layout.
+                let entry = &entries[index];
+                self.advance_metadata_prefix_proof_unlocked(std::slice::from_ref(entry))?;
+                self.materialize_local_journal_entry(entry)?;
                 if entry.sequence > cursor.last_sequence {
                     cursor.last_sequence = entry.sequence;
                     advanced = true;
                 }
+                index = index.saturating_add(1);
             }
             if advanced {
-                if self
-                    .prefix_proof
-                    .as_ref()
-                    .is_some_and(|proof| proof.journal_sequence == cursor.last_sequence)
+                if self.materialized_through_sequence < cursor.last_sequence
+                    && self
+                        .prefix_proof
+                        .as_ref()
+                        .is_some_and(|proof| proof.journal_sequence == cursor.last_sequence)
                 {
+                    // A no-op or legacy replay may advance the exact prefix
+                    // without producing table operations. Persist that proof
+                    // only when the replay batch above did not already do so.
                     self.append_and_apply_table_ops(cursor.last_sequence, Vec::new())?;
                 }
                 self.materialized_through_sequence =
@@ -6287,6 +6318,8 @@ impl LocalSobjMetadataBackend {
     }
 
     fn reload_durable_metadata_table_state(&mut self) -> Result<()> {
+        #[cfg(test)]
+        METADATA_DURABLE_TABLE_RELOADS.set(METADATA_DURABLE_TABLE_RELOADS.get().saturating_add(1));
         let state = read_metadata_table_state_lenient(&self.root)?;
         self.tables = state.tables;
         self.table_log_offset = state.table_log_offset;
@@ -6338,12 +6371,19 @@ impl LocalSobjMetadataBackend {
         let durable_journal_tail = durable_next_sequence.saturating_sub(1);
         let materialization_rewound =
             self.materialized_through_sequence < previous_materialized_sequence;
-        if durable_journal_tail > self.materialized_through_sequence {
+        let live_table_prefix_is_exact = self.prefix_proof.as_ref().is_some_and(|proof| {
+            proof.is_well_formed() && proof.journal_sequence == self.materialized_through_sequence
+        });
+        if durable_journal_tail > self.materialized_through_sequence && !live_table_prefix_is_exact
+        {
             // The journal is the durability boundary. A prior append may have
             // succeeded while table-batch materialization failed and rolled
             // back this live handle. Reload the exact durable table proof so a
-            // same-instance retry does not carry the journal-ahead proof into
-            // replay, then recover the gap before admitting another write.
+            // same-instance retry does not carry a journal-ahead proof into
+            // replay. A deferred replica suffix leaves the live table proof
+            // exactly at its materialized head; reloading that same large
+            // snapshot would only duplicate the resident image before the
+            // bounded suffix can be materialized in one batch.
             self.reload_durable_metadata_table_state()?;
         }
         self.next_sequence = durable_next_sequence
@@ -19304,9 +19344,15 @@ mod tests {
         successor.object_id =
             DfsObjectId::from_legacy_named("obj_after_table_gap").expect("object id");
         successor.path = "/docs/after-table-gap.md".to_string();
+        reset_metadata_durable_table_reloads();
         backend
             .put_object(&successor)
             .expect("same handle recovers the durable tail before admitting a successor");
+        assert_eq!(
+            metadata_durable_table_reloads(),
+            1,
+            "an ambiguous journal-ahead proof must reload the durable table head before replay"
+        );
 
         assert_eq!(
             backend
@@ -24447,6 +24493,101 @@ mod tests {
                 .materialize_pending_replica_journal()
                 .expect("no pending materialization"),
             0,
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn deferred_replica_materialization_batches_a_replayable_suffix_once() {
+        let root = temp_root("deferred_replica_materialization_batches_suffix");
+        let source_root = root.join("source");
+        let replica_root = root.join("replica");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut source =
+            LocalSobjMetadataBackend::new(shard_id.clone(), &source_root).expect("source backend");
+        let mut file_system = file_system();
+        source
+            .put_file_system(&file_system)
+            .expect("source filesystem");
+        for index in 1..4 {
+            file_system.display_name = format!("replica materialization generation {index}");
+            source
+                .put_file_system(&file_system)
+                .expect("source filesystem update");
+        }
+        let mut entries = source.journal_since(0).expect("source journal suffix");
+        assert_eq!(entries.len(), 4);
+
+        let permit = DfsMetadataReplicaIngestPermit::new_validated(
+            file_system.file_system_id.clone(),
+            shard_id.clone(),
+            node("node_deferred_materialization_source"),
+            1,
+        );
+        let mut replica = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root)
+            .expect("replica backend");
+        let baseline = entries.remove(0);
+        replica
+            .apply_journal_batch_with_replica_permit(
+                &permit,
+                &DfsMetadataJournalBatch {
+                    shard_id: shard_id.clone(),
+                    next_after_sequence: baseline.sequence,
+                    entries: vec![baseline],
+                },
+            )
+            .expect("materialized replica baseline");
+        for entry in entries {
+            let sequence = entry.sequence;
+            let report = replica
+                .persist_journal_batch_with_replica_permit_report(
+                    &permit,
+                    &DfsMetadataJournalBatch {
+                        shard_id: shard_id.clone(),
+                        entries: vec![entry],
+                        next_after_sequence: sequence,
+                    },
+                )
+                .expect("durable replica suffix entry");
+            assert!(report.materialization_pending());
+        }
+
+        assert_eq!(replica.materialized_through_sequence, 1);
+        let table_batches_before = metadata_table_batch_count(&replica_root);
+        reset_metadata_durable_table_reloads();
+        assert_eq!(
+            replica
+                .materialize_pending_replica_journal()
+                .expect("materialize replayable suffix"),
+            3,
+        );
+        let table_batches_after = metadata_table_batch_count(&replica_root);
+        assert!(
+            table_batches_after.saturating_sub(table_batches_before) <= 1,
+            "one replayable suffix should persist at most one active table batch before an asynchronous checkpoint fold; before={table_batches_before}, after={table_batches_after}"
+        );
+        assert_eq!(
+            metadata_durable_table_reloads(),
+            0,
+            "an exact resident table proof must materialize its deferred suffix without decoding the same durable snapshot again"
+        );
+        assert_eq!(
+            replica
+                .get_file_system(&file_system.file_system_id)
+                .expect("materialized filesystem"),
+            Some(file_system.clone()),
+        );
+        drop(replica);
+
+        let reopened = LocalSobjMetadataBackend::new(shard_id, &replica_root)
+            .expect("reopen materialized replica");
+        assert_eq!(
+            reopened
+                .get_file_system(&file_system.file_system_id)
+                .expect("reopened filesystem"),
+            Some(file_system),
+            "the batched materialization must survive either the active log or its folded checkpoint"
         );
 
         cleanup(&root);

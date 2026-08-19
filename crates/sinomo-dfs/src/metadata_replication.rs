@@ -69,9 +69,13 @@ fn metadata_backend_open_error_allows_snapshot_repair(error: &crate::MetadataBac
 /// Both catalog inspection and all logical object mutations are bounded by
 /// this per-generation budget; a durable object-id cursor resumes the next
 /// generation without rescanning a settled prefix.
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 256;
+const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT: usize = 32;
 const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_PAGE_SIZE: usize = 32;
-const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 5;
+const DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION: u16 = 6;
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct DfsDefaultSifsMigrationGeneration {
@@ -86,6 +90,11 @@ struct DfsDefaultSifsMigrationGeneration {
 struct DfsDefaultSifsMigrationCursor {
     format_version: u16,
     generation: DfsDefaultSifsMigrationGeneration,
+    /// The ordered catalog reached a durable end-of-generation fence. Later
+    /// process generations can replay only the journal suffix instead of
+    /// rescanning every settled object after each daemon restart.
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    catalog_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     after_object_id: Option<crate::DfsObjectId>,
     /// Durable source-journal positions already converted into dirty-object
@@ -301,17 +310,6 @@ fn write_default_sifs_migration_cursor(
     })?;
     crate::metadata_io::create_dir_all(parent.to_path_buf())?;
     crate::metadata_io::write_sobj_atomic(&path, cursor)?;
-    Ok(())
-}
-
-fn clear_default_sifs_migration_cursor(
-    metadata_root: &std::path::Path,
-    file_system_id: &DfsFileSystemId,
-) -> Result<(), DfsError> {
-    crate::metadata_io::remove_file_if_exists(&default_sifs_migration_cursor_path(
-        metadata_root,
-        file_system_id,
-    ))?;
     Ok(())
 }
 
@@ -1572,6 +1570,16 @@ impl DfsMetadataPublishScheduler {
             running: AtomicBool::new(false),
             wake: tokio::sync::Notify::const_new(),
         }
+    }
+
+    /// Return whether another request arrived after the active pass claimed
+    /// its current input edge.
+    ///
+    /// Specialized retained workers use this to debounce rebuildable work
+    /// while preserving the scheduler's ordinary pending/running ownership.
+    /// The run loop remains the only consumer which clears this bit.
+    pub fn has_pending_request(&self) -> bool {
+        self.pending.load(Ordering::Acquire)
     }
 
     fn claim_publish_start(&self) -> DfsMetadataPublishScheduleStart {
@@ -9355,20 +9363,22 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
                 .map(|backend| (shard_id.0.clone(), backend.journal_last_sequence()))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let new_cursor = || DfsDefaultSifsMigrationCursor {
+        format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
+        generation: generation.clone(),
+        catalog_complete: false,
+        after_object_id: None,
+        observed_journal_sequences: observed_journal_sequences.clone(),
+        dirty_object_ids: BTreeSet::new(),
+        pending_journal_replay: None,
+        pending_migration: None,
+    };
     let mut cursor = read_default_sifs_migration_cursor(
         metadata_root,
         &file_system.file_system_id,
         &generation,
     )?
-    .unwrap_or_else(|| DfsDefaultSifsMigrationCursor {
-        format_version: DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_CURSOR_FORMAT_VERSION,
-        generation: generation.clone(),
-        after_object_id: None,
-        observed_journal_sequences,
-        dirty_object_ids: BTreeSet::new(),
-        pending_journal_replay: None,
-        pending_migration: None,
-    });
+    .unwrap_or_else(&new_cursor);
     for shard_id in &participating_shard_ids {
         let backend = shard_backends.shard_backend(shard_id)?;
         cursor
@@ -9381,9 +9391,17 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         shard_backends,
         &participating_shard_ids,
     )? {
-        return Err(DfsError::Metadata {
-            message: "default SIFS migration cursor references pruned journal history".to_string(),
-        });
+        if cursor.catalog_complete {
+            // A settled marker has no in-flight source eviction or partially
+            // replayed family. If its incremental journal fence was pruned,
+            // restart a complete ordered proof from the current durable heads.
+            cursor = new_cursor();
+        } else {
+            return Err(DfsError::Metadata {
+                message: "default SIFS migration cursor references pruned journal history"
+                    .to_string(),
+            });
+        }
     }
 
     // Convert a bounded durable journal suffix into dirty object IDs before
@@ -9532,8 +9550,12 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         }
     }
 
-    let mut catalog_has_more = true;
-    if !stopped_for_budget && cursor.dirty_object_ids.is_empty() && remaining_object_scans > 0 {
+    let mut catalog_has_more = !cursor.catalog_complete;
+    if !stopped_for_budget
+        && !cursor.catalog_complete
+        && cursor.dirty_object_ids.is_empty()
+        && remaining_object_scans > 0
+    {
         let scan = collect_default_sifs_migration_scan_batch(
             shard_backends,
             &participating_shard_ids,
@@ -9632,6 +9654,10 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
                 }
             }
         }
+        if !stopped_for_budget && !scan_has_more {
+            cursor.catalog_complete = true;
+            catalog_has_more = false;
+        }
     }
 
     // End with a quiescent journal fence. This catches a mutation that lands
@@ -9659,10 +9685,15 @@ fn migrate_default_sifs_metadata_on_active_primary_shards(
         // the durable proof that no live record still depends on an obsolete
         // route. Retire only this filesystem from the already-open router;
         // this adds no second scan and preserves other filesystems' fallbacks.
-        // Persist retirement before clearing the cursor so a history-write
-        // failure retains bounded completion progress for the next retry.
+        // Persist retirement before refreshing the completed cursor so a
+        // history-write failure retains bounded completion progress for the
+        // next retry.
         shard_backends.retire_routing_fallbacks_for_file_system(&file_system.file_system_id)?;
-        clear_default_sifs_migration_cursor(metadata_root, &file_system.file_system_id)?;
+        // Retain the completed ordered-catalog fence and exact journal heads.
+        // Process restart can then prove only the bounded suffix which landed
+        // after this pass; topology-generation changes still discard it in
+        // `read_default_sifs_migration_cursor` and force a complete scan.
+        write_default_sifs_migration_cursor(metadata_root, &cursor)?;
     }
 
     Ok(DfsDefaultSifsMaterializationReport {
@@ -11175,7 +11206,7 @@ mod cursor_update_tests {
 
     #[test]
     fn default_sifs_bootstrap_shard_migration_is_bounded() {
-        assert_eq!(DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT, 256);
+        assert_eq!(DEFAULT_SIFS_BOOTSTRAP_SHARD_MIGRATION_MUTATION_LIMIT, 32);
         let source = include_str!("metadata_replication.rs");
         assert!(!source.contains(concat!(
             "migrate_objects_to_configured_shards(&file_system.file_system_id, ",
@@ -11240,6 +11271,7 @@ mod cursor_update_tests {
                 active_primary_shard_ids: vec![shard_id.clone()],
                 certified_replica_shard_ids: Vec::new(),
             },
+            catalog_complete: false,
             after_object_id: None,
             observed_journal_sequences: BTreeMap::from([(shard_id.0.clone(), baseline_sequence)]),
             dirty_object_ids: BTreeSet::new(),
@@ -11325,6 +11357,7 @@ mod cursor_update_tests {
                 active_primary_shard_ids: vec![shard_id.clone()],
                 certified_replica_shard_ids: Vec::new(),
             },
+            catalog_complete: false,
             after_object_id: None,
             observed_journal_sequences: BTreeMap::from([(shard_id.0.clone(), 0)]),
             dirty_object_ids: BTreeSet::new(),
@@ -12132,9 +12165,12 @@ mod cursor_update_tests {
             total_migrated = total_migrated.saturating_add(report.migration.migrated_objects);
             total_indexed = total_indexed.saturating_add(report.migration.indexed_objects);
             if !report.migration.reached_limit {
+                let cursor =
+                    crate::metadata_io::read_sobj::<DfsDefaultSifsMigrationCursor>(&cursor_path)
+                        .expect("settled durable migration cursor");
                 assert!(
-                    !cursor_path.exists(),
-                    "settled migration must clear its cursor"
+                    cursor.catalog_complete,
+                    "settled migration must retain a completed catalog fence"
                 );
                 break;
             }
@@ -12159,28 +12195,64 @@ mod cursor_update_tests {
         assert_eq!(total_migrated, OBJECTS);
         assert_eq!(total_indexed, OBJECTS);
 
-        // A complete verification sweep revisits every settled object after
-        // the cursor was cleared. Exact indexes and target generations must
-        // remain pure reads throughout the sweep.
-        let mut verification_scanned = 0usize;
-        for _ in 0..64 {
-            let (report, _, _, index_writes, _) = run_test_default_migration_pass(
+        // A process restart reuses the completed catalog fence and validates
+        // only the journal suffix. With no new suffix, this is a zero-object
+        // pass and no exact index or target generation is rewritten.
+        let (verification, _, _, index_writes, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!verification.migration.reached_limit);
+        assert_eq!(verification.migration.scanned_objects, 0);
+        assert_eq!(verification.migration.migrated_objects, 0);
+        assert_eq!(verification.migration.indexed_objects, 0);
+        assert_eq!(index_writes, 0, "settled prefixes must not be rewritten");
+
+        // The durable completion marker is not a stale snapshot: a later
+        // journal entry for an object behind the catalog cursor must still be
+        // selected exactly and migrated without restarting the full scan. The
+        // target install contributes one more exact journal observation, so
+        // the same ID is checked once after migration to settle the fence.
+        let mut late = crate::distributed_sifs_bootstrap_objects(local.clone())
+            .into_iter()
+            .next()
+            .expect("late bootstrap object");
+        late.object_id =
+            crate::DfsObjectId::from_legacy_named("obj_large_cursor_migration_after_settlement")
+                .expect("late object id");
+        late.path = "/services/after-settlement.txt".to_string();
+        open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("root"))
+            .expect("late legacy source")
+            .put_object(&late)
+            .expect("late journal mutation");
+        let mut late_scanned = 0usize;
+        let mut late_migrated = 0usize;
+        for _ in 0..16 {
+            let (report, _, _, _, _) = run_test_default_migration_pass(
                 &data_dir,
                 &file_system,
                 &shards,
                 &local,
                 PASS_LIMIT,
             );
-            verification_scanned =
-                verification_scanned.saturating_add(report.migration.scanned_objects);
-            assert_eq!(report.migration.migrated_objects, 0);
-            assert_eq!(report.migration.indexed_objects, 0);
-            assert_eq!(index_writes, 0, "settled prefixes must not be rewritten");
+            late_scanned = late_scanned.saturating_add(report.migration.scanned_objects);
+            late_migrated = late_migrated.saturating_add(report.migration.migrated_objects);
             if !report.migration.reached_limit {
                 break;
             }
         }
-        assert_eq!(verification_scanned, OBJECTS);
+        assert_eq!(late_scanned, 2);
+        assert_eq!(late_migrated, 1);
+        assert_eq!(
+            open_local_metadata_shard_backend(&data_dir, DfsMetadataShardId::new("services"))
+                .expect("late target")
+                .get_object(&late.object_id)
+                .expect("late target lookup"),
+            Some(late)
+        );
+        let (settled, _, _, settled_index_writes, _) =
+            run_test_default_migration_pass(&data_dir, &file_system, &shards, &local, PASS_LIMIT);
+        assert!(!settled.migration.reached_limit);
+        assert_eq!(settled.migration.scanned_objects, 0);
+        assert_eq!(settled_index_writes, 0);
     }
 
     #[test]

@@ -102,6 +102,31 @@ const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60
 const DAEMON_DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+// Replica table expansion is rebuildable and deliberately sits behind the
+// durable journal ACK. Let a short foreground burst finish before checking out
+// the same resident shard; each later ACK resets this quiet period through the
+// retained per-shard scheduler. This keeps full-shard authority latency on the
+// append-only durability path while still materializing promptly when quiet.
+#[cfg(not(test))]
+const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(750);
+#[cfg(test)]
+const DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD: Duration = Duration::from_millis(10);
+// Returning pages from glibc is process-global allocator work. Defer it until
+// DFS mutation traffic is quiet, then hold only the global mutation fence for
+// the brief trim instead of waking a complete maintenance generation.
+#[cfg(not(test))]
+const DAEMON_DFS_ALLOCATOR_CLEANUP_QUIET_PERIOD: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const DAEMON_DFS_ALLOCATOR_CLEANUP_QUIET_PERIOD: Duration = Duration::from_millis(10);
+// A bounded default-layout verification pass is durable control-plane work,
+// but it can still scan many settled metadata records after an upgrade. If a
+// foreground request arrives during one pass, let the complete burst drain
+// before the reactor attempts another global generation.
+#[cfg(not(test))]
+const DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD: Duration =
+    Duration::from_millis(10);
 // DFS provider discovery is a routing hint, not an authority decision. Keep a
 // short process-local lease so every routed metadata lookup does not stat and
 // range the materialized cluster KV snapshot. The retained cluster-state Arc
@@ -987,23 +1012,32 @@ impl DaemonDfsMetadataAuthorityGeneration {
     /// Applies a complete process-local committed authority delta without
     /// projecting the whole resident KV image. The delta stream is an
     /// optimization rather than a replay log. Any startup, compaction, or
-    /// revision gap immediately invalidates the retained projection before a
-    /// bounded authoritative ReadIndex rebuild is attempted, so a missed delta
-    /// can never exact-admit stale topology.
+    /// revision gap immediately withdraws retained readiness before a bounded
+    /// authoritative ReadIndex rebuild is attempted, so a missed delta can
+    /// never exact-admit stale topology. The last exact topology remains only
+    /// as a comparison baseline: an equal proof restores readiness without
+    /// reopening resident metadata, while a changed proof advances the
+    /// topology generation before any caller can borrow the replacement.
     fn observe_delta(&self, delta: &sinomo_core::kv::ClusterKvCommittedDelta) -> bool {
         let authority_changed = {
             let Ok(mut observed) = self.projection.lock() else {
                 return false;
             };
             let Some(previous_revision) = observed.revision else {
-                self.invalidate_projection_locked(&mut observed, delta.revision);
+                self.invalidate_projection_for_revision_catchup_locked(
+                    &mut observed,
+                    delta.revision,
+                );
                 return false;
             };
             if delta.revision <= previous_revision {
                 return true;
             }
             if previous_revision < delta.compacted_revision || delta.events.is_empty() {
-                self.invalidate_projection_locked(&mut observed, delta.revision);
+                self.invalidate_projection_for_revision_catchup_locked(
+                    &mut observed,
+                    delta.revision,
+                );
                 return false;
             }
             if !daemon_kv_events_cover_revision_range(
@@ -1011,7 +1045,10 @@ impl DaemonDfsMetadataAuthorityGeneration {
                 delta.revision,
                 &delta.events,
             ) {
-                self.invalidate_projection_locked(&mut observed, delta.revision);
+                self.invalidate_projection_for_revision_catchup_locked(
+                    &mut observed,
+                    delta.revision,
+                );
                 return false;
             }
 
@@ -1035,7 +1072,10 @@ impl DaemonDfsMetadataAuthorityGeneration {
                                 || entry.modify_revision > delta.revision)
                     })
                 {
-                    self.invalidate_projection_locked(&mut observed, delta.revision);
+                    self.invalidate_projection_for_revision_catchup_locked(
+                        &mut observed,
+                        delta.revision,
+                    );
                     return false;
                 }
                 if state.key.starts_with(DAEMON_DFS_METADATA_AUTHORITY_PREFIX) {
@@ -1043,7 +1083,10 @@ impl DaemonDfsMetadataAuthorityGeneration {
                 }
             }
             if relevant_event_keys != relevant_final_keys {
-                self.invalidate_projection_locked(&mut observed, delta.revision);
+                self.invalidate_projection_for_revision_catchup_locked(
+                    &mut observed,
+                    delta.revision,
+                );
                 return false;
             }
 
@@ -1513,6 +1556,24 @@ enum DaemonDfsMutationGenerationFence {
     },
 }
 
+impl DaemonDfsMutationGenerationFence {
+    fn begin_foreground_preemption(&self) -> DaemonDfsMaintenanceForegroundPreemption {
+        match self {
+            Self::Shared { _scheduler, .. } | Self::Exclusive { _scheduler, .. } => {
+                _scheduler.begin_maintenance_interest()
+            }
+        }
+    }
+
+    fn scheduler(&self) -> Arc<DaemonDfsMutationScheduler> {
+        match self {
+            Self::Shared { _scheduler, .. } | Self::Exclusive { _scheduler, .. } => {
+                Arc::clone(_scheduler)
+            }
+        }
+    }
+}
+
 impl DaemonDfsMutationAdmission {
     fn is_global(&self) -> bool {
         matches!(self, Self::Global { .. })
@@ -1557,8 +1618,8 @@ impl DaemonDfsMutationAdmission {
 /// running claim.
 #[derive(Debug)]
 struct DaemonDfsReplicaMaterializationLane {
-    #[cfg(test)]
     data_dir: SinomoDataDir,
+    runtime: tokio::runtime::Handle,
     shard: ResidentLocalMetadataShardHandle,
     _data_owner_lock: Arc<DaemonDataOwnerLock>,
     _generation_fence: DaemonDfsMutationGenerationFence,
@@ -1566,14 +1627,19 @@ struct DaemonDfsReplicaMaterializationLane {
 }
 
 impl DaemonDfsReplicaMaterializationLane {
-    fn materialize(&self) -> Result<usize, sinomo_dfs::MetadataBackendError> {
+    fn begin_foreground_preemption(&self) -> DaemonDfsMaintenanceForegroundPreemption {
+        self._generation_fence.begin_foreground_preemption()
+    }
+
+    fn materialize(
+        &self,
+        mut shard: sinomo_dfs::ResidentLocalMetadataShardLease,
+    ) -> Result<usize, sinomo_dfs::MetadataBackendError> {
         // Even a failed decode/apply can leave a glibc arena at its temporary
         // high-water mark. The lane's final drop transfers one cleanup edge to
-        // established, blocking DFS maintenance after every attempted pass.
+        // the scoped allocator lane after every attempted pass.
         self.allocator_cleanup_needed.store(true, Ordering::Release);
-        self.shard.with_backend(|backend| {
-            DfsMetadataBackend::materialize_pending_replica_journal(backend)
-        })
+        DfsMetadataBackend::materialize_pending_replica_journal(&mut *shard)
     }
 }
 
@@ -1584,11 +1650,14 @@ impl Drop for DaemonDfsReplicaMaterializationLane {
         }
         #[cfg(test)]
         record_daemon_dfs_allocator_cleanup_request(&self.data_dir);
-        // Notify stores a coalesced permit. Routine maintenance owns lifecycle
-        // and global mutation admission, yields to foreground traffic, and
-        // invokes malloc_trim from its blocking task after the lane's authority
-        // fence and resident checkout have both been released.
-        notify_daemon_dfs_maintenance_work();
+        // This task begins with an async quiet period, so this Drop finishes and
+        // releases the lane's authority fence, resident handle, and data-owner
+        // capability before it can acquire global mutation admission.
+        schedule_daemon_dfs_allocator_cleanup_on_runtime(
+            self.data_dir.clone(),
+            &self.runtime,
+            self._generation_fence.scheduler(),
+        );
     }
 }
 
@@ -1640,6 +1709,9 @@ static DAEMON_DFS_METADATA_PUBLISH_SCHEDULERS: OnceLock<
 > = OnceLock::new();
 static DAEMON_DFS_METADATA_MATERIALIZATION_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<DaemonDfsMetadataPublishLaneKey, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
+> = OnceLock::new();
+static DAEMON_DFS_ALLOCATOR_CLEANUP_SCHEDULERS: OnceLock<
+    Mutex<BTreeMap<PathBuf, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
 > = OnceLock::new();
 static DAEMON_DFS_METADATA_PUBLISH_DISCOVERY_SCHEDULERS: OnceLock<
     Mutex<BTreeMap<PathBuf, Weak<sinomo_dfs::DfsMetadataPublishScheduler>>>,
@@ -6800,6 +6872,26 @@ fn daemon_dfs_metadata_materialization_lane_scheduler(
     )
 }
 
+fn daemon_dfs_allocator_cleanup_scheduler(
+    data_dir: &SinomoDataDir,
+) -> Result<Arc<sinomo_dfs::DfsMetadataPublishScheduler>, DaemonError> {
+    let key = data_dir.root();
+    let mut schedulers = DAEMON_DFS_ALLOCATOR_CLEANUP_SCHEDULERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| DaemonError::Network {
+            address: "DFS allocator cleanup scheduler".to_string(),
+            detail: "DFS allocator cleanup scheduler map is poisoned".to_string(),
+        })?;
+    if let Some(scheduler) = schedulers.get(&key).and_then(Weak::upgrade) {
+        return Ok(scheduler);
+    }
+    schedulers.retain(|_, scheduler| scheduler.strong_count() > 0);
+    let scheduler = Arc::new(sinomo_dfs::DfsMetadataPublishScheduler::new());
+    schedulers.insert(key, Arc::downgrade(&scheduler));
+    Ok(scheduler)
+}
+
 fn daemon_dfs_keyed_metadata_scheduler(
     registry: &'static OnceLock<
         Mutex<
@@ -9801,6 +9893,7 @@ impl DaemonDefaultDfsReconciliationReactor {
                     expected_cluster_id,
                     expected_node_id,
                     runtime,
+                    false,
                 )
                 .await?
             {
@@ -9917,6 +10010,7 @@ impl DaemonDefaultDfsReconciliationReactor {
         expected_cluster_id: &sinomo_core::Id,
         expected_node_id: &NodeId,
         runtime: &tokio::runtime::Handle,
+        foreground_preemptible: bool,
     ) -> Result<DaemonDefaultDfsReconciliationStep, DaemonError> {
         let Some(work) = self.pending_work() else {
             return Ok(DaemonDefaultDfsReconciliationStep::Idle);
@@ -9968,6 +10062,7 @@ impl DaemonDefaultDfsReconciliationReactor {
                 options,
                 publish_cluster_control,
                 runtime.clone(),
+                foreground_preemptible,
             )
             .await?
             {
@@ -10783,6 +10878,7 @@ pub(crate) async fn run_daemon_default_dfs_reconciliation_reactor(
                 &expected_cluster_id,
                 &expected_node_id,
                 &runtime,
+                true,
             )
             .await
         {
@@ -10877,6 +10973,7 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
         options,
         publish_cluster_control,
         runtime,
+        false,
     )
     .await?
     {
@@ -10899,6 +10996,7 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     options: &DaemonRunOptions,
     publish_cluster_control: bool,
     runtime: tokio::runtime::Handle,
+    foreground_preemptible: bool,
 ) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
     #[cfg(test)]
     record_daemon_default_dfs_reconciliation_run(paths);
@@ -10924,13 +11022,55 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
         None
     };
     let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
-    // The dedicated reactor is the sole owner of default reconciliation. Wait
-    // behind an active backend-bearing maintenance pass instead of treating
-    // overlap as success and losing a committed input generation.
-    let lifecycle_guard = lifecycle_gate.lock_owned().await;
-    let mutation_admission = daemon_dfs_mutation_scheduler(&lifecycle_data_dir)?
-        .admit(&DfsMessageExecutionScope::GlobalExclusive)
-        .await?;
+    let mutation_scheduler = daemon_dfs_mutation_scheduler(&lifecycle_data_dir)?;
+    // The dedicated reactor is the sole owner of default reconciliation. A
+    // startup pass waits normally. Background passes publish maintenance
+    // interest before either broad gate and destroy any queued global writer
+    // as soon as foreground traffic asks to run; this avoids Tokio's
+    // write-preferring RwLock stranding later exact-shard requests behind a
+    // reconciliation generation which has not started yet.
+    let (lifecycle_guard, mutation_admission, foreground_preemption) = if foreground_preemptible {
+        loop {
+            let foreground_preemption = mutation_scheduler.begin_maintenance_interest();
+            let mut lifecycle_admission = Box::pin(Arc::clone(&lifecycle_gate).lock_owned());
+            let lifecycle_guard = tokio::select! {
+                biased;
+                _ = foreground_preemption.requested() => None,
+                guard = &mut lifecycle_admission => Some(guard),
+            };
+            drop(lifecycle_admission);
+            let Some(lifecycle_guard) = lifecycle_guard else {
+                drop(foreground_preemption);
+                tokio::time::sleep(DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD).await;
+                continue;
+            };
+            let mut mutation_admission_future =
+                Box::pin(mutation_scheduler.admit(&DfsMessageExecutionScope::GlobalExclusive));
+            let mutation_admission = tokio::select! {
+                biased;
+                _ = foreground_preemption.requested() => None,
+                admission = &mut mutation_admission_future => Some(admission?),
+            };
+            drop(mutation_admission_future);
+            let Some(mutation_admission) = mutation_admission else {
+                drop(lifecycle_guard);
+                drop(foreground_preemption);
+                tokio::time::sleep(DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD).await;
+                continue;
+            };
+            break (
+                lifecycle_guard,
+                mutation_admission,
+                Some(foreground_preemption),
+            );
+        }
+    } else {
+        let lifecycle_guard = lifecycle_gate.lock_owned().await;
+        let mutation_admission = mutation_scheduler
+            .admit(&DfsMessageExecutionScope::GlobalExclusive)
+            .await?;
+        (lifecycle_guard, mutation_admission, None)
+    };
     // Own admission inside the blocking task that polls the complete lifecycle
     // future. Dropping the JoinHandle cannot cancel a running blocking task, so
     // neither guard can be released while backend-bearing DFS work still runs.
@@ -11001,6 +11141,17 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
             address: "default DFS lifecycle".to_string(),
             detail: format!("default DFS lifecycle task failed: {source}"),
         })?;
+    let foreground_waiting = foreground_preemption
+        .as_ref()
+        .is_some_and(DaemonDfsMaintenanceForegroundPreemption::is_requested);
+    drop(foreground_preemption);
+    if foreground_waiting {
+        // Admission was released inside the completed blocking task. Delay
+        // only the next bounded pass so the foreground burst which requested
+        // preemption can drain without another global writer immediately
+        // taking its place.
+        tokio::time::sleep(DAEMON_DEFAULT_DFS_RECONCILIATION_FOREGROUND_QUIET_PERIOD).await;
+    }
     lifecycle_result
 }
 
@@ -11249,6 +11400,32 @@ enum DaemonDfsMaintenancePreemptionOutcome<T> {
     ForegroundWaiting,
 }
 
+async fn acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
+    data_dir: &SinomoDataDir,
+    foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
+) -> Result<Option<DaemonDfsMaintenanceAdmission>, DaemonError> {
+    let mut admission = Box::pin(acquire_daemon_dfs_maintenance_admission(data_dir));
+    let outcome = tokio::select! {
+        biased;
+        _ = foreground_preemption.requested() => None,
+        result = &mut admission => Some(result?),
+    };
+    if outcome.is_none() {
+        // Dropping the pending writer is the important ordering boundary: a
+        // Tokio RwLock prefers queued writers, so leaving this future alive
+        // would keep later exact-shard readers behind maintenance even though
+        // foreground traffic had already requested preemption.
+        let drop_started = Instant::now();
+        drop(admission);
+        tracing::trace!(
+            target: "sinomo.dfs.perf",
+            admission_future_drop_us = drop_started.elapsed().as_micros() as u64,
+            "dfs maintenance admission cancelled for foreground traffic"
+        );
+    }
+    Ok(outcome)
+}
+
 async fn run_daemon_dfs_maintenance_until_foreground_waits<F>(
     foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
     maintenance: F,
@@ -11386,7 +11563,14 @@ async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     // to yield once its current synchronous poll reaches an await boundary.
     let foreground_preemption =
         daemon_dfs_mutation_scheduler(&data_dir)?.begin_maintenance_interest();
-    let admission = acquire_daemon_dfs_maintenance_admission(&data_dir).await?;
+    let Some(admission) = acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
+        &data_dir,
+        &foreground_preemption,
+    )
+    .await?
+    else {
+        return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+    };
     let DaemonDfsMaintenanceAdmission {
         _lifecycle_guard: lifecycle_guard,
         _mutation_admission: mutation_admission,
@@ -12013,6 +12197,101 @@ fn schedule_daemon_dfs_metadata_publish_for_data_dir_on_runtime(
     )
 }
 
+fn schedule_daemon_dfs_allocator_cleanup_on_runtime(
+    data_dir: SinomoDataDir,
+    runtime: &tokio::runtime::Handle,
+    mutation_scheduler: Arc<DaemonDfsMutationScheduler>,
+) {
+    let cleanup_scheduler = match daemon_dfs_allocator_cleanup_scheduler(&data_dir) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            tracing::warn!(
+                data_root = %data_dir.root().display(),
+                "sinomo daemon DFS allocator cleanup could not be scheduled: {error}"
+            );
+            return;
+        }
+    };
+    let run_scheduler = Arc::clone(&cleanup_scheduler);
+    let report_data_root = data_dir.root();
+    let error_data_root = report_data_root.clone();
+    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+        Arc::clone(&cleanup_scheduler),
+        runtime.clone(),
+        DfsMetadataPublishScheduleOptions {
+            max_retry_rounds: 0,
+            ..daemon_dfs_metadata_publish_schedule_options()
+        },
+        move || {
+            let data_dir = data_dir.clone();
+            let mutation_scheduler = Arc::clone(&mutation_scheduler);
+            let run_scheduler = Arc::clone(&run_scheduler);
+            async move {
+                loop {
+                    // Publish interest before waiting for quiet. A foreground
+                    // mutation can then invalidate this pass without queueing
+                    // behind allocator work, even while it is still entering
+                    // cluster or local admission.
+                    let foreground_preemption = mutation_scheduler.begin_maintenance_interest();
+                    tokio::select! {
+                        biased;
+                        _ = foreground_preemption.requested() => continue,
+                        _ = tokio::time::sleep(DAEMON_DFS_ALLOCATOR_CLEANUP_QUIET_PERIOD) => {}
+                    }
+                    if run_scheduler.has_pending_request() {
+                        // Let the retained scheduler consume the new cleanup
+                        // edge and restart the quiet period from that request.
+                        return Ok(DfsMetadataJournalReplicationReport {
+                            outcomes: Vec::new(),
+                        });
+                    }
+                    let Ok(global_admission) =
+                        Arc::clone(&mutation_scheduler.global).try_write_owned()
+                    else {
+                        // Never become a queued writer ahead of foreground
+                        // exact-shard traffic. A later quiet pass retries.
+                        continue;
+                    };
+                    if foreground_preemption.is_requested() {
+                        drop(global_admission);
+                        continue;
+                    }
+
+                    let trim_data_dir = data_dir.clone();
+                    let trim_started = Instant::now();
+                    let allocator_trimmed = tokio::task::spawn_blocking(move || {
+                        release_daemon_dfs_idle_allocator_pages(&trim_data_dir)
+                    })
+                    .await
+                    .map_err(|error| format!("DFS allocator cleanup task failed: {error}"))?;
+                    daemon_dfs_perf_trace(format_args!(
+                        "dfs-allocator-cleanup data_root={} trimmed={} elapsed_ms={}",
+                        data_dir.root().display(),
+                        allocator_trimmed,
+                        trim_started.elapsed().as_millis(),
+                    ));
+                    drop(global_admission);
+                    return Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    });
+                }
+            }
+        },
+        move |_| {
+            daemon_dfs_perf_trace(format_args!(
+                "dfs-allocator-cleanup-complete data_root={}",
+                report_data_root.display()
+            ));
+        },
+        move |error| {
+            tracing::warn!(
+                data_root = %error_data_root.display(),
+                "sinomo daemon DFS allocator cleanup failed: {error}"
+            );
+        },
+    );
+}
+
 fn schedule_daemon_dfs_replica_materialization_on_runtime(
     data_dir: SinomoDataDir,
     runtime: &tokio::runtime::Handle,
@@ -12038,8 +12317,8 @@ fn schedule_daemon_dfs_replica_materialization_on_runtime(
         }
     };
     let lane = Arc::new(DaemonDfsReplicaMaterializationLane {
-        #[cfg(test)]
         data_dir,
+        runtime: runtime.clone(),
         shard,
         _data_owner_lock: data_owner_lock,
         _generation_fence: generation_fence,
@@ -12050,7 +12329,7 @@ fn schedule_daemon_dfs_replica_materialization_on_runtime(
     let error_file_system_id = file_system_id;
     let error_shard_id = shard_id;
     sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
-        scheduler,
+        Arc::clone(&scheduler),
         runtime.clone(),
         DfsMetadataPublishScheduleOptions {
             // Coalesce new ACKs, but never retain an authority fence forever
@@ -12060,10 +12339,51 @@ fn schedule_daemon_dfs_replica_materialization_on_runtime(
         },
         move || {
             let lane = Arc::clone(&lane);
+            let scheduler = Arc::clone(&scheduler);
             async move {
+                // Publish background interest before the quiet period. An
+                // ingress that has reached mutation admission but has not yet
+                // checked out the resident shard must be able to preempt this
+                // rebuildable replay before `try_checkout` can win the race.
+                // This guard is fresh for every retained scheduler pass, so a
+                // completed foreground edge does not suppress the later
+                // quiescent pass that closes its journal/table gap.
+                let foreground_preemption = lane.begin_foreground_preemption();
+                tokio::time::sleep(DAEMON_DFS_REPLICA_MATERIALIZATION_QUIET_PERIOD).await;
+                if scheduler.has_pending_request() || foreground_preemption.is_requested() {
+                    // The retained run loop observes the same pending bit and
+                    // starts a fresh quiet period without dropping this
+                    // generation's authority capabilities. A foreground edge
+                    // with no completed append lets the loop release this
+                    // lane so that request can schedule a fresh generation.
+                    return Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    });
+                }
+
+                let Some(shard) = lane
+                    .shard
+                    .try_checkout()
+                    .map_err(|error| error.to_string())?
+                else {
+                    // Never enqueue rebuildable work ahead of a foreground
+                    // shard owner. A durable replica ingress schedules the
+                    // next pass after its append, while ordinary writers close
+                    // the journal/table gap synchronously under their lock.
+                    return Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    });
+                };
+                if scheduler.has_pending_request() || foreground_preemption.is_requested() {
+                    drop(shard);
+                    return Ok(DfsMetadataJournalReplicationReport {
+                        outcomes: Vec::new(),
+                    });
+                }
+
                 let materialize_file_system_id = lane.shard.file_system_id().clone();
                 let materialize_shard_id = lane.shard.shard_id().clone();
-                let materialized = tokio::task::spawn_blocking(move || lane.materialize())
+                let materialized = tokio::task::spawn_blocking(move || lane.materialize(shard))
                     .await
                     .map_err(|error| format!("DFS replica materialization task failed: {error}"))?
                     .map_err(|error| error.to_string())?;
@@ -12931,6 +13251,7 @@ mod tests {
         assert!(
             daemon_dfs_visible_mutation_event(&command_for(DfsNamespaceOperation::LookupPath {
                 path: "/services/reactive".to_string(),
+                inline_range: None,
             }))
             .is_none(),
             "read-only namespace traffic must not wake a mounted projection"
@@ -14252,6 +14573,65 @@ mod tests {
     }
 
     #[test]
+    fn allocator_cleanup_yields_to_foreground_mutation_admission() {
+        let root = temp_root("allocator-cleanup-foreground-preemption");
+        let data_dir = SinomoDataDir::new(root.path());
+        let runtime = daemon_test_runtime("allocator-cleanup-foreground-preemption");
+        let mutation_scheduler =
+            daemon_dfs_mutation_scheduler(&data_dir).expect("mutation scheduler");
+        let trims_before = daemon_dfs_allocator_trim_completion_count(&data_dir);
+
+        schedule_daemon_dfs_allocator_cleanup_on_runtime(
+            data_dir.clone(),
+            runtime.handle(),
+            Arc::clone(&mutation_scheduler),
+        );
+        runtime.block_on(async {
+            let interest_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while mutation_scheduler
+                .maintenance_interest_count
+                .load(Ordering::Acquire)
+                == 0
+            {
+                assert!(
+                    tokio::time::Instant::now() < interest_deadline,
+                    "allocator cleanup did not publish foreground interest"
+                );
+                tokio::task::yield_now().await;
+            }
+
+            let foreground = admit_daemon_dfs_foreground_message(
+                &mutation_scheduler,
+                &DfsMessageExecutionScope::ExactShard {
+                    file_system_id: DfsFileSystemId::from_legacy_named(
+                        "allocator_cleanup_filesystem",
+                    )
+                    .expect("filesystem id"),
+                    shard_id: DfsMetadataShardId::new("root"),
+                },
+            )
+            .await
+            .expect("foreground admission");
+            tokio::time::sleep(DAEMON_DFS_ALLOCATOR_CLEANUP_QUIET_PERIOD * 3).await;
+            assert_eq!(
+                daemon_dfs_allocator_trim_completion_count(&data_dir),
+                trims_before,
+                "allocator cleanup must not trim while foreground admission is held"
+            );
+            drop(foreground);
+
+            let trim_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while daemon_dfs_allocator_trim_completion_count(&data_dir) == trims_before {
+                assert!(
+                    tokio::time::Instant::now() < trim_deadline,
+                    "allocator cleanup did not resume after foreground admission"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    }
+
+    #[test]
     fn lightweight_dfs_reads_bypass_global_admission() {
         let root = temp_root("lightweight-read-bypasses-mutation-gate");
         let scheduler = daemon_dfs_mutation_scheduler(&SinomoDataDir::new(root.path()))
@@ -14333,6 +14713,58 @@ mod tests {
                 DaemonDfsMutationAdmission::ReadOnly { .. }
             ));
             drop(global);
+        });
+    }
+
+    #[test]
+    fn foreground_dfs_cancels_a_queued_maintenance_writer() {
+        let root = temp_root("foreground-cancels-queued-maintenance-writer");
+        let data_dir = SinomoDataDir::new(root.path());
+        let scheduler = daemon_dfs_mutation_scheduler(&data_dir).expect("mutation scheduler");
+        let runtime = daemon_test_runtime("foreground-cancels-queued-maintenance-writer");
+        runtime.block_on(async {
+            // A replica materializer retains the shared generation fence while
+            // it waits for a quiet shard-local replay window.
+            let retained_replica = scheduler
+                .admit(&daemon_dfs_test_execution_scope(
+                    "queued-maintenance-fs",
+                    "root",
+                ))
+                .await
+                .expect("retained replica generation");
+            let foreground_preemption = scheduler.begin_maintenance_interest();
+            let maintenance_data_dir = data_dir.clone();
+            let maintenance = tokio::spawn(async move {
+                acquire_daemon_dfs_maintenance_admission_until_foreground_waits(
+                    &maintenance_data_dir,
+                    &foreground_preemption,
+                )
+                .await
+                .expect("maintenance admission result")
+            });
+
+            // Let maintenance acquire its lifecycle gate and queue the global
+            // writer behind the retained replica read fence.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let foreground = tokio::time::timeout(
+                Duration::from_secs(1),
+                admit_daemon_dfs_foreground_message(
+                    &scheduler,
+                    &daemon_dfs_test_execution_scope("queued-maintenance-fs", "services"),
+                ),
+            )
+            .await
+            .expect("foreground read must cancel the queued maintenance writer")
+            .expect("foreground admission");
+            assert!(
+                maintenance
+                    .await
+                    .expect("maintenance admission task")
+                    .is_none(),
+                "pre-admission maintenance must defer after foreground interest"
+            );
+            drop(foreground);
+            drop(retained_replica);
         });
     }
 
@@ -15458,6 +15890,7 @@ mod tests {
             authority_shards: Vec::new(),
             operation: DfsNamespaceOperation::LookupPath {
                 path: path.to_string(),
+                inline_range: None,
             },
         });
         DfsRoutedMessage {
@@ -17329,23 +17762,18 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         });
-        // This focused host fixture intentionally is not a Raft voter, so it
-        // cannot execute the complete production maintenance tick. Exercise
-        // the same blocking trim boundary directly after proving that the
-        // materializer transferred a scoped maintenance obligation.
-        let trim_data_dir = data_dir.as_ref().clone();
-        runtime.block_on(async move {
-            tokio::task::spawn_blocking(move || {
-                release_daemon_dfs_idle_allocator_pages(&trim_data_dir)
-            })
-            .await
-            .expect("blocking allocator cleanup");
+        runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while daemon_dfs_allocator_trim_completion_count(data_dir.as_ref())
+                <= allocator_trims_before_materialization
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "scoped allocator cleanup did not trim after materialization"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
-        assert!(
-            daemon_dfs_allocator_trim_completion_count(data_dir.as_ref())
-                > allocator_trims_before_materialization,
-            "blocking maintenance must complete the retained allocator cleanup"
-        );
 
         let mut next_shard = shard.clone();
         next_shard.epoch = next_shard.epoch.saturating_add(1);
@@ -22526,6 +22954,7 @@ mod tests {
         let read_only = namespace_command(
             DfsNamespaceOperation::LookupPath {
                 path: "/services/exact".to_string(),
+                inline_range: None,
             },
             vec![services.clone()],
         );
@@ -23821,14 +24250,14 @@ mod tests {
                 revision: KvRevision(4),
                 key: shard_key.clone(),
                 kind: sinomo_core::kv::KvEventKind::Put {
-                    value: b"shard-v4".to_vec(),
+                    value: b"shard-v2".to_vec(),
                 },
             }],
             final_key_states: vec![sinomo_core::kv::ClusterKvCommittedKeyState {
                 key: shard_key.clone(),
                 entry: Some(KvEntry {
                     key: shard_key.clone(),
-                    value: b"shard-v4".to_vec(),
+                    value: b"shard-v2".to_vec(),
                     create_revision: KvRevision(1),
                     modify_revision: KvRevision(4),
                     version: KvVersion(3),
@@ -23837,15 +24266,14 @@ mod tests {
             }],
         };
         assert!(!generation.observe_delta(&gapped));
-        assert_eq!(generation.generation(), initial_generation + 2);
+        assert_eq!(
+            generation.generation(),
+            complete_generation,
+            "a revision gap must not manufacture a topology transition before the replacement proof is compared",
+        );
         let gapped_generation = generation.generation();
         assert_eq!(
             generation.retained_complete_prefix_revision_for_generation(complete_generation),
-            None,
-            "an invalidation must withdraw the certificate from the superseded generation",
-        );
-        assert_eq!(
-            generation.retained_complete_prefix_revision_for_generation(gapped_generation),
             None,
             "the current generation must remain fail-closed while its retained projection has a gap",
         );
@@ -23853,7 +24281,12 @@ mod tests {
             let projection = generation.projection.lock().expect("projection lock");
             assert_eq!(projection.revision, None);
             assert_eq!(projection.required_revision, KvRevision(4));
-            assert!(projection.entries.is_empty());
+            assert_eq!(
+                projection.entries.len(),
+                1,
+                "the last exact topology remains comparison-only while readiness is withdrawn",
+            );
+            assert!(projection.topology_comparison_baseline);
         }
         assert!(
             !generation
@@ -23868,32 +24301,32 @@ mod tests {
                 vec![(shard_key.clone(), b"stale-checkpoint".to_vec())],
             )),
         ));
-        assert_eq!(generation.generation(), initial_generation + 2);
+        assert_eq!(generation.generation(), gapped_generation);
         assert_eq!(
             generation.retained_complete_prefix_revision_for_generation(gapped_generation),
             None,
             "a stale checkpoint below the required revision must not restore readiness",
         );
         assert!(
-            generation
+            !generation
                 .projection
                 .lock()
                 .expect("projection lock")
                 .entries
                 .is_empty(),
-            "a stale checkpoint below the missing revision must not repopulate authority"
+            "a stale checkpoint below the missing revision must not erase the comparison baseline"
         );
 
         assert!(generation.install_authoritative_projection(
             test_dfs_authoritative_prefix_projection(&default_dfs_reactor_test_snapshot(
                 4,
-                vec![(shard_key, b"shard-v4".to_vec())],
+                vec![(shard_key.clone(), b"shard-v2".to_vec())],
             )),
         ));
         assert_eq!(
             generation.generation(),
-            initial_generation + 2,
-            "closing an already-counted invalidation must not roll the generation twice"
+            gapped_generation,
+            "closing a revision gap with equal topology must not reopen resident metadata"
         );
         assert_eq!(
             generation
@@ -23907,6 +24340,18 @@ mod tests {
             generation.retained_complete_prefix_revision_for_generation(gapped_generation),
             Some(KvRevision(4)),
             "only a checkpoint closing the revision gap may restore readiness",
+        );
+
+        assert!(generation.install_authoritative_projection(
+            test_dfs_authoritative_prefix_projection(&default_dfs_reactor_test_snapshot(
+                5,
+                vec![(shard_key, b"shard-v5".to_vec())],
+            )),
+        ));
+        assert_eq!(
+            generation.generation(),
+            gapped_generation + 1,
+            "a changed authoritative replacement must still advance the resident generation",
         );
     }
 
@@ -26441,6 +26886,7 @@ mod tests {
                 &cluster_id,
                 &local,
                 runtime.handle(),
+                false,
             ))
             .expect_err("non-voter recovery failure remains pending for retry");
         assert!(
