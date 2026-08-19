@@ -3631,11 +3631,18 @@ impl CloudFilesNamespaceReconciler {
         Ok(conflict)
     }
 
-    /// Rewrites the canonical state snapshot after dropping event receipts
-    /// already covered by durable cursors.
+    /// Compacts event receipts already covered by durable cursors, rewriting
+    /// the canonical state snapshot only when compaction changes it.
     pub fn compact_durable_state(&mut self) -> Result<u64, CloudFilesNamespaceReconcileError> {
         self.ensure_usable()?;
-        self.persist()?;
+        let previous = self.state.clone();
+        compact_reconciliation_state(&mut self.state);
+        if self.state != previous {
+            self.persist()?;
+        } else if let Err(error) = self.manifest_store.compact_if_needed(&self.manifest) {
+            self.usable = false;
+            return Err(error);
+        }
         fs::metadata(&self.state_path)
             .map(|metadata| metadata.len())
             .map_err(io_error("inspect compacted namespace reconciliation state"))
@@ -8496,6 +8503,28 @@ mod tests {
             .expect("replay unchanged full-scan delta");
 
         assert_eq!(snapshot_tree(&scope), before);
+    }
+
+    #[test]
+    fn unchanged_maintenance_compaction_does_not_rewrite_state() {
+        let root = TestRoot::new("unchanged-maintenance-compaction");
+        let mut reconciler = open_reconciler(&root);
+        let state_path = reconciler.state_path().to_path_buf();
+        let modified_before = fs::metadata(&state_path)
+            .expect("state metadata before maintenance")
+            .modified()
+            .expect("state modification time before maintenance");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        reconciler
+            .compact_durable_state()
+            .expect("compact unchanged durable state");
+
+        let modified_after = fs::metadata(&state_path)
+            .expect("state metadata after maintenance")
+            .modified()
+            .expect("state modification time after maintenance");
+        assert_eq!(modified_after, modified_before);
     }
 
     #[test]

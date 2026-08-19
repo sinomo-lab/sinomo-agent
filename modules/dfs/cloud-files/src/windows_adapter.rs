@@ -5109,6 +5109,7 @@ impl WindowsWritableWorkerHandle {
                 let mut cursor_recovery_terminal_emitted = false;
                 let run_result = catch_unwind(AssertUnwindSafe(|| {
                     let mut generation = initial_generation;
+                    let mut reasons = WORKER_WAKE_NAMESPACE_CHANGE;
                     while !thread_cancelled.load(Ordering::SeqCst) {
                         if let Some(detail) = thread_wake.take_failure() {
                             return Err(crate::windows_sync::CloudFilesWindowsSyncError {
@@ -5126,7 +5127,10 @@ impl WindowsWritableWorkerHandle {
                             &thread_cancelled,
                             || {
                                 worker
-                                    .run_once(&thread_cancelled)
+                                    .run_once_for_wake(
+                                        &thread_cancelled,
+                                        reasons & WORKER_WAKE_NAMESPACE_CHANGE != 0,
+                                    )
                                     .map(|_| worker.state().status())
                             },
                             |cancelled| {
@@ -5169,7 +5173,7 @@ impl WindowsWritableWorkerHandle {
                                     .send(CursorRecoveryWorkerProgress::Advanced(generation));
                             }
                         }
-                        let reasons =
+                        reasons =
                             thread_wake.wait(&thread_cancelled, worker.next_scheduled_work_in());
                         if let Some(detail) = thread_wake.take_failure() {
                             return Err(crate::windows_sync::CloudFilesWindowsSyncError {

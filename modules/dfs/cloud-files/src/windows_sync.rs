@@ -3248,7 +3248,23 @@ where
         &mut self,
         cancelled: &AtomicBool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
-        let result = self.run_once_inner(cancelled);
+        self.run_once_with_namespace_poll(cancelled, true)
+    }
+
+    pub(crate) fn run_once_for_wake(
+        &mut self,
+        cancelled: &AtomicBool,
+        namespace_poll_requested: bool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        self.run_once_with_namespace_poll(cancelled, namespace_poll_requested)
+    }
+
+    fn run_once_with_namespace_poll(
+        &mut self,
+        cancelled: &AtomicBool,
+        namespace_poll_requested: bool,
+    ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
+        let result = self.run_once_inner(cancelled, namespace_poll_requested);
         if let Err(error) = &result
             && !retryable_namespace_read_error(error)
         {
@@ -3260,6 +3276,7 @@ where
     fn run_once_inner(
         &mut self,
         cancelled: &AtomicBool,
+        namespace_poll_requested: bool,
     ) -> Result<CloudFilesWritableSyncProgress, CloudFilesWindowsSyncError> {
         if self.cursor_recovery_is_armed() {
             return self.run_authorized_cursor_recovery(cancelled);
@@ -3347,7 +3364,7 @@ where
             .drain_changes(self.state.reconciler.manifest(), cancelled)
             .map_err(capture_sync_error("read-directory-changes"))?;
         let mut progress = CloudFilesWritableSyncProgress::default();
-        if captures.overflowed {
+        let mut maintenance_needed = if captures.overflowed {
             let previous_manifest = self.state.reconciler.manifest().clone();
             let snapshot = self.full_scan_snapshot(cancelled)?;
             let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
@@ -3360,7 +3377,9 @@ where
                 self.full_scan_pending = true;
                 self.startup_scan_baseline = Some(previous_manifest);
             }
+            true
         } else {
+            let had_sparse_placeholders = !captures.sparse_placeholders.is_empty();
             self.resolve_sparse_placeholders(captures.sparse_placeholders)?;
             for capture in captures.changes {
                 check_cancelled(cancelled)?;
@@ -3369,11 +3388,20 @@ where
             }
             check_cancelled(cancelled)?;
             progress.mutation_progress = self.execute_mutations()?;
-        }
-        if !self.full_scan_pending && self.startup_scan_baseline.is_none() {
+            had_sparse_placeholders
+                || progress.captures_enqueued != 0
+                || !progress.mutation_progress.is_empty()
+        };
+        if namespace_poll_requested
+            && !self.full_scan_pending
+            && self.startup_scan_baseline.is_none()
+        {
             self.poll_namespace(cancelled, &mut progress)?;
+            maintenance_needed = true;
         }
-        self.run_maintenance()?;
+        if maintenance_needed {
+            self.run_maintenance()?;
+        }
         Ok(progress)
     }
 
@@ -6727,6 +6755,32 @@ mod tests {
         assert_eq!(drain_calls.load(Ordering::SeqCst), 0);
         assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
         assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn empty_local_wake_does_not_poll_remote_namespace() {
+        let root = TestRoot::new("empty-local-wake");
+        let state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let namespace = FakeNamespace::with_scans([snapshot(1)]);
+        let poll_calls = Arc::clone(&namespace.poll_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            namespace,
+            FakeEffects::default(),
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("startup");
+        let polls_after_startup = poll_calls.load(Ordering::SeqCst);
+
+        let progress = worker
+            .run_once_for_wake(&cancelled, false)
+            .expect("empty local wake");
+
+        assert_eq!(progress, CloudFilesWritableSyncProgress::default());
+        assert_eq!(poll_calls.load(Ordering::SeqCst), polls_after_startup);
     }
 
     #[test]
