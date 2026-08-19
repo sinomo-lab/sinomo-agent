@@ -112,6 +112,7 @@ const LOCAL_STARTUP_SCAN_WORK_PER_PASS: usize = 32;
 const SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CURSOR_RECOVERY_SENTINEL_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_LIFECYCLE_MIN_EMIT_INTERVAL: Duration = Duration::from_secs(1);
 const CURSOR_RECOVERY_SENTINEL_PAYLOAD_DOMAIN: &[u8] =
     b"sinomo.cloud-files.cursor-recovery.sentinel.v1";
 
@@ -5008,6 +5009,16 @@ impl WorkerLifecycleEmitter {
     }
 }
 
+fn worker_lifecycle_emission_due(
+    previous_status: Option<&CloudFilesLocalChangeSyncStatus>,
+    status: &CloudFilesLocalChangeSyncStatus,
+    elapsed_since_previous: Option<Duration>,
+) -> bool {
+    previous_status != Some(status)
+        || elapsed_since_previous
+            .is_none_or(|elapsed| elapsed >= WORKER_LIFECYCLE_MIN_EMIT_INTERVAL)
+}
+
 pub(super) struct WindowsWritableWorkerHandle {
     cancelled: Arc<AtomicBool>,
     wake: Arc<WindowsWorkerWake>,
@@ -5073,6 +5084,8 @@ impl WindowsWritableWorkerHandle {
                 }
                 let progress_emitter = emitter;
                 let last_generation = AtomicU64::new(initial_generation);
+                let mut last_emitted_status = None;
+                let mut last_lifecycle_emit = None;
                 let mut cursor_recovery_terminal_emitted = false;
                 let run_result = catch_unwind(AssertUnwindSafe(|| {
                     let mut generation = initial_generation;
@@ -5112,7 +5125,17 @@ impl WindowsWritableWorkerHandle {
                         generation = generation.saturating_add(1);
                         let ready = status.mode == CloudFilesLocalChangeSyncMode::Active;
                         last_generation.store(generation, Ordering::SeqCst);
-                        progress_emitter.emit(status, true, ready, generation);
+                        let now = Instant::now();
+                        if worker_lifecycle_emission_due(
+                            last_emitted_status.as_ref(),
+                            &status,
+                            last_lifecycle_emit
+                                .map(|emitted: Instant| now.saturating_duration_since(emitted)),
+                        ) {
+                            last_emitted_status = Some(status.clone());
+                            last_lifecycle_emit = Some(now);
+                            progress_emitter.emit(status, true, ready, generation);
+                        }
                         if ready {
                             let _ = progress_sender.try_send(generation);
                         }
@@ -5550,6 +5573,29 @@ mod tests {
         let timeouts = namespace_event_stream_timeouts();
         assert_eq!(timeouts.connect_timeout, Some(Duration::from_secs(3)));
         assert_eq!(timeouts.idle_timeout, None);
+    }
+
+    #[test]
+    fn unchanged_worker_lifecycle_is_rate_limited_but_transitions_are_immediate() {
+        let active = CloudFilesLocalChangeSyncStatus::writable_active(0, 0, 0, 0);
+        let changed = CloudFilesLocalChangeSyncStatus::writable_active(1, 0, 0, 0);
+
+        assert!(worker_lifecycle_emission_due(None, &active, None));
+        assert!(!worker_lifecycle_emission_due(
+            Some(&active),
+            &active,
+            Some(WORKER_LIFECYCLE_MIN_EMIT_INTERVAL - Duration::from_millis(1)),
+        ));
+        assert!(worker_lifecycle_emission_due(
+            Some(&active),
+            &active,
+            Some(WORKER_LIFECYCLE_MIN_EMIT_INTERVAL),
+        ));
+        assert!(worker_lifecycle_emission_due(
+            Some(&active),
+            &changed,
+            Some(Duration::ZERO),
+        ));
     }
 
     #[test]

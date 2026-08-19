@@ -9499,9 +9499,8 @@ mod tests {
     }
 
     #[test]
-    fn content_writes_do_not_create_stats_snapshot_until_stats_are_requested() {
-        let root =
-            temp_root("content_writes_do_not_create_stats_snapshot_until_stats_are_requested");
+    fn no_quota_stats_are_byte_read_only_and_rescan_durable_content() {
+        let root = temp_root("no_quota_stats_are_byte_read_only_and_rescan_durable_content");
         let store = LocalContentStore::new(&root).expect("create store");
 
         store
@@ -9516,25 +9515,25 @@ mod tests {
             "ordinary writes without quotas should not force a stats lock"
         );
 
-        let initial = store.stats().expect("stats scan materializes snapshot");
+        let initial = store.stats().expect("read derived stats");
         assert_eq!(initial.blob_count, 1);
         assert_eq!(initial.manifest_count, 1);
-        assert!(store.stats_snapshot_path().exists());
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "an observational stats read must not persist a derived snapshot"
+        );
+        assert!(
+            !root.join(CONTENT_STORE_STATS_LOCK_FILE).exists(),
+            "an observational stats read must not create a snapshot lock"
+        );
         assert!(
             !store.tracks_stats_deltas(),
             "derived status state must not become synchronous write authority"
         );
-        let snapshot_before_second_write =
-            read_file(&store.stats_snapshot_path()).expect("read initial derived snapshot");
 
         store
             .put_object_version("object-lazy-stats", "v2", b"lazy stats bravo")
             .expect("put second object");
-        assert_eq!(
-            read_file(&store.stats_snapshot_path()).expect("read lagging derived snapshot"),
-            snapshot_before_second_write,
-            "no-quota writes must not rewrite a status snapshot"
-        );
         let updated = store.stats().expect("derived stats rescan durable content");
         assert_eq!(updated.blob_count, 2);
         assert_eq!(updated.manifest_count, 2);
@@ -9542,6 +9541,8 @@ mod tests {
             updated.logical_object_bytes,
             b"lazy stats alpha".len() as u64 + b"lazy stats bravo".len() as u64
         );
+        assert!(!store.stats_snapshot_path().exists());
+        assert!(!root.join(CONTENT_STORE_STATS_LOCK_FILE).exists());
 
         cleanup(&root);
     }
@@ -9553,10 +9554,24 @@ mod tests {
         store
             .put_object_version("object-legacy-a", "v1", b"legacy alpha")
             .expect("put first object");
-        let initial = store.stats().expect("materialize legacy snapshot");
+        let legacy_snapshot = ContentStoreStats {
+            blob_count: 41,
+            manifest_count: 43,
+            ..ContentStoreStats::default()
+        };
+        store
+            .replace_stats_snapshot(&legacy_snapshot)
+            .expect("write legacy snapshot fixture");
+        let stale_snapshot = read_file(&store.stats_snapshot_path()).expect("read legacy snapshot");
+
+        let initial = store.stats().expect("ignore legacy snapshot");
         assert_eq!(initial.blob_count, 1);
         assert_eq!(initial.manifest_count, 1);
-        let stale_snapshot = read_file(&store.stats_snapshot_path()).expect("read legacy snapshot");
+        assert_eq!(
+            read_file(&store.stats_snapshot_path()).expect("read untouched legacy snapshot"),
+            stale_snapshot,
+            "a no-quota stats read must not rewrite legacy derived state"
+        );
 
         store
             .put_object_version("object-legacy-b", "v1", b"legacy bravo")

@@ -595,6 +595,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.metadata_backend.as_deref_mut()
     }
 
+    /// Count locally authoritative shards whose write lane is frozen without
+    /// collecting unrelated content-store observability. Maintenance uses this
+    /// as a safety gate and must not scan the content tree as a side effect.
+    pub fn authoritative_write_frozen_shard_count(&self) -> Result<usize, DfsError> {
+        let mut frozen_shard_count = 0usize;
+        if let Some(backend) = self.metadata_backend.as_deref() {
+            for status in backend.metadata_shard_statuses()? {
+                if status.primary_node_id.as_ref() != Some(&self.node_id) {
+                    continue;
+                }
+                if backend.metadata_shard_authoritative_writes_frozen(&status.shard_id)? {
+                    frozen_shard_count = frozen_shard_count.saturating_add(1);
+                }
+            }
+        }
+        Ok(frozen_shard_count)
+    }
+
     pub fn operational_metrics(&self) -> Result<DfsOperationalMetrics, DfsError> {
         let open_conflict_count = self
             .metadata
@@ -637,18 +655,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .values()
             .map(|pending| pending.fetch_failed_from.len())
             .sum();
-        let mut authoritative_write_frozen_shard_count = 0usize;
-        if let Some(backend) = self.metadata_backend.as_deref() {
-            for status in backend.metadata_shard_statuses()? {
-                if status.primary_node_id.as_ref() != Some(&self.node_id) {
-                    continue;
-                }
-                if backend.metadata_shard_authoritative_writes_frozen(&status.shard_id)? {
-                    authoritative_write_frozen_shard_count =
-                        authoritative_write_frozen_shard_count.saturating_add(1);
-                }
-            }
-        }
+        let authoritative_write_frozen_shard_count =
+            self.authoritative_write_frozen_shard_count()?;
         Ok(DfsOperationalMetrics {
             node_id: self.node_id.clone(),
             file_system_count: self.metadata.filesystems.len(),
@@ -767,6 +775,30 @@ mod projection_release_tests {
         );
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frozen_shard_gate_does_not_collect_or_persist_content_stats() {
+        let root = temporary_root("frozen-shard-gate-read-only");
+        let node = NodeId::from_legacy_named("node_frozen_shard_gate_read_only").expect("node");
+        let service = service_at(&root, node);
+
+        assert_eq!(
+            service
+                .authoritative_write_frozen_shard_count()
+                .expect("read frozen shard gate"),
+            0
+        );
+        assert!(
+            !root.join("content").join("stats.sobj").exists(),
+            "the maintenance safety gate must not collect content metrics"
+        );
+        assert!(
+            !root.join("content").join("stats.lock").exists(),
+            "the maintenance safety gate must not create the stats lock"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

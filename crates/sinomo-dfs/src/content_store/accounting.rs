@@ -177,17 +177,16 @@ impl LocalContentStore {
     }
 
     pub fn stats(&self) -> Result<ContentStoreStats> {
-        let _lock = self.lock_stats_snapshot()?;
-        if self.quota.is_some() {
-            return self.quota_stats_unlocked();
+        if self.quota.is_none() {
+            // Without quota, stats are rebuildable observability state. Keep
+            // this read byte-read-only: status and maintenance callers must
+            // not turn an otherwise idle content store into an atomic snapshot
+            // writer (or even create the snapshot lock file).
+            return self.scan_stats();
         }
 
-        // Without quota, stats are rebuildable observability state. Always
-        // derive them from durable content so a legacy or lagging snapshot can
-        // neither return stale usage nor become write-path authority.
-        let stats = self.scan_stats()?;
-        self.write_stats_snapshot_unlocked(&stats)?;
-        Ok(stats)
+        let _lock = self.lock_stats_snapshot()?;
+        self.quota_stats_unlocked()
     }
 
     fn quota_stats_unlocked(&self) -> Result<ContentStoreStats> {

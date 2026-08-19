@@ -325,8 +325,8 @@ impl MountedSifsMutationOutboxCursorRecoveryGuard {
     /// Accepts the exact token-bound owner image or the one monotonic change
     /// this owner permits while cursor recovery runs: committed mounted DFS
     /// work may advance the constant-size daemon latch. The latch never clears
-    /// bits, and every write increments its generation, so this does not admit
-    /// a replacement or ambiguous operation tree.
+    /// bits, and every ownership-advancing write increments its generation, so
+    /// this does not admit a replacement or ambiguous operation tree.
     pub fn matches_original_or_committed_work_successor(
         &self,
         original_raw_files: &BTreeMap<String, Vec<u8>>,
@@ -2114,10 +2114,14 @@ impl MountedSifsMutationOutboxStore {
         committed_work: DfsCommittedWork,
     ) -> Result<MountedSifsMutationCommittedWorkLatch, DfsError> {
         let mut latch = self.daemon_committed_work_latch_unlocked()?;
+        let retained_before = latch.committed_work;
+        latch.committed_work.merge(committed_work);
+        if latch.committed_work == retained_before {
+            return Ok(latch);
+        }
         latch.generation = latch.generation.checked_add(1).ok_or_else(|| {
             outbox_error("mounted-mutation committed-work latch generation overflow")
         })?;
-        latch.committed_work.merge(committed_work);
         latch.updated_at_unix_nanos = now_unix_nanos();
         self.write_daemon_committed_work_latch_unlocked(&latch)?;
         Ok(latch)
@@ -3242,6 +3246,27 @@ mod tests {
         );
         drop(retained_guard);
         assert_eq!(snapshot_tree(store.root()), retained_before);
+    }
+
+    #[test]
+    fn retaining_already_owned_daemon_work_is_byte_read_only() {
+        let (_root, store) = store("mounted-mutation-duplicate-daemon-work");
+        let work = DfsCommittedWork {
+            publish_metadata: true,
+            namespace_maintenance: true,
+            ..DfsCommittedWork::default()
+        };
+        let retained = store
+            .retain_daemon_committed_work(work)
+            .expect("retain daemon work");
+        let before = snapshot_tree(store.root());
+
+        let duplicate = store
+            .retain_daemon_committed_work(work)
+            .expect("retain duplicate daemon work");
+
+        assert_eq!(duplicate, retained);
+        assert_eq!(snapshot_tree(store.root()), before);
     }
 
     #[test]

@@ -6706,8 +6706,7 @@ fn restore_daemon_dfs_message_mutation_service_after_maintenance(
     if retained
         .lane
         .service
-        .operational_metrics()?
-        .authoritative_write_frozen_shard_count
+        .authoritative_write_frozen_shard_count()?
         != 0
     {
         return Ok(false);
@@ -11802,8 +11801,8 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
     // lazy shell over the resident backend. Durable tables and the repair queue
     // reconstruct the released projection on demand.
     let reusable_service = if matches!(&maintenance_result, Ok(Some(_))) {
-        match maintenance_service.operational_metrics() {
-            Ok(metrics) if metrics.authoritative_write_frozen_shard_count == 0 => {
+        match maintenance_service.authoritative_write_frozen_shard_count() {
+            Ok(0) => {
                 let reset_to_lazy = matches!(
                     maintenance_kind,
                     DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
@@ -11824,10 +11823,10 @@ async fn run_daemon_dfs_maintenance_tick_with_admission(
                     Some(maintenance_service)
                 }
             }
-            Ok(metrics) => {
+            Ok(frozen_shard_count) => {
                 tracing::info!(
                     data_root = %data_dir.root().display(),
-                    frozen_shard_count = metrics.authoritative_write_frozen_shard_count,
+                    frozen_shard_count,
                     "dropping daemon DFS maintenance service while an authoritative shard is frozen"
                 );
                 drop(maintenance_service);
