@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 
 use sinomo_core::node::NodeId;
 
+use crate::protocol::{
+    DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES, DfsNamespaceLookupRangeRequest,
+};
 use crate::*;
 use crate::{posix_model, posix_path};
 
@@ -182,6 +185,7 @@ mod tests {
             false,
             &DfsNamespaceOperation::LookupPath {
                 path: "/services/lookup.txt".to_string(),
+                inline_range: None,
             },
         ));
         assert!(namespace_request_returns_synced_response_objects(
@@ -2021,7 +2025,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(Vec::new());
         }
         let point_lookup_path = match operation {
-            DfsNamespaceOperation::LookupPath { path } => Some(path.as_str()),
+            DfsNamespaceOperation::LookupPath { path, .. } => Some(path.as_str()),
             _ => None,
         };
         let pinned_backend = self.metadata_backend.is_some();
@@ -2057,7 +2061,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::SyncPath { path } => {
                 return self.synced_namespace_objects_for_sync_path(file_system_id, path);
             }
-            DfsNamespaceOperation::LookupPath { path }
+            DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::Mkdir { path }
             | DfsNamespaceOperation::MkdirWithAttrs { path, .. }
             | DfsNamespaceOperation::MkdirAtNoLinks { path, .. } => {
@@ -2647,6 +2651,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => None,
         };
+        if posix_coordination_result.is_none()
+            && let DfsNamespaceOperation::LookupPath {
+                inline_range: Some(range),
+                ..
+            } = &command.operation
+            && range.max_bytes <= DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES
+            && let Some(object) = synced_path_object.as_ref()
+            && let NetworkedDfsRangeReadOutcome::Found {
+                data,
+                freshness: NetworkedDfsReadFreshness::Current,
+            } = self.read_object_metadata_local_range_with_state(
+                object,
+                range.offset,
+                range.max_bytes,
+                false,
+            )?
+            && object.content_size_bytes == Some(data.total_size_bytes)
+        {
+            posix_coordination_result = Some(DfsPosixCoordinationResult::LookupPathRange(data));
+        }
         let trace_sync_ms = sync_started.elapsed().as_millis();
         let trace_synced_path_objects = synced_path_objects.len();
         let send_started = Instant::now();
@@ -3371,8 +3395,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: String,
         timeout: Duration,
     ) -> Result<Option<DfsObjectMetadata>, DfsError> {
+        self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
+            file_system_id,
+            primary_node_id,
+            path,
+            None,
+            timeout,
+        )
+        .map(|(object, _)| object)
+    }
+
+    pub(crate) fn route_namespace_lookup_path_range_to_metadata_primary(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        path: String,
+        offset: u64,
+        max_bytes: usize,
+        timeout: Duration,
+    ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
+        self.route_namespace_lookup_path_to_metadata_primary_with_inline_range(
+            file_system_id,
+            primary_node_id,
+            path,
+            (max_bytes <= DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES)
+                .then_some(DfsNamespaceLookupRangeRequest { offset, max_bytes }),
+            timeout,
+        )
+    }
+
+    fn route_namespace_lookup_path_to_metadata_primary_with_inline_range(
+        &mut self,
+        file_system_id: DfsFileSystemId,
+        primary_node_id: NodeId,
+        path: String,
+        inline_range: Option<DfsNamespaceLookupRangeRequest>,
+        timeout: Duration,
+    ) -> Result<(Option<DfsObjectMetadata>, Option<DfsReadRangeData>), DfsError> {
         let mut primary = primary_node_id;
-        let operation = DfsNamespaceOperation::LookupPath { path };
+        let operation = DfsNamespaceOperation::LookupPath { path, inline_range };
         for _ in 0..DFS_ROUTED_WRITE_AUTHORITY_REDIRECT_LIMIT {
             let settled = self
                 .route_namespace_operation_to_metadata_primary_with_timeout_and_options(
@@ -3384,13 +3445,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     false,
                 )?;
             match settled.result {
-                DfsNamespaceResult::Applied => return Ok(settled.synced_path_object),
+                DfsNamespaceResult::Applied => {
+                    let inline_range = match settled.posix_coordination_result {
+                        Some(DfsPosixCoordinationResult::LookupPathRange(data)) => Some(data),
+                        None => None,
+                        Some(result) => {
+                            return Err(DfsError::Distributed {
+                                message: format!(
+                                    "routed namespace lookup returned unexpected coordination result {result:?}"
+                                ),
+                            });
+                        }
+                    };
+                    return Ok((settled.synced_path_object, inline_range));
+                }
                 DfsNamespaceResult::Rejected {
                     reason: _,
                     current_primary_node_id: Some(current),
                     ..
                 } if current == self.node_id => {
-                    return self.synced_namespace_object_for_operation(&file_system_id, &operation);
+                    return self
+                        .synced_namespace_object_for_operation(&file_system_id, &operation)
+                        .map(|object| (object, None));
                 }
                 DfsNamespaceResult::Rejected {
                     current_primary_node_id: Some(current),
@@ -3404,7 +3480,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?;
                     if next_primary == self.node_id {
                         return self
-                            .synced_namespace_object_for_operation(&file_system_id, &operation);
+                            .synced_namespace_object_for_operation(&file_system_id, &operation)
+                            .map(|object| (object, None));
                     }
                     primary = next_primary;
                 }

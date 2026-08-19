@@ -16,8 +16,8 @@ use crate::{
     DFS_ROUTED_NAMESPACE_OP_TIMEOUT, DfsControlPlaneStore, DfsError, DfsMessageTransport,
     DfsMetadataShardConfig, DfsMetadataShardId, DfsNamespaceJobKind, DfsNamespaceJobRecord,
     DfsNamespaceOperation, DfsNamespaceResult, DfsObjectKind, DfsObjectMetadata,
-    DfsPosixCoordinationResult, NetworkedDfsService, PendingRoutedNamespaceResult,
-    sifs_file_system_id,
+    DfsPosixCoordinationResult, DfsReadRangeData, NetworkedDfsService,
+    PendingRoutedNamespaceResult, sifs_file_system_id,
 };
 use sinomo_core::node::NodeId;
 use std::time::{Duration, Instant};
@@ -262,7 +262,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
         self.with_metadata_lookup_cache_mut(|service| {
-            service.lookup_sifs_path_distributed_synced_with_cache(path, follow_final)
+            service
+                .lookup_sifs_path_distributed_synced_with_cache(path, follow_final, None)
+                .map(|(path, object, _)| (path, object))
+        })
+    }
+
+    pub(super) fn lookup_sifs_path_distributed_synced_with_inline_range(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
+        self.with_metadata_lookup_cache_mut(|service| {
+            service.lookup_sifs_path_distributed_synced_with_cache(
+                path,
+                follow_final,
+                Some((offset, max_bytes)),
+            )
         })
     }
 
@@ -270,7 +288,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
         follow_final: bool,
-    ) -> Result<(String, Option<DfsObjectMetadata>)> {
+        inline_range: Option<(u64, usize)>,
+    ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
@@ -284,22 +303,35 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if let Some(object) = local_object
                     && object.kind != DfsObjectKind::Tombstone
                 {
-                    return Ok((resolved, Some(object)));
+                    return Ok((resolved, Some(object), None));
                 }
                 break;
             };
             if shard.primary_node_id != self.node_id {
-                match self.route_namespace_lookup_path_to_metadata_primary(
-                    sifs_file_system_id(),
-                    shard.primary_node_id.clone(),
-                    resolved.clone(),
-                    POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
-                ) {
-                    Ok(Some(object)) if object.kind != DfsObjectKind::Tombstone => {
-                        return Ok((resolved, Some(object)));
+                let routed = if let Some((offset, max_bytes)) = inline_range {
+                    self.route_namespace_lookup_path_range_to_metadata_primary(
+                        sifs_file_system_id(),
+                        shard.primary_node_id.clone(),
+                        resolved.clone(),
+                        offset,
+                        max_bytes,
+                        POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                    )
+                } else {
+                    self.route_namespace_lookup_path_to_metadata_primary(
+                        sifs_file_system_id(),
+                        shard.primary_node_id.clone(),
+                        resolved.clone(),
+                        POSIX_READ_FRESHNESS_SYNC_TIMEOUT,
+                    )
+                    .map(|object| (object, None))
+                };
+                match routed {
+                    Ok((Some(object), range)) if object.kind != DfsObjectKind::Tombstone => {
+                        return Ok((resolved, Some(object), range));
                     }
-                    Ok(Some(object)) => return Ok((resolved, Some(object))),
-                    Ok(None) => return Ok((resolved, None)),
+                    Ok((Some(object), range)) => return Ok((resolved, Some(object), range)),
+                    Ok((None, _)) => return Ok((resolved, None, None)),
                     Err(error) if namespace_lookup_error_is_uncorroborated_redirect(&error) => {
                         let current_shard =
                             self.select_sifs_metadata_shard_for_path_fresh(&resolved)?;
@@ -309,7 +341,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .as_ref()
                             .is_some_and(|object| object.kind != DfsObjectKind::Tombstone)
                         {
-                            return Ok((resolved, local_object));
+                            return Ok((resolved, local_object, None));
                         }
                         return Err(error.into());
                     }
@@ -326,12 +358,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 && let Some(object) = local_object.as_ref()
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok((resolved, local_object));
+                return Ok((resolved, local_object, None));
             }
             if let Some(object) = local_object
                 && object.kind != DfsObjectKind::Tombstone
             {
-                return Ok((resolved, Some(object)));
+                return Ok((resolved, Some(object), None));
             }
             if self.is_local_metadata_replica_for_shard(&shard) {
                 break;
@@ -366,7 +398,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         }
         let object = self.lookup_sifs_path(&resolved)?;
-        Ok((resolved, object))
+        Ok((resolved, object, None))
     }
 
     /// Fetch one exact normalized namespace path from its current metadata

@@ -178,7 +178,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         shards: &[DfsMetadataShardConfig],
     ) -> Result<Vec<DfsMetadataShardConfig>, DfsError> {
         let candidates = match operation {
-            DfsNamespaceOperation::LookupPath { path }
+            DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::SyncPath { path }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }

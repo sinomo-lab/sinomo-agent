@@ -3028,6 +3028,7 @@ mod tests {
                 "stale-same-id-lookup-path",
                 crate::DfsNamespaceOperation::LookupPath {
                     path: "/".to_string(),
+                    inline_range: None,
                 },
             ),
             (

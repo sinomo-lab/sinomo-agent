@@ -384,6 +384,7 @@ fn test_dfs_lookup_routed_message(
             authority_shards: Vec::new(),
             operation: DfsNamespaceOperation::LookupPath {
                 path: path.to_string(),
+                inline_range: None,
             },
         }),
     )
@@ -729,6 +730,7 @@ fn dfs_message_repair_progress_is_only_inline_for_explicit_foreground_repair_wri
             "dfs_lookup_no_inline_repair",
             DfsNamespaceOperation::LookupPath {
                 path: "/services/no-inline-repair".to_string(),
+                inline_range: None,
             },
         ),
     );
@@ -1080,6 +1082,7 @@ fn dfs_message_classifier_keeps_lookup_connectivity_observing() {
             authority_shards: Vec::new(),
             operation: DfsNamespaceOperation::LookupPath {
                 path: "/services/example.txt".to_string(),
+                inline_range: None,
             },
         }),
     );
@@ -42451,11 +42454,16 @@ fn sifs_cluster_routed_lookup_under_split_prefix_uses_exact_path_primary() {
     );
     assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
     crate::posix::reset_posix_metadata_raw_lookup_count();
+    crate::service_read::reset_remote_metadata_range_read_request_count();
+    let prefix = replica
+        .posix_read_file_prefix_distributed(path, bytes.len())
+        .expect("distributed prefix read after exact-primary stat");
+    assert_eq!(prefix.bytes, bytes);
+    assert!(!prefix.truncated);
     assert_eq!(
-        replica
-            .posix_read_file_distributed(path)
-            .expect("distributed read after exact-primary stat"),
-        bytes
+        crate::service_read::remote_metadata_range_read_request_count(),
+        0,
+        "the authoritative lookup should return a small local range without a second content RPC"
     );
     let read_lookup_count = crate::posix::posix_metadata_raw_lookup_count();
     let read_lookup_bound = component_count + 6;

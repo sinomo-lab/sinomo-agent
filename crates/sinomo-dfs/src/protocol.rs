@@ -441,6 +441,18 @@ pub struct DfsNamespaceChangePollResponse {
     pub batch: DfsNamespaceChangeBatch,
 }
 
+/// Optional bounded content range returned with one authoritative namespace
+/// lookup. The inline response is deliberately capped so lightweight reads can
+/// avoid a second serialized RPC without moving bulk content through the
+/// namespace-control envelope.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct DfsNamespaceLookupRangeRequest {
+    pub offset: u64,
+    pub max_bytes: usize,
+}
+
+pub(crate) const DFS_NAMESPACE_LOOKUP_INLINE_RANGE_MAX_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsNamespaceOperation {
@@ -571,6 +583,12 @@ pub enum DfsNamespaceOperation {
     /// it in memory but do not replay journals or write it to the local mirror.
     LookupPath {
         path: String,
+        /// New peers may serve this bounded immutable content range in the
+        /// same response. Older peers ignore the additive field and return the
+        /// metadata-only response, which callers transparently follow with the
+        /// existing exact-content RPC.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        inline_range: Option<DfsNamespaceLookupRangeRequest>,
     },
     /// Batched read-only lookups against one metadata primary.
     LookupPaths {
@@ -751,7 +769,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::AdvisoryLock { path, .. }
             | DfsNamespaceOperation::FileSync { path, .. }
@@ -808,7 +826,7 @@ impl DfsNamespaceOperation {
             | DfsNamespaceOperation::TouchDirectoryModified { path }
             | DfsNamespaceOperation::ClearDirRecursive { path }
             | DfsNamespaceOperation::SyncPath { path }
-            | DfsNamespaceOperation::LookupPath { path }
+            | DfsNamespaceOperation::LookupPath { path, .. }
             | DfsNamespaceOperation::ReconcilePlacement { path, .. }
             | DfsNamespaceOperation::ResumeNamespaceJobBounded { path, .. }
             | DfsNamespaceOperation::CommitHardlinkTargetFence {
@@ -974,6 +992,10 @@ pub struct DfsNamespaceResponse {
 pub enum DfsPosixCoordinationResult {
     NamespaceChanges(DfsNamespaceChangePollResponse),
     NamespaceJob(DfsNamespaceJobRecord),
+    /// Content read from the exact object/version returned by the same pinned
+    /// authoritative lookup. Absence means the caller must use the ordinary
+    /// exact-content read path, including when talking to an older peer.
+    LookupPathRange(DfsReadRangeData),
     AdvisoryLock(DfsAdvisoryLockOutcome),
     /// Capability acknowledgement for a lock-bearing cross-shard adoption.
     /// An older destination that ignores the optional lock aggregate cannot
@@ -1512,6 +1534,29 @@ mod reactive_namespace_event_tests {
     use super::DfsNamespaceOperation;
 
     #[test]
+    fn lookup_path_without_inline_range_remains_wire_compatible() {
+        let legacy = serde_json::json!({
+            "lookup-path": {
+                "path": "/services/reactive"
+            }
+        });
+        let decoded = serde_json::from_value::<DfsNamespaceOperation>(legacy.clone())
+            .expect("deserialize legacy lookup-path operation");
+
+        assert_eq!(
+            decoded,
+            DfsNamespaceOperation::LookupPath {
+                path: "/services/reactive".to_string(),
+                inline_range: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(decoded).expect("serialize metadata-only lookup-path operation"),
+            legacy
+        );
+    }
+
+    #[test]
     fn only_visible_namespace_mutations_wake_reactive_mounts() {
         assert!(
             DfsNamespaceOperation::Mkdir {
@@ -1529,6 +1574,7 @@ mod reactive_namespace_event_tests {
         assert!(
             !DfsNamespaceOperation::LookupPath {
                 path: "/services/reactive".to_string(),
+                inline_range: None,
             }
             .changes_visible_namespace()
         );

@@ -16,6 +16,22 @@ use sinomo_core::node::NodeId;
 use crate::transfer::{PendingNetworkedRead, range_transfer_size_bytes};
 use crate::*;
 
+#[cfg(test)]
+thread_local! {
+    static REMOTE_METADATA_RANGE_READ_REQUEST_COUNT: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_remote_metadata_range_read_request_count() {
+    REMOTE_METADATA_RANGE_READ_REQUEST_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn remote_metadata_range_read_request_count() -> usize {
+    REMOTE_METADATA_RANGE_READ_REQUEST_COUNT.get()
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn ensure_standalone_local_object_publication(&self) -> Result<(), DfsError> {
         if self.control_plane.is_some() {
@@ -122,6 +138,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Result<Vec<String>, DfsError> {
+        #[cfg(test)]
+        REMOTE_METADATA_RANGE_READ_REQUEST_COUNT.with(|count| {
+            count.set(count.get().saturating_add(1));
+        });
         let requested_nodes = self.request_remote_object_read_for_metadata_inner(
             object,
             Some((offset, max_bytes)),

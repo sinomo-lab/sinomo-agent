@@ -907,6 +907,7 @@ mod tests {
                 authority_shards,
                 operation: DfsNamespaceOperation::LookupPath {
                     path: "/services/existing".to_string(),
+                    inline_range: None,
                 },
             }))
         };

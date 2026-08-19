@@ -26,6 +26,9 @@
 //!   conflicts, leaked cross-shard locks, or reachable metadata-replica lag.
 //! - `cluster.dfs.lightweight-latency` — warmed SIFS stat/list/read-prefix
 //!   latency probe for file-browser-style lightweight operations.
+//! - `cluster.dfs.raw-lightweight-latency` — the matching node-local raw
+//!   filesystem operations under `SINOMO_DATA_DIR`, used to price the DFS
+//!   algorithm and network overhead against the actual backing filesystem.
 //! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS body-aware object-RPC
 //!   head codec throughput for representative large-object messages, independent
 //!   of attachment I/O, disk, and live network conditions.
@@ -113,6 +116,7 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_failover_current_read())
         .register(dfs_invariants())
         .register(dfs_lightweight_latency())
+        .register(dfs_raw_lightweight_latency())
         .register(dfs_protocol_codec_baseline())
         .register(dfs_write())
         .register(dfs_expect_file())
@@ -257,6 +261,18 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_lightweight_latency(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_raw_lightweight_latency(ctx) {
+        id: "cluster.dfs.raw-lightweight-latency",
+        summary: "Measure warmed node-local raw stat/list/read-prefix latency under SINOMO_DATA_DIR",
+        tags: ["cluster-dfs", "probe", "performance"],
+        requirements: [],
+        run: {
+            run_raw_lightweight_latency(ctx)
         }
     }
 }
@@ -3261,6 +3277,274 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         "DFS lightweight latency on node {node}: worst p50 {}={}us, worst p95 {}={}us over {iterations} warmed iterations",
         worst_p50.0, worst_p50.1, worst_p95.0, worst_p95.1
     )))
+}
+
+struct RawLightweightLatencyFixture {
+    root: std::path::PathBuf,
+}
+
+impl Drop for RawLightweightLatencyFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn run_raw_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let iterations =
+        optional_usize_parameter(ctx, "iterations", DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS)?;
+    let warmup_iterations = optional_usize_parameter(
+        ctx,
+        "warmup-iterations",
+        DEFAULT_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS,
+    )?;
+    let payload_bytes = optional_usize_parameter(
+        ctx,
+        "payload-bytes",
+        DEFAULT_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES,
+    )?;
+    let max_p50_us = optional_usize_parameter(ctx, "max-p50-us", 0)? as u64;
+    let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 0)? as u64;
+    let max_max_us = optional_usize_parameter(ctx, "max-max-us", 0)? as u64;
+    require_positive("iterations", iterations)?;
+    require_positive("payload-bytes", payload_bytes)?;
+    if iterations > MAX_LIGHTWEIGHT_LATENCY_ITERATIONS {
+        return Err(SinomoTestError::failed(format!(
+            "iterations must not exceed {MAX_LIGHTWEIGHT_LATENCY_ITERATIONS}"
+        )));
+    }
+    if warmup_iterations > MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS {
+        return Err(SinomoTestError::failed(format!(
+            "warmup-iterations must not exceed {MAX_LIGHTWEIGHT_LATENCY_WARMUP_ITERATIONS}"
+        )));
+    }
+    if payload_bytes > MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES {
+        return Err(SinomoTestError::failed(format!(
+            "payload-bytes must not exceed {MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES}"
+        )));
+    }
+
+    let setup_started = Instant::now();
+    let root = ctx
+        .data_dir()
+        .join("test-artifacts")
+        .join("dfs-raw-lightweight-latency")
+        .join(probe_nonce());
+    fs::create_dir_all(&root).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot create raw lightweight latency directory {}: {source}",
+            root.display()
+        ))
+    })?;
+    let fixture = RawLightweightLatencyFixture { root };
+    let file_name = "tiny.txt";
+    let file_path = fixture.root.join(file_name);
+    let payload = pattern_payload("dfs-raw-lightweight-latency", payload_bytes);
+    fs::write(&file_path, &payload).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot write raw lightweight latency file {}: {source}",
+            file_path.display()
+        ))
+    })?;
+    let setup_elapsed = setup_started.elapsed();
+
+    for _ in 0..warmup_iterations {
+        run_raw_lightweight_latency_operations(&fixture.root, &file_path, file_name, &payload)?;
+    }
+
+    let mut latency_us = BTreeMap::<&'static str, Vec<u64>>::new();
+    let measurement_started = Instant::now();
+    for _ in 0..iterations {
+        record_lightweight_operation_latency(&mut latency_us, "stat_file", || {
+            validate_raw_lightweight_stat_file(&file_path, payload.len() as u64)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "stat_dir", || {
+            validate_raw_lightweight_stat_dir(&fixture.root)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "list_dir", || {
+            validate_raw_lightweight_list_dir(&fixture.root, file_name)
+        })?;
+        record_lightweight_operation_latency(&mut latency_us, "read_prefix", || {
+            validate_raw_lightweight_read_prefix(&file_path, &payload)
+        })?;
+    }
+    let measurement_elapsed = measurement_started.elapsed();
+
+    ctx.record("root", fixture.root.display().to_string());
+    ctx.record("file_path", file_path.display().to_string());
+    ctx.record("iterations", iterations);
+    ctx.record("warmup_iterations", warmup_iterations);
+    ctx.record("payload_bytes", payload_bytes);
+    ctx.record("max_p50_us", max_p50_us);
+    ctx.record("max_p95_us", max_p95_us);
+    ctx.record("max_max_us", max_max_us);
+    ctx.record("setup_elapsed_ms", setup_elapsed.as_millis() as u64);
+    ctx.record(
+        "measurement_elapsed_ms",
+        measurement_elapsed.as_millis() as u64,
+    );
+
+    let mut operation_summaries = BTreeMap::new();
+    let mut worst_p50 = (String::new(), 0_u64);
+    let mut worst_p95 = (String::new(), 0_u64);
+    let mut worst_max = (String::new(), 0_u64);
+    for (operation, mut samples) in latency_us {
+        samples.sort_unstable();
+        let count = samples.len();
+        let min = samples.iter().copied().min().unwrap_or(0);
+        let p50 = percentile_value(&samples, 50);
+        let p95 = percentile_value(&samples, 95);
+        let max = samples.iter().copied().max().unwrap_or(0);
+        let mean = mean_value(&samples);
+        let operation_key = operation.to_string();
+        ctx.record(format!("{operation}_count"), count);
+        ctx.record(format!("{operation}_latency_min_us"), min);
+        ctx.record(format!("{operation}_latency_p50_us"), p50);
+        ctx.record(format!("{operation}_latency_p95_us"), p95);
+        ctx.record(format!("{operation}_latency_max_us"), max);
+        ctx.record(format!("{operation}_latency_mean_us"), mean);
+        operation_summaries.insert(
+            operation_key.clone(),
+            format!("count={count} min={min} mean={mean:.2} p50={p50} p95={p95} max={max}"),
+        );
+        if p50 > worst_p50.1 {
+            worst_p50 = (operation_key.clone(), p50);
+        }
+        if p95 > worst_p95.1 {
+            worst_p95 = (operation_key.clone(), p95);
+        }
+        if max > worst_max.1 {
+            worst_max = (operation_key, max);
+        }
+    }
+    ctx.record("operation_latency_us", operation_summaries);
+    ctx.record("worst_p50_operation", &worst_p50.0);
+    ctx.record("worst_p50_us", worst_p50.1);
+    ctx.record("worst_p95_operation", &worst_p95.0);
+    ctx.record("worst_p95_us", worst_p95.1);
+    ctx.record("worst_max_operation", &worst_max.0);
+    ctx.record("worst_max_us", worst_max.1);
+
+    if latency_reaches_exclusive_limit(worst_p50.1, max_p50_us) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw lightweight latency worst p50 {}={}us is not below required {max_p50_us}us",
+            worst_p50.0, worst_p50.1
+        )));
+    }
+    if latency_reaches_exclusive_limit(worst_p95.1, max_p95_us) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw lightweight latency worst p95 {}={}us is not below required {max_p95_us}us",
+            worst_p95.0, worst_p95.1
+        )));
+    }
+    if latency_reaches_exclusive_limit(worst_max.1, max_max_us) {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "raw lightweight latency worst max {}={}us is not below required {max_max_us}us",
+            worst_max.0, worst_max.1
+        )));
+    }
+
+    Ok(SinomoTestOutcome::passed(format!(
+        "raw lightweight latency: worst p50 {}={}us, worst p95 {}={}us over {iterations} warmed iterations",
+        worst_p50.0, worst_p50.1, worst_p95.0, worst_p95.1
+    )))
+}
+
+fn run_raw_lightweight_latency_operations(
+    fixture_dir: &Path,
+    file_path: &Path,
+    file_name: &str,
+    payload: &[u8],
+) -> Result<(), SinomoTestError> {
+    validate_raw_lightweight_stat_file(file_path, payload.len() as u64)?;
+    validate_raw_lightweight_stat_dir(fixture_dir)?;
+    validate_raw_lightweight_list_dir(fixture_dir, file_name)?;
+    validate_raw_lightweight_read_prefix(file_path, payload)?;
+    Ok(())
+}
+
+fn validate_raw_lightweight_stat_file(
+    path: &Path,
+    expected_bytes: u64,
+) -> Result<(), SinomoTestError> {
+    let metadata = fs::metadata(path).map_err(|source| {
+        SinomoTestError::failed(format!("cannot stat raw file {}: {source}", path.display()))
+    })?;
+    if !metadata.is_file() || metadata.len() != expected_bytes {
+        return Err(SinomoTestError::failed(format!(
+            "raw file {} metadata was file={} size={}, expected file=true size={expected_bytes}",
+            path.display(),
+            metadata.is_file(),
+            metadata.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_raw_lightweight_stat_dir(path: &Path) -> Result<(), SinomoTestError> {
+    let metadata = fs::metadata(path).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot stat raw directory {}: {source}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(SinomoTestError::failed(format!(
+            "raw path {} is not a directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_raw_lightweight_list_dir(
+    path: &Path,
+    expected_name: &str,
+) -> Result<(), SinomoTestError> {
+    let entries = fs::read_dir(path).map_err(|source| {
+        SinomoTestError::failed(format!(
+            "cannot list raw directory {}: {source}",
+            path.display()
+        ))
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot read raw directory entry under {}: {source}",
+                path.display()
+            ))
+        })?;
+        if entry.file_name().to_string_lossy() == expected_name {
+            return Ok(());
+        }
+    }
+    Err(SinomoTestError::failed(format!(
+        "raw directory {} did not contain {expected_name}",
+        path.display()
+    )))
+}
+
+fn validate_raw_lightweight_read_prefix(
+    path: &Path,
+    expected: &[u8],
+) -> Result<(), SinomoTestError> {
+    let file = fs::File::open(path).map_err(|source| {
+        SinomoTestError::failed(format!("cannot open raw file {}: {source}", path.display()))
+    })?;
+    let mut actual = Vec::with_capacity(expected.len());
+    file.take(expected.len() as u64)
+        .read_to_end(&mut actual)
+        .map_err(|source| {
+            SinomoTestError::failed(format!("cannot read raw file {}: {source}", path.display()))
+        })?;
+    if actual != expected {
+        return Err(SinomoTestError::failed(format!(
+            "raw prefix read {} returned {} bytes, expected {}",
+            path.display(),
+            actual.len(),
+            expected.len()
+        )));
+    }
+    Ok(())
 }
 
 fn run_lightweight_latency_operations(

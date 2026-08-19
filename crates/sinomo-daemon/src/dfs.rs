@@ -446,7 +446,7 @@ impl DaemonDfsMetadataAuthorityGeneration {
             None => &[],
         };
         let stamp_matches = match &command.operation {
-            sinomo_dfs::DfsNamespaceOperation::LookupPath { path } => {
+            sinomo_dfs::DfsNamespaceOperation::LookupPath { path, .. } => {
                 sinomo_dfs::select_metadata_shard_config_for_path_strict_default_sifs_split(
                     &command.file_system_id,
                     shards,

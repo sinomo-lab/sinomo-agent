@@ -278,6 +278,52 @@ fn validate_complete_posix_range_content_hash(
     Ok(())
 }
 
+fn validate_inline_namespace_range(
+    object: &DfsObjectMetadata,
+    data: &DfsReadRangeData,
+    requested_offset: u64,
+    requested_max_bytes: usize,
+) -> std::result::Result<(), DfsError> {
+    if data.object_id != object.object_id
+        || data.version != object.version
+        || data.content_hash != object.content_hash
+    {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "authoritative namespace range identity mismatch for object {} version {}",
+                object.object_id, object.version
+            ),
+        });
+    }
+    let Some(expected_size) = object.content_size_bytes else {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "authoritative namespace range for object {} lacks metadata content size",
+                object.object_id
+            ),
+        });
+    };
+    let expected_offset = requested_offset.min(expected_size);
+    let expected_bytes = expected_size
+        .saturating_sub(expected_offset)
+        .min(u64::try_from(requested_max_bytes).unwrap_or(u64::MAX));
+    if data.total_size_bytes != expected_size
+        || data.offset != expected_offset
+        || u64::try_from(data.bytes.len()).unwrap_or(u64::MAX) != expected_bytes
+    {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "authoritative namespace range shape mismatch for object {}: expected offset {expected_offset}, size {expected_size}, bytes {expected_bytes}; actual offset {}, size {}, bytes {}",
+                object.object_id,
+                data.offset,
+                data.total_size_bytes,
+                data.bytes.len()
+            ),
+        });
+    }
+    validate_complete_posix_range_content_hash(object, data)
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn with_posix_remote_read_deadline<R>(
         &mut self,
@@ -378,6 +424,50 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(DistributedPosixFileContentObjectOutcome::NotFound { path });
         };
         self.posix_file_content_object_candidate_outcome(path, object)
+    }
+
+    fn distributed_posix_file_content_object_with_inline_range_outcome(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        offset: u64,
+        max_bytes: usize,
+    ) -> Result<(
+        DistributedPosixFileContentObjectOutcome,
+        Option<DfsReadRangeData>,
+    )> {
+        let (path, object, inline_range) = match self
+            .lookup_sifs_path_distributed_synced_with_inline_range(
+                path,
+                follow_final,
+                offset,
+                max_bytes,
+            ) {
+            Ok(lookup) => lookup,
+            Err(DfsPosixError::NotFound { path }) => {
+                let candidate = self.lookup_sifs_path_direct_distributed_synced(&path)?;
+                if let Some(candidate) = candidate
+                    && candidate.kind == DfsObjectKind::Hardlink
+                {
+                    return self
+                        .posix_file_content_object_candidate_outcome(path, candidate)
+                        .map(|outcome| (outcome, None));
+                }
+                return Ok((
+                    DistributedPosixFileContentObjectOutcome::NotFound { path },
+                    None,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(object) = object else {
+            return Ok((
+                DistributedPosixFileContentObjectOutcome::NotFound { path },
+                None,
+            ));
+        };
+        self.posix_file_content_object_candidate_outcome(path, object)
+            .map(|outcome| (outcome, inline_range))
     }
 
     fn local_posix_file_content_object(
@@ -606,7 +696,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
         self.check_cancelled("distributed prefix read")?;
-        let (path, object) = match self.distributed_posix_file_content_object_outcome(path, true)? {
+        let (lookup, inline_range) = self
+            .distributed_posix_file_content_object_with_inline_range_outcome(
+                path, true, 0, max_bytes,
+            )?;
+        let (path, object) = match lookup {
             DistributedPosixFileContentObjectOutcome::Found { path, object } => (path, object),
             DistributedPosixFileContentObjectOutcome::NotFound { path } => {
                 return Ok(DfsPosixDistributedFilePrefixReadOutcome::NotFound { path });
@@ -617,6 +711,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             }
         };
+        if let Some(data) = inline_range {
+            validate_inline_namespace_range(&object, &data, 0, max_bytes)?;
+            return distributed_file_prefix_content_outcome(
+                path,
+                &object,
+                NetworkedDfsRangeReadOutcome::Found {
+                    data,
+                    freshness: NetworkedDfsReadFreshness::Current,
+                },
+                max_bytes,
+            );
+        }
         let outcome =
             self.read_object_metadata_range_or_fetch_remote_without_cache(&object, 0, max_bytes)?;
         distributed_file_prefix_content_outcome(path, &object, outcome, max_bytes)
