@@ -599,6 +599,39 @@ impl TxScheduler {
         Ok(())
     }
 
+    fn enqueue_final_data(
+        &self,
+        stream_id: u64,
+        chunk: OwnedChunk,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>, NetworkError> {
+        let mut state = self.state.lock().map_err(|_| {
+            mux_error(
+                "queue final owned logical stream data",
+                "transmitter lock poisoned",
+            )
+        })?;
+        let queue = state.streams.get_mut(&stream_id).ok_or_else(|| {
+            mux_error(
+                "queue final owned logical stream data",
+                "logical stream is not registered",
+            )
+        })?;
+        if queue.finish_requested {
+            return Err(mux_error(
+                "queue final owned logical stream data",
+                "write direction is finished",
+            ));
+        }
+        let (completion, completed) = tokio::sync::oneshot::channel();
+        queue.chunks.push_back(chunk);
+        queue.finish_requested = true;
+        queue.finish_completion = Some(completion);
+        Self::activate(&mut state, stream_id);
+        drop(state);
+        self.writer_waker.wake();
+        Ok(completed)
+    }
+
     fn finish_stream(
         &self,
         stream_id: u64,
@@ -949,6 +982,56 @@ impl AuthenticatedChunkWriter for LogicalChunkWriter {
                     .await?;
             }
             tx.enqueue_data(self.slot.stream_id, chunk)
+        })
+    }
+
+    fn send_final_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            if self.finished {
+                return Err(mux_error(
+                    "write final owned logical stream chunk",
+                    "write direction is finished",
+                ));
+            }
+            if chunk.len() > RPC_RECORD_MAX {
+                return Err(NetworkError::FrameTooLarge {
+                    actual_bytes: chunk.len(),
+                    max_bytes: RPC_RECORD_MAX,
+                });
+            }
+            let tx = self.slot.tx.upgrade().ok_or_else(|| {
+                mux_error(
+                    "write final owned logical stream chunk",
+                    "carrier transmitter closed",
+                )
+            })?;
+            if chunk.class() == ChunkClass::Data {
+                let charged_bytes = chunk.class().resident_bytes();
+                let stream_id = self.slot.stream_id;
+                let stream_tx = Arc::clone(&tx);
+                self.slot
+                    .remote_credit
+                    .acquire(charged_bytes, move || {
+                        stream_tx.enqueue_control(ControlCommand::window_request(stream_id));
+                    })
+                    .await?;
+                let connection_tx = Arc::clone(&tx);
+                self.connection
+                    .remote_credit
+                    .acquire(charged_bytes, move || {
+                        connection_tx.enqueue_control(ControlCommand::connection_window_request());
+                    })
+                    .await?;
+            }
+            self.finished = true;
+            tx.enqueue_final_data(self.slot.stream_id, chunk)?
+                .await
+                .map_err(|_| {
+                    mux_error(
+                        "write final owned logical stream chunk",
+                        "carrier stopped before staging the final record",
+                    )
+                })
         })
     }
 
@@ -2123,6 +2206,40 @@ mod tests {
             } => {}
             other => panic!("unexpected finish priority work: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn scheduler_atomically_combines_first_and_final_chunk() {
+        let tx = TxScheduler::new();
+        tx.register_stream(1, false).unwrap();
+        let allocator = ChunkAllocator::new(
+            ChunkPool::new(SECURE_WIRE_MAX, 64 * 1024, 0, 0),
+            SECURE_WIRE_MAX,
+            64 * 1024,
+        );
+        let mut head = allocator.allocate_control(1).await.unwrap();
+        head.commit_payload(1).unwrap();
+        let _completed = tx.enqueue_final_data(1, head).unwrap();
+
+        match tx.next().await.unwrap().unwrap() {
+            TxWork::Data {
+                kind,
+                stream_id,
+                finish_completion: Some(_),
+                ..
+            } => {
+                assert_eq!(kind, FRAME_OPEN_DATA_FINISH);
+                assert_eq!(stream_id, 1);
+            }
+            other => panic!("unexpected atomic final work: {other:?}"),
+        }
+        assert!(
+            tx.state
+                .lock()
+                .expect("transmitter state")
+                .streams
+                .is_empty()
+        );
     }
 
     #[tokio::test]

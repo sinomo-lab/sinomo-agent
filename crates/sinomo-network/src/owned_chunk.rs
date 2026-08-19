@@ -1296,6 +1296,12 @@ pub(crate) trait AuthenticatedChunkWriter: Send {
     fn max_payload_bytes(&self) -> usize;
     fn allocator(&self) -> &ChunkAllocator;
     fn send_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()>;
+    fn send_final_chunk(&mut self, chunk: OwnedChunk) -> ChunkStreamFuture<'_, ()> {
+        Box::pin(async move {
+            self.send_chunk(chunk).await?;
+            self.finish().await
+        })
+    }
     fn finish(&mut self) -> ChunkStreamFuture<'_, ()>;
     fn reset(&mut self, reason: ResetReason) -> ChunkStreamFuture<'_, ()>;
 }

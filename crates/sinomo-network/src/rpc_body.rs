@@ -1157,6 +1157,34 @@ impl ObjectRpcBodySource {
         }
     }
 
+    /// Moves an already-buffered small body into object-RPC head framing.
+    ///
+    /// Reader, file, forwarded, and transport-shaped sources deliberately
+    /// remain streaming even when their declared length is small. A lifetime
+    /// guard also keeps its original source boundary so inlining cannot release
+    /// caller-owned admission or resource state before transport completion.
+    pub(crate) fn try_into_inline_bytes(self, max_bytes: usize) -> Result<Bytes, Self> {
+        let has_no_lifetime_guards = self
+            .lifetime_guards
+            .lock()
+            .map(|guards| guards.is_empty())
+            .unwrap_or(false);
+        let is_inline = has_no_lifetime_guards
+            && match &self.kind {
+                ObjectRpcBodySourceKind::Empty => true,
+                ObjectRpcBodySourceKind::Bytes(source) => source.bytes.len() <= max_bytes,
+                _ => false,
+            };
+        if !is_inline {
+            return Err(self);
+        }
+        match self.kind {
+            ObjectRpcBodySourceKind::Empty => Ok(Bytes::new()),
+            ObjectRpcBodySourceKind::Bytes(source) => Ok(source.bytes),
+            _ => unreachable!("checked inline object RPC body source kind"),
+        }
+    }
+
     /// Keeps an opaque route/concurrency/resource guard alive until this body
     /// source and every producer opened from it have finished or been dropped.
     pub fn hold_lifetime_guard<T>(&mut self, guard: T) -> Result<(), NetworkError>

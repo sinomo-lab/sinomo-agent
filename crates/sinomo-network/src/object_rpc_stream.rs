@@ -142,8 +142,13 @@ impl ObjectRpcStreamBody {
     }
 
     pub fn source(source: ObjectRpcBodySource) -> Self {
-        Self {
-            kind: OutgoingBodyKind::Source(source),
+        match source.try_into_inline_bytes(OBJECT_RPC_STREAM_INLINE_BODY_BYTES) {
+            Ok(bytes) => Self {
+                kind: OutgoingBodyKind::Inline(bytes),
+            },
+            Err(source) => Self {
+                kind: OutgoingBodyKind::Source(source),
+            },
         }
     }
 
@@ -779,6 +784,30 @@ trait RpcRecordWriter: Send + 'static {
         operation: &'a str,
     ) -> RpcSendFuture<'a>;
 
+    fn write_final_record<'a>(
+        &'a mut self,
+        kind: u8,
+        payload: &'a [u8],
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            self.write_record(kind, payload, operation).await?;
+            self.finish_records().await
+        })
+    }
+
+    fn write_final_owned_record<'a>(
+        &'a mut self,
+        kind: u8,
+        chunk: OwnedChunk,
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            self.write_owned_record(kind, chunk, operation).await?;
+            self.finish_records().await
+        })
+    }
+
     fn flush_record(&mut self) -> RpcSendFuture<'_>;
 
     fn finish_records(&mut self) -> RpcSendFuture<'_>;
@@ -995,6 +1024,64 @@ impl RpcRecordWriter for OwnedRpcRecordWriter {
             observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
             self.writer
                 .send_chunk(chunk)
+                .await
+                .map_err(|error| SendFailure {
+                    error: delivery_error(operation, error.to_string()),
+                    wrote_any: true,
+                })
+        })
+    }
+
+    fn write_final_record<'a>(
+        &'a mut self,
+        kind: u8,
+        payload: &'a [u8],
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            let prefix = Self::rpc_prefix(kind, payload.len())?;
+            let mut chunk = self
+                .allocator
+                .allocate_control(payload.len())
+                .await
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: false,
+                })?;
+            chunk.writable_payload()[..payload.len()].copy_from_slice(payload);
+            chunk
+                .commit_payload(payload.len())
+                .and_then(|_| chunk.prepend(&prefix))
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: false,
+                })?;
+            self.writer
+                .send_final_chunk(chunk)
+                .await
+                .map_err(|error| SendFailure {
+                    error: delivery_error(operation, error.to_string()),
+                    wrote_any: true,
+                })
+        })
+    }
+
+    fn write_final_owned_record<'a>(
+        &'a mut self,
+        kind: u8,
+        mut chunk: OwnedChunk,
+        operation: &'a str,
+    ) -> RpcSendFuture<'a> {
+        Box::pin(async move {
+            observe_chunk_identity(chunk.slab_id(), "rpc-body-produced");
+            let prefix = Self::rpc_prefix(kind, chunk.len())?;
+            chunk.prepend(&prefix).map_err(|error| SendFailure {
+                error,
+                wrote_any: false,
+            })?;
+            observe_chunk_identity(chunk.slab_id(), "rpc-record-framed");
+            self.writer
+                .send_final_chunk(chunk)
                 .await
                 .map_err(|error| SendFailure {
                     error: delivery_error(operation, error.to_string()),
@@ -1494,7 +1581,7 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
     progress_nonce: &mut u64,
     data_kind: u8,
     body: &mut PreparedOutgoingBody,
-) -> Result<ObjectRpcBodyCompletion, SendFailure> {
+) -> Result<(ObjectRpcBodyCompletion, bool), SendFailure> {
     let mut length = 0_u64;
     if let Some(inline) = body.inline_body.as_ref() {
         length = inline.bytes.len() as u64;
@@ -1508,21 +1595,23 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
             })?;
         loop {
             let allocator = writer.chunk_allocator().cloned();
-            let mut next_chunk =
-                std::pin::pin!(next_outgoing_body_chunk(&mut producer, allocator.as_ref()));
-            let next = await_with_stream_progress(
-                writer,
-                direction,
-                request_id,
-                progress_interval,
-                progress_nonce,
-                next_chunk.as_mut(),
-            )
-            .await?
-            .map_err(|error| SendFailure {
-                error,
-                wrote_any: length != 0,
-            })?;
+            let next = {
+                let mut next_chunk =
+                    Box::pin(next_outgoing_body_chunk(&mut producer, allocator.as_ref()));
+                await_with_stream_progress(
+                    writer,
+                    direction,
+                    request_id,
+                    progress_interval,
+                    progress_nonce,
+                    next_chunk.as_mut(),
+                )
+                .await?
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: length != 0,
+                })?
+            };
             let Some(chunk) = next else {
                 break;
             };
@@ -1547,8 +1636,9 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                     length: expected_length
                 } if length == expected_length
             );
-            match chunk {
-                OutgoingRpcData::Bytes(bytes) => {
+            let records_finished = reached_declared_end;
+            match (chunk, records_finished) {
+                (OutgoingRpcData::Bytes(bytes), false) => {
                     writer
                         .write_record(
                             data_kind,
@@ -1557,14 +1647,46 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
                         )
                         .await?;
                 }
-                OutgoingRpcData::Owned(chunk) => {
+                (OutgoingRpcData::Bytes(bytes), true) => {
+                    writer
+                        .write_final_record(
+                            data_kind,
+                            &bytes,
+                            "write final byte-compatible object RPC body data",
+                        )
+                        .await?;
+                }
+                (OutgoingRpcData::Owned(chunk), false) => {
                     writer
                         .write_owned_record(data_kind, chunk, "write owned object RPC body data")
                         .await?;
                 }
+                (OutgoingRpcData::Owned(chunk), true) => {
+                    writer
+                        .write_final_owned_record(
+                            data_kind,
+                            chunk,
+                            "write final owned object RPC body data",
+                        )
+                        .await?;
+                }
             }
             if reached_declared_end {
-                break;
+                let mut finish_producer = std::pin::pin!(producer.finish());
+                await_with_stream_progress(
+                    writer,
+                    direction,
+                    request_id,
+                    progress_interval,
+                    progress_nonce,
+                    finish_producer.as_mut(),
+                )
+                .await?
+                .map_err(|error| SendFailure {
+                    error,
+                    wrote_any: true,
+                })?;
+                return Ok((ObjectRpcBodyCompletion { length }, true));
             }
         }
         let mut finish_producer = std::pin::pin!(producer.finish());
@@ -1600,7 +1722,7 @@ async fn write_prepared_body_data<W: RpcRecordWriter>(
         }
         BodyDescriptor::Deferred => {}
     }
-    Ok(ObjectRpcBodyCompletion { length })
+    Ok((ObjectRpcBodyCompletion { length }, false))
 }
 
 fn make_finish(
@@ -1813,15 +1935,28 @@ async fn send_request<W: RpcRecordWriter>(
 ) -> Result<(), SendFailure> {
     let started_ns = timeline_started_ns(timeline_trace);
     let result = async {
-        let result =
-            write_request_frames(&mut writer, request_id, &head_payload, &mut body, options).await;
-        if result.is_ok() {
-            writer.flush_record().await?;
-            writer.finish_records().await?;
+        let request_is_inline = matches!(body.descriptor, BodyDescriptor::Inline { .. });
+        let result = if request_is_inline {
+            writer
+                .write_final_record(
+                    FRAME_REQUEST_HEAD,
+                    &head_payload,
+                    "write final object RPC request head",
+                )
+                .await
+                .map(|()| true)
+        } else {
+            write_request_frames(&mut writer, request_id, &head_payload, &mut body, options).await
+        };
+        if let Ok(records_finished) = result.as_ref() {
+            if !records_finished {
+                writer.flush_record().await?;
+                writer.finish_records().await?;
+            }
         } else {
             let _ = writer.finish_records().await;
         }
-        result
+        result.map(|_| ())
     }
     .await;
     record_rpc_timeline_duration(
@@ -1840,7 +1975,7 @@ async fn write_request_frames<W: RpcRecordWriter>(
     head_payload: &[u8],
     body: &mut PreparedOutgoingBody,
     options: ObjectFrameIoOptions,
-) -> Result<(), SendFailure> {
+) -> Result<bool, SendFailure> {
     writer
         .write_record(
             FRAME_REQUEST_HEAD,
@@ -1849,10 +1984,10 @@ async fn write_request_frames<W: RpcRecordWriter>(
         )
         .await?;
     if matches!(body.descriptor, BodyDescriptor::Inline { .. }) {
-        return Ok(());
+        return Ok(false);
     }
     let mut progress_nonce = 1;
-    let completion = write_prepared_body_data(
+    let (completion, records_finished) = write_prepared_body_data(
         writer,
         IncomingDirection::Request,
         &request_id,
@@ -1867,7 +2002,7 @@ async fn write_request_frames<W: RpcRecordWriter>(
         wrote_any: true,
     })?;
     if matches!(body.descriptor, BodyDescriptor::KnownLength { .. }) {
-        return Ok(());
+        return Ok(records_finished);
     }
     let finish = make_finish(request_id, completion, FinishStatus::Completed);
     write_finish(writer, FRAME_REQUEST_FINISH, &finish)
@@ -1876,7 +2011,7 @@ async fn write_request_frames<W: RpcRecordWriter>(
             error: failure.error,
             wrote_any: true,
         })?;
-    Ok(())
+    Ok(false)
 }
 
 /// Executes one call over one peer-bound duplex stream.
@@ -2174,11 +2309,11 @@ async fn write_rejection<W: RpcRecordWriter>(
 ) -> Result<(), NetworkError> {
     let payload = response_head(request_id, ResponseDisposition::Rejected { detail })?;
     writer
-        .write_record(FRAME_RESPONSE_HEAD, &payload, "write object RPC rejection")
-        .await
-        .map_err(|failure| failure.error)?;
-    writer
-        .finish_records()
+        .write_final_record(
+            FRAME_RESPONSE_HEAD,
+            &payload,
+            "write final object RPC rejection",
+        )
         .await
         .map_err(|failure| failure.error)
 }
@@ -2328,17 +2463,13 @@ where
             inline_body: response_body.inline_body.clone(),
         },
     )?;
-    writer
-        .write_record(
-            FRAME_RESPONSE_HEAD,
-            &response_payload,
-            "write object RPC response head",
-        )
-        .await
-        .map_err(|failure| failure.error)?;
     if buffer_entire_response {
         writer
-            .finish_records()
+            .write_final_record(
+                FRAME_RESPONSE_HEAD,
+                &response_payload,
+                "write final object RPC response head",
+            )
             .await
             .map_err(|failure| failure.error)?;
         let result = match request_receive_completion.join().await {
@@ -2354,10 +2485,18 @@ where
         return result;
     }
     writer
+        .write_record(
+            FRAME_RESPONSE_HEAD,
+            &response_payload,
+            "write object RPC response head",
+        )
+        .await
+        .map_err(|failure| failure.error)?;
+    writer
         .flush_record()
         .await
         .map_err(|failure| failure.error)?;
-    let response_completion = write_prepared_body_data(
+    let (response_completion, records_finished) = write_prepared_body_data(
         &mut writer,
         IncomingDirection::Response,
         &request_id,
@@ -2369,10 +2508,12 @@ where
     .await
     .map_err(|failure| failure.error)?;
     if response_completes_at_known_boundary {
-        writer
-            .finish_records()
-            .await
-            .map_err(|failure| failure.error)?;
+        if !records_finished {
+            writer
+                .finish_records()
+                .await
+                .map_err(|failure| failure.error)?;
+        }
         let result = match request_receive_completion.join().await {
             Ok(IncomingTerminal::Completed(_)) => Ok(()),
             Ok(IncomingTerminal::Rejected(detail)) => Err(serialization_error(format!(
@@ -3617,6 +3758,28 @@ mod tests {
         assert!(
             validate_incoming_finish(&request_id, 4, &BodyDescriptor::Deferred, &finish,).is_err()
         );
+    }
+
+    #[test]
+    fn already_buffered_small_source_uses_inline_framing() {
+        let expected = Bytes::from_static(b"small typed service value");
+        let body = ObjectRpcStreamBody::source(ObjectRpcBodySource::bytes(expected.to_vec()));
+
+        match body.kind {
+            OutgoingBodyKind::Inline(actual) => assert_eq!(actual, expected),
+            OutgoingBodyKind::Source(_) => panic!("small buffered source remained streamed"),
+        }
+    }
+
+    #[test]
+    fn guarded_small_source_keeps_streaming_boundary() {
+        let mut source = ObjectRpcBodySource::bytes(b"guarded service value".to_vec());
+        source
+            .hold_lifetime_guard(())
+            .expect("attach lifetime guard");
+        let body = ObjectRpcStreamBody::source(source);
+
+        assert!(matches!(body.kind, OutgoingBodyKind::Source(_)));
     }
 
     #[tokio::test]
