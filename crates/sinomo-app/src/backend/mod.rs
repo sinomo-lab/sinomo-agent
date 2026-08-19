@@ -544,8 +544,7 @@ fn reconcile_android_cluster_node_role(connection: &Connection, data_dir: &Sinom
         }
     };
     let address = address.to_string();
-    if let Err(error) = thread::Builder::new()
-        .name("sinomo-app-mobile-role-migration".to_string())
+    if let Err(error) = crate::daemon_rpc_thread_builder("sinomo-app-mobile-role-migration")
         .spawn(move || {
             let client = DaemonApiClient::at_address(address).with_timeout(DAEMON_RPC_TIMEOUT);
             let mut failed_attempt_index = 0;
@@ -653,8 +652,7 @@ pub(crate) fn run_with_timeout<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, String> {
     let (tx, rx) = mpsc::channel();
-    thread::Builder::new()
-        .name(format!("sinomo-app-timed-{label}"))
+    crate::daemon_rpc_thread_builder(format!("sinomo-app-timed-{label}"))
         .spawn(move || {
             let _ = tx.send(work());
         })
@@ -832,6 +830,7 @@ fn build_app_runtime() -> Arc<tokio::runtime::Runtime> {
     Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .thread_name("sinomo-app-runtime")
+            .thread_stack_size(crate::DAEMON_RPC_WORKER_STACK_BYTES)
             .worker_threads(2)
             .enable_all()
             .build()

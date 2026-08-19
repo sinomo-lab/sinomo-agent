@@ -2856,9 +2856,8 @@ impl ChatState {
         let data_dir = self.data_dir.clone();
         let sifs_daemon = self.sifs_daemon.clone();
         let worker_waker = waker.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sinomo-app-chat-list".to_string())
-            .spawn(move || {
+        let spawn_result =
+            crate::daemon_rpc_thread_builder("sinomo-app-chat-list").spawn(move || {
                 let (sessions, error) =
                     list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
                 let _ = tx.send(SessionListWorkerResult { sessions, error });
@@ -4187,28 +4186,28 @@ impl ChatState {
             ActivityTone::Running,
         );
 
-        let spawn = thread::Builder::new()
-            .name(format!("sinomo-app-{label}-rename-{request_id}"))
-            .spawn(move || {
-                let result = rename_session_in_store(
-                    data_dir.as_ref(),
-                    sifs_daemon.as_ref(),
-                    kind,
-                    &worker_session_id,
-                    &worker_title,
-                )
-                .map_err(|error| error.to_string());
-                let _ = tx.send(SessionRenameWorkerResult {
-                    request_id,
-                    session_id: worker_session_id,
-                    kind,
-                    title: worker_title,
-                    result,
+        let spawn =
+            crate::daemon_rpc_thread_builder(format!("sinomo-app-{label}-rename-{request_id}"))
+                .spawn(move || {
+                    let result = rename_session_in_store(
+                        data_dir.as_ref(),
+                        sifs_daemon.as_ref(),
+                        kind,
+                        &worker_session_id,
+                        &worker_title,
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(SessionRenameWorkerResult {
+                        request_id,
+                        session_id: worker_session_id,
+                        kind,
+                        title: worker_title,
+                        result,
+                    });
+                    if let Some(waker) = worker_waker {
+                        waker.wake();
+                    }
                 });
-                if let Some(waker) = worker_waker {
-                    waker.wake();
-                }
-            });
         match spawn {
             Ok(_) => self.session_rename_rx = Some(rx),
             Err(error) => {
@@ -4358,9 +4357,8 @@ impl ChatState {
         let worker_session_id = session_id.clone();
         let worker_session = session.clone();
         let worker_waker = waker.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sinomo-app-chat-delete".to_string())
-            .spawn(move || {
+        let spawn_result =
+            crate::daemon_rpc_thread_builder("sinomo-app-chat-delete").spawn(move || {
                 let result = delete_conversation_records(
                     &data_dir,
                     sifs_daemon.as_ref(),
@@ -4597,9 +4595,8 @@ impl ChatState {
         let known_message_ids = self.timeline.discovered_message_ids.clone();
         let worker_session = session.clone();
         let worker_waker = self.ui_waker.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sinomo-app-chat-load".to_string())
-            .spawn(move || {
+        let spawn_result =
+            crate::daemon_rpc_thread_builder("sinomo-app-chat-load").spawn(move || {
                 let result = load_conversation_timeline(
                     &data_dir,
                     sifs_daemon.as_ref(),
@@ -5079,29 +5076,27 @@ impl ChatState {
             let camera_surface = self.media_setup.camera_surface.clone();
             let data_dir = self.data_dir.clone();
             let worker_waker = self.ui_waker.clone();
-            match thread::Builder::new()
-                .name("sinomo-app-media-call".to_string())
-                .spawn(move || {
-                    run_chat_media_call_worker(
-                        data_dir,
-                        provider_id,
-                        model,
-                        start_config,
-                        setup_shutdown,
-                        event_tx,
-                        control_rx,
-                        worker_snapshots,
-                        worker_cancelled,
-                        worker_microphone_enabled,
-                        worker_camera_enabled,
-                        camera_surface,
-                        stable_chat,
-                        tool_context,
-                        realtime_handoff,
-                        sifs_daemon,
-                        worker_waker,
-                    );
-                }) {
+            match crate::daemon_rpc_thread_builder("sinomo-app-media-call").spawn(move || {
+                run_chat_media_call_worker(
+                    data_dir,
+                    provider_id,
+                    model,
+                    start_config,
+                    setup_shutdown,
+                    event_tx,
+                    control_rx,
+                    worker_snapshots,
+                    worker_cancelled,
+                    worker_microphone_enabled,
+                    worker_camera_enabled,
+                    camera_surface,
+                    stable_chat,
+                    tool_context,
+                    realtime_handoff,
+                    sifs_daemon,
+                    worker_waker,
+                );
+            }) {
                 Ok(worker) => {
                     self.media_call_runtime = Some(ChatNativeMediaRuntime {
                         control_tx,
@@ -5985,15 +5980,13 @@ impl ChatState {
             return false;
         }
         let (tx, rx) = mpsc::channel();
-        match thread::Builder::new()
-            .name("sinomo-app-chat-providers".to_string())
-            .spawn(move || {
-                let providers = crate::backend::config::cluster_provider_summaries(config.as_ref());
-                let _ = tx.send(ProviderListWorkerResult { providers });
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }) {
+        match crate::daemon_rpc_thread_builder("sinomo-app-chat-providers").spawn(move || {
+            let providers = crate::backend::config::cluster_provider_summaries(config.as_ref());
+            let _ = tx.send(ProviderListWorkerResult { providers });
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }) {
             Ok(_) => {
                 self.provider_list_rx = Some(rx);
                 true
@@ -6762,9 +6755,8 @@ impl ChatState {
         let worker_channel = channel;
         let worker_session = session_ref;
         let worker_waker = waker.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sinomo-app-channel-create".to_string())
-            .spawn(move || {
+        let spawn_result =
+            crate::daemon_rpc_thread_builder("sinomo-app-channel-create").spawn(move || {
                 let result = open_agent_channel_store(&data_dir, sifs_daemon.as_ref())
                     .and_then(|store| {
                         store
@@ -6910,27 +6902,27 @@ impl ChatState {
             ActivityTone::Running,
         );
 
-        let spawn = thread::Builder::new()
-            .name(format!("sinomo-app-channel-config-{request_id}"))
-            .spawn(move || {
-                let result = update_channel_membership_in_store(
-                    data_dir.as_ref(),
-                    sifs_daemon.as_ref(),
-                    &worker_channel_id,
-                    operation,
-                )
-                .map_err(|error| error.to_string());
-                let _ = tx.send(ChannelConfigWorkerResult {
-                    request_id,
-                    channel_id: worker_channel_id,
-                    action: worker_action,
-                    success_notice,
-                    result,
+        let spawn =
+            crate::daemon_rpc_thread_builder(format!("sinomo-app-channel-config-{request_id}"))
+                .spawn(move || {
+                    let result = update_channel_membership_in_store(
+                        data_dir.as_ref(),
+                        sifs_daemon.as_ref(),
+                        &worker_channel_id,
+                        operation,
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = tx.send(ChannelConfigWorkerResult {
+                        request_id,
+                        channel_id: worker_channel_id,
+                        action: worker_action,
+                        success_notice,
+                        result,
+                    });
+                    if let Some(waker) = worker_waker {
+                        waker.wake();
+                    }
                 });
-                if let Some(waker) = worker_waker {
-                    waker.wake();
-                }
-            });
 
         match spawn {
             Ok(_) => self.channel_config_rx = Some(rx),

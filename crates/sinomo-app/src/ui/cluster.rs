@@ -5,7 +5,6 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::thread;
 use time::OffsetDateTime;
 
 use sui::{
@@ -498,15 +497,13 @@ impl ClusterState {
             return false;
         }
         let (tx, rx) = mpsc::channel();
-        match thread::Builder::new()
-            .name("sinomo-app-cluster-refresh".to_string())
-            .spawn(move || {
-                let snapshot = backend.refresh_cluster_snapshot();
-                let _ = tx.send(snapshot);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }) {
+        match crate::daemon_rpc_thread_builder("sinomo-app-cluster-refresh").spawn(move || {
+            let snapshot = backend.refresh_cluster_snapshot();
+            let _ = tx.send(snapshot);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }) {
             Ok(_) => {
                 self.refreshing = true;
                 self.refresh_rx = Some(rx);
@@ -678,15 +675,13 @@ impl ClusterState {
         }
         let generation = self.observation.generation;
         let (tx, rx) = mpsc::channel();
-        match thread::Builder::new()
-            .name("sinomo-app-cluster-observe".to_string())
-            .spawn(move || {
-                let batch = backend.observe_cluster_metrics(generation);
-                let _ = tx.send(batch);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }) {
+        match crate::daemon_rpc_thread_builder("sinomo-app-cluster-observe").spawn(move || {
+            let batch = backend.observe_cluster_metrics(generation);
+            let _ = tx.send(batch);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }) {
             Ok(_) => {
                 self.observation.in_flight = true;
                 self.observation.sample_rx = Some(rx);

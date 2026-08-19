@@ -35,6 +35,18 @@ static ANDROID_SAFE_AREA: std::sync::OnceLock<std::sync::RwLock<sui::Insets>> =
 #[cfg(all(target_os = "android", feature = "mobile"))]
 static ANDROID_APP: std::sync::OnceLock<sui::AndroidApp> = std::sync::OnceLock::new();
 
+/// Synchronous app clients bridge deeply composed daemon-RPC futures on their calling worker.
+/// Unoptimized poll frames exceed Rust's 2 MiB child-thread default on Windows. Keep one explicit
+/// budget for workers that may enter those bridges so behavior never depends on
+/// `RUST_MIN_STACK` or a platform default.
+pub(crate) const DAEMON_RPC_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) fn daemon_rpc_thread_builder(name: impl Into<String>) -> std::thread::Builder {
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(DAEMON_RPC_WORKER_STACK_BYTES)
+}
+
 pub(crate) fn platform_safe_area_insets() -> sui::Insets {
     #[cfg(all(target_os = "android", feature = "mobile"))]
     {
@@ -110,8 +122,7 @@ pub fn run() -> sui::Result<()> {
         shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
-        std::thread::Builder::new()
-            .name("sinomo-app-connect".to_string())
+        daemon_rpc_thread_builder("sinomo-app-connect")
             .spawn(move || {
                 let backend = Backend::connect(|status| {
                     let _ = tx.send(ConnectEvent::Status(status.to_string()));
@@ -155,8 +166,7 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
         mobile_runtime::start_android_operating_conditions_monitor(conditions_app);
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
-        std::thread::Builder::new()
-            .name("sinomo-app-connect".to_string())
+        daemon_rpc_thread_builder("sinomo-app-connect")
             .spawn(move || {
                 mobile_runtime::wait_until_interactive_blocking();
                 let backend = Backend::connect(|status| {
@@ -544,10 +554,16 @@ fn rotate_app_log_if_large(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_area_insets_from_physical;
+    use super::{DAEMON_RPC_WORKER_STACK_BYTES, safe_area_insets_from_physical};
     use crate::rendering::{AppRenderMode, resolve_render_options};
     use std::path::{Path, PathBuf};
     use sui::{WindowColorManagementMode, WindowStemDarkening, WindowTextHinting};
+
+    #[test]
+    fn daemon_rpc_worker_stack_budget_covers_unoptimized_poll_frames() {
+        let configured = std::hint::black_box(DAEMON_RPC_WORKER_STACK_BYTES);
+        assert!(configured >= 8 * 1024 * 1024);
+    }
 
     #[test]
     fn android_safe_area_converts_physical_insets_to_logical_units() {

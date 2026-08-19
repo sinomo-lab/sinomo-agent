@@ -319,8 +319,7 @@ impl ChatHandle {
             evt_tx: evt_tx.clone(),
         };
         let worker_tool_context = tool_context.clone();
-        let worker = thread::Builder::new()
-            .name("sinomo-chat".to_string())
+        let worker = crate::daemon_rpc_thread_builder("sinomo-chat")
             .spawn(move || {
                 worker(
                     data_dir,
@@ -547,8 +546,7 @@ impl DirectControl {
         let registry = self.runtime_control_registry.clone();
         let active_session_id = self.active_session_id.clone();
         let tx = self.evt_tx.clone();
-        thread::Builder::new()
-            .name("sinomo-chat-control".to_string())
+        crate::daemon_rpc_thread_builder("sinomo-chat-control")
             .spawn(move || {
                 let session_id = if requested_session_id.trim().is_empty() {
                     match active_session_id.lock() {
