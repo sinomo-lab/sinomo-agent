@@ -79,6 +79,15 @@ incremental = true
 [profile.dev.package."*"]
 debug = "limited"
 
+# The network data plane remains on the ordinary incremental dev pipeline, but
+# bodyless routed RPCs otherwise spend most of their budget in unoptimized mux,
+# framing, and authenticated-stream code before device/network latency is even
+# visible. Optimize only that hot crate so Docker debug-cluster measurements
+# exercise the production-shaped data path without making the full workspace
+# expensive to rebuild while iterating.
+[profile.dev.package.sinomo-network]
+opt-level = 2
+
 [profile.android-debug-small]
 inherits = "dev"
 debug = 0
