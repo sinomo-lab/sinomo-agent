@@ -600,37 +600,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_read_file_distributed(&mut self, path: &str) -> Result<Vec<u8>> {
-        self.check_cancelled("distributed read")?;
-        let trace_started = Instant::now();
-        let lookup_started = Instant::now();
-        let (path, object) = self.distributed_posix_file_content_object(path, true)?;
-        let lookup_elapsed_ms = lookup_started.elapsed().as_millis();
-        let fetch_started = Instant::now();
-        let outcome = self.read_object_metadata_or_fetch_remote_without_cache(&object)?;
-        let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
-        match outcome {
-            NetworkedDfsReadOutcome::Found {
-                data: DfsReadData { bytes, .. },
-                ..
-            } => {
-                crate::dfs_perf_trace(format_args!(
-                    "posix-read-distributed path={} object={} bytes={} lookup_ms={} fetch_ms={} total_ms={}",
-                    path,
-                    object.object_id,
-                    bytes.len(),
-                    lookup_elapsed_ms,
-                    fetch_elapsed_ms,
-                    trace_started.elapsed().as_millis()
-                ));
-                Ok(bytes)
-            }
-            NetworkedDfsReadOutcome::PendingReplication { .. }
-            | NetworkedDfsReadOutcome::NotConfirmed { .. }
-            | NetworkedDfsReadOutcome::NotFound => Err(DfsPosixError::NotFound { path }),
-            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
-                Err(read_conflict_error(path, conflicts))
-            }
-        }
+        legacy_distributed_file_read_result(self.posix_read_file_distributed_outcome(path)?)
     }
 
     /// Read a distributed file without collapsing content availability into
@@ -641,6 +611,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// availability failure, including a replica-layer `NotFound`: it cannot
     /// revoke the already confirmed namespace object.
     pub fn posix_read_file_distributed_outcome(
+        &mut self,
+        path: &str,
+    ) -> Result<DfsPosixDistributedFileReadOutcome> {
+        let path = normalize_posix_path(path)?;
+        self.with_local_primary_metadata_read_snapshot(&path, |service| {
+            service.posix_read_file_distributed_outcome_from_snapshot(&path)
+        })
+    }
+
+    fn posix_read_file_distributed_outcome_from_snapshot(
         &mut self,
         path: &str,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
@@ -691,6 +671,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// Read a bounded distributed file prefix without collapsing content
     /// availability into namespace absence.
     pub fn posix_read_file_prefix_distributed_outcome(
+        &mut self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
+        let path = normalize_posix_path(path)?;
+        self.with_local_primary_metadata_read_snapshot(&path, |service| {
+            service.posix_read_file_prefix_distributed_outcome_from_snapshot(&path, max_bytes)
+        })
+    }
+
+    fn posix_read_file_prefix_distributed_outcome_from_snapshot(
         &mut self,
         path: &str,
         max_bytes: usize,

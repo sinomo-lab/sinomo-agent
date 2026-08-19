@@ -192,23 +192,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        self.with_metadata_lookup_cache_mut(|service| {
-            service.check_cancelled("distributed stat")?;
-            let requested = normalize_posix_path(path)?;
-            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
-            let path = service.resolve_existing_posix_path_distributed(path, true)?;
-            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
-            let shard_snapshot = service.refresh_sifs_metadata_shards()?;
-            let object = service
-                .lookup_sifs_path_direct_distributed_synced_from_snapshot(
-                    &path,
-                    shard_snapshot.as_deref(),
-                )?
-                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-            if object.kind == DfsObjectKind::Tombstone {
-                return Err(DfsPosixError::NotFound { path });
-            }
-            service.stat_object_for_path(&object, &path)
+        let path = normalize_posix_path(path)?;
+        self.with_local_primary_metadata_read_snapshot(&path, |service| {
+            service.with_metadata_lookup_cache_mut(|service| {
+                service.check_cancelled("distributed stat")?;
+                service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+                let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+                service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+                let shard_snapshot = service.refresh_sifs_metadata_shards()?;
+                let object = service
+                    .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                        &path,
+                        shard_snapshot.as_deref(),
+                    )?
+                    .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+                if object.kind == DfsObjectKind::Tombstone {
+                    return Err(DfsPosixError::NotFound { path });
+                }
+                service.stat_object_for_path(&object, &path)
+            })
         })
     }
 
@@ -300,13 +302,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
-        self.check_cancelled("distributed list")?;
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        if self.local_metadata_replica_can_list_resolved_dir(&path)? {
-            return self.posix_collect_resolved_dir(&path);
-        }
-        self.sync_remote_namespace_path_until_quiet(&path)?;
-        self.posix_collect_resolved_dir(&path)
+        let path = normalize_posix_path(path)?;
+        self.with_local_primary_metadata_read_snapshot(&path, |service| {
+            service.check_cancelled("distributed list")?;
+            let path = service.resolve_existing_posix_path_distributed(&path, true)?;
+            if service.local_metadata_replica_can_list_resolved_dir(&path)? {
+                return service.posix_collect_resolved_dir(&path);
+            }
+            service.sync_remote_namespace_path_until_quiet(&path)?;
+            service.posix_collect_resolved_dir(&path)
+        })
     }
 
     pub fn posix_list_dir_page(

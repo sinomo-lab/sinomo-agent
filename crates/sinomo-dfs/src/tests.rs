@@ -7248,6 +7248,76 @@ fn networked_sifs_with_backend(
 }
 
 #[test]
+fn local_primary_lightweight_reads_pin_one_metadata_generation() {
+    let root = temp_root("local-primary-lightweight-read-snapshot");
+    let node_id =
+        NodeId::from_legacy_named("node_local_primary_lightweight_snapshot").expect("node");
+    let directory = "/services/lightweight-read-snapshot/deep";
+    let path = "/services/lightweight-read-snapshot/deep/tiny.txt";
+    let payload = b"resident metadata snapshot";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(directory).expect("fixture directory");
+    dfs.posix_write_file(
+        path,
+        payload,
+        DfsWriteOptions::replicated_eventual(vec![node_id]),
+    )
+    .expect("fixture file");
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    let stat = dfs.posix_stat_distributed(path).expect("distributed stat");
+    assert_eq!(stat.size_bytes, Some(payload.len() as u64));
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes(),
+        0,
+        "one local-primary stat must not probe durable table files per path component"
+    );
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    let entries = dfs
+        .posix_list_dir_distributed(directory)
+        .expect("distributed list");
+    assert!(entries.iter().any(|entry| entry.path == path));
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes(),
+        0,
+        "one local-primary listing must retain its starting metadata generation"
+    );
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    let prefix = dfs
+        .posix_read_file_prefix_distributed(path, payload.len())
+        .expect("distributed prefix read");
+    assert_eq!(prefix.bytes, payload);
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes(),
+        0,
+        "one local-primary prefix read must retain its starting metadata generation"
+    );
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    assert_eq!(
+        dfs.posix_read_file_distributed(path)
+            .expect("distributed full read"),
+        payload
+    );
+    assert_eq!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes(),
+        0,
+        "one local-primary full read must retain its starting metadata generation"
+    );
+
+    crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    dfs.posix_stat(path)
+        .expect("ordinary stat after distributed reads");
+    assert!(
+        crate::metadata_read_snapshot::metadata_durable_table_probes() > 0,
+        "the operation-scoped metadata snapshot must be released before returning"
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn content_root_catalog_refresh_failure_durably_invalidates_previous_catalog() {
     let root = temp_root("content-root-catalog-refresh-failure");
     let node_id = NodeId::from_legacy_named("node_catalog_refresh_failure").expect("node");

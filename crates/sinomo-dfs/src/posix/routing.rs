@@ -49,6 +49,40 @@ fn namespace_operation_uses_stable_admission(operation: &DfsNamespaceOperation) 
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    /// Run one local-primary read against a single durable metadata cut.
+    ///
+    /// A short-lived client backend may share shard files with the resident
+    /// daemon. The first snapshot refresh observes any commit that completed
+    /// before this read, after which the component walk can safely reuse the
+    /// resident tables. Without this scope, every path component repeats the
+    /// checkpoint/snapshot/log generation probes; that is especially costly
+    /// on NTFS. Remote-primary reads retain their authority lookup unchanged.
+    pub(super) fn with_local_primary_metadata_read_snapshot<R>(
+        &mut self,
+        path: &str,
+        operation: impl FnOnce(&mut Self) -> Result<R>,
+    ) -> Result<R> {
+        let path = normalize_posix_path(path)?;
+        let local_primary = self.routed_namespace_primary_for_path(&path)?.is_none();
+        let pinned = local_primary && self.metadata_backend.is_some();
+        if pinned {
+            self.metadata_backend
+                .as_mut()
+                .expect("metadata backend presence checked before read snapshot")
+                .begin_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path)
+                .map_err(DfsPosixError::from)?;
+        }
+
+        let result = operation(self);
+        if pinned {
+            self.metadata_backend
+                .as_mut()
+                .expect("pinned metadata backend remains installed")
+                .end_consistent_read_snapshot_for_path(&sifs_file_system_id(), &path);
+        }
+        result
+    }
+
     /// The metadata-shard primary to route a namespace mutation to, or `None`
     /// when this node is itself the namespace authority for the path (or no
     /// cluster shard configuration exists).
