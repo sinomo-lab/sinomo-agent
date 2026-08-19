@@ -88,6 +88,18 @@ debug = "limited"
 [profile.dev.package.sinomo-network]
 opt-level = 2
 
+# DFS metadata authority is part of the same latency-sensitive distributed
+# data plane. Keep the rest of the workspace cheap to build while avoiding
+# debug-only multi-millisecond table/query overhead in cluster benchmarks.
+[profile.dev.package.sinomo-dfs]
+opt-level = 2
+
+# The daemon owns the service adapter around that data plane; leaving only the
+# adapter unoptimized makes a warmed metadata lookup slower than the network
+# and DFS work it encloses.
+[profile.dev.package.sinomo-daemon]
+opt-level = 2
+
 [profile.android-debug-small]
 inherits = "dev"
 debug = 0
