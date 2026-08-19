@@ -109,6 +109,7 @@ const DIRECTORY_CHANGE_CHANNEL_CAPACITY: usize = 8;
 const DIRECTORY_CHANGES_PER_PASS: usize = 64;
 const DEFERRED_CAPTURE_RETRIES_MAX: usize = 4_096;
 const LOCAL_STARTUP_SCAN_WORK_PER_PASS: usize = 32;
+const NAMESPACE_FULL_SCAN_OBSERVATIONS_PER_PASS: usize = 32;
 const SERVICE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CURSOR_RECOVERY_SENTINEL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -558,155 +559,174 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
 
         let mut plan = self.scan.take().expect("initialized sparse scan plan");
         let mut manifest = BTreeMap::new();
-        let mut removed_paths = Vec::new();
-        let mut audited_materialized_directories = Vec::new();
+        let mut removed_paths = BTreeSet::new();
+        let mut audited_materialized_directories = BTreeSet::new();
 
-        let known_path = if plan.known_complete {
-            None
-        } else {
-            let page = next_sparse_known_path(
-                materialized_manifest,
-                &plan.materialized_directories,
-                plan.known_before.as_deref(),
-                CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
-            );
-            plan.known_before = page.before;
-            plan.known_complete = page.complete;
-            page.path
-        };
-        if let Some(path) = known_path {
-            match lock_service(&self.service)?.posix_lstat_distributed(&path) {
-                Ok(stat) if stat.kind != DfsObjectKind::Tombstone => {
-                    let entry = manifest_entry_from_stat(stat);
-                    manifest.insert(entry.path.clone(), entry);
-                }
-                Ok(_) | Err(dfs::DfsPosixError::NotFound { .. }) => removed_paths.push(path),
-                Err(error) => return Err(error.to_string()),
-            }
-        } else if plan.known_complete {
-            if plan.active_page.is_none()
-                && let Some(task) = plan.directories.pop_front()
-            {
-                let page = self
-                    .mounted_mutation_handoff
-                    .run_captured_read_ingest(
-                        &self.service,
-                        "cloud-files.namespace-full-scan-directory-page",
-                        |service| {
-                            service.capture_mounted_mutation(|service| {
-                                service.posix_list_dir_distributed_page(
-                                    &task.path,
-                                    task.after.as_ref(),
-                                    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
-                                )
-                            })
-                        },
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "durably hand off Cloud Files namespace full-scan directory refresh for `{}`: {error}",
-                            task.path
-                        )
-                    })?;
-                match page {
-                    Ok(page) => {
-                        // A durable materialization ledger can outlive the
-                        // physical directory placeholder (for example, when a
-                        // provider restart follows a rolled-back registration).
-                        // Re-establish the enumerated directory itself before
-                        // later snapshots try to create any of its children.
-                        // The root is the registered sync-root directory and is
-                        // therefore not created as a child placeholder.
-                        if task.path != root {
-                            let stat = lock_service(&self.service)?
-                                .posix_lstat_distributed(&task.path)
-                                .map_err(|error| {
-                                    format!(
-                                        "authoritative stat of materialized Cloud Files directory `{}`: {error}",
-                                        task.path
-                                    )
-                                })?;
-                            let entry = materialized_directory_manifest_entry(stat)?;
-                            manifest.insert(entry.path.clone(), entry);
-                        }
-                        audited_materialized_directories.push(task.path.clone());
-                        plan.active_page = Some(WindowsActiveDirectoryPage {
-                            task,
-                            entries: page.entries.into(),
-                            next_cursor: page.next_cursor,
-                        });
-                    }
-                    Err(dfs::DfsPosixError::NotFound { .. })
-                    | Err(dfs::DfsPosixError::MissingParent { .. }) => {
-                        audited_materialized_directories.push(task.path.clone());
-                        removed_paths.push(task.path.clone());
-                        remove_path_subtree(&mut plan.materialized_directories, &task.path);
-                        if let Ok(mut materialized) = self.materialized_directories.lock() {
-                            remove_path_subtree(&mut materialized, &task.path);
-                        }
-                    }
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
-            if let Some(active) = plan.active_page.as_mut()
-                && let Some(child) = active.entries.pop_front()
-            {
-                // A crash can persist an already-open directory page before
-                // the parent placeholder effect completes. Carry the parent
-                // in every resumed page snapshot so recovery still orders the
-                // directory before the next child.
-                if active.task.path != root {
-                    let stat = lock_service(&self.service)?
-                        .posix_lstat_distributed(&active.task.path)
-                        .map_err(|error| {
-                            format!(
-                                "authoritative stat of resumed materialized Cloud Files directory `{}`: {error}",
-                                active.task.path
-                            )
-                        })?;
-                    let entry = materialized_directory_manifest_entry(stat)?;
-                    manifest.insert(entry.path.clone(), entry);
-                }
-                match lock_service(&self.service)?.posix_lstat_distributed(&child.path) {
+        // One durable worker pass should cover one bounded page of remote
+        // observations, rather than fsyncing state after every individual
+        // stat. The in-memory plan remains resumable between these quanta.
+        for _ in 0..NAMESPACE_FULL_SCAN_OBSERVATIONS_PER_PASS {
+            let known_path = if plan.known_complete {
+                None
+            } else {
+                let page = next_sparse_known_path(
+                    materialized_manifest,
+                    &plan.materialized_directories,
+                    plan.known_before.as_deref(),
+                    CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+                );
+                plan.known_before = page.before;
+                plan.known_complete = page.complete;
+                page.path
+            };
+            if let Some(path) = known_path {
+                match lock_service(&self.service)?.posix_lstat_distributed(&path) {
                     Ok(stat) if stat.kind != DfsObjectKind::Tombstone => {
-                        if cloud_files_object_projection(&stat.kind)
-                            == CloudFilesObjectProjection::Directory
-                        {
-                            let child_depth = active.task.depth.saturating_add(1);
-                            let should_scan = sparse_child_directory_is_enumerated(
-                                child_depth,
-                                self.prepopulate_depth,
-                                plan.materialized_directories.contains(&stat.path),
-                            );
-                            if should_scan && plan.queued_directories.insert(stat.path.clone()) {
-                                plan.directories.push_back(WindowsDirectoryScanTask {
-                                    path: stat.path.clone(),
-                                    depth: child_depth,
-                                    after: None,
-                                });
-                            }
-                        }
                         let entry = manifest_entry_from_stat(stat);
+                        removed_paths.remove(&entry.path);
                         manifest.insert(entry.path.clone(), entry);
                     }
                     Ok(_) | Err(dfs::DfsPosixError::NotFound { .. }) => {
-                        removed_paths.push(child.path)
+                        manifest.remove(&path);
+                        removed_paths.insert(path);
                     }
                     Err(error) => return Err(error.to_string()),
                 }
-            }
-            let page_finished = plan
-                .active_page
-                .as_ref()
-                .is_some_and(|active| active.entries.is_empty());
-            if page_finished {
-                let active = plan.active_page.take().expect("finished active page");
-                if let Some(after) = active.next_cursor {
-                    plan.directories.push_front(WindowsDirectoryScanTask {
-                        after: Some(after),
-                        ..active.task
-                    });
+            } else if plan.known_complete {
+                if plan.active_page.is_none()
+                    && let Some(task) = plan.directories.pop_front()
+                {
+                    let page = self
+                        .mounted_mutation_handoff
+                        .run_captured_read_ingest(
+                            &self.service,
+                            "cloud-files.namespace-full-scan-directory-page",
+                            |service| {
+                                service.capture_mounted_mutation(|service| {
+                                    service.posix_list_dir_distributed_page(
+                                        &task.path,
+                                        task.after.as_ref(),
+                                        CLOUD_FILES_DIRECTORY_PAGE_ENTRIES,
+                                    )
+                                })
+                            },
+                        )
+                        .map_err(|error| {
+                            format!(
+                                "durably hand off Cloud Files namespace full-scan directory refresh for `{}`: {error}",
+                                task.path
+                            )
+                        })?;
+                    match page {
+                        Ok(page) => {
+                            // A durable materialization ledger can outlive the
+                            // physical directory placeholder (for example, when a
+                            // provider restart follows a rolled-back registration).
+                            // Re-establish the enumerated directory itself before
+                            // later snapshots try to create any of its children.
+                            // The root is the registered sync-root directory and is
+                            // therefore not created as a child placeholder.
+                            if task.path != root {
+                                let stat = lock_service(&self.service)?
+                                    .posix_lstat_distributed(&task.path)
+                                    .map_err(|error| {
+                                        format!(
+                                            "authoritative stat of materialized Cloud Files directory `{}`: {error}",
+                                            task.path
+                                        )
+                                    })?;
+                                let entry = materialized_directory_manifest_entry(stat)?;
+                                removed_paths.remove(&entry.path);
+                                manifest.insert(entry.path.clone(), entry);
+                            }
+                            audited_materialized_directories.insert(task.path.clone());
+                            plan.active_page = Some(WindowsActiveDirectoryPage {
+                                task,
+                                entries: page.entries.into(),
+                                next_cursor: page.next_cursor,
+                            });
+                        }
+                        Err(dfs::DfsPosixError::NotFound { .. })
+                        | Err(dfs::DfsPosixError::MissingParent { .. }) => {
+                            audited_materialized_directories.insert(task.path.clone());
+                            manifest.remove(&task.path);
+                            removed_paths.insert(task.path.clone());
+                            remove_path_subtree(&mut plan.materialized_directories, &task.path);
+                            if let Ok(mut materialized) = self.materialized_directories.lock() {
+                                remove_path_subtree(&mut materialized, &task.path);
+                            }
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
                 }
+                if let Some(active) = plan.active_page.as_mut()
+                    && let Some(child) = active.entries.pop_front()
+                {
+                    // A crash can persist an already-open directory page before
+                    // the parent placeholder effect completes. Carry the parent
+                    // in every resumed page snapshot so recovery still orders the
+                    // directory before the next child.
+                    if active.task.path != root {
+                        let stat = lock_service(&self.service)?
+                            .posix_lstat_distributed(&active.task.path)
+                            .map_err(|error| {
+                                format!(
+                                    "authoritative stat of resumed materialized Cloud Files directory `{}`: {error}",
+                                    active.task.path
+                                )
+                            })?;
+                        let entry = materialized_directory_manifest_entry(stat)?;
+                        removed_paths.remove(&entry.path);
+                        manifest.insert(entry.path.clone(), entry);
+                    }
+                    match lock_service(&self.service)?.posix_lstat_distributed(&child.path) {
+                        Ok(stat) if stat.kind != DfsObjectKind::Tombstone => {
+                            if cloud_files_object_projection(&stat.kind)
+                                == CloudFilesObjectProjection::Directory
+                            {
+                                let child_depth = active.task.depth.saturating_add(1);
+                                let should_scan = sparse_child_directory_is_enumerated(
+                                    child_depth,
+                                    self.prepopulate_depth,
+                                    plan.materialized_directories.contains(&stat.path),
+                                );
+                                if should_scan && plan.queued_directories.insert(stat.path.clone())
+                                {
+                                    plan.directories.push_back(WindowsDirectoryScanTask {
+                                        path: stat.path.clone(),
+                                        depth: child_depth,
+                                        after: None,
+                                    });
+                                }
+                            }
+                            let entry = manifest_entry_from_stat(stat);
+                            removed_paths.remove(&entry.path);
+                            manifest.insert(entry.path.clone(), entry);
+                        }
+                        Ok(_) | Err(dfs::DfsPosixError::NotFound { .. }) => {
+                            manifest.remove(&child.path);
+                            removed_paths.insert(child.path);
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                let page_finished = plan
+                    .active_page
+                    .as_ref()
+                    .is_some_and(|active| active.entries.is_empty());
+                if page_finished {
+                    let active = plan.active_page.take().expect("finished active page");
+                    if let Some(after) = active.next_cursor {
+                        plan.directories.push_front(WindowsDirectoryScanTask {
+                            after: Some(after),
+                            ..active.task
+                        });
+                    }
+                }
+            }
+
+            if plan.known_complete && plan.directories.is_empty() && plan.active_page.is_none() {
+                break;
             }
         }
 
@@ -720,8 +740,8 @@ impl<T: DfsMessageTransport> CloudFilesNamespaceSource for WindowsDfsNamespaceSo
         };
         Ok(CloudFilesFullScanSnapshot {
             manifest,
-            removed_paths,
-            materialized_directories: audited_materialized_directories,
+            removed_paths: removed_paths.into_iter().collect(),
+            materialized_directories: audited_materialized_directories.into_iter().collect(),
             scan_complete,
             cursors,
         })

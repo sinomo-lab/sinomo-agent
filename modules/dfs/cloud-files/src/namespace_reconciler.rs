@@ -4186,11 +4186,24 @@ impl CloudFilesNamespaceReconciler {
     fn persist_manifest_or_restore(
         &mut self,
         previous: CloudFilesNamespaceReconciliationState,
-        mutations: Vec<CloudFilesManifestMutation>,
-        undo: CloudFilesManifestUndo,
+        mut mutations: Vec<CloudFilesManifestMutation>,
+        mut undo: CloudFilesManifestUndo,
     ) -> Result<(), CloudFilesNamespaceReconcileError> {
         self.ensure_usable()?;
+        // Sparse authoritative scans commonly re-observe entries that are
+        // already current. Preserve only net manifest transitions so those
+        // observations do not append and fsync duplicate journal records.
+        let changed_paths = undo
+            .iter()
+            .filter(|(path, previous_entry)| self.manifest.get(path) != previous_entry.as_ref())
+            .map(|(path, _)| path.clone())
+            .collect::<BTreeSet<_>>();
+        mutations.retain(|mutation| changed_paths.contains(manifest_mutation_path(mutation)));
+        undo.retain(|(path, _)| changed_paths.contains(path));
         update_unsupported_projection_summary(&mut self.state, &self.manifest, &undo);
+        if mutations.is_empty() && self.state == previous {
+            return Ok(());
+        }
         compact_reconciliation_state(&mut self.state);
         let bytes = match encode_reconciliation_state(&self.state) {
             Ok(bytes) => bytes,
@@ -6528,6 +6541,36 @@ mod tests {
             .expect("open reconciler")
     }
 
+    fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
+            let mut entries = fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .map(|entry| entry.expect("read snapshot entry").path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for path in entries {
+                let metadata = fs::symlink_metadata(&path).expect("snapshot metadata");
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("path beneath snapshot root")
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if metadata.file_type().is_dir() {
+                    snapshot.insert(format!("{relative}/"), None);
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(relative, Some(fs::read(&path).expect("snapshot file")));
+                }
+            }
+        }
+
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
     struct CursorRecoveryFixture {
         root: TestRoot,
         scope: PathBuf,
@@ -8423,6 +8466,36 @@ mod tests {
             reopened.unsupported_projection_examples().len(),
             CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT
         );
+    }
+
+    #[test]
+    fn unchanged_partial_full_scan_delta_is_byte_read_only() {
+        let root = TestRoot::new("unchanged-full-scan-delta");
+        let mut reconciler = open_reconciler(&root);
+        let entry = CloudFilesReconciledManifestEntry {
+            path: "/services/stable.txt".to_string(),
+            object_id: "stable-object".to_string(),
+            version: "stable-version".to_string(),
+            content_hash: Some("blake3:stable".to_string()),
+            content_size_bytes: Some(6),
+            kind: "file".to_string(),
+        };
+        let page = BTreeMap::from([(entry.path.clone(), entry)]);
+        reconciler
+            .install_full_scan_delta(page.clone(), Vec::new(), Vec::new(), BTreeMap::new(), false)
+            .expect("install initial full-scan delta");
+        let scope = reconciler
+            .state_path()
+            .parent()
+            .expect("reconciliation scope")
+            .to_path_buf();
+        let before = snapshot_tree(&scope);
+
+        reconciler
+            .install_full_scan_delta(page, Vec::new(), Vec::new(), BTreeMap::new(), false)
+            .expect("replay unchanged full-scan delta");
+
+        assert_eq!(snapshot_tree(&scope), before);
     }
 
     #[test]
