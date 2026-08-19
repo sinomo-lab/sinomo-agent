@@ -146,8 +146,35 @@ frontmatter field does not override Sinomo authority checks.
 
 ## Shared Files and SIFS
 
-The graphical app exposes the SIFS namespace directly. On supported desktop
-platforms, an operator can also mount a subtree through the host filesystem:
+The graphical app exposes the SIFS namespace in **Files**. Use **Locations** to
+move between Sinomo and this device, then use the visible **New**, **Import**,
+and item-action controls for everyday work. Copy, move, and download dialogs
+offer common Sinomo destinations or the native folder picker, while retaining
+an editable exact path for less common destinations.
+
+Select a Sinomo file or folder to manage its availability. The primary choices
+are to inherit the folder default, keep copies available across devices, or
+wait for every configured copy before publishing. Replica thresholds, zones,
+node constraints, and policy impact stay under **Advanced settings**; every
+change still requires a fresh preview before it can be applied.
+
+For a selected item, **History & issues** shows immutable versions, open
+conflicts, and missing-copy evidence. Conflict resolution is explicit: keep the
+current version or choose another retained version, review the confirmation,
+and let the daemon apply the authoritative change. **Run maintenance and
+refresh** requests ordinary DFS maintenance; it does not claim that the client
+performed a path-scoped repair.
+
+Use **Storage health** for the cluster-wide view. It keeps object/version
+counts, pending writes, bounded conflict and missing-copy lists, Cluster
+diagnostics, mount configuration, and reconciliation activity out of the
+everyday file list. Select **Show file** on a conflict to return to its folder
+before opening that item's guided history flow. Disaster-recovery operations
+such as rebuilding a lost repair queue or clearing fenced placement authority
+remain explicit operator commands; they are not ordinary Files actions.
+
+On supported desktop platforms, an operator can also mount a subtree through
+the host filesystem:
 
 ```sh
 sinomo dfs mount /path/to/mount-point --root /sinomo

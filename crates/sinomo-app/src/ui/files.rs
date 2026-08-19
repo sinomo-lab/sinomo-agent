@@ -52,11 +52,13 @@ use sui::{
 };
 
 use sinomo_cli::app_api::{
-    SifsBrowser, SifsEntry, SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary,
-    SifsListOptions, SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails,
-    SifsObjectDetails, SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy,
-    SifsPlacementPreview, SifsPlacementPreviewToken, SifsPlacementReconciliationJob,
-    SifsPlacementScope, SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+    DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
+    DfsOperatorRepairView, DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry,
+    SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
+    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
+    SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
+    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
+    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
 };
 use sinomo_runtime::{
     api::{
@@ -77,7 +79,7 @@ use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot}
 
 /// Below this content width the tab collapses to a list-only column (the inspector is hidden).
 /// The wide branch reserves enough room for Places, the inspector, and the compact file table so
-/// the Placement column never disappears behind horizontal overflow.
+/// the Availability column never disappears behind horizontal overflow.
 const WIDE_THRESHOLD: f32 = 880.0;
 #[cfg(test)]
 const INSPECTOR_W: f32 = 340.0;
@@ -88,6 +90,9 @@ const COMPACT_FILE_NAME_MIN_W: f32 = 120.0;
 const COMPACT_FILE_PLACEMENT_W: f32 = 144.0;
 const CONTENT_PAD: f32 = 16.0;
 const HEADER_H: f32 = 44.0;
+/// A small, task-oriented command row above the listing. Everyday actions live here instead of
+/// depending on a right click, while the full command inventory remains in grouped menus.
+const FILE_ACTION_BAR_H: f32 = 48.0;
 const HEADER_COMMAND_GAP: f32 = 4.0;
 const HEADER_PAD_Y: f32 = 8.0;
 /// Minimum inner width for the complete desktop command row. Below this, the wide Files layout
@@ -253,7 +258,7 @@ impl FileActionPromptKind {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
-            Self::Placement => "Edit placement",
+            Self::Placement => "Manage availability",
         }
     }
 
@@ -272,7 +277,7 @@ impl FileActionPromptKind {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
-            Self::Placement => "Apply placement",
+            Self::Placement => "Apply availability",
         }
     }
 }
@@ -423,6 +428,7 @@ enum PlacementEditorScopeDraft {
     Unknown,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PlacementInheritanceAction {
     MakeExplicitHere,
@@ -430,6 +436,7 @@ enum PlacementInheritanceAction {
     KeepExplicitRule,
 }
 
+#[cfg(test)]
 impl PlacementInheritanceAction {
     fn label(self) -> &'static str {
         match self {
@@ -437,10 +444,6 @@ impl PlacementInheritanceAction {
             Self::UseInheritedPolicy => "Use inherited policy",
             Self::KeepExplicitRule => "Keep explicit rule",
         }
-    }
-
-    fn inherit(self) -> bool {
-        matches!(self, Self::UseInheritedPolicy)
     }
 }
 
@@ -614,6 +617,7 @@ impl PlacementEditorDraft {
         self.scope_draft(self.scope).has_exact_rule()
     }
 
+    #[cfg(test)]
     fn inheritance_action(&self) -> Option<PlacementInheritanceAction> {
         let policy = self.active_policy()?;
         Some(match (self.active_has_exact_rule(), policy.inherit) {
@@ -956,12 +960,19 @@ enum FilesPickerAction {
     OpenFolder,
     ImportFiles,
     ImportFolder,
+    ChooseDestination,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum FilesOperationFailure {
     Cancelled(String),
     Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryDecision {
+    KeepCurrent,
+    UseVersion(DfsVersion),
 }
 
 type FilesOperationResult = Result<FilesOperationOutcome, FilesOperationFailure>;
@@ -1018,6 +1029,15 @@ impl PlacementActivityFilter {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FilesStorageOverview {
+    status: DfsOperatorStatus,
+    conflicts: Vec<DfsConflictRecord>,
+    repairs: Vec<DfsOperatorRepairView>,
+    conflicts_have_more: bool,
+    repairs_have_more: bool,
+}
+
 // ---------------------------------------------------------------------------
 // State (data layer) — SIFS-backed browser snapshot + async load worker.
 // ---------------------------------------------------------------------------
@@ -1057,6 +1077,20 @@ pub struct FilesState {
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
+    history_open: bool,
+    history_revision: u64,
+    history_loading: bool,
+    history_object: Option<DfsOperatorObjectView>,
+    history_error: Option<String>,
+    history_notice: Option<String>,
+    history_decision: Option<HistoryDecision>,
+    pending_history_request_id: Option<u64>,
+    storage_center_open: bool,
+    storage_center_revision: u64,
+    storage_center_loading: bool,
+    storage_overview: Option<FilesStorageOverview>,
+    storage_center_error: Option<String>,
+    pending_storage_center_request_id: Option<u64>,
     document: Option<FilesDocument>,
     document_revision: u64,
     document_close_confirmation: bool,
@@ -1070,6 +1104,7 @@ pub struct FilesState {
     picker_error: Option<String>,
     external_file_hovered: bool,
     action_prompt: Option<FileActionPrompt>,
+    action_prompt_revision: u64,
     marked_entries: BTreeSet<usize>,
     sort_mode: FileSortMode,
     tasks: Vec<FilesTask>,
@@ -1101,6 +1136,7 @@ pub struct FilesState {
     pending_attachment_source_path: Option<(FilesSourceKind, String)>,
     pending_import_request_ids: BTreeSet<u64>,
     placement_draft: Option<PlacementEditorDraft>,
+    placement_advanced_open: bool,
     placement_edit_revision: u64,
     placement_preview_revision: Option<u64>,
     pending_placement_preview_revision: Option<u64>,
@@ -1229,7 +1265,9 @@ enum FilesDialogStructure {
         target_path: Option<String>,
         targets: Vec<FileActionTarget>,
         error: Option<String>,
+        action_prompt_revision: u64,
         placement_edit_revision: u64,
+        placement_advanced_open: bool,
         placement_preview_revision: Option<u64>,
         placement_preview: Option<SifsPlacementPreview>,
         placement_reconciliation: Option<SifsPlacementReconciliationJob>,
@@ -1250,6 +1288,14 @@ enum FilesDialogStructure {
     },
     PlacementActivity {
         theme: (AppThemeMode, AppTextScale),
+    },
+    History {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
+    },
+    StorageCenter {
+        theme: (AppThemeMode, AppTextScale),
+        revision: u64,
     },
 }
 
@@ -1431,13 +1477,25 @@ impl FilesStructureKey {
                 target_path: prompt.target_path.clone(),
                 targets: prompt.targets.clone(),
                 error: prompt.error.clone(),
+                action_prompt_revision: state.action_prompt_revision,
                 placement_edit_revision: state.placement_edit_revision,
+                placement_advanced_open: state.placement_advanced_open,
                 placement_preview_revision: state.placement_preview_revision,
                 placement_preview: state.placement_preview.clone(),
                 placement_reconciliation: state.placement_reconciliation.clone(),
                 placement_loading: state.placement_loading,
                 placement_applying: state.placement_applying,
                 placement_error: state.placement_error.clone(),
+            }
+        } else if state.history_open {
+            FilesDialogStructure::History {
+                theme,
+                revision: state.history_revision,
+            }
+        } else if state.storage_center_open {
+            FilesDialogStructure::StorageCenter {
+                theme,
+                revision: state.storage_center_revision,
             }
         } else if state.placement_activity_open {
             FilesDialogStructure::PlacementActivity { theme }
@@ -1504,6 +1562,20 @@ impl FilesState {
             selected_preview: None,
             preview_loading: false,
             preview_error: None,
+            history_open: false,
+            history_revision: 0,
+            history_loading: false,
+            history_object: None,
+            history_error: None,
+            history_notice: None,
+            history_decision: None,
+            pending_history_request_id: None,
+            storage_center_open: false,
+            storage_center_revision: 0,
+            storage_center_loading: false,
+            storage_overview: None,
+            storage_center_error: None,
+            pending_storage_center_request_id: None,
             document: None,
             document_revision: 0,
             document_close_confirmation: false,
@@ -1517,6 +1589,7 @@ impl FilesState {
             picker_error: None,
             external_file_hovered: false,
             action_prompt: None,
+            action_prompt_revision: 0,
             marked_entries: BTreeSet::new(),
             sort_mode: FileSortMode::default(),
             tasks: Vec::new(),
@@ -1548,6 +1621,7 @@ impl FilesState {
             pending_attachment_source_path: None,
             pending_import_request_ids: BTreeSet::new(),
             placement_draft: None,
+            placement_advanced_open: false,
             placement_edit_revision: 0,
             placement_preview_revision: None,
             pending_placement_preview_revision: None,
@@ -1958,7 +2032,22 @@ impl FilesState {
         self.pending_attachment_request_id = None;
         self.pending_attachment_source_path = None;
         self.pending_import_request_ids.clear();
+        self.history_open = false;
+        self.history_loading = false;
+        self.history_object = None;
+        self.history_error = None;
+        self.history_notice = None;
+        self.history_decision = None;
+        self.pending_history_request_id = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+        self.storage_center_open = false;
+        self.storage_center_loading = false;
+        self.storage_overview = None;
+        self.storage_center_error = None;
+        self.pending_storage_center_request_id = None;
+        self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
         self.placement_draft = None;
+        self.placement_advanced_open = false;
         self.placement_preview_revision = None;
         self.pending_placement_preview_revision = None;
         self.placement_preview = None;
@@ -2123,6 +2212,24 @@ impl FilesState {
                             "The Files background worker stopped while reading the attachment."
                                 .to_string(),
                         );
+                        changed = true;
+                    }
+                    if self.pending_history_request_id.take().is_some() {
+                        self.history_loading = false;
+                        self.history_error = Some(
+                            "The Files background worker stopped while reading file history."
+                                .to_string(),
+                        );
+                        self.history_revision = self.history_revision.wrapping_add(1);
+                        changed = true;
+                    }
+                    if self.pending_storage_center_request_id.take().is_some() {
+                        self.storage_center_loading = false;
+                        self.storage_center_error = Some(
+                            "The Files background worker stopped while reading storage health."
+                                .to_string(),
+                        );
+                        self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
                         changed = true;
                     }
                     if self.pending_placement_request_id.take().is_some() {
@@ -2514,6 +2621,86 @@ impl FilesState {
             } => self.update_task_progress(request_id, detail, progress),
             FilesWorkerResult::Operation { request_id, result } => {
                 self.apply_operation_result(request_id, result)
+            }
+            FilesWorkerResult::History {
+                request_id,
+                path,
+                result,
+            } => {
+                if self.pending_history_request_id != Some(request_id) || !self.history_open {
+                    return false;
+                }
+                self.pending_history_request_id = None;
+                self.history_loading = false;
+                match result {
+                    Ok(Some(object)) if object.object.path == path => {
+                        self.history_object = Some(object);
+                        self.history_error = None;
+                    }
+                    Ok(Some(_)) => {
+                        self.history_object = None;
+                        self.history_error = Some(
+                            "The object at this path changed while its history was loading. Refresh and try again."
+                                .to_string(),
+                        );
+                    }
+                    Ok(None) => {
+                        self.history_object = None;
+                        self.history_error = Some(
+                            "No authoritative DFS history was found for this path.".to_string(),
+                        );
+                    }
+                    Err(error) => {
+                        self.history_object = None;
+                        self.history_error = Some(error);
+                    }
+                }
+                self.history_revision = self.history_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::HistoryAction { request_id, result } => {
+                if self.pending_history_request_id != Some(request_id) || !self.history_open {
+                    return false;
+                }
+                self.pending_history_request_id = None;
+                self.history_loading = false;
+                match result {
+                    Ok((object, notice)) => {
+                        self.history_object = Some(object);
+                        self.history_notice = Some(notice);
+                        self.history_error = None;
+                        self.pending_select_path = self
+                            .history_object
+                            .as_ref()
+                            .map(|object| object.object.path.clone());
+                        self.refresh(None);
+                    }
+                    Err(error) => {
+                        self.history_error = Some(error);
+                    }
+                }
+                self.history_revision = self.history_revision.wrapping_add(1);
+                true
+            }
+            FilesWorkerResult::StorageOverview { request_id, result } => {
+                if self.pending_storage_center_request_id != Some(request_id)
+                    || !self.storage_center_open
+                {
+                    return false;
+                }
+                self.pending_storage_center_request_id = None;
+                self.storage_center_loading = false;
+                match result {
+                    Ok(overview) => {
+                        self.storage_overview = Some(overview);
+                        self.storage_center_error = None;
+                    }
+                    Err(error) => {
+                        self.storage_center_error = Some(error);
+                    }
+                }
+                self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
+                true
             }
             FilesWorkerResult::PlacementPreview {
                 request_id,
@@ -3086,6 +3273,13 @@ impl FilesState {
         self.preview_loading = false;
         self.preview_error = None;
         self.pending_preview_request_id = None;
+        if !self.history_open {
+            self.history_object = None;
+            self.history_error = None;
+            self.history_notice = None;
+            self.history_decision = None;
+            self.pending_history_request_id = None;
+        }
     }
 
     fn selected_entry(&self) -> Option<&SifsEntry> {
@@ -3535,6 +3729,9 @@ impl FilesState {
                 NativePickerKind::OneFolder,
                 "Import a folder into this folder",
             ),
+            FilesPickerAction::ChooseDestination => {
+                (NativePickerKind::OneFolder, "Choose a destination folder")
+            }
         };
         self.picker_error = None;
         match self
@@ -3554,7 +3751,11 @@ impl FilesState {
         if result.context_generation != self.picker_context_generation
             && matches!(
                 action,
-                Some(FilesPickerAction::ImportFiles | FilesPickerAction::ImportFolder)
+                Some(
+                    FilesPickerAction::ImportFiles
+                        | FilesPickerAction::ImportFolder
+                        | FilesPickerAction::ChooseDestination
+                )
             )
         {
             self.picker_error = Some(
@@ -3591,11 +3792,73 @@ impl FilesState {
                     self.picker_error = Some(error);
                 }
             }
+            (
+                Some(FilesPickerAction::ChooseDestination),
+                NativePickerOutcome::Selected(mut paths),
+            ) => {
+                if let Some(path) = paths.pop() {
+                    self.apply_picked_destination(path);
+                }
+            }
             (None, NativePickerOutcome::Selected(_)) => {
                 self.picker_error = Some("The picker result no longer has an owner.".to_string())
             }
         }
         true
+    }
+
+    fn apply_picked_destination(&mut self, folder: PathBuf) {
+        let folder = match normalize_local_path(&folder.to_string_lossy()) {
+            Ok(folder) => folder,
+            Err(error) => {
+                self.picker_error = Some(error);
+                return;
+            }
+        };
+        let Some(prompt) = self.action_prompt.as_mut() else {
+            self.picker_error = Some("The destination dialog is no longer open.".to_string());
+            return;
+        };
+        let destination = match prompt.kind {
+            FileActionPromptKind::Copy
+            | FileActionPromptKind::Move
+            | FileActionPromptKind::CopyToLocal => {
+                join_local_child(&folder, &prompt.target_name).unwrap_or(folder)
+            }
+            FileActionPromptKind::CopySelected
+            | FileActionPromptKind::MoveSelected
+            | FileActionPromptKind::TransferSelected => folder,
+            _ => {
+                self.picker_error =
+                    Some("This action does not accept a local destination folder.".to_string());
+                return;
+            }
+        };
+        prompt.input = destination;
+        prompt.error = None;
+        self.picker_error = None;
+        self.action_prompt_revision = self.action_prompt_revision.wrapping_add(1);
+    }
+
+    fn choose_sifs_destination(&mut self, folder: &str) {
+        let Some(prompt) = self.action_prompt.as_mut() else {
+            return;
+        };
+        let destination = match prompt.kind {
+            FileActionPromptKind::Copy
+            | FileActionPromptKind::Move
+            | FileActionPromptKind::CopyToSifs => {
+                join_sifs_child(folder, &prompt.target_name).unwrap_or_else(|_| folder.to_string())
+            }
+            FileActionPromptKind::CopySelected
+            | FileActionPromptKind::MoveSelected
+            | FileActionPromptKind::TransferSelected => folder.to_string(),
+            _ => return,
+        };
+        prompt.input = destination;
+        prompt.error = None;
+        self.picker_error = None;
+        self.action_prompt_revision = self.action_prompt_revision.wrapping_add(1);
     }
 
     fn open_picked_local_file(&mut self, path: PathBuf) {
@@ -3800,6 +4063,7 @@ impl FilesState {
         };
         if kind == FileActionPromptKind::Placement {
             self.placement_draft = placement_draft;
+            self.placement_advanced_open = false;
             self.placement_edit_revision = self.placement_edit_revision.wrapping_add(1);
             self.placement_preview_revision = None;
             self.pending_placement_preview_revision = None;
@@ -3828,6 +4092,7 @@ impl FilesState {
             targets,
             error,
         });
+        self.action_prompt_revision = self.action_prompt_revision.wrapping_add(1);
         if let Some(job_id) = continuing_reconciliation_job
             && self.pending_placement_request_id.is_none()
         {
@@ -3842,6 +4107,7 @@ impl FilesState {
         let reconciliation_in_flight = self.placement_reconciliation_in_flight();
         self.action_prompt = None;
         self.placement_draft = None;
+        self.placement_advanced_open = false;
         self.placement_preview_revision = None;
         self.pending_placement_preview_revision = None;
         if !reconciliation_in_flight {
@@ -3888,6 +4154,255 @@ impl FilesState {
         self.placement_activity_in_flight_generation
             .store(0, Ordering::Release);
         self.placement_activity_refresh_dirty = false;
+    }
+
+    fn selected_operator_identity(&self) -> Result<(DfsFileSystemId, DfsObjectId, String), String> {
+        if self.source != FilesSourceKind::Sifs {
+            return Err("History and DFS issues are available for Sinomo files.".to_string());
+        }
+        let entry = self
+            .selected_entry()
+            .ok_or_else(|| "Select a file or folder first.".to_string())?;
+        let details = self
+            .selected_details
+            .as_ref()
+            .filter(|details| details.path == entry.path)
+            .ok_or_else(|| {
+                if self.details_loading {
+                    "File details are still loading. Try again in a moment.".to_string()
+                } else {
+                    "Refresh this item's details before opening history.".to_string()
+                }
+            })?;
+        let file_system_id = DfsFileSystemId::new(details.file_system_id.clone())
+            .map_err(|error| format!("The file-system identity is invalid: {error}"))?;
+        let object_id = DfsObjectId::new(details.object_id.clone())
+            .map_err(|error| format!("The object identity is invalid: {error}"))?;
+        Ok((file_system_id, object_id, details.path.clone()))
+    }
+
+    fn open_history(&mut self, waker: Option<sui::UiHandle>) {
+        self.history_open = true;
+        self.compact_overlay = None;
+        self.action_prompt = None;
+        self.history_notice = None;
+        self.history_decision = None;
+        self.request_history(waker);
+    }
+
+    fn request_history(&mut self, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        self.history_error = None;
+        let (file_system_id, _object_id, path) = match self.selected_operator_identity() {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.history_loading = false;
+                self.history_error = Some(error);
+                self.history_revision = self.history_revision.wrapping_add(1);
+                return;
+            }
+        };
+        let Some(tx) = self.worker_tx.clone() else {
+            self.history_loading = false;
+            self.history_error = Some("The Files background worker is not available.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_history_request_id = Some(request_id);
+        self.history_loading = true;
+        self.history_revision = self.history_revision.wrapping_add(1);
+        if tx
+            .send(FilesWorkerCommand::History {
+                request_id,
+                file_system_id,
+                path,
+            })
+            .is_err()
+        {
+            self.pending_history_request_id = None;
+            self.history_loading = false;
+            self.history_error =
+                Some("The Files background worker stopped before reading history.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+        }
+    }
+
+    fn close_history(&mut self) {
+        self.history_open = false;
+        self.pending_history_request_id = None;
+        self.history_loading = false;
+        self.history_decision = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    fn open_storage_center(&mut self, waker: Option<sui::UiHandle>) {
+        self.history_open = false;
+        self.compact_overlay = None;
+        self.action_prompt = None;
+        self.storage_center_open = true;
+        self.request_storage_overview(waker);
+    }
+
+    fn request_storage_overview(&mut self, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(tx) = self.worker_tx.clone() else {
+            self.storage_center_loading = false;
+            self.storage_center_error =
+                Some("Storage health requires a daemon connection.".to_string());
+            self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        self.pending_storage_center_request_id = Some(request_id);
+        self.storage_center_loading = true;
+        self.storage_center_error = None;
+        self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
+        if tx
+            .send(FilesWorkerCommand::StorageOverview { request_id })
+            .is_err()
+        {
+            self.pending_storage_center_request_id = None;
+            self.storage_center_loading = false;
+            self.storage_center_error = Some(
+                "The Files background worker stopped before reading storage health.".to_string(),
+            );
+            self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
+        }
+    }
+
+    fn close_storage_center(&mut self) {
+        self.storage_center_open = false;
+        self.storage_center_loading = false;
+        self.pending_storage_center_request_id = None;
+        self.storage_center_revision = self.storage_center_revision.wrapping_add(1);
+    }
+
+    fn reveal_storage_issue_path(&mut self, path: String, waker: Option<sui::UiHandle>) {
+        self.close_storage_center();
+        let path = normalize_path(&path);
+        let parent = parent_path(&path).unwrap_or_else(|| "/".to_string());
+        self.pending_select_path = Some(path);
+        self.open_location(FilesSourceKind::Sifs, parent, waker);
+    }
+
+    fn stage_history_decision(&mut self, decision: HistoryDecision) {
+        if self.history_loading {
+            return;
+        }
+        self.history_decision = Some(decision);
+        self.history_error = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    fn cancel_history_decision(&mut self) {
+        self.history_decision = None;
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+
+    fn confirm_history_decision(&mut self, waker: Option<sui::UiHandle>) {
+        let Some(decision) = self.history_decision.take() else {
+            return;
+        };
+        match decision {
+            HistoryDecision::KeepCurrent => self.resolve_history_conflicts(waker),
+            HistoryDecision::UseVersion(version) => self.use_history_version(version, waker),
+        }
+    }
+
+    fn resolve_history_conflicts(&mut self, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(object) = self.history_object.as_ref() else {
+            return;
+        };
+        let conflict_ids = object
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
+            .map(|conflict| conflict.conflict_id.clone())
+            .collect::<Vec<_>>();
+        if conflict_ids.is_empty() {
+            self.history_notice = Some("No open conflicts remain for this item.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        }
+        let object_id = object.object.object_id.clone();
+        self.send_history_action(
+            FilesWorkerCommand::ResolveHistoryConflicts {
+                request_id: 0,
+                object_id,
+                conflict_ids,
+            },
+            "Keeping the current version...",
+        );
+    }
+
+    fn use_history_version(&mut self, version: DfsVersion, waker: Option<sui::UiHandle>) {
+        if let Some(waker) = waker {
+            self.ensure_worker(waker);
+        }
+        let Some(object) = self.history_object.as_ref() else {
+            return;
+        };
+        let conflict_ids = object
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
+            .map(|conflict| conflict.conflict_id.clone())
+            .collect::<Vec<_>>();
+        if conflict_ids.is_empty() {
+            self.history_error = Some(
+                "Restoring an ordinary older version is not yet supported by the daemon; version choices are available while resolving a conflict."
+                    .to_string(),
+            );
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        }
+        let object_id = object.object.object_id.clone();
+        self.send_history_action(
+            FilesWorkerCommand::UseHistoryVersion {
+                request_id: 0,
+                object_id,
+                version,
+                conflict_ids,
+            },
+            "Switching to the selected version...",
+        );
+    }
+
+    fn send_history_action(&mut self, mut command: FilesWorkerCommand, notice: &str) {
+        let Some(tx) = self.worker_tx.clone() else {
+            self.history_error = Some("The Files background worker is not available.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+            return;
+        };
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        match &mut command {
+            FilesWorkerCommand::ResolveHistoryConflicts { request_id: id, .. }
+            | FilesWorkerCommand::UseHistoryVersion { request_id: id, .. } => *id = request_id,
+            _ => unreachable!("history action command"),
+        }
+        self.pending_history_request_id = Some(request_id);
+        self.history_loading = true;
+        self.history_error = None;
+        self.history_notice = Some(notice.to_string());
+        self.history_revision = self.history_revision.wrapping_add(1);
+        if tx.send(command).is_err() {
+            self.pending_history_request_id = None;
+            self.history_loading = false;
+            self.history_error =
+                Some("The Files background worker stopped before applying the choice.".to_string());
+            self.history_revision = self.history_revision.wrapping_add(1);
+        }
     }
 
     fn set_placement_activity_filter(&mut self, filter: PlacementActivityFilter) -> bool {
@@ -4119,6 +4634,37 @@ impl FilesState {
         })
     }
 
+    fn set_placement_goal(&mut self, goal: usize) -> bool {
+        if self
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .is_some_and(|draft| !draft.consistency.is_editable())
+        {
+            return false;
+        }
+        self.mutate_placement_draft(|draft| {
+            let Some(policy) = draft.active_policy_mut() else {
+                return;
+            };
+            match goal {
+                0 => policy.inherit = true,
+                2 => {
+                    policy.inherit = false;
+                    policy.consistency = PlacementEditorConsistency::Confirmed;
+                }
+                _ => {
+                    policy.inherit = false;
+                    policy.consistency = PlacementEditorConsistency::Eventual;
+                }
+            }
+        })
+    }
+
+    fn toggle_placement_advanced(&mut self) {
+        self.placement_advanced_open = !self.placement_advanced_open;
+    }
+
     fn set_placement_min_commit_replicas(&mut self, replicas: usize) -> bool {
         self.mutate_placement_policy(|policy| {
             policy.inherit = false;
@@ -4168,6 +4714,7 @@ impl FilesState {
         self.mutate_placement_draft(|draft| draft.scope = scope)
     }
 
+    #[cfg(test)]
     fn set_placement_inherit(&mut self, inherit: bool) -> bool {
         self.mutate_placement_draft(|draft| {
             if let Some(policy) = draft.active_policy_mut() {
@@ -4907,7 +5454,7 @@ impl FilesState {
                 target: None,
                 directory: entry.is_dir,
             },
-            "Repair replicas".to_string(),
+            "DFS maintenance".to_string(),
             entry.path,
             waker,
         );
@@ -4925,7 +5472,7 @@ impl FilesState {
                 target: None,
                 directory: true,
             },
-            "Repair replicas".to_string(),
+            "DFS maintenance".to_string(),
             path,
             waker,
         );
@@ -5363,6 +5910,19 @@ enum FilesWorkerResult {
         append: bool,
         result: Result<sinomo_runtime::dfs::DfsPlacementReconciliationActivityPage, String>,
     },
+    History {
+        request_id: u64,
+        path: String,
+        result: Result<Option<DfsOperatorObjectView>, String>,
+    },
+    HistoryAction {
+        request_id: u64,
+        result: Result<(DfsOperatorObjectView, String), String>,
+    },
+    StorageOverview {
+        request_id: u64,
+        result: Result<FilesStorageOverview, String>,
+    },
 }
 
 enum FilesLiveUpdate {
@@ -5446,6 +6006,25 @@ enum FilesWorkerCommand {
         filter: PlacementActivityFilter,
         cursor: Option<sinomo_runtime::dfs::DfsPlacementReconciliationActivityCursor>,
         append: bool,
+    },
+    History {
+        request_id: u64,
+        file_system_id: DfsFileSystemId,
+        path: String,
+    },
+    ResolveHistoryConflicts {
+        request_id: u64,
+        object_id: DfsObjectId,
+        conflict_ids: Vec<String>,
+    },
+    UseHistoryVersion {
+        request_id: u64,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        conflict_ids: Vec<String>,
+    },
+    StorageOverview {
+        request_id: u64,
     },
 }
 
@@ -5575,6 +6154,8 @@ fn files_worker_loop(
     waker: sui::UiHandle,
 ) {
     let mut browser: Option<SifsBrowser> = None;
+    let mut operator: Option<DfsOperatorClient> = None;
+    let mut operator_open_error: Option<String> = None;
     let mut open_error: Option<String> = daemon_address.is_none().then(|| {
         daemon_unavailable_detail
             .clone()
@@ -6014,6 +6595,124 @@ fn files_worker_loop(
                     result,
                 });
             }
+            FilesWorkerCommand::History {
+                request_id,
+                file_system_id,
+                path,
+            } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => operator.object_by_path(file_system_id, path.clone()),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::History {
+                    request_id,
+                    path,
+                    result,
+                });
+            }
+            FilesWorkerCommand::ResolveHistoryConflicts {
+                request_id,
+                object_id,
+                conflict_ids,
+            } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => (|| {
+                        let report = operator.resolve_conflicts(
+                            None,
+                            Some(object_id.clone()),
+                            conflict_ids,
+                        )?;
+                        let object = operator.object(object_id)?.ok_or_else(|| {
+                            "The object disappeared after conflict resolution.".to_string()
+                        })?;
+                        Ok((
+                            object,
+                            format!(
+                                "Kept the current version and resolved {} conflict record(s).",
+                                report.removed.len()
+                            ),
+                        ))
+                    })(),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
+            }
+            FilesWorkerCommand::UseHistoryVersion {
+                request_id,
+                object_id,
+                version,
+                conflict_ids,
+            } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => (|| {
+                        let selected = version.clone();
+                        let report = operator.use_conflict_version(
+                            object_id.clone(),
+                            version,
+                            conflict_ids,
+                        )?;
+                        let object = operator.object(object_id)?.ok_or_else(|| {
+                            "The object disappeared after selecting the version.".to_string()
+                        })?;
+                        Ok((
+                            object,
+                            format!(
+                                "Made version {} current and resolved {} conflict record(s).",
+                                short(selected.as_str(), 18),
+                                report.removed.len()
+                            ),
+                        ))
+                    })(),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS history service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::HistoryAction { request_id, result });
+            }
+            FilesWorkerCommand::StorageOverview { request_id } => {
+                ensure_files_worker_operator(
+                    &mut operator,
+                    &mut operator_open_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                let result = match (&operator, &operator_open_error) {
+                    (Some(operator), _) => (|| {
+                        let status = operator.status()?;
+                        let conflicts = operator.conflicts_page(None, None, 100, None)?;
+                        let repairs = operator.repair_page(None, None, 100, None)?;
+                        Ok(FilesStorageOverview {
+                            status,
+                            conflicts_have_more: conflicts.next_cursor.is_some(),
+                            repairs_have_more: repairs.next_cursor.is_some(),
+                            conflicts: conflicts.conflicts,
+                            repairs: repairs.repairs,
+                        })
+                    })(),
+                    (None, Some(error)) => Err(error.clone()),
+                    (None, None) => Err("DFS storage health service did not start".to_string()),
+                };
+                let _ = result_tx.send(FilesWorkerResult::StorageOverview { request_id, result });
+            }
             FilesWorkerCommand::PlacementPreview {
                 request_id,
                 path,
@@ -6257,6 +6956,27 @@ fn ensure_files_worker_browser(
             Err(error) => *open_error = Some(error),
         },
         None => *open_error = Some("SIFS browsing requires a daemon connection".to_string()),
+    }
+}
+
+fn ensure_files_worker_operator(
+    operator: &mut Option<DfsOperatorClient>,
+    open_error: &mut Option<String>,
+    daemon_address: Option<&str>,
+    app_runtime: &tokio::runtime::Handle,
+) {
+    if operator.is_some() {
+        return;
+    }
+    // Operator reads may recover after a transient daemon or route failure. Each explicit retry
+    // gets a fresh bounded handshake; mutations themselves are never retried.
+    *open_error = None;
+    match daemon_address {
+        Some(address) => match DfsOperatorClient::open_daemon_on_runtime(address, app_runtime) {
+            Ok(opened) => *operator = Some(opened),
+            Err(error) => *open_error = Some(error),
+        },
+        None => *open_error = Some("DFS history requires a daemon connection".to_string()),
     }
 }
 
@@ -7313,7 +8033,7 @@ fn execute_sifs_operation(
             Ok(FilesOperationOutcome {
                 refresh_path: current_path.to_string(),
                 select_path: Some(operation.path.clone()),
-                message: format!("requested replica repair for {}", operation.path),
+                message: format!("requested DFS maintenance and refreshed {}", operation.path),
             })
         }
         FilesOperationKind::MakeMetadataPrimary => {
@@ -8576,7 +9296,7 @@ fn operation_progress_label(
             format!("{phase} placement refresh in {scope}: {}", operation.path)
         }
         FilesOperationKind::RepairReplicas => {
-            format!("{phase} replica repair in {scope}: {}", operation.path)
+            format!("{phase} DFS maintenance in {scope}: {}", operation.path)
         }
         FilesOperationKind::MakeMetadataPrimary => {
             format!(
@@ -8756,7 +9476,7 @@ fn sifs_metadata_error_next_step(error: &str) -> String {
             "Retry metadata, then inspect Cluster health if it stalls".to_string()
         }
         "SIFS browser stopped unexpectedly." => "Retry the SIFS metadata request".to_string(),
-        _ => "Show details, then refresh placement".to_string(),
+        _ => "Open Advanced details, then refresh availability".to_string(),
     }
 }
 
@@ -8936,9 +9656,9 @@ fn file_row_placement_badge(entry: &SifsEntry, files: &FilesState) -> FileRowPla
 
     FileRowPlacementBadge {
         label: if files.clustered {
-            "on mesh".to_string()
+            "unknown".to_string()
         } else {
-            "this node".to_string()
+            "local".to_string()
         },
         tone: if files.clustered {
             SemanticTone::Info
@@ -9412,7 +10132,7 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
                 return "resolve SIFS conflicts before changing placement".to_string();
             }
             if sifs_repair_backlog_count(health) > 0 {
-                return "repair replicas, then refresh placement".to_string();
+                return "run maintenance, then refresh availability".to_string();
             }
             if sifs_agent_state_is_current(&health.agent_state)
                 && details.current_locations.len() > 1
@@ -9422,7 +10142,7 @@ fn sifs_placement_next_step(details: Option<&SifsObjectDetails>, clustered: bool
         }
         return match details.current_locations.len() {
             0 => "refresh metadata; no durable replica receipt is recorded yet".to_string(),
-            1 => "keep peers online and refresh after replica repair settles".to_string(),
+            1 => "keep peers online and refresh after maintenance settles".to_string(),
             _ => {
                 "replica locations are visible; use details for object and version ids".to_string()
             }
@@ -9510,11 +10230,12 @@ fn sifs_details_signature(details: Option<&SifsObjectDetails>) -> String {
 
 fn unselected_inspector_title(source: FilesSourceKind) -> &'static str {
     match source {
-        FilesSourceKind::Sifs => "Current SIFS location",
-        FilesSourceKind::Local => "Current folder",
+        FilesSourceKind::Sifs => "This Sinomo folder",
+        FilesSourceKind::Local => "This device folder",
     }
 }
 
+#[cfg(test)]
 fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> &'static str {
     if entries_empty {
         return "No entries in this directory";
@@ -9525,6 +10246,7 @@ fn unselected_inspector_status(source: FilesSourceKind, entries_empty: bool) -> 
     }
 }
 
+#[cfg(test)]
 fn unselected_inspector_scope(files: &FilesState) -> String {
     match files.source {
         FilesSourceKind::Sifs => {
@@ -9538,6 +10260,7 @@ fn unselected_inspector_scope(files: &FilesState) -> String {
     }
 }
 
+#[cfg(test)]
 fn unselected_inspector_management(files: &FilesState) -> String {
     match files.source {
         FilesSourceKind::Sifs => {
@@ -9568,6 +10291,7 @@ fn unselected_inspector_management(files: &FilesState) -> String {
     }
 }
 
+#[cfg(test)]
 fn unselected_inspector_health_summary(files: &FilesState) -> Option<String> {
     if files.source != FilesSourceKind::Sifs {
         return None;
@@ -9594,6 +10318,7 @@ fn unselected_inspector_health_detail(files: &FilesState) -> Option<String> {
     Some("DFS health not loaded".to_string())
 }
 
+#[cfg(test)]
 fn unselected_inspector_rows(files: &FilesState) -> Vec<(&'static str, String)> {
     let mut rows = vec![
         ("Path", files.path.clone()),
@@ -10353,6 +11078,151 @@ fn compact_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> 
         .with_item(inspector, FlexItem::new().no_shrink())
 }
 
+fn files_action_bar_content(
+    shared: &Shared,
+    reader: &ThemeReader,
+    contextual_selection: bool,
+) -> WidgetPod {
+    let (marked_count, selected_entry, source) = {
+        let files = shared.files();
+        (
+            files.marked_count(),
+            files.selected_entry().cloned(),
+            files.source,
+        )
+    };
+
+    let controls = if contextual_selection && (marked_count > 0 || selected_entry.is_some()) {
+        let mut row = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
+        if marked_count == 0 {
+            let entry = selected_entry.as_ref().expect("selected entry");
+            row = row.with_child(file_action_button(
+                shared,
+                reader,
+                FileContextAction::Open,
+                if entry.is_dir { "Open folder" } else { "Open" },
+                if entry.is_dir {
+                    IconGlyph::Folder
+                } else {
+                    IconGlyph::FileText
+                },
+                ButtonAppearance::Tonal,
+            ));
+        }
+
+        let transfer_action = if marked_count > 0 {
+            FileContextAction::TransferSelected
+        } else {
+            FileContextAction::Transfer
+        };
+        let transfer_label = match source {
+            FilesSourceKind::Sifs => "Download",
+            FilesSourceKind::Local => "Copy to Sinomo",
+        };
+        row = row.with_child(file_action_button(
+            shared,
+            reader,
+            transfer_action,
+            transfer_label,
+            if source == FilesSourceKind::Sifs {
+                IconGlyph::Download
+            } else {
+                IconGlyph::Storage
+            },
+            ButtonAppearance::Ghost,
+        ));
+
+        let trigger = sui::Button::new("Actions")
+            .icon(IconGlyph::MoreHorizontal)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Ghost)
+            .theme_when(clone_reader(reader));
+        row = row.with_child(files_primary_menu(
+            "visible-selection-actions",
+            shared,
+            reader,
+            FileContextMenuTarget::Selection,
+            trigger,
+        ));
+        row
+    } else {
+        let new = files_primary_menu(
+            "visible-create-menu",
+            shared,
+            reader,
+            FileContextMenuTarget::Create,
+            sui::Button::new("New")
+                .icon(IconGlyph::Add)
+                .min_height(32.0)
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader)),
+        );
+        let import = files_primary_menu(
+            "visible-import-menu",
+            shared,
+            reader,
+            FileContextMenuTarget::Import,
+            sui::Button::new("Import")
+                .icon(IconGlyph::Download)
+                .min_height(32.0)
+                .appearance(ButtonAppearance::Ghost)
+                .theme_when(clone_reader(reader)),
+        );
+        let more = files_primary_menu(
+            "visible-location-actions",
+            shared,
+            reader,
+            FileContextMenuTarget::LocationMore,
+            IconButton::new(IconGlyph::MoreHorizontal, "More folder actions")
+                .size(32.0)
+                .theme_when(clone_reader(reader)),
+        );
+        Flex::horizontal()
+            .gap(6.0)
+            .align_items(Alignment::Center)
+            .with_child(new)
+            .with_child(import)
+            .with_child(more)
+    };
+
+    WidgetPod::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .with_child(
+                SizedBox::new().height(FILE_ACTION_BAR_H - 1.0).with_child(
+                    WidgetPadding::horizontal(
+                        10.0,
+                        Flex::horizontal()
+                            .align_items(Alignment::Center)
+                            .with_item(controls, FlexItem::new().no_shrink()),
+                    )
+                    .fill_child_width()
+                    .fill_child_height(),
+                ),
+            )
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader))),
+    )
+}
+
+fn files_action_bar(
+    shared: &Shared,
+    reader: &ThemeReader,
+    contextual_selection: bool,
+) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files visible action bar", |key| {
+            (key.header.clone(), key.list.entries_total_count)
+        });
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_key| {
+        files_action_bar_content(&s, &r, contextual_selection)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // File listing — rebuilt on navigation by `RebuildOnChange`.
 // ---------------------------------------------------------------------------
@@ -10522,6 +11392,10 @@ fn files_list_body_rebuild(
 enum FileContextMenuTarget {
     Selection,
     CurrentLocation,
+    Create,
+    Import,
+    LocationMore,
+    Availability,
 }
 
 struct FileListContextTarget {
@@ -10694,6 +11568,53 @@ where
     )
 }
 
+fn files_primary_menu<W>(
+    name: &'static str,
+    shared: &Shared,
+    reader: &ThemeReader,
+    target: FileContextMenuTarget,
+    trigger: W,
+) -> ContextMenu
+where
+    W: Widget + 'static,
+{
+    file_context_menu(
+        name,
+        shared,
+        reader,
+        Rc::new(Cell::new(target)),
+        PointerButton::Primary,
+        false,
+        trigger,
+    )
+}
+
+fn file_action_button(
+    shared: &Shared,
+    reader: &ThemeReader,
+    action: FileContextAction,
+    label: impl Into<String>,
+    icon: IconGlyph,
+    appearance: ButtonAppearance,
+) -> sui::Button {
+    let enabled = action.enabled(&shared.files());
+    let action_shared = shared.clone();
+    sui::Button::new(label)
+        .icon(icon)
+        .min_height(32.0)
+        .appearance(appearance)
+        .tone(if action.destructive() {
+            SemanticTone::Warning
+        } else {
+            SemanticTone::Neutral
+        })
+        .theme_when(clone_reader(reader))
+        .enabled(enabled)
+        .on_press_with_ctx(move |ctx| {
+            activate_file_context_action(&action_shared, action, ctx);
+        })
+}
+
 fn files_list_body_table(
     shared: &Shared,
     reader: &ThemeReader,
@@ -10739,7 +11660,7 @@ fn files_list_body_table(
                     COMPACT_FILE_NAME_MIN_W
                 })
                 .sort_direction(sort_mode.name_sort_direction()),
-            VirtualTableColumn::new("Placement")
+            VirtualTableColumn::new("Availability")
                 .key(3)
                 .width(if show_details {
                     156.0
@@ -10925,7 +11846,11 @@ fn paint_file_table_row(
         let placement = file_row_placement_badge(entry, &files);
         // The compact badge has a fixed maximum width. Keep the full local-placement label
         // visible by yielding its redundant storage icon instead of truncating "this device".
-        let placement_icon = (placement.label.as_str() != "this device").then_some(placement.icon);
+        let placement_icon = (!matches!(
+            placement.label.as_str(),
+            "this device" | "unknown" | "local"
+        ))
+        .then_some(placement.icon);
         paint_placement_badge_with(
             ctx,
             &theme,
@@ -11066,6 +11991,7 @@ fn sifs_health_error_status_detail(error: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn sifs_health_status_summary(health: &SifsHealthSummary) -> String {
     if sifs_health_has_attention(health) {
         return "Needs attention".to_string();
@@ -11076,6 +12002,7 @@ fn sifs_health_status_summary(health: &SifsHealthSummary) -> String {
     "Healthy".to_string()
 }
 
+#[cfg(test)]
 fn sifs_health_error_status_summary(_error: &str) -> String {
     "Health unavailable; open Connection or Cluster".to_string()
 }
@@ -12420,6 +13347,7 @@ enum FileContextAction {
     CopyPath,
     CopyPaths,
     CopyIdentifiers,
+    HistoryIssues,
     Transfer,
     TransferSelected,
     Move,
@@ -12444,6 +13372,7 @@ enum FileContextAction {
     OpenLocalFile,
     OpenLocalFolder,
     RefreshFolder,
+    OpenStorageCenter,
     OpenPlacementActivity,
     RepairCurrentLocation,
     OpenCluster,
@@ -12459,6 +13388,7 @@ impl FileContextAction {
             Self::CopyPath => "Copy path",
             Self::CopyPaths => "Copy paths",
             Self::CopyIdentifiers => "Copy DFS identifiers",
+            Self::HistoryIssues => "History & issues",
             Self::Transfer => match source {
                 FilesSourceKind::Local => "Copy to SIFS",
                 FilesSourceKind::Sifs => "Download",
@@ -12472,14 +13402,14 @@ impl FileContextAction {
             Self::Rename => "Rename",
             Self::Delete => "Delete",
             Self::DeleteSelected => "Delete selected",
-            Self::EditPlacement => "Edit placement",
-            Self::RefreshPlacement => "Refresh placement",
-            Self::RepairReplicas => "Repair replicas",
-            Self::MakeMetadataPrimary => "Make metadata primary",
-            Self::PinMetadata => "Pin metadata",
-            Self::UnpinMetadata => "Unpin metadata",
-            Self::PinContent => "Pin content",
-            Self::UnpinContent => "Unpin content",
+            Self::EditPlacement => "Manage availability",
+            Self::RefreshPlacement => "Refresh availability",
+            Self::RepairReplicas => "Run maintenance and refresh",
+            Self::MakeMetadataPrimary => "Move metadata authority here",
+            Self::PinMetadata => "Keep metadata on this device",
+            Self::UnpinMetadata => "Stop keeping metadata here",
+            Self::PinContent => "Keep content on this device",
+            Self::UnpinContent => "Stop keeping content here",
             Self::ConnectionSettings => "Connection settings",
             Self::NewFile => "New file",
             Self::NewFolder => "New folder",
@@ -12489,8 +13419,9 @@ impl FileContextAction {
             Self::OpenLocalFile => "Open local file",
             Self::OpenLocalFolder => "Choose local folder",
             Self::RefreshFolder => "Refresh current folder",
+            Self::OpenStorageCenter => "Storage health",
             Self::OpenPlacementActivity => "View reconciliation activity",
-            Self::RepairCurrentLocation => "Repair current folder replicas",
+            Self::RepairCurrentLocation => "Run folder maintenance",
             Self::OpenCluster => "Open Cluster",
         }
         .to_string()
@@ -12512,6 +13443,7 @@ impl FileContextAction {
             | Self::ImportFolder => 1,
             Self::CopyPath
             | Self::CopyPaths
+            | Self::HistoryIssues
             | Self::EditPlacement
             | Self::RefreshPlacement
             | Self::RepairReplicas
@@ -12522,6 +13454,7 @@ impl FileContextAction {
             | Self::UnpinContent
             | Self::CopyIdentifiers
             | Self::RefreshFolder
+            | Self::OpenStorageCenter
             | Self::OpenPlacementActivity
             | Self::RepairCurrentLocation
             | Self::OpenCluster
@@ -12562,9 +13495,16 @@ impl FileContextAction {
             | Self::PinContent
             | Self::UnpinContent
             | Self::ConnectionSettings
+            | Self::OpenStorageCenter
             | Self::OpenPlacementActivity
             | Self::RepairCurrentLocation
             | Self::OpenCluster => true,
+            Self::HistoryIssues => {
+                files.source == FilesSourceKind::Sifs
+                    && files.selected_entry().is_some()
+                    && !files.details_loading
+                    && files.selected_details.is_some()
+            }
             Self::Copy | Self::CopySelected | Self::Transfer | Self::TransferSelected => can_read,
         }
     }
@@ -12665,6 +13605,7 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
             actions.push(FileContextAction::EditPlacement);
         }
         actions.push(FileContextAction::RefreshPlacement);
+        actions.push(FileContextAction::HistoryIssues);
         if !metadata_needs_connection && !files.details_loading {
             if let Some(details) = details {
                 if sifs_needs_replica_repair(details) {
@@ -12706,6 +13647,10 @@ fn file_context_menu_entries(
     match target {
         FileContextMenuTarget::Selection => selection_context_menu_entries(files),
         FileContextMenuTarget::CurrentLocation => current_location_context_menu_entries(files),
+        FileContextMenuTarget::Create => create_context_menu_entries(files),
+        FileContextMenuTarget::Import => import_context_menu_entries(files),
+        FileContextMenuTarget::LocationMore => location_more_context_menu_entries(files),
+        FileContextMenuTarget::Availability => availability_context_menu_entries(files),
     }
 }
 
@@ -12800,7 +13745,11 @@ fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntr
             }
         }
 
-        let mut sifs = vec![FileContextMenuEntry::submenu("Placement", placement, false)];
+        let mut sifs = vec![FileContextMenuEntry::submenu(
+            "Availability",
+            placement,
+            false,
+        )];
         if !device.is_empty() {
             sifs.push(FileContextMenuEntry::submenu("This device", device, false));
         }
@@ -12819,6 +13768,7 @@ fn selection_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntr
             ));
         }
         entries.push(FileContextMenuEntry::submenu("SIFS", sifs, false));
+        entries.push(action_entry(FileContextAction::HistoryIssues, files, false));
     }
     entries.push(action_entry(FileContextAction::Delete, files, true));
     entries
@@ -12855,11 +13805,10 @@ fn current_location_context_menu_entries(files: &FilesState) -> Vec<FileContextM
     ];
 
     if files.source == FilesSourceKind::Sifs {
-        let mut sifs = vec![action_entry(
-            FileContextAction::OpenPlacementActivity,
-            files,
-            false,
-        )];
+        let mut sifs = vec![
+            action_entry(FileContextAction::OpenStorageCenter, files, false),
+            action_entry(FileContextAction::OpenPlacementActivity, files, false),
+        ];
         if files
             .sifs_health
             .as_ref()
@@ -12884,6 +13833,148 @@ fn current_location_context_menu_entries(files: &FilesState) -> Vec<FileContextM
             ));
         }
         entries.push(FileContextMenuEntry::submenu("SIFS", sifs, true));
+    }
+    entries
+}
+
+/// Visible toolbar menus deliberately expose a small task vocabulary. The complete combined menu
+/// remains available on the directory background for pointer users, but nobody has to discover a
+/// right click before they can create, import, or troubleshoot a location.
+fn create_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    vec![
+        action_entry(FileContextAction::NewFile, files, false),
+        action_entry(FileContextAction::NewFolder, files, false),
+    ]
+}
+
+fn import_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    vec![
+        action_entry(FileContextAction::ImportFiles, files, false),
+        action_entry(FileContextAction::ImportFolder, files, false),
+    ]
+}
+
+fn location_more_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    let mut entries = vec![
+        action_entry(FileContextAction::GoToPath, files, false),
+        FileContextMenuEntry::submenu(
+            "Open from this device",
+            vec![
+                action_entry(FileContextAction::OpenLocalFile, files, false),
+                action_entry(FileContextAction::OpenLocalFolder, files, false),
+            ],
+            false,
+        ),
+        action_entry(FileContextAction::RefreshFolder, files, true),
+    ];
+
+    if files.source == FilesSourceKind::Sifs {
+        let mut storage = vec![
+            action_entry(FileContextAction::OpenStorageCenter, files, false),
+            action_entry(FileContextAction::OpenPlacementActivity, files, false),
+        ];
+        if files
+            .sifs_health
+            .as_ref()
+            .is_some_and(|health| health.pending_repair_count > 0)
+        {
+            storage.push(action_entry(
+                FileContextAction::RepairCurrentLocation,
+                files,
+                false,
+            ));
+        }
+        storage.push(action_entry(FileContextAction::OpenCluster, files, false));
+        if files.sifs_health_error.is_some() || files.error.is_some() {
+            storage.push(action_entry(
+                FileContextAction::ConnectionSettings,
+                files,
+                true,
+            ));
+        }
+        entries.push(FileContextMenuEntry::submenu(
+            "Storage and activity",
+            storage,
+            true,
+        ));
+    }
+    entries
+}
+
+fn availability_context_menu_entries(files: &FilesState) -> Vec<FileContextMenuEntry> {
+    if files.source != FilesSourceKind::Sifs {
+        return Vec::new();
+    }
+    let Some(entry) = files.selected_entry() else {
+        return Vec::new();
+    };
+    let details = files
+        .selected_details
+        .as_ref()
+        .filter(|details| details.path == entry.path);
+    let metadata_needs_connection = files
+        .details_error
+        .as_deref()
+        .is_some_and(sifs_metadata_error_needs_connection);
+
+    let mut entries = Vec::new();
+    if details.is_some_and(|details| details.placement.is_some()) {
+        entries.push(action_entry(FileContextAction::EditPlacement, files, false));
+    }
+    entries.push(action_entry(
+        FileContextAction::RefreshPlacement,
+        files,
+        false,
+    ));
+    if details.is_some_and(sifs_needs_replica_repair) {
+        entries.push(action_entry(
+            FileContextAction::RepairReplicas,
+            files,
+            false,
+        ));
+    }
+
+    if let Some(details) = details.filter(|_| !metadata_needs_connection) {
+        let mut device = vec![action_entry(
+            if sifs_has_local_pin(details, "metadata") {
+                FileContextAction::UnpinMetadata
+            } else {
+                FileContextAction::PinMetadata
+            },
+            files,
+            false,
+        )];
+        if !entry.is_dir && !entry.is_link {
+            device.push(action_entry(
+                if sifs_has_local_pin(details, "content") {
+                    FileContextAction::UnpinContent
+                } else {
+                    FileContextAction::PinContent
+                },
+                files,
+                false,
+            ));
+        }
+        if sifs_can_make_metadata_primary(details) {
+            device.push(action_entry(
+                FileContextAction::MakeMetadataPrimary,
+                files,
+                false,
+            ));
+        }
+        entries.push(FileContextMenuEntry::submenu("This device", device, true));
+        entries.push(action_entry(
+            FileContextAction::CopyIdentifiers,
+            files,
+            true,
+        ));
+    }
+    if metadata_needs_connection {
+        entries.push(action_entry(
+            FileContextAction::ConnectionSettings,
+            files,
+            true,
+        ));
     }
     entries
 }
@@ -12964,9 +14055,9 @@ fn sifs_unavailable_rows(error: &str, details_open: bool) -> Vec<(&'static str, 
 
 fn inspector_detail_button_label(details_open: bool) -> &'static str {
     if details_open {
-        "Hide details"
+        "Hide advanced"
     } else {
-        "Show details"
+        "Advanced details"
     }
 }
 
@@ -13145,7 +14236,7 @@ fn inspector_details_button(
     let s = shared.clone();
     sui::Button::new(label)
         .semantic_name(label)
-        .description("File storage metadata and diagnostics")
+        .description("Technical file, version, storage, and authority details")
         .icon(if details_open {
             IconGlyph::ChevronUp
         } else {
@@ -13274,6 +14365,10 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
                 ctx.set_clipboard_text(value);
             }
         }
+        FileContextAction::HistoryIssues => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().open_history(waker);
+        }
         FileContextAction::NewFile => shared
             .files_mut()
             .open_action_prompt(FileActionPromptKind::NewFile),
@@ -13306,6 +14401,10 @@ fn activate_file_context_action(shared: &Shared, action: FileContextAction, ctx:
                 .request_native_picker(picker_action, waker);
         }
         FileContextAction::RefreshFolder => shared.files_mut().reload(),
+        FileContextAction::OpenStorageCenter => {
+            let waker = { shared.borrow().waker.clone() };
+            shared.files_mut().open_storage_center(waker);
+        }
         FileContextAction::OpenPlacementActivity => {
             let waker = { shared.borrow().waker.clone() };
             shared.files_mut().open_placement_activity(waker);
@@ -13392,6 +14491,216 @@ fn preview_card(
         body = body.with_child(RichText::from_plain_text(muted, muted_style));
     }
     inspector_card("Preview", body, reader, None, false)
+}
+
+fn selected_item_actions(
+    shared: &Shared,
+    reader: &ThemeReader,
+    entry: &SifsEntry,
+) -> impl Widget + use<> {
+    let source = shared.files().source;
+    let open = file_action_button(
+        shared,
+        reader,
+        FileContextAction::Open,
+        if entry.is_dir { "Open folder" } else { "Open" },
+        if entry.is_dir {
+            IconGlyph::Folder
+        } else {
+            IconGlyph::FileText
+        },
+        ButtonAppearance::Tonal,
+    );
+    let transfer = (!entry.is_dir).then(|| {
+        file_action_button(
+            shared,
+            reader,
+            FileContextAction::Transfer,
+            match source {
+                FilesSourceKind::Sifs => "Download",
+                FilesSourceKind::Local => "Copy to Sinomo",
+            },
+            if source == FilesSourceKind::Sifs {
+                IconGlyph::Download
+            } else {
+                IconGlyph::Storage
+            },
+            ButtonAppearance::Ghost,
+        )
+    });
+    let attach = (!entry.is_dir).then(|| {
+        file_action_button(
+            shared,
+            reader,
+            FileContextAction::AttachToChat,
+            "Attach to chat",
+            IconGlyph::Attach,
+            ButtonAppearance::Ghost,
+        )
+    });
+    let more = files_primary_menu(
+        "inspector-selection-actions",
+        shared,
+        reader,
+        FileContextMenuTarget::Selection,
+        sui::Button::new("More")
+            .icon(IconGlyph::MoreHorizontal)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Ghost)
+            .theme_when(clone_reader(reader)),
+    );
+
+    let mut primary = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center)
+        .with_child(open);
+    if let Some(attach) = attach {
+        primary = primary.with_child(attach);
+    }
+    let mut secondary = Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(6.0)
+        .align_items(Alignment::Center);
+    if let Some(transfer) = transfer {
+        secondary = secondary.with_child(transfer);
+    }
+    if source == FilesSourceKind::Sifs {
+        secondary = secondary.with_child(file_action_button(
+            shared,
+            reader,
+            FileContextAction::HistoryIssues,
+            "History & issues",
+            IconGlyph::History,
+            ButtonAppearance::Ghost,
+        ));
+    }
+    secondary = secondary.with_child(more);
+    let mut actions = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(4.0)
+        .with_child(primary)
+        .with_child(secondary);
+    if source == FilesSourceKind::Sifs {
+        actions = actions.with_child(availability_actions(shared, reader));
+    }
+    actions
+}
+
+fn availability_actions(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
+    files_primary_menu(
+        "inspector-availability-actions",
+        shared,
+        reader,
+        FileContextMenuTarget::Availability,
+        sui::Button::new("Manage availability")
+            .icon(IconGlyph::Storage)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Tonal)
+            .tone(SemanticTone::Accent)
+            .theme_when(clone_reader(reader)),
+    )
+}
+
+fn current_location_overview(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let files = shared.files();
+    let (status, tone) = match files.source {
+        FilesSourceKind::Local => ("On this device".to_string(), SemanticTone::Neutral),
+        FilesSourceKind::Sifs => match files.sifs_health.as_ref() {
+            Some(health) if sifs_health_has_attention(health) => {
+                ("Needs attention".to_string(), SemanticTone::Warning)
+            }
+            Some(health) if sifs_health_has_activity(health) => {
+                ("Syncing changes".to_string(), SemanticTone::Accent)
+            }
+            Some(_) => ("Available".to_string(), SemanticTone::Success),
+            None if files.sifs_health_error.is_some() => {
+                ("Health unavailable".to_string(), SemanticTone::Warning)
+            }
+            None => ("Ready".to_string(), SemanticTone::Neutral),
+        },
+    };
+    let hint = match files.source {
+        FilesSourceKind::Sifs => {
+            "Select an item to open it, share it, or choose where copies stay available."
+        }
+        FilesSourceKind::Local => {
+            "Select an item to open it or copy it into Sinomo for access across devices."
+        }
+    };
+    let rows = vec![
+        ("Location", files.path.clone()),
+        ("Contents", files_entry_count_status(&files)),
+    ];
+    let mut advanced_rows = Vec::new();
+    if files.source == FilesSourceKind::Sifs && files.inspector_details_open {
+        if let Some(detail) = files_sifs_connection_detail(&files) {
+            advanced_rows.push(("Daemon", detail));
+        }
+        if let Some(detail) = unselected_inspector_health_detail(&files) {
+            advanced_rows.push(("DFS detail", detail));
+        }
+    }
+    drop(files);
+
+    let theme = reader();
+    let mut hint_style = theme.text_style(theme.palette.text_muted);
+    hint_style.font_size = theme.text.sm.size;
+    hint_style.line_height = theme.text.sm.line_height;
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(10.0)
+        .with_child(
+            StatusBadge::new(status)
+                .icon(IconGlyph::Storage)
+                .tone(tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(detail_rows_widget(rows, reader))
+        .with_child(Label::new(hint).style(hint_style));
+
+    if shared.files().source == FilesSourceKind::Sifs {
+        let storage = file_action_button(
+            shared,
+            reader,
+            FileContextAction::OpenStorageCenter,
+            "Storage health",
+            IconGlyph::Storage,
+            ButtonAppearance::Tonal,
+        );
+        let activity = file_action_button(
+            shared,
+            reader,
+            FileContextAction::OpenPlacementActivity,
+            "View activity",
+            IconGlyph::History,
+            ButtonAppearance::Ghost,
+        );
+        let settings_shared = shared.clone();
+        let mount = sui::Button::new("Mount & sync")
+            .icon(IconGlyph::Folder)
+            .min_height(32.0)
+            .appearance(ButtonAppearance::Ghost)
+            .theme_when(clone_reader(reader))
+            .on_press(move || open_settings_section(&settings_shared, SettingsSection::SifsMount));
+        content = content
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(storage)
+                    .with_child(activity)
+                    .with_child(mount),
+            );
+    }
+    if !advanced_rows.is_empty() {
+        content = content
+            .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+            .with_child(detail_rows_widget(advanced_rows, reader));
+    }
+    content
 }
 
 fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
@@ -13520,11 +14829,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     }
 
     let Some(entry) = files.selected_entry().cloned() else {
-        let rows = unselected_inspector_rows(&files);
-        let body = Stack::vertical()
-            .alignment(Alignment::Stretch)
-            .spacing(10.0)
-            .with_child(detail_rows_widget(rows, reader));
+        let body = current_location_overview(shared, reader);
         let header_action = (files.source == FilesSourceKind::Sifs).then(details_button);
         return WidgetPod::new(inspector_card(
             unselected_inspector_title(files.source),
@@ -13588,6 +14893,9 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
                 .max_value_lines(2),
         );
     }
+    selected_body = selected_body
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(selected_item_actions(shared, reader, &entry));
     if files.attachment_loading {
         selected_body = selected_body.with_child(
             StatusBadge::new("Preparing chat attachment")
@@ -13740,7 +15048,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             )
             .with_child(detail_rows_widget(placement_rows, reader));
         content = content.with_child(inspector_card(
-            "Placement",
+            "Availability",
             placement_body,
             reader,
             None,
@@ -14046,6 +15354,7 @@ fn list_column(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
+    contextual_selection: bool,
 ) -> impl Widget + use<> {
     let source = shared
         .signals()
@@ -14054,7 +15363,11 @@ fn list_column(
     let s = shared.clone();
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
-    RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss))
+    let listing = RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss));
+    Dock::new(listing).top(
+        FILE_ACTION_BAR_H,
+        files_action_bar(shared, reader, contextual_selection),
+    )
 }
 
 /// Wide split: header docked on top, with independently resizable Locations and Inspector
@@ -14075,17 +15388,18 @@ fn wide_pod(
     });
     let places_ratio = shared.files().places_sidebar_ratio;
     let places_ratio_shared = shared.clone();
-    let list_with_places = SplitView::horizontal(places, list_column(shared, reader, scroll_state))
-        .name("File locations sidebar")
-        .ratio(places_ratio)
-        .min_first(PLACES_SIDEBAR_MIN_W)
-        .min_second(FILE_LIST_MIN_W)
-        .theme(reader())
-        .on_change(move |ratio| {
-            places_ratio_shared
-                .files_mut()
-                .set_places_sidebar_ratio(ratio)
-        });
+    let list_with_places =
+        SplitView::horizontal(places, list_column(shared, reader, scroll_state, false))
+            .name("File locations sidebar")
+            .ratio(places_ratio)
+            .min_first(PLACES_SIDEBAR_MIN_W)
+            .min_second(FILE_LIST_MIN_W)
+            .theme(reader())
+            .on_change(move |ratio| {
+                places_ratio_shared
+                    .files_mut()
+                    .set_places_sidebar_ratio(ratio)
+            });
     let inspector_ratio = shared.files().inspector_sidebar_ratio;
     let inspector_ratio_shared = shared.clone();
     let body = SplitView::horizontal(
@@ -14130,7 +15444,7 @@ fn narrow_pod(
                 .with_child(compact_header_bar(shared, reader)),
         )
         .with_child(Separator::horizontal().theme_when(clone_reader(reader)));
-    Dock::new(list_column(shared, reader, scroll_state))
+    Dock::new(list_column(shared, reader, scroll_state, true))
         .top(HEADER_H + 1.0, header)
         .bottom(FILES_STATUS_H, files_status_bar(shared, reader))
 }
@@ -14414,6 +15728,99 @@ fn go_to_path_placeholder(source: FilesSourceKind) -> &'static str {
         FilesSourceKind::Sifs => "/services",
         FilesSourceKind::Local => "C:\\Users or \\\\server\\share",
     }
+}
+
+fn prompt_destination_source(
+    kind: FileActionPromptKind,
+    source: FilesSourceKind,
+) -> Option<FilesSourceKind> {
+    match kind {
+        FileActionPromptKind::Copy
+        | FileActionPromptKind::CopySelected
+        | FileActionPromptKind::Move
+        | FileActionPromptKind::MoveSelected => Some(source),
+        FileActionPromptKind::CopyToSifs => Some(FilesSourceKind::Sifs),
+        FileActionPromptKind::CopyToLocal => Some(FilesSourceKind::Local),
+        FileActionPromptKind::TransferSelected => Some(match source {
+            FilesSourceKind::Sifs => FilesSourceKind::Local,
+            FilesSourceKind::Local => FilesSourceKind::Sifs,
+        }),
+        _ => None,
+    }
+}
+
+fn destination_chooser_controls(
+    shared: &Shared,
+    reader: &ThemeReader,
+    kind: FileActionPromptKind,
+    source: FilesSourceKind,
+) -> Option<Stack> {
+    let destination = prompt_destination_source(kind, source)?;
+    let theme = reader();
+    let mut hint_style = theme.text_style(theme.palette.text_muted);
+    hint_style.font_size = theme.text.sm.size;
+    hint_style.line_height = theme.text.sm.line_height;
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(7.0)
+        .with_child(Label::new("Choose a destination").style(theme.text_style(theme.palette.text)));
+    if destination == FilesSourceKind::Local {
+        let enabled = shared.clone();
+        let action = shared.clone();
+        content = content
+            .with_child(
+                sui::Button::new("Choose folder...")
+                    .icon(IconGlyph::Folder)
+                    .min_height(34.0)
+                    .appearance(ButtonAppearance::Tonal)
+                    .tone(SemanticTone::Accent)
+                    .theme_when(clone_reader(reader))
+                    .enabled_when(move || !enabled.files().picker_lane.is_pending())
+                    .on_press_with_ctx(move |ctx| {
+                        let waker = { action.borrow().waker.clone() };
+                        action
+                            .files_mut()
+                            .request_native_picker(FilesPickerAction::ChooseDestination, waker);
+                        request_files_overlay_rebuild(ctx);
+                    }),
+            )
+            .with_child(
+                Label::new(
+                    "The selected folder is combined with the original name. You can edit the exact path below before starting.",
+                )
+                .style(hint_style),
+            );
+    } else {
+        let choice = |label: &'static str, path: &'static str| {
+            let action = shared.clone();
+            sui::Button::new(label)
+                .icon(IconGlyph::Folder)
+                .min_height(34.0)
+                .appearance(ButtonAppearance::Ghost)
+                .theme_when(clone_reader(reader))
+                .on_press_with_ctx(move |ctx| {
+                    action.files_mut().choose_sifs_destination(path);
+                    request_files_overlay_rebuild(ctx);
+                })
+        };
+        content = content
+            .with_child(
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(6.0)
+                    .align_items(Alignment::Center)
+                    .with_child(choice("Sinomo root", "/"))
+                    .with_child(choice("Services", "/services"))
+                    .with_child(choice("Users", "/users")),
+            )
+            .with_child(
+                Label::new(
+                    "Choose a common Sinomo space, then edit the exact folder or name below if needed.",
+                )
+                .style(hint_style),
+            );
+    }
+    Some(content)
 }
 
 fn placement_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static str, String)> {
@@ -15130,7 +16537,117 @@ fn placement_scope_control(
         })
 }
 
-fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, target_is_dir: bool) -> Stack {
+fn placement_user_preview_rows(preview: &SifsPlacementPreview) -> Vec<(&'static str, String)> {
+    let policy = &preview.resolved.policy;
+    let mode = match &policy.consistency {
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed => {
+            "Confirmed copies before publishing"
+        }
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual => {
+            "Available while remaining copies finish"
+        }
+        sinomo_runtime::core::DfsObjectPolicy::LocalOwned => "Only on its owning device",
+        sinomo_runtime::core::DfsObjectPolicy::EphemeralLocal => "Temporary on this device",
+        sinomo_runtime::core::DfsObjectPolicy::AppendOnly => "Append-only storage",
+    };
+    let publish = if matches!(
+        policy.consistency,
+        sinomo_runtime::core::DfsObjectPolicy::ReplicatedConfirmed
+    ) {
+        format!("After all {} copies are durable", policy.desired_replicas)
+    } else {
+        format!(
+            "After {} of {} copies are durable",
+            policy.min_commit_replicas, policy.desired_replicas
+        )
+    };
+    vec![
+        ("Availability", mode.to_string()),
+        ("Publishing", publish),
+        (
+            "Device spread",
+            if policy.min_distinct_zones == 0 {
+                "No zone minimum".to_string()
+            } else {
+                format!("At least {} zones", policy.min_distinct_zones)
+            },
+        ),
+    ]
+}
+
+fn placement_goal_control(shared: &Shared, reader: &ThemeReader) -> Stack {
+    let editable = shared
+        .files()
+        .placement_draft
+        .as_ref()
+        .and_then(PlacementEditorDraft::active_policy)
+        .is_some_and(|policy| policy.consistency.is_editable());
+    let item = |label: &'static str, name: &'static str, description: &'static str| {
+        let item = SegmentedControlItem::new(label)
+            .semantic_name(name)
+            .description(description);
+        if editable { item } else { item.disabled() }
+    };
+    let selected = shared.clone();
+    let changed = shared.clone();
+    let control = SegmentedControl::new("Availability goal")
+        .items([
+            item(
+                "Use folder default",
+                "Use inherited availability",
+                "Follow the nearest folder availability rule",
+            ),
+            item(
+                "Across devices",
+                "Available across devices",
+                "Publish after the required copies are durable, then continue toward the desired copy count",
+            ),
+            item(
+                "Confirmed copies",
+                "Confirmed availability",
+                "Publish only after every desired copy is durable",
+            ),
+        ])
+        .selected_when(move || {
+            Some(
+                selected
+                    .files()
+                    .placement_draft
+                    .as_ref()
+                    .and_then(PlacementEditorDraft::active_policy)
+                    .map_or(0, |policy| {
+                        if policy.inherit {
+                            0
+                        } else if policy.consistency == PlacementEditorConsistency::Confirmed {
+                            2
+                        } else {
+                            1
+                        }
+                    }),
+            )
+        })
+        .theme_when(clone_reader(reader))
+        .on_change_with_ctx(move |index, _label, ctx| {
+            changed.files_mut().set_placement_goal(index);
+            request_files_overlay_rebuild(ctx);
+        });
+    let theme = reader();
+    let mut hint_style = theme.text_style(theme.palette.text_muted);
+    hint_style.font_size = theme.text.sm.size;
+    hint_style.line_height = theme.text.sm.line_height;
+    Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(7.0)
+        .with_child(control)
+        .with_child(
+            Label::new(
+                "Across devices favors responsiveness; Confirmed copies waits for the complete copy set before publishing a write.",
+            )
+            .style(hint_style),
+        )
+}
+
+fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, _target_is_dir: bool) -> Stack {
     if shared.files().placement_editor_locked() {
         let applying = shared.files().placement_applying;
         let rows = shared
@@ -15198,8 +16715,7 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, target_is_di
                     "The current non-replicated policy is shown read-only. Use the DFS administration surface for an explicit data migration.",
                 )
                 .theme(reader()),
-            )
-            .with_child(placement_scope_control(shared, reader, target_is_dir));
+            );
     }
 
     let consistency = {
@@ -15378,8 +16894,6 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, target_is_di
             FlexItem::fixed(230.0),
         );
 
-    let scope = placement_scope_control(shared, reader, target_is_dir);
-
     let inheritance = StatusBadge::dynamic("Explicit override", {
         let shared = shared.clone();
         move || {
@@ -15423,7 +16937,6 @@ fn placement_policy_controls(shared: &Shared, reader: &ThemeReader, target_is_di
         .spacing(10.0)
         .with_child(consistency)
         .with_child(counts)
-        .with_child(scope)
         .with_child(inheritance)
 }
 
@@ -15537,27 +17050,67 @@ fn files_placement_dialog(
         .as_ref()
         .map(placement_draft_rows)
         .unwrap_or_default();
+    let advanced_open = shared.files().placement_advanced_open;
+    let advanced = {
+        let shared = shared.clone();
+        sui::Button::new(if advanced_open {
+            "Hide advanced settings"
+        } else {
+            "Advanced settings"
+        })
+        .icon(if advanced_open {
+            IconGlyph::ChevronUp
+        } else {
+            IconGlyph::ChevronDown
+        })
+        .appearance(ButtonAppearance::Ghost)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            shared.files_mut().toggle_placement_advanced();
+            request_files_overlay_rebuild(ctx);
+        })
+    };
     let mut content = Stack::vertical()
         .alignment(Alignment::Stretch)
         .spacing(12.0)
         .with_child(
             Label::new(format!(
-                "Choose how SIFS keeps {target} durable. W controls when writes become visible; N is the repaired copy target."
+                "Choose how {target} stays available. Nothing changes until you preview the plan and apply it."
             ))
             .theme(reader()),
         )
-        .with_child(PanelSection::new(
-            "Policy",
-            placement_policy_controls(shared, reader, prompt.target_is_dir),
-        ).theme_when(clone_reader(reader)))
         .with_child(
             PanelSection::new(
-                "Selected scope draft",
-                detail_rows_widget(draft_rows, reader),
+                "Availability",
+                placement_goal_control(shared, reader),
             )
             .theme_when(clone_reader(reader)),
         )
+        .with_child(
+            PanelSection::new(
+                "Apply to",
+                placement_scope_control(shared, reader, prompt.target_is_dir),
+            )
+            .theme_when(clone_reader(reader)),
+        )
+        .with_child(advanced)
         .with_child(placement_preview_status(shared, reader));
+
+    if advanced_open {
+        content = content
+            .with_child(
+                PanelSection::new(
+                    "Copy policy",
+                    placement_policy_controls(shared, reader, prompt.target_is_dir),
+                )
+                .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                PanelSection::new("Policy details", detail_rows_widget(draft_rows, reader))
+                    .theme_when(clone_reader(reader)),
+            );
+    }
 
     if let Some(error) = prompt.error.as_ref() {
         content = content.with_child(
@@ -15589,34 +17142,47 @@ fn files_placement_dialog(
                 .placement_draft
                 .as_ref()
                 .is_some_and(PlacementEditorDraft::has_actionable_change);
-            content = content
-                .with_child(
-                    PanelSection::new(
-                        if preview_is_current {
-                            "Selected object's resolved placement"
-                        } else {
-                            "Previous resolved placement"
-                        },
-                        detail_rows_widget(placement_preview_rows(preview), reader),
-                    )
-                    .theme_when(clone_reader(reader)),
+            content = content.with_child(
+                PanelSection::new(
+                    if preview_is_current {
+                        "Preview"
+                    } else {
+                        "Previous preview"
+                    },
+                    detail_rows_widget(placement_user_preview_rows(preview), reader),
                 )
-                .with_child(
-                    PanelSection::new(
-                        if preview_is_current {
-                            if draft_has_actionable_change {
-                                "Before you apply"
+                .theme_when(clone_reader(reader)),
+            );
+            if advanced_open {
+                content = content
+                    .with_child(
+                        PanelSection::new(
+                            if preview_is_current {
+                                "Resolved policy"
                             } else {
-                                "Current placement impact"
-                            }
-                        } else {
-                            "Previous impact estimate"
-                        },
-                        placement_impact_widget(preview, reader),
+                                "Previous resolved policy"
+                            },
+                            detail_rows_widget(placement_preview_rows(preview), reader),
+                        )
+                        .theme_when(clone_reader(reader)),
                     )
-                    .theme_when(clone_reader(reader)),
-                );
-            if preview.supports_safe_apply() {
+                    .with_child(
+                        PanelSection::new(
+                            if preview_is_current {
+                                if draft_has_actionable_change {
+                                    "Before you apply"
+                                } else {
+                                    "Current placement impact"
+                                }
+                            } else {
+                                "Previous impact estimate"
+                            },
+                            placement_impact_widget(preview, reader),
+                        )
+                        .theme_when(clone_reader(reader)),
+                    );
+            }
+            if advanced_open && preview.supports_safe_apply() {
                 content = content.with_child(
                     PanelSection::new(
                         if preview_is_current {
@@ -15702,42 +17268,6 @@ fn files_placement_dialog(
                 request_files_overlay_rebuild(ctx);
             })
     };
-    let inherit = {
-        let action = shared
-            .files()
-            .placement_draft
-            .as_ref()
-            .and_then(PlacementEditorDraft::inheritance_action);
-        let enabled = shared.clone();
-        let shared = shared.clone();
-        sui::Button::new(
-            action.map_or("Placement inheritance unavailable", |action| action.label()),
-        )
-        .appearance(ButtonAppearance::Ghost)
-        .tone(SemanticTone::Neutral)
-        .theme_when(clone_reader(reader))
-        .enabled_when(move || {
-            let files = enabled.files();
-            !files.placement_loading
-                && !files.placement_editor_locked()
-                && files.placement_draft.as_ref().is_some_and(|draft| {
-                    draft.inheritance_action().is_some()
-                        && draft
-                            .active_policy()
-                            .is_some_and(|policy| policy.consistency.is_editable())
-                })
-        })
-        .on_press_with_ctx(move |ctx| {
-            let inherit = shared
-                .files()
-                .placement_draft
-                .as_ref()
-                .and_then(PlacementEditorDraft::inheritance_action)
-                .is_some_and(PlacementInheritanceAction::inherit);
-            shared.files_mut().set_placement_inherit(inherit);
-            request_files_overlay_rebuild(ctx);
-        })
-    };
     let apply = {
         let label = if shared.files().placement_reconciliation_in_flight()
             && shared
@@ -15748,7 +17278,7 @@ fn files_placement_dialog(
         {
             "Apply replacement"
         } else {
-            "Apply placement"
+            "Apply availability"
         };
         let enabled = shared.clone();
         let apply = shared.clone();
@@ -15786,7 +17316,6 @@ fn files_placement_dialog(
         .gap(8.0)
         .align_items(Alignment::End)
         .with_child(preview)
-        .with_child(inherit)
         .with_child(apply)
         .with_child(cancel);
 
@@ -15794,7 +17323,7 @@ fn files_placement_dialog(
         .alignment(Alignment::Stretch)
         .spacing(12.0)
         .with_child(
-            SizedBox::new().height(580.0).with_child(
+            SizedBox::new().height(480.0).with_child(
                 ScrollView::vertical(WidgetPadding::new(
                     Insets {
                         left: 2.0,
@@ -15814,9 +17343,9 @@ fn files_placement_dialog(
         move || shared.files_mut().close_action_prompt()
     };
     WidgetPod::new(
-        sui::Dialog::new("Edit placement", body)
+        sui::Dialog::new("Manage availability", body)
             .theme(shared.theme())
-            .description("Visual SIFS placement policy editor")
+            .description("Choose where copies stay available, preview the plan, and apply it")
             .max_width(1040.0)
             .dismiss_on_scrim(true)
             .on_dismiss(dismiss),
@@ -15989,8 +17518,17 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let mut body = Stack::vertical()
         .spacing(10.0)
         .alignment(Alignment::Stretch)
-        .with_child(sui::Label::new(description).theme(dialog_theme.clone()))
-        .with_child(input);
+        .with_child(sui::Label::new(description).theme(dialog_theme.clone()));
+    if let Some(chooser) = destination_chooser_controls(shared, reader, prompt.kind, source) {
+        body = body.with_child(
+            Surface::panel(chooser)
+                .appearance(sui::SurfaceAppearance::Soft)
+                .padding(Insets::all(10.0))
+                .theme_when(clone_reader(reader))
+                .fill_width(),
+        );
+    }
+    body = body.with_child(input);
     if let Some(error) = prompt.error {
         body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
     }
@@ -17239,6 +18777,758 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
     )
 }
 
+fn storage_conflict_row(
+    shared: &Shared,
+    reader: &ThemeReader,
+    conflict: &DfsConflictRecord,
+) -> Surface {
+    let status = match &conflict.status {
+        sinomo_runtime::dfs::DfsConflictStatus::Open => "open",
+        sinomo_runtime::dfs::DfsConflictStatus::Resolved => "resolved",
+        sinomo_runtime::dfs::DfsConflictStatus::Superseded => "superseded",
+    };
+    let path = conflict.path.clone();
+    let reveal = shared.clone();
+    let action = sui::Button::new("Show file")
+        .icon(IconGlyph::Folder)
+        .min_height(30.0)
+        .appearance(ButtonAppearance::Ghost)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            let waker = { reveal.borrow().waker.clone() };
+            reveal
+                .files_mut()
+                .reveal_storage_issue_path(path.clone(), waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let body = TrailingSlotRow::new(
+        Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(5.0)
+            .with_child(
+                Label::new(conflict.path.clone()).style(reader().text_style(reader().palette.text)),
+            )
+            .with_child(
+                Label::new(format!(
+                    "{} · {status} · detected {}",
+                    conflict.reason,
+                    conflict
+                        .detected_at
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| conflict.detected_at.to_string())
+                ))
+                .theme(reader()),
+            ),
+        action,
+    )
+    .trailing_width(108.0)
+    .trailing_height(30.0)
+    .gap(10.0);
+    Surface::panel(body)
+        .appearance(sui::SurfaceAppearance::Soft)
+        .tone(SemanticTone::Warning)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width()
+}
+
+fn storage_repair_row(reader: &ThemeReader, repair: &DfsOperatorRepairView) -> Surface {
+    let rows = vec![
+        (
+            "Missing from",
+            short_node_label(repair.missing_replica_node_id.as_str()),
+        ),
+        ("Version", middle_short(repair.version.as_str(), 24)),
+        ("Object", middle_short(repair.object_id.as_str(), 24)),
+    ];
+    Surface::panel(detail_rows_widget(rows, reader))
+        .appearance(sui::SurfaceAppearance::Soft)
+        .tone(SemanticTone::Warning)
+        .padding(Insets::all(10.0))
+        .theme_when(clone_reader(reader))
+        .fill_width()
+}
+
+fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if !shared.files().storage_center_open {
+        return None;
+    }
+    let files = shared.files();
+    let loading = files.storage_center_loading;
+    let error = files.storage_center_error.clone();
+    let overview = files.storage_overview.clone();
+    drop(files);
+
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0);
+    if let Some(overview) = overview.as_ref() {
+        let status = &overview.status;
+        let attention = status.open_conflict_count > 0
+            || status.pending_repair_count > 0
+            || status.pending_write_count > 0
+            || status.failed_namespace_job_count > 0;
+        content = content.with_child(inspector_card(
+            "Overview",
+            Stack::vertical()
+                .alignment(Alignment::Stretch)
+                .spacing(9.0)
+                .with_child(
+                    StatusBadge::new(if attention {
+                        "Storage needs attention"
+                    } else {
+                        "Storage is healthy"
+                    })
+                    .icon(if attention {
+                        IconGlyph::Alert
+                    } else {
+                        IconGlyph::Check
+                    })
+                    .tone(if attention {
+                        SemanticTone::Warning
+                    } else {
+                        SemanticTone::Success
+                    })
+                    .theme_when(clone_reader(reader)),
+                )
+                .with_child(detail_rows_widget(
+                    vec![
+                        ("Objects", status.object_count.to_string()),
+                        ("Versions", status.version_count.to_string()),
+                        ("Pending writes", status.pending_write_count.to_string()),
+                        ("Open conflicts", status.open_conflict_count.to_string()),
+                        ("Missing copies", status.pending_repair_count.to_string()),
+                        ("Metadata shards", status.metadata_shards.len().to_string()),
+                    ],
+                    reader,
+                )),
+            reader,
+            None,
+            false,
+        ));
+        for reason in status.blocking_incomplete_reasons() {
+            content = content.with_child(
+                StatusBadge::new(format!("Incomplete storage view: {reason}"))
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+
+        let mut conflict_rows = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+        for conflict in overview.conflicts.iter().take(20) {
+            conflict_rows =
+                conflict_rows.with_child(storage_conflict_row(shared, reader, conflict));
+        }
+        if overview.conflicts.is_empty() {
+            conflict_rows = conflict_rows
+                .with_child(Label::new("No conflict records were returned.").theme(reader()));
+        } else if overview.conflicts.len() > 20 || overview.conflicts_have_more {
+            conflict_rows = conflict_rows.with_child(
+                StatusBadge::new(
+                    "More conflicts exist. Open a file from its row, or use the bounded DFS operator command for the complete paged list.",
+                )
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+            );
+        }
+        for omission in &status.bounded_omissions {
+            content = content.with_child(
+                StatusBadge::new(format!("Bounded view: {}", omission.legacy_reason()))
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Info)
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+        content = content.with_child(
+            PanelSection::new("Conflict records", conflict_rows)
+                .theme_when(clone_reader(reader))
+                .gap(8.0),
+        );
+
+        let mut repair_rows = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+        for repair in overview.repairs.iter().take(20) {
+            repair_rows = repair_rows.with_child(storage_repair_row(reader, repair));
+        }
+        if overview.repairs.is_empty() {
+            repair_rows = repair_rows
+                .with_child(Label::new("No missing-copy records were returned.").theme(reader()));
+        } else if overview.repairs.len() > 20 || overview.repairs_have_more {
+            repair_rows = repair_rows.with_child(
+                StatusBadge::new(
+                    "More missing-copy records exist. The Cluster view and bounded DFS operator command expose the wider queue.",
+                )
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+            );
+        }
+        content = content.with_child(
+            PanelSection::new("Missing copies", repair_rows)
+                .theme_when(clone_reader(reader))
+                .gap(8.0),
+        );
+
+        let cluster = shared.clone();
+        let mount = shared.clone();
+        let activity = shared.clone();
+        content = content.with_child(
+            PanelSection::new(
+                "Storage tools",
+                Flex::horizontal()
+                    .wrap(FlexWrap::Wrap)
+                    .gap(8.0)
+                    .align_items(Alignment::Center)
+                    .with_child(
+                        sui::Button::new("Open Cluster")
+                            .icon(IconGlyph::Storage)
+                            .appearance(ButtonAppearance::Ghost)
+                            .theme_when(clone_reader(reader))
+                            .on_press(move || {
+                                cluster.files_mut().close_storage_center();
+                                open_cluster_tab(&cluster);
+                            }),
+                    )
+                    .with_child(
+                        sui::Button::new("Mount & sync")
+                            .icon(IconGlyph::Folder)
+                            .appearance(ButtonAppearance::Ghost)
+                            .theme_when(clone_reader(reader))
+                            .on_press(move || {
+                                mount.files_mut().close_storage_center();
+                                open_settings_section(&mount, SettingsSection::SifsMount)
+                            }),
+                    )
+                    .with_child(
+                        sui::Button::new("Reconciliation activity")
+                            .icon(IconGlyph::History)
+                            .appearance(ButtonAppearance::Ghost)
+                            .theme_when(clone_reader(reader))
+                            .on_press_with_ctx(move |ctx| {
+                                activity.files_mut().close_storage_center();
+                                let waker = { activity.borrow().waker.clone() };
+                                activity.files_mut().open_placement_activity(waker);
+                                request_files_overlay_rebuild(ctx);
+                            }),
+                    ),
+            )
+            .theme_when(clone_reader(reader)),
+        );
+    }
+    if loading && overview.is_some() {
+        content = content.with_child(
+            StatusBadge::new("Refreshing storage health...")
+                .icon(IconGlyph::Hourglass)
+                .tone(SemanticTone::Info)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if let Some(error) = error.clone().filter(|_| overview.is_some()) {
+        content = content.with_child(
+            StatusBadge::new(error)
+                .icon(IconGlyph::Alert)
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+
+    let loaded = ScrollView::vertical(
+        WidgetPadding::new(
+            Insets {
+                left: 2.0,
+                top: 2.0,
+                right: 10.0,
+                bottom: 16.0,
+            },
+            content,
+        )
+        .fill_child_width(),
+    )
+    .name("Storage health overview")
+    .viewport_width_hint(true);
+    let selected = if overview.is_some() {
+        2
+    } else if loading {
+        0
+    } else {
+        1
+    };
+    let body = SwitchView::new()
+        .selected(selected)
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Hourglass,
+            "Checking storage",
+            "Reading bounded DFS status, conflict, and missing-copy pages.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Alert,
+            "Storage health unavailable",
+            error.unwrap_or_else(|| "The daemon did not return storage health.".to_string()),
+        ))
+        .with_child(loaded);
+
+    let refresh_shared = shared.clone();
+    let refresh_enabled = shared.clone();
+    let refresh = sui::Button::new("Refresh")
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || !refresh_enabled.files().storage_center_loading)
+        .on_press_with_ctx(move |ctx| {
+            let waker = { refresh_shared.borrow().waker.clone() };
+            refresh_shared.files_mut().request_storage_overview(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let close_shared = shared.clone();
+    let close = sui::Button::new("Close")
+        .appearance(ButtonAppearance::Outline)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.files_mut().close_storage_center();
+            request_files_overlay_rebuild(ctx);
+        });
+    let dismiss = shared.clone();
+    Some(WidgetPod::new(
+        SideSheet::new("Storage health", body)
+            .theme_when(clone_reader(reader))
+            .description("DFS objects, pending work, conflicts, and missing copies")
+            .placement(SideSheetPlacement::Right)
+            .width(780.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(refresh)
+            .action(close)
+            .on_dismiss(move || dismiss.files_mut().close_storage_center()),
+    ))
+}
+
+fn history_open_conflict_count(object: &DfsOperatorObjectView) -> usize {
+    object
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
+        .count()
+}
+
+fn history_version_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    object: &DfsOperatorObjectView,
+    version: &sinomo_runtime::dfs::DfsObjectVersionRecord,
+) -> Surface {
+    let current = version.version == object.object.version || version.visible;
+    let saved = version
+        .created_at
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| version.created_at.to_string());
+    let locations = if version.locations.is_empty() {
+        "No durable content location is recorded".to_string()
+    } else {
+        version
+            .locations
+            .iter()
+            .map(|node| short_node_label(node.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let rows = vec![
+        ("Saved", saved),
+        ("Size", human_size(version.size_bytes)),
+        ("Available on", locations),
+    ];
+    let status = StatusBadge::new(if current { "Current" } else { "Older version" })
+        .icon(if current {
+            IconGlyph::Check
+        } else {
+            IconGlyph::History
+        })
+        .tone(if current {
+            SemanticTone::Success
+        } else {
+            SemanticTone::Neutral
+        })
+        .theme_when(clone_reader(reader));
+    let mut body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(8.0)
+        .with_child(status)
+        .with_child(detail_rows_widget(rows, reader));
+
+    if !current && history_open_conflict_count(object) > 0 {
+        let selected = version.version.clone();
+        let action = shared.clone();
+        body = body.with_child(
+            sui::Button::new("Use this version")
+                .icon(IconGlyph::History)
+                .min_height(32.0)
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .enabled(!shared.files().history_loading)
+                .on_press_with_ctx(move |ctx| {
+                    action
+                        .files_mut()
+                        .stage_history_decision(HistoryDecision::UseVersion(selected.clone()));
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    }
+
+    inspector_card(
+        format!("Version {}", middle_short(version.version.as_str(), 22)),
+        body,
+        reader,
+        None,
+        false,
+    )
+}
+
+fn history_issues_card(
+    shared: &Shared,
+    reader: &ThemeReader,
+    object: &DfsOperatorObjectView,
+) -> Surface {
+    let conflicts = history_open_conflict_count(object);
+    let repairs = object.repairs.len();
+    let (headline, tone, explanation) = if conflicts > 0 && repairs > 0 {
+        (
+            format!(
+                "{} · {}",
+                plural(conflicts, "conflict"),
+                plural(repairs, "missing copy")
+            ),
+            SemanticTone::Warning,
+            "First choose the version that should remain visible; content is never silently merged. Then run maintenance after the missing device or route is available.",
+        )
+    } else if conflicts > 0 {
+        (
+            plural(conflicts, "conflict"),
+            SemanticTone::Warning,
+            "Choose the version that should remain visible. Keeping the current version only removes the selected conflict records; content is never silently merged.",
+        )
+    } else if repairs > 0 {
+        (
+            plural(repairs, "missing copy"),
+            SemanticTone::Warning,
+            "The file remains readable from its current locations. Run maintenance after the missing device or route is available.",
+        )
+    } else {
+        (
+            "No open issues".to_string(),
+            SemanticTone::Success,
+            "The current version has no open conflict or missing-copy record.",
+        )
+    };
+    let theme = reader();
+    let mut explanation_style = theme.text_style(theme.palette.text_muted);
+    explanation_style.font_size = theme.text.sm.size;
+    explanation_style.line_height = theme.text.sm.line_height;
+    let mut body = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(9.0)
+        .with_child(
+            StatusBadge::new(headline)
+                .icon(if conflicts + repairs > 0 {
+                    IconGlyph::Alert
+                } else {
+                    IconGlyph::Check
+                })
+                .tone(tone)
+                .theme_when(clone_reader(reader)),
+        )
+        .with_child(Label::new(explanation).style(explanation_style));
+    let mut issue_rows = Vec::new();
+    for conflict in object
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.status == sinomo_runtime::dfs::DfsConflictStatus::Open)
+        .take(4)
+    {
+        issue_rows.push((
+            "Conflict",
+            format!(
+                "{} · detected {}",
+                conflict.reason,
+                conflict
+                    .detected_at
+                    .format(&Rfc3339)
+                    .unwrap_or_else(|_| conflict.detected_at.to_string())
+            ),
+        ));
+    }
+    for repair in object.repairs.iter().take(4) {
+        issue_rows.push((
+            "Missing copy",
+            format!(
+                "Version {} is missing from {}",
+                middle_short(repair.version.as_str(), 18),
+                short_node_label(repair.missing_replica_node_id.as_str())
+            ),
+        ));
+    }
+    if !issue_rows.is_empty() {
+        body = body.with_child(detail_rows_widget(issue_rows, reader));
+    }
+
+    if conflicts > 0 {
+        let action = shared.clone();
+        body = body.with_child(
+            sui::Button::new("Keep current version")
+                .icon(IconGlyph::Check)
+                .min_height(32.0)
+                .appearance(ButtonAppearance::Tonal)
+                .tone(SemanticTone::Accent)
+                .theme_when(clone_reader(reader))
+                .enabled(!shared.files().history_loading)
+                .on_press_with_ctx(move |ctx| {
+                    action
+                        .files_mut()
+                        .stage_history_decision(HistoryDecision::KeepCurrent);
+                    request_files_overlay_rebuild(ctx);
+                }),
+        );
+    }
+    if repairs > 0 {
+        body = body.with_child(file_action_button(
+            shared,
+            reader,
+            FileContextAction::RepairReplicas,
+            "Run maintenance and refresh",
+            IconGlyph::Redo,
+            ButtonAppearance::Ghost,
+        ));
+    }
+    inspector_card("Issues", body, reader, None, false)
+}
+
+fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    if !shared.files().history_open {
+        return None;
+    }
+    let files = shared.files();
+    let loading = files.history_loading;
+    let error = files.history_error.clone();
+    let notice = files.history_notice.clone();
+    let decision = files.history_decision.clone();
+    let object = files.history_object.clone();
+    let title = object
+        .as_ref()
+        .and_then(|object| {
+            Path::new(&object.object.path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .or_else(|| files.selected_entry().map(|entry| entry.name.clone()))
+        .unwrap_or_else(|| "History & issues".to_string());
+    drop(files);
+
+    let theme = reader();
+    let mut intro_style = theme.text_style(theme.palette.text_muted);
+    intro_style.font_size = theme.text.sm.size;
+    intro_style.line_height = theme.text.sm.line_height;
+    let mut content = Stack::vertical()
+        .alignment(Alignment::Stretch)
+        .spacing(12.0)
+        .with_child(
+            Label::new(
+                "Review immutable versions and resolve only the issue you choose. DFS authority applies every change and refreshes this view afterward.",
+            )
+            .style(intro_style),
+        );
+    if loading && object.is_some() {
+        content = content.with_child(
+            StatusBadge::new(
+                notice
+                    .clone()
+                    .unwrap_or_else(|| "Refreshing history...".to_string()),
+            )
+            .icon(IconGlyph::Hourglass)
+            .tone(SemanticTone::Info)
+            .theme_when(clone_reader(reader)),
+        );
+    } else if let Some(notice) = notice.clone() {
+        content = content.with_child(
+            StatusBadge::new(notice)
+                .icon(IconGlyph::Check)
+                .tone(SemanticTone::Success)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if let Some(error) = error.clone().filter(|_| object.is_some()) {
+        content = content.with_child(
+            StatusBadge::new(error)
+                .icon(IconGlyph::Alert)
+                .tone(SemanticTone::Danger)
+                .theme_when(clone_reader(reader)),
+        );
+    }
+    if let Some(decision) = decision {
+        let (summary, confirm_label) = match &decision {
+            HistoryDecision::KeepCurrent => (
+                "Keep the current visible version and close every open conflict record for this item. No content is merged.",
+                "Confirm current version",
+            ),
+            HistoryDecision::UseVersion(_) => (
+                "Make the selected immutable version visible and close every open conflict record for this item. The current version remains in history.",
+                "Confirm version choice",
+            ),
+        };
+        let back = shared.clone();
+        let confirm = shared.clone();
+        let actions = Flex::horizontal()
+            .wrap(FlexWrap::Wrap)
+            .gap(8.0)
+            .align_items(Alignment::Center)
+            .with_child(
+                sui::Button::new("Back")
+                    .appearance(ButtonAppearance::Ghost)
+                    .tone(SemanticTone::Neutral)
+                    .theme_when(clone_reader(reader))
+                    .on_press_with_ctx(move |ctx| {
+                        back.files_mut().cancel_history_decision();
+                        request_files_overlay_rebuild(ctx);
+                    }),
+            )
+            .with_child(
+                sui::Button::new(confirm_label)
+                    .icon(IconGlyph::Check)
+                    .appearance(ButtonAppearance::Filled)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader))
+                    .on_press_with_ctx(move |ctx| {
+                        let waker = { confirm.borrow().waker.clone() };
+                        confirm.files_mut().confirm_history_decision(waker);
+                        request_files_overlay_rebuild(ctx);
+                    }),
+            );
+        let mut confirmation = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(8.0)
+            .with_child(
+                StatusBadge::new("Confirm version choice")
+                    .icon(IconGlyph::Alert)
+                    .tone(SemanticTone::Warning)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(Label::new(summary).theme(reader()));
+        if let HistoryDecision::UseVersion(version) = decision {
+            confirmation = confirmation.with_child(
+                DetailRow::new("Selected version", version.to_string())
+                    .theme_when(clone_reader(reader)),
+            );
+        }
+        confirmation = confirmation.with_child(actions);
+        content = content.with_child(
+            Surface::panel(confirmation)
+                .appearance(sui::SurfaceAppearance::Soft)
+                .tone(SemanticTone::Warning)
+                .padding(Insets::all(12.0))
+                .theme_when(clone_reader(reader))
+                .fill_width(),
+        );
+    }
+    if let Some(object) = object.as_ref() {
+        content = content.with_child(history_issues_card(shared, reader, object));
+
+        let mut versions = object.versions.clone();
+        versions.sort_by_key(|version| std::cmp::Reverse(version.created_at));
+        let mut version_stack = Stack::vertical()
+            .alignment(Alignment::Stretch)
+            .spacing(10.0);
+        for version in &versions {
+            version_stack =
+                version_stack.with_child(history_version_card(shared, reader, object, version));
+        }
+        if versions.is_empty() {
+            version_stack = version_stack.with_child(
+                Label::new("No retained version records were returned for this item.")
+                    .theme(reader()),
+            );
+        }
+        content = content.with_child(
+            PanelSection::new("Versions", version_stack)
+                .theme_when(clone_reader(reader))
+                .gap(10.0),
+        );
+    }
+    let loaded = ScrollView::vertical(
+        WidgetPadding::new(
+            Insets {
+                left: 2.0,
+                top: 2.0,
+                right: 10.0,
+                bottom: 16.0,
+            },
+            content,
+        )
+        .fill_child_width(),
+    )
+    .name("File history and issues")
+    .viewport_width_hint(true);
+    let selected = if object.is_some() {
+        2
+    } else if loading {
+        0
+    } else {
+        1
+    };
+    let body = SwitchView::new()
+        .selected(selected)
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Hourglass,
+            "Loading history",
+            "Reading a bounded, authoritative DFS object view.",
+        ))
+        .with_child(centered_note(
+            reader,
+            IconGlyph::Alert,
+            "History unavailable",
+            error.unwrap_or_else(|| "No DFS object history was returned.".to_string()),
+        ))
+        .with_child(loaded);
+
+    let refresh_shared = shared.clone();
+    let refresh_enabled = shared.clone();
+    let refresh = sui::Button::new("Refresh")
+        .icon(IconGlyph::Redo)
+        .appearance(ButtonAppearance::Tonal)
+        .tone(SemanticTone::Accent)
+        .theme_when(clone_reader(reader))
+        .enabled_when(move || !refresh_enabled.files().history_loading)
+        .on_press_with_ctx(move |ctx| {
+            let waker = { refresh_shared.borrow().waker.clone() };
+            refresh_shared.files_mut().request_history(waker);
+            request_files_overlay_rebuild(ctx);
+        });
+    let close_shared = shared.clone();
+    let close = sui::Button::new("Close")
+        .appearance(ButtonAppearance::Outline)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| {
+            close_shared.files_mut().close_history();
+            request_files_overlay_rebuild(ctx);
+        });
+    let dismiss = shared.clone();
+    Some(WidgetPod::new(
+        SideSheet::new(title, body)
+            .theme_when(clone_reader(reader))
+            .description("Immutable versions, conflicts, and missing-copy records")
+            .placement(SideSheetPlacement::Right)
+            .width(720.0)
+            .modal(true)
+            .dismiss_on_scrim(true)
+            .action(refresh)
+            .action(close)
+            .on_dismiss(move || dismiss.files_mut().close_history()),
+    ))
+}
+
 fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
     let source = shared.files().source;
     let actions_for_selection = selection_context_actions(&shared.files());
@@ -17330,6 +19620,10 @@ fn files_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
         files_document_sheet(shared, reader)
     } else if shared.files().action_prompt.is_some() {
         files_action_dialog(shared, reader)
+    } else if shared.files().history_open {
+        files_history_sheet(shared, reader)
+    } else if shared.files().storage_center_open {
+        files_storage_center_sheet(shared, reader)
     } else if shared.files().placement_activity_open {
         Some(files_placement_activity_sheet(shared, reader))
     } else {
@@ -17622,6 +19916,124 @@ mod tests {
         }
     }
 
+    fn test_operator_object() -> DfsOperatorObjectView {
+        let file_system_id = DfsFileSystemId::from_legacy_named("history-fs").expect("filesystem");
+        let object_id = DfsObjectId::from_legacy_named("history-object").expect("object");
+        let current = DfsVersion::from_legacy_named("history-current").expect("version");
+        let older = DfsVersion::from_legacy_named("history-older").expect("version");
+        let node_a =
+            sinomo_runtime::node::NodeId::from_legacy_named("history-node-a").expect("node a");
+        let node_b =
+            sinomo_runtime::node::NodeId::from_legacy_named("history-node-b").expect("node b");
+        let timestamp =
+            time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("history timestamp");
+        DfsOperatorObjectView {
+            object: sinomo_runtime::dfs::DfsObjectMetadata {
+                object_id: object_id.clone(),
+                file_system_id: file_system_id.clone(),
+                path: "/documents/report.txt".to_string(),
+                kind: sinomo_runtime::dfs::DfsObjectKind::File,
+                tombstone_provenance: None,
+                owner_node_id: node_a.clone(),
+                current_locations: vec![node_a.clone()],
+                content_hash: Some("current-hash".to_string()),
+                content_size_bytes: Some(12),
+                link_target_object_id: None,
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                accessed_at_unix_nanos: 0,
+                modified_at_unix_nanos: 0,
+                created_at_unix_nanos: 0,
+                changed_at_unix_nanos: 0,
+                version: current.clone(),
+                policy: sinomo_runtime::core::DfsObjectPolicy::ReplicatedEventual,
+                created_by_event_id: None,
+                last_modified_by_event_id: None,
+            },
+            versions: vec![
+                sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    version: current.clone(),
+                    content_hash: Some("current-hash".to_string()),
+                    size_bytes: Some(12),
+                    locations: vec![node_a.clone()],
+                    created_by_event_id: None,
+                    created_at: timestamp,
+                    visible: true,
+                },
+                sinomo_runtime::dfs::DfsObjectVersionRecord {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    version: older.clone(),
+                    content_hash: Some("older-hash".to_string()),
+                    size_bytes: Some(10),
+                    locations: vec![node_b.clone()],
+                    created_by_event_id: None,
+                    created_at: timestamp - time::Duration::hours(1),
+                    visible: false,
+                },
+            ],
+            receipts: Vec::new(),
+            intents: Vec::new(),
+            conflicts: vec![sinomo_runtime::dfs::DfsConflictRecord {
+                conflict_id: "conflict-1".to_string(),
+                file_system_id: file_system_id.clone(),
+                object_id: object_id.clone(),
+                path: "/documents/report.txt".to_string(),
+                base_version: None,
+                local_version: current.clone(),
+                remote_version: older.clone(),
+                detected_by_node_id: node_a,
+                reason: "concurrent edits".to_string(),
+                local_content_hash: Some("current-hash".to_string()),
+                remote_content_hash: Some("older-hash".to_string()),
+                created_by_intent_id: None,
+                strategy: None,
+                status: sinomo_runtime::dfs::DfsConflictStatus::Open,
+                detected_at: timestamp,
+            }],
+            repairs: vec![sinomo_runtime::dfs::DfsOperatorRepairView {
+                intent_id: "repair-1".to_string(),
+                file_system_id,
+                object_id,
+                version: current,
+                content_hash: Some("current-hash".to_string()),
+                missing_replica_node_id: node_b,
+            }],
+            agent_state: sinomo_runtime::dfs::DfsAgentObjectState::Conflicted,
+        }
+    }
+
+    fn test_storage_overview() -> FilesStorageOverview {
+        let object = test_operator_object();
+        FilesStorageOverview {
+            status: DfsOperatorStatus {
+                incomplete_reasons: Vec::new(),
+                bounded_omissions: Vec::new(),
+                file_system_count: 1,
+                object_count: 24,
+                version_count: 31,
+                receipt_count: 48,
+                intent_count: 4,
+                pending_write_count: 1,
+                open_conflict_count: object.conflicts.len(),
+                pending_repair_count: object.repairs.len(),
+                repair_attempt_count: 2,
+                pending_namespace_job_count: 0,
+                failed_namespace_job_count: 0,
+                cross_shard_namespace_lock_count: Some(0),
+                metadata_shards: Vec::new(),
+                repair_attempts: Vec::new(),
+            },
+            conflicts: object.conflicts,
+            repairs: object.repairs,
+            conflicts_have_more: false,
+            repairs_have_more: false,
+        }
+    }
+
     fn test_placement_policy(
         consistency: sinomo_runtime::core::DfsObjectPolicy,
         w: usize,
@@ -17675,6 +20087,352 @@ mod tests {
             targets: Vec::new(),
             error: None,
         }
+    }
+
+    #[test]
+    fn simple_availability_goals_preserve_the_safe_policy_model() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.action_prompt = Some(placement_prompt("/documents", true));
+        files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+
+        assert!(files.set_placement_goal(2));
+        let confirmed = files
+            .placement_draft
+            .as_ref()
+            .and_then(PlacementEditorDraft::active_policy)
+            .expect("confirmed policy");
+        assert!(!confirmed.inherit);
+        assert_eq!(confirmed.consistency, PlacementEditorConsistency::Confirmed);
+        assert_eq!(confirmed.min_commit_replicas, confirmed.desired_replicas);
+
+        assert!(files.set_placement_goal(0));
+        assert!(
+            files
+                .placement_draft
+                .as_ref()
+                .and_then(PlacementEditorDraft::active_policy)
+                .expect("inherited policy")
+                .inherit
+        );
+        assert!(!files.placement_preview_is_current());
+    }
+
+    #[test]
+    fn destination_choices_fill_safe_paths_before_starting_work() {
+        let root = files_test_temp_dir("destination-picker");
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        files.source = FilesSourceKind::Sifs;
+        files.local_path = root.to_string_lossy().into_owned();
+        files.entries = vec![SifsEntry {
+            name: "report.txt".to_string(),
+            path: "/documents/report.txt".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(12),
+        }];
+        files.selected = Some(0);
+        files.open_action_prompt(FileActionPromptKind::CopyToLocal);
+        files.apply_picked_destination(root.clone());
+        let expected_local = root.join("report.txt").to_string_lossy().into_owned();
+        assert_eq!(
+            files
+                .action_prompt
+                .as_ref()
+                .map(|prompt| prompt.input.as_str()),
+            Some(expected_local.as_str())
+        );
+
+        files.source = FilesSourceKind::Local;
+        files.open_action_prompt(FileActionPromptKind::CopyToSifs);
+        files.choose_sifs_destination("/services");
+        assert_eq!(
+            files
+                .action_prompt
+                .as_ref()
+                .map(|prompt| prompt.input.as_str()),
+            Some("/services/report.txt")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn visible_file_toolbar_exposes_primary_tasks_without_right_click() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.entries = vec![SifsEntry {
+                name: "report.txt".to_string(),
+                path: "/documents/report.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(12),
+            }];
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme().with_size(ControlSize::Small))
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Visible Files actions")
+                    .root(files_action_bar(&shared, &reader, false)),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        for name in ["New", "Import", "More folder actions"] {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name(name)
+                .expect()
+                .to_be_visible()?;
+        }
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("New")
+            .click()?;
+        for name in ["New file", "New folder"] {
+            window
+                .get_by_role(SemanticsRole::MenuItem)
+                .with_name(name)
+                .expect()
+                .to_be_visible()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn history_sheet_turns_conflicts_into_explicit_user_choices() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let object = test_operator_object();
+        let (tx, rx) = mpsc::channel();
+        let (_result_tx, result_rx) = mpsc::channel();
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.source = FilesSourceKind::Sifs;
+            files.entries = vec![SifsEntry {
+                name: "report.txt".to_string(),
+                path: object.object.path.clone(),
+                is_dir: false,
+                is_link: false,
+                size: object.object.content_size_bytes,
+            }];
+            files.selected = Some(0);
+            files.selected_details = Some(SifsObjectDetails {
+                file_system_id: object.object.file_system_id.to_string(),
+                object_id: object.object.object_id.to_string(),
+                path: object.object.path.clone(),
+                ..test_sifs_details(Vec::new())
+            });
+            files.history_open = true;
+            files.history_object = Some(object.clone());
+            files.worker_tx = Some(tx);
+            files.worker_rx = Some(result_rx);
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme().with_size(ControlSize::Small))
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("File history choices")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1000.0).height(760.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+
+        for name in ["Keep current version", "Use this version"] {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name(name)
+                .expect()
+                .to_be_visible()?;
+        }
+        let older = object
+            .versions
+            .iter()
+            .find(|version| version.version != object.object.version)
+            .expect("older conflict version")
+            .version
+            .clone();
+        shared
+            .files_mut()
+            .stage_history_decision(HistoryDecision::UseVersion(older));
+        assert!(matches!(
+            shared.files().history_decision.as_ref(),
+            Some(HistoryDecision::UseVersion(_))
+        ));
+        shared.files_mut().confirm_history_decision(None);
+        match rx.try_recv().expect("authoritative history action") {
+            FilesWorkerCommand::UseHistoryVersion {
+                object_id,
+                version,
+                conflict_ids,
+                ..
+            } => {
+                assert_eq!(object_id, object.object.object_id);
+                assert_ne!(version, object.object.version);
+                assert_eq!(conflict_ids, vec!["conflict-1".to_string()]);
+            }
+            _ => panic!("expected conflict-version selection"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_keeps_cluster_issues_out_of_the_everyday_browser() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.storage_center_open = true;
+            files.storage_overview = Some(test_storage_overview());
+        }
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme().with_size(ControlSize::Small))
+        };
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Storage health workflow")
+                    .root(FilesDialogHost::new(
+                        SizedBox::new().width(1100.0).height(760.0),
+                        shared.clone(),
+                        Rc::clone(&reader),
+                    )),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        app.run_until_idle()?;
+        window.advance_time(1.0)?;
+        app.run_until_idle()?;
+
+        assert!(window.get_by_text("Storage needs attention").count()? >= 1);
+        assert!(window.get_by_text("/documents/report.txt").count()? >= 1);
+        assert!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Show file")
+                .count()?
+                >= 1
+        );
+        for name in ["Open Cluster", "Mount & sync", "Reconciliation activity"] {
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name(name)
+                .expect()
+                .to_be_visible()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn storage_health_uses_its_own_bounded_worker_request() {
+        let backend = Backend::local_fallback();
+        let mut files = FilesState::new(&backend);
+        let (tx, rx) = mpsc::channel();
+        files.worker_tx = Some(tx);
+
+        files.open_storage_center(None);
+        let request_id = match rx.recv().expect("storage overview request") {
+            FilesWorkerCommand::StorageOverview { request_id } => request_id,
+            _ => panic!("expected storage overview request"),
+        };
+        assert!(files.storage_center_open);
+        assert!(files.storage_center_loading);
+
+        let overview = test_storage_overview();
+        assert!(
+            files.apply_worker_result(FilesWorkerResult::StorageOverview {
+                request_id,
+                result: Ok(overview.clone()),
+            })
+        );
+        assert!(!files.storage_center_loading);
+        assert_eq!(files.storage_overview, Some(overview));
+    }
+
+    #[test]
+    #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
+    fn capture_redesigned_files_workflows() -> sui::Result<()> {
+        let capture = |name: &str, shared: Shared| -> sui::Result<()> {
+            let reader: ThemeReader = {
+                let shared = shared.clone();
+                Rc::new(move || shared.theme().with_size(ControlSize::Small))
+            };
+            let runtime = sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new()
+                        .title(name)
+                        .root(FilesDialogHost::new(
+                            SizedBox::new().width(1280.0).height(720.0),
+                            shared,
+                            reader,
+                        )),
+                )
+                .build()?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window
+                .root()
+                .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
+                    1280.0, 720.0,
+                ))))?;
+            app.run_until_idle()?;
+            window.advance_time(1.0)?;
+            let path = std::env::temp_dir().join(format!("sinomo-app-{name}.png"));
+            window.capture_screenshot()?.write_png(&path)?;
+            println!("wrote {}", path.display());
+            Ok(())
+        };
+
+        let history_backend = Backend::local_fallback();
+        let history_shared = Shared::new(AppState::ready(history_backend));
+        {
+            let mut files = history_shared.files_mut();
+            files.history_open = true;
+            files.history_object = Some(test_operator_object());
+        }
+        capture("files-history-issues", history_shared)?;
+
+        let storage_backend = Backend::local_fallback();
+        let storage_shared = Shared::new(AppState::ready(storage_backend));
+        {
+            let mut files = storage_shared.files_mut();
+            files.storage_center_open = true;
+            files.storage_overview = Some(test_storage_overview());
+        }
+        capture("files-storage-health", storage_shared)?;
+
+        let availability_backend = Backend::local_fallback();
+        let availability_shared = Shared::new(AppState::ready(availability_backend));
+        {
+            let mut files = availability_shared.files_mut();
+            files.action_prompt = Some(placement_prompt("/documents", true));
+            files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+        }
+        capture("files-manage-availability", availability_shared)
     }
 
     #[test]
@@ -19310,6 +22068,7 @@ mod tests {
                 .desired_replicas = 3;
             files.action_prompt = Some(placement_prompt("/folder", true));
             files.placement_draft = Some(draft);
+            files.placement_advanced_open = true;
             files.placement_edit_revision = 12;
             files.placement_preview_revision = Some(11);
             files.placement_preview = Some(stale_preview);
@@ -19363,6 +22122,7 @@ mod tests {
             let mut files = shared.files_mut();
             files.action_prompt = Some(placement_prompt("/folder", true));
             files.placement_draft = Some(PlacementEditorDraft::for_details(Some(&details), true));
+            files.placement_advanced_open = true;
             files.placement_edit_revision = 4;
             files.placement_preview_revision = Some(4);
             files.placement_preview = Some(unsatisfiable_placement_preview());
@@ -19470,6 +22230,7 @@ mod tests {
             preview.blocking_diagnostics.clear();
             files.action_prompt = Some(placement_prompt("/folder", true));
             files.placement_draft = Some(draft);
+            files.placement_advanced_open = true;
             files.placement_edit_revision = 6;
             files.placement_preview_revision = Some(6);
             files.placement_preview = Some(preview);
@@ -19825,6 +22586,7 @@ mod tests {
             let mut files = shared.files_mut();
             files.action_prompt = Some(placement_prompt("/folder", true));
             files.placement_draft = Some(PlacementEditorDraft::for_details(None, true));
+            files.placement_advanced_open = true;
             files.placement_preview = Some(preview);
         }
         let reader: ThemeReader = {
@@ -19923,6 +22685,7 @@ mod tests {
                 error: None,
             });
             files.placement_draft = Some(draft);
+            files.placement_advanced_open = true;
             files.placement_edit_revision = 11;
             files.placement_preview_revision = Some(11);
             files.placement_preview = Some(preview);
@@ -20006,7 +22769,7 @@ mod tests {
         assert!(window.get_by_text(zone_warning).count()? >= 1);
         assert!(snapshot.accessibility.nodes.iter().any(|node| {
             node.role == sui::SemanticsRole::Button
-                && node.name.as_deref() == Some("Apply placement")
+                && node.name.as_deref() == Some("Apply availability")
                 && node.state.disabled
         }));
         Ok(())
@@ -21503,7 +24266,7 @@ mod tests {
     fn unselected_inspector_copy_is_source_specific() {
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Sifs),
-            "Current SIFS location"
+            "This Sinomo folder"
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Sifs, false),
@@ -21511,7 +24274,7 @@ mod tests {
         );
         assert_eq!(
             unselected_inspector_title(FilesSourceKind::Local),
-            "Current folder"
+            "This device folder"
         );
         assert_eq!(
             unselected_inspector_status(FilesSourceKind::Local, false),
@@ -21651,7 +24414,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Advanced details")
             .click()?;
         assert!(shared.files().inspector_details_open);
         let rows = unselected_inspector_rows(&shared.files());
@@ -21665,7 +24428,7 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide advanced")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
@@ -21785,10 +24548,10 @@ mod tests {
         hover_menu_path(&window, &["SIFS"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Repair current folder replicas")
+            .with_name("Run folder maintenance")
             .click()?;
 
-        assert_eq!(shared.files().tasks[0].title, "Repair replicas");
+        assert_eq!(shared.files().tasks[0].title, "DFS maintenance");
         match rx.try_recv().expect("replica repair command") {
             FilesWorkerCommand::Operation {
                 request_id,
@@ -22427,7 +25190,7 @@ mod tests {
         );
         assert_eq!(
             sifs_placement_next_step(Some(&details), true),
-            "repair replicas, then refresh placement"
+            "run maintenance, then refresh availability"
         );
         assert_eq!(
             details
@@ -22547,7 +25310,7 @@ mod tests {
         details.current_locations.push("node-a".to_string());
         assert_eq!(
             sifs_placement_next_step(Some(&details), true),
-            "keep peers online and refresh after replica repair settles"
+            "keep peers online and refresh after maintenance settles"
         );
         details.current_locations.push("node-b".to_string());
         assert_eq!(
@@ -22587,7 +25350,7 @@ mod tests {
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, Some("metadata read failed")),
-            "Show details, then refresh placement"
+            "Open Advanced details, then refresh availability"
         );
         assert_eq!(
             sifs_inspector_next_step(None, true, false, Some("device authorization was denied")),
@@ -24262,7 +27025,7 @@ mod tests {
         );
         assert!(
             table.description.as_deref().is_some_and(
-                |description| description.starts_with("Columns: Name, Placement, Details")
+                |description| description.starts_with("Columns: Name, Availability, Details")
             ),
             "table semantics should preserve the column description: {:?}",
             table.description
@@ -24348,13 +27111,13 @@ mod tests {
         let placement = sifs
             .submenu_items()
             .iter()
-            .find(|item| item.label() == "Placement")
-            .expect("Placement submenu");
+            .find(|item| item.label() == "Availability")
+            .expect("Availability submenu");
         assert!(
             placement
                 .submenu_items()
                 .iter()
-                .any(|item| item.label() == "Refresh placement")
+                .any(|item| item.label() == "Refresh availability")
         );
         assert!(!labels.iter().any(|label| label == "Copy to SIFS"));
 
@@ -24686,7 +27449,7 @@ mod tests {
             "New folder",
             "Rename",
             "Delete selected item",
-            "Repair replicas",
+            "Run maintenance and refresh",
         ] {
             assert_eq!(
                 window
@@ -24767,8 +27530,8 @@ mod tests {
             table
                 .description
                 .as_deref()
-                .is_some_and(|description| description.contains("Columns: Name, Placement;")),
-            "compact table should retain Placement, got {:?}",
+                .is_some_and(|description| description.contains("Columns: Name, Availability;")),
+            "compact table should retain Availability, got {:?}",
             table.description
         );
         assert!(
@@ -24921,10 +27684,10 @@ mod tests {
         window_root.dispatch_event(Event::Pointer(up))?;
         app.run_until_idle()?;
 
-        hover_menu_path(&window, &["SIFS", "Placement"])?;
+        hover_menu_path(&window, &["SIFS", "Availability"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Repair replicas")
+            .with_name("Run maintenance and refresh")
             .click()?;
 
         let files = shared.files();
@@ -24932,7 +27695,7 @@ mod tests {
             files
                 .tasks
                 .iter()
-                .any(|task| task.title == "Repair replicas"),
+                .any(|task| task.title == "DFS maintenance"),
             "context-menu repair action should queue a background file task"
         );
 
@@ -25811,7 +28574,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::Button)
-                .with_name("Pin content")
+                .with_name("Keep content on this device")
                 .count()?,
             0,
             "directories do not have file content pins"
@@ -25926,10 +28689,10 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
-        hover_menu_path(&window, &["SIFS", "Placement"])?;
+        hover_menu_path(&window, &["SIFS", "Availability"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Refresh placement")
+            .with_name("Refresh availability")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Refresh placement");
@@ -25954,13 +28717,13 @@ mod tests {
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Open selection actions")
             .click()?;
-        hover_menu_path(&window, &["SIFS", "Placement"])?;
+        hover_menu_path(&window, &["SIFS", "Availability"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Repair replicas")
+            .with_name("Run maintenance and refresh")
             .click()?;
 
-        assert_eq!(shared.files().tasks[0].title, "Repair replicas");
+        assert_eq!(shared.files().tasks[0].title, "DFS maintenance");
         match rx.try_recv().expect("replica repair command") {
             FilesWorkerCommand::Operation {
                 request_id,
@@ -25985,7 +28748,7 @@ mod tests {
         hover_menu_path(&window, &["SIFS", "This device"])?;
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Make metadata primary")
+            .with_name("Move metadata authority here")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Make metadata primary");
@@ -26014,14 +28777,14 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Unpin metadata")
+                .with_name("Stop keeping metadata here")
                 .count()?,
             0,
             "unpinned metadata should expose pin, not unpin"
         );
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Pin metadata")
+            .with_name("Keep metadata on this device")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Pin metadata");
@@ -26050,14 +28813,14 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Unpin content")
+                .with_name("Stop keeping content here")
                 .count()?,
             0,
             "unpinned content should expose pin, not unpin"
         );
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Pin content")
+            .with_name("Keep content on this device")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Pin content");
@@ -26137,14 +28900,14 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Pin metadata")
+                .with_name("Keep metadata on this device")
                 .count()?,
             0,
             "pinned metadata should expose unpin, not pin"
         );
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Unpin metadata")
+            .with_name("Stop keeping metadata here")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Unpin metadata");
@@ -26173,14 +28936,14 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Pin content")
+                .with_name("Keep content on this device")
                 .count()?,
             0,
             "pinned content should expose unpin, not pin"
         );
         window
             .get_by_role(sui::SemanticsRole::MenuItem)
-            .with_name("Unpin content")
+            .with_name("Stop keeping content here")
             .click()?;
 
         assert_eq!(shared.files().tasks[0].title, "Unpin content");
@@ -26242,7 +29005,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Repair replicas")
+                .with_name("Run maintenance and refresh")
                 .count()?,
             0,
             "metadata connection errors should hide replica repair"
@@ -26250,7 +29013,7 @@ mod tests {
         assert_eq!(
             window
                 .get_by_role(sui::SemanticsRole::MenuItem)
-                .with_name("Pin metadata")
+                .with_name("Keep metadata on this device")
                 .count()?,
             0,
             "metadata connection errors should hide pin actions"
@@ -26352,13 +29115,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Advanced details")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide advanced")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
@@ -26398,13 +29161,13 @@ mod tests {
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Show details")
+            .with_name("Advanced details")
             .click()?;
         assert!(shared.files().inspector_details_open);
 
         window
             .get_by_role(sui::SemanticsRole::Button)
-            .with_name("Hide details")
+            .with_name("Hide advanced")
             .click()?;
         assert!(!shared.files().inspector_details_open);
 
