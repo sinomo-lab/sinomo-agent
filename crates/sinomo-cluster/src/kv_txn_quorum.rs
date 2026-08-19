@@ -796,6 +796,7 @@ fn remaining_authoritative_read_budget(
 
 const LOCAL_READ_INDEX_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 const LOCAL_READ_INDEX_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(5);
+const BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(250);
 const RANGE_AUTHORITY_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(250);
 
 /// Rechecks local ReadIndex admission after a forwarding attempt had time to
@@ -804,8 +805,9 @@ const RANGE_AUTHORITY_BUSY_RETRY_BUDGET: Duration = Duration::from_millis(250);
 /// A locally-originated read yields between short, bounded, non-queued probes.
 /// That gives the in-flight owner a chance to clear at the first available
 /// slot without letting background reads join the Raft operation FIFO ahead of
-/// formation or mutation writes. Formation-sensitive exact and snapshot reads
-/// use one interval; bounded range reads can use a longer adaptive grace budget.
+/// formation or mutation writes. Formation-sensitive request-outcome and
+/// snapshot reads use one interval; point, exact-set, and bounded range reads
+/// can use a longer adaptive grace budget.
 /// Already-forwarded requests never reach this helper, so they retain prompt
 /// rejection and never campaign. Callers preserve the original forwarding
 /// failure when this best-effort retry errors, exhausts its grace budget, or
@@ -2847,6 +2849,52 @@ where
     result
 }
 
+fn forwarded_point_read_admission_is_busy(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::ClusterReadOnly { detail }
+            if detail.contains("local Raft admission is busy")
+                && detail.contains("forwarded point read")
+    )
+}
+
+async fn retry_forward_cluster_kv_authoritative_entry_after_busy<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    key: &str,
+    options: ClusterKvTxnForwardOptions,
+    deadline: Instant,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let remaining =
+        remaining_authoritative_read_budget(deadline, "authoritative KV point forwarding retry")?;
+    let retry_deadline = Instant::now() + remaining.min(BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET);
+    let mut last_busy_error = None;
+    loop {
+        let retry_remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if retry_remaining.is_zero() {
+            return last_busy_error.map_or(Ok(None), Err);
+        }
+        tokio::time::sleep(retry_remaining.min(LOCAL_READ_INDEX_BUSY_RETRY_INTERVAL)).await;
+        match forward_cluster_kv_authoritative_entry_recovering_stale_leader_async(
+            runtime, paths, state, key, options, deadline, host,
+        )
+        .await
+        {
+            Ok(Some(read)) => return Ok(Some(read)),
+            Ok(None) => {}
+            Err(error) if forwarded_point_read_admission_is_busy(&error) => {
+                last_busy_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn forward_cluster_kv_authoritative_entries_recovering_stale_leader_async<H>(
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
@@ -2888,6 +2936,54 @@ where
     }
     remaining_authoritative_read_budget(deadline, "authoritative KV exact-key-set forwarding")?;
     result
+}
+
+fn forwarded_exact_key_set_read_admission_is_busy(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::ClusterReadOnly { detail }
+            if detail.contains("local Raft admission is busy")
+                && detail.contains("forwarded exact-key-set read")
+    )
+}
+
+async fn retry_forward_cluster_kv_authoritative_entries_after_busy<H>(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    keys: &[String],
+    options: ClusterKvTxnForwardOptions,
+    deadline: Instant,
+    host: &mut H,
+) -> Result<Option<KvAuthoritativeRead<Vec<Option<sinomo_kv::KvEntry>>>>, NetworkError>
+where
+    H: ClusterKvTxnQuorumAsyncHost,
+{
+    let remaining = remaining_authoritative_read_budget(
+        deadline,
+        "authoritative KV exact-key-set forwarding retry",
+    )?;
+    let retry_deadline = Instant::now() + remaining.min(BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET);
+    let mut last_busy_error = None;
+    loop {
+        let retry_remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if retry_remaining.is_zero() {
+            return last_busy_error.map_or(Ok(None), Err);
+        }
+        tokio::time::sleep(retry_remaining.min(LOCAL_READ_INDEX_BUSY_RETRY_INTERVAL)).await;
+        match forward_cluster_kv_authoritative_entries_recovering_stale_leader_async(
+            runtime, paths, state, keys, options, deadline, host,
+        )
+        .await
+        {
+            Ok(Some(read)) => return Ok(Some(read)),
+            Ok(None) => {}
+            Err(error) if forwarded_exact_key_set_read_admission_is_busy(&error) => {
+                last_busy_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn exact_key_set_route_is_definitely_unsupported(error: &NetworkError) -> bool {
@@ -3989,6 +4085,40 @@ where
     if let Some(reason) = forward_only {
         return Err(reason.into_error());
     }
+    if !local_admission_busy
+        && forwarding_failure
+            .as_ref()
+            .is_some_and(forwarded_exact_key_set_read_admission_is_busy)
+    {
+        match retry_forward_cluster_kv_authoritative_entries_after_busy(
+            runtime,
+            paths,
+            &consensus_state,
+            &keys,
+            options.forward_options,
+            deadline,
+            host,
+        )
+        .await
+        {
+            Ok(Some(read)) => {
+                let read =
+                    validate_forwarded_authoritative_entries_read(read, &consensus_state, &keys)?;
+                adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                state.term = state
+                    .term
+                    .max(consensus_state.term)
+                    .max(read.authority.term);
+                state.kv_revision = state
+                    .kv_revision
+                    .max(consensus_state.kv_revision)
+                    .max(read.authority.revision.0);
+                return Ok(read);
+            }
+            Ok(None) => {}
+            Err(error) => forwarding_failure = Some(error),
+        }
+    }
     if local_admission_busy {
         let keys_for_read = keys.clone();
         if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
@@ -3999,7 +4129,7 @@ where
             deadline,
             "authoritative KV exact-key-set local admission retry",
             ClusterRaftReadProjectionPolicy::DeadlineBounded,
-            LOCAL_READ_INDEX_BUSY_RETRY_BUDGET,
+            BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET,
             move |storage| storage.read_index_entries(&keys_for_read),
             host,
         )
@@ -4023,7 +4153,8 @@ where
                     .ok()
                 }
                 ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
-                    return Err(reason.into_error());
+                    reason.apply_forwarding_floor(&mut consensus_state)?;
+                    None
                 }
                 ClusterRaftReadIndexAttempt::NotLeader
                 | ClusterRaftReadIndexAttempt::LocalAdmissionBusy => None,
@@ -4041,6 +4172,43 @@ where
                     .max(consensus_state.kv_revision)
                     .max(read.authority.revision.0);
                 return Ok(read);
+            }
+        }
+        if options.allow_forwarding
+            && forwarding_failure
+                .as_ref()
+                .is_none_or(forwarded_exact_key_set_read_admission_is_busy)
+        {
+            match retry_forward_cluster_kv_authoritative_entries_after_busy(
+                runtime,
+                paths,
+                &consensus_state,
+                &keys,
+                options.forward_options,
+                deadline,
+                host,
+            )
+            .await
+            {
+                Ok(Some(read)) => {
+                    let read = validate_forwarded_authoritative_entries_read(
+                        read,
+                        &consensus_state,
+                        &keys,
+                    )?;
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
+                }
+                Ok(None) => {}
+                Err(error) => forwarding_failure = Some(error),
             }
         }
         return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
@@ -4241,6 +4409,38 @@ where
     if let Some(reason) = forward_only {
         return Err(reason.into_error());
     }
+    if !local_admission_busy
+        && forwarding_failure
+            .as_ref()
+            .is_some_and(forwarded_point_read_admission_is_busy)
+    {
+        match retry_forward_cluster_kv_authoritative_entry_after_busy(
+            runtime,
+            paths,
+            &consensus_state,
+            &key,
+            options.forward_options,
+            deadline,
+            host,
+        )
+        .await
+        {
+            Ok(Some(read)) => {
+                adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                state.term = state
+                    .term
+                    .max(consensus_state.term)
+                    .max(read.authority.term);
+                state.kv_revision = state
+                    .kv_revision
+                    .max(consensus_state.kv_revision)
+                    .max(read.authority.revision.0);
+                return Ok(read);
+            }
+            Ok(None) => {}
+            Err(error) => forwarding_failure = Some(error),
+        }
+    }
     if local_admission_busy {
         let key_for_read = key.clone();
         if let Ok(Some(retry)) = retry_local_read_index_after_busy_forward(
@@ -4251,7 +4451,7 @@ where
             deadline,
             "authoritative KV point local admission retry",
             ClusterRaftReadProjectionPolicy::DeadlineBounded,
-            LOCAL_READ_INDEX_BUSY_RETRY_BUDGET,
+            BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET,
             move |storage| storage.read_index_entry(&key_for_read),
             host,
         )
@@ -4275,7 +4475,8 @@ where
                     .ok()
                 }
                 ClusterRaftReadIndexAttempt::ForwardOnly(reason) => {
-                    return Err(reason.into_error());
+                    reason.apply_forwarding_floor(&mut consensus_state)?;
+                    None
                 }
                 ClusterRaftReadIndexAttempt::NotLeader
                 | ClusterRaftReadIndexAttempt::LocalAdmissionBusy => None,
@@ -4291,6 +4492,38 @@ where
                     .max(consensus_state.kv_revision)
                     .max(read.authority.revision.0);
                 return Ok(read);
+            }
+        }
+        if options.allow_forwarding
+            && forwarding_failure
+                .as_ref()
+                .is_none_or(forwarded_point_read_admission_is_busy)
+        {
+            match retry_forward_cluster_kv_authoritative_entry_after_busy(
+                runtime,
+                paths,
+                &consensus_state,
+                &key,
+                options.forward_options,
+                deadline,
+                host,
+            )
+            .await
+            {
+                Ok(Some(read)) => {
+                    adopt_newer_authoritative_consensus_members(state, &consensus_state);
+                    state.term = state
+                        .term
+                        .max(consensus_state.term)
+                        .max(read.authority.term);
+                    state.kv_revision = state
+                        .kv_revision
+                        .max(consensus_state.kv_revision)
+                        .max(read.authority.revision.0);
+                    return Ok(read);
+                }
+                Ok(None) => {}
+                Err(error) => forwarding_failure = Some(error),
             }
         }
         return Err(forwarding_failure.unwrap_or_else(|| NetworkError::ClusterReadOnly {
@@ -5101,6 +5334,8 @@ mod tests {
         busy_admission_release_delay: Duration,
         release_busy_admission_on_snapshot_forward: Option<sinomo_kv::ClusterKvRaftOperationGuard>,
         forwarded_point_reads: usize,
+        forwarded_point_read: Option<KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>>,
+        forwarded_point_read_returns_busy_count: usize,
         forwarded_prefix_reads: usize,
         forwarded_prefix_read: Option<KvAuthoritativeRead<Vec<sinomo_kv::KvEntry>>>,
         forwarded_prefix_read_returns_none_count: usize,
@@ -5109,6 +5344,7 @@ mod tests {
         forwarded_exact_reads: usize,
         forwarded_exact_states: Vec<ClusterBootstrapState>,
         forwarded_exact_read: Option<KvAuthoritativeRead<Vec<Option<sinomo_kv::KvEntry>>>>,
+        forwarded_exact_read_returns_busy_count: usize,
         forwarded_exact_read_returns_none: bool,
         forwarded_exact_read_unknown_route: bool,
         vote_requests: usize,
@@ -5299,27 +5535,36 @@ mod tests {
         ) -> ClusterMembershipRpcFuture<'a, Option<KvAuthoritativeRead<Option<sinomo_kv::KvEntry>>>>
         {
             self.forwarded_point_reads = self.forwarded_point_reads.saturating_add(1);
+            let call = self.forwarded_point_reads;
             let release = self.release_busy_admission_on_forward.take();
             let release_delay = self.busy_admission_release_delay;
+            let response = self.forwarded_point_read.clone();
+            let returns_busy = call <= self.forwarded_point_read_returns_busy_count;
             let remote_voter_count = sinomo_kv::cluster_kv_raft_voter_ids(state)
                 .expect("point-forward test voter topology")
                 .into_iter()
                 .filter(|node_id| node_id != &state.local_node_id)
                 .count();
             Box::pin(async move {
-                let Some(release) = release else {
-                    return Err(NetworkError::ClusterReadOnly {
-                        detail: "current-term point read unexpectedly forwarded".to_string(),
-                    });
-                };
                 assert_eq!(remote_voter_count, 2);
-                if release_delay.is_zero() {
-                    drop(release);
-                } else {
-                    std::thread::spawn(move || {
-                        std::thread::sleep(release_delay);
+                if let Some(release) = release {
+                    if release_delay.is_zero() {
                         drop(release);
+                    } else {
+                        std::thread::spawn(move || {
+                            std::thread::sleep(release_delay);
+                            drop(release);
+                        });
+                    }
+                }
+                if returns_busy {
+                    return Err(NetworkError::ClusterReadOnly {
+                        detail: "local Raft admission is busy and no authority accepted the forwarded point read; local election was skipped"
+                            .to_string(),
                     });
+                }
+                if let Some(response) = response {
+                    return Ok(Some(response));
                 }
                 Err(NetworkError::ClusterReadOnly {
                     detail: "both authenticated remote voters confirmed they are non-leaders"
@@ -5340,14 +5585,22 @@ mod tests {
             Option<KvAuthoritativeRead<Vec<Option<sinomo_kv::KvEntry>>>>,
         > {
             self.forwarded_exact_reads = self.forwarded_exact_reads.saturating_add(1);
+            let call = self.forwarded_exact_reads;
             self.forwarded_exact_states.push(state.clone());
             let response = self.forwarded_exact_read.clone();
+            let returns_busy = call <= self.forwarded_exact_read_returns_busy_count;
             let returns_none = self.forwarded_exact_read_returns_none;
             let unknown_route = self.forwarded_exact_read_unknown_route;
             Box::pin(async move {
                 if unknown_route {
                     return Err(NetworkError::UnknownRoute {
                         route: sinomo_kv::CLUSTER_KV_AUTHORITATIVE_ENTRIES_ROUTE.to_string(),
+                    });
+                }
+                if returns_busy {
+                    return Err(NetworkError::ClusterReadOnly {
+                        detail: "local Raft admission is busy and no authority accepted the forwarded exact-key-set read; local election was skipped"
+                            .to_string(),
                     });
                 }
                 if returns_none {
@@ -5422,13 +5675,21 @@ mod tests {
         ) -> ClusterMembershipRpcFuture<'a, Option<KvAuthoritativeRead<KvSnapshot>>> {
             self.forwarded_snapshot_reads = self.forwarded_snapshot_reads.saturating_add(1);
             let release = self.release_busy_admission_on_snapshot_forward.take();
+            let release_delay = self.busy_admission_release_delay;
             Box::pin(async move {
                 let Some(release) = release else {
                     return Err(NetworkError::ClusterReadOnly {
                         detail: "current-term snapshot read unexpectedly forwarded".to_string(),
                     });
                 };
-                drop(release);
+                if release_delay.is_zero() {
+                    drop(release);
+                } else {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(release_delay);
+                        drop(release);
+                    });
+                }
                 Err(NetworkError::ClusterReadOnly {
                     detail: "mixed-version snapshot fallback sentinel".to_string(),
                 })
@@ -7364,7 +7625,7 @@ mod tests {
     }
 
     #[test]
-    fn busy_local_point_read_retries_after_forwarding_releases_admission() {
+    fn busy_local_point_read_waits_briefly_for_forwarding_contender() {
         let fixture = cold_barrier_fixture("busy_local_point_read_rejoins_resident_leader");
         let last_index_before = commit_current_term_barrier(&fixture);
         let preparations_before =
@@ -7374,6 +7635,7 @@ mod tests {
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_forward: Some(held),
+            busy_admission_release_delay: Duration::from_millis(12),
             ..ExactSetReadIndexHost::default()
         };
         let mut options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
@@ -7406,10 +7668,11 @@ mod tests {
         assert_eq!(host.forwarded_point_reads, 1);
         assert_eq!(host.quorum_waves, 1);
         assert_eq!(host.vote_requests, 0, "local retry must never campaign");
-        assert_eq!(
-            crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root),
-            preparations_before.saturating_add(2),
-            "point read must perform one busy probe and exactly one local retry"
+        let preparations_after =
+            crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root);
+        assert!(
+            preparations_after >= preparations_before.saturating_add(3),
+            "point read must perform the initial busy probe and multiple non-queued retries; before={preparations_before}, after={preparations_after}"
         );
         assert_eq!(
             fixture
@@ -7425,6 +7688,145 @@ mod tests {
             started.elapsed() < Duration::from_millis(100),
             "point read local rejoin took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[test]
+    fn follower_point_read_retries_remote_busy_authority_without_campaigning() {
+        let fixture = cold_barrier_fixture("follower_point_read_retries_remote_busy_authority");
+        let last_index_before = commit_current_term_barrier(&fixture);
+        fixture
+            .paths
+            .kv_paths()
+            .raft_store()
+            .open_node(&fixture.local)
+            .expect("open follower fixture node")
+            .clear_known_leader()
+            .expect("make fixture a follower without a known leader");
+        let mut state = fixture.state.clone();
+        let forwarded = KvAuthoritativeRead {
+            value: None,
+            authority: KvAuthorityProof {
+                term: state.term,
+                commit_index: last_index_before,
+                revision: KvRevision(state.kv_revision),
+                basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+        };
+        let mut host = ExactSetReadIndexHost {
+            forwarded_point_read: Some(forwarded),
+            forwarded_point_read_returns_busy_count: 3,
+            ..ExactSetReadIndexHost::default()
+        };
+        let mut options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        options.raft_append_timeout = Duration::from_secs(5);
+        options.forward_options.timeout = Duration::from_secs(5);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let read = runtime
+            .block_on(read_cluster_kv_authoritative_entry_async_with_host(
+                runtime.handle(),
+                &fixture.paths,
+                &mut state,
+                "/cold/missing".to_string(),
+                options,
+                &mut host,
+            ))
+            .expect("follower must re-probe a transiently busy remote authority");
+
+        assert!(read.value.is_none());
+        assert_eq!(host.forwarded_point_reads, 4);
+        assert_eq!(host.quorum_waves, 0, "follower must not run ReadIndex");
+        assert_eq!(
+            host.vote_requests, 0,
+            "remote busy retry must never campaign"
+        );
+        assert_eq!(
+            fixture
+                .paths
+                .kv_paths()
+                .raft_store()
+                .locked_last_log_index(&fixture.local)
+                .expect("remote busy retry last Raft index"),
+            last_index_before,
+            "remote busy retry must not append a barrier or campaign"
+        );
+    }
+
+    #[test]
+    fn follower_exact_read_retries_remote_busy_authority_without_campaigning() {
+        let fixture = cold_barrier_fixture("follower_exact_read_retries_remote_busy_authority");
+        let last_index_before = commit_current_term_barrier(&fixture);
+        fixture
+            .paths
+            .kv_paths()
+            .raft_store()
+            .open_node(&fixture.local)
+            .expect("open follower fixture node")
+            .clear_known_leader()
+            .expect("make fixture a follower without a known leader");
+        let mut state = fixture.state.clone();
+        let keys = vec!["/cold/missing".to_string()];
+        let forwarded = KvAuthoritativeRead {
+            value: vec![None],
+            authority: KvAuthorityProof {
+                term: state.term,
+                commit_index: last_index_before,
+                revision: KvRevision(state.kv_revision),
+                basis: sinomo_kv::KvAuthorityBasis::CurrentTermQuorum {
+                    voter_acks: 2,
+                    required_quorum: 2,
+                },
+            },
+        };
+        let mut host = ExactSetReadIndexHost {
+            forwarded_exact_read: Some(forwarded),
+            forwarded_exact_read_returns_busy_count: 3,
+            ..ExactSetReadIndexHost::default()
+        };
+        let mut options = crate::ClusterControlPlaneTimeouts::default_daemon_transport()
+            .kv_txn_quorum_options(true);
+        options.raft_append_timeout = Duration::from_secs(5);
+        options.forward_options.timeout = Duration::from_secs(5);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let read = runtime
+            .block_on(read_cluster_kv_authoritative_entries_async_with_host(
+                runtime.handle(),
+                &fixture.paths,
+                &mut state,
+                keys,
+                options,
+                &mut host,
+            ))
+            .expect("follower must re-probe a transiently busy remote authority");
+
+        assert_eq!(read.value, vec![None]);
+        assert_eq!(host.forwarded_exact_reads, 4);
+        assert_eq!(host.quorum_waves, 0, "follower must not run ReadIndex");
+        assert_eq!(
+            host.vote_requests, 0,
+            "remote busy retry must never campaign"
+        );
+        assert_eq!(
+            fixture
+                .paths
+                .kv_paths()
+                .raft_store()
+                .locked_last_log_index(&fixture.local)
+                .expect("remote busy retry last Raft index"),
+            last_index_before,
+            "remote busy retry must not append a barrier or campaign"
         );
     }
 
@@ -7645,6 +8047,7 @@ mod tests {
         let mut state = fixture.state.clone();
         let mut host = ExactSetReadIndexHost {
             release_busy_admission_on_snapshot_forward: Some(held),
+            busy_admission_release_delay: Duration::from_millis(12),
             forwarded_exact_read_unknown_route: true,
             ..ExactSetReadIndexHost::default()
         };
@@ -7679,10 +8082,11 @@ mod tests {
         assert_eq!(host.forwarded_snapshot_reads, 1);
         assert_eq!(host.quorum_waves, 1);
         assert_eq!(host.vote_requests, 0, "local retry must never campaign");
-        assert_eq!(
-            crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root),
-            preparations_before.saturating_add(2),
-            "mixed-version fallback must perform one busy probe and exactly one local retry"
+        let preparations_after =
+            crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root);
+        assert!(
+            preparations_after >= preparations_before.saturating_add(3),
+            "mixed-version fallback must perform the initial busy probe and multiple non-queued retries; before={preparations_before}, after={preparations_after}"
         );
         assert_eq!(
             fixture
