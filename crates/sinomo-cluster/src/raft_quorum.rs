@@ -4061,10 +4061,53 @@ where
         },
     )
     .await?;
+    let (snapshot, authority) = if snapshot.revision == compact.authority.revision {
+        (snapshot, compact.authority)
+    } else {
+        // A compact commit deliberately does not refresh the full materialized
+        // checkpoint. If another compact writer owns the resident slot here,
+        // the observational read above can therefore return an older snapshot;
+        // conversely, a later writer can advance it beyond this commit. Repair
+        // either race with one inseparable ReadIndex snapshot/proof rather than
+        // attaching this commit's authority to a different KV generation.
+        match read_cluster_raft_with_read_index_attempt_async_with_projection_policy(
+            runtime,
+            paths,
+            state,
+            options.timeout,
+            append_options,
+            ClusterRaftReadProjectionPolicy::CompleteAdmittedSnapshot,
+            |storage| storage.read_index_snapshot(),
+            host,
+        )
+        .await?
+        {
+            ClusterRaftReadIndexAttempt::Confirmed(read) => (read.value, read.authority),
+            ClusterRaftReadIndexAttempt::NeedsBarrier(_) => {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "legacy full-view commit response needs a new current-term barrier"
+                        .to_string(),
+                });
+            }
+            ClusterRaftReadIndexAttempt::NotLeader => {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "local node lost Raft leadership while repairing a legacy full-view commit response"
+                        .to_string(),
+                });
+            }
+            ClusterRaftReadIndexAttempt::ForwardOnly(reason) => return Err(reason.into_error()),
+            ClusterRaftReadIndexAttempt::LocalAdmissionBusy => {
+                return Err(NetworkError::ClusterReadOnly {
+                    detail: "local Raft admission stayed busy while repairing a legacy full-view commit response"
+                        .to_string(),
+                });
+            }
+        }
+    };
     Ok(ClusterKvRaftQuorumCommitResult {
         snapshot,
         txn_response: compact.txn_response,
-        authority: compact.authority,
+        authority,
         replayed_committed_request: compact.replayed_committed_request,
     })
 }

@@ -8008,6 +8008,13 @@ fn higher_term_marked_probe_uses_durable_append_path() {
     request_thread.join().expect("join request");
     assert!(response.accepted);
     assert_eq!(response.append.term, 2);
+    assert_eq!(
+        read_cluster_state_without_kv(&paths)
+            .expect("read projected follower term")
+            .term,
+        2,
+        "durable AppendEntries term must suppress redundant same-term preflight closers"
+    );
     let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("inspect hard state");
     assert_eq!(node.hard_state().current_term, 2);
 }
@@ -8529,6 +8536,13 @@ fn cancelled_admitted_vote_finishes_durability_before_a_subsequent_vote() {
         .expect("subsequent vote response");
     assert!(response.accepted);
     assert!(response.vote.vote_granted);
+    assert_eq!(
+        read_cluster_state_without_kv(&paths)
+            .expect("read projected vote term")
+            .term,
+        2,
+        "durable RequestVote term must suppress redundant same-term preflight closers"
+    );
     let node = open_cluster_raft_kv_node(&paths, &local_node_id).expect("inspect durable vote");
     assert_eq!(node.hard_state().current_term, 2);
     assert_eq!(
@@ -21817,6 +21831,10 @@ fn async_cluster_raft_quorum_commit_uses_async_replication_and_fanout() {
         )
         .expect("async quorum commit");
 
+    assert_eq!(
+        result.snapshot.revision, result.authority.revision,
+        "legacy full-view response must pair one snapshot generation with its authority proof"
+    );
     assert_eq!(
         result
             .snapshot

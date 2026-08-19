@@ -254,6 +254,11 @@ fn handle_cluster_raft_append_request_durable(
         request.snapshot,
         request.append,
     )?;
+    // Keep the cheap RPC admission projection aligned with the hard state
+    // that AppendEntries just made durable. Otherwise every later heartbeat
+    // at this same term looks higher to the preflight and needlessly starts
+    // another exclusive higher-term closer, briefly fencing local KV work.
+    state.term = state.term.max(append.term);
     // The append may itself have committed a new config. Persist its effective
     // role projection so restart/local demotion cannot resurrect stale voters.
     project_committed_cluster_raft_config(paths, &mut state)?;
@@ -533,7 +538,13 @@ fn handle_cluster_raft_vote_request_durable(
             },
         )
         .map_err(kv_err)??;
-    let (vote, (state, rejection_detail)) = vote;
+    let (vote, (mut state, rejection_detail)) = vote;
+    // RequestVote can advance hard state even when the vote is rejected.
+    // Persist that observed term in the bootstrap projection for the same
+    // reason as AppendEntries: same-term RPCs must not repeatedly re-fence
+    // otherwise valid local authority.
+    state.term = state.term.max(vote.term);
+    write_cluster_state_unlocked(paths, &state)?;
     Ok(ClusterRaftVoteResponse {
         accepted: vote.vote_granted,
         detail: rejection_detail.unwrap_or_else(|| {

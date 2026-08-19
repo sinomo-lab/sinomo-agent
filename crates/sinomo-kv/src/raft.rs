@@ -223,6 +223,42 @@ impl Drop for PendingHigherRaftTermExclusiveLease {
         self.gate.changed.notify_all();
     }
 }
+
+/// Admission retained while one AppendEntries request applies. A request at
+/// or below already-durable hard state shares the ordinary authority side of
+/// the gate: a later higher-term publication linearizes after it and waits for
+/// this lease to drain. Only a request that can advance/close durable term
+/// owns the exclusive side and briefly fences local authority.
+#[derive(Debug)]
+#[allow(dead_code)] // The settled variant owns its lease solely for Drop.
+enum PendingHigherRaftTermAppendLease {
+    Settled(PendingHigherRaftTermAuthorityLease),
+    Closing(PendingHigherRaftTermExclusiveLease),
+}
+
+impl PendingHigherRaftTermAppendLease {
+    fn ensure_observation_is_current(&self, observed_term: u64) -> Result<(), KvError> {
+        let Self::Closing(lease) = self else {
+            // A higher-term publication after shared admission is ordered
+            // after this request and waits for the retained authority lease.
+            return Ok(());
+        };
+        ClusterKvRaftStore::ensure_pending_higher_term_observation_is_current(
+            lease,
+            observed_term,
+        )
+    }
+
+    fn clear_if_durable(
+        &self,
+        generation: PendingHigherRaftTermGeneration,
+        durable_term: u64,
+    ) {
+        if let Self::Closing(lease) = self {
+            lease.clear_if_durable(generation, durable_term);
+        }
+    }
+}
 /// Process-resident durable Raft nodes, keyed by their node-local WAL root.
 ///
 /// etcd keeps its MVCC store, Raft storage, and backend open for the lifetime of
@@ -7507,6 +7543,59 @@ impl ClusterKvRaftStore {
         Ok(PendingHigherRaftTermExclusiveLease { gate })
     }
 
+    fn acquire_pending_higher_term_append_lease(
+        &self,
+        node_id: &NodeId,
+        append_term: u64,
+        durable_term: u64,
+    ) -> Result<PendingHigherRaftTermAppendLease, KvError> {
+        let root = self.wal_paths(node_id).root;
+        let gate = self.pending_higher_term_gate(node_id)?;
+        let mut state = gate
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.exclusive {
+            state = gate
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if state.floor.is_none() && append_term <= durable_term {
+            state.active_authority_leases = state
+                .active_authority_leases
+                .checked_add(1)
+                .ok_or_else(|| KvError::Io {
+                    path: root.display().to_string(),
+                    detail: "pending higher Raft term authority lease count overflow".to_string(),
+                })?;
+            drop(state);
+            return Ok(PendingHigherRaftTermAppendLease::Settled(
+                PendingHigherRaftTermAuthorityLease { gate },
+            ));
+        }
+        if let Some(pending_term) = state.floor
+            && append_term < pending_term
+        {
+            return Err(KvError::AuthorityUnavailable {
+                detail: format!(
+                    "cannot apply a Raft append at term {append_term} while observed Raft term {pending_term} is pending durable hard state"
+                ),
+            });
+        }
+        state.exclusive = true;
+        while state.active_authority_leases > 0 {
+            state = gate
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(state);
+        Ok(PendingHigherRaftTermAppendLease::Closing(
+            PendingHigherRaftTermExclusiveLease { gate },
+        ))
+    }
+
     /// Publish a higher term before queuing the durable hard-state update.
     /// Floors are monotonic so concurrent observations cannot make an older
     /// persistence completion reopen authority prematurely.
@@ -8130,8 +8219,12 @@ impl ClusterKvRaftStore {
         )?;
         let incoming_snapshot = snapshot.as_ref().map(|snapshot| snapshot.kv.clone());
         let mut node = self.open_node(node_id)?;
-        let term_lease = self.acquire_pending_higher_term_exclusive_lease(node_id)?;
-        Self::ensure_pending_higher_term_observation_is_current(&term_lease, append.term)?;
+        let term_lease = self.acquire_pending_higher_term_append_lease(
+            node_id,
+            append.term,
+            node.hard_state().current_term,
+        )?;
+        term_lease.ensure_observation_is_current(append.term)?;
         let before_applied_index = node.applied_index();
         let (response, snapshot_restored, before_revision) =
             node.apply_append_entries_with_optional_snapshot_state(snapshot, append)?;
@@ -11787,6 +11880,43 @@ mod pending_higher_term_gate_tests {
             },
             root_ino: ino,
         }
+    }
+
+    #[test]
+    fn settled_append_uses_shared_term_admission_until_later_publication() {
+        let paths = ClusterKvPaths::new("/pending-higher-term-settled-append");
+        let node_id =
+            NodeId::from_legacy_named("node_pending_higher_term_settled_append").expect("node id");
+        let store = ClusterKvRaftStore::new(paths, default_cluster_kv_raft_compaction_policy());
+        let lease = store
+            .acquire_pending_higher_term_append_lease(&node_id, 3, 3)
+            .expect("admit settled append");
+        assert!(matches!(
+            lease,
+            PendingHigherRaftTermAppendLease::Settled(_)
+        ));
+        let gate = store
+            .pending_higher_term_gate(&node_id)
+            .expect("pending term gate");
+        {
+            let state = gate.state.lock().expect("pending term state");
+            assert!(!state.exclusive);
+            assert_eq!(state.active_authority_leases, 1);
+        }
+
+        store
+            .publish_pending_higher_term(&node_id, 4)
+            .expect("publish after append admission");
+        {
+            let state = gate.state.lock().expect("published term state");
+            assert_eq!(state.floor, Some(4));
+            assert!(!state.exclusive);
+            assert_eq!(state.active_authority_leases, 1);
+        }
+        drop(lease);
+        let state = gate.state.lock().expect("released term state");
+        assert_eq!(state.active_authority_leases, 0);
+        assert_eq!(state.floor, Some(4));
     }
 
     #[test]
