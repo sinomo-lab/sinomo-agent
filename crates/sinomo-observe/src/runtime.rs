@@ -5,9 +5,10 @@ use metrics::{
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::local::SinomoDataDir;
-use std::collections::{BTreeMap, VecDeque};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{Event, Subscriber, field};
@@ -394,16 +395,6 @@ impl ObserveMetricDescriptor {
             self.semantics.aggregation
         } else {
             ObserveMetricAggregation::None
-        }
-    }
-}
-
-impl ObserveMetricKind {
-    fn as_key_prefix(self) -> &'static str {
-        match self {
-            Self::Counter => "counter",
-            Self::Gauge => "gauge",
-            Self::Histogram => "histogram",
         }
     }
 }
@@ -1879,34 +1870,146 @@ impl field::Visit for JsonFieldVisitor {
     }
 }
 
-#[derive(Default)]
 struct ObserveMetricsRecorder {
-    slots: Mutex<BTreeMap<String, Arc<ObserveMetricSlot>>>,
+    id: u64,
+    slots: RwLock<ObserveMetricSlots>,
+}
+
+static NEXT_OBSERVE_METRICS_RECORDER_ID: AtomicU64 = AtomicU64::new(1);
+
+impl Default for ObserveMetricsRecorder {
+    fn default() -> Self {
+        Self {
+            id: NEXT_OBSERVE_METRICS_RECORDER_ID.fetch_add(1, Ordering::Relaxed),
+            slots: RwLock::new(ObserveMetricSlots::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ObserveMetricSlots {
+    counters: HashMap<Key, Arc<ObserveMetricSlot>>,
+    gauges: HashMap<Key, Arc<ObserveMetricSlot>>,
+    histograms: HashMap<Key, Arc<ObserveMetricSlot>>,
+}
+
+impl ObserveMetricSlots {
+    fn for_kind(&self, kind: ObserveMetricKind) -> &HashMap<Key, Arc<ObserveMetricSlot>> {
+        match kind {
+            ObserveMetricKind::Counter => &self.counters,
+            ObserveMetricKind::Gauge => &self.gauges,
+            ObserveMetricKind::Histogram => &self.histograms,
+        }
+    }
+
+    fn for_kind_mut(
+        &mut self,
+        kind: ObserveMetricKind,
+    ) -> &mut HashMap<Key, Arc<ObserveMetricSlot>> {
+        match kind {
+            ObserveMetricKind::Counter => &mut self.counters,
+            ObserveMetricKind::Gauge => &mut self.gauges,
+            ObserveMetricKind::Histogram => &mut self.histograms,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.counters
+            .len()
+            .saturating_add(self.gauges.len())
+            .saturating_add(self.histograms.len())
+    }
+}
+
+#[derive(Default)]
+struct ObserveMetricThreadCache {
+    recorder_id: u64,
+    slots: ObserveMetricSlots,
+}
+
+thread_local! {
+    static OBSERVE_METRIC_THREAD_CACHE: RefCell<ObserveMetricThreadCache> =
+        RefCell::new(ObserveMetricThreadCache::default());
 }
 
 impl ObserveMetricsRecorder {
     fn slot(&self, key: &Key, kind: ObserveMetricKind) -> Arc<ObserveMetricSlot> {
-        let map_key = observe_metric_map_key(key, kind);
-        let mut slots = self.slots.lock().expect("observe metrics lock poisoned");
-        Arc::clone(slots.entry(map_key).or_insert_with(|| {
-            Arc::new(ObserveMetricSlot::new(
-                key.name().to_string(),
-                observe_metric_labels(key),
-                kind,
-            ))
-        }))
+        if let Some(slot) = OBSERVE_METRIC_THREAD_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            (cache.recorder_id == self.id)
+                .then(|| cache.slots.for_kind(kind).get(key).cloned())
+                .flatten()
+        }) {
+            return slot;
+        }
+
+        if let Some(slot) = self
+            .slots
+            .read()
+            .expect("observe metrics lock poisoned")
+            .for_kind(kind)
+            .get(key)
+        {
+            let slot = Arc::clone(slot);
+            self.remember_thread_slot(key, kind, &slot);
+            return slot;
+        }
+
+        let mut slots = self.slots.write().expect("observe metrics lock poisoned");
+        let slot = Arc::clone(
+            slots
+                .for_kind_mut(kind)
+                .entry(key.to_retained())
+                .or_insert_with(|| {
+                    Arc::new(ObserveMetricSlot::new(
+                        key.name().to_string(),
+                        observe_metric_labels(key),
+                        kind,
+                    ))
+                }),
+        );
+        drop(slots);
+        self.remember_thread_slot(key, kind, &slot);
+        slot
+    }
+
+    fn remember_thread_slot(
+        &self,
+        key: &Key,
+        kind: ObserveMetricKind,
+        slot: &Arc<ObserveMetricSlot>,
+    ) {
+        OBSERVE_METRIC_THREAD_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.recorder_id != self.id {
+                *cache = ObserveMetricThreadCache {
+                    recorder_id: self.id,
+                    slots: ObserveMetricSlots::default(),
+                };
+            }
+            cache
+                .slots
+                .for_kind_mut(kind)
+                .insert(key.to_retained(), Arc::clone(slot));
+        });
     }
 
     fn snapshot(&self) -> Vec<ObserveMetricRecord> {
-        let Ok(slots) = self.slots.lock() else {
+        let Ok(slots) = self.slots.read() else {
             return Vec::new();
         };
-        slots.values().map(|slot| slot.snapshot()).collect()
+        slots
+            .counters
+            .values()
+            .chain(slots.gauges.values())
+            .chain(slots.histograms.values())
+            .map(|slot| slot.snapshot())
+            .collect()
     }
 
     fn slot_count(&self) -> usize {
         self.slots
-            .lock()
+            .read()
             .map(|slots| slots.len())
             .unwrap_or_default()
     }
@@ -2144,17 +2247,6 @@ fn histogram_bucket_snapshot(bucket_counts: &[u64]) -> Vec<ObserveHistogramBucke
         .collect()
 }
 
-fn observe_metric_map_key(key: &Key, kind: ObserveMetricKind) -> String {
-    let mut value = format!("{}:{}", kind.as_key_prefix(), key.name());
-    for label in key.labels() {
-        value.push('|');
-        value.push_str(label.key());
-        value.push('=');
-        value.push_str(label.value());
-    }
-    value
-}
-
 fn observe_metric_labels(key: &Key) -> BTreeMap<String, String> {
     key.labels()
         .map(|label| (label.key().to_string(), label.value().to_string()))
@@ -2167,6 +2259,29 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracing_subscriber::Registry;
+
+    #[test]
+    fn metric_recorder_reuses_a_registered_slot_without_rebuilding_its_key() {
+        let recorder = ObserveMetricsRecorder::default();
+        let key = Key::from_parts(
+            "sinomo.test.hot_counter",
+            vec![metrics::Label::new("path", "routed")],
+        );
+
+        let first = recorder.slot(&key, ObserveMetricKind::Counter);
+        let second = recorder.slot(&key, ObserveMetricKind::Counter);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        CounterFn::increment(first.as_ref(), 2);
+        CounterFn::increment(second.as_ref(), 3);
+        assert_eq!(recorder.slot_count(), 1);
+        assert_eq!(recorder.snapshot()[0].value, Some(5.0));
+
+        let replacement_recorder = ObserveMetricsRecorder::default();
+        let replacement = replacement_recorder.slot(&key, ObserveMetricKind::Counter);
+        assert!(!Arc::ptr_eq(&first, &replacement));
+        assert_eq!(replacement_recorder.slot_count(), 1);
+    }
 
     #[test]
     fn self_health_reports_current_exporter_state_with_bounded_labels() {
