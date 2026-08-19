@@ -192,22 +192,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        self.check_cancelled("distributed stat")?;
-        let requested = normalize_posix_path(path)?;
-        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
-        let path = self.resolve_existing_posix_path_distributed(path, true)?;
-        self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
-        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
-        let object = self
-            .lookup_sifs_path_direct_distributed_synced_from_snapshot(
-                &path,
-                shard_snapshot.as_deref(),
-            )?
-            .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
-        if object.kind == DfsObjectKind::Tombstone {
-            return Err(DfsPosixError::NotFound { path });
-        }
-        self.stat_object_for_path(&object, &path)
+        self.with_metadata_lookup_cache_mut(|service| {
+            service.check_cancelled("distributed stat")?;
+            let requested = normalize_posix_path(path)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
+            let path = service.resolve_existing_posix_path_distributed(path, true)?;
+            service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
+            let shard_snapshot = service.refresh_sifs_metadata_shards()?;
+            let object = service
+                .lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                    &path,
+                    shard_snapshot.as_deref(),
+                )?
+                .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+            if object.kind == DfsObjectKind::Tombstone {
+                return Err(DfsPosixError::NotFound { path });
+            }
+            service.stat_object_for_path(&object, &path)
+        })
     }
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {

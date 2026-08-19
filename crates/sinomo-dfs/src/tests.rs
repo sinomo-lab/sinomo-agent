@@ -42438,15 +42438,30 @@ fn sifs_cluster_routed_lookup_under_split_prefix_uses_exact_path_primary() {
     let services_thread =
         std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
 
+    crate::posix::reset_posix_metadata_raw_lookup_count();
     let stat = replica
         .posix_stat_distributed(path)
         .expect("distributed stat follows exact path primary");
+    let component_count = path.trim_matches('/').split('/').count();
+    let stat_lookup_count = crate::posix::posix_metadata_raw_lookup_count();
+    let stat_lookup_bound = component_count + 4;
+    assert!(
+        stat_lookup_count <= stat_lookup_bound,
+        "distributed stat performed {stat_lookup_count} raw metadata lookups for {component_count} path components; expected no more than {stat_lookup_bound} including root and fixed authority checks"
+    );
     assert_eq!(stat.size_bytes, Some(bytes.len() as u64));
+    crate::posix::reset_posix_metadata_raw_lookup_count();
     assert_eq!(
         replica
             .posix_read_file_distributed(path)
             .expect("distributed read after exact-primary stat"),
         bytes
+    );
+    let read_lookup_count = crate::posix::posix_metadata_raw_lookup_count();
+    let read_lookup_bound = component_count + 6;
+    assert!(
+        read_lookup_count <= read_lookup_bound,
+        "distributed read performed {read_lookup_count} raw metadata lookups for {component_count} path components; expected no more than {read_lookup_bound} including root and fixed authority/content checks"
     );
 
     stop.store(true, Ordering::SeqCst);

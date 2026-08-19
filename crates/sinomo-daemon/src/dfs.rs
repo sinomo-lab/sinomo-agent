@@ -102,6 +102,12 @@ const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60
 const DAEMON_DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS: usize = 4;
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);
 const DAEMON_DFS_MUTATION_SHARD_GATE_LIMIT: usize = 256;
+// DFS provider discovery is a routing hint, not an authority decision. Keep a
+// short process-local lease so every routed metadata lookup does not stat and
+// range the materialized cluster KV snapshot. The retained cluster-state Arc
+// still invalidates membership changes immediately; service-only changes are
+// observed within this bounded lease.
+const DAEMON_DFS_PEER_DISCOVERY_VALIDATION_LEASE: Duration = Duration::from_millis(250);
 const DAEMON_DFS_MOUNTED_MUTATION_REPROBE_INTERVAL: Duration = Duration::from_secs(5);
 const SINOMO_DFS_ZONE_ENV: &str = "SINOMO_DFS_ZONE";
 const DAEMON_DEFAULT_DFS_RECONCILIATION_RETRY_INITIAL: Duration = Duration::from_secs(1);
@@ -217,6 +223,13 @@ struct DaemonDfsMessagePeerSnapshot {
     cluster_id: sinomo_core::Id,
     local_node_id: sinomo_core::node::NodeId,
     peer_node_ids: Vec<NodeId>,
+}
+
+#[derive(Clone, Debug)]
+struct DaemonDfsPeerDiscoveryCacheEntry {
+    cluster_state: Arc<sinomo_core::ClusterBootstrapState>,
+    peer_node_ids: Vec<NodeId>,
+    validated_at: Instant,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1581,6 +1594,9 @@ impl Drop for DaemonDfsReplicaMaterializationLane {
 
 static DAEMON_DFS_MESSAGE_SERVICE_CACHE: OnceLock<
     Mutex<BTreeMap<PathBuf, DaemonDfsMessageServiceCacheEntry>>,
+> = OnceLock::new();
+static DAEMON_DFS_PEER_DISCOVERY_CACHE: OnceLock<
+    Mutex<BTreeMap<PathBuf, DaemonDfsPeerDiscoveryCacheEntry>>,
 > = OnceLock::new();
 #[cfg(test)]
 static DAEMON_DFS_TEST_MESSAGE_SERVICE_LANE_OPENS: OnceLock<Mutex<BTreeMap<PathBuf, usize>>> =
@@ -6295,6 +6311,11 @@ fn daemon_dfs_message_service_cache()
     DAEMON_DFS_MESSAGE_SERVICE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+fn daemon_dfs_peer_discovery_cache()
+-> &'static Mutex<BTreeMap<PathBuf, DaemonDfsPeerDiscoveryCacheEntry>> {
+    DAEMON_DFS_PEER_DISCOVERY_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 /// Borrow only an already-published resident metadata generation for status.
 /// A busy cache, missing hydration, or observed authority rollover is an
 /// explicit unavailable result: this read-only path must never wait for or
@@ -7422,7 +7443,34 @@ fn read_daemon_dfs_message_peer_snapshot(
             Err(sinomo_core::network::NetworkError::ClusterOrphan) => return Ok(None),
             Err(error) => return Err(daemon_dfs_network_error(error)),
         };
-    let peer_node_ids = sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
+    let cache_key = cluster_paths.root.clone();
+    let cached_peer_node_ids = daemon_dfs_peer_discovery_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+        .filter(|cached| {
+            Arc::ptr_eq(&cached.cluster_state, &state)
+                && cached.validated_at.elapsed() <= DAEMON_DFS_PEER_DISCOVERY_VALIDATION_LEASE
+        })
+        .map(|cached| cached.peer_node_ids);
+    let peer_node_ids = match cached_peer_node_ids {
+        Some(peer_node_ids) => peer_node_ids,
+        None => {
+            let peer_node_ids =
+                sinomo_dfs::discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
+            if let Ok(mut cache) = daemon_dfs_peer_discovery_cache().lock() {
+                cache.insert(
+                    cache_key,
+                    DaemonDfsPeerDiscoveryCacheEntry {
+                        cluster_state: Arc::clone(&state),
+                        peer_node_ids: peer_node_ids.clone(),
+                        validated_at: Instant::now(),
+                    },
+                );
+            }
+            peer_node_ids
+        }
+    };
     Ok(Some(DaemonDfsMessagePeerSnapshot {
         cluster_id: state.cluster_id.clone(),
         local_node_id: state.local_node_id.clone(),
@@ -12803,6 +12851,58 @@ mod tests {
         assert_eq!(leased.cluster_id, first.cluster_id);
         assert_eq!(leased.local_node_id, first.local_node_id);
         assert_eq!(leased.peer_node_ids, first.peer_node_ids);
+    }
+
+    #[test]
+    fn daemon_dfs_peer_snapshot_leases_provider_discovery_without_leasing_identity() {
+        let root = temp_root("daemon-dfs-peer-snapshot-provider-lease");
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("data directory");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_daemon_dfs_peer_snapshot_provider_lease")
+                .expect("cluster id"),
+            "daemon DFS peer snapshot provider lease",
+            NodeId::from_legacy_named("node_daemon_dfs_peer_snapshot_provider_lease")
+                .expect("node id"),
+            "local",
+            "pk-local",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write cluster state");
+
+        let first = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read initial peer snapshot")
+            .expect("initial peer snapshot");
+        let kv_snapshot = cluster_paths.kv_paths().snapshot;
+        fs::write(&kv_snapshot, b"invalid cluster KV snapshot")
+            .expect("corrupt provider discovery source");
+
+        let leased = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+            .expect("read leased peer snapshot")
+            .expect("leased peer snapshot");
+        assert_eq!(leased.cluster_id, first.cluster_id);
+        assert_eq!(leased.local_node_id, first.local_node_id);
+        assert_eq!(leased.peer_node_ids, first.peer_node_ids);
+
+        let cache_key = cluster_paths.root.clone();
+        daemon_dfs_peer_discovery_cache()
+            .lock()
+            .expect("peer discovery cache")
+            .get_mut(&cache_key)
+            .expect("peer discovery cache entry")
+            .validated_at = Instant::now()
+            .checked_sub(DAEMON_DFS_PEER_DISCOVERY_VALIDATION_LEASE + Duration::from_millis(1))
+            .expect("backdated validation instant");
+        assert!(
+            read_daemon_dfs_message_peer_snapshot(&cluster_paths).is_err(),
+            "an expired routing lease must validate the current provider catalog"
+        );
+        daemon_dfs_peer_discovery_cache()
+            .lock()
+            .expect("peer discovery cache cleanup")
+            .remove(&cache_key);
     }
 
     #[test]

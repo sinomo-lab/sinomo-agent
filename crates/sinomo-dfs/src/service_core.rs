@@ -153,6 +153,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         result
     }
 
+    pub(crate) fn with_metadata_lookup_cache_mut<R>(
+        &mut self,
+        operation: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let outer = self.enter_metadata_lookup_cache_scope();
+        let result = operation(self);
+        self.exit_metadata_lookup_cache_scope(outer);
+        result
+    }
+
     fn enter_metadata_lookup_cache_scope(&self) -> bool {
         let outer = if let Ok(mut depth) = self.metadata_lookup_cache_depth.lock() {
             let outer = *depth == 0;

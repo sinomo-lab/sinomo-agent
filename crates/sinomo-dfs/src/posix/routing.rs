@@ -261,6 +261,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<(String, Option<DfsObjectMetadata>)> {
+        self.with_metadata_lookup_cache_mut(|service| {
+            service.lookup_sifs_path_distributed_synced_with_cache(path, follow_final)
+        })
+    }
+
+    fn lookup_sifs_path_distributed_synced_with_cache(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+    ) -> Result<(String, Option<DfsObjectMetadata>)> {
         let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
