@@ -1069,15 +1069,47 @@ impl<'a, H: ClusterObjectRpcAsyncHost> ClusterObjectRpcClient<'a, H> {
         paths: &'a ClusterPaths,
         state: &ClusterBootstrapState,
     ) -> Result<Self, NetworkError> {
+        Self::routed_from_fenced_bootstrap_state_inner(host, paths, state, None)
+    }
+
+    /// Build a routed client whose authorization and endpoints remain fenced
+    /// to `state`, while route planning may use connectivity evidence from a
+    /// locally observed directory projection.
+    ///
+    /// The evidence provider is queried only while capturing a cold prepared
+    /// connector. Its members and endpoints are ignored, so a newer or stale
+    /// projection cannot widen the accepted Raft/KV membership fence.
+    pub fn routed_from_fenced_bootstrap_state_with_connectivity(
+        host: &'a mut H,
+        paths: &'a ClusterPaths,
+        state: &ClusterBootstrapState,
+        connectivity: Arc<dyn crate::ClusterDirectory>,
+    ) -> Result<Self, NetworkError> {
+        Self::routed_from_fenced_bootstrap_state_inner(host, paths, state, Some(connectivity))
+    }
+
+    fn routed_from_fenced_bootstrap_state_inner(
+        host: &'a mut H,
+        paths: &'a ClusterPaths,
+        state: &ClusterBootstrapState,
+        connectivity: Option<Arc<dyn crate::ClusterDirectory>>,
+    ) -> Result<Self, NetworkError> {
         let fingerprint = fenced_bootstrap_route_fingerprint(state)?;
+        let directory = match connectivity {
+            Some(connectivity) => {
+                crate::directory::cluster_directory_from_fenced_bootstrap_state_with_connectivity(
+                    state,
+                    connectivity,
+                )
+            }
+            None => crate::directory::cluster_directory_from_fenced_bootstrap_state(state),
+        };
         Ok(Self {
             host,
             route_context: Some(ClusterObjectRpcRouteContext {
                 paths,
                 directory: ClusterObjectRpcRouteDirectory::FencedBootstrap {
-                    directory: crate::directory::cluster_directory_from_fenced_bootstrap_state(
-                        state,
-                    ),
+                    directory,
                     cluster_id: state.cluster_id.clone(),
                     local_node_id: state.local_node_id.clone(),
                     fingerprint,
@@ -1710,6 +1742,41 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ConnectivityOnlyRouteDirectory(crate::DirectoryRoutingRecordsSnapshot);
+
+    impl crate::ClusterDirectory for ConnectivityOnlyRouteDirectory {
+        fn members(&self) -> Result<Vec<sinomo_base::ClusterMemberRecord>, NetworkError> {
+            panic!("fenced connectivity evidence must not supply members")
+        }
+
+        fn endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+            panic!("fenced connectivity evidence must not supply endpoints")
+        }
+
+        fn node_statuses(
+            &self,
+        ) -> Result<BTreeMap<NodeId, sinomo_base::ClusterNodeStatusRecord>, NetworkError> {
+            panic!("fenced connectivity evidence must not supply statuses")
+        }
+
+        fn connectivity_records(
+            &self,
+        ) -> Result<Vec<crate::ClusterConnectivityRecord>, NetworkError> {
+            panic!("fenced connectivity evidence must use one routing snapshot")
+        }
+
+        fn version(&self) -> Result<crate::DirectoryVersion, NetworkError> {
+            panic!("fenced connectivity evidence must not supply a generation")
+        }
+
+        fn routing_records_snapshot(
+            &self,
+        ) -> Result<crate::DirectoryRoutingRecordsSnapshot, NetworkError> {
+            Ok(self.0.clone())
+        }
+    }
+
     struct RegisteredDirectoryActivation(Arc<std::sync::atomic::AtomicBool>);
 
     impl Drop for RegisteredDirectoryActivation {
@@ -1800,6 +1867,102 @@ mod tests {
                 .endpoints,
             vec![target_endpoint]
         );
+    }
+
+    #[test]
+    fn fenced_bootstrap_route_imports_only_connectivity_from_observed_directory() {
+        let cluster_id =
+            sinomo_base::Id::from_legacy_named("fenced-connectivity-cluster").expect("cluster id");
+        let local_node_id =
+            sinomo_base::Id::from_legacy_named("fenced-connectivity-local").expect("local node");
+        let target_node_id =
+            sinomo_base::Id::from_legacy_named("fenced-connectivity-target").expect("target node");
+        let unaccepted_node_id =
+            sinomo_base::Id::from_legacy_named("fenced-connectivity-unaccepted")
+                .expect("unaccepted node");
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "fenced-connectivity",
+            local_node_id.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        let mut target = sinomo_base::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            target_node_id.clone(),
+            "target",
+            "target-public-key",
+            now,
+        );
+        let target_endpoint =
+            ClusterEndpointRecord::loopback(target_node_id.clone(), "127.0.0.1:45680");
+        target.endpoints.push(target_endpoint.clone());
+        state.members.push(target);
+        state.kv_revision = 53;
+
+        let mut unaccepted = sinomo_base::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            unaccepted_node_id.clone(),
+            "unaccepted",
+            "unaccepted-public-key",
+            now,
+        );
+        let unaccepted_endpoint =
+            ClusterEndpointRecord::loopback(unaccepted_node_id.clone(), "127.0.0.1:45681");
+        unaccepted.endpoints.push(unaccepted_endpoint.clone());
+        let connectivity = crate::ClusterConnectivityRecord {
+            cluster_id,
+            source_node_id: local_node_id,
+            target_node_id: target_node_id.clone(),
+            endpoint_id: target_endpoint.endpoint_id.clone(),
+            transport: target_endpoint.transport.clone(),
+            address: target_endpoint.address.clone(),
+            state: crate::ClusterConnectivityState::Healthy,
+            latency_ms: Some(2),
+            consecutive_failures: 0,
+            last_success_at: None,
+            last_failure_at: None,
+            failure_reason: None,
+            observed_at: now,
+            expires_at: now + time::Duration::minutes(15),
+        };
+        let observed = Arc::new(ConnectivityOnlyRouteDirectory(
+            crate::DirectoryRoutingRecordsSnapshot::new(
+                crate::DirectoryVersion(91),
+                vec![unaccepted],
+                vec![unaccepted_endpoint],
+                vec![connectivity.clone()],
+            ),
+        ));
+
+        let root = PathBuf::from("/test/fenced-connectivity-provider");
+        let paths = ClusterPaths {
+            state: root.join("state.sobj"),
+            connectivity_local: root.join("connectivity-local.sobj"),
+            root,
+        };
+        let mut host = NoopObjectRpcHost;
+        let client = ClusterObjectRpcClient::routed_from_fenced_bootstrap_state_with_connectivity(
+            &mut host, &paths, &state, observed,
+        )
+        .expect("fenced routed client with connectivity");
+        let context = client.route_context.expect("fenced route context");
+        let (directory, _) = context.directory(&state).expect("fenced route directory");
+        assert_eq!(directory.routing_version(), Ok(crate::DirectoryVersion(53)));
+        let (version, members, endpoints, connectivity_records) = directory
+            .routing_records_snapshot()
+            .expect("fenced routing snapshot")
+            .into_parts();
+        let snapshot = crate::DirectorySnapshot::try_from_records(version, members, endpoints)
+            .expect("exact fenced directory snapshot");
+        assert!(snapshot.node(&target_node_id).is_some());
+        assert!(
+            snapshot.node(&unaccepted_node_id).is_none(),
+            "connectivity evidence must not widen the accepted member fence"
+        );
+        assert_eq!(connectivity_records, vec![connectivity]);
     }
 
     #[test]

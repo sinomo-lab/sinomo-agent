@@ -532,6 +532,82 @@ pub(crate) fn cluster_directory_from_fenced_bootstrap_state(
     cluster_directory_with_bootstrap_state(Arc::new(EmptyClusterDirectory), state)
 }
 
+/// Exact accepted membership plus optional locally observed connectivity.
+///
+/// The connectivity provider cannot add members, endpoints, statuses, or a
+/// routing generation to the accepted fence. It is consulted only when a cold
+/// routed connector captures its connectivity records, and failure falls back
+/// to the ordinary local bootstrap overlay. This lets a restarted node recover
+/// a multi-hop authority route from its last observed KV projection without
+/// making that projection an authorization source.
+struct FencedBootstrapConnectivityDirectory {
+    exact: Arc<dyn ClusterDirectory>,
+    connectivity: Arc<dyn ClusterDirectory>,
+}
+
+impl FencedBootstrapConnectivityDirectory {
+    fn observed_connectivity_records(&self) -> Vec<ClusterConnectivityRecord> {
+        self.connectivity
+            .routing_records_snapshot()
+            .map(|snapshot| snapshot.into_parts().3)
+            .unwrap_or_default()
+    }
+}
+
+impl ClusterDirectory for FencedBootstrapConnectivityDirectory {
+    fn members(&self) -> Result<Vec<ClusterMemberRecord>, NetworkError> {
+        self.exact.members()
+    }
+
+    fn endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+        self.exact.endpoints()
+    }
+
+    fn node_statuses(&self) -> Result<BTreeMap<NodeId, ClusterNodeStatusRecord>, NetworkError> {
+        self.exact.node_statuses()
+    }
+
+    fn connectivity_records(&self) -> Result<Vec<ClusterConnectivityRecord>, NetworkError> {
+        Ok(self.observed_connectivity_records())
+    }
+
+    fn version(&self) -> Result<DirectoryVersion, NetworkError> {
+        self.exact.version()
+    }
+
+    fn routing_version(&self) -> Result<DirectoryVersion, NetworkError> {
+        self.exact.routing_version()
+    }
+
+    fn records_snapshot(&self) -> Result<DirectoryRecordsSnapshot, NetworkError> {
+        self.exact.records_snapshot()
+    }
+
+    fn routing_records_snapshot(&self) -> Result<DirectoryRoutingRecordsSnapshot, NetworkError> {
+        let (version, members, endpoints) = self.exact.records_snapshot()?.into_parts();
+        Ok(DirectoryRoutingRecordsSnapshot::new(
+            version,
+            members,
+            endpoints,
+            self.observed_connectivity_records(),
+        ))
+    }
+
+    fn snapshot(&self) -> Result<DirectorySnapshot, NetworkError> {
+        self.exact.snapshot()
+    }
+}
+
+pub(crate) fn cluster_directory_from_fenced_bootstrap_state_with_connectivity(
+    state: &ClusterBootstrapState,
+    connectivity: Arc<dyn ClusterDirectory>,
+) -> Arc<dyn ClusterDirectory> {
+    Arc::new(FencedBootstrapConnectivityDirectory {
+        exact: cluster_directory_from_fenced_bootstrap_state(state),
+        connectivity,
+    })
+}
+
 /// Builds the [`ClusterDirectory`] for a cluster data root. Registered once at
 /// process startup by whoever owns cluster state (the daemon registers the
 /// KV-backed directory from `sinomo-cluster`).

@@ -2454,10 +2454,12 @@ pub(crate) async fn call_node_object_rpc_with_cluster_paths_async_on_runtime(
     // KV authority forwarding already carries the exact Raft membership fence
     // in `state`; remote dispatch must retain it rather than recursively
     // consulting the KV-backed dynamic route directory.
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
-            &mut host, paths, state,
-        )?;
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state_with_connectivity(
+        &mut host,
+        paths,
+        state,
+        sinomo_core::network::cluster_directory_for(paths),
+    )?;
     client
         .call_target(state, target_node_id, call, options)
         .await
@@ -8624,12 +8626,12 @@ async fn send_cluster_raft_append_routed_async(
     // Every Raft message carries the committed/projected membership fence that
     // selected this target. Consensus traffic must not consult the dynamic KV
     // directory whose contents it is responsible for replicating.
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
-            &mut host,
-            paths,
-            &request.state,
-        )?;
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state_with_connectivity(
+        &mut host,
+        paths,
+        &request.state,
+        sinomo_core::network::cluster_directory_for(paths),
+    )?;
     decode_cluster_raft_rpc_before(
         "cluster Raft append RPC",
         timeout,
@@ -8676,12 +8678,12 @@ async fn send_cluster_raft_vote_routed_async(
     )?;
     call.request = call.request.with_response_retry_safe();
     let mut host = DaemonObjectRpcAsyncHost::new(runtime, true).with_cluster_paths(paths);
-    let mut client =
-        sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state(
-            &mut host,
-            paths,
-            &request.state,
-        )?;
+    let mut client = sinomo_core::network::ClusterObjectRpcClient::routed_from_fenced_bootstrap_state_with_connectivity(
+        &mut host,
+        paths,
+        &request.state,
+        sinomo_core::network::cluster_directory_for(paths),
+    )?;
     decode_cluster_raft_rpc_before(
         "cluster Raft vote RPC",
         timeout,
