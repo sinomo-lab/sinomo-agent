@@ -1,6 +1,7 @@
 //! App-facing launcher and view over local self-evolution job persistence.
 
 use std::sync::mpsc::{Receiver, channel};
+use std::thread;
 
 use sinomo_evolution::EvolutionJobStatus;
 use sinomo_evolution::persistence::{EvolutionPaths, StoredEvolutionJob, list_job_records};
@@ -173,8 +174,9 @@ pub enum EvolutionDecisionEvent {
 pub fn spawn_evolution_job(request: EvolutionStartRequest) -> Receiver<EvolutionStartEvent> {
     let (tx, rx) = channel();
     let failure_tx = tx.clone();
-    if let Err(error) =
-        crate::daemon_rpc_thread_builder("sinomo-app-evolution-start").spawn(move || {
+    if let Err(error) = thread::Builder::new()
+        .name("sinomo-app-evolution-start".to_string())
+        .spawn(move || {
             let _ = tx.send(EvolutionStartEvent::Started);
             let result = run_evolution_job(request).map_err(|error| error.to_string());
             let _ = tx.send(EvolutionStartEvent::Finished(result));
@@ -192,8 +194,9 @@ pub fn spawn_evolution_decision(
 ) -> Receiver<EvolutionDecisionEvent> {
     let (tx, rx) = channel();
     let failure_tx = tx.clone();
-    if let Err(error) =
-        crate::daemon_rpc_thread_builder("sinomo-app-evolution-decision").spawn(move || {
+    if let Err(error) = thread::Builder::new()
+        .name("sinomo-app-evolution-decision".to_string())
+        .spawn(move || {
             let _ = tx.send(EvolutionDecisionEvent::Started);
             let result = run_evolution_decision(request).map_err(|error| error.to_string());
             let _ = tx.send(EvolutionDecisionEvent::Finished(result));

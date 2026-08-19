@@ -2116,18 +2116,20 @@ impl FilesState {
         let live_address = self.daemon_address.clone();
         let live_runtime = self.app_runtime.clone();
         let live_result_tx = result_tx.clone();
-        match crate::daemon_rpc_thread_builder("sinomo-app-files").spawn(move || {
-            files_worker_loop(
-                data_dir,
-                daemon_address,
-                daemon_unavailable_detail,
-                app_runtime,
-                command_rx,
-                result_tx,
-                cancellations,
-                waker,
-            )
-        }) {
+        match thread::Builder::new()
+            .name("sinomo-app-files".to_string())
+            .spawn(move || {
+                files_worker_loop(
+                    data_dir,
+                    daemon_address,
+                    daemon_unavailable_detail,
+                    app_runtime,
+                    command_rx,
+                    result_tx,
+                    cancellations,
+                    waker,
+                )
+            }) {
             Ok(_) => {
                 self.worker_tx = Some(command_tx);
                 self.worker_rx = Some(result_rx);

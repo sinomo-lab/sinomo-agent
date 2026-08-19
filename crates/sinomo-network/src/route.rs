@@ -1112,7 +1112,7 @@ where
             NetworkDeliveryState::PossiblyApplied,
         );
         let result = cluster_object_rpc_call_with_deadline(
-            self.call_endpoint_inner(state, endpoint, call, options, deadline),
+            Box::pin(self.call_endpoint_inner(state, endpoint, call, options, deadline)),
             deadline,
             timeout_error,
         )
@@ -1258,7 +1258,7 @@ where
             NetworkDeliveryState::PossiblyApplied,
         );
         let result = cluster_object_rpc_call_with_deadline(
-            self.call_loopback_inner(data_dir, address, call, options, deadline),
+            Box::pin(self.call_loopback_inner(data_dir, address, call, options, deadline)),
             deadline,
             timeout_error,
         )
@@ -1368,7 +1368,7 @@ where
         );
         prepare_call_for_active_network_timeline(&mut call);
         cluster_object_rpc_call_with_deadline(
-            self.call_target_stream_native(
+            Box::pin(self.call_target_stream_native(
                 context.paths,
                 directory,
                 directory_identity,
@@ -1377,7 +1377,7 @@ where
                 call,
                 options,
                 deadline,
-            ),
+            )),
             deadline,
             timeout_error,
         )
@@ -1634,21 +1634,24 @@ impl ClusterEndpointRpcDeadline {
     }
 }
 
-async fn cluster_object_rpc_call_with_deadline<T, F>(
-    call: F,
+// Keep the concrete routed-call future behind a pointer before composing it
+// with Tokio's timeout future. In unoptimized builds the stream-native RPC
+// future is large; a generic wrapper would embed that state in its own future
+// and amplify the synchronous caller's poll stack.
+fn cluster_object_rpc_call_with_deadline<'a, T: 'a>(
+    call: ClusterObjectRpcFuture<'a, T>,
     deadline: ClusterEndpointRpcDeadline,
     timeout_error: NetworkError,
-) -> Result<T, NetworkError>
-where
-    F: Future<Output = Result<T, NetworkError>>,
-{
+) -> ClusterObjectRpcFuture<'a, T> {
     let Some(deadline_at) = deadline.deadline_at else {
-        return call.await;
+        return call;
     };
-    match tokio::time::timeout_at(deadline_at, call).await {
-        Ok(result) => result,
-        Err(_) => Err(timeout_error),
-    }
+    Box::pin(async move {
+        match tokio::time::timeout_at(deadline_at, call).await {
+            Ok(result) => result,
+            Err(_) => Err(timeout_error),
+        }
+    })
 }
 
 fn cluster_target_rpc_timeout_error(
@@ -1677,6 +1680,37 @@ fn cluster_target_rpc_timeout_error(
 mod tests {
     use super::*;
     use crate::ObjectRpcRequest;
+
+    #[test]
+    fn deadline_wrapper_erases_oversized_concrete_call_state() {
+        const OVERSIZED_STATE_BYTES: usize = 128 * 1024;
+        let oversized_state = [0_u8; OVERSIZED_STATE_BYTES];
+        let concrete_call = async move {
+            std::hint::black_box(&oversized_state);
+            Ok::<usize, NetworkError>(oversized_state.len())
+        };
+        assert!(std::mem::size_of_val(&concrete_call) >= OVERSIZED_STATE_BYTES);
+
+        let deadline = ClusterEndpointRpcDeadline::new(Some(Duration::from_secs(1)));
+        let wrapped = cluster_object_rpc_call_with_deadline(
+            Box::pin(concrete_call),
+            deadline,
+            deadline.timeout_error(
+                "oversized call fixture",
+                NetworkTimeoutPhase::Overall,
+                NetworkDeliveryState::PossiblyApplied,
+            ),
+        );
+
+        assert_eq!(
+            std::mem::size_of_val(&wrapped),
+            std::mem::size_of::<ClusterObjectRpcFuture<'static, usize>>()
+        );
+        assert_eq!(
+            std::mem::size_of_val(&wrapped),
+            2 * std::mem::size_of::<usize>()
+        );
+    }
 
     struct NoopObjectRpcHost;
 

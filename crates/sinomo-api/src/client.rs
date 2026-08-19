@@ -40,9 +40,16 @@ use sinomo_core::network::{
 };
 use sinomo_core::node::NodeId;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+type DaemonApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DaemonApiError>> + Send + 'a>>;
+type LocalDaemonApiFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, DaemonApiError>> + 'a>>;
+type NetworkRpcFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, sinomo_core::network::NetworkError>> + Send + 'a>>;
 
 /// How long daemon discovery waits for the status probe.
 pub const DAEMON_API_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -261,23 +268,23 @@ impl DaemonDfsMountedMutationHandoffClient {
         let data_dir = self.data_dir.clone();
         let address = self.address.clone();
         let timeout = self.timeout;
-        block_on_daemon_client(async move {
+        block_on_daemon_client(Box::pin(async move {
             let runtime = tokio::runtime::Handle::current();
             let deadline = daemon_api_overall_deadline(Some(timeout));
             let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
             run_daemon_api_with_overall_deadline(
                 "mounted-mutation main-daemon handoff",
                 deadline,
-                async move {
+                Box::pin(async move {
                     call_daemon_address_rpc_async(data_dir, &address, call, options, &runtime)
                         .await?
                         .decode_body()
                         .await
                         .map_err(Into::into)
-                },
+                }),
             )
             .await
-        })
+        }))
     }
 }
 
@@ -488,6 +495,25 @@ impl DaemonApiClient {
         Ok(response)
     }
 
+    /// Asynchronously sends an already built request to the running local
+    /// daemon. This is the non-blocking counterpart to [`Self::call_request`]
+    /// and retains the same response-error and client-timeout semantics.
+    pub async fn call_request_async(
+        &self,
+        request: &ObjectRpcRequest,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        let runtime = tokio::runtime::Handle::current();
+        let response = send_daemon_rpc_async(
+            &self.address,
+            request,
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+            &runtime,
+        )
+        .await?;
+        response.error_detail()?;
+        Ok(response)
+    }
+
     fn call_request_value<T>(
         &self,
         request: &ObjectRpcRequest,
@@ -574,13 +600,13 @@ impl DaemonApiClient {
         let address = self.address.clone();
         let data_dir = data_dir.clone();
         let target_node_id = target_node_id.clone();
-        block_on_daemon_client(async move {
+        block_on_daemon_client(Box::pin(async move {
             let runtime = tokio::runtime::Handle::current();
             let deadline = daemon_api_overall_deadline(Some(timeout));
             run_daemon_api_with_overall_deadline(
                 "daemon-mediated object RPC value call",
                 deadline,
-                async move {
+                Box::pin(async move {
                     let result = send_daemon_object_rpc_call_with_affinity_async(
                         data_dir,
                         &address,
@@ -599,10 +625,10 @@ impl DaemonApiClient {
                     )
                     .await?;
                     decode_object_rpc_value_response(result).await
-                },
+                }),
             )
             .await
-        })
+        }))
     }
 
     /// Sends an object-RPC from inside the running local daemon.
@@ -638,13 +664,15 @@ impl DaemonApiClient {
         overall_timeout: Option<Duration>,
         observe_connectivity: bool,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        block_on_daemon_client(self.object_rpc_to_target_with_deadline_and_affinity_async(
-            target_node_id,
-            request,
-            connect_timeout,
-            overall_timeout,
-            observe_connectivity,
-            crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+        block_on_daemon_client(Box::pin(
+            self.object_rpc_to_target_with_deadline_and_affinity_async(
+                target_node_id,
+                request,
+                connect_timeout,
+                overall_timeout,
+                observe_connectivity,
+                crate::DaemonObjectRpcDestinationProcessAffinity::Any,
+            ),
         ))
     }
 
@@ -659,13 +687,15 @@ impl DaemonApiClient {
         observe_connectivity: bool,
         destination_process_affinity: crate::DaemonObjectRpcDestinationProcessAffinity,
     ) -> Result<ObjectRpcResponse, DaemonApiError> {
-        block_on_daemon_client(self.object_rpc_to_target_with_deadline_and_affinity_async(
-            target_node_id,
-            request,
-            connect_timeout,
-            overall_timeout,
-            observe_connectivity,
-            destination_process_affinity,
+        block_on_daemon_client(Box::pin(
+            self.object_rpc_to_target_with_deadline_and_affinity_async(
+                target_node_id,
+                request,
+                connect_timeout,
+                overall_timeout,
+                observe_connectivity,
+                destination_process_affinity,
+            ),
         ))
     }
 
@@ -704,7 +734,7 @@ impl DaemonApiClient {
         run_daemon_api_with_overall_deadline(
             "daemon-mediated object RPC value call",
             deadline,
-            async {
+            Box::pin(async {
                 let call = ObjectRpcCall::value(request.clone());
                 let result = self
                     .object_rpc_call_to_target_with_deadline_and_affinity_async(
@@ -717,7 +747,7 @@ impl DaemonApiClient {
                     )
                     .await?;
                 decode_object_rpc_value_response(result).await
-            },
+            }),
         )
         .await
     }
@@ -738,7 +768,7 @@ impl DaemonApiClient {
         run_daemon_api_with_overall_deadline(
             "daemon-mediated object RPC value call with forward timing",
             deadline,
-            async {
+            Box::pin(async {
                 let call = ObjectRpcCall::value(request.clone());
                 let (result, forward_elapsed) = self
                     .object_rpc_call_to_target_with_forward_elapsed_async(
@@ -751,7 +781,7 @@ impl DaemonApiClient {
                     .await?;
                 let response = decode_object_rpc_value_response(result).await?;
                 Ok((response, forward_elapsed))
-            },
+            }),
         )
         .await
     }
@@ -962,13 +992,13 @@ impl DaemonApiClient {
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout);
         let target_node_id = target_node_id.clone();
         let request = request.clone();
-        block_on_daemon_client(async move {
+        block_on_daemon_client(Box::pin(async move {
             let runtime = tokio::runtime::Handle::current();
             let deadline = daemon_api_overall_deadline(options.overall_timeout);
             run_daemon_api_with_overall_deadline(
                 "daemon-mediated DFS object RPC value call",
                 deadline,
-                async move {
+                Box::pin(async move {
                     let call = ObjectRpcCall::value(request);
                     let result = send_daemon_object_rpc_call_with_affinity_async(
                         data_dir,
@@ -988,10 +1018,10 @@ impl DaemonApiClient {
                     )
                     .await?;
                     decode_object_rpc_value_response(result).await
-                },
+                }),
             )
             .await
-        })
+        }))
     }
 
     fn call_control_value<Req, Resp>(&self, route: &str, value: Req) -> Result<Resp, DaemonApiError>
@@ -1304,37 +1334,38 @@ async fn decode_object_rpc_value_response(
         .map_err(Into::into)
 }
 
-async fn call_loopback_daemon_rpc_async(
+fn call_loopback_daemon_rpc_async<'a>(
     data_dir: SinomoDataDir,
-    address: &str,
+    address: &'a str,
     call: ObjectRpcCall,
     options: sinomo_core::network::ClusterObjectRpcOptions,
-    runtime: &tokio::runtime::Handle,
-) -> Result<ObjectRpcResult, DaemonApiError> {
-    if !sinomo_core::network::is_loopback_connect_address(address) {
-        return Err(DaemonApiError::Network {
-            address: address.to_string(),
-            detail: "daemon-mediated object RPC requires the local daemon loopback address"
-                .to_string(),
-        });
-    }
-    call_daemon_address_rpc_async(data_dir, address, call, options, runtime).await
+    runtime: &'a tokio::runtime::Handle,
+) -> DaemonApiFuture<'a, ObjectRpcResult> {
+    Box::pin(async move {
+        if !sinomo_core::network::is_loopback_connect_address(address) {
+            return Err(DaemonApiError::Network {
+                address: address.to_string(),
+                detail: "daemon-mediated object RPC requires the local daemon loopback address"
+                    .to_string(),
+            });
+        }
+        call_daemon_address_rpc_async(data_dir, address, call, options, runtime).await
+    })
 }
 
-async fn call_loopback_daemon_rpc_with_overall_deadline_async(
+fn call_loopback_daemon_rpc_with_overall_deadline_async<'a>(
     data_dir: SinomoDataDir,
-    address: &str,
+    address: &'a str,
     call: ObjectRpcCall,
     options: sinomo_core::network::ClusterObjectRpcOptions,
     overall_deadline: Option<(tokio::time::Instant, Duration)>,
-    runtime: &tokio::runtime::Handle,
-) -> Result<ObjectRpcResult, DaemonApiError> {
+    runtime: &'a tokio::runtime::Handle,
+) -> DaemonApiFuture<'a, ObjectRpcResult> {
     run_daemon_api_with_overall_deadline(
         "daemon-mediated object RPC outer call",
         overall_deadline,
         call_loopback_daemon_rpc_async(data_dir, address, call, options, runtime),
     )
-    .await
 }
 
 fn daemon_api_overall_deadline(
@@ -1343,54 +1374,64 @@ fn daemon_api_overall_deadline(
     timeout.map(|timeout| (tokio::time::Instant::now() + timeout, timeout))
 }
 
-async fn run_daemon_api_with_overall_deadline<T, F>(
+fn run_daemon_api_with_overall_deadline<'a, T>(
     operation: &'static str,
     overall_deadline: Option<(tokio::time::Instant, Duration)>,
-    pending: F,
-) -> Result<T, DaemonApiError>
+    pending: DaemonApiFuture<'a, T>,
+) -> DaemonApiFuture<'a, T>
 where
-    F: std::future::Future<Output = Result<T, DaemonApiError>>,
+    T: Send + 'a,
 {
-    let Some((deadline_at, timeout)) = overall_deadline else {
-        return pending.await;
-    };
-    match tokio::time::timeout_at(deadline_at, pending).await {
-        Ok(result) => result,
-        Err(_) => Err(sinomo_core::network::NetworkError::timeout(
-            operation,
-            sinomo_core::network::NetworkTimeoutPhase::Overall,
-            timeout,
-            // A daemon or target may already have dispatched the request even
-            // when its streamed response value has not finished arriving.
-            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
-        )
-        .into()),
-    }
+    // Type-erasing before constructing `Timeout` is deliberate. In an
+    // unoptimized build, carrying the concrete routed-RPC future through both
+    // the no-deadline and timeout states duplicates tens of KiB of future
+    // state and amplifies every generic poll frame. A pinned trait object keeps
+    // this wrapper constant-sized while preserving cancellation-on-drop.
+    Box::pin(async move {
+        let Some((deadline_at, timeout)) = overall_deadline else {
+            return pending.await;
+        };
+        match tokio::time::timeout_at(deadline_at, pending).await {
+            Ok(result) => result,
+            Err(_) => Err(sinomo_core::network::NetworkError::timeout(
+                operation,
+                sinomo_core::network::NetworkTimeoutPhase::Overall,
+                timeout,
+                // A daemon or target may already have dispatched the request even
+                // when its streamed response value has not finished arriving.
+                sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+            )
+            .into()),
+        }
+    })
 }
 
-async fn call_daemon_address_rpc_async(
+fn call_daemon_address_rpc_async<'a>(
     data_dir: SinomoDataDir,
-    address: &str,
+    address: &'a str,
     call: ObjectRpcCall,
     options: sinomo_core::network::ClusterObjectRpcOptions,
-    _runtime: &tokio::runtime::Handle,
-) -> Result<ObjectRpcResult, DaemonApiError> {
-    let mut host = DaemonApiRpcHost;
-    let mut call = call;
-    call.request.auth = None;
-    if sinomo_core::network::is_loopback_connect_address(address) {
-        return sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host)
-            .call_loopback(&data_dir, address, call, options)
-            .await
-            .map_err(Into::into);
-    }
-    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let endpoint = daemon_api_rpc_endpoint_for_address(&state, address)?;
-    sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths)
-        .call_endpoint(&state, &endpoint, call, options)
-        .await
-        .map_err(Into::into)
+    _runtime: &'a tokio::runtime::Handle,
+) -> DaemonApiFuture<'a, ObjectRpcResult> {
+    Box::pin(async move {
+        let mut host = DaemonApiRpcHost;
+        let mut call = call;
+        call.request.auth = None;
+        if sinomo_core::network::is_loopback_connect_address(address) {
+            let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
+            let pending: NetworkRpcFuture<'_, ObjectRpcResult> =
+                Box::pin(client.call_loopback(&data_dir, address, call, options));
+            return pending.await.map_err(Into::into);
+        }
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+        let endpoint = daemon_api_rpc_endpoint_for_address(&state, address)?;
+        let mut client =
+            sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
+        let pending: NetworkRpcFuture<'_, ObjectRpcResult> =
+            Box::pin(client.call_endpoint(&state, &endpoint, call, options));
+        pending.await.map_err(Into::into)
+    })
 }
 
 #[cfg(test)]
@@ -1564,14 +1605,14 @@ async fn send_daemon_object_rpc_call_with_forward_elapsed_and_affinity_async(
     run_daemon_api_with_overall_deadline(
         "daemon-mediated object RPC outer call and forwarding envelope",
         overall_deadline,
-        async move {
+        Box::pin(async move {
             let result =
                 call_loopback_daemon_rpc_async(data_dir, address, outer, outer_options, runtime)
                     .await?;
             let (result, elapsed) =
                 decode_daemon_object_rpc_forward_call_response_with_elapsed(result).await?;
             Ok((result, Some(elapsed)))
-        },
+        }),
     )
     .await
 }
@@ -1734,10 +1775,13 @@ impl sinomo_dfs::DfsPeerTransport for DaemonDfsPeerTransport {
         options: sinomo_dfs::DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, sinomo_dfs::DfsPeerTransportError> {
         let runtime = self.runtime.handle().clone();
-        block_on_daemon_client_on_owner_runtime(&runtime, async {
-            self.call_rpc_inner(target_node_id, call, options, &runtime)
-                .await
-        })
+        block_on_daemon_client_on_owner_runtime(
+            &runtime,
+            Box::pin(async {
+                self.call_rpc_inner(target_node_id, call, options, &runtime)
+                    .await
+            }),
+        )
         .and_then(|result| {
             result.response.error_detail()?;
             Ok(result)
@@ -1808,12 +1852,12 @@ pub fn send_daemon_rpc_on_runtime(
     let runtime_for_future = runtime.clone();
     block_on_daemon_client_on_owner_runtime(
         runtime,
-        send_daemon_rpc_async(
+        Box::pin(send_daemon_rpc_async(
             address,
             request,
             sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
             &runtime_for_future,
-        ),
+        )),
     )
 }
 
@@ -1851,14 +1895,14 @@ fn send_daemon_rpc_value<T>(
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    block_on_daemon_client(async {
+    block_on_daemon_client(Box::pin(async {
         let runtime = tokio::runtime::Handle::current();
         send_daemon_rpc_result_async(address, request, timeouts, &runtime)
             .await?
             .decode_body()
             .await
             .map_err(Into::into)
-    })
+    }))
 }
 
 fn send_daemon_typed_value<Req, Resp>(
@@ -1884,7 +1928,7 @@ fn send_daemon_call_value<Resp>(
 where
     Resp: serde::de::DeserializeOwned + Send + 'static,
 {
-    block_on_daemon_client(async {
+    block_on_daemon_client(Box::pin(async {
         let runtime = tokio::runtime::Handle::current();
         call_daemon_address_rpc_async(
             SinomoDataDir::from_env_or_home()?,
@@ -1897,7 +1941,7 @@ where
         .decode_body()
         .await
         .map_err(Into::into)
-    })
+    }))
 }
 
 fn send_daemon_typed_value_on_runtime<Req, Resp>(
@@ -1914,19 +1958,22 @@ where
 {
     let call = ObjectRpcCall::encode_value(route, category, value)?;
     let runtime_for_future = runtime.clone();
-    block_on_daemon_client_on_owner_runtime(runtime, async {
-        call_daemon_address_rpc_async(
-            SinomoDataDir::from_env_or_home()?,
-            address,
-            call,
-            sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
-            &runtime_for_future,
-        )
-        .await?
-        .decode_body()
-        .await
-        .map_err(Into::into)
-    })
+    block_on_daemon_client_on_owner_runtime(
+        runtime,
+        Box::pin(async {
+            call_daemon_address_rpc_async(
+                SinomoDataDir::from_env_or_home()?,
+                address,
+                call,
+                sinomo_core::network::ClusterObjectRpcOptions::new(timeouts),
+                &runtime_for_future,
+            )
+            .await?
+            .decode_body()
+            .await
+            .map_err(Into::into)
+        }),
+    )
 }
 
 pub fn send_daemon_rpc_with_timeouts(
@@ -1934,10 +1981,10 @@ pub fn send_daemon_rpc_with_timeouts(
     request: &ObjectRpcRequest,
     timeouts: sinomo_core::network::DaemonRpcTimeouts,
 ) -> Result<ObjectRpcResponse, DaemonApiError> {
-    block_on_daemon_client(async {
+    block_on_daemon_client(Box::pin(async {
         let runtime = tokio::runtime::Handle::current();
         send_daemon_rpc_async(address, request, timeouts, &runtime).await
-    })
+    }))
 }
 
 /// A [`ConfigClient`] backed by RPC to a running daemon's `/config/*` service.
@@ -2051,12 +2098,12 @@ pub fn send_daemon_rpc_stream(
     _operation_timeout: Duration,
     mut on_response: impl FnMut(ObjectRpcResponse) -> Result<bool, DaemonApiError>,
 ) -> Result<(), DaemonApiError> {
-    block_on_daemon_client_stream(send_daemon_rpc_stream_async(
+    block_on_daemon_client_stream(Box::pin(send_daemon_rpc_stream_async(
         address,
         request,
         daemon_rpc_stream_timeouts(),
         &mut on_response,
-    ))
+    )))
 }
 
 fn daemon_rpc_stream_timeouts() -> sinomo_core::network::DaemonRpcTimeouts {
@@ -2351,9 +2398,8 @@ fn daemon_api_rpc_endpoint_for_address(
     })
 }
 
-fn block_on_daemon_client<F, T>(future: F) -> Result<T, DaemonApiError>
+fn block_on_daemon_client<T>(future: DaemonApiFuture<'_, T>) -> Result<T, DaemonApiError>
 where
-    F: std::future::Future<Output = Result<T, DaemonApiError>> + Send,
     T: Send,
 {
     // Keep the concrete RPC state machine out of synchronous callers' stacks.
@@ -2362,7 +2408,6 @@ where
     // heap-backed. `Runtime::block_on` carries its future through several
     // generic frames, so passing that concrete value by hand can amplify its
     // stack footprint on ordinary 2 MiB worker threads.
-    let future = Box::pin(future);
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return if matches!(
             handle.runtime_flavor(),
@@ -2379,28 +2424,25 @@ where
     block_on_daemon_client_on_process_runtime_pinned(future)
 }
 
-fn block_on_daemon_client_stream<F, T>(future: F) -> Result<T, DaemonApiError>
-where
-    F: std::future::Future<Output = Result<T, DaemonApiError>>,
-{
+fn block_on_daemon_client_stream<T>(
+    future: LocalDaemonApiFuture<'_, T>,
+) -> Result<T, DaemonApiError> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(DaemonApiError::Network {
             address: "daemon client runtime".to_string(),
             detail: "streaming daemon RPC sync client cannot run inside a Tokio runtime; use send_daemon_rpc_stream_async".to_string(),
         });
     }
-    block_on_daemon_client_on_process_runtime_pinned(Box::pin(future))
+    block_on_daemon_client_on_process_runtime_pinned(future)
 }
 
-fn block_on_daemon_client_on_owner_runtime<F, T>(
+fn block_on_daemon_client_on_owner_runtime<T>(
     runtime: &tokio::runtime::Handle,
-    future: F,
+    future: DaemonApiFuture<'_, T>,
 ) -> Result<T, DaemonApiError>
 where
-    F: std::future::Future<Output = Result<T, DaemonApiError>> + Send,
     T: Send,
 {
-    let future = Box::pin(future);
     if let Ok(current) = tokio::runtime::Handle::try_current() {
         return if matches!(
             current.runtime_flavor(),
@@ -2435,12 +2477,9 @@ fn daemon_api_sync_runtime() -> Result<&'static tokio::runtime::Runtime, DaemonA
     }
 }
 
-fn block_on_daemon_client_on_process_runtime_pinned<F, T>(
-    future: std::pin::Pin<Box<F>>,
-) -> Result<T, DaemonApiError>
-where
-    F: std::future::Future<Output = Result<T, DaemonApiError>>,
-{
+fn block_on_daemon_client_on_process_runtime_pinned<T>(
+    future: LocalDaemonApiFuture<'_, T>,
+) -> Result<T, DaemonApiError> {
     daemon_api_sync_runtime()?.block_on(future)
 }
 
@@ -2731,12 +2770,12 @@ mod tests {
         let error = run_daemon_api_with_overall_deadline(
             "test forwarding envelope decode",
             deadline,
-            async move {
+            Box::pin(async move {
                 let _hold_sender = sender;
                 decode_daemon_object_rpc_forward_call_response_with_elapsed(result)
                     .await
                     .map(|_| ())
-            },
+            }),
         )
         .await
         .expect_err("a stalled forwarding envelope must honor the overall deadline");
@@ -2760,11 +2799,11 @@ mod tests {
         let error = run_daemon_api_with_overall_deadline(
             "test complete value call",
             deadline,
-            async move {
+            Box::pin(async move {
                 tokio::time::sleep(head_delay).await;
                 let _hold_sender = sender;
                 decode_object_rpc_value_response(result).await.map(|_| ())
-            },
+            }),
         )
         .await
         .expect_err("value materialization must not receive a fresh timeout after its head");
@@ -2797,7 +2836,7 @@ mod tests {
                 )
                 .expect("construct streamed observe response");
 
-                let response = block_on_daemon_client(async move {
+                let response = block_on_daemon_client(Box::pin(async move {
                     let producer = tokio::spawn(async move {
                         for _ in 0..(RESPONSE_BYTES / CHUNK_BYTES) {
                             sender
@@ -2809,7 +2848,7 @@ mod tests {
                     let response = decode_object_rpc_value_response(result).await?;
                     producer.await.expect("join observe response producer");
                     Ok(response)
-                })
+                }))
                 .expect("materialize streamed observe response");
 
                 assert_eq!(response.route, "/observe/metrics");
@@ -2819,6 +2858,133 @@ mod tests {
             .expect("spawn two-MiB observe bridge worker")
             .join()
             .expect("join two-MiB observe bridge worker");
+    }
+
+    #[test]
+    fn forwarded_rpc_with_deadline_completes_on_two_mib_stack() {
+        const WORKER_STACK_BYTES: usize = 2 * 1024 * 1024;
+        const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let root = sinomo_testdir::TestDir::new("sinomo-api-two-mib-forwarded-rpc");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir layout");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main node identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_two_mib_local").expect("local node id");
+        let target_node =
+            NodeId::from_legacy_named("node_api_two_mib_target").expect("target node id");
+        write_test_cluster_state(
+            &data_dir,
+            "two_mib_forwarded_rpc",
+            local_node.clone(),
+            identity.public_key,
+        );
+
+        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("sinomo-api-two-mib-forward-server")
+            .enable_all()
+            .build()
+            .expect("forward server runtime");
+        let listener = server_runtime
+            .block_on(sinomo_core::network::AsyncDaemonControlListener::bind(
+                "127.0.0.1:0",
+            ))
+            .expect("forward listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let expected_target = target_node.clone();
+        let server = server_runtime.spawn(async move {
+            let stream = listener.accept().await.expect("accept forward carrier");
+            serve_test_stream_native_service(stream, move |incoming, _peer| async move {
+                assert_eq!(incoming.request.route, DAEMON_OBJECT_RPC_FORWARD_ROUTE);
+                let payload: DaemonObjectRpcForwardRequest =
+                    incoming.decode_body().await.expect("forward payload");
+                assert_eq!(payload.target_node_id, expected_target);
+                assert_eq!(payload.overall_timeout_millis, Some(5_000));
+                let inner = ObjectRpcResponse::encode_body(payload.request.route, &"forwarded")
+                    .expect("inner response");
+                sinomo_core::network::ObjectRpcOutgoingResponse::encode_borrowed_value(
+                    DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                    &DaemonObjectRpcForwardResponse::Success {
+                        response: inner,
+                        streamed_value_body: false,
+                        forward_elapsed_micros: 1,
+                    },
+                )
+            })
+            .await
+            .expect("serve forwarded RPC");
+        });
+
+        let worker_address = address.clone();
+        let response = std::thread::Builder::new()
+            .name("sinomo-api-two-mib-forward-client".to_string())
+            .stack_size(WORKER_STACK_BYTES)
+            .spawn(move || {
+                block_on_daemon_client(Box::pin(async move {
+                    let runtime = tokio::runtime::Handle::current();
+                    let request = ObjectRpcRequest::encode_body(
+                        "/test/two-mib-forwarded-rpc",
+                        "test",
+                        &"request",
+                    )?;
+                    let result = send_daemon_object_rpc_call_async(
+                        data_dir,
+                        &worker_address,
+                        DAEMON_OBJECT_RPC_FORWARD_ROUTE,
+                        &target_node,
+                        ObjectRpcCall::value(request),
+                        RPC_TIMEOUT,
+                        None,
+                        Some(RPC_TIMEOUT),
+                        false,
+                        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(RPC_TIMEOUT),
+                        Some(&local_node),
+                        &runtime,
+                    )
+                    .await?;
+                    decode_object_rpc_value_response(result).await
+                }))
+            })
+            .expect("spawn two-MiB forwarded RPC worker")
+            .join()
+            .expect("join two-MiB forwarded RPC worker")
+            .expect("forwarded RPC on two-MiB stack");
+
+        assert_eq!(
+            response
+                .decode_body::<String>()
+                .expect("decode forwarded response"),
+            "forwarded"
+        );
+        server_runtime
+            .block_on(server)
+            .expect("join forward server");
+    }
+
+    #[test]
+    fn overall_deadline_future_is_constant_sized_after_type_erasure() {
+        const RETAINED_BYTES: usize = 256 * 1024;
+        let retained = [0_u8; RETAINED_BYTES];
+        let concrete = async move {
+            std::hint::black_box(&retained);
+            std::future::ready(()).await;
+            Ok::<(), DaemonApiError>(())
+        };
+        let concrete_size = std::mem::size_of_val(&concrete);
+        assert!(
+            concrete_size >= RETAINED_BYTES,
+            "test precondition: concrete future was unexpectedly only {concrete_size} bytes"
+        );
+
+        let pending: DaemonApiFuture<'_, ()> = Box::pin(concrete);
+        let wrapped = run_daemon_api_with_overall_deadline("test type erasure", None, pending);
+        assert_eq!(
+            std::mem::size_of_val(&wrapped),
+            std::mem::size_of::<DaemonApiFuture<'_, ()>>(),
+            "the deadline boundary must return only a pinned trait-object handle"
+        );
     }
 
     #[test]

@@ -7670,14 +7670,13 @@ impl DfsOperatorClient {
         let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(&body)
             .map_err(|error| error.to_string())?;
         let response = if let Some(runtime) = &self.runtime {
-            runtime
-                .block_on(sinomo_runtime::api::send_daemon_rpc_async(
-                    &self.address,
-                    &request,
-                    sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
-                    runtime,
-                ))
-                .map_err(|error| error.to_string())?
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
+                &self.address,
+                &request,
+                self.timeout,
+                runtime,
+            )
+            .map_err(|error| error.to_string())?
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
                 .map_err(|error| error.to_string())?
@@ -8297,14 +8296,13 @@ impl RemoteSifsBrowser {
                 .map_err(|error| error.to_string());
         }
         let response = if let Some(runtime) = &self.runtime {
-            runtime
-                .block_on(sinomo_runtime::api::send_daemon_rpc_async(
-                    &self.address,
-                    &request,
-                    sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
-                    runtime,
-                ))
-                .map_err(|error| error.to_string())?
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
+                &self.address,
+                &request,
+                self.timeout,
+                runtime,
+            )
+            .map_err(|error| error.to_string())?
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
                 .map_err(|error| error.to_string())?
@@ -8486,12 +8484,12 @@ impl RemoteSifsBrowser {
         )
         .map_err(|error| error.to_string())?;
         let response = if let Some(runtime) = &self.runtime {
-            runtime.block_on(sinomo_runtime::api::send_daemon_rpc_async(
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
                 &self.address,
                 &request,
-                sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+                self.timeout,
                 runtime,
-            ))
+            )
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
         };

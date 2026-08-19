@@ -21,6 +21,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -1969,17 +1970,19 @@ impl SettingsState {
         let (tx, rx) = mpsc::channel();
         let server_generations = self.server_generations;
         let draft_generations = self.draft_generations;
-        match crate::daemon_rpc_thread_builder("sinomo-app-settings-load").spawn(move || {
-            let settings = SettingsState::new(&backend);
-            let _ = tx.send(SettingsInitialLoadResult {
-                settings,
-                server_generations,
-                draft_generations,
-            });
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }) {
+        match thread::Builder::new()
+            .name("sinomo-app-settings-load".to_string())
+            .spawn(move || {
+                let settings = SettingsState::new(&backend);
+                let _ = tx.send(SettingsInitialLoadResult {
+                    settings,
+                    server_generations,
+                    draft_generations,
+                });
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            }) {
             Ok(_) => {
                 self.initial_load_rx = Some(rx);
                 self.initial_load_started = true;
@@ -2309,7 +2312,8 @@ impl SettingsState {
             let (request_tx, request_rx) = mpsc::channel();
             let (result_tx, result_rx) = mpsc::channel();
             let worker_waker = waker;
-            let spawn = crate::daemon_rpc_thread_builder("sinomo-app-settings-operations")
+            let spawn = thread::Builder::new()
+                .name("sinomo-app-settings-operations".to_string())
                 .spawn(move || settings_operation_worker(request_rx, result_tx, worker_waker));
             if let Err(error) = spawn {
                 self.apply_operation_queue_error(

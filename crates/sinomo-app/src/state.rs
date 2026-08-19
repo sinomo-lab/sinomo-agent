@@ -11,6 +11,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
 use std::time::Instant;
 
 use sui::{DefaultTheme, Signal, WindowRenderOptions};
@@ -1075,8 +1076,9 @@ impl Shared {
         };
         self.publish_connection_signals();
 
-        let spawn =
-            crate::daemon_rpc_thread_builder("sinomo-app-connection-probe").spawn(move || {
+        let spawn = thread::Builder::new()
+            .name("sinomo-app-connection-probe".to_string())
+            .spawn(move || {
                 let result = probe_runtime_connection(data_dir.as_ref(), address.as_deref())
                     .map(ConnectionProbeResult::Online)
                     .unwrap_or_else(ConnectionProbeResult::Unavailable);
