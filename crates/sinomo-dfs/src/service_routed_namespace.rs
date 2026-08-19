@@ -463,6 +463,11 @@ mod tests {
                 ..
             }]
         ));
+        assert_eq!(
+            isolated_rescans[0].next_cursor.authority_epoch, root_shard.epoch,
+            "an epoch-change rescan must expose the current durable boundary"
+        );
+        assert_eq!(isolated_rescans[0].next_cursor.after_sequence, 9);
         assert!(matches!(
             isolated_rescans[1].events.as_slice(),
             [DfsNamespaceChangeEvent::RescanRequired {
@@ -3288,10 +3293,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             if cursor.authority_epoch != shard.epoch {
+                // A full-scan consumer must be able to install the current
+                // authority epoch as its new replay boundary. Returning the
+                // stale input cursor here would complete the scan and then
+                // immediately request the same epoch-change scan forever.
+                let current_cursor =
+                    DfsNamespaceChangeCursor::from_shard_config(&shard, cursor.after_sequence);
                 batches.insert(
                     shard_id,
                     DfsNamespaceChangeBatch::require_rescan(
-                        cursor,
+                        &current_cursor,
                         cursor.after_sequence,
                         DfsNamespaceRescanReason::AuthorityEpochChanged,
                         format!(
