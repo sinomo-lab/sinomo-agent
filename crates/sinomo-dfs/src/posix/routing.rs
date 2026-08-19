@@ -60,10 +60,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(super) fn with_local_primary_metadata_read_snapshot<R>(
         &mut self,
         path: &str,
-        operation: impl FnOnce(&mut Self) -> Result<R>,
+        operation: impl FnOnce(&mut Self, Option<&[DfsMetadataShardConfig]>) -> Result<R>,
     ) -> Result<R> {
         let path = normalize_posix_path(path)?;
-        let local_primary = self.routed_namespace_primary_for_path(&path)?.is_none();
+        let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        let local_primary = match shard_snapshot.as_deref() {
+            Some(shards) => self
+                .routed_namespace_primary_for_path_from_snapshot(&path, shards)?
+                .is_none(),
+            None => true,
+        };
         let pinned = local_primary && self.metadata_backend.is_some();
         if pinned {
             self.metadata_backend
@@ -73,7 +79,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .map_err(DfsPosixError::from)?;
         }
 
-        let result = operation(self);
+        let result = operation(self, shard_snapshot.as_deref());
         if pinned {
             self.metadata_backend
                 .as_mut()
@@ -198,7 +204,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )
     }
 
-    fn routed_namespace_shard_for_path_from_snapshot(
+    pub(super) fn routed_namespace_shard_for_path_from_snapshot(
         &self,
         path: &str,
         shards: &[DfsMetadataShardConfig],
@@ -302,18 +308,38 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         })
     }
 
-    pub(super) fn lookup_sifs_path_distributed_synced_with_inline_range(
+    pub(super) fn lookup_sifs_path_distributed_synced_from_snapshot(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<(String, Option<DfsObjectMetadata>)> {
+        self.with_metadata_lookup_cache_mut(|service| {
+            service
+                .lookup_sifs_path_distributed_synced_with_cache_from_snapshot(
+                    path,
+                    follow_final,
+                    None,
+                    shard_snapshot,
+                )
+                .map(|(path, object, _)| (path, object))
+        })
+    }
+
+    pub(super) fn lookup_sifs_path_distributed_synced_with_inline_range_from_snapshot(
         &mut self,
         path: &str,
         follow_final: bool,
         offset: u64,
         max_bytes: usize,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
         self.with_metadata_lookup_cache_mut(|service| {
-            service.lookup_sifs_path_distributed_synced_with_cache(
+            service.lookup_sifs_path_distributed_synced_with_cache_from_snapshot(
                 path,
                 follow_final,
                 Some((offset, max_bytes)),
+                shard_snapshot,
             )
         })
     }
@@ -324,12 +350,45 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
         inline_range: Option<(u64, usize)>,
     ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
-        let mut resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        let resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
+        self.lookup_sifs_path_distributed_synced_with_resolved_snapshot(
+            path,
+            follow_final,
+            inline_range,
+            resolved,
+            shard_snapshot.as_deref(),
+        )
+    }
+
+    fn lookup_sifs_path_distributed_synced_with_cache_from_snapshot(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        inline_range: Option<(u64, usize)>,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
+        let resolved = self.resolve_existing_posix_path_distributed(path, follow_final)?;
+        self.lookup_sifs_path_distributed_synced_with_resolved_snapshot(
+            path,
+            follow_final,
+            inline_range,
+            resolved,
+            shard_snapshot,
+        )
+    }
+
+    fn lookup_sifs_path_distributed_synced_with_resolved_snapshot(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        inline_range: Option<(u64, usize)>,
+        mut resolved: String,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<(String, Option<DfsObjectMetadata>, Option<DfsReadRangeData>)> {
         for _ in 0..POSIX_ROUTED_SYNC_RETRY_ROUNDS {
             let local_object = self.lookup_sifs_path(&resolved)?;
             let Some(shard) = shard_snapshot
-                .as_deref()
                 .map(|shards| self.routed_namespace_shard_for_path_from_snapshot(&resolved, shards))
                 .transpose()?
                 .flatten()
@@ -407,7 +466,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let cursor_before = self.metadata_shard_cursor_for_path_from_snapshot(
                 &resolved,
-                shard_snapshot.as_deref().unwrap_or_default(),
+                shard_snapshot.unwrap_or_default(),
             )?;
             if self
                 .route_namespace_operation_to_metadata_primary_with_timeout(
@@ -424,7 +483,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             if self.metadata_shard_cursor_for_path_from_snapshot(
                 &resolved,
-                shard_snapshot.as_deref().unwrap_or_default(),
+                shard_snapshot.unwrap_or_default(),
             )? <= cursor_before
             {
                 break;

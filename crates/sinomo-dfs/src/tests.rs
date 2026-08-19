@@ -7252,19 +7252,39 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
     let root = temp_root("local-primary-lightweight-read-snapshot");
     let node_id =
         NodeId::from_legacy_named("node_local_primary_lightweight_snapshot").expect("node");
-    let directory = "/services/lightweight-read-snapshot/deep";
-    let path = "/services/lightweight-read-snapshot/deep/tiny.txt";
+    let directory = "/lightweight-read-snapshot/deep";
+    let path = "/lightweight-read-snapshot/deep/tiny.txt";
     let payload = b"resident metadata snapshot";
     let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
     dfs.posix_mkdir_all(directory).expect("fixture directory");
     dfs.posix_write_file(
         path,
         payload,
-        DfsWriteOptions::replicated_eventual(vec![node_id]),
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
     )
     .expect("fixture file");
 
+    let mut kv = InProcessKvStore::new();
+    DfsControlPlaneStore::new(&mut kv)
+        .put_metadata_shard(&DfsMetadataShardConfig {
+            file_system_id: sifs_file_system_id(),
+            shard_id: "root".to_string(),
+            primary_node_id: node_id,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedEventual,
+        })
+        .expect("root metadata shard");
+    let range_prefix_calls = Arc::new(AtomicUsize::new(0));
+    dfs = dfs.with_control_plane(CountingDfsControlPlaneKvClient::new(
+        kv,
+        Arc::clone(&range_prefix_calls),
+    ));
+
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    range_prefix_calls.store(0, Ordering::SeqCst);
     let stat = dfs.posix_stat_distributed(path).expect("distributed stat");
     assert_eq!(stat.size_bytes, Some(payload.len() as u64));
     assert_eq!(
@@ -7272,8 +7292,14 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
         0,
         "one local-primary stat must not probe durable table files per path component"
     );
+    assert_eq!(
+        range_prefix_calls.load(Ordering::SeqCst),
+        1,
+        "one local-primary stat must reuse one control-plane shard snapshot"
+    );
 
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    range_prefix_calls.store(0, Ordering::SeqCst);
     let entries = dfs
         .posix_list_dir_distributed(directory)
         .expect("distributed list");
@@ -7283,8 +7309,14 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
         0,
         "one local-primary listing must retain its starting metadata generation"
     );
+    assert_eq!(
+        range_prefix_calls.load(Ordering::SeqCst),
+        1,
+        "one local-primary listing must reuse one control-plane shard snapshot"
+    );
 
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    range_prefix_calls.store(0, Ordering::SeqCst);
     let prefix = dfs
         .posix_read_file_prefix_distributed(path, payload.len())
         .expect("distributed prefix read");
@@ -7294,8 +7326,14 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
         0,
         "one local-primary prefix read must retain its starting metadata generation"
     );
+    assert_eq!(
+        range_prefix_calls.load(Ordering::SeqCst),
+        1,
+        "one local-primary prefix read must reuse one control-plane shard snapshot"
+    );
 
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();
+    range_prefix_calls.store(0, Ordering::SeqCst);
     assert_eq!(
         dfs.posix_read_file_distributed(path)
             .expect("distributed full read"),
@@ -7305,6 +7343,11 @@ fn local_primary_lightweight_reads_pin_one_metadata_generation() {
         crate::metadata_read_snapshot::metadata_durable_table_probes(),
         0,
         "one local-primary full read must retain its starting metadata generation"
+    );
+    assert_eq!(
+        range_prefix_calls.load(Ordering::SeqCst),
+        1,
+        "one local-primary full read must reuse one control-plane shard snapshot"
     );
 
     crate::metadata_read_snapshot::reset_metadata_durable_table_probes();

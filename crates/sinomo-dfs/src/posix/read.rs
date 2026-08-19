@@ -18,12 +18,12 @@ use crate::posix_model::{
 use crate::posix_path::normalize_posix_path;
 use crate::{
     DfsBulkReadItem, DfsBulkReadItemResponse, DfsBulkReadRequest, DfsDirectReadClientResult,
-    DfsError, DfsMessageTransport, DfsNetworkMessage, DfsNodeTransport, DfsObjectId, DfsObjectKind,
-    DfsObjectMetadata, DfsPosixFilePrefixRead, DfsPosixRemoteFileRangeReadStream,
-    DfsPosixRemoteFileReadStream, DfsReadData, DfsReadRangeData, DfsReadResult, DfsVersion,
-    NetworkedDfsRangeReadOutcome, NetworkedDfsRangeReadStreamOutcome, NetworkedDfsReadFreshness,
-    NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome, NetworkedDfsService,
-    NetworkedDfsServiceEvent, sifs_file_system_id,
+    DfsError, DfsMessageTransport, DfsMetadataShardConfig, DfsNetworkMessage, DfsNodeTransport,
+    DfsObjectId, DfsObjectKind, DfsObjectMetadata, DfsPosixFilePrefixRead,
+    DfsPosixRemoteFileRangeReadStream, DfsPosixRemoteFileReadStream, DfsReadData, DfsReadRangeData,
+    DfsReadResult, DfsVersion, NetworkedDfsRangeReadOutcome, NetworkedDfsRangeReadStreamOutcome,
+    NetworkedDfsReadFreshness, NetworkedDfsReadOutcome, NetworkedDfsReadStreamOutcome,
+    NetworkedDfsService, NetworkedDfsServiceEvent, sifs_file_system_id,
 };
 use sinomo_core::events::EventId;
 use sinomo_core::node::NodeId;
@@ -400,7 +400,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         follow_final: bool,
     ) -> Result<DistributedPosixFileContentObjectOutcome> {
-        let (path, object) = match self.lookup_sifs_path_distributed_synced(path, follow_final) {
+        let lookup = self.lookup_sifs_path_distributed_synced(path, follow_final);
+        self.distributed_posix_file_content_object_outcome_from_lookup(lookup)
+    }
+
+    fn distributed_posix_file_content_object_outcome_from_snapshot(
+        &mut self,
+        path: &str,
+        follow_final: bool,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
+    ) -> Result<DistributedPosixFileContentObjectOutcome> {
+        let lookup = self.lookup_sifs_path_distributed_synced_from_snapshot(
+            path,
+            follow_final,
+            shard_snapshot,
+        );
+        self.distributed_posix_file_content_object_outcome_from_lookup(lookup)
+    }
+
+    fn distributed_posix_file_content_object_outcome_from_lookup(
+        &mut self,
+        lookup: Result<(String, Option<DfsObjectMetadata>)>,
+    ) -> Result<DistributedPosixFileContentObjectOutcome> {
+        let (path, object) = match lookup {
             Ok(lookup) => lookup,
             Err(DfsPosixError::NotFound { path }) => {
                 // Path resolution follows hardlinks before returning the
@@ -432,16 +454,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         follow_final: bool,
         offset: u64,
         max_bytes: usize,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<(
         DistributedPosixFileContentObjectOutcome,
         Option<DfsReadRangeData>,
     )> {
         let (path, object, inline_range) = match self
-            .lookup_sifs_path_distributed_synced_with_inline_range(
+            .lookup_sifs_path_distributed_synced_with_inline_range_from_snapshot(
                 path,
                 follow_final,
                 offset,
                 max_bytes,
+                shard_snapshot,
             ) {
             Ok(lookup) => lookup,
             Err(DfsPosixError::NotFound { path }) => {
@@ -615,19 +639,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
         let path = normalize_posix_path(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service| {
-            service.posix_read_file_distributed_outcome_from_snapshot(&path)
+        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
+            service.posix_read_file_distributed_outcome_from_snapshot(&path, shard_snapshot)
         })
     }
 
     fn posix_read_file_distributed_outcome_from_snapshot(
         &mut self,
         path: &str,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
         self.check_cancelled("distributed read")?;
         let trace_started = Instant::now();
         let lookup_started = Instant::now();
-        let (path, object) = match self.distributed_posix_file_content_object_outcome(path, true)? {
+        let (path, object) = match self
+            .distributed_posix_file_content_object_outcome_from_snapshot(
+                path,
+                true,
+                shard_snapshot,
+            )? {
             DistributedPosixFileContentObjectOutcome::Found { path, object } => (path, object),
             DistributedPosixFileContentObjectOutcome::NotFound { path } => {
                 return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
@@ -676,8 +706,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
         let path = normalize_posix_path(path)?;
-        self.with_local_primary_metadata_read_snapshot(&path, |service| {
-            service.posix_read_file_prefix_distributed_outcome_from_snapshot(&path, max_bytes)
+        self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
+            service.posix_read_file_prefix_distributed_outcome_from_snapshot(
+                &path,
+                max_bytes,
+                shard_snapshot,
+            )
         })
     }
 
@@ -685,11 +719,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
         max_bytes: usize,
+        shard_snapshot: Option<&[DfsMetadataShardConfig]>,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
         self.check_cancelled("distributed prefix read")?;
         let (lookup, inline_range) = self
             .distributed_posix_file_content_object_with_inline_range_outcome(
-                path, true, 0, max_bytes,
+                path,
+                true,
+                0,
+                max_bytes,
+                shard_snapshot,
             )?;
         let (path, object) = match lookup {
             DistributedPosixFileContentObjectOutcome::Found { path, object } => (path, object),
