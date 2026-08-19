@@ -3191,7 +3191,7 @@ async fn handle_daemon_peer_opened_routed_stream_async(
     service_runtime: tokio::runtime::Handle,
 ) -> Result<bool, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
-    let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
+    let state = sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths)?;
     let directory = sinomo_core::network::cluster_directory_with_bootstrap_state(
         sinomo_core::network::cluster_directory_for(&cluster_paths),
         &state,
@@ -3770,7 +3770,7 @@ async fn handle_daemon_local_stream_native_service_rpc_with_context_async(
     let responder_node_id = cluster_paths_from_daemon_paths(&paths)
         .ok()
         .and_then(|cluster_paths| {
-            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths).ok()
+            sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths).ok()
         })
         .map(|state| Arc::<str>::from(state.local_node_id.as_str()));
     let local_node_id = responder_node_id
