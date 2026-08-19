@@ -135,6 +135,33 @@ fn cluster_directory_projection_cache_tick() -> u64 {
     CLUSTER_DIRECTORY_PROJECTION_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Returns the process-hot semantic routing generation when the exact network
+/// module generation that produced it is still active.
+///
+/// Route-sensitive KV commits and imported snapshot replacements synchronously
+/// evict this entry through [`invalidate_cluster_directory_projection`]. That
+/// makes this a read-model lookup, not a time-based cache: unrelated KV writes
+/// retain the generation while membership, endpoint, policy, connectivity, or
+/// module changes force the ordinary authoritative snapshot path.
+fn cached_cluster_directory_routing_version(
+    paths: &ClusterPaths,
+) -> Option<sinomo_network::DirectoryVersion> {
+    let module_routing_generation = sinomo_network::network_module_routing_generation();
+    let mut cache = CLUSTER_DIRECTORY_PROJECTIONS.lock().ok()?;
+    let entry = cache.get_mut(&paths.root)?;
+    if entry.module_routing_generation != module_routing_generation {
+        return None;
+    }
+    entry.last_used = cluster_directory_projection_cache_tick();
+    Some(entry.projection.routing_version)
+}
+
+pub(crate) fn invalidate_cluster_directory_projection(paths: &ClusterPaths) {
+    if let Ok(mut cache) = CLUSTER_DIRECTORY_PROJECTIONS.lock() {
+        cache.remove(&paths.root);
+    }
+}
+
 fn cluster_directory_projection_mark(snapshot: &KvSnapshot) -> Result<blake3::Hash, NetworkError> {
     const ROUTE_PREFIXES: [&str; 4] = [
         "/cluster/members/",
@@ -659,6 +686,9 @@ impl sinomo_network::ClusterDirectory for KvClusterDirectory {
     }
 
     fn routing_version(&self) -> Result<sinomo_network::DirectoryVersion, NetworkError> {
+        if let Some(version) = cached_cluster_directory_routing_version(&self.paths) {
+            return Ok(version);
+        }
         let Some(snapshot) = read_cluster_kv_latest_observed_snapshot_arc_if_present(&self.paths)?
         else {
             return Ok(sinomo_network::DirectoryVersion(0));
@@ -1300,6 +1330,20 @@ mod tests {
         let second = read_projection(Arc::clone(&snapshot)).expect("cached projection");
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.routing_version, second.routing_version);
+        assert_eq!(
+            cached_cluster_directory_routing_version(&paths),
+            Some(first.routing_version),
+            "a materialized directory projection must expose its process-hot semantic generation"
+        );
+
+        invalidate_cluster_directory_projection(&paths);
+        assert_eq!(
+            cached_cluster_directory_routing_version(&paths),
+            None,
+            "route-sensitive commit observers must make the next generation read authoritative"
+        );
+        let first = read_projection(Arc::clone(&snapshot))
+            .expect("projection rebuilt after explicit invalidation");
 
         let replacement = Arc::new((*snapshot).clone());
         let same_route = read_projection(replacement).expect("replacement projection");

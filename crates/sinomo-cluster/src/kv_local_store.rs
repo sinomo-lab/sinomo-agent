@@ -499,6 +499,7 @@ fn invalidate_cluster_kv_observed_read_models_selective(
         crate::local_state_store::invalidate_cluster_state_cache(paths);
     }
     if invalidation.route_graph {
+        crate::kv_read_model::invalidate_cluster_directory_projection(paths);
         sinomo_network::invalidate_cluster_route_graph_cache(paths);
     }
 }
