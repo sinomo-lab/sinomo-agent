@@ -5,7 +5,8 @@
 //! route the object RPC through its persistent cluster transports.
 
 use std::collections::BTreeSet;
-use std::sync::Mutex;
+use std::future::Future;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use sinomo_runtime::api::DaemonApiClient;
@@ -40,7 +41,9 @@ pub struct ObserveSampleBatch {
 impl Backend {
     /// Collect one bounded dashboard sample from every authorized cluster
     /// member. A daemon without cluster identity is represented by a single
-    /// synthetic `local` target.
+    /// synthetic `local` target. This synchronous facade waits for tasks on
+    /// `app_runtime`, so callers must invoke it from an ordinary OS worker,
+    /// never from one of that runtime's worker threads.
     pub fn observe_cluster_metrics(&self, generation: u64) -> ObserveSampleBatch {
         let requested_at = OffsetDateTime::now_utc();
         let targets = match self.observe_dashboard_targets() {
@@ -61,40 +64,32 @@ impl Backend {
             }
         };
 
-        let local_sample_id = targets
-            .first()
-            .and_then(Option::as_ref)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "local".to_string());
-        let mut samples = Vec::with_capacity(targets.len());
-        for chunk in targets.chunks(OBSERVE_DASHBOARD_MAX_WORKERS) {
-            let results = Mutex::new(Vec::with_capacity(chunk.len()));
-            std::thread::scope(|scope| {
-                for target in chunk.iter().cloned() {
-                    let results = &results;
-                    scope.spawn(move || {
-                        let node_id = target
-                            .as_ref()
-                            .map(ToString::to_string)
-                            .unwrap_or_else(|| "local".to_string());
-                        let response = self.observe_metrics_for_target(target.as_ref());
-                        results
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(ObserveTargetSample { node_id, response });
-                    });
-                }
-            });
-            samples.extend(
-                results
-                    .into_inner()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
-        samples.sort_by(|left, right| {
-            (left.node_id != local_sample_id)
-                .cmp(&(right.node_id != local_sample_id))
-                .then_with(|| left.node_id.cmp(&right.node_id))
+        let disconnected_targets = targets.clone();
+        let address = self.connection.daemon_address().map(ToString::to_string);
+        let local_node_id = self.observe_local_node_id().cloned();
+        let (sample_tx, sample_rx) = mpsc::sync_channel(1);
+        // The dashboard API remains synchronous for the UI refresh worker, but
+        // daemon futures are created and polled only on the app runtime. This
+        // keeps deeply composed routed-RPC polls off short-lived OS threads.
+        self.app_runtime.spawn(async move {
+            let samples = collect_bounded_observation_samples(targets, move |target| {
+                let address = address.clone();
+                let local_node_id = local_node_id.clone();
+                async move { observe_metrics_for_target(address, local_node_id, target).await }
+            })
+            .await;
+            let _ = sample_tx.send(samples);
+        });
+        let samples = sample_rx.recv().unwrap_or_else(|_| {
+            disconnected_targets
+                .into_iter()
+                .map(|target| ObserveTargetSample {
+                    node_id: observation_target_label(target.as_ref()),
+                    response: Err(
+                        "cluster observation task stopped before returning a sample".to_string()
+                    ),
+                })
+                .collect()
         });
         ObserveSampleBatch {
             generation,
@@ -102,41 +97,6 @@ impl Backend {
             received_at: OffsetDateTime::now_utc(),
             targets: samples,
         }
-    }
-
-    fn observe_metrics_for_target(
-        &self,
-        target: Option<&NodeId>,
-    ) -> Result<ObserveMetricsResponse, String> {
-        let address = self.connection.daemon_address().ok_or_else(|| {
-            "live observation requires a running Sinomo daemon; reconnect the app after starting it"
-                .to_string()
-        })?;
-        let request = ObjectRpcRequest::encode_body(
-            OBSERVE_METRICS_ROUTE,
-            OBSERVE_RPC_CATEGORY,
-            &ObserveMetricsRequest {
-                name_prefix: Some("sinomo.".to_string()),
-                limit: OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET,
-            },
-        )
-        .map_err(|error| error.to_string())?
-        .with_trace_context_if_missing();
-        let client = DaemonApiClient::at_address(address.to_string())
-            .with_timeout(OBSERVE_DASHBOARD_RPC_TIMEOUT);
-        let response = if target.is_none() || target == self.observe_local_node_id() {
-            client.call_request(&request)
-        } else {
-            client.object_rpc_to_target_with_deadline(
-                target.expect("remote target checked above"),
-                &request,
-                OBSERVE_DASHBOARD_RPC_TIMEOUT,
-                Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
-                true,
-            )
-        }
-        .map_err(|error| error.to_string())?;
-        response.decode_body().map_err(|error| error.to_string())
     }
 
     fn observe_dashboard_targets(&self) -> Result<Vec<Option<NodeId>>, String> {
@@ -170,6 +130,81 @@ impl Backend {
     }
 }
 
+async fn observe_metrics_for_target(
+    address: Option<String>,
+    local_node_id: Option<NodeId>,
+    target: Option<NodeId>,
+) -> Result<ObserveMetricsResponse, String> {
+    let address = address.ok_or_else(|| {
+        "live observation requires a running Sinomo daemon; reconnect the app after starting it"
+            .to_string()
+    })?;
+    let request = ObjectRpcRequest::encode_body(
+        OBSERVE_METRICS_ROUTE,
+        OBSERVE_RPC_CATEGORY,
+        &ObserveMetricsRequest {
+            name_prefix: Some("sinomo.".to_string()),
+            limit: OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET,
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_trace_context_if_missing();
+    let client = DaemonApiClient::at_address(address).with_timeout(OBSERVE_DASHBOARD_RPC_TIMEOUT);
+    let response = if target.is_none() || target.as_ref() == local_node_id.as_ref() {
+        client.call_request_async(&request).await
+    } else {
+        client
+            .object_rpc_to_target_with_deadline_async(
+                target.as_ref().expect("remote target checked above"),
+                &request,
+                OBSERVE_DASHBOARD_RPC_TIMEOUT,
+                Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
+                true,
+            )
+            .await
+    }
+    .map_err(|error| error.to_string())?;
+    response.decode_body().map_err(|error| error.to_string())
+}
+
+async fn collect_bounded_observation_samples<Observe, ObserveFuture>(
+    targets: Vec<Option<NodeId>>,
+    observe: Observe,
+) -> Vec<ObserveTargetSample>
+where
+    Observe: Fn(Option<NodeId>) -> ObserveFuture + Clone + Send + 'static,
+    ObserveFuture: Future<Output = Result<ObserveMetricsResponse, String>> + Send + 'static,
+{
+    let mut samples = Vec::with_capacity(targets.len());
+    // Each chunk preserves input order and bounds both routed traffic and live
+    // task state. The next chunk starts only after every task in this one ends.
+    for chunk in targets.chunks(OBSERVE_DASHBOARD_MAX_WORKERS) {
+        let jobs = chunk
+            .iter()
+            .cloned()
+            .map(|target| {
+                let node_id = observation_target_label(target.as_ref());
+                let observe = observe.clone();
+                (node_id, tokio::spawn(async move { observe(target).await }))
+            })
+            .collect::<Vec<_>>();
+        for (node_id, job) in jobs {
+            let response = match job.await {
+                Ok(response) => response,
+                Err(error) => Err(format!("cluster observation task failed: {error}")),
+            };
+            samples.push(ObserveTargetSample { node_id, response });
+        }
+    }
+    samples
+}
+
+fn observation_target_label(target: Option<&NodeId>) -> String {
+    target
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "local".to_string())
+}
+
 fn bounded_observation_targets(
     local_node_id: NodeId,
     authorized: impl IntoIterator<Item = NodeId>,
@@ -189,6 +224,8 @@ fn bounded_observation_targets(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn daemonless_dashboard_sample_is_bounded_error() {
@@ -223,5 +260,62 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn async_observation_fanout_is_bounded_and_keeps_target_order() {
+        let targets = std::iter::once(None)
+            .chain((0..15).map(|index| {
+                Some(
+                    NodeId::from_legacy_named(format!("node_observe_async_{index:02}"))
+                        .expect("valid async observation node id"),
+                )
+            }))
+            .collect::<Vec<_>>();
+        let expected_labels = targets
+            .iter()
+            .map(|target| observation_target_label(target.as_ref()))
+            .collect::<Vec<_>>();
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let batch_barrier = Arc::new(tokio::sync::Barrier::new(OBSERVE_DASHBOARD_MAX_WORKERS));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .expect("observation test runtime");
+
+        let samples = runtime.block_on(collect_bounded_observation_samples(targets, {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let batch_barrier = Arc::clone(&batch_barrier);
+            move |target| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                let batch_barrier = Arc::clone(&batch_barrier);
+                async move {
+                    let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now_active, Ordering::SeqCst);
+                    batch_barrier.wait().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Err(format!(
+                        "sampled {}",
+                        observation_target_label(target.as_ref())
+                    ))
+                }
+            }
+        }));
+
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.node_id.clone())
+                .collect::<Vec<_>>(),
+            expected_labels
+        );
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            OBSERVE_DASHBOARD_MAX_WORKERS
+        );
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 }

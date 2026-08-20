@@ -1,9 +1,9 @@
-//! Stable, GUI-facing surface over the main-agent chat runtime.
+//! Stable, GUI-facing surfaces over CLI-owned application workflows.
 //!
-//! The graphical app (`sinomo-app`) drives the *same* interaction runtime the
-//! terminal UI uses, but needs a small, owned, type-erased API rather than the
+//! The graphical app (`sinomo-app`) drives the same chat, cluster, and DFS
+//! authority paths as the terminal UI, but needs small owned APIs rather than
 //! crate-internal handler types. Everything here returns plain data so the app
-//! never depends on `tui` internals.
+//! never depends on `tui` internals or bypasses daemon-owned mutations.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -7457,6 +7457,289 @@ pub type SifsPlacementActivityPage = sinomo_runtime::dfs::DfsPlacementReconcilia
 pub type SifsPlacementActivityRequest =
     sinomo_runtime::api::DaemonDfsBrowserPlacementActivityRequest;
 
+/// Stable DFS identifiers used by the operator views.
+pub type DfsFileSystemId = sinomo_runtime::dfs::DfsFileSystemId;
+pub type DfsObjectId = sinomo_runtime::dfs::DfsObjectId;
+pub type DfsVersion = sinomo_runtime::dfs::DfsVersion;
+
+/// Bounded, daemon-owned DFS operator projections exposed to the GUI.
+pub type DfsOperatorStatus = sinomo_runtime::dfs::DfsOperatorStatus;
+pub type DfsOperatorObjectView = sinomo_runtime::dfs::DfsOperatorObjectView;
+pub type DfsOperatorInspectionCursor = sinomo_runtime::dfs::DfsOperatorInspectionCursor;
+pub type DfsConflictRecord = sinomo_runtime::dfs::DfsConflictRecord;
+pub type DfsOperatorConflictPage = sinomo_runtime::dfs::DfsOperatorConflictPage;
+pub type DfsOperatorConflictVersionView = sinomo_runtime::dfs::DfsOperatorConflictVersionView;
+pub type DfsOperatorConflictVersionsReport = sinomo_runtime::dfs::DfsOperatorConflictVersionsReport;
+pub type DfsOperatorConflictResolutionReport =
+    sinomo_runtime::dfs::DfsOperatorConflictResolutionReport;
+pub type DfsOperatorUseConflictVersionReport =
+    sinomo_runtime::dfs::DfsOperatorUseConflictVersionReport;
+pub type DfsOperatorRepairView = sinomo_runtime::dfs::DfsOperatorRepairView;
+pub type DfsOperatorRepairPage = sinomo_runtime::dfs::DfsOperatorRepairPage;
+
+/// Typed GUI client for the daemon-owned DFS operator surface.
+///
+/// Reads stay bounded by the DFS inspection contract. Conflict resolution and
+/// version selection are sent to the daemon as authority-owning commands; this
+/// client never edits metadata locally and never retries a mutation.
+#[derive(Clone)]
+pub struct DfsOperatorClient {
+    address: String,
+    timeout: Duration,
+    runtime: Option<tokio::runtime::Handle>,
+}
+
+impl DfsOperatorClient {
+    pub fn open_daemon(address: impl Into<String>) -> Result<Self, String> {
+        Self::open_daemon_with_timeout(address, sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT)
+    }
+
+    pub fn open_daemon_with_timeout(
+        address: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Self, String> {
+        Self::open_remote(address.into(), timeout, None)
+    }
+
+    pub fn open_daemon_on_runtime(
+        address: impl Into<String>,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<Self, String> {
+        Self::open_remote(
+            address.into(),
+            sinomo_runtime::network::DEFAULT_NETWORK_TIMEOUT,
+            Some(runtime.clone()),
+        )
+    }
+
+    fn open_remote(
+        address: String,
+        timeout: Duration,
+        runtime: Option<tokio::runtime::Handle>,
+    ) -> Result<Self, String> {
+        let client = Self {
+            address,
+            timeout,
+            runtime,
+        };
+        // Match `SifsBrowser`'s open semantics: prove the supplied endpoint
+        // serves the expected contract before handing a live handle to the UI.
+        client.status()?;
+        Ok(client)
+    }
+
+    /// Read the daemon's bounded DFS status projection.
+    pub fn status(&self) -> Result<DfsOperatorStatus, String> {
+        match self.rpc(sinomo_runtime::dfs::DaemonDfsInspectionRequest::Status)? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Status { status } => Ok(status),
+            response => Err(unexpected_dfs_operator_response("status", &response)),
+        }
+    }
+
+    /// Inspect the authoritative object currently visible at a filesystem path.
+    pub fn object_by_path(
+        &self,
+        file_system_id: DfsFileSystemId,
+        path: impl Into<String>,
+    ) -> Result<Option<DfsOperatorObjectView>, String> {
+        match self.rpc(sinomo_runtime::dfs::DaemonDfsInspectionRequest::Path {
+            file_system_id,
+            path: path.into(),
+        })? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Path { object } => Ok(object),
+            response => Err(unexpected_dfs_operator_response("path", &response)),
+        }
+    }
+
+    /// Inspect one object by its stable DFS identity.
+    pub fn object(&self, object_id: DfsObjectId) -> Result<Option<DfsOperatorObjectView>, String> {
+        match self.rpc(sinomo_runtime::dfs::DaemonDfsInspectionRequest::Object { object_id })? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Object { object } => Ok(object),
+            response => Err(unexpected_dfs_operator_response("object", &response)),
+        }
+    }
+
+    /// Read one explicitly bounded page of conflict records.
+    pub fn conflicts_page(
+        &self,
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+        limit: usize,
+        cursor: Option<DfsOperatorInspectionCursor>,
+    ) -> Result<DfsOperatorConflictPage, String> {
+        let response = self.rpc(sinomo_runtime::dfs::DaemonDfsInspectionRequest::Conflicts {
+            file_system_id,
+            object_id,
+            limit: Some(limit),
+            cursor,
+        })?;
+        dfs_operator_conflict_page_from_response(response)
+    }
+
+    /// Read the versions relevant to selected conflict records on an object.
+    pub fn conflict_versions(
+        &self,
+        object_id: DfsObjectId,
+        conflict_ids: Vec<String>,
+    ) -> Result<Option<DfsOperatorConflictVersionsReport>, String> {
+        match self.rpc(
+            sinomo_runtime::dfs::DaemonDfsInspectionRequest::ConflictVersions {
+                object_id,
+                conflict_ids,
+            },
+        )? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::ConflictVersions { report } => {
+                Ok(report)
+            }
+            response => Err(unexpected_dfs_operator_response(
+                "conflict-versions",
+                &response,
+            )),
+        }
+    }
+
+    /// Resolve the selected conflict records through the daemon's DFS authority.
+    pub fn resolve_conflicts(
+        &self,
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+        conflict_ids: Vec<String>,
+    ) -> Result<DfsOperatorConflictResolutionReport, String> {
+        match self.rpc(
+            sinomo_runtime::dfs::DaemonDfsInspectionRequest::ResolveConflicts {
+                file_system_id,
+                object_id,
+                conflict_ids,
+            },
+        )? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::ResolveConflicts { report } => {
+                Ok(report)
+            }
+            response => Err(unexpected_dfs_operator_response(
+                "resolve-conflicts",
+                &response,
+            )),
+        }
+    }
+
+    /// Make a selected stored version current and resolve matching conflicts.
+    pub fn use_conflict_version(
+        &self,
+        object_id: DfsObjectId,
+        version: DfsVersion,
+        conflict_ids: Vec<String>,
+    ) -> Result<DfsOperatorUseConflictVersionReport, String> {
+        match self.rpc(
+            sinomo_runtime::dfs::DaemonDfsInspectionRequest::UseConflictVersion {
+                object_id,
+                version,
+                conflict_ids,
+            },
+        )? {
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::UseConflictVersion { report } => {
+                Ok(report)
+            }
+            response => Err(unexpected_dfs_operator_response(
+                "use-conflict-version",
+                &response,
+            )),
+        }
+    }
+
+    /// Read one explicitly bounded page of pending replica repairs.
+    pub fn repair_page(
+        &self,
+        file_system_id: Option<DfsFileSystemId>,
+        object_id: Option<DfsObjectId>,
+        limit: usize,
+        cursor: Option<DfsOperatorInspectionCursor>,
+    ) -> Result<DfsOperatorRepairPage, String> {
+        let response = self.rpc(sinomo_runtime::dfs::DaemonDfsInspectionRequest::Repair {
+            file_system_id,
+            object_id,
+            limit: Some(limit),
+            cursor,
+        })?;
+        dfs_operator_repair_page_from_response(response)
+    }
+
+    fn rpc(
+        &self,
+        body: sinomo_runtime::dfs::DaemonDfsInspectionRequest,
+    ) -> Result<sinomo_runtime::dfs::DaemonDfsInspectionResponse, String> {
+        let request = sinomo_runtime::dfs::dfs_inspection_rpc_request(&body)
+            .map_err(|error| error.to_string())?;
+        let response = if let Some(runtime) = &self.runtime {
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
+                &self.address,
+                &request,
+                self.timeout,
+                runtime,
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
+                .map_err(|error| error.to_string())?
+        };
+        sinomo_runtime::dfs::decode_dfs_inspection_rpc_response(&response)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn dfs_operator_conflict_page_from_response(
+    response: sinomo_runtime::dfs::DaemonDfsInspectionResponse,
+) -> Result<DfsOperatorConflictPage, String> {
+    match response {
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Conflicts {
+            conflicts,
+            next_cursor,
+        } => Ok(DfsOperatorConflictPage {
+            conflicts,
+            next_cursor,
+        }),
+        response => Err(unexpected_dfs_operator_response("conflicts", &response)),
+    }
+}
+
+fn dfs_operator_repair_page_from_response(
+    response: sinomo_runtime::dfs::DaemonDfsInspectionResponse,
+) -> Result<DfsOperatorRepairPage, String> {
+    match response {
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Repair {
+            repairs,
+            next_cursor,
+        } => Ok(DfsOperatorRepairPage {
+            repairs,
+            next_cursor,
+        }),
+        response => Err(unexpected_dfs_operator_response("repair", &response)),
+    }
+}
+
+fn unexpected_dfs_operator_response(
+    expected: &str,
+    response: &sinomo_runtime::dfs::DaemonDfsInspectionResponse,
+) -> String {
+    let actual = match response {
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Status { .. } => "status",
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::FileSystem { .. } => "file-system",
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Path { .. } => "path",
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Object { .. } => "object",
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Conflicts { .. } => "conflicts",
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::ResolveConflicts { .. } => {
+            "resolve-conflicts"
+        }
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::ConflictVersions { .. } => {
+            "conflict-versions"
+        }
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::UseConflictVersion { .. } => {
+            "use-conflict-version"
+        }
+        sinomo_runtime::dfs::DaemonDfsInspectionResponse::Repair { .. } => "repair",
+    };
+    format!("daemon returned DFS {actual} response to {expected} request")
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SifsPlacementUpdateOutcome {
     pub preview: SifsPlacementPreview,
@@ -8013,14 +8296,13 @@ impl RemoteSifsBrowser {
                 .map_err(|error| error.to_string());
         }
         let response = if let Some(runtime) = &self.runtime {
-            runtime
-                .block_on(sinomo_runtime::api::send_daemon_rpc_async(
-                    &self.address,
-                    &request,
-                    sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
-                    runtime,
-                ))
-                .map_err(|error| error.to_string())?
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
+                &self.address,
+                &request,
+                self.timeout,
+                runtime,
+            )
+            .map_err(|error| error.to_string())?
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
                 .map_err(|error| error.to_string())?
@@ -8202,12 +8484,12 @@ impl RemoteSifsBrowser {
         )
         .map_err(|error| error.to_string())?;
         let response = if let Some(runtime) = &self.runtime {
-            runtime.block_on(sinomo_runtime::api::send_daemon_rpc_async(
+            sinomo_runtime::api::send_daemon_rpc_on_runtime(
                 &self.address,
                 &request,
-                sinomo_runtime::network::DaemonRpcTimeouts::connect_and_idle(self.timeout),
+                self.timeout,
                 runtime,
-            ))
+            )
         } else {
             sinomo_runtime::api::send_daemon_rpc(&self.address, &request, self.timeout)
         };
@@ -8993,6 +9275,118 @@ mod tests {
         assert_eq!(
             filesystem_provider_node_ids(&entries, &local).expect("provider selection"),
             vec![local, remote]
+        );
+    }
+
+    #[test]
+    fn dfs_operator_conflict_response_maps_page_and_rejects_other_variants() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("app_api_conflict_filesystem").expect("filesystem");
+        let object_id = DfsObjectId::from_legacy_named("app_api_conflict_object").expect("object");
+        let conflict = DfsConflictRecord {
+            conflict_id: "conflict-app-api".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            path: "/documents/report.txt".to_string(),
+            base_version: Some(
+                DfsVersion::from_legacy_named("app_api_conflict_base").expect("base version"),
+            ),
+            local_version: DfsVersion::from_legacy_named("app_api_conflict_local")
+                .expect("local version"),
+            remote_version: DfsVersion::from_legacy_named("app_api_conflict_remote")
+                .expect("remote version"),
+            detected_by_node_id: NodeId::from_legacy_named("app_api_conflict_node").expect("node"),
+            reason: "concurrent edit".to_string(),
+            local_content_hash: Some("blake3:local".to_string()),
+            remote_content_hash: Some("blake3:remote".to_string()),
+            created_by_intent_id: Some("intent-app-api".to_string()),
+            strategy: Some("branch".to_string()),
+            status: sinomo_runtime::dfs::DfsConflictStatus::Open,
+            detected_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let next_cursor = DfsOperatorInspectionCursor {
+            file_system_id,
+            object_cursor: None,
+            object_id: Some(object_id),
+            item_key: Some(
+                sinomo_runtime::dfs::DfsOperatorInspectionItemCursor::Conflict {
+                    conflict_id: conflict.conflict_id.clone(),
+                },
+            ),
+        };
+
+        let page = dfs_operator_conflict_page_from_response(
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Conflicts {
+                conflicts: vec![conflict.clone()],
+                next_cursor: Some(next_cursor.clone()),
+            },
+        )
+        .expect("conflict response");
+        assert_eq!(page.conflicts, vec![conflict]);
+        assert_eq!(page.next_cursor, Some(next_cursor));
+
+        let error = dfs_operator_conflict_page_from_response(
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Repair {
+                repairs: Vec::new(),
+                next_cursor: None,
+            },
+        )
+        .expect_err("repair response must not satisfy a conflict request");
+        assert_eq!(
+            error,
+            "daemon returned DFS repair response to conflicts request"
+        );
+    }
+
+    #[test]
+    fn dfs_operator_repair_response_maps_page_and_rejects_other_variants() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("app_api_repair_filesystem").expect("filesystem");
+        let object_id = DfsObjectId::from_legacy_named("app_api_repair_object").expect("object");
+        let version = DfsVersion::from_legacy_named("app_api_repair_version").expect("version");
+        let missing_replica_node_id =
+            NodeId::from_legacy_named("app_api_repair_node").expect("node");
+        let repair = DfsOperatorRepairView {
+            intent_id: "intent-app-api-repair".to_string(),
+            file_system_id: file_system_id.clone(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: Some("blake3:repair".to_string()),
+            missing_replica_node_id: missing_replica_node_id.clone(),
+        };
+        let next_cursor = DfsOperatorInspectionCursor {
+            file_system_id,
+            object_cursor: None,
+            object_id: Some(object_id),
+            item_key: Some(
+                sinomo_runtime::dfs::DfsOperatorInspectionItemCursor::Repair {
+                    intent_id: repair.intent_id.clone(),
+                    version,
+                    missing_replica_node_id,
+                },
+            ),
+        };
+
+        let page = dfs_operator_repair_page_from_response(
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Repair {
+                repairs: vec![repair.clone()],
+                next_cursor: Some(next_cursor.clone()),
+            },
+        )
+        .expect("repair response");
+        assert_eq!(page.repairs, vec![repair]);
+        assert_eq!(page.next_cursor, Some(next_cursor));
+
+        let error = dfs_operator_repair_page_from_response(
+            sinomo_runtime::dfs::DaemonDfsInspectionResponse::Conflicts {
+                conflicts: Vec::new(),
+                next_cursor: None,
+            },
+        )
+        .expect_err("conflict response must not satisfy a repair request");
+        assert_eq!(
+            error,
+            "daemon returned DFS conflicts response to repair request"
         );
     }
 
