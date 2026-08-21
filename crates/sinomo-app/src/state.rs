@@ -266,6 +266,17 @@ impl ReadyState {
         progress: impl Fn(&str),
     ) -> Self {
         let interactive = waker.is_some();
+        if interactive {
+            progress("Reconciling provider accounts…");
+            if let Err(error) =
+                crate::backend::config::migrate_legacy_device_login_provider_accounts(
+                    backend.config.as_ref(),
+                    &backend.data_dir,
+                )
+            {
+                tracing::warn!(%error, "legacy provider account migration failed");
+            }
+        }
         progress("Starting the chat engine…");
         let chat = ChatState::new_with_waker(&backend, waker);
         progress("Preparing self-evolution…");

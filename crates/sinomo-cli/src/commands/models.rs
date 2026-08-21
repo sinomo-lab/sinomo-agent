@@ -61,6 +61,8 @@ pub(crate) struct ModelOptionsSetOptions {
     pub(crate) reasoning_effort: Option<ModelOptionValueUpdate<ProviderReasoningEffort>>,
     pub(crate) reasoning_budget_tokens: Option<ModelOptionValueUpdate<u32>>,
     pub(crate) text_verbosity: Option<ModelOptionValueUpdate<ProviderTextVerbosity>>,
+    pub(crate) max_context_tokens: Option<ModelOptionValueUpdate<u32>>,
+    pub(crate) auto_compact_token_limit: Option<ModelOptionValueUpdate<u32>>,
     pub(crate) vendor_options: Vec<(String, String)>,
     pub(crate) clear_vendor_options: Vec<String>,
 }
@@ -223,6 +225,16 @@ pub(crate) fn models_cli_spec() -> CliCommandSpec {
                                 choice("default", "remove the configured override"),
                             ])
                             .restricted(),
+                    ),
+                    CliOptionSpec::value(
+                        "--max-context-tokens",
+                        "maximum model context token cap",
+                        CliValueSpec::new("n|clear", "context limit or clear"),
+                    ),
+                    CliOptionSpec::value(
+                        "--auto-compact-token-limit",
+                        "automatic history compaction threshold",
+                        CliValueSpec::new("n|clear", "compaction limit or clear"),
                     ),
                     CliOptionSpec::value(
                         "--vendor-option",
@@ -522,6 +534,14 @@ fn parse_model_options_set_matches(
             })
         })
         .transpose()?;
+    options.max_context_tokens = matches
+        .value("--max-context-tokens")
+        .map(|value| parse_u32_option_update(value, "maximum context tokens"))
+        .transpose()?;
+    options.auto_compact_token_limit = matches
+        .value("--auto-compact-token-limit")
+        .map(|value| parse_u32_option_update(value, "automatic compaction token limit"))
+        .transpose()?;
     options.vendor_options = matches
         .values("--vendor-option")
         .map(parse_vendor_option)
@@ -542,6 +562,8 @@ fn parse_model_options_set_matches(
     if options.reasoning_effort.is_none()
         && options.reasoning_budget_tokens.is_none()
         && options.text_verbosity.is_none()
+        && options.max_context_tokens.is_none()
+        && options.auto_compact_token_limit.is_none()
         && options.vendor_options.is_empty()
         && options.clear_vendor_options.is_empty()
     {
@@ -560,6 +582,25 @@ fn parse_option_update<T>(
         "clear" | "unset" | "default" => Ok(ModelOptionValueUpdate::Clear),
         value => parse(value).map(ModelOptionValueUpdate::Set),
     }
+}
+
+fn parse_u32_option_update(
+    value: &str,
+    label: &str,
+) -> Result<ModelOptionValueUpdate<u32>, CliParseError> {
+    parse_option_update(value, |value| {
+        let parsed = value
+            .parse::<u32>()
+            .map_err(|source| CliParseError::Parse {
+                detail: format!("invalid {label} `{value}`: {source}"),
+            })?;
+        if parsed == 0 {
+            return Err(CliParseError::Parse {
+                detail: format!("{label} must be greater than zero"),
+            });
+        }
+        Ok(parsed)
+    })
 }
 
 fn parse_vendor_option(value: &str) -> Result<(String, String), CliParseError> {
@@ -989,6 +1030,20 @@ fn print_language_model_provider_options(prefix: &str, options: &LanguageModelPr
             .map(|value| value.to_string())
             .unwrap_or_default()
     );
+    println!(
+        "{prefix}maximum context tokens: {}",
+        options
+            .max_context_tokens
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
+    println!(
+        "{prefix}automatic compaction token limit: {}",
+        options
+            .auto_compact_token_limit
+            .map(|value| value.to_string())
+            .unwrap_or_default()
+    );
     if options.vendor_options.is_empty() {
         println!("{prefix}vendor options: none");
     } else {
@@ -1070,6 +1125,18 @@ fn apply_model_options_set(
         match update {
             ModelOptionValueUpdate::Set(value) => options.text_verbosity = Some(*value),
             ModelOptionValueUpdate::Clear => options.text_verbosity = None,
+        }
+    }
+    if let Some(update) = &updates.max_context_tokens {
+        match update {
+            ModelOptionValueUpdate::Set(value) => options.max_context_tokens = Some(*value),
+            ModelOptionValueUpdate::Clear => options.max_context_tokens = None,
+        }
+    }
+    if let Some(update) = &updates.auto_compact_token_limit {
+        match update {
+            ModelOptionValueUpdate::Set(value) => options.auto_compact_token_limit = Some(*value),
+            ModelOptionValueUpdate::Clear => options.auto_compact_token_limit = None,
         }
     }
     for (key, value) in &updates.vendor_options {

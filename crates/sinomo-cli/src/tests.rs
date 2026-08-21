@@ -16788,6 +16788,10 @@ fn model_options_parser_accepts_reasoning_and_vendor_options() {
         "4096",
         "--text-verbosity",
         "low",
+        "--max-context-tokens",
+        "1000000",
+        "--auto-compact-token-limit",
+        "900000",
         "--vendor-option",
         "reasoning.summary=auto",
     ])
@@ -16806,6 +16810,8 @@ fn model_options_parser_accepts_reasoning_and_vendor_options() {
             reasoning_effort: Some(ModelOptionValueUpdate::Set(ProviderReasoningEffort::None)),
             reasoning_budget_tokens: Some(ModelOptionValueUpdate::Set(4096)),
             text_verbosity: Some(ModelOptionValueUpdate::Set(ProviderTextVerbosity::Low)),
+            max_context_tokens: Some(ModelOptionValueUpdate::Set(1_000_000)),
+            auto_compact_token_limit: Some(ModelOptionValueUpdate::Set(900_000)),
             vendor_options: vec![("reasoning.summary".to_string(), "auto".to_string())],
             clear_vendor_options: Vec::new(),
         })
@@ -16839,6 +16845,8 @@ fn model_options_parser_distinguishes_clear_from_none() {
             reasoning_effort: Some(ModelOptionValueUpdate::Clear),
             reasoning_budget_tokens: None,
             text_verbosity: Some(ModelOptionValueUpdate::Clear),
+            max_context_tokens: None,
+            auto_compact_token_limit: None,
             vendor_options: Vec::new(),
             clear_vendor_options: Vec::new(),
         })

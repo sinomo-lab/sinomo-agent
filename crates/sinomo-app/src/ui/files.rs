@@ -4856,15 +4856,6 @@ impl FilesState {
                 }
                 return;
             }
-            if prompt.input.trim() != "DELETE" {
-                if let Some(current) = &mut self.action_prompt {
-                    current.error = Some(format!(
-                        "type DELETE to remove {}",
-                        marked_entries_label(prompt.targets.len())
-                    ));
-                }
-                return;
-            }
             self.action_prompt = None;
             self.start_delete_targets(prompt.targets, waker);
             return;
@@ -5222,9 +5213,6 @@ impl FilesState {
                     .target_path
                     .clone()
                     .ok_or_else(|| "select an item first".to_string())?;
-                if prompt.input.trim() != "DELETE" {
-                    return Err(format!("type DELETE to remove {}", prompt.target_name));
-                }
                 Ok((
                     FilesOperation {
                         kind: FilesOperationKind::Delete,
@@ -9329,6 +9317,43 @@ fn clone_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
     move || reader()
 }
 
+/// Keep scroll chrome neutral without muting the app's accent palette for ordinary controls.
+fn gray_scrollbar_theme(mut theme: DefaultTheme) -> DefaultTheme {
+    let neutral = if theme.surfaces.dark {
+        DefaultTheme::neutral_dark()
+    } else {
+        DefaultTheme::neutral()
+    };
+    theme.palette.control_active = neutral.palette.control_active;
+    theme.palette.border = neutral.palette.border;
+    theme.palette.border_hover = neutral.palette.border_hover;
+    theme.palette.accent_hover = neutral.palette.border_hover;
+    theme.palette.accent_pressed = neutral.palette.border_strong;
+    theme
+}
+
+fn clone_gray_scrollbar_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || gray_scrollbar_theme(reader())
+}
+
+/// SUI's virtual table uses the placeholder role for its retained scroll thumb. Supply the same
+/// neutral gray used by ordinary scrollbars while leaving the rest of the table palette intact.
+fn gray_data_scrollbar_theme(mut theme: DefaultTheme) -> DefaultTheme {
+    let neutral = if theme.surfaces.dark {
+        DefaultTheme::neutral_dark()
+    } else {
+        DefaultTheme::neutral()
+    };
+    theme.palette.placeholder = neutral.palette.placeholder;
+    theme
+}
+
+fn clone_gray_data_scrollbar_reader(reader: &ThemeReader) -> impl Fn() -> DefaultTheme + 'static {
+    let reader = Rc::clone(reader);
+    move || gray_data_scrollbar_theme(reader())
+}
+
 /// Resolve the app chrome palette for file rows and preview-specific paint helpers.
 fn palette(shared: &Shared) -> Palette {
     Palette::from_theme(&shared.theme(), widgets::theme_is_dark(shared))
@@ -11690,7 +11715,7 @@ fn files_list_body_table(
                 let entries = entries.clone();
                 move |index| entries.get(index).map(file_entry_key).unwrap_or_default()
             })
-            .theme_when(clone_reader(reader))
+            .theme_when(clone_gray_data_scrollbar_reader(reader))
             .selected_when({
                 let s = s.clone();
                 move || {
@@ -12645,15 +12670,42 @@ fn marked_entries_label(count: usize) -> String {
     }
 }
 
+fn files_task_popover(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
+    let source = shared
+        .signals()
+        .files_structure
+        .select_named("files task popover theme", |key| key.theme);
+    let s = shared.clone();
+    let r = Rc::clone(reader);
+    RebuildOnChange::new_observable(source, move |_theme| {
+        let badge_label = {
+            let s = s.clone();
+            move || files_task_badge_label(&s.files())
+        };
+        let badge_tone = {
+            let s = s.clone();
+            move || files_task_badge_tone(&s.files())
+        };
+        WidgetPod::new(
+            Popover::new(
+                "File tasks",
+                SizedBox::new().width(FILES_TASK_BADGE_W).with_child(
+                    StatusBadge::dynamic("SIFS unknown", badge_label)
+                        .tone_when(badge_tone)
+                        .icon(IconGlyph::Storage)
+                        .theme_when(clone_reader(&r)),
+                ),
+                SizedBox::new()
+                    .width(FILES_TASK_POPOVER_W)
+                    .with_child(FilesTaskQueue::new(s.clone(), &r)),
+            )
+            .alignment(PopoverAlignment::Start)
+            .theme(r()),
+        )
+    })
+}
+
 fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let badge_label = {
-        let s = shared.clone();
-        move || files_task_badge_label(&s.files())
-    };
-    let badge_tone = {
-        let s = shared.clone();
-        move || files_task_badge_tone(&s.files())
-    };
     let path_summary = {
         let s = shared.clone();
         move || {
@@ -12671,20 +12723,7 @@ fn files_status_bar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<
         let s = shared.clone();
         move || files_status_summary(&s.files())
     };
-    let task_popover = Popover::new(
-        "File tasks",
-        SizedBox::new().width(FILES_TASK_BADGE_W).with_child(
-            StatusBadge::dynamic("SIFS unknown", badge_label)
-                .tone_when(badge_tone)
-                .icon(IconGlyph::Storage)
-                .theme_when(clone_reader(reader)),
-        ),
-        SizedBox::new()
-            .width(FILES_TASK_POPOVER_W)
-            .with_child(FilesTaskQueue::new(shared.clone(), reader)),
-    )
-    .alignment(PopoverAlignment::Start)
-    .theme(reader());
+    let task_popover = files_task_popover(shared, reader);
     let status_theme = clone_reader(reader);
     let body = Background::new(
         Color::TRANSPARENT,
@@ -15262,6 +15301,7 @@ fn inspector(
         ScrollView::vertical(body)
             .state(scroll_state.clone())
             .name("Selection info")
+            .theme_when(clone_gray_scrollbar_reader(reader))
             .viewport_width_hint(true),
     )
     .border(SurfaceBorder::Left)
@@ -15380,8 +15420,9 @@ fn wide_pod(
     places_scroll_state: &ScrollState,
     inspector_scroll_state: &ScrollState,
 ) -> impl Widget + use<> {
-    let places_scroll =
-        ScrollView::vertical(files_places_rail(shared, reader)).state(places_scroll_state.clone());
+    let places_scroll = ScrollView::vertical(files_places_rail(shared, reader))
+        .state(places_scroll_state.clone())
+        .theme_when(clone_gray_scrollbar_reader(reader));
     let places = Background::new(Color::TRANSPARENT, places_scroll).brush_when({
         let s = shared.clone();
         move || palette(&s).sidebar
@@ -15394,7 +15435,7 @@ fn wide_pod(
             .ratio(places_ratio)
             .min_first(PLACES_SIDEBAR_MIN_W)
             .min_second(FILE_LIST_MIN_W)
-            .theme(reader())
+            .theme_when(clone_reader(reader))
             .on_change(move |ratio| {
                 places_ratio_shared
                     .files_mut()
@@ -15410,7 +15451,7 @@ fn wide_pod(
     .ratio(1.0 - inspector_ratio)
     .min_first(PLACES_SIDEBAR_MIN_W + FILE_LIST_MIN_W)
     .min_second(INSPECTOR_SIDEBAR_MIN_W)
-    .theme(reader())
+    .theme_when(clone_reader(reader))
     .on_change(move |ratio| {
         inspector_ratio_shared
             .files_mut()
@@ -15684,6 +15725,7 @@ fn compact_files_commands(shared: &Shared, reader: &ThemeReader) -> impl Widget 
         content,
     ))
     .name("Compact file command overflow")
+    .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true)
 }
 
@@ -17210,7 +17252,8 @@ fn files_placement_dialog(
                                 ScrollView::horizontal(placement_node_table(
                                     shared, reader, preview,
                                 ))
-                                .name("Placement node table"),
+                                .name("Placement node table")
+                                .theme_when(clone_gray_scrollbar_reader(reader)),
                             ),
                     )
                     .theme_when(clone_reader(reader)),
@@ -17334,6 +17377,7 @@ fn files_placement_dialog(
                     content,
                 ))
                 .name("Placement editor")
+                .theme_when(clone_gray_scrollbar_reader(reader))
                 .viewport_width_hint(true),
             ),
         )
@@ -17412,11 +17456,14 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         FileActionPromptKind::Delete => prompt
             .target_path
             .as_deref()
-            .map(|path| format!("Delete {path}"))
+            .map(|path| format!("Delete {path}? This action cannot be undone."))
             .unwrap_or_else(|| "Select an item to delete".to_string()),
         FileActionPromptKind::DeleteSelected => {
             let label = marked_entries_label(prompt.targets.len());
-            format!("Delete {label} from {}", shared.files().path)
+            format!(
+                "Delete {label} from {}? This action cannot be undone.",
+                shared.files().path
+            )
         }
         FileActionPromptKind::Placement => prompt
             .target_path
@@ -17437,11 +17484,14 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         | FileActionPromptKind::TransferSelected
         | FileActionPromptKind::MoveSelected
         | FileActionPromptKind::Move => "Destination",
-        FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected => "Type DELETE",
         FileActionPromptKind::Placement => "Placement policy",
         _ => "Name",
     };
-    let input = {
+    let input = (!matches!(
+        prompt.kind,
+        FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected
+    ))
+    .then(|| {
         let s = shared.clone();
         let placeholder = match prompt.kind {
             FileActionPromptKind::GoTo => go_to_path_placeholder(source),
@@ -17469,12 +17519,13 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .on_change(move |value| {
                 s.files_mut().set_action_prompt_input(value);
             })
-    };
+    });
     let primary_label = prompt.kind.primary_label();
     let submit = {
         let s = shared.clone();
         sui::Button::new(primary_label)
             .min_width(112.0)
+            .tone(file_action_submit_tone(prompt.kind))
             .theme_when(clone_reader(reader))
             .on_press_with_ctx(move |ctx| {
                 let waker = { s.borrow().waker.clone() };
@@ -17528,7 +17579,9 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
                 .fill_width(),
         );
     }
-    body = body.with_child(input);
+    if let Some(input) = input {
+        body = body.with_child(input);
+    }
     if let Some(error) = prompt.error {
         body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
     }
@@ -17575,6 +17628,17 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             .dismiss_on_scrim(true)
             .on_dismiss(dismiss),
     ))
+}
+
+fn file_action_submit_tone(kind: FileActionPromptKind) -> SemanticTone {
+    if matches!(
+        kind,
+        FileActionPromptKind::Delete | FileActionPromptKind::DeleteSelected
+    ) {
+        SemanticTone::Danger
+    } else {
+        SemanticTone::Accent
+    }
 }
 
 fn document_status_text(shared: &Shared) -> String {
@@ -18679,6 +18743,7 @@ fn files_placement_activity_sheet(shared: &Shared, reader: &ThemeReader) -> Widg
         .fill_child_width(),
     )
     .state(summary_scroll_state.clone())
+    .theme_when(clone_gray_scrollbar_reader(reader))
     .name("Reconciliation activity summary");
     let previous_summary = {
         let enabled = summary_scroll_state.clone();
@@ -19045,6 +19110,7 @@ fn files_storage_center_sheet(shared: &Shared, reader: &ThemeReader) -> Option<W
         .fill_child_width(),
     )
     .name("Storage health overview")
+    .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true);
     let selected = if overview.is_some() {
         2
@@ -19468,6 +19534,7 @@ fn files_history_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         .fill_child_width(),
     )
     .name("File history and issues")
+    .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true);
     let selected = if object.is_some() {
         2
@@ -19572,6 +19639,7 @@ fn compact_file_selection_actions(shared: &Shared, reader: &ThemeReader) -> impl
         actions,
     ))
     .name("Selected item actions")
+    .theme_when(clone_gray_scrollbar_reader(reader))
     .viewport_width_hint(true)
 }
 
@@ -26372,18 +26440,8 @@ mod tests {
             assert_eq!(prompt.targets[1].path, "/services/logs");
         }
 
-        state.submit_action_prompt(None);
-        assert_eq!(
-            state
-                .action_prompt
-                .as_ref()
-                .and_then(|prompt| prompt.error.as_deref()),
-            Some("type DELETE to remove 2 selected entries")
-        );
-
         let (tx, rx) = mpsc::channel();
         state.worker_tx = Some(tx);
-        state.set_action_prompt_input("DELETE".to_string());
         state.submit_action_prompt(None);
 
         assert!(state.action_prompt.is_none());
@@ -27908,6 +27966,18 @@ mod tests {
                 Some("/services/artifact.txt")
             );
         }
+        assert_eq!(
+            window
+                .get_by_role(sui::SemanticsRole::TextInput)
+                .with_name("files-action-input-Delete")
+                .count()?,
+            0,
+            "delete confirmation should not require typed confirmation"
+        );
+        assert_eq!(
+            file_action_submit_tone(FileActionPromptKind::Delete),
+            SemanticTone::Danger
+        );
 
         window
             .get_by_role(sui::SemanticsRole::Button)
@@ -27976,6 +28046,111 @@ mod tests {
         ));
 
         Ok(())
+    }
+
+    #[test]
+    fn mounted_files_chrome_switches_from_dark_to_light() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut app = shared.borrow_mut();
+            app.theme_mode = AppThemeMode::Dark;
+        }
+        {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Sifs;
+            files.clustered = true;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+        }
+        shared.publish_files_signals();
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files live light theme")
+                    .root(
+                        SizedBox::new()
+                            .width(1_200.0)
+                            .height(720.0)
+                            .with_child(view(shared.clone())),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let _ = window.snapshot()?;
+
+        {
+            let mut app = shared.borrow_mut();
+            app.theme_mode = AppThemeMode::Light;
+        }
+        shared.publish_files_signals();
+        window.run_until_idle()?;
+        window
+            .get_by_role(SemanticsRole::Popover)
+            .with_name("File tasks")
+            .click()?;
+        window.advance_time(1.0)?;
+
+        let snapshot = window.snapshot()?;
+        let queue_bounds = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Text && node.name.as_deref() == Some("File task queue")
+            })
+            .expect("open file task queue semantics")
+            .bounds;
+        let splitter_bounds = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Splitter
+                    && node.name.as_deref() == Some("File locations sidebar")
+            })
+            .expect("Files locations splitter semantics")
+            .bounds;
+        let screenshot = window.capture_screenshot()?;
+        let average_lightness = |bounds: Rect| -> sui::Result<f32> {
+            let crop = screenshot.crop(bounds)?;
+            let (sum, count) =
+                crop.pixels()
+                    .chunks_exact(4)
+                    .fold((0_u64, 0_u64), |(sum, count), pixel| {
+                        (
+                            sum + u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]),
+                            count + 3,
+                        )
+                    });
+            Ok(sum as f32 / count as f32)
+        };
+        assert!(
+            average_lightness(queue_bounds)? > 160.0,
+            "the SIFS task popover should repaint with a light surface"
+        );
+        assert!(
+            average_lightness(splitter_bounds)? > 160.0,
+            "the Files splitter should repaint with a light separator"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn file_scrollbar_themes_use_neutral_gray_roles() {
+        let light = DefaultTheme::light();
+        let neutral = DefaultTheme::neutral();
+        let scroll = gray_scrollbar_theme(light);
+        let data_scroll = gray_data_scrollbar_theme(light);
+
+        assert_eq!(scroll.palette.border, neutral.palette.border);
+        assert_eq!(scroll.palette.border_hover, neutral.palette.border_hover);
+        assert_eq!(scroll.palette.accent_hover, neutral.palette.border_hover);
+        assert_eq!(scroll.palette.accent_pressed, neutral.palette.border_strong);
+        assert_eq!(data_scroll.palette.placeholder, neutral.palette.placeholder);
     }
 
     #[test]

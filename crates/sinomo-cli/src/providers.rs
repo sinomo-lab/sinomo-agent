@@ -110,8 +110,8 @@ pub(super) fn parse_provider_schema_for_test(
 pub(super) fn run_provider_command(command: ProviderCliCommand) -> Result<(), CliError> {
     match command {
         ProviderCliCommand::Auth(options) => match options.provider {
-            ProviderName::GitHubCopilot => auth_github_copilot(),
-            ProviderName::Codex => auth_codex(),
+            ProviderName::GitHubCopilot => auth_github_copilot_account(&options.account),
+            ProviderName::Codex => auth_codex_account(&options.account),
             ProviderName::Claude => auth_claude(),
             ProviderName::Anthropic => auth_api_key_provider(
                 "Anthropic",
@@ -282,8 +282,17 @@ fn print_device_prompt(prompt: DeviceLoginPrompt) {
 }
 
 pub fn auth_github_copilot() -> Result<(), CliError> {
+    auth_github_copilot_account(DEFAULT_PROVIDER_ACCOUNT)
+}
+
+fn auth_github_copilot_account(account: &str) -> Result<(), CliError> {
     run_github_copilot_device_login(print_device_prompt)?;
-    println!("GitHub Copilot credentials saved.");
+    let config_path =
+        register_device_login_provider_account(GitHubCopilotProvider::PROVIDER_ID, account)?;
+    println!(
+        "GitHub Copilot credentials saved; account `{account}` registered in {}.",
+        config_path.display()
+    );
     Ok(())
 }
 
@@ -332,9 +341,52 @@ pub fn test_openai() -> Result<(), CliError> {
 }
 
 pub fn auth_codex() -> Result<(), CliError> {
+    auth_codex_account(DEFAULT_PROVIDER_ACCOUNT)
+}
+
+fn auth_codex_account(account: &str) -> Result<(), CliError> {
     run_codex_device_login(print_device_prompt)?;
-    println!("Codex credentials saved.");
+    let config_path = register_device_login_provider_account(CODEX_PROVIDER_ID, account)?;
+    println!(
+        "Codex credentials saved; account `{account}` registered in {}.",
+        config_path.display()
+    );
     Ok(())
+}
+
+fn register_device_login_provider_account(
+    provider: &str,
+    account: &str,
+) -> Result<PathBuf, CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let account = normalize_provider_account_name(Some(account));
+    let (mut config, config_path) = load_model_config_for_node(&data_dir)?;
+    if config.accounts.iter().any(|candidate| {
+        candidate.provider == provider
+            && normalize_provider_account_name(Some(&candidate.account)) == account
+    }) {
+        return Ok(config_path);
+    }
+    upsert_provider_account_config(
+        &mut config,
+        ProviderAccountConfig {
+            provider: provider.to_string(),
+            account: account.clone(),
+            default_model: None,
+            api_base_url: None,
+            api_key: None,
+            enabled: true,
+            options: LanguageModelProviderOptions::default(),
+            model_options: Vec::new(),
+        },
+    )
+    .map_err(CliError::LanguageModel)?;
+    if config.default_provider.is_none() {
+        config.default_provider = Some(provider.to_string());
+        config.default_account = Some(account);
+        config.default_model = None;
+    }
+    write_model_config_for_node(&data_dir, &config)
 }
 
 pub fn auth_claude() -> Result<(), CliError> {

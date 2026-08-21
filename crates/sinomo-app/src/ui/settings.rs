@@ -12,7 +12,8 @@
 //! `TextInput` / `Select` / `Button` / `ListView` / `ScrollView` widgets. State lives
 //! entirely in [`SettingsState`]; controls bind to it via reactive `*_when` readers and
 //! snapshot-seed-plus-`on_change` writeback. Async provider device-login status is
-//! rebuilt as ordinary `Label` / `Link` composition when its typed state changes.
+//! rebuilt as ordinary selectable text / `Label` / `Link` composition when its typed state
+//! changes.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -74,8 +75,9 @@ use crate::backend::config::{
     mark_provider_health_stale, provider_default_model, provider_display_name, provider_forms,
     provider_requires_api_key, reasoning_effort_index, remove_provider_account,
     remove_provider_health, resolve_items, run_provider_device_login, set_bool,
-    set_provider_api_key, set_provider_base_url, set_provider_chat_default, set_provider_effort,
-    set_provider_enabled, set_provider_model, set_provider_reasoning_budget,
+    set_provider_api_key, set_provider_auto_compact_token_limit, set_provider_base_url,
+    set_provider_chat_default, set_provider_effort, set_provider_enabled,
+    set_provider_max_context_tokens, set_provider_model, set_provider_reasoning_budget,
     set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
     text_verbosity_index,
 };
@@ -106,8 +108,8 @@ const SIFS_MOUNT_ATTENTION_DISPLAY_LIMIT: usize = 16;
 /// Below this content width the tab collapses to a single drill-down column.
 const WIDE_THRESHOLD: f32 = 700.0;
 const SIDEBAR_W: f32 = 276.0;
-const SIDEBAR_ITEM_H: f32 = 52.0;
-const MENU_ROW_H: f32 = 58.0;
+const SIDEBAR_ITEM_H: f32 = 40.0;
+const MENU_ROW_H: f32 = 44.0;
 const CONTENT_PAD: f32 = 22.0;
 const AGENT_MENU_W: f32 = 292.0;
 const AGENT_LIST_ROW_H: f32 = 66.0;
@@ -1016,8 +1018,15 @@ impl SettingsOperationScope {
 
 struct SettingsInitialLoadResult {
     settings: SettingsState,
+    chat_providers: Vec<ProviderSummary>,
     server_generations: SettingsGenerations,
     draft_generations: SettingsGenerations,
+}
+
+#[derive(Default)]
+pub(crate) struct SettingsInitialLoadEffects {
+    pub(crate) changed: bool,
+    pub(crate) chat_providers: Option<Vec<ProviderSummary>>,
 }
 
 struct SettingsOperationLane {
@@ -1440,6 +1449,8 @@ pub enum ProviderField {
     Model,
     BaseUrl,
     ReasoningBudget,
+    MaxContextTokens,
+    AutoCompactTokenLimit,
     VendorOptions,
 }
 
@@ -1974,8 +1985,10 @@ impl SettingsState {
             .name("sinomo-app-settings-load".to_string())
             .spawn(move || {
                 let settings = SettingsState::new(&backend);
+                let chat_providers = cluster_provider_summaries(backend.config.as_ref());
                 let _ = tx.send(SettingsInitialLoadResult {
                     settings,
+                    chat_providers,
                     server_generations,
                     draft_generations,
                 });
@@ -1996,18 +2009,21 @@ impl SettingsState {
         }
     }
 
-    pub fn pump_initial_load(&mut self) -> bool {
+    pub(crate) fn pump_initial_load(&mut self) -> SettingsInitialLoadEffects {
         let result = self
             .initial_load_rx
             .as_ref()
             .and_then(|rx| rx.try_recv().ok());
         let Some(result) = result else {
-            return false;
+            return SettingsInitialLoadEffects::default();
         };
         self.initial_load_rx = None;
         self.initial_load_started = true;
-        self.merge_initial_load(result);
-        true
+        let chat_providers = self.merge_initial_load(result);
+        SettingsInitialLoadEffects {
+            changed: true,
+            chat_providers,
+        }
     }
 
     /// Rebind Settings after the connection state machine installs a new daemon backend. In-flight
@@ -2119,7 +2135,13 @@ impl SettingsState {
     /// Drafts, confirmations, action feedback, expansion state, and the operation lane always stay
     /// owned by the live state. This is deliberately field-wise: replacing `self` here used to
     /// erase join links, agent edits, and completed action feedback entered while loading.
-    fn merge_initial_load(&mut self, result: SettingsInitialLoadResult) {
+    fn merge_initial_load(
+        &mut self,
+        result: SettingsInitialLoadResult,
+    ) -> Option<Vec<ProviderSummary>> {
+        let chat_providers = (self.server_generations.providers
+            == result.server_generations.providers)
+            .then_some(result.chat_providers);
         let loaded = result.settings;
         self.mode_label = loaded.mode_label;
         self.status_detail = loaded.status_detail;
@@ -2202,6 +2224,7 @@ impl SettingsState {
                 self.skill_action_error = loaded.skill_action_error;
             }
         }
+        chat_providers
     }
 
     fn mark_draft_changed(&mut self, domain: SettingsOperationDomain) {
@@ -3879,6 +3902,14 @@ impl SettingsState {
                     .reasoning_budget_tokens
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
+                ProviderField::MaxContextTokens => form
+                    .max_context_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                ProviderField::AutoCompactTokenLimit => form
+                    .auto_compact_token_limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 ProviderField::VendorOptions => form.vendor_options.clone(),
             });
         Some(SettingsOperation::SetProviderField {
@@ -4195,6 +4226,18 @@ fn execute_settings_operation(
                     &account,
                     &raw,
                 ),
+                ProviderField::MaxContextTokens => set_provider_max_context_tokens(
+                    backend.config.as_ref(),
+                    &provider,
+                    &account,
+                    &raw,
+                ),
+                ProviderField::AutoCompactTokenLimit => set_provider_auto_compact_token_limit(
+                    backend.config.as_ref(),
+                    &provider,
+                    &account,
+                    &raw,
+                ),
                 ProviderField::VendorOptions => {
                     set_provider_vendor_options(backend.config.as_ref(), &provider, &account, &raw)
                 }
@@ -4471,7 +4514,7 @@ fn execute_settings_operation(
                 &path,
                 None,
                 None,
-                true,
+                false,
             )?;
             load_skill_operation_success(
                 backend,
@@ -5014,6 +5057,8 @@ fn provider_field_key(provider: &str, account: &str, field: ProviderField) -> St
         ProviderField::Model => "model",
         ProviderField::BaseUrl => "base_url",
         ProviderField::ReasoningBudget => "reasoning_budget_tokens",
+        ProviderField::MaxContextTokens => "max_context_tokens",
+        ProviderField::AutoCompactTokenLimit => "auto_compact_token_limit",
         ProviderField::VendorOptions => "vendor_options",
     };
     format!("provider:{provider}:{account}:{suffix}")
@@ -5025,6 +5070,8 @@ fn provider_field_saved_message(field: ProviderField) -> &'static str {
         ProviderField::Model => "Default model saved to lm.providers",
         ProviderField::BaseUrl => "API base URL saved to lm.providers",
         ProviderField::ReasoningBudget => "Reasoning budget saved to lm.providers",
+        ProviderField::MaxContextTokens => "Maximum context saved to lm.providers",
+        ProviderField::AutoCompactTokenLimit => "Compaction limit saved to lm.providers",
         ProviderField::VendorOptions => "Provider options saved to lm.providers",
     }
 }
@@ -8870,6 +8917,134 @@ fn provider_card(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Wi
             },
         ));
 
+        if provider_supports_context_controls(&form.provider) {
+            body = body.with_child(provider_subsection_heading(
+                shared,
+                reader,
+                "Context and cost",
+            ));
+            let configured_model = if form.default_model.trim().is_empty() {
+                sinomo_lm::PROVIDER_DEFAULT_MODEL
+            } else {
+                form.default_model.as_str()
+            };
+            let automatic =
+                sinomo_lm::inferred_model_context_window_tokens(&form.provider, configured_model);
+            let supported = sinomo_lm::inferred_model_max_context_window_tokens(
+                &form.provider,
+                configured_model,
+            );
+            let effective_model = sinomo_lm::effective_model_name(&form.provider, configured_model);
+            let context_hint = match (automatic, supported, effective_model.contains("gpt-5.6")) {
+                (Some(automatic), Some(supported), true) => format!(
+                    "Automatic cost-aware limit: {automatic} tokens. Known model window: {supported} tokens. OpenAI long-context requests above {} input tokens use higher rates and may consume subscription allowance faster.",
+                    sinomo_lm::OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS
+                ),
+                (Some(automatic), Some(supported), false) => format!(
+                    "Automatic inferred limit: {automatic} tokens. Known model window: {supported} tokens. Higher context limits can increase API cost or subscription usage."
+                ),
+                _ => "Leave blank to use Sinomo's inferred model limit. Higher context limits can increase API cost or subscription usage.".to_string(),
+            };
+            body = body.with_child(
+                FormRow::new("Context policy", muted_label(shared, context_hint))
+                    .stacked()
+                    .theme_when(clone_reader(reader)),
+            );
+
+            let max_key = provider_field_key(
+                &form.provider,
+                &form.account,
+                ProviderField::MaxContextTokens,
+            );
+            let max_value = shared.settings().field_draft_or(&max_key, || {
+                form.max_context_tokens
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            });
+            let max_placeholder = automatic
+                .map(|value| format!("Automatic ({value})"))
+                .unwrap_or_else(|| "Automatic".to_string());
+            body = body.with_child(text_save_inline_row(
+                shared,
+                reader,
+                &format!("provider-{index}-max-context-tokens"),
+                "Maximum context tokens",
+                max_key,
+                max_value,
+                &max_placeholder,
+                {
+                    let s = shared.clone();
+                    move |value| {
+                        s.settings_mut().set_provider_field_draft(
+                            index,
+                            ProviderField::MaxContextTokens,
+                            value,
+                        );
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        if let Some(operation) = s
+                            .settings()
+                            .provider_field_operation(index, ProviderField::MaxContextTokens)
+                        {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::Providers,
+                                operation,
+                            );
+                        }
+                    }
+                },
+            ));
+
+            let compact_key = provider_field_key(
+                &form.provider,
+                &form.account,
+                ProviderField::AutoCompactTokenLimit,
+            );
+            let compact_value = shared.settings().field_draft_or(&compact_key, || {
+                form.auto_compact_token_limit
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            });
+            body = body.with_child(text_save_inline_row(
+                shared,
+                reader,
+                &format!("provider-{index}-auto-compact-token-limit"),
+                "Compact history after",
+                compact_key,
+                compact_value,
+                "Automatic (80% of active limit)",
+                {
+                    let s = shared.clone();
+                    move |value| {
+                        s.settings_mut().set_provider_field_draft(
+                            index,
+                            ProviderField::AutoCompactTokenLimit,
+                            value,
+                        );
+                    }
+                },
+                {
+                    let s = shared.clone();
+                    move || {
+                        if let Some(operation) = s
+                            .settings()
+                            .provider_field_operation(index, ProviderField::AutoCompactTokenLimit)
+                        {
+                            queue_settings_operation(
+                                &s,
+                                SettingsOperationScope::Providers,
+                                operation,
+                            );
+                        }
+                    }
+                },
+            ));
+        }
+
         let has_response_defaults = form.supports_reasoning
             || provider_supports_reasoning_budget(&form.provider)
             || provider_supports_text_verbosity(&form.provider)
@@ -9395,6 +9570,10 @@ fn current_settings_unix_timestamp() -> i64 {
 
 fn provider_supports_reasoning_budget(provider: &str) -> bool {
     provider == "anthropic"
+}
+
+fn provider_supports_context_controls(provider: &str) -> bool {
+    matches!(provider, "openai" | "codex")
 }
 
 fn provider_supports_text_verbosity(provider: &str) -> bool {
@@ -11571,7 +11750,7 @@ fn agent_readonly_section(
             shared,
             reader,
             definition.key(),
-            true,
+            false,
         ))
         .with_child(
             FormRow::new("Actions", duplicate)
@@ -15367,35 +15546,27 @@ fn sidebar(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                     "settings wide extension previews",
                     "settings wide developer previews",
                 ],
-                true,
+                false,
                 true,
                 SIDEBAR_ITEM_H,
             ),
             8.0,
         ))
-        .with_child(SizedBox::new().height(12.0));
-    let about = horizontal_inset(
-        about_group_host(
-            shared,
-            reader,
-            "settings wide about preview",
-            "settings-about",
-            true,
-            true,
-            SIDEBAR_ITEM_H,
-        ),
-        8.0,
-    );
-    Flex::vertical()
-        .align_items(Alignment::Stretch)
-        .with_item(
-            ScrollView::vertical(primary).state(ScrollState::new()),
-            FlexItem::flex(1.0),
-        )
-        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
-        .with_child(SizedBox::new().height(6.0))
-        .with_child(about)
-        .with_child(SizedBox::new().height(8.0))
+        .with_child(SizedBox::new().height(14.0))
+        .with_child(horizontal_inset(
+            about_group_host(
+                shared,
+                reader,
+                "settings wide about preview",
+                "settings-about",
+                false,
+                true,
+                SIDEBAR_ITEM_H,
+            ),
+            8.0,
+        ))
+        .with_child(SizedBox::new().height(14.0));
+    ScrollView::vertical(primary).state(ScrollState::new())
 }
 
 fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
@@ -15414,7 +15585,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                     "settings narrow extension previews",
                     "settings narrow developer previews",
                 ],
-                true,
+                false,
                 false,
                 MENU_ROW_H,
             ),
@@ -15427,7 +15598,7 @@ fn menu(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 reader,
                 "settings narrow about preview",
                 "settings-narrow-about",
-                true,
+                false,
                 false,
                 MENU_ROW_H,
             ),
@@ -15697,6 +15868,7 @@ fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl
         let theme = build_reader();
         let pal = palette(&build_shared);
         let (primary, prompt_url) = device_login_lines(&build_shared, index);
+        let prompt_code = device_login_code(&build_shared, index);
         let is_error = device_login_is_error(&build_shared, index);
         let primary_style = sui::TextStyle {
             font_size: theme.text.sm.size,
@@ -15705,9 +15877,17 @@ fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl
             color: if is_error { pal.danger_text } else { pal.text },
             ..theme.body_text_style()
         };
-        let mut body = Flex::vertical()
-            .align_items(Alignment::Start)
-            .with_child(sui::Label::new(primary).style(primary_style));
+        let mut body = Flex::vertical().align_items(Alignment::Start).with_child(
+            sui::Label::new(if prompt_code.is_some() {
+                "Enter this code:"
+            } else {
+                primary.as_str()
+            })
+            .style(primary_style),
+        );
+        if let Some(code) = prompt_code {
+            body = body.with_child(device_login_code_control(&build_reader, &theme, &pal, code));
+        }
         if let Some(url) = prompt_url {
             let link_style = sui::TextStyle {
                 font_size: theme.text.xs.size,
@@ -15726,6 +15906,56 @@ fn status_reflector(shared: &Shared, index: usize, reader: &ThemeReader) -> impl
     })
 }
 
+fn device_login_code_control(
+    reader: &ThemeReader,
+    theme: &DefaultTheme,
+    pal: &Palette,
+    code: String,
+) -> impl Widget + use<> {
+    let selection = SelectionScope::new();
+    let code_style = device_login_code_text_style(theme, pal);
+    let field = TextInput::new("provider-device-login-code")
+        .value(code.clone())
+        .read_only()
+        .selection_scope(selection.clone())
+        .copy_to_clipboard(true)
+        .text_style(code_style)
+        .padding(sui::Insets {
+            left: 14.0,
+            top: 6.0,
+            right: 14.0,
+            bottom: 6.0,
+        })
+        .min_width(240.0)
+        .min_height(54.0)
+        .theme_when(clone_reader(reader));
+    let field = read_only_text_menu(reader, "provider-device-login-code", field, selection, true);
+    let copy_code = code;
+    let copy = sui::Button::new("Copy code")
+        .semantic_name("Copy pairing code")
+        .description("Copy the device-login pairing code to the clipboard")
+        .icon(IconGlyph::Restore)
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .theme_when(clone_reader(reader))
+        .on_press_with_ctx(move |ctx| ctx.set_clipboard_text(&copy_code));
+
+    Flex::horizontal()
+        .wrap(FlexWrap::Wrap)
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_item(field, FlexItem::new().min_width(240.0))
+        .with_item(copy, FlexItem::new().no_shrink())
+}
+
+fn device_login_code_text_style(theme: &DefaultTheme, pal: &Palette) -> sui::TextStyle {
+    let mut style = theme.mono_text_style(pal.text);
+    style.font_size = theme.text._3xl.size;
+    style.line_height = theme.text._3xl.line_height;
+    style.weight = FontWeight::SEMIBOLD;
+    style
+}
+
 fn device_login_lines(shared: &Shared, index: usize) -> (String, Option<String>) {
     let settings = shared.settings();
     let Some(form) = settings.provider_forms.get(index) else {
@@ -15741,6 +15971,14 @@ fn device_login_lines(shared: &Shared, index: usize) -> (String, Option<String>)
         Some(DeviceLoginStatus::Failed(error)) => (format!("Failed: {error}"), None),
         None if form.signed_in => ("Signed in".to_string(), None),
         None => ("Not signed in".to_string(), None),
+    }
+}
+
+fn device_login_code(shared: &Shared, index: usize) -> Option<String> {
+    let settings = shared.settings();
+    match device_login_status_for(&settings, index) {
+        Some(DeviceLoginStatus::Prompt { user_code, .. }) => Some(user_code.clone()),
+        _ => None,
     }
 }
 
@@ -16609,6 +16847,7 @@ mod tests {
         assert!(!loaded.agent_snapshot.agents.is_empty());
         live.merge_initial_load(SettingsInitialLoadResult {
             settings: loaded,
+            chat_providers: Vec::new(),
             server_generations: baseline_server,
             draft_generations: baseline_drafts,
         });
@@ -16616,6 +16855,43 @@ mod tests {
         assert!(!live.agent_snapshot.agents.is_empty());
         assert_eq!(live.agent_form.id, "draft-agent");
         assert_eq!(live.agent_form.name, "Unsaved draft");
+    }
+
+    #[test]
+    fn provider_preload_exports_chat_snapshot_without_overwriting_newer_edits() {
+        let backend = Backend::local_fallback();
+        let provider = ProviderSummary {
+            id: "codex".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            name: "Codex".to_string(),
+            models: vec!["gpt-5.4".to_string()],
+            capabilities: sinomo_lm::provider_capabilities("codex"),
+        };
+
+        let mut current = SettingsState::new_lightweight(&backend);
+        let current_server_generations = current.server_generations;
+        let current_draft_generations = current.draft_generations;
+        let accepted = current.merge_initial_load(SettingsInitialLoadResult {
+            settings: SettingsState::new(&backend),
+            chat_providers: vec![provider.clone()],
+            server_generations: current_server_generations,
+            draft_generations: current_draft_generations,
+        });
+        assert_eq!(accepted, Some(vec![provider.clone()]));
+
+        let mut edited = SettingsState::new_lightweight(&backend);
+        let stale_generation = edited.server_generations;
+        edited
+            .server_generations
+            .bump(SettingsOperationDomain::Providers);
+        let edited_draft_generations = edited.draft_generations;
+        let rejected = edited.merge_initial_load(SettingsInitialLoadResult {
+            settings: SettingsState::new(&backend),
+            chat_providers: vec![provider],
+            server_generations: stale_generation,
+            draft_generations: edited_draft_generations,
+        });
+        assert_eq!(rejected, None);
     }
 
     #[test]
@@ -16750,6 +17026,7 @@ mod tests {
         let reconnect_draft_generations = state.draft_generations;
         state.merge_initial_load(SettingsInitialLoadResult {
             settings: SettingsState::new(&new_backend),
+            chat_providers: Vec::new(),
             server_generations: reconnect_server_generations,
             draft_generations: reconnect_draft_generations,
         });
@@ -16811,6 +17088,7 @@ mod tests {
         refreshed.remote_management.module_observed = ModuleObservedState::Stopped;
         state.merge_initial_load(SettingsInitialLoadResult {
             settings: refreshed,
+            chat_providers: Vec::new(),
             server_generations: reconnect_server_generations,
             draft_generations: reconnect_draft_generations,
         });
@@ -19633,6 +19911,17 @@ mod tests {
             .expect()
             .to_have_value("")?;
         window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-max-context-tokens")
+            .expect()
+            .to_have_value("")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name("provider-0-auto-compact-token-limit")
+            .expect()
+            .to_have_value("")?;
+        assert!(window.get_by_text("CONTEXT AND COST").count()? >= 1);
+        window
             .get_by_role(sui::SemanticsRole::Button)
             .with_name("Remove account")
             .expect()
@@ -20218,7 +20507,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_navigation_previews_refresh_with_loaded_state() -> sui::Result<()> {
+    fn settings_navigation_remains_single_line_when_status_changes() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -20237,12 +20526,52 @@ mod tests {
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
-        let providers = || {
-            window
-                .get_by_role(SemanticsRole::ListItem)
-                .with_name("Providers")
-        };
-        providers().expect().to_have_value("Not set up")?;
+        let provider_row = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("Providers")
+            })
+            .expect("Providers navigation row");
+        assert!(provider_row.bounds.height() <= SIDEBAR_ITEM_H + 0.1);
+
+        let before_scroll = window.snapshot()?;
+        let about_y_before = before_scroll
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("About")
+            })
+            .expect("About navigation row before sidebar scroll")
+            .bounds
+            .y();
+        let mut sidebar_scroll = sui::PointerEvent::new(
+            sui::PointerEventKind::Scroll,
+            sui::Point::new(SIDEBAR_W - 6.0, 350.0),
+        );
+        sidebar_scroll.scroll_delta = Some(sui::ScrollDelta::Pixels(sui::Vector::new(0.0, -80.0)));
+        window
+            .root()
+            .dispatch_event(Event::Pointer(sidebar_scroll))?;
+        app.run_until_idle()?;
+        let about_y_after = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("About")
+            })
+            .expect("About navigation row after sidebar scroll")
+            .bounds
+            .y();
+        assert!(
+            about_y_after < about_y_before,
+            "About should move with the normal sidebar scroll content"
+        );
         window
             .get_by_role(SemanticsRole::ListItem)
             .with_name("About")
@@ -20269,7 +20598,16 @@ mod tests {
             .dispatch_event(Event::Window(sui::WindowEvent::RedrawRequested))?;
         app.run_until_idle()?;
 
-        providers().expect().to_have_value("1 ready")?;
+        let refreshed_provider_row = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("Providers")
+            })
+            .expect("refreshed Providers navigation row");
+        assert!(refreshed_provider_row.bounds.height() <= SIDEBAR_ITEM_H + 0.1);
         about_list.expect().to_be_focused()?;
         Ok(())
     }
@@ -20871,6 +21209,7 @@ mod tests {
         let baseline_drafts = SettingsGenerations::default();
         state.merge_initial_load(SettingsInitialLoadResult {
             settings: loaded,
+            chat_providers: Vec::new(),
             server_generations,
             draft_generations: baseline_drafts,
         });
@@ -20908,6 +21247,7 @@ mod tests {
         stale.cluster_id = Some("cluster_stale".to_string());
         state.merge_initial_load(SettingsInitialLoadResult {
             settings: stale,
+            chat_providers: Vec::new(),
             server_generations: SettingsGenerations::default(),
             draft_generations: SettingsGenerations::default(),
         });
@@ -20919,6 +21259,89 @@ mod tests {
             state.cluster_action_status.as_deref(),
             Some("Invitation generated")
         );
+    }
+
+    #[test]
+    fn device_login_pairing_code_is_large_selectable_and_copyable() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        add_provider_account(
+            backend.config.as_ref(),
+            "codex",
+            sinomo_lm::DEFAULT_PROVIDER_ACCOUNT,
+            "",
+            &provider_default_model("codex"),
+            "",
+        )
+        .expect("add Codex provider account");
+        let shared = Shared::new(AppState::ready(backend));
+        let (_tx, rx) = std::sync::mpsc::channel();
+        shared.settings_mut().device_login = Some(DeviceLogin {
+            provider: "codex".to_string(),
+            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            status: DeviceLoginStatus::Prompt {
+                verification_uri: "https://example.test/device".to_string(),
+                user_code: "ABCD-1234".to_string(),
+            },
+            rx,
+        });
+        let reader: ThemeReader = {
+            let s = shared.clone();
+            Rc::new(move || s.theme())
+        };
+        let theme = reader();
+        let code_style = device_login_code_text_style(&theme, &palette(&shared));
+        assert_eq!(code_style.font_size, theme.text._3xl.size);
+        assert!(code_style.font_size > theme.body_text_style().font_size);
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Provider pairing code")
+                    .root(
+                        SizedBox::new()
+                            .width(520.0)
+                            .height(160.0)
+                            .with_child(status_reflector(&shared, 0, &reader)),
+                    ),
+            )
+            .build()?;
+        let clipboard = runtime.clipboard();
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let field = window
+            .get_by_role(SemanticsRole::TextInput)
+            .with_name("provider-device-login-code");
+        field.expect().to_have_value("ABCD-1234")?;
+        let field_bounds = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::TextInput
+                    && node.name.as_deref() == Some("provider-device-login-code")
+            })
+            .expect("pairing code field semantics")
+            .bounds;
+        assert!(field_bounds.height() >= 54.0);
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Copy pairing code")
+            .click()?;
+        assert_eq!(clipboard.text().as_deref(), Some("ABCD-1234"));
+
+        clipboard.set_text("selection copy did not run");
+        field.focus()?;
+        let mut select_all = sui::KeyboardEvent::new("a", sui::KeyState::Pressed);
+        select_all.modifiers.control = true;
+        field.dispatch_event(sui::Event::Keyboard(select_all))?;
+        let mut copy = sui::KeyboardEvent::new("c", sui::KeyState::Pressed);
+        copy.modifiers.control = true;
+        field.dispatch_event(sui::Event::Keyboard(copy))?;
+        assert_eq!(clipboard.text().as_deref(), Some("ABCD-1234"));
+
+        Ok(())
     }
 
     #[test]

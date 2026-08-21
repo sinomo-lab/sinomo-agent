@@ -58,9 +58,10 @@ pub use local_responses::{
 };
 pub use nvidia::{NVIDIA_DEFAULT_MODEL, NvidiaConfig, NvidiaProvider, normalize_nvidia_model_id};
 pub use openai::{
-    OPENAI_DEFAULT_IMAGE_MODEL, OPENAI_DEFAULT_WEB_SEARCH_MODEL, OPENAI_MAX_IMAGE_REFERENCES,
-    OpenAiConfig, OpenAiImageRequest, OpenAiImageResponse, OpenAiProvider,
-    OpenAiWebSearchContextSize, OpenAiWebSearchRequest, OpenAiWebSearchResponse,
+    OPENAI_DEFAULT_IMAGE_MODEL, OPENAI_DEFAULT_MODEL, OPENAI_DEFAULT_WEB_SEARCH_MODEL,
+    OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS, OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS,
+    OPENAI_MAX_IMAGE_REFERENCES, OpenAiConfig, OpenAiImageRequest, OpenAiImageResponse,
+    OpenAiProvider, OpenAiWebSearchContextSize, OpenAiWebSearchRequest, OpenAiWebSearchResponse,
     OpenAiWebSearchSource,
 };
 pub use realtime_audio::{
@@ -800,6 +801,10 @@ pub struct LanguageModelProviderOptions {
     pub reasoning_budget_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_verbosity: Option<ProviderTextVerbosity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub vendor_options: BTreeMap<String, String>,
 }
@@ -819,6 +824,12 @@ impl LanguageModelProviderOptions {
         }
         if overrides.text_verbosity.is_some() {
             merged.text_verbosity = overrides.text_verbosity;
+        }
+        if overrides.max_context_tokens.is_some() {
+            merged.max_context_tokens = overrides.max_context_tokens;
+        }
+        if overrides.auto_compact_token_limit.is_some() {
+            merged.auto_compact_token_limit = overrides.auto_compact_token_limit;
         }
         for (key, value) in &overrides.vendor_options {
             merged.vendor_options.insert(key.clone(), value.clone());
@@ -1123,6 +1134,17 @@ pub fn inferred_model_context_window_tokens(provider: &str, model: &str) -> Opti
     }
 }
 
+pub fn inferred_model_max_context_window_tokens(provider: &str, model: &str) -> Option<usize> {
+    let provider = normalize_model_provider(provider)?;
+    let model = effective_model_name(&provider, model);
+    match provider.as_str() {
+        CODEX_PROVIDER_ID | OpenAiProvider::PROVIDER_ID => {
+            openai::inferred_max_context_window_tokens(&model)
+        }
+        _ => inferred_model_context_window_tokens(&provider, &model),
+    }
+}
+
 pub(crate) fn parse_declared_context_window_tokens(model: &str) -> Option<usize> {
     model
         .to_ascii_lowercase()
@@ -1278,6 +1300,24 @@ fn provider_options_schema() -> ConfigSchemaValue {
             "Text verbosity",
             "Preferred response verbosity when the provider supports it.",
             text_verbosity_schema(),
+        ),
+        optional_config_field(
+            "max_context_tokens",
+            "Maximum context tokens",
+            "Optional user cap for the model context window. Lower limits can reduce long-context cost and usage.",
+            ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                min: Some(1.0),
+                max: Some(u32::MAX as f64),
+            })),
+        ),
+        optional_config_field(
+            "auto_compact_token_limit",
+            "Automatic compaction token limit",
+            "Optional context size at which Sinomo compacts older conversation history.",
+            ConfigSchemaValue::u64(Some(ConfigNumberRange {
+                min: Some(1.0),
+                max: Some(u32::MAX as f64),
+            })),
         ),
         optional_config_field(
             "vendor_options",
@@ -4626,7 +4666,11 @@ mod tests {
         );
         assert_eq!(
             inferred_model_context_window_tokens(CODEX_PROVIDER_ID, "provider-default"),
-            Some(400_000)
+            Some(OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS)
+        );
+        assert_eq!(
+            inferred_model_max_context_window_tokens(CODEX_PROVIDER_ID, "provider-default"),
+            Some(OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS)
         );
         assert_eq!(
             inferred_model_context_window_tokens("deepseek", "provider-default"),
@@ -4818,6 +4862,8 @@ mod tests {
                     reasoning_effort: Some(ProviderReasoningEffort::High),
                     reasoning_budget_tokens: Some(8_192),
                     text_verbosity: Some(ProviderTextVerbosity::Medium),
+                    max_context_tokens: Some(1_000_000),
+                    auto_compact_token_limit: Some(900_000),
                     vendor_options: BTreeMap::from([(
                         "service_tier".to_string(),
                         "priority".to_string(),

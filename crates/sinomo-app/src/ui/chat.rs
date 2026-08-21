@@ -17984,7 +17984,7 @@ fn wide_pod(
         .ratio(ratio)
         .min_first(SIDEBAR_MIN_W)
         .min_second(CHAT_PANE_MIN_W)
-        .theme(reader())
+        .theme_when(clone_reader(reader))
         .on_change(move |ratio| ratio_shared.chat_mut().set_sidebar_ratio(ratio));
     let dialog_host = ChatDialogHost::new(row, shared.clone(), Rc::clone(reader));
     WidgetPod::new(

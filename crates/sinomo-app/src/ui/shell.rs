@@ -75,7 +75,15 @@ impl BackgroundWorkController {
 
         let ready = self.shared.is_ready();
         let device_changed = ready && self.shared.settings_mut().pump_device_login();
-        let settings_changed = ready && self.shared.settings_mut().pump_initial_load();
+        let initial_settings = if ready {
+            self.shared.settings_mut().pump_initial_load()
+        } else {
+            settings::SettingsInitialLoadEffects::default()
+        };
+        if let Some(providers) = initial_settings.chat_providers {
+            self.shared.chat_mut().refresh_providers(providers);
+        }
+        let settings_changed = initial_settings.changed;
         let settings_operations_changed =
             ready && settings::pump_background_operations(&self.shared);
         let evolution_changed = ready && self.shared.evolution_mut().pump_dashboard_load();

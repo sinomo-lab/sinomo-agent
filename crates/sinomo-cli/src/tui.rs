@@ -8004,6 +8004,8 @@ where
     account: Option<String>,
     reasoning_effort: Option<ProviderReasoningEffort>,
     reasoning_budget_tokens: Option<u32>,
+    max_context_tokens: Option<u32>,
+    auto_compact_token_limit: Option<u32>,
     /// Conversation-projected primary workspace. `None` is a real revocation,
     /// not an instruction to fall back to the process cwd.
     workspace_root: Option<PathBuf>,
@@ -8023,6 +8025,8 @@ where
     account: Option<String>,
     reasoning_effort: Option<ProviderReasoningEffort>,
     reasoning_budget_tokens: Option<u32>,
+    max_context_tokens: Option<u32>,
+    auto_compact_token_limit: Option<u32>,
     workspace_root: Option<PathBuf>,
 }
 
@@ -8120,6 +8124,8 @@ where
             account: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
+            max_context_tokens: None,
+            auto_compact_token_limit: None,
             workspace_root: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         }
     }
@@ -8191,6 +8197,7 @@ where
         let mut config =
             sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
                 .with_agent_definition(self.agent_definition.clone())
+                .with_model_context_limits(self.max_context_tokens, self.auto_compact_token_limit)
                 .with_skill_catalog(self.skill_catalog.clone())
                 .with_skill_catalog_texts(self.skill_catalog_texts.clone())
                 .with_skill_catalog_resources(self.skill_catalog_resources.clone());
@@ -8318,6 +8325,12 @@ where
             &mut self.reasoning_budget_tokens,
             options.reasoning_budget_tokens,
         );
+        let previous_max_context_tokens =
+            std::mem::replace(&mut self.max_context_tokens, options.max_context_tokens);
+        let previous_auto_compact_token_limit = std::mem::replace(
+            &mut self.auto_compact_token_limit,
+            options.auto_compact_token_limit,
+        );
         let next_runtime = match preserved_session {
             Some(mut session) => {
                 if recall_transition.is_some() {
@@ -8340,6 +8353,8 @@ where
                     self.account = previous_account;
                     self.reasoning_effort = previous_reasoning_effort;
                     self.reasoning_budget_tokens = previous_reasoning_budget_tokens;
+                    self.max_context_tokens = previous_max_context_tokens;
+                    self.auto_compact_token_limit = previous_auto_compact_token_limit;
                     self.runtime = previous_runtime;
                     return Err(match control_rollback {
                         Some(rollback) => CliError::Parse {
@@ -8556,6 +8571,8 @@ where
             account: self.account.clone(),
             reasoning_effort: self.reasoning_effort,
             reasoning_budget_tokens: self.reasoning_budget_tokens,
+            max_context_tokens: self.max_context_tokens,
+            auto_compact_token_limit: self.auto_compact_token_limit,
             workspace_root: self.workspace_root.clone(),
         })
     }
@@ -8600,6 +8617,8 @@ where
         self.account = snapshot.account;
         self.reasoning_effort = snapshot.reasoning_effort;
         self.reasoning_budget_tokens = snapshot.reasoning_budget_tokens;
+        self.max_context_tokens = snapshot.max_context_tokens;
+        self.auto_compact_token_limit = snapshot.auto_compact_token_limit;
         self.workspace_root = snapshot.workspace_root;
         self.runtime_cursor = snapshot.runtime_cursor;
         self.runtime = Some(RuntimeMainAgentSlot::Ready(snapshot.runtime.clone()));
@@ -8807,6 +8826,8 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         self.account = account;
         self.reasoning_effort = options.reasoning_effort;
         self.reasoning_budget_tokens = options.reasoning_budget_tokens;
+        self.max_context_tokens = options.max_context_tokens;
+        self.auto_compact_token_limit = options.auto_compact_token_limit;
         self
     }
 

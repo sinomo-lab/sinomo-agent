@@ -74,7 +74,8 @@ use sinomo_lm::{
     provider_api_key_from_env, provider_options_for_model, resolve_default_model,
     save_provider_api_key_in_model_config, stored_provider_api_key,
     stored_provider_api_key_in_data_dir, subscription_usage_provider_ids,
-    test_provider_account_credentials, test_provider_credentials, write_default_model_config,
+    test_provider_account_credentials, test_provider_credentials, upsert_provider_account_config,
+    write_default_model_config,
 };
 use sinomo_pytorch::{
     MINICPM_DEFAULT_MODEL, MINICPM_PROVIDER_ID, ManagedPytorchServer, ManagedPytorchServerConfig,

@@ -84,13 +84,36 @@ impl Default for AgentContextBudget {
 
 impl AgentContextBudget {
     pub fn for_loaded_model(provider: &str, model: &str, max_output_tokens: Option<u32>) -> Self {
-        let window_tokens = resolved_model_context_window_tokens(provider, model);
+        Self::for_loaded_model_with_limits(provider, model, max_output_tokens, None, None)
+    }
+
+    pub fn for_loaded_model_with_limits(
+        provider: &str,
+        model: &str,
+        max_output_tokens: Option<u32>,
+        max_context_tokens: Option<u32>,
+        auto_compact_token_limit: Option<u32>,
+    ) -> Self {
+        let inferred_window = resolved_model_context_window_tokens(provider, model);
+        let supported_max = sinomo_lm::inferred_model_max_context_window_tokens(provider, model);
+        let window_tokens = max_context_tokens
+            .map(|value| value as usize)
+            .map(|value| supported_max.map_or(value, |max| value.min(max)))
+            .unwrap_or(inferred_window);
+        let max_context_bytes = context_max_bytes_for_window(window_tokens, max_output_tokens);
+        let compaction_threshold_ratio =
+            auto_compact_token_limit.map_or(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO, |limit| {
+                if max_context_bytes == 0 {
+                    0.0
+                } else {
+                    ((limit as usize).saturating_mul(CONTEXT_ESTIMATE_BYTES_PER_TOKEN) as f32
+                        / max_context_bytes as f32)
+                        .clamp(0.0, 1.0)
+                }
+            });
         Self {
-            max_context_bytes: Some(context_max_bytes_for_window(
-                window_tokens,
-                max_output_tokens,
-            )),
-            compaction_threshold_ratio: Some(DEFAULT_CONTEXT_COMPACTION_THRESHOLD_RATIO),
+            max_context_bytes: Some(max_context_bytes),
+            compaction_threshold_ratio: Some(compaction_threshold_ratio),
             retained_tail_items: None,
         }
     }
@@ -4713,6 +4736,21 @@ impl AgentConfig {
 
     pub fn with_context_budget(mut self, context_budget: AgentContextBudget) -> Self {
         self.context_budget = context_budget;
+        self
+    }
+
+    pub fn with_model_context_limits(
+        mut self,
+        max_context_tokens: Option<u32>,
+        auto_compact_token_limit: Option<u32>,
+    ) -> Self {
+        self.context_budget = AgentContextBudget::for_loaded_model_with_limits(
+            &self.provider,
+            &self.model,
+            self.max_output_tokens,
+            max_context_tokens,
+            auto_compact_token_limit,
+        );
         self
     }
 }
@@ -12978,6 +13016,26 @@ mod tests {
         assert_eq!(
             unknown.max_context_bytes,
             Some((DEFAULT_UNKNOWN_MODEL_CONTEXT_WINDOW_TOKENS - 1_600) * 4)
+        );
+    }
+
+    #[test]
+    fn explicit_long_context_and_compaction_limits_follow_provider_options() {
+        let budget = AgentContextBudget::for_loaded_model_with_limits(
+            "codex",
+            "gpt-5.6-sol",
+            None,
+            Some(1_000_000),
+            Some(900_000),
+        );
+
+        assert_eq!(budget.max_context_bytes, Some(4_000_000));
+        assert_eq!(budget.compaction_threshold_bytes(), Some(3_600_000));
+
+        let cost_aware = AgentContextBudget::for_loaded_model("codex", "gpt-5.6-sol", None);
+        assert_eq!(
+            cost_aware.max_context_bytes,
+            Some(sinomo_lm::OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS * 4)
         );
     }
 

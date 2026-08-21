@@ -11,12 +11,12 @@
 use serde_json::Value;
 use sinomo_cli::app_api::ProviderSummary;
 use sinomo_lm::{
-    DEFAULT_PROVIDER_ACCOUNT, LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_HEALTH_CONFIG_KEY,
-    LM_STUDIO_PROVIDER_ID, LanguageModelProviderHealthConfig, LanguageModelProviderHealthSnapshot,
-    LanguageModelProviderOptions, ModelConfig, OLLAMA_PROVIDER_ID, ProviderAccountConfig,
-    ProviderReasoningEffort, ProviderTextVerbosity, model_supports_reasoning_effort,
-    normalize_model_provider, normalize_provider_account_name, provider_health_account_key,
-    upsert_provider_account_config,
+    CODEX_PROVIDER_ID, DEFAULT_PROVIDER_ACCOUNT, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KEY,
+    LM_PROVIDER_HEALTH_CONFIG_KEY, LM_STUDIO_PROVIDER_ID, LanguageModelProviderHealthConfig,
+    LanguageModelProviderHealthSnapshot, LanguageModelProviderOptions, ModelConfig,
+    OLLAMA_PROVIDER_ID, ProviderAccountConfig, ProviderReasoningEffort, ProviderTextVerbosity,
+    model_supports_reasoning_effort, normalize_model_provider, normalize_provider_account_name,
+    provider_health_account_key, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigClusterMode, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType,
@@ -343,6 +343,110 @@ mod tests {
     }
 
     #[test]
+    fn legacy_codex_credentials_create_the_initial_provider_account() {
+        let (client, root) = test_client("legacy-codex-account");
+        let data_dir = SinomoDataDir::new(root);
+        let credentials = data_dir.provider_credentials_file(CODEX_PROVIDER_ID);
+        std::fs::create_dir_all(credentials.parent().expect("credential parent"))
+            .expect("create credential parent");
+        std::fs::write(&credentials, b"legacy-codex-token-document")
+            .expect("write legacy credential marker");
+
+        assert!(
+            migrate_legacy_device_login_provider_accounts(&client, &data_dir)
+                .expect("migrate provider account")
+        );
+        let config = load_provider_config(&client).expect("migrated provider config");
+        assert_eq!(config.default_provider.as_deref(), Some(CODEX_PROVIDER_ID));
+        assert_eq!(
+            config.default_account.as_deref(),
+            Some(DEFAULT_PROVIDER_ACCOUNT)
+        );
+        assert!(config.accounts.iter().any(|account| {
+            account.provider == CODEX_PROVIDER_ID
+                && account.account == DEFAULT_PROVIDER_ACCOUNT
+                && account.enabled
+                && account.api_key.is_none()
+        }));
+        assert_eq!(cluster_provider_summaries(&client).len(), 1);
+    }
+
+    #[test]
+    fn explicit_empty_provider_config_is_not_repopulated_from_credentials() {
+        let (client, root) = test_client("explicit-empty-provider-config");
+        let data_dir = SinomoDataDir::new(root);
+        let credentials = data_dir.provider_credentials_file(CODEX_PROVIDER_ID);
+        std::fs::create_dir_all(credentials.parent().expect("credential parent"))
+            .expect("create credential parent");
+        std::fs::write(&credentials, b"retained-codex-token-document")
+            .expect("write retained credential marker");
+        write_provider_config(&client, &ModelConfig::default())
+            .expect("write explicit empty provider config");
+
+        assert!(
+            !migrate_legacy_device_login_provider_accounts(&client, &data_dir)
+                .expect("respect explicit provider config")
+        );
+        assert!(
+            load_provider_config(&client)
+                .expect("explicit provider config")
+                .accounts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn codex_context_limits_persist_and_validate_known_model_bounds() {
+        let (client, _root) = test_client("codex-context-limits");
+        add_provider_account(
+            &client,
+            CODEX_PROVIDER_ID,
+            DEFAULT_PROVIDER_ACCOUNT,
+            "",
+            sinomo_lm::OPENAI_DEFAULT_MODEL,
+            "",
+        )
+        .expect("add Codex account");
+
+        set_provider_max_context_tokens(
+            &client,
+            CODEX_PROVIDER_ID,
+            DEFAULT_PROVIDER_ACCOUNT,
+            "1000000",
+        )
+        .expect("save long context cap");
+        set_provider_auto_compact_token_limit(
+            &client,
+            CODEX_PROVIDER_ID,
+            DEFAULT_PROVIDER_ACCOUNT,
+            "900000",
+        )
+        .expect("save compaction threshold");
+
+        let form = provider_forms(&client).pop().expect("provider form");
+        assert_eq!(form.max_context_tokens, Some(1_000_000));
+        assert_eq!(form.auto_compact_token_limit, Some(900_000));
+        assert!(
+            set_provider_max_context_tokens(
+                &client,
+                CODEX_PROVIDER_ID,
+                DEFAULT_PROVIDER_ACCOUNT,
+                "1100000",
+            )
+            .is_err()
+        );
+        assert!(
+            set_provider_auto_compact_token_limit(
+                &client,
+                CODEX_PROVIDER_ID,
+                DEFAULT_PROVIDER_ACCOUNT,
+                "1000001",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn provider_forms_include_complete_known_model_catalogs() {
         let (client, _root) = test_client("known-models");
         add_provider_account(
@@ -605,6 +709,63 @@ pub fn load_provider_config(client: &dyn ConfigClient) -> Option<ModelConfig> {
     serde_json::from_value(resolution.value).ok()
 }
 
+/// Upgrade pre-account OAuth setup into the authoritative `lm.providers` document.
+///
+/// Older Codex and GitHub Copilot authentication flows wrote only a node-local token file. Once
+/// provider accounts became explicit, those installations looked signed in but Chat had no
+/// enabled account to select. Migrate only while the resolved provider document still comes from
+/// the schema default; an explicitly empty local or cluster document represents operator intent
+/// and must never be repopulated from leftover credentials.
+pub fn migrate_legacy_device_login_provider_accounts(
+    client: &dyn ConfigClient,
+    data_dir: &SinomoDataDir,
+) -> Result<bool, String> {
+    let resolution = client
+        .get(LM_PROVIDER_CONFIG_KEY)
+        .map_err(|error| error.to_string())?;
+    if resolution.source != ConfigValueSource::Default {
+        return Ok(false);
+    }
+    let mut config: ModelConfig =
+        serde_json::from_value(resolution.value).map_err(|error| error.to_string())?;
+    if !config.accounts.is_empty() {
+        return Ok(false);
+    }
+
+    let providers = [GitHubCopilotProvider::PROVIDER_ID, CODEX_PROVIDER_ID]
+        .into_iter()
+        .filter(|provider| {
+            std::fs::metadata(data_dir.provider_credentials_file(provider))
+                .is_ok_and(|metadata| metadata.len() > 0)
+        })
+        .collect::<Vec<_>>();
+    let Some(default_provider) = providers.first().copied() else {
+        return Ok(false);
+    };
+
+    for provider in providers {
+        upsert_provider_account_config(
+            &mut config,
+            ProviderAccountConfig {
+                provider: provider.to_string(),
+                account: DEFAULT_PROVIDER_ACCOUNT.to_string(),
+                default_model: None,
+                api_base_url: None,
+                api_key: None,
+                enabled: true,
+                options: LanguageModelProviderOptions::default(),
+                model_options: Vec::new(),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    config.default_provider = Some(default_provider.to_string());
+    config.default_account = Some(DEFAULT_PROVIDER_ACCOUNT.to_string());
+    config.default_model = None;
+    write_provider_config(client, &config)?;
+    Ok(true)
+}
+
 /// A human-friendly label for a provider id (falls back to the id itself).
 pub fn provider_display_name(id: &str) -> String {
     match id {
@@ -684,6 +845,8 @@ pub struct ProviderForm {
     pub reasoning_effort: Option<String>,
     pub reasoning_budget_tokens: Option<u32>,
     pub text_verbosity: Option<String>,
+    pub max_context_tokens: Option<u32>,
+    pub auto_compact_token_limit: Option<u32>,
     pub vendor_options: String,
     /// Whether reasoning effort applies to this provider/model at all.
     pub supports_reasoning: bool,
@@ -758,6 +921,8 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
                 .reasoning_effort
                 .map(|e| e.as_config_value().to_string()),
             reasoning_budget_tokens: account.options.reasoning_budget_tokens,
+            max_context_tokens: account.options.max_context_tokens,
+            auto_compact_token_limit: account.options.auto_compact_token_limit,
             text_verbosity: account
                 .options
                 .text_verbosity
@@ -1072,6 +1237,93 @@ pub fn set_provider_base_url(
     update_provider_account(client, provider, account, move |account| {
         account.api_base_url = (!url.is_empty()).then_some(url);
     })
+}
+
+pub fn set_provider_max_context_tokens(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = parse_optional_positive_u32("maximum context tokens", raw)?;
+    update_provider_context_options(client, provider, account, |options| {
+        options.max_context_tokens = value;
+    })
+}
+
+pub fn set_provider_auto_compact_token_limit(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    raw: &str,
+) -> Result<(), String> {
+    let value = parse_optional_positive_u32("automatic compaction token limit", raw)?;
+    update_provider_context_options(client, provider, account, |options| {
+        options.auto_compact_token_limit = value;
+    })
+}
+
+fn parse_optional_positive_u32(label: &str, raw: &str) -> Result<Option<u32>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let value = raw
+        .parse::<u32>()
+        .map_err(|error| format!("invalid {label} `{raw}`: {error}"))?;
+    if value == 0 {
+        return Err(format!("{label} must be greater than zero"));
+    }
+    Ok(Some(value))
+}
+
+fn update_provider_context_options(
+    client: &dyn ConfigClient,
+    provider: &str,
+    account: &str,
+    edit: impl FnOnce(&mut LanguageModelProviderOptions),
+) -> Result<(), String> {
+    let provider = normalize_configurable_provider(provider)?;
+    let account_name = normalize_provider_account_name(Some(account));
+    let mut config = load_provider_config(client).unwrap_or_default();
+    let mut account = config
+        .accounts
+        .iter()
+        .find(|candidate| {
+            normalize_model_provider(&candidate.provider).as_deref() == Some(provider.as_str())
+                && normalize_provider_account_name(Some(&candidate.account)) == account_name
+        })
+        .cloned()
+        .ok_or_else(|| format!("provider account `{provider}/{account_name}` was not found"))?;
+    edit(&mut account.options);
+    let model = account
+        .default_model
+        .as_deref()
+        .unwrap_or(sinomo_lm::PROVIDER_DEFAULT_MODEL);
+    let effective_default = sinomo_lm::inferred_model_context_window_tokens(&provider, model);
+    let effective_max = sinomo_lm::inferred_model_max_context_window_tokens(&provider, model);
+    if let (Some(limit), Some(max)) = (account.options.max_context_tokens, effective_max)
+        && limit as usize > max
+    {
+        return Err(format!(
+            "maximum context tokens {limit} exceeds the known {max}-token window for {}",
+            sinomo_lm::effective_model_name(&provider, model)
+        ));
+    }
+    let active_limit = account
+        .options
+        .max_context_tokens
+        .map(|value| value as usize)
+        .or(effective_default);
+    if let (Some(compact), Some(limit)) = (account.options.auto_compact_token_limit, active_limit)
+        && compact as usize > limit
+    {
+        return Err(format!(
+            "automatic compaction token limit {compact} exceeds the active {limit}-token context limit"
+        ));
+    }
+    upsert_provider_account_config(&mut config, account).map_err(|error| error.to_string())?;
+    write_provider_config(client, &config)
 }
 
 /// Advance a provider's reasoning effort to the next option (default → low → medium → high → max →

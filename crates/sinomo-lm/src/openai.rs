@@ -18,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub const OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS: usize = 272_000;
+pub const OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS: usize = 1_050_000;
 pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-5.6-luna";
 pub const OPENAI_DEFAULT_IMAGE_MODEL: &str = "gpt-image-2";
 /// Reference images accepted by one `images/edits` request.
@@ -36,7 +39,7 @@ impl Default for OpenAiConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://api.openai.com/v1".to_string(),
-            default_model: "gpt-5.2-codex".to_string(),
+            default_model: OPENAI_DEFAULT_MODEL.to_string(),
             api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_OPENAI_CREDENTIALS_FILE",
@@ -264,7 +267,9 @@ impl Default for OpenAiProvider {
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model).or_else(|| {
         let model = model.to_ascii_lowercase();
-        if model.contains("gpt-5")
+        if model.contains("gpt-5.6") {
+            Some(OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS)
+        } else if model.contains("gpt-5")
             || model.contains("gpt-4.1")
             || model.contains("o3")
             || model.contains("o4")
@@ -274,6 +279,15 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
             None
         }
     })
+}
+
+pub(crate) fn inferred_max_context_window_tokens(model: &str) -> Option<usize> {
+    let model = model.to_ascii_lowercase();
+    if model.contains("gpt-5.6") {
+        Some(OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS)
+    } else {
+        inferred_context_window_tokens(&model)
+    }
 }
 
 pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
@@ -1250,6 +1264,21 @@ mod tests {
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::json!({ "job_id": "task_test" }),
         }
+    }
+
+    #[test]
+    fn openai_and_codex_defaults_use_gpt_5_6_sol() {
+        assert_eq!(OPENAI_DEFAULT_MODEL, "gpt-5.6-sol");
+        assert_eq!(OpenAiConfig::default().default_model, OPENAI_DEFAULT_MODEL);
+        assert_eq!(crate::CODEX_DEFAULT_MODEL, OPENAI_DEFAULT_MODEL);
+        assert_eq!(
+            crate::effective_model_name("openai", crate::PROVIDER_DEFAULT_MODEL),
+            OPENAI_DEFAULT_MODEL
+        );
+        assert_eq!(
+            crate::effective_model_name(crate::CODEX_PROVIDER_ID, crate::PROVIDER_DEFAULT_MODEL),
+            OPENAI_DEFAULT_MODEL
+        );
     }
 
     #[test]
