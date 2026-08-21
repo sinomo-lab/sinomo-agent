@@ -4321,7 +4321,14 @@ mod tests {
             let marker_id = mutation.marker.marker_id.clone();
             let marker_nonce = mutation.marker.marker_nonce.clone();
             let arm_request_id = arm(&store, &mutation);
-            let captured = MountedSifsMutationCapturedWork::default();
+            let captured = MountedSifsMutationCapturedWork::new(
+                DfsCommittedWork {
+                    publish_metadata: true,
+                    ..DfsCommittedWork::default()
+                },
+                Vec::new(),
+            )
+            .expect("captured committed work");
             mutation
                 .record_captured_success(&arm_request_id, captured.clone())
                 .expect("capture successful mutation");
@@ -4344,7 +4351,8 @@ mod tests {
                 .daemon_committed_work_latch()
                 .expect("coalesced latch")
                 .generation,
-            operation_count as u64
+            1,
+            "successful churn must coalesce one retained work bit into one ownership generation"
         );
         drop(session);
 
@@ -4362,7 +4370,8 @@ mod tests {
                 .daemon_committed_work_latch()
                 .expect("reopened latch")
                 .generation,
-            operation_count as u64
+            1,
+            "the coalesced ownership generation must survive reopen"
         );
         reopened
             .open_host_mount_session(MountedSifsMutationAdapter::Fuse, "/mnt/reopened")

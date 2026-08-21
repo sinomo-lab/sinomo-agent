@@ -6824,6 +6824,17 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
+        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
+            .expect("shutdown request");
+        daemon
+            .join()
+            .expect("daemon thread")
+            .expect("daemon exits cleanly");
+
+        // Read durable startup output only after the daemon has released its
+        // Raft and DFS ownership. The successful status response above is the
+        // readiness boundary; racing the live owner here tests lock timing,
+        // not publication-before-serving.
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let shard_entries = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
             .expect("current canonical shard authority")
@@ -6842,13 +6853,6 @@ mod tests {
         let services_anchor = backend
             .get_object_by_path(&file_system.file_system_id, sinomo_dfs::SIFS_SERVICES_PATH)
             .expect("services anchor lookup");
-
-        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
-            .expect("shutdown request");
-        daemon
-            .join()
-            .expect("daemon thread")
-            .expect("daemon exits cleanly");
 
         assert_eq!(
             shard_entries.len(),

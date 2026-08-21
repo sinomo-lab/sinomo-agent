@@ -13754,6 +13754,8 @@ mod tests {
             maintenance.last_probe = Instant::now()
                 .checked_sub(DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL)
                 .expect("due probe timestamp");
+            maintenance.probe_retry_at = None;
+            maintenance.connectivity_force_probe = true;
             let Some(pending) = run_cluster_network_maintenance_tick_for_test(
                 &mut maintenance,
                 &daemon_paths,

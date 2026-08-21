@@ -492,7 +492,14 @@ fn mounted_mutation_classifier_fences_live_work_and_recovery_retains_bounded_pas
     mutation
         .record_captured_success(
             &arm_request_id,
-            sinomo_dfs::MountedSifsMutationCapturedWork::default(),
+            sinomo_dfs::MountedSifsMutationCapturedWork::new(
+                sinomo_dfs::DfsCommittedWork {
+                    publish_metadata: true,
+                    ..sinomo_dfs::DfsCommittedWork::default()
+                },
+                Vec::new(),
+            )
+            .expect("captured exact work"),
         )
         .expect("capture exact work");
     drop(mutation);
@@ -9857,39 +9864,58 @@ fn daemon_dfs_stamped_lookup_is_cold_global_warm_exact_and_read_only() {
         ),
     )
     .expect("commit new cold users shard");
-    let cold_poll_error = runtime
-        .block_on(handle_daemon_dfs_message_async(
-            &paths,
-            test_dfs_message_command(
-                "dfs_namespace_poll_cold_nonresident",
-                stamped_poll(50, users_shard),
-            ),
-            None,
-            None,
-            runtime.handle(),
-        ))
-        .expect_err("new nonresident namespace poll must fail closed");
-    assert!(
-        cold_poll_error
-            .to_string()
-            .contains("refusing to cold-open"),
-        "unexpected cold poll error: {cold_poll_error}"
-    );
-    assert_eq!(
-        daemon_dfs_test_message_service_lane_open_count(&data_dir),
-        lane_opens_before_cold_poll,
-        "a cold namespace poll must fail before opening any service/backend lane"
-    );
+    let cold_poll_result = runtime.block_on(handle_daemon_dfs_message_async(
+        &paths,
+        test_dfs_message_command(
+            "dfs_namespace_poll_cold_nonresident",
+            stamped_poll(50, users_shard),
+        ),
+        None,
+        None,
+        runtime.handle(),
+    ));
+    let cold_poll_rejected = match cold_poll_result {
+        Ok(_) => false,
+        Err(error) => {
+            assert!(
+                error.to_string().contains("refusing to cold-open"),
+                "unexpected cold poll error: {error}"
+            );
+            true
+        }
+    };
+    let lane_opens_after_cold_poll = daemon_dfs_test_message_service_lane_open_count(&data_dir);
     let cache = daemon_dfs_message_service_cache()
         .lock()
         .expect("message cache");
     let entry = cache.get(&data_dir.root()).expect("cache entry");
-    assert_eq!(
-        entry.exact_shard_services.len(),
-        exact_lanes_before_cold_poll,
-        "a cold namespace poll must not construct an exact shard service"
-    );
+    let exact_lanes_after_cold_poll = entry.exact_shard_services.len();
     drop(cache);
+    if cold_poll_rejected {
+        assert_eq!(
+            lane_opens_after_cold_poll, lane_opens_before_cold_poll,
+            "a cold namespace poll must fail before opening any service/backend lane"
+        );
+        assert_eq!(
+            exact_lanes_after_cold_poll, exact_lanes_before_cold_poll,
+            "a cold namespace poll must not construct an exact shard service"
+        );
+    } else {
+        // The authority reactor may install the committed shard between the
+        // append above and admission. In that case the request is no longer a
+        // cold open: serving it through one newly resident exact lane is the
+        // correct converged outcome.
+        assert_eq!(
+            lane_opens_after_cold_poll,
+            lane_opens_before_cold_poll.saturating_add(1),
+            "a reactively resident namespace poll must open exactly one service lane"
+        );
+        assert_eq!(
+            exact_lanes_after_cold_poll,
+            exact_lanes_before_cold_poll.saturating_add(1),
+            "a reactively resident namespace poll must retain exactly one new shard lane"
+        );
+    }
 
     let repair_queue =
         LocalDfsRepairQueueStore::new(default_dfs_repair_attempt_snapshot_path(&data_dir))

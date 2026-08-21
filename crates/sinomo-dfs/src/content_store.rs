@@ -8945,15 +8945,17 @@ mod tests {
     }
 
     #[test]
-    fn no_quota_status_snapshot_preserves_streamed_durable_blob_only_branch() {
-        let root =
-            temp_root("no_quota_status_snapshot_preserves_streamed_durable_blob_only_branch");
+    fn no_quota_status_scan_preserves_streamed_durable_blob_only_branch() {
+        let root = temp_root("no_quota_status_scan_preserves_streamed_durable_blob_only_branch");
         let store = LocalContentStore::new(&root).expect("create store");
         let bytes = vec![0x71; STREAMED_BLOB_ONLY_MIN_BYTES + 4096];
 
         let empty = store.stats().expect("status materializes derived snapshot");
         assert_eq!(empty, ContentStoreStats::default());
-        let snapshot_before_write = read_file(&store.stats_snapshot_path()).expect("read snapshot");
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "a no-quota status scan must not persist derived state"
+        );
         assert!(!store.tracks_stats_deltas());
         assert!(store.uses_streamed_blob_only_path(bytes.len()));
 
@@ -8961,10 +8963,9 @@ mod tests {
             .put_object_version_blob_only("object-blob-only-large", "v1", &bytes)
             .expect("put blob-only large object");
 
-        assert_eq!(
-            read_file(&store.stats_snapshot_path()).expect("read unchanged snapshot"),
-            snapshot_before_write,
-            "a derived status snapshot must not activate synchronous write deltas"
+        assert!(
+            !store.stats_snapshot_path().exists(),
+            "a no-quota streamed write must not persist synchronous stats state"
         );
         assert_eq!(
             store
@@ -9839,6 +9840,9 @@ mod tests {
             .expect("put first pre-quota object");
         let initial = store.stats().expect("materialize pre-quota snapshot");
         assert_eq!(initial.blob_bytes, 4);
+        store
+            .replace_stats_snapshot(&initial)
+            .expect("persist legacy pre-quota snapshot fixture");
         let stale_snapshot =
             read_file(&store.stats_snapshot_path()).expect("read pre-quota snapshot");
         store
