@@ -8,11 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub type SinomoTestResult = Result<SinomoTestOutcome, SinomoTestError>;
 pub type SinomoTestFn = fn(&mut SinomoTestContext) -> SinomoTestResult;
+
+static NEXT_TEST_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Error)]
 pub enum SinomoTestError {
@@ -285,6 +288,7 @@ impl SinomoTestAuthoritativeClusterSnapshot {
 #[derive(Clone, Debug)]
 pub struct SinomoTestContext {
     data_dir: PathBuf,
+    run_id: String,
     parameters: BTreeMap<String, String>,
     live: bool,
     require_cluster: bool,
@@ -298,6 +302,7 @@ impl SinomoTestContext {
     pub fn new(data_dir: impl Into<PathBuf>) -> Self {
         Self {
             data_dir: data_dir.into(),
+            run_id: new_test_run_id(),
             parameters: BTreeMap::new(),
             live: false,
             require_cluster: false,
@@ -390,6 +395,15 @@ impl SinomoTestContext {
         &self.data_dir
     }
 
+    /// Stable, path-safe identity for this test invocation.
+    ///
+    /// A tagged suite reuses one context, so every case can create its own
+    /// subtree below the same temporary run namespace without sharing mutable
+    /// fixtures with another invocation or with product data.
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
     pub fn parameter(&self, key: &str) -> Option<&str> {
         self.parameters.get(key).map(String::as_str)
     }
@@ -447,6 +461,15 @@ impl SinomoTestContext {
     pub fn take_diagnostics(&mut self) -> serde_json::Value {
         serde_json::Value::Object(std::mem::take(&mut self.diagnostics))
     }
+}
+
+fn new_test_run_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_TEST_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{:x}-{sequence:x}", std::process::id())
 }
 
 #[derive(Default)]
@@ -581,6 +604,22 @@ mod tests {
 
         assert_eq!(report.status, SinomoTestStatus::Passed);
         assert_eq!(report.diagnostics["seen"], true);
+    }
+
+    #[test]
+    fn context_run_ids_are_stable_path_safe_and_unique() {
+        let first = SinomoTestContext::new("/tmp/sinomo-test");
+        let first_run_id = first.run_id().to_string();
+        let second = SinomoTestContext::new("/tmp/sinomo-test");
+
+        assert_eq!(first.run_id(), first_run_id);
+        assert_ne!(first.run_id(), second.run_id());
+        assert!(
+            first
+                .run_id()
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        );
     }
 
     #[test]

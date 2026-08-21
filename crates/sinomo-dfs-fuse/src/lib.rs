@@ -753,6 +753,48 @@ mod tests {
     #[cfg(all(unix, feature = "fuse"))]
     #[test]
     #[ignore = "requires an executable FUSE helper and a usable /dev/fuse"]
+    fn owner_only_mount_can_remove_dfs_native_root_owned_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = sinomo_testdir::TestDir::new("sinomo-fuse-owner-projection");
+        let mount_point = root.join("mount");
+        let data_dir = root.join("data");
+        let mut opened = sinomo_runtime::dfs::open_mounted_sifs_service(Some(data_dir.clone()))
+            .expect("open standalone SIFS service");
+        opened
+            .service
+            .posix_mkdir_all("/service-created")
+            .expect("create DFS-native directory");
+        assert_eq!(
+            opened
+                .service
+                .posix_stat("/service-created")
+                .expect("stat durable DFS-native directory")
+                .uid,
+            0,
+            "the regression fixture must use DFS-native neutral ownership"
+        );
+        drop(opened);
+
+        let handle =
+            mount_sifs_background(DfsFuseMountOptions::new(&mount_point).with_data_dir(data_dir))
+                .expect("background SIFS mount");
+        let mounted_directory = handle.mount_root().join("service-created");
+        let metadata = std::fs::metadata(&mounted_directory).expect("stat mounted directory");
+        // SAFETY: `geteuid` and `getegid` have no preconditions.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.gid(), gid);
+
+        std::fs::remove_dir(&mounted_directory)
+            .expect("mount owner removes a DFS-native root-owned directory");
+        assert!(!mounted_directory.exists());
+        handle.shutdown().expect("shutdown owner-only mount");
+    }
+
+    #[cfg(all(unix, feature = "fuse"))]
+    #[test]
+    #[ignore = "requires an executable FUSE helper and a usable /dev/fuse"]
     fn dead_fuse_worker_is_unmounted_and_removed() {
         let root = sinomo_testdir::TestDir::new("sinomo-fuse-dead-worker-cleanup");
         let mount_point = root.join("mount");

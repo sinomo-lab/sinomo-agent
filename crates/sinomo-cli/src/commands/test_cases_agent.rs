@@ -44,6 +44,7 @@ const AGENT_CHANNEL_EXPECT_MAX_TIMEOUT_SECONDS: u64 = 300;
 const AGENT_CHANNEL_EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const AGENT_CHANNEL_PROBE_DEFAULT_TITLE: &str = "Cluster sync probe";
 const AGENT_CHANNEL_PROBE_SOURCE_ADAPTER: &str = "sinomo-cli.cluster-test";
+const AGENT_CHANNEL_TEST_RUNS_ROOT: &str = "/services/cluster-tests/runs";
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct BenchmarkCancelProbeRequest {
@@ -448,7 +449,8 @@ fn run_agent_channel_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         ))
     })?;
     let source_node_id = cluster_state.local_node_id.to_string();
-    let (_runtime, store) = open_daemon_agent_channel_store()?;
+    let test_root = agent_channel_probe_root(&channel_id);
+    let (_runtime, store) = open_daemon_agent_channel_store(&test_root)?;
     let (mut channel, channel_created) =
         match store.load_channel(&channel_id).map_err(|source| {
             SinomoTestError::failed(format!("cannot load agent channel {channel_id}: {source}"))
@@ -497,6 +499,7 @@ fn run_agent_channel_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 
     ctx.record("channel", &channel_parameter);
     ctx.record("channel_id", channel_id.to_string());
+    ctx.record("test_root", &test_root);
     ctx.record("channel_title", &channel.title);
     ctx.record("channel_created", channel_created);
     ctx.record("message_id", message.message_id.to_string());
@@ -516,11 +519,13 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let timeout = agent_channel_expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
-    let (_runtime, store) = open_daemon_agent_channel_store()?;
+    let test_root = agent_channel_probe_root(&channel_id);
+    let (_runtime, store) = open_daemon_agent_channel_store(&test_root)?;
     let mut last_state: String;
 
     ctx.record("channel", &channel_parameter);
     ctx.record("channel_id", channel_id.to_string());
+    ctx.record("test_root", &test_root);
     ctx.record("timeout_seconds", timeout.as_secs());
     loop {
         match store.load_recent_messages(&channel_id, usize::MAX) {
@@ -537,6 +542,7 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     ctx.record("matching_message_ids", &matching_message_ids);
                     ctx.record("matching_message_count", matching.len());
                     ctx.record("observed_message_count", messages.len());
+                    cleanup_agent_channel_probe(ctx, &store)?;
                     return Ok(SinomoTestOutcome::failed(format!(
                         "agent channel {channel_id} contains {} immutable records matching the expected message; expected exactly one",
                         matching.len()
@@ -550,6 +556,7 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                     ctx.record("message_source", &message.source);
                     ctx.record("observed_message_count", messages.len());
                     ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                    cleanup_agent_channel_probe(ctx, &store)?;
                     return Ok(SinomoTestOutcome::passed(format!(
                         "observed exactly one matching immutable channel record {} in {channel_id} after {}ms",
                         message.message_id,
@@ -571,6 +578,7 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             ctx.record("matching_message_count", 0);
             ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
             ctx.record("last_state", &last_state);
+            cleanup_agent_channel_probe(ctx, &store)?;
             return Ok(SinomoTestOutcome::failed(format!(
                 "agent channel {channel_id} did not converge to exactly one matching immutable record within {}s: {last_state}",
                 timeout.as_secs()
@@ -580,8 +588,22 @@ fn run_agent_channel_expect(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     }
 }
 
-fn open_daemon_agent_channel_store()
--> Result<(tokio::runtime::Runtime, SifsAgentChannelStore), SinomoTestError> {
+fn cleanup_agent_channel_probe(
+    ctx: &mut SinomoTestContext,
+    store: &SifsAgentChannelStore,
+) -> Result<(), SinomoTestError> {
+    store.delete_isolated_test_run().map_err(|detail| {
+        SinomoTestError::failed(format!(
+            "cannot remove isolated agent channel test run after expectation: {detail}"
+        ))
+    })?;
+    ctx.record("test_root_removed", true);
+    Ok(())
+}
+
+fn open_daemon_agent_channel_store(
+    test_root: &str,
+) -> Result<(tokio::runtime::Runtime, SifsAgentChannelStore), SinomoTestError> {
     let daemon_client = DaemonApiClient::connect().map_err(|source| {
         SinomoTestError::failed(format!(
             "cannot connect to the local daemon for agent channel storage: {source}"
@@ -594,9 +616,10 @@ fn open_daemon_agent_channel_store()
         .map_err(|source| {
             SinomoTestError::failed(format!("cannot create agent channel RPC runtime: {source}"))
         })?;
-    let store = SifsAgentChannelStore::open_daemon_on_runtime(
+    let store = SifsAgentChannelStore::open_daemon_on_runtime_at_root(
         daemon_client.address().to_string(),
         runtime.handle(),
+        test_root,
     )
     .map_err(|detail| {
         SinomoTestError::failed(format!(
@@ -604,6 +627,10 @@ fn open_daemon_agent_channel_store()
         ))
     })?;
     Ok((runtime, store))
+}
+
+fn agent_channel_probe_root(channel_id: &SessionId) -> String {
+    format!("{AGENT_CHANNEL_TEST_RUNS_ROOT}/{channel_id}/agent-channels")
 }
 
 fn parse_agent_channel_probe_id(raw: &str) -> Result<SessionId, SinomoTestError> {
@@ -891,6 +918,18 @@ mod tests {
             SessionId::from_legacy_named(label).expect("derived channel id")
         );
         assert!(parse_agent_channel_probe_id("invalid channel label").is_err());
+    }
+
+    #[test]
+    fn agent_channel_probe_root_is_isolated_from_product_channels() {
+        let channel_id = SessionId::generate();
+        let root = agent_channel_probe_root(&channel_id);
+
+        assert_eq!(
+            root,
+            format!("/services/cluster-tests/runs/{channel_id}/agent-channels")
+        );
+        assert!(!root.starts_with("/services/sinomo-agent/channels"));
     }
 
     #[test]

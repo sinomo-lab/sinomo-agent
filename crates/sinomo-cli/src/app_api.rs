@@ -82,6 +82,71 @@ const SIFS_BROWSER_READ_RETRY_BUDGET: Duration = Duration::from_secs(3);
 const SIFS_BROWSER_READ_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SIFS_BROWSER_READ_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
 
+fn sifs_agent_channel_dir_at(channels_root: &str, channel_id: &SessionId) -> String {
+    format!("{channels_root}/{}", channel_id.as_str())
+}
+
+fn sifs_agent_channel_history_projection_path_at(
+    channels_root: &str,
+    channel_id: &SessionId,
+) -> String {
+    format!(
+        "{}/metadata/history-current.json",
+        sifs_agent_channel_dir_at(channels_root, channel_id)
+    )
+}
+
+fn sifs_agent_channel_metadata_records_dir_at(
+    channels_root: &str,
+    channel_id: &SessionId,
+) -> String {
+    format!(
+        "{}/metadata/records",
+        sifs_agent_channel_dir_at(channels_root, channel_id)
+    )
+}
+
+fn sifs_agent_channel_metadata_record_path_at(
+    channels_root: &str,
+    channel_id: &SessionId,
+    record_id: &str,
+) -> String {
+    format!(
+        "{}/{}.json",
+        sifs_agent_channel_metadata_records_dir_at(channels_root, channel_id),
+        record_id
+    )
+}
+
+fn sifs_agent_channel_message_chunks_dir_at(channels_root: &str, channel_id: &SessionId) -> String {
+    format!(
+        "{}/messages",
+        sifs_agent_channel_dir_at(channels_root, channel_id)
+    )
+}
+
+fn sifs_agent_channel_message_records_dir_at(
+    channels_root: &str,
+    channel_id: &SessionId,
+) -> String {
+    format!(
+        "{}/records",
+        sifs_agent_channel_message_chunks_dir_at(channels_root, channel_id)
+    )
+}
+
+fn sifs_agent_channel_message_record_path_at(
+    channels_root: &str,
+    channel_id: &SessionId,
+    message_id: &TaskId,
+) -> String {
+    format!(
+        "{}/{}.json",
+        sifs_agent_channel_message_records_dir_at(channels_root, channel_id),
+        message_id.as_str()
+    )
+}
+
 /// Lightweight channel metadata for list views.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AgentChannelSummary {
@@ -1003,6 +1068,7 @@ fn filesystem_provider_node_ids(
 /// SIFS-backed channel store used by the app chat runtime.
 pub struct SifsAgentChannelStore {
     browser: SifsBrowser,
+    channels_root: String,
     #[cfg(test)]
     message_record_body_reads: std::sync::atomic::AtomicUsize,
 }
@@ -1026,6 +1092,19 @@ impl SifsAgentChannelStore {
         SifsBrowser::open_daemon_on_runtime(address, runtime).map(Self::from_browser)
     }
 
+    /// Open a daemon-backed channel store below an isolated SIFS root.
+    ///
+    /// Live probes use this to keep test channels out of the user-visible
+    /// production channel catalog.
+    pub fn open_daemon_on_runtime_at_root(
+        address: impl Into<String>,
+        runtime: &tokio::runtime::Handle,
+        channels_root: impl Into<String>,
+    ) -> Result<Self, String> {
+        let browser = SifsBrowser::open_daemon_on_runtime(address, runtime)?;
+        Self::from_browser_at_root(browser, channels_root)
+    }
+
     pub fn open_daemon_node_on_runtime(
         data_dir: SinomoDataDir,
         address: impl Into<String>,
@@ -1039,101 +1118,168 @@ impl SifsAgentChannelStore {
     pub fn from_browser(browser: SifsBrowser) -> Self {
         Self {
             browser,
+            channels_root: SIFS_AGENT_CHANNELS_ROOT.to_string(),
             #[cfg(test)]
             message_record_body_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn channel_dir(channel_id: &SessionId) -> String {
-        format!("{}/{}", SIFS_AGENT_CHANNELS_ROOT, channel_id.as_str())
+    pub fn from_browser_at_root(
+        browser: SifsBrowser,
+        channels_root: impl Into<String>,
+    ) -> Result<Self, String> {
+        let channels_root = channels_root.into();
+        let channels_root = channels_root.trim_end_matches('/');
+        if channels_root.is_empty()
+            || !channels_root.starts_with('/')
+            || channels_root.bytes().any(|byte| byte == 0)
+            || channels_root
+                .split('/')
+                .any(|part| matches!(part, "." | ".."))
+            || channels_root.split('/').skip(1).any(|part| part.is_empty())
+        {
+            return Err(format!(
+                "agent channel store root must be a normalized absolute SIFS path: {channels_root}"
+            ));
+        }
+        Ok(Self {
+            browser,
+            channels_root: channels_root.to_string(),
+            #[cfg(test)]
+            message_record_body_reads: std::sync::atomic::AtomicUsize::new(0),
+        })
     }
 
-    fn snapshot_path(channel_id: &SessionId) -> String {
-        format!("{}/snapshot.json", Self::channel_dir(channel_id))
+    /// Delete the complete temporary cluster-test run containing this store.
+    ///
+    /// The production channel root and arbitrary SIFS paths are rejected. This
+    /// lets a cross-node channel expectation clean up the write-side fixture
+    /// after it has proved convergence.
+    pub fn delete_isolated_test_run(&self) -> Result<(), String> {
+        const TEST_RUNS_ROOT: &str = "/services/cluster-tests/runs";
+        let suffix = self
+            .channels_root
+            .strip_prefix(&format!("{TEST_RUNS_ROOT}/"))
+            .ok_or_else(|| {
+                format!(
+                    "refusing to delete agent channel store outside {TEST_RUNS_ROOT}: {}",
+                    self.channels_root
+                )
+            })?;
+        let run_id = suffix
+            .split('/')
+            .next()
+            .filter(|part| !part.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "isolated agent channel store has no test run identity: {}",
+                    self.channels_root
+                )
+            })?;
+        let run_root = format!("{TEST_RUNS_ROOT}/{run_id}");
+
+        fn remove_tree(browser: &SifsBrowser, path: &str) -> Result<(), String> {
+            for entry in browser.list_if_exists(path)? {
+                if entry.is_dir && !entry.is_link {
+                    remove_tree(browser, &entry.path)?;
+                } else {
+                    browser.delete(&entry.path, false)?;
+                }
+            }
+            match browser.delete(path, true) {
+                Ok(()) => Ok(()),
+                Err(detail) if sifs_error_is_not_found(&detail) => Ok(()),
+                Err(detail) => Err(detail),
+            }
+        }
+
+        remove_tree(&self.browser, &run_root)
     }
 
-    fn metadata_records_dir(channel_id: &SessionId) -> String {
-        format!("{}/metadata/records", Self::channel_dir(channel_id))
+    fn channel_dir(&self, channel_id: &SessionId) -> String {
+        sifs_agent_channel_dir_at(&self.channels_root, channel_id)
     }
 
-    fn metadata_record_path(channel_id: &SessionId, record_id: &str) -> String {
-        format!(
-            "{}/{}.json",
-            Self::metadata_records_dir(channel_id),
-            record_id
-        )
+    fn snapshot_path(&self, channel_id: &SessionId) -> String {
+        format!("{}/snapshot.json", self.channel_dir(channel_id))
     }
 
-    fn history_metadata_projection_path(channel_id: &SessionId) -> String {
-        format!(
-            "{}/metadata/history-current.json",
-            Self::channel_dir(channel_id)
-        )
+    fn metadata_records_dir(&self, channel_id: &SessionId) -> String {
+        sifs_agent_channel_metadata_records_dir_at(&self.channels_root, channel_id)
     }
 
-    fn message_chunks_dir(channel_id: &SessionId) -> String {
-        format!("{}/messages", Self::channel_dir(channel_id))
+    fn metadata_record_path(&self, channel_id: &SessionId, record_id: &str) -> String {
+        sifs_agent_channel_metadata_record_path_at(&self.channels_root, channel_id, record_id)
+    }
+
+    fn history_metadata_projection_path(&self, channel_id: &SessionId) -> String {
+        sifs_agent_channel_history_projection_path_at(&self.channels_root, channel_id)
+    }
+
+    fn message_chunks_dir(&self, channel_id: &SessionId) -> String {
+        sifs_agent_channel_message_chunks_dir_at(&self.channels_root, channel_id)
     }
 
     #[cfg(test)]
-    fn message_index_path(channel_id: &SessionId) -> String {
-        format!("{}/index.json", Self::message_chunks_dir(channel_id))
+    fn message_index_path(&self, channel_id: &SessionId) -> String {
+        format!("{}/index.json", self.message_chunks_dir(channel_id))
     }
 
     #[cfg(test)]
-    fn message_chunk_path(channel_id: &SessionId, sequence: u64) -> String {
+    fn message_chunk_path(&self, channel_id: &SessionId, sequence: u64) -> String {
         let chunk = sequence.saturating_sub(1) / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
-        Self::message_chunk_path_by_index(channel_id, chunk)
+        self.message_chunk_path_by_index(channel_id, chunk)
     }
 
     #[cfg(test)]
-    fn message_chunk_path_by_index(channel_id: &SessionId, chunk: u64) -> String {
-        format!("{}/{chunk:08}.jsonl", Self::message_chunks_dir(channel_id))
+    fn message_chunk_path_by_index(&self, channel_id: &SessionId, chunk: u64) -> String {
+        format!("{}/{chunk:08}.jsonl", self.message_chunks_dir(channel_id))
     }
 
-    fn message_records_dir(channel_id: &SessionId) -> String {
-        format!("{}/records", Self::message_chunks_dir(channel_id))
+    fn message_records_dir(&self, channel_id: &SessionId) -> String {
+        sifs_agent_channel_message_records_dir_at(&self.channels_root, channel_id)
     }
 
-    fn message_record_path(channel_id: &SessionId, message_id: &TaskId) -> String {
-        format!(
-            "{}/{}.json",
-            Self::message_records_dir(channel_id),
-            message_id.as_str()
-        )
+    fn message_record_path(&self, channel_id: &SessionId, message_id: &TaskId) -> String {
+        sifs_agent_channel_message_record_path_at(&self.channels_root, channel_id, message_id)
     }
 
-    fn turn_chunks_dir(channel_id: &SessionId) -> String {
-        format!("{}/turns", Self::channel_dir(channel_id))
+    fn turn_chunks_dir(&self, channel_id: &SessionId) -> String {
+        format!("{}/turns", self.channel_dir(channel_id))
     }
 
     #[cfg(test)]
-    fn turn_index_path(channel_id: &SessionId) -> String {
-        format!("{}/index.json", Self::turn_chunks_dir(channel_id))
+    fn turn_index_path(&self, channel_id: &SessionId) -> String {
+        format!("{}/index.json", self.turn_chunks_dir(channel_id))
     }
 
     #[cfg(test)]
-    fn turn_chunk_path(channel_id: &SessionId, sequence: u64) -> String {
+    fn turn_chunk_path(&self, channel_id: &SessionId, sequence: u64) -> String {
         let chunk = sequence / SIFS_AGENT_CHANNEL_LOG_CHUNK_SIZE;
-        format!("{}/{chunk:08}.jsonl", Self::turn_chunks_dir(channel_id))
+        format!("{}/{chunk:08}.jsonl", self.turn_chunks_dir(channel_id))
     }
 
-    fn turn_records_dir(channel_id: &SessionId) -> String {
-        format!("{}/records", Self::turn_chunks_dir(channel_id))
+    fn turn_records_dir(&self, channel_id: &SessionId) -> String {
+        format!("{}/records", self.turn_chunks_dir(channel_id))
     }
 
-    fn turn_record_path(channel_id: &SessionId, turn_id: &TaskId) -> String {
+    fn turn_record_path(&self, channel_id: &SessionId, turn_id: &TaskId) -> String {
         format!(
             "{}/{}.json",
-            Self::turn_records_dir(channel_id),
+            self.turn_records_dir(channel_id),
             turn_id.as_str()
         )
     }
 
-    fn attachment_path(channel_id: &SessionId, attachment_id: &TaskId, file_name: &str) -> String {
+    fn attachment_path(
+        &self,
+        channel_id: &SessionId,
+        attachment_id: &TaskId,
+        file_name: &str,
+    ) -> String {
         format!(
             "{}/attachments/{}/{}",
-            Self::channel_dir(channel_id),
+            self.channel_dir(channel_id),
             attachment_id,
             safe_agent_channel_attachment_file_name(file_name)
         )
@@ -1218,7 +1364,7 @@ impl SifsAgentChannelStore {
         message: &AgentChannelMessage,
     ) -> Result<(), AgentChannelStoreError> {
         self.write_immutable_json(
-            &Self::message_record_path(channel_id, &message.message_id),
+            &self.message_record_path(channel_id, &message.message_id),
             message,
         )
     }
@@ -1228,7 +1374,7 @@ impl SifsAgentChannelStore {
         channel_id: &SessionId,
         message_id: &TaskId,
     ) -> Result<Option<AgentChannelMessage>, AgentChannelStoreError> {
-        let path = Self::message_record_path(channel_id, message_id);
+        let path = self.message_record_path(channel_id, message_id);
         let bytes = match self.browser.read_file(&path) {
             Ok(bytes) => bytes,
             Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
@@ -1255,7 +1401,7 @@ impl SifsAgentChannelStore {
         channel_id: &SessionId,
         turn: &AgentChannelTurn,
     ) -> Result<(), AgentChannelStoreError> {
-        self.write_immutable_json(&Self::turn_record_path(channel_id, &turn.turn_id), turn)
+        self.write_immutable_json(&self.turn_record_path(channel_id, &turn.turn_id), turn)
     }
 
     fn append_metadata_record(
@@ -1276,7 +1422,7 @@ impl SifsAgentChannelStore {
             channel,
         };
         self.write_immutable_json(
-            &Self::metadata_record_path(&record.channel.channel_id, &record_id),
+            &self.metadata_record_path(&record.channel.channel_id, &record_id),
             &record,
         )?;
         Ok(record)
@@ -1289,7 +1435,7 @@ impl SifsAgentChannelStore {
     ) -> Result<(), AgentChannelStoreError> {
         const STABLE_FOLD_ATTEMPTS: usize = 3;
 
-        let records_dir = Self::metadata_records_dir(channel_id);
+        let records_dir = self.metadata_records_dir(channel_id);
         for _ in 0..STABLE_FOLD_ATTEMPTS {
             let before = self
                 .browser
@@ -1368,7 +1514,7 @@ impl SifsAgentChannelStore {
             // fail validation. It can never stamp this fold as covering the
             // newer record, even if this cache write wins the race.
             return self.write_materialized_cache(
-                &Self::history_metadata_projection_path(channel_id),
+                &self.history_metadata_projection_path(channel_id),
                 &bytes,
             );
         }
@@ -1418,7 +1564,7 @@ impl SifsAgentChannelStore {
         for (path, result) in self
             .browser
             .read_files(paths)
-            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?
+            .map_err(|detail| channel_store_io(&self.channels_root, detail))?
         {
             let Some(bytes) = channel_optional_bulk_read_bytes(&path, result)? else {
                 continue;
@@ -1477,9 +1623,9 @@ impl SifsAgentChannelStore {
     ) -> Result<Vec<AgentChannelMessage>, AgentChannelStoreError> {
         // Legacy indexes were mutable caches and could lag concurrent writes.
         // Enumerate the actual JSONL chunks and immutable records instead.
-        let mut messages = self.load_legacy_json_lines(&Self::message_chunks_dir(channel_id))?;
+        let mut messages = self.load_legacy_json_lines(&self.message_chunks_dir(channel_id))?;
         let record_paths =
-            self.paths_in_dir_with_suffix(&Self::message_records_dir(channel_id), ".json")?;
+            self.paths_in_dir_with_suffix(&self.message_records_dir(channel_id), ".json")?;
         messages.extend(
             self.load_message_record_documents(&record_paths)?
                 .into_iter()
@@ -1492,9 +1638,9 @@ impl SifsAgentChannelStore {
         &self,
         channel_id: &SessionId,
     ) -> Result<Vec<AgentChannelTurn>, AgentChannelStoreError> {
-        let mut turns = self.load_legacy_json_lines(&Self::turn_chunks_dir(channel_id))?;
+        let mut turns = self.load_legacy_json_lines(&self.turn_chunks_dir(channel_id))?;
         let record_paths =
-            self.paths_in_dir_with_suffix(&Self::turn_records_dir(channel_id), ".json")?;
+            self.paths_in_dir_with_suffix(&self.turn_records_dir(channel_id), ".json")?;
         turns.extend(self.load_json_documents(&record_paths)?);
         canonicalize_channel_turns(turns)
     }
@@ -1555,7 +1701,7 @@ impl SifsAgentChannelStore {
         &self,
         channel_id: &SessionId,
     ) -> Result<Option<OwnedSifsAgentChannelSnapshot>, AgentChannelStoreError> {
-        let path = Self::snapshot_path(channel_id);
+        let path = self.snapshot_path(channel_id);
         let bytes = match self.browser.read_file(&path) {
             Ok(bytes) => bytes,
             Err(detail) if sifs_error_is_not_found(&detail) => return Ok(None),
@@ -1603,7 +1749,7 @@ impl SifsAgentChannelStore {
                 detail: source.to_string(),
             }
         })?;
-        self.write_materialized_cache(&Self::snapshot_path(&channel.channel_id), &bytes)
+        self.write_materialized_cache(&self.snapshot_path(&channel.channel_id), &bytes)
     }
 
     /// Resolve channel metadata from immutable state records. `snapshot.json`
@@ -1627,7 +1773,7 @@ impl SifsAgentChannelStore {
             })
             .unwrap_or_default();
         let record_paths =
-            self.paths_in_dir_with_suffix(&Self::metadata_records_dir(channel_id), ".json")?;
+            self.paths_in_dir_with_suffix(&self.metadata_records_dir(channel_id), ".json")?;
         let missing_paths = record_paths
             .into_iter()
             .filter(|path| {
@@ -1726,6 +1872,7 @@ impl SifsAgentChannelStore {
     ) -> Result<AgentChannelHistoryMetadataRead, AgentChannelStoreError> {
         Self::load_channel_metadata_for_history_from_vfs(
             history_vfs,
+            &self.channels_root,
             channel_id,
             max_items,
             max_bytes,
@@ -1734,6 +1881,7 @@ impl SifsAgentChannelStore {
 
     pub(crate) fn load_channel_metadata_for_history_from_vfs(
         history_vfs: &VfsHandle,
+        channels_root: &str,
         channel_id: &SessionId,
         max_items: usize,
         max_bytes: u64,
@@ -1743,7 +1891,8 @@ impl SifsAgentChannelStore {
         let mut scanned_items = 0usize;
         let mut scanned_bytes = 0u64;
         let omitted_records = 0usize;
-        let projection_path = Self::history_metadata_projection_path(channel_id);
+        let projection_path =
+            sifs_agent_channel_history_projection_path_at(channels_root, channel_id);
         let projection_metadata = match history_vfs.stat_beneath_no_links(&projection_path) {
             Ok(metadata) => Some(metadata),
             Err(VfsError::NotFound { .. }) => None,
@@ -1788,9 +1937,13 @@ impl SifsAgentChannelStore {
                 })
                 .flatten();
             if let Some(projection) = projection {
-                let records_dir = Self::metadata_records_dir(channel_id);
-                let source_record =
-                    Self::metadata_record_path(channel_id, &projection.source_record_id);
+                let records_dir =
+                    sifs_agent_channel_metadata_records_dir_at(channels_root, channel_id);
+                let source_record = sifs_agent_channel_metadata_record_path_at(
+                    channels_root,
+                    channel_id,
+                    &projection.source_record_id,
+                );
                 let current_records = history_vfs.stat_beneath_no_links(&records_dir);
                 let source_exists = history_vfs.stat_beneath_no_links(&source_record).is_ok();
                 let current_matches = current_records.is_ok_and(|metadata| {
@@ -1817,7 +1970,7 @@ impl SifsAgentChannelStore {
             // immutable metadata namespace. Fall back to the bounded fold;
             // never authorize from stale compact state.
         }
-        let records_dir = Self::metadata_records_dir(channel_id);
+        let records_dir = sifs_agent_channel_metadata_records_dir_at(channels_root, channel_id);
         let records_revision_before =
             channel_metadata_namespace_revision(history_vfs, &records_dir)?;
         let mut channel = None;
@@ -1977,9 +2130,9 @@ impl SifsAgentChannelStore {
         tail_limit: usize,
     ) -> Result<AgentChannelMessageReconciliation, AgentChannelStoreError> {
         let legacy_messages = self
-            .load_legacy_json_lines::<AgentChannelMessage>(&Self::message_chunks_dir(channel_id))?;
+            .load_legacy_json_lines::<AgentChannelMessage>(&self.message_chunks_dir(channel_id))?;
         let record_paths =
-            self.paths_in_dir_with_suffix(&Self::message_records_dir(channel_id), ".json")?;
+            self.paths_in_dir_with_suffix(&self.message_records_dir(channel_id), ".json")?;
         let missing_record_paths = record_paths
             .into_iter()
             .filter(|path| {
@@ -2166,6 +2319,7 @@ impl SifsAgentChannelStore {
     ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
         Self::load_immutable_message_record_page_with_observer(
             history_vfs,
+            &self.channels_root,
             channel_id,
             after,
             record_offset,
@@ -2189,6 +2343,7 @@ impl SifsAgentChannelStore {
     ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
         Self::load_immutable_message_record_page_with_observer(
             history_vfs,
+            SIFS_AGENT_CHANNELS_ROOT,
             channel_id,
             after,
             record_offset,
@@ -2201,6 +2356,7 @@ impl SifsAgentChannelStore {
     #[allow(clippy::too_many_arguments)]
     fn load_immutable_message_record_page_with_observer(
         history_vfs: &VfsHandle,
+        channels_root: &str,
         channel_id: &SessionId,
         after: Option<&VfsDirectoryCursor>,
         record_offset: usize,
@@ -2208,7 +2364,7 @@ impl SifsAgentChannelStore {
         max_serialized_bytes: u64,
         body_read_observer: &dyn Fn(),
     ) -> Result<AgentChannelImmutableMessageRecordPage, AgentChannelStoreError> {
-        let dir = Self::message_records_dir(channel_id);
+        let dir = sifs_agent_channel_message_records_dir_at(channels_root, channel_id);
         let page = history_vfs
             .list_page_beneath_no_links_if_exists(&dir, after, limit)
             .map_err(|source| channel_store_io(&dir, source.to_string()))?;
@@ -2304,6 +2460,7 @@ impl SifsAgentChannelStore {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_legacy_message_record_page_from_vfs(
         history_vfs: &VfsHandle,
+        channels_root: &str,
         channel_id: &SessionId,
         after: Option<&VfsDirectoryCursor>,
         expected_entry_name: Option<&str>,
@@ -2316,7 +2473,7 @@ impl SifsAgentChannelStore {
         limit: usize,
         max_serialized_bytes: u64,
     ) -> Result<AgentChannelLegacyMessageRecordPage, AgentChannelStoreError> {
-        let dir = Self::message_chunks_dir(channel_id);
+        let dir = sifs_agent_channel_message_chunks_dir_at(channels_root, channel_id);
         let page = history_vfs
             .list_page_beneath_no_links_if_exists(&dir, after, 1)
             .map_err(|source| channel_store_io(&dir, source.to_string()))?;
@@ -2494,7 +2651,11 @@ impl SifsAgentChannelStore {
                 if line.iter().all(u8::is_ascii_whitespace) {
                     omitted_records = omitted_records.saturating_add(1);
                 } else if let Ok(message) = serde_json::from_slice::<AgentChannelMessage>(line) {
-                    let immutable_path = Self::message_record_path(channel_id, &message.message_id);
+                    let immutable_path = sifs_agent_channel_message_record_path_at(
+                        channels_root,
+                        channel_id,
+                        &message.message_id,
+                    );
                     match history_vfs.stat_beneath_no_links(&immutable_path) {
                         Ok(_) => {}
                         Err(VfsError::NotFound { .. }) => {
@@ -2534,7 +2695,11 @@ impl SifsAgentChannelStore {
                     continue;
                 }
             };
-            let immutable_path = Self::message_record_path(channel_id, &message.message_id);
+            let immutable_path = sifs_agent_channel_message_record_path_at(
+                channels_root,
+                channel_id,
+                &message.message_id,
+            );
             match history_vfs.stat_beneath_no_links(&immutable_path) {
                 Ok(_) => continue,
                 Err(VfsError::NotFound { .. }) => {}
@@ -2616,8 +2781,8 @@ impl SifsAgentChannelStore {
     fn channel_ids_from_sifs(&self) -> Result<BTreeSet<SessionId>, AgentChannelStoreError> {
         let entries = self
             .browser
-            .list_if_exists(SIFS_AGENT_CHANNELS_ROOT)
-            .map_err(|detail| channel_store_io(SIFS_AGENT_CHANNELS_ROOT, detail))?;
+            .list_if_exists(&self.channels_root)
+            .map_err(|detail| channel_store_io(&self.channels_root, detail))?;
         Ok(entries
             .into_iter()
             .filter(|entry| entry.is_dir)
@@ -2741,7 +2906,7 @@ impl AgentChannelStore for SifsAgentChannelStore {
         file_name: &str,
         bytes: &[u8],
     ) -> Result<String, AgentChannelStoreError> {
-        let path = Self::attachment_path(channel_id, attachment_id, file_name);
+        let path = self.attachment_path(channel_id, attachment_id, file_name);
         self.write_file(&path, bytes)?;
         Ok(path)
     }
@@ -12037,6 +12202,72 @@ mod tests {
     }
 
     #[test]
+    fn sifs_channel_store_can_use_an_isolated_test_root() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-isolated-root");
+        let data_dir = SinomoDataDir::new(&root);
+        let isolated_root = "/services/cluster-tests/runs/test-run/agent-channels";
+        let isolated = SifsAgentChannelStore::from_browser_at_root(
+            SifsBrowser::open(&data_dir).expect("open isolated SIFS browser"),
+            isolated_root,
+        )
+        .expect("open isolated channel store");
+        let channel = AgentChannel::new_channel(SessionId::generate(), "Isolated test channel");
+
+        isolated
+            .save_channel(&channel)
+            .expect("save isolated channel");
+
+        let production = SifsAgentChannelStore::open(&data_dir).expect("open production store");
+        assert!(
+            production
+                .list_channel_summaries()
+                .expect("list production channels")
+                .is_empty(),
+            "isolated test channels must not enter the product channel catalog"
+        );
+        assert!(
+            SifsBrowser::open(&data_dir)
+                .expect("open verification browser")
+                .read_file(&format!(
+                    "{isolated_root}/{}/snapshot.json",
+                    channel.channel_id
+                ))
+                .is_ok()
+        );
+        isolated
+            .delete_isolated_test_run()
+            .expect("remove isolated test run");
+        assert!(
+            SifsBrowser::open(&data_dir)
+                .expect("open cleanup verification browser")
+                .stat("/services/cluster-tests/runs/test-run")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn sifs_channel_store_rejects_unsafe_roots() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-unsafe-root");
+        let data_dir = SinomoDataDir::new(&root);
+        for candidate in [
+            "",
+            "/",
+            "relative",
+            "//services/cluster-tests",
+            "/services/../sinomo-agent/channels",
+        ] {
+            assert!(
+                SifsAgentChannelStore::from_browser_at_root(
+                    SifsBrowser::open(&data_dir).expect("open SIFS browser"),
+                    candidate,
+                )
+                .is_err(),
+                "unsafe root should be rejected: {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sifs_channel_summaries_track_snapshot_metadata_without_index_cache() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-summaries");
         let data_dir = SinomoDataDir::new(&root);
@@ -12090,7 +12321,7 @@ mod tests {
         let channel_id = SessionId::generate();
         SifsBrowser::open(&data_dir)
             .expect("open SIFS")
-            .create_dir_all(&SifsAgentChannelStore::channel_dir(&channel_id))
+            .create_dir_all(&store.channel_dir(&channel_id))
             .expect("create partial channel dir");
 
         let summaries = store.list_channel_summaries().expect("list summaries");
@@ -12696,10 +12927,7 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
         let channel_id = SessionId::generate();
-        let malformed_path = format!(
-            "{}/malformed.json",
-            SifsAgentChannelStore::message_records_dir(&channel_id)
-        );
+        let malformed_path = format!("{}/malformed.json", store.message_records_dir(&channel_id));
         let malformed = b"{not valid channel message json";
         store
             .write_file(&malformed_path, malformed)
@@ -12758,7 +12986,7 @@ mod tests {
         );
         store
             .write_file(
-                &SifsAgentChannelStore::snapshot_path(&channel_id),
+                &store.snapshot_path(&channel_id),
                 b"private transcript sentinel; not valid snapshot JSON",
             )
             .expect("replace repairable snapshot with unreadable transcript fixture");
@@ -12821,9 +13049,7 @@ mod tests {
 
         let projection_bytes = store
             .browser
-            .read_file(&SifsAgentChannelStore::history_metadata_projection_path(
-                &channel_id,
-            ))
+            .read_file(&store.history_metadata_projection_path(&channel_id))
             .expect("read compact projection");
         let projection_text = String::from_utf8(projection_bytes).expect("projection text");
         assert!(!projection_text.contains("transcript body"));
@@ -13042,7 +13268,7 @@ mod tests {
 
         let snapshot_bytes = SifsBrowser::open(&data_dir)
             .expect("open SIFS")
-            .read_file(&SifsAgentChannelStore::snapshot_path(&channel_id))
+            .read_file(&store.snapshot_path(&channel_id))
             .expect("snapshot");
         let snapshot = serde_json::from_slice::<OwnedSifsAgentChannelSnapshot>(&snapshot_bytes)
             .expect("snapshot json");
@@ -13053,10 +13279,10 @@ mod tests {
 
         let first_record = SifsBrowser::open(&data_dir)
             .expect("open SIFS")
-            .read_file(&SifsAgentChannelStore::message_record_path(
-                &channel_id,
-                &first_message_id.expect("first message id"),
-            ))
+            .read_file(
+                &store
+                    .message_record_path(&channel_id, &first_message_id.expect("first message id")),
+            )
             .expect("first immutable message record");
         assert!(
             String::from_utf8_lossy(&first_record).contains("message 0"),
@@ -13065,22 +13291,19 @@ mod tests {
         let browser = SifsBrowser::open(&data_dir).expect("open SIFS");
         assert!(
             browser
-                .read_file(&SifsAgentChannelStore::message_index_path(&channel_id))
+                .read_file(&store.message_index_path(&channel_id))
                 .is_err(),
             "new message appends must not create a shared mutable index"
         );
         assert!(
             browser
-                .read_file(&SifsAgentChannelStore::turn_index_path(&channel_id))
+                .read_file(&store.turn_index_path(&channel_id))
                 .is_err(),
             "new turn appends must not create a shared mutable index"
         );
         assert!(
             browser
-                .read_file(&SifsAgentChannelStore::turn_record_path(
-                    &channel_id,
-                    &turn.turn_id,
-                ))
+                .read_file(&store.turn_record_path(&channel_id, &turn.turn_id))
                 .is_ok(),
             "turns should be stored as immutable records"
         );
@@ -13197,34 +13420,28 @@ mod tests {
 
         let browser = SifsBrowser::open(&data_dir).expect("open SIFS browser");
         browser
-            .create_dir_all(&SifsAgentChannelStore::message_chunks_dir(&channel_id))
+            .create_dir_all(&store.message_chunks_dir(&channel_id))
             .expect("create legacy message dir");
         let legacy_messages = json_lines(&[first.clone(), second.clone()]);
         browser
-            .write_file(
-                &SifsAgentChannelStore::message_chunk_path(&channel_id, 1),
-                &legacy_messages,
-            )
+            .write_file(&store.message_chunk_path(&channel_id, 1), &legacy_messages)
             .expect("write legacy message chunk");
         browser
             .write_file(
-                &SifsAgentChannelStore::message_index_path(&channel_id),
+                &store.message_index_path(&channel_id),
                 br#"{"schema_version":1,"entry_count":1,"updated_unix":0}"#,
             )
             .expect("write deliberately stale legacy message index");
         browser
-            .create_dir_all(&SifsAgentChannelStore::turn_chunks_dir(&channel_id))
+            .create_dir_all(&store.turn_chunks_dir(&channel_id))
             .expect("create legacy turn dir");
         let legacy_turns = json_lines(std::slice::from_ref(&legacy_turn));
         browser
-            .write_file(
-                &SifsAgentChannelStore::turn_chunk_path(&channel_id, 0),
-                &legacy_turns,
-            )
+            .write_file(&store.turn_chunk_path(&channel_id, 0), &legacy_turns)
             .expect("write legacy turn chunk");
         browser
             .write_file(
-                &SifsAgentChannelStore::turn_index_path(&channel_id),
+                &store.turn_index_path(&channel_id),
                 br#"{"schema_version":1,"entry_count":0,"updated_unix":0}"#,
             )
             .expect("write deliberately stale legacy turn index");
@@ -13272,7 +13489,7 @@ mod tests {
         );
         assert_eq!(
             browser
-                .read_file(&SifsAgentChannelStore::message_chunk_path(&channel_id, 1))
+                .read_file(&store.message_chunk_path(&channel_id, 1))
                 .expect("legacy chunk remains readable"),
             legacy_messages,
             "new appends must not rewrite legacy JSONL chunks"
@@ -13392,10 +13609,10 @@ mod tests {
         let right_turn = channel_turn(&channel_id, &right_message.message_id);
         let browser = SifsBrowser::open(&data_dir).expect("open setup browser");
         browser
-            .create_dir_all(&SifsAgentChannelStore::message_records_dir(&channel_id))
+            .create_dir_all(&setup.message_records_dir(&channel_id))
             .expect("create message records dir");
         browser
-            .create_dir_all(&SifsAgentChannelStore::turn_records_dir(&channel_id))
+            .create_dir_all(&setup.turn_records_dir(&channel_id))
             .expect("create turn records dir");
 
         let barrier = Arc::new(Barrier::new(3));

@@ -101,6 +101,126 @@ const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 const MAX_RECORDED_BULK_RETRY_REASONS: usize = 8;
 
+const DFS_TEST_NAMESPACE_ROOTS: [&str; 3] = [
+    "/cluster-tests/runs",
+    "/services/cluster-tests/runs",
+    "/users/cluster-tests/runs",
+];
+
+struct ScopedSifsTestNamespace {
+    browser: SifsBrowser,
+    roots: Vec<String>,
+}
+
+impl ScopedSifsTestNamespace {
+    fn open(
+        ctx: &SinomoTestContext,
+        roots: impl IntoIterator<Item = String>,
+    ) -> Result<Self, SinomoTestError> {
+        let roots = roots
+            .into_iter()
+            .map(|root| scoped_sifs_test_run_root(&root))
+            .collect::<Result<BTreeSet<_>, _>>()?
+            .into_iter()
+            .collect();
+        Ok(Self {
+            browser: open_local_daemon_sifs_browser(ctx)?,
+            roots,
+        })
+    }
+}
+
+impl Drop for ScopedSifsTestNamespace {
+    fn drop(&mut self) {
+        for root in self.roots.iter().rev() {
+            let _ = remove_scoped_sifs_test_tree(&self.browser, root);
+        }
+    }
+}
+
+fn scoped_dfs_test_base(ctx: &SinomoTestContext, case: &str) -> Result<String, SinomoTestError> {
+    let base = ctx
+        .parameter("base")
+        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
+        .trim_end_matches('/');
+    if !matches!(
+        base,
+        "/cluster-tests" | "/services/cluster-tests" | "/users/cluster-tests"
+    ) {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "base".to_string(),
+            detail: "must be one of /cluster-tests, /services/cluster-tests, or /users/cluster-tests; live tests create a temporary subtree below its runs directory"
+                .to_string(),
+        });
+    }
+    let path = format!("{base}/runs/{}/{case}", ctx.run_id());
+    validate_scoped_sifs_test_namespace(&path)?;
+    Ok(path)
+}
+
+fn validate_scoped_sifs_test_namespace(path: &str) -> Result<(), SinomoTestError> {
+    let normalized = path.trim_end_matches('/');
+    let path_safe = normalized.starts_with('/')
+        && !normalized.bytes().any(|byte| byte == 0)
+        && !normalized.split('/').any(|part| matches!(part, "." | ".."));
+    let scoped = DFS_TEST_NAMESPACE_ROOTS.iter().any(|root| {
+        normalized
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/') && suffix.len() > 1)
+    });
+    if path_safe && scoped {
+        Ok(())
+    } else {
+        Err(SinomoTestError::failed(format!(
+            "refusing to use unscoped SIFS test namespace `{path}`"
+        )))
+    }
+}
+
+fn scoped_sifs_test_run_root(path: &str) -> Result<String, SinomoTestError> {
+    validate_scoped_sifs_test_namespace(path)?;
+    let normalized = path.trim_end_matches('/');
+    for root in DFS_TEST_NAMESPACE_ROOTS {
+        if let Some(suffix) = normalized.strip_prefix(root) {
+            let run_id = suffix
+                .trim_start_matches('/')
+                .split('/')
+                .next()
+                .filter(|run_id| !run_id.is_empty())
+                .ok_or_else(|| {
+                    SinomoTestError::failed(format!(
+                        "SIFS test namespace `{path}` has no run identity"
+                    ))
+                })?;
+            return Ok(format!("{root}/{run_id}"));
+        }
+    }
+    Err(SinomoTestError::failed(format!(
+        "SIFS test namespace `{path}` has no recognized runs root"
+    )))
+}
+
+fn remove_scoped_sifs_test_tree(browser: &SifsBrowser, path: &str) -> Result<(), String> {
+    validate_scoped_sifs_test_namespace(path).map_err(|error| error.to_string())?;
+    for entry in browser.list_if_exists(path)? {
+        if entry.is_dir && !entry.is_link {
+            remove_scoped_sifs_test_tree(browser, &entry.path)?;
+        } else {
+            browser.delete(&entry.path, false)?;
+        }
+    }
+    match browser.delete(path, true) {
+        Ok(()) => Ok(()),
+        Err(error) if sifs_cleanup_error_is_not_found(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn sifs_cleanup_error_is_not_found(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("not found") || error.contains("does not exist") || error.contains("enoent")
+}
+
 pub fn register_dfs_cluster_test_cases(
     builder: SinomoTestRegistryBuilder,
 ) -> SinomoTestRegistryBuilder {
@@ -446,11 +566,8 @@ sinomo_runtime::test::sinomo_test_case! {
 }
 
 fn run_read_your_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let base = ctx
-        .parameter("base")
-        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
-        .trim_end_matches('/')
-        .to_string();
+    let base = scoped_dfs_test_base(ctx, "read-your-write")?;
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [base.clone()])?;
     let timeout = expect_timeout(ctx)?;
     let started = Instant::now();
     let deadline = started + timeout;
@@ -1030,7 +1147,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         if primary_node_id == &local_node_id {
             return None;
         }
-        let path_prefix = remote_shard_write_probe_prefix(&shard.shard_id.0)?;
+        let path_prefix = remote_shard_write_probe_prefix(&shard.shard_id.0, ctx.run_id())?;
         Some((
             shard.shard_id.0.clone(),
             primary_node_id.clone(),
@@ -1044,6 +1161,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     };
 
     let nonce = probe_nonce();
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [target.2.clone()])?;
     let path = format!("{}/remote-shard-{nonce}.txt", target.2);
     let deferred_path = format!("{}/remote-shard-deferred-{nonce}.txt", target.2);
     let app_path = format!("{}/remote-shard-app-{nonce}.txt", target.2);
@@ -1069,7 +1187,7 @@ fn run_remote_shard_write(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         let create_parent_deadline = next_phase_deadline();
         retry_bulk_mutation(
             create_parent_deadline,
-            || backend.create_dir_all_deferred_publish_until(target.2, create_parent_deadline),
+            || backend.create_dir_all_deferred_publish_until(&target.2, create_parent_deadline),
             || {
                 format!(
                     "cannot create SIFS directory {} through remote metadata shard",
@@ -1412,13 +1530,14 @@ fn namespace_prepare_codec_mismatch_detail(
     (!mismatches.is_empty()).then(|| mismatches.join(", "))
 }
 
-fn remote_shard_write_probe_prefix(shard_id: &str) -> Option<&'static str> {
-    match shard_id {
-        "root" => Some("/cluster-tests/remote-shard"),
-        "services" => Some("/services/cluster-tests/remote-shard"),
-        "users" => Some("/users/cluster-tests/remote-shard"),
-        _ => None,
-    }
+fn remote_shard_write_probe_prefix(shard_id: &str, run_id: &str) -> Option<String> {
+    let root = match shard_id {
+        "root" => "/cluster-tests/runs",
+        "services" => "/services/cluster-tests/runs",
+        "users" => "/users/cluster-tests/runs",
+        _ => return None,
+    };
+    Some(format!("{root}/{run_id}/remote-shard-write"))
 }
 
 fn remote_shard_write_phase_timeout(timeout: Duration) -> Duration {
@@ -1821,7 +1940,9 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map(|advertisement| advertisement.node_id.clone())
         .ok_or_else(|| SinomoTestError::failed("cannot choose distinct placement constraints"))?;
     let nonce = probe_nonce();
-    let base = format!("{DEFAULT_ROUNDTRIP_BASE}/placement-{nonce}");
+    let namespace = scoped_dfs_test_base(ctx, "placement-management")?;
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [namespace.clone()])?;
+    let base = format!("{namespace}/placement-{nonce}");
     let inherited_path = format!("{base}/inherited.txt");
     let override_path = format!("{base}/override.txt");
     let browser = open_local_daemon_sifs_browser(ctx)?;
@@ -2184,11 +2305,8 @@ fn routed_status_dirty_summaries(
 }
 
 fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let base = ctx
-        .parameter("base")
-        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
-        .trim_end_matches('/')
-        .to_string();
+    let base = scoped_dfs_test_base(ctx, "concurrent-file-race")?;
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [base.clone()])?;
     let timeout = expect_timeout(ctx)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let backend = open_backend(ctx)?;
@@ -2359,11 +2477,8 @@ fn file_race_payload_profile(read: &[u8]) -> String {
 }
 
 fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let base = ctx
-        .parameter("base")
-        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
-        .trim_end_matches('/')
-        .to_string();
+    let base = scoped_dfs_test_base(ctx, "concurrent-dir-race")?;
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [base.clone()])?;
     let timeout = expect_timeout(ctx)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let backend = open_backend(ctx)?;
@@ -2445,11 +2560,8 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn run_failover_current_read(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let base = ctx
-        .parameter("base")
-        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
-        .trim_end_matches('/')
-        .to_string();
+    let base = scoped_dfs_test_base(ctx, "failover-current-read")?;
+    let _namespace = ScopedSifsTestNamespace::open(ctx, [base.clone()])?;
     let timeout = expect_timeout(ctx)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let backend = open_backend(ctx)?;
@@ -3014,11 +3126,7 @@ fn record_dfs_invariant_replica_assessment(
 }
 
 fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let base = ctx
-        .parameter("base")
-        .unwrap_or(DEFAULT_ROUNDTRIP_BASE)
-        .trim_end_matches('/')
-        .to_string();
+    let base = scoped_dfs_test_base(ctx, "lightweight-latency")?;
     let iterations =
         optional_usize_parameter(ctx, "iterations", DEFAULT_LIGHTWEIGHT_LATENCY_ITERATIONS)?;
     let warmup_iterations = optional_usize_parameter(
@@ -3036,6 +3144,10 @@ fn run_lightweight_latency(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         .map(str::trim)
         .filter(|path| !path.is_empty())
         .map(str::to_string);
+    let _namespace = existing_file
+        .is_none()
+        .then(|| ScopedSifsTestNamespace::open(ctx, [base.clone()]))
+        .transpose()?;
     let max_p50_us = optional_usize_parameter(ctx, "max-p50-us", 0)? as u64;
     let max_p95_us = optional_usize_parameter(ctx, "max-p95-us", 0)? as u64;
     let max_max_us = optional_usize_parameter(ctx, "max-max-us", 0)? as u64;
@@ -5931,6 +6043,71 @@ mod tests {
         ClusterEndpointSource, ClusterMemberRecord, ClusterTransportKind,
     };
     use sinomo_runtime::node::ClusterId;
+
+    #[test]
+    fn self_contained_dfs_tests_use_unique_run_namespaces() {
+        let context = SinomoTestContext::new("unused");
+        let base =
+            scoped_dfs_test_base(&context, "read-your-write").expect("scoped test namespace");
+
+        assert_eq!(
+            base,
+            format!(
+                "/services/cluster-tests/runs/{}/read-your-write",
+                context.run_id()
+            )
+        );
+        assert_eq!(
+            scoped_sifs_test_run_root(&base).expect("run root"),
+            format!("/services/cluster-tests/runs/{}", context.run_id())
+        );
+        assert!(
+            scoped_dfs_test_base(
+                &context
+                    .clone()
+                    .with_parameter("base", "/services/sinomo-agent/channels"),
+                "read-your-write"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_shard_probe_paths_are_scoped_by_lane_and_run() {
+        assert_eq!(
+            remote_shard_write_probe_prefix("root", "run-1").as_deref(),
+            Some("/cluster-tests/runs/run-1/remote-shard-write")
+        );
+        assert_eq!(
+            remote_shard_write_probe_prefix("services", "run-1").as_deref(),
+            Some("/services/cluster-tests/runs/run-1/remote-shard-write")
+        );
+        assert_eq!(
+            remote_shard_write_probe_prefix("users", "run-1").as_deref(),
+            Some("/users/cluster-tests/runs/run-1/remote-shard-write")
+        );
+        assert!(remote_shard_write_probe_prefix("unknown", "run-1").is_none());
+    }
+
+    #[test]
+    fn scoped_sifs_test_cleanup_removes_only_the_run_tree() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-dfs-scoped-cleanup");
+        let data_dir = SinomoDataDir::new(&root);
+        let browser = SifsBrowser::open(&data_dir).expect("open local SIFS browser");
+        let run_root = "/services/cluster-tests/runs/unit-run";
+        let fixture = format!("{run_root}/case/fixture.txt");
+        browser
+            .create_dir_all(&format!("{run_root}/case"))
+            .expect("create test namespace");
+        browser
+            .write_file(&fixture, b"temporary")
+            .expect("write temporary fixture");
+
+        remove_scoped_sifs_test_tree(&browser, run_root).expect("remove test namespace");
+
+        assert!(browser.stat(run_root).is_err());
+        assert!(validate_scoped_sifs_test_namespace("/services/sinomo-agent/channels").is_err());
+    }
 
     #[test]
     fn lightweight_latency_limit_is_strictly_exclusive() {

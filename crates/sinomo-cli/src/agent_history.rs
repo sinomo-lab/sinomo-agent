@@ -268,6 +268,7 @@ impl SessionHistorySearchBackend for VfsAgentHistorySearchBackend {
                 let metadata_started_after_prior_scan = scanned.items > 0 || scanned.bytes > 0;
                 let metadata = SifsAgentChannelStore::load_channel_metadata_for_history_from_vfs(
                     &history_vfs,
+                    SIFS_AGENT_CHANNELS_ROOT,
                     &current_channel_id,
                     request.max_scanned_items.saturating_sub(scanned.items),
                     request.max_scanned_bytes.saturating_sub(scanned.bytes),
@@ -560,6 +561,7 @@ impl SessionHistorySearchBackend for VfsAgentHistorySearchBackend {
                     let metadata_after_read =
                         SifsAgentChannelStore::load_channel_metadata_for_history_from_vfs(
                             &history_vfs,
+                            SIFS_AGENT_CHANNELS_ROOT,
                             &current.channel_id,
                             request.max_scanned_items.saturating_sub(scanned.items),
                             request.max_scanned_bytes.saturating_sub(scanned.bytes),
@@ -1229,6 +1231,7 @@ fn load_channel_history_message_page(
         ChannelMessageSource::Legacy => {
             let page = SifsAgentChannelStore::load_legacy_message_record_page_from_vfs(
                 history_vfs,
+                SIFS_AGENT_CHANNELS_ROOT,
                 channel_id,
                 after,
                 expected_entry_name,

@@ -1529,6 +1529,25 @@ fn map_mount_error(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FusePresentedOwner {
+    uid: u32,
+    gid: u32,
+}
+
+impl FusePresentedOwner {
+    fn for_mount(allow_other: bool) -> Option<Self> {
+        if allow_other {
+            return None;
+        }
+        // SAFETY: `geteuid` and `getegid` have no preconditions and only read
+        // the effective credentials of this process, which owns the FUSE
+        // session.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        Some(Self { uid, gid })
+    }
+}
+
 #[derive(Debug)]
 struct SifsFuseFileSystem {
     dfs: Arc<Mutex<SifsService>>,
@@ -1538,6 +1557,7 @@ struct SifsFuseFileSystem {
     read_executor: FuseReadExecutor,
     state: Arc<Mutex<FuseState>>,
     read_only: bool,
+    presented_owner: Option<FusePresentedOwner>,
     attr_ttl: Duration,
     entry_ttl: Duration,
     write_replica_candidates: Vec<dfs::DfsNodeId>,
@@ -1562,6 +1582,7 @@ impl SifsFuseFileSystem {
             None => SinomoDataDir::from_env_or_home()
                 .map_err(|source| DfsFuseError::LocalData(source.to_string()))?,
         };
+        let presented_owner = FusePresentedOwner::for_mount(options.allow_other);
         let clustered = sinomo_runtime::network::ClusterPaths::new(&data_dir)
             .state
             .exists();
@@ -1703,6 +1724,7 @@ impl SifsFuseFileSystem {
             read_executor,
             state,
             read_only: options.read_only,
+            presented_owner,
             attr_ttl: options.attr_ttl,
             entry_ttl: options.entry_ttl,
             write_replica_candidates: replica_candidates,
@@ -1934,7 +1956,11 @@ impl SifsFuseFileSystem {
 
     fn reply_entry_for_path(&self, reply: ReplyEntry, path: String, stat: dfs::DfsStat) {
         match self.intern_entry(path, &stat.object_id) {
-            Ok(ino) => reply.entry(&self.entry_ttl, &file_attr(ino, &stat), Generation(0)),
+            Ok(ino) => reply.entry(
+                &self.entry_ttl,
+                &file_attr(ino, &stat, self.presented_owner),
+                Generation(0),
+            ),
             Err(errno) => reply.error_from_i32(errno),
         }
     }
@@ -2790,7 +2816,8 @@ impl Filesystem for SifsFuseFileSystem {
             match self.lock_state() {
                 Ok(state) => {
                     if let Some(stat) = state.visible_handle_stat(fh) {
-                        return reply.attr(&self.attr_ttl, &file_attr(ino, &stat));
+                        return reply
+                            .attr(&self.attr_ttl, &file_attr(ino, &stat, self.presented_owner));
                     }
                 }
                 Err(errno) => return reply.error_from_i32(errno),
@@ -2801,7 +2828,7 @@ impl Filesystem for SifsFuseFileSystem {
             Err(errno) => return reply.error_from_i32(errno),
         };
         match self.stat_path(&path, false) {
-            Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat)),
+            Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat, self.presented_owner)),
             Err(errno) => reply.error_from_i32(errno),
         }
     }
@@ -2899,7 +2926,7 @@ impl Filesystem for SifsFuseFileSystem {
             return reply.error_from_i32(errno);
         }
         match self.stat_path(&path, false) {
-            Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat)),
+            Ok(stat) => reply.attr(&self.attr_ttl, &file_attr(ino, &stat, self.presented_owner)),
             Err(errno) => reply.error_from_i32(errno),
         }
     }
@@ -3142,9 +3169,11 @@ impl Filesystem for SifsFuseFileSystem {
         match result {
             Ok(stat) => match self.lock_state() {
                 Ok(mut state) => match state.intern_alias_path(ino, link_path, &stat.object_id) {
-                    Ok(link_ino) => {
-                        reply.entry(&self.entry_ttl, &file_attr(link_ino, &stat), Generation(0))
-                    }
+                    Ok(link_ino) => reply.entry(
+                        &self.entry_ttl,
+                        &file_attr(link_ino, &stat, self.presented_owner),
+                        Generation(0),
+                    ),
                     Err(errno) => reply.error_from_i32(errno),
                 },
                 Err(errno) => reply.error_from_i32(errno),
@@ -3207,7 +3236,7 @@ impl Filesystem for SifsFuseFileSystem {
                     let fh = state.allocate_handle(path, stat.clone(), flags);
                     reply.created(
                         &self.entry_ttl,
-                        &file_attr(ino, &stat),
+                        &file_attr(ino, &stat, self.presented_owner),
                         Generation(0),
                         FileHandle(fh),
                         FopenFlags::empty(),
@@ -5089,8 +5118,20 @@ fn errno_for_unexpected_lock_outcome(outcome: &dfs::DfsAdvisoryLockOutcome) -> l
     }
 }
 
-fn file_attr(ino: u64, stat: &dfs::DfsStat) -> FileAttr {
+fn file_attr(
+    ino: u64,
+    stat: &dfs::DfsStat,
+    presented_owner: Option<FusePresentedOwner>,
+) -> FileAttr {
     let size = stat.size_bytes.unwrap_or(0);
+    // Owner-only FUSE sessions admit requests solely from the process that
+    // mounted the filesystem. DFS-native writers do not have a portable Unix
+    // identity and therefore use neutral durable ownership (0:0). Presenting
+    // that metadata verbatim would make the kernel's `default_permissions`
+    // reject the mount owner before FUSE can handle the request. Project an
+    // owner-only view to the mount process while preserving durable uid/gid
+    // for explicit multi-user (`allow_other`) mounts.
+    let (uid, gid) = presented_owner.map_or((stat.uid, stat.gid), |owner| (owner.uid, owner.gid));
     FileAttr {
         ino: INodeNo(ino),
         size,
@@ -5102,8 +5143,8 @@ fn file_attr(ino: u64, stat: &dfs::DfsStat) -> FileAttr {
         kind: file_type_for_kind(&stat.kind),
         perm: (stat.mode & 0o7777) as u16,
         nlink: stat.link_count.min(u32::MAX as u64) as u32,
-        uid: stat.uid,
-        gid: stat.gid,
+        uid,
+        gid,
         rdev: 0,
         blksize: DEFAULT_BLOCK_SIZE,
         flags: 0,
@@ -6731,6 +6772,11 @@ mod errno_tests {
 
         let direct_config = fuse_mount_config(&options, false);
         assert!(
+            direct_config
+                .mount_options
+                .contains(&MountOption::DefaultPermissions)
+        );
+        assert!(
             !direct_config
                 .mount_options
                 .contains(&MountOption::AutoUnmount)
@@ -6787,6 +6833,32 @@ mod errno_tests {
         assert_eq!(created_mode(libc::S_IFDIR | 0o777, 0o027), 0o750);
         assert_eq!(created_mode(0o700, 0), 0o700);
         assert_eq!(created_mode(0o6777, 0o7000), 0o6777);
+    }
+
+    #[test]
+    fn owner_only_file_attrs_project_the_mount_owner() {
+        let stat = test_stat("owner-only-object", "owner-only-version", "/services/chat");
+        let owner = FusePresentedOwner {
+            uid: 1_234,
+            gid: 5_678,
+        };
+
+        let attr = file_attr(7, &stat, Some(owner));
+
+        assert_eq!(attr.uid, owner.uid);
+        assert_eq!(attr.gid, owner.gid);
+        assert_eq!(attr.perm, 0o644);
+    }
+
+    #[test]
+    fn allow_other_file_attrs_preserve_durable_ownership() {
+        let stat = test_stat("shared-object", "shared-version", "/services/shared");
+
+        let attr = file_attr(8, &stat, None);
+
+        assert_eq!(attr.uid, stat.uid);
+        assert_eq!(attr.gid, stat.gid);
+        assert_eq!(attr.perm, 0o644);
     }
 
     #[test]

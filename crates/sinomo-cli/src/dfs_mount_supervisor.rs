@@ -12319,7 +12319,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_stage_identity_or_provider_change_blocks_without_altering_ownership() {
+    fn retained_stage_identity_change_blocks_but_provider_change_releases_old_pin() {
         let temp = TestDir::new("sifs-cloud-retained-replacement");
         let data_dir = SinomoDataDir::new(temp.path().join("data"));
         let mount_point = temp.path().join("mount");
@@ -12343,15 +12343,17 @@ mod tests {
 
         let mut other_module = recovery.module.clone();
         other_module.content_hash = "different-provider".to_string();
-        let error = recover_pending_cloud_unregister_from_staged_with(
+        let pending = recover_pending_cloud_unregister_from_staged_with(
             &data_dir,
             &windows_mount_config(&mount_point, "/root"),
             Some(&other_module),
         )
-        .expect_err("changed provider must remain blocked");
-        assert!(error.contains("registration replacement is blocked"));
+        .expect("changed provider should request release of the old pin")
+        .expect("old-provider release intent");
+        assert_eq!(pending, recovery);
         assert_eq!(
-            load_staged_cloud_registration_record(&data_dir).expect("retained stage"),
+            load_staged_cloud_registration_record(&data_dir)
+                .expect("release leaves retained ownership staged"),
             Some(retained)
         );
     }
