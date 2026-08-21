@@ -37,6 +37,7 @@ pub mod r1 {
     pub use sinomo_dfs as dfs;
     pub use sinomo_dfs_cloud_files_api as dfs_cloud_files_api;
     pub use sinomo_eval as eval;
+    pub use sinomo_installer as installer;
     pub use sinomo_memory_extension_api as memory_extension_api;
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
@@ -100,10 +101,10 @@ pub use r0::{core, object};
 #[cfg(feature = "sandbox")]
 pub use r1::sandbox_wasix_host;
 pub use r1::{
-    api, build, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events, kv,
-    local, memory_extension_api, module, module_api, modules, network, network_module, node,
-    observe, policy, registry, remote_management, rollout, sandbox, sandbox_simple,
-    sandbox_wasix_api, service, storage, supervision, test, vfs,
+    api, build, cli_registry, config, daemon, device, dfs, dfs_cloud_files_api, eval, events,
+    installer, kv, local, memory_extension_api, module, module_api, modules, network,
+    network_module, node, observe, policy, registry, remote_management, rollout, sandbox,
+    sandbox_simple, sandbox_wasix_api, service, storage, supervision, test, vfs,
 };
 
 #[cfg(test)]

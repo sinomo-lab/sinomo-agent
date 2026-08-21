@@ -1,8 +1,12 @@
 //! Rollout paths, source management, staged binary activation, and rollout policy.
 
+mod activation_network;
 mod artifact;
+mod binary_ingress;
+mod client_protocol;
 mod cluster_kv;
 mod controller;
+mod desired_reactor;
 mod error;
 mod module_load;
 mod native_install;
@@ -13,7 +17,9 @@ mod protocol;
 mod service;
 mod source;
 mod state;
+mod supervision;
 mod target;
+mod telemetry;
 
 pub type RolloutPlanId = sinomo_core::Id;
 pub type ScorecardId = sinomo_core::Id;
@@ -49,6 +55,9 @@ pub enum RolloutActivationStrategy {
     ShadowSupervised,
 }
 
+pub use activation_network::{
+    rollout_bind_covers_manual_tcp_endpoint, select_rollout_main_host, select_rollout_shadow_host,
+};
 pub use artifact::{
     ROLLOUT_RECOVERY_BACKUP_RETENTION, activate_staged_rollout_binary, binary_should_update,
     current_executable_path, current_executable_should_update, install_binary_atomically,
@@ -57,6 +66,13 @@ pub use artifact::{
     stage_rollout_bytes, stage_rollout_bytes_pair, stage_rollout_file, stage_rollout_file_pair,
     stage_rollout_file_with_retry,
 };
+pub use binary_ingress::{
+    PreparedRolloutBinaryActivation, RolloutBinaryIngress, complete_rollout_binary_activation,
+    receive_rollout_binary_ingress, rollout_upload_artifact_path, rollout_upload_manifest_path,
+    validate_rollout_binary_manifest, validate_rollout_upload_component,
+    verify_rollout_uploaded_artifact, verify_rollout_uploaded_module,
+};
+pub use client_protocol::{rollout_binary_rpc_call, rollout_build_rpc_call};
 pub use cluster_kv::{
     build_cluster_module_rollout_desired_put_op,
     build_cluster_module_rollout_reconciliation_put_op, build_cluster_module_rollout_status_put_op,
@@ -73,6 +89,18 @@ pub use controller::{
     canary_telemetry_scorecard_from_event_store, canary_telemetry_scorecard_from_events,
     rollout_telemetry_event_kind_is_relevant, shadow_telemetry_scorecard_from_event_store,
     shadow_telemetry_scorecard_from_events,
+};
+pub use desired_reactor::{
+    DESIRED_ROLLOUT_RETRY_MAX, DESIRED_ROLLOUT_RETRY_MIN,
+    DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS, DESIRED_ROLLOUT_WATCH_CANCEL_TIMEOUT,
+    DESIRED_ROLLOUT_WATCH_DRAIN_TIMEOUT, DESIRED_ROLLOUT_WATCH_DRAIN_WAIT,
+    DESIRED_ROLLOUT_WATCH_READ_TIMEOUT, DESIRED_ROLLOUT_WATCH_RECREATE_AFTER_FAILURES,
+    DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_ATTEMPT, DESIRED_ROLLOUT_WATCH_SHUTDOWN_CANCEL_BUDGET,
+    DESIRED_ROLLOUT_WATCH_START_TIMEOUT, DesiredRolloutReactor, DesiredRolloutReactorFuture,
+    DesiredRolloutReactorHost, DesiredRolloutReconcileDecision, DesiredRolloutReconcileWork,
+    desired_rollout_failure_is_hard, desired_rollout_reconcile_decision,
+    desired_rollout_stale_handoff_failure_status, desired_rollout_stale_handoff_should_be_recorded,
+    record_desired_rollout_stale_handoff_failure_if_needed, rollout_progress_status_is_stale,
 };
 pub use error::RolloutError;
 pub use module_load::{
@@ -113,7 +141,10 @@ pub use protocol::{
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
     unique_rollout_targets,
 };
-pub use service::{RolloutService, register_services};
+pub use service::{
+    HostedRolloutService, RolloutHostFuture, RolloutService, RolloutServiceHost,
+    register_host_services, register_services,
+};
 pub use source::{
     LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions,
     ManagedSourceStatus, RolloutBuiltArtifacts, RolloutStatusView, create_source_repo_bundle,
@@ -158,9 +189,19 @@ pub use state::{
     write_main_activation, write_object, write_rollout_runtime_state, write_rollout_status,
     write_rollout_telemetry_advance_state, write_rollout_telemetry_gate_config,
 };
+pub use supervision::{
+    PendingShadowCandidateExitAction, SHADOW_MAIN_RESTART_INITIAL_BACKOFF,
+    SHADOW_MAIN_RESTART_MAX_BACKOFF, SHADOW_MAIN_RESTART_STABLE_RESET_AFTER,
+    ShadowMainRestartBackoff, SupervisedMainExitDecision, classify_supervised_main_exit,
+    pending_rollout_probe_matches_candidate, pending_shadow_candidate_exit_action,
+    shadow_main_should_start,
+};
 pub use target::{
     cluster_rollout_should_use_remote_build, ensure_rollout_target_platform_matches_local,
     rollout_target_platform_matches_local,
+};
+pub use telemetry::{
+    RolloutTelemetryHost, RolloutTelemetryReactor, RolloutTelemetryReconcileOutcome,
 };
 
 pub fn rollout_module_id() -> sinomo_module::ModuleId {

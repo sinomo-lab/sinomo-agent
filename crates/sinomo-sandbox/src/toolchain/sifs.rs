@@ -26,6 +26,10 @@ impl<T: DfsMessageTransport> SifsSandboxToolchainStore<T> {
         self.dfs
     }
 
+    pub fn node_id(&self) -> &NodeId {
+        self.dfs.node_id()
+    }
+
     pub fn with_replica_candidates(mut self, replica_candidates: Vec<NodeId>) -> Self {
         let mut replica_candidates = replica_candidates;
         if !replica_candidates.contains(self.dfs.node_id()) {

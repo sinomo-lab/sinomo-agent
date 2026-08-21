@@ -1,13 +1,21 @@
 //! Module registry, routing, loader state, and native module host glue.
 
 mod cli;
+mod native_cancellation;
 mod native_host;
+mod native_staging;
+mod network_runtime;
+mod service;
 
 pub use cli::{
     ModuleCliCommandConfig, ModuleCliCommandHandler, ModuleNativeRustToggleTarget,
     ModuleWasixCliConfig, module_cli_command_handler,
 };
+pub use native_cancellation::*;
 pub use native_host::*;
+pub use native_staging::*;
+pub use network_runtime::*;
+pub use service::*;
 
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};

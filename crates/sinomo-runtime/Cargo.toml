@@ -29,6 +29,7 @@ sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-eval = { path = "../sinomo-eval" }
+sinomo-installer = { path = "../sinomo-installer" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-memory-extension-api = { path = "../sinomo-memory-extension-api" }

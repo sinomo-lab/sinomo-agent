@@ -30,6 +30,7 @@ default-members = [
     "crates/sinomo-evolution",
     "crates/sinomo-fusion",
     "crates/sinomo-gateway",
+    "crates/sinomo-installer",
     "crates/sinomo-kv",
     "crates/sinomo-lm",
     "crates/sinomo-local",

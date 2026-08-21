@@ -35,6 +35,7 @@ sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-registry = { path = "../sinomo-registry" }
 tokio = { workspace = true, features = ["rt"] }
+tracing.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

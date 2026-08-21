@@ -22,8 +22,11 @@ serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
+sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
+sysinfo.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tracing.workspace = true

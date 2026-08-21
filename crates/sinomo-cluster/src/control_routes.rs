@@ -101,6 +101,15 @@ pub fn cluster_control_rpc_route_policy(route: &str) -> Option<&'static ClusterC
         .find(|policy| policy.route == route)
 }
 
+/// Returns whether committing this route replaces the cluster identity held by
+/// boot-time daemon services and therefore requires a process restart.
+pub fn cluster_control_route_requires_runtime_restart(route: &str) -> bool {
+    matches!(
+        route,
+        CLUSTER_CONTROL_INIT_ROUTE | CLUSTER_CONTROL_JOIN_ROUTE | CLUSTER_CONTROL_LEAVE_ROUTE
+    )
+}
+
 /// Initialize a single-node cluster on the daemon's node.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClusterControlInitRequest {
@@ -408,6 +417,25 @@ cluster_control_rpc_codec!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_identity_changing_routes_require_runtime_restart() {
+        for route in [
+            CLUSTER_CONTROL_INIT_ROUTE,
+            CLUSTER_CONTROL_JOIN_ROUTE,
+            CLUSTER_CONTROL_LEAVE_ROUTE,
+        ] {
+            assert!(cluster_control_route_requires_runtime_restart(route));
+        }
+        for route in [
+            CLUSTER_CONTROL_INVITE_ROUTE,
+            CLUSTER_CONTROL_RENAME_ROUTE,
+            CLUSTER_CONTROL_ROLE_ROUTE,
+            CLUSTER_CONTROL_REMOVE_ROUTE,
+        ] {
+            assert!(!cluster_control_route_requires_runtime_restart(route));
+        }
+    }
 
     #[test]
     fn cluster_control_policy_table_covers_every_route() {

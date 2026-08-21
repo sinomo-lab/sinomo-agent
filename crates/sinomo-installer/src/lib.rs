@@ -1,9 +1,11 @@
-use crate::{
+//! Local runtime installation, managed-source deployment, and boot-entry orchestration.
+
+use sinomo_api::{daemon_probe_status_needs_restart_for_options, daemon_status_matches_options};
+use sinomo_core::local::SinomoDataDir;
+use sinomo_daemon::{
     DaemonError, DaemonPaths, DaemonRunOptions, DaemonStatus, daemon_connect_address,
-    daemon_probe_status_needs_restart_for_options, daemon_status_matches_options,
     probe_daemon_status, probe_daemon_status_at_address, send_daemon_shutdown_request,
 };
-use sinomo_core::local::SinomoDataDir;
 use sinomo_rollout::{
     SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SelfRolloutPaths,
     current_executable_should_update, deploy_managed_source_repo, discover_current_git_repo,
@@ -80,7 +82,7 @@ pub enum ManagedSourceRepoInstallStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InstalledDaemonStartStatus {
-    Started(crate::DaemonStatus),
+    Started(sinomo_daemon::DaemonStatus),
     ExitedBeforeReady { command: String, status: i32 },
     TimedOut { status_path: PathBuf, child_id: u32 },
 }
@@ -285,7 +287,7 @@ fn install_child_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg(windows)]
     {
         let mut command = command;
-        crate::prepare_noninteractive_command(&mut command);
+        sinomo_daemon::prepare_noninteractive_command(&mut command);
         command
     }
     #[cfg(not(windows))]
@@ -520,12 +522,12 @@ pub fn stop_daemon_if_running(
     timeout: Duration,
 ) -> Result<DaemonStopIfRunningStatus, DaemonError> {
     match probe_daemon_status(paths, timeout) {
-        crate::DaemonProbeStatus::Running(status) => {
+        sinomo_daemon::DaemonProbeStatus::Running(status) => {
             let _ = send_daemon_shutdown_request(&status.address, timeout)?;
             Ok(DaemonStopIfRunningStatus::StopRequested)
         }
-        crate::DaemonProbeStatus::Locked { .. } => Ok(DaemonStopIfRunningStatus::Locked),
-        crate::DaemonProbeStatus::NotRunning => Ok(DaemonStopIfRunningStatus::NotRunning),
+        sinomo_daemon::DaemonProbeStatus::Locked { .. } => Ok(DaemonStopIfRunningStatus::Locked),
+        sinomo_daemon::DaemonProbeStatus::NotRunning => Ok(DaemonStopIfRunningStatus::NotRunning),
     }
 }
 
@@ -536,13 +538,13 @@ pub fn stop_daemon_before_install(
 ) -> Result<DaemonStopBeforeInstallStatus, DaemonError> {
     let mut next_shutdown_nudge = Instant::now();
     let start = match probe_daemon_status(paths, probe_timeout) {
-        crate::DaemonProbeStatus::Running(status) => {
+        sinomo_daemon::DaemonProbeStatus::Running(status) => {
             match send_daemon_shutdown_request(&status.address, probe_timeout) {
                 Ok(_) => DaemonStopBeforeInstallStart::StopRequested,
                 Err(error) => {
                     if matches!(
                         probe_daemon_status(paths, probe_timeout),
-                        crate::DaemonProbeStatus::NotRunning
+                        sinomo_daemon::DaemonProbeStatus::NotRunning
                     ) {
                         return Ok(DaemonStopBeforeInstallStatus::NotRunning);
                     }
@@ -553,8 +555,8 @@ pub fn stop_daemon_before_install(
                 }
             }
         }
-        crate::DaemonProbeStatus::Locked { .. } => DaemonStopBeforeInstallStart::Locked,
-        crate::DaemonProbeStatus::NotRunning => {
+        sinomo_daemon::DaemonProbeStatus::Locked { .. } => DaemonStopBeforeInstallStart::Locked,
+        sinomo_daemon::DaemonProbeStatus::NotRunning => {
             return Ok(DaemonStopBeforeInstallStatus::NotRunning);
         }
     };
@@ -562,14 +564,17 @@ pub fn stop_daemon_before_install(
     let deadline = Instant::now() + wait_timeout;
     while Instant::now() < deadline {
         match probe_daemon_status(paths, probe_timeout) {
-            crate::DaemonProbeStatus::NotRunning => {
+            sinomo_daemon::DaemonProbeStatus::NotRunning => {
                 return Ok(DaemonStopBeforeInstallStatus::Stopped { start });
             }
-            crate::DaemonProbeStatus::Running(status) if Instant::now() >= next_shutdown_nudge => {
+            sinomo_daemon::DaemonProbeStatus::Running(status)
+                if Instant::now() >= next_shutdown_nudge =>
+            {
                 let _ = send_daemon_shutdown_request(&status.address, probe_timeout);
                 next_shutdown_nudge = Instant::now() + Duration::from_secs(1);
             }
-            crate::DaemonProbeStatus::Running(_) | crate::DaemonProbeStatus::Locked { .. } => {}
+            sinomo_daemon::DaemonProbeStatus::Running(_)
+            | sinomo_daemon::DaemonProbeStatus::Locked { .. } => {}
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -588,7 +593,7 @@ fn terminate_daemon_from_status_file(
     wait_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<Option<u32>, DaemonError> {
-    let Ok(status) = crate::read_daemon_status(paths) else {
+    let Ok(status) = sinomo_daemon::read_daemon_status(paths) else {
         return Ok(None);
     };
     #[cfg(not(unix))]
@@ -610,7 +615,7 @@ fn terminate_daemon_from_status_file(
         while Instant::now() < deadline {
             if matches!(
                 probe_daemon_status(paths, probe_timeout),
-                crate::DaemonProbeStatus::NotRunning
+                sinomo_daemon::DaemonProbeStatus::NotRunning
             ) {
                 return Ok(Some(status.pid));
             }
@@ -688,7 +693,7 @@ fn installed_daemon_command(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    crate::prepare_background_command(&mut command);
+    sinomo_daemon::prepare_background_command(&mut command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -805,12 +810,12 @@ fn probe_installed_daemon_start_status(
     timeout: Duration,
 ) -> Option<DaemonStatus> {
     match probe_daemon_status(paths, timeout) {
-        crate::DaemonProbeStatus::Running(status)
-        | crate::DaemonProbeStatus::Locked {
+        sinomo_daemon::DaemonProbeStatus::Running(status)
+        | sinomo_daemon::DaemonProbeStatus::Locked {
             status: Some(status),
         } => return Some(status),
-        crate::DaemonProbeStatus::Locked { status: None }
-        | crate::DaemonProbeStatus::NotRunning => {}
+        sinomo_daemon::DaemonProbeStatus::Locked { status: None }
+        | sinomo_daemon::DaemonProbeStatus::NotRunning => {}
     }
 
     let options = daemon_run_options_from_args(args)?;

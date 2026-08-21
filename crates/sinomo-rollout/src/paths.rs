@@ -269,23 +269,22 @@ pub fn discover_native_dylib_module_platform_policies(
 pub fn native_dylib_loader_state_is_host_compatible(
     state: &sinomo_module::NativeDylibModuleLoaderState,
 ) -> bool {
-    native_dylib_loader_state_is_host_compatible_for(
-        state,
-        env::consts::ARCH,
-        env::consts::OS,
-        env::consts::FAMILY,
-    )
+    sinomo_module::native_dylib_loader_state_is_host_compatible(state)
 }
 
+#[cfg(test)]
 fn native_dylib_loader_state_is_host_compatible_for(
     state: &sinomo_module::NativeDylibModuleLoaderState,
     current_arch: &str,
     current_os: &str,
     current_family: &str,
 ) -> bool {
-    let current_platform_triple = format!("{current_arch}-{current_os}-{current_family}");
-    state.platform_triple == current_platform_triple
-        && state.native_abi_version == sinomo_module::NATIVE_DYLIB_HOST_ABI_VERSION
+    sinomo_module::native_dylib_loader_state_is_host_compatible_for(
+        state,
+        current_arch,
+        current_os,
+        current_family,
+    )
 }
 
 fn native_dylib_policy_matches_state(

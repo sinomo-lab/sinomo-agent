@@ -1013,7 +1013,7 @@ fn dfs_metadata_shard_config_key_is_exact(key: &str) -> bool {
     )
 }
 
-fn dfs_metadata_shard_membership_handoff_key_is_exact(key: &str) -> bool {
+pub fn dfs_metadata_shard_membership_handoff_key_is_exact(key: &str) -> bool {
     let mut segments = key.split('/');
     matches!(
         (

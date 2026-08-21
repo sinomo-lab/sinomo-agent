@@ -2,6 +2,8 @@
 
 mod backend;
 mod cli;
+mod clustered_lifecycle;
+mod clustered_toolchain;
 mod commands;
 mod constants;
 mod events;
@@ -11,6 +13,7 @@ mod filesystem;
 mod harness;
 mod http;
 mod internal;
+mod lifecycle_recovery;
 mod model;
 mod module_artifact;
 mod paths;
@@ -19,10 +22,13 @@ mod runtime;
 mod service;
 mod storage;
 mod store;
+mod streaming;
 mod toolchain;
 
 pub use backend::*;
 pub use cli::*;
+pub use clustered_lifecycle::*;
+pub use clustered_toolchain::*;
 pub use commands::*;
 pub use constants::*;
 pub use events::*;
@@ -31,6 +37,7 @@ pub use fidelity::*;
 pub use filesystem::*;
 pub use harness::*;
 pub use http::*;
+pub use lifecycle_recovery::*;
 pub use model::*;
 pub use module_artifact::*;
 pub use paths::*;
@@ -51,4 +58,5 @@ pub use service::{
 };
 pub use storage::register_storage_paths;
 pub use store::*;
+pub use streaming::*;
 pub use toolchain::*;

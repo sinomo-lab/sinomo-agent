@@ -1,6 +1,8 @@
 //! Operational events, logs, and object-RPC observation service.
 
+mod builtin_metrics;
 mod cli;
+mod idle_stats;
 mod profile;
 mod prometheus;
 mod prometheus_server;
@@ -24,9 +26,13 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+pub use builtin_metrics::register_builtin_observe_metric_exporters;
 pub use cli::{
     ObserveCliCommandHandler, observe_cli_command_handler,
     observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,
+};
+pub use idle_stats::{
+    IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
 };
 pub use profile::{
     OBSERVE_CPU_PROFILE_ARTIFACT_ROOT, OBSERVE_CPU_PROFILE_DEFAULT_DURATION_SECONDS,

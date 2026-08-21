@@ -1,9 +1,8 @@
 use crate::{DaemonError, DaemonPaths, DaemonStatus};
 use sinomo_build::{
-    BUILD_ARTIFACT_ROUTE, BUILD_CAPABILITIES_ROUTE, BUILD_RPC_CATEGORY, BUILD_STATUS_ROUTE,
-    BUILD_SUBMIT_ROUTE, BuildArtifactRequest, BuildArtifactResponse, BuildCapabilitiesRequest,
-    BuildCapabilitiesResponse, BuildStatusRequest, BuildStatusResponse, BuildSubmitRequest,
-    BuildSubmitResponse,
+    BUILD_CAPABILITIES_ROUTE, BUILD_RPC_CATEGORY, BUILD_STATUS_ROUTE, BuildArtifactRequest,
+    BuildArtifactResponse, BuildCapabilitiesRequest, BuildCapabilitiesResponse, BuildStatusRequest,
+    BuildStatusResponse, BuildSubmitRequest, BuildSubmitResponse,
 };
 use sinomo_config::{
     CONFIG_CATALOG_ROUTE, CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE,
@@ -28,66 +27,18 @@ use sinomo_dfs::{
 };
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
-    ClusterRolloutNativeDylibModuleRequest, ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE,
-    ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
-    ROLLOUT_RPC_CATEGORY,
+    ClusterRolloutNativeDylibModuleRequest, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
+    ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE, ROLLOUT_RPC_CATEGORY,
 };
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-const DAEMON_RPC_SUCCESS_OBSERVATION_INTERVAL: Duration = Duration::from_secs(1);
-const DAEMON_RPC_SUCCESS_OBSERVATION_MAX_ENDPOINTS: usize = 256;
-const DAEMON_RPC_OBSERVATION_MAX_IN_FLIGHT: usize = 8;
 const DAEMON_BUILD_TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_BUILD_TRANSFER_OVERALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-static DAEMON_RPC_OBSERVATION_COORDINATOR: OnceLock<Arc<DaemonRpcObservationCoordinator>> =
-    OnceLock::new();
-
-struct DaemonRpcObservationCoordinator {
-    slots: Mutex<HashMap<String, Arc<DaemonRpcObservationSlot>>>,
-    task_permits: Arc<tokio::sync::Semaphore>,
-    sequence: AtomicU64,
-    max_slots: usize,
-    success_interval: Duration,
-}
-
-struct DaemonRpcObservationSlot {
-    // This is deliberately a blocking mutex: it is acquired only from a
-    // spawn_blocking closure and remains held until the durable write itself
-    // finishes. Cancelling an async waiter therefore cannot release ordering
-    // while a detached blocking write is still running.
-    write_gate: Mutex<()>,
-    state: Mutex<DaemonRpcObservationState>,
-}
-
-struct DaemonRpcObservationState {
-    active_operations: usize,
-    success_in_flight: Option<u64>,
-    failure_in_flight: Option<u64>,
-    latest_sequence: u64,
-    durable_sequence: u64,
-    last_started: Option<Instant>,
-    last_used: Instant,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DaemonRpcObservationKind {
-    Success,
-    Failure,
-}
-
-struct DaemonRpcObservationReservation {
-    slot: Arc<DaemonRpcObservationSlot>,
-    sequence: u64,
-    kind: DaemonRpcObservationKind,
-    _task_permit: tokio::sync::OwnedSemaphorePermit,
-}
+static DAEMON_RPC_OBSERVATION_COORDINATOR: OnceLock<
+    Arc<sinomo_core::cluster::ClusterCommandObservationCoordinator>,
+> = OnceLock::new();
 
 async fn materialize_daemon_client_value_response(
     result: ObjectRpcResult,
@@ -1435,23 +1386,21 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonObjectRpcAsyncHos
             .paths
             .as_ref()
             .and_then(|paths| crate::cluster::cluster_paths_from_daemon_paths(paths).ok());
-        let (connectivity_state, latency_ms, bypass_failure_grace, command_auth_denied) =
-            daemon_rpc_connectivity_observation(observation);
+        let success = observation.is_success();
+        let connectivity_observation =
+            sinomo_core::cluster::ClusterCommandConnectivityObservation::from_rpc(observation);
         let coordinator = Arc::clone(daemon_rpc_observation_coordinator());
         let sequence = coordinator.next_sequence();
-        let key = daemon_rpc_observation_key(paths.as_ref(), endpoint);
-        if observation.is_success() {
+        let key = sinomo_core::cluster::cluster_command_observation_key(paths.as_ref(), endpoint);
+        if success {
             if let Some(reservation) = coordinator.try_reserve_success(key, sequence) {
                 let endpoint = endpoint.clone();
                 let _observation_task = runtime.spawn_blocking(move || {
-                    publish_reserved_daemon_rpc_success_observation(reservation, move || {
+                    reservation.publish(move || {
                         remember_endpoint_command_connectivity(
                             paths,
                             endpoint,
-                            connectivity_state,
-                            latency_ms,
-                            bypass_failure_grace,
-                            command_auth_denied,
+                            connectivity_observation,
                         );
                     });
                 });
@@ -1465,14 +1414,11 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonObjectRpcAsyncHos
         Box::pin(async move {
             runtime
                 .spawn_blocking(move || {
-                    publish_reserved_daemon_rpc_failure_observation(reservation, move || {
+                    reservation.publish(move || {
                         remember_endpoint_command_connectivity(
                             paths,
                             endpoint,
-                            connectivity_state,
-                            latency_ms,
-                            bypass_failure_grace,
-                            command_auth_denied,
+                            connectivity_observation,
                         );
                     });
                 })
@@ -1532,249 +1478,11 @@ impl sinomo_core::network::ClusterObjectRpcAsyncHost for DaemonObjectRpcAsyncHos
     }
 }
 
-fn daemon_rpc_observation_key(
-    paths: Option<&sinomo_core::network::ClusterPaths>,
-    endpoint: &ClusterEndpointRecord,
-) -> String {
-    format!(
-        "{}:{}:{}",
-        paths
-            .map(|paths| paths.root.display().to_string())
-            .unwrap_or_else(|| "<default>".to_string()),
-        endpoint.node_id,
-        endpoint.endpoint_id
-    )
-}
-
-fn daemon_rpc_observation_coordinator() -> &'static Arc<DaemonRpcObservationCoordinator> {
+fn daemon_rpc_observation_coordinator()
+-> &'static Arc<sinomo_core::cluster::ClusterCommandObservationCoordinator> {
     DAEMON_RPC_OBSERVATION_COORDINATOR.get_or_init(|| {
-        Arc::new(DaemonRpcObservationCoordinator::new(
-            DAEMON_RPC_SUCCESS_OBSERVATION_MAX_ENDPOINTS,
-            DAEMON_RPC_OBSERVATION_MAX_IN_FLIGHT,
-            DAEMON_RPC_SUCCESS_OBSERVATION_INTERVAL,
-        ))
+        Arc::new(sinomo_core::cluster::ClusterCommandObservationCoordinator::production())
     })
-}
-
-fn lock_daemon_rpc_observation<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-impl DaemonRpcObservationCoordinator {
-    fn new(max_slots: usize, max_tasks_in_flight: usize, success_interval: Duration) -> Self {
-        assert!(
-            max_slots > 0,
-            "RPC observation slot capacity must be positive"
-        );
-        assert!(
-            max_tasks_in_flight > 0,
-            "RPC observation task capacity must be positive"
-        );
-        Self {
-            slots: Mutex::new(HashMap::new()),
-            task_permits: Arc::new(tokio::sync::Semaphore::new(max_tasks_in_flight)),
-            sequence: AtomicU64::new(0),
-            max_slots,
-            success_interval,
-        }
-    }
-
-    fn next_sequence(&self) -> u64 {
-        let previous = self
-            .sequence
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("RPC observation sequence exhausted");
-        previous + 1
-    }
-
-    fn try_reserve_success(
-        self: &Arc<Self>,
-        key: String,
-        sequence: u64,
-    ) -> Option<DaemonRpcObservationReservation> {
-        let permit = Arc::clone(&self.task_permits).try_acquire_owned().ok()?;
-        let now = Instant::now();
-        let mut slots = lock_daemon_rpc_observation(&self.slots);
-        let slot = if let Some(slot) = slots.get(&key) {
-            Arc::clone(slot)
-        } else {
-            if slots.len() >= self.max_slots && !Self::evict_oldest_inactive(&mut slots) {
-                return None;
-            }
-            let slot = Arc::new(DaemonRpcObservationSlot {
-                write_gate: Mutex::new(()),
-                state: Mutex::new(DaemonRpcObservationState {
-                    active_operations: 0,
-                    success_in_flight: None,
-                    failure_in_flight: None,
-                    latest_sequence: 0,
-                    durable_sequence: 0,
-                    last_started: None,
-                    last_used: now,
-                }),
-            });
-            slots.insert(key, Arc::clone(&slot));
-            slot
-        };
-        let mut state = lock_daemon_rpc_observation(&slot.state);
-        state.last_used = now;
-        if state.success_in_flight.is_some()
-            || sequence <= state.latest_sequence
-            || state
-                .last_started
-                .is_some_and(|last| now.saturating_duration_since(last) < self.success_interval)
-        {
-            return None;
-        }
-        state.active_operations = state
-            .active_operations
-            .checked_add(1)
-            .expect("RPC observation active-operation count overflowed");
-        state.success_in_flight = Some(sequence);
-        state.latest_sequence = sequence;
-        state.last_started = Some(now);
-        drop(state);
-        drop(slots);
-        Some(DaemonRpcObservationReservation {
-            slot,
-            sequence,
-            kind: DaemonRpcObservationKind::Success,
-            _task_permit: permit,
-        })
-    }
-
-    fn try_reserve_failure(
-        self: &Arc<Self>,
-        key: String,
-        sequence: u64,
-    ) -> Option<DaemonRpcObservationReservation> {
-        let permit = Arc::clone(&self.task_permits).try_acquire_owned().ok()?;
-        let now = Instant::now();
-        let mut slots = lock_daemon_rpc_observation(&self.slots);
-        let slot = if let Some(slot) = slots.get(&key) {
-            Arc::clone(slot)
-        } else {
-            if slots.len() >= self.max_slots && !Self::evict_oldest_inactive(&mut slots) {
-                return None;
-            }
-            let slot = Arc::new(DaemonRpcObservationSlot {
-                write_gate: Mutex::new(()),
-                state: Mutex::new(DaemonRpcObservationState {
-                    active_operations: 0,
-                    success_in_flight: None,
-                    failure_in_flight: None,
-                    latest_sequence: 0,
-                    durable_sequence: 0,
-                    last_started: None,
-                    last_used: now,
-                }),
-            });
-            slots.insert(key, Arc::clone(&slot));
-            slot
-        };
-        let mut state = lock_daemon_rpc_observation(&slot.state);
-        state.latest_sequence = state.latest_sequence.max(sequence);
-        state.last_used = now;
-        if state.failure_in_flight.is_some() {
-            return None;
-        }
-        state.active_operations = state
-            .active_operations
-            .checked_add(1)
-            .expect("RPC observation active-operation count overflowed");
-        state.failure_in_flight = Some(sequence);
-        drop(state);
-        drop(slots);
-        Some(DaemonRpcObservationReservation {
-            slot,
-            sequence,
-            kind: DaemonRpcObservationKind::Failure,
-            _task_permit: permit,
-        })
-    }
-
-    fn evict_oldest_inactive(slots: &mut HashMap<String, Arc<DaemonRpcObservationSlot>>) -> bool {
-        let candidate = slots
-            .iter()
-            .filter_map(|(key, slot)| {
-                let state = lock_daemon_rpc_observation(&slot.state);
-                (state.active_operations == 0).then(|| (key.clone(), state.last_used))
-            })
-            .min_by_key(|(_, last_used)| *last_used)
-            .map(|(key, _)| key);
-        candidate.is_some_and(|key| slots.remove(&key).is_some())
-    }
-}
-
-impl Drop for DaemonRpcObservationReservation {
-    fn drop(&mut self) {
-        let mut state = lock_daemon_rpc_observation(&self.slot.state);
-        if self.kind == DaemonRpcObservationKind::Success
-            && state.success_in_flight == Some(self.sequence)
-        {
-            state.success_in_flight = None;
-        }
-        if self.kind == DaemonRpcObservationKind::Failure
-            && state.failure_in_flight == Some(self.sequence)
-        {
-            state.failure_in_flight = None;
-        }
-        debug_assert!(state.active_operations > 0);
-        state.active_operations = state.active_operations.saturating_sub(1);
-        state.last_used = Instant::now();
-    }
-}
-
-fn publish_reserved_daemon_rpc_success_observation<Publish>(
-    reservation: DaemonRpcObservationReservation,
-    publish: Publish,
-) where
-    Publish: FnOnce(),
-{
-    let slot = Arc::clone(&reservation.slot);
-    {
-        let _write_guard = lock_daemon_rpc_observation(&slot.write_gate);
-        let should_publish = {
-            let state = lock_daemon_rpc_observation(&slot.state);
-            state.latest_sequence == reservation.sequence
-                && state.durable_sequence < reservation.sequence
-        };
-        if should_publish {
-            publish();
-            let mut state = lock_daemon_rpc_observation(&slot.state);
-            state.durable_sequence = state.durable_sequence.max(reservation.sequence);
-        }
-    }
-    drop(reservation);
-}
-
-fn publish_reserved_daemon_rpc_failure_observation<Publish>(
-    reservation: DaemonRpcObservationReservation,
-    publish: Publish,
-) where
-    Publish: FnOnce(),
-{
-    let slot = Arc::clone(&reservation.slot);
-    {
-        let _write_guard = lock_daemon_rpc_observation(&slot.write_gate);
-        let should_publish = {
-            let state = lock_daemon_rpc_observation(&slot.state);
-            state.durable_sequence < reservation.sequence
-        };
-        if should_publish {
-            publish();
-            let mut state = lock_daemon_rpc_observation(&slot.state);
-            state.durable_sequence = state.durable_sequence.max(reservation.sequence);
-            if state.latest_sequence == reservation.sequence {
-                state.last_started = None;
-            }
-        }
-    }
-    drop(reservation);
 }
 
 fn daemon_paths_from_cluster_paths(
@@ -1786,52 +1494,10 @@ fn daemon_paths_from_cluster_paths(
     )))
 }
 
-fn daemon_rpc_connectivity_observation(
-    observation: sinomo_core::network::ClusterObjectRpcObservation,
-) -> (
-    sinomo_core::network::ClusterConnectivityState,
-    Option<u64>,
-    bool,
-    bool,
-) {
-    if observation.is_success() {
-        (
-            sinomo_core::network::ClusterConnectivityState::Healthy,
-            observation.latency_ms(),
-            false,
-            false,
-        )
-    } else if observation.is_io_failure() {
-        (
-            sinomo_core::network::ClusterConnectivityState::Degraded,
-            None,
-            observation.is_hard_io_failure(),
-            false,
-        )
-    } else if observation.is_auth_denied() {
-        (
-            sinomo_core::network::ClusterConnectivityState::Unreachable,
-            None,
-            false,
-            true,
-        )
-    } else {
-        (
-            sinomo_core::network::ClusterConnectivityState::Degraded,
-            None,
-            false,
-            false,
-        )
-    }
-}
-
 fn remember_endpoint_command_connectivity(
     paths: Option<sinomo_core::network::ClusterPaths>,
     endpoint: ClusterEndpointRecord,
-    connectivity_state: sinomo_core::network::ClusterConnectivityState,
-    latency_ms: Option<u64>,
-    bypass_failure_grace: bool,
-    command_auth_denied: bool,
+    observation: sinomo_core::cluster::ClusterCommandConnectivityObservation,
 ) {
     let Some(paths) = paths.or_else(cluster_paths_from_env) else {
         return;
@@ -1839,29 +1505,7 @@ fn remember_endpoint_command_connectivity(
     let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&paths) else {
         return;
     };
-    if command_auth_denied {
-        crate::cluster::remember_cluster_endpoint_command_auth_denied(
-            &paths, &state, &endpoint, None,
-        );
-    } else if bypass_failure_grace {
-        crate::cluster::remember_cluster_endpoint_command_connectivity_without_failure_grace(
-            &paths,
-            &state,
-            &endpoint,
-            connectivity_state,
-            latency_ms,
-            None,
-        );
-    } else {
-        crate::cluster::remember_cluster_endpoint_command_connectivity(
-            &paths,
-            &state,
-            &endpoint,
-            connectivity_state,
-            latency_ms,
-            None,
-        );
-    }
+    let _ = observation.record_daemon_owned(&paths, &state, &endpoint);
 }
 
 pub(crate) fn cluster_paths_from_env() -> Option<sinomo_core::network::ClusterPaths> {
@@ -2648,7 +2292,7 @@ pub fn send_daemon_build_submit(
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
             DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
-        let call = build_submit_rpc_call(&request, source_bundle.as_deref())?;
+        let call = sinomo_build::build_submit_rpc_call(&request, source_bundle.as_deref())?;
         let result = if sinomo_core::network::is_loopback_connect_address(&address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -2686,7 +2330,7 @@ pub fn send_daemon_build_submit_to_endpoint(
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
             DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
-        let call = build_submit_rpc_call(&request, source_bundle.as_deref())?;
+        let call = sinomo_build::build_submit_rpc_call(&request, source_bundle.as_deref())?;
         let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -2733,39 +2377,12 @@ pub fn send_daemon_build_submit_to_target(
             .call_target(
                 &state,
                 &target_node_id,
-                build_submit_rpc_call(&request, source_bundle.as_deref())?,
+                sinomo_build::build_submit_rpc_call(&request, source_bundle.as_deref())?,
                 main_daemon_build_target_rpc_options(daemon_build_transfer_rpc_options()),
             )
             .await?;
         decode_build_submit_rpc_result(result).await
     })
-}
-
-fn build_submit_rpc_call(
-    request: &BuildSubmitRequest,
-    source_bundle: Option<&Path>,
-) -> Result<ObjectRpcCall, DaemonError> {
-    let body = match source_bundle {
-        Some(path) => {
-            let body = sinomo_core::network::ObjectRpcBodySource::file(path.to_path_buf())?;
-            if body.total_bytes() != Some(request.plan.source.bundle_bytes) {
-                return Err(DaemonError::Io {
-                    path: path.display().to_string(),
-                    detail: format!(
-                        "build source bundle size changed after planning: expected {}, found {}",
-                        request.plan.source.bundle_bytes,
-                        body.total_bytes().unwrap_or_default()
-                    ),
-                });
-            }
-            body
-        }
-        None => sinomo_core::network::ObjectRpcBodySource::default(),
-    };
-    let head = ObjectRpcRequest::encode_body(BUILD_SUBMIT_ROUTE, BUILD_RPC_CATEGORY, request)?
-        .with_operation_id(format!("build-submit:{}", request.plan.key.path_key()))
-        .with_response_retry_safe();
-    Ok(ObjectRpcCall::new(head, body))
 }
 
 async fn decode_build_submit_rpc_result(
@@ -2788,7 +2405,7 @@ pub fn send_daemon_build_artifact(
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
             DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
-        let call = build_artifact_rpc_call(&request)?;
+        let call = sinomo_build::build_artifact_rpc_call(&request)?;
         let result = if sinomo_core::network::is_loopback_connect_address(&address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -2808,7 +2425,9 @@ pub fn send_daemon_build_artifact(
                 .call_endpoint(&state, &endpoint, call, daemon_build_transfer_rpc_options())
                 .await?
         };
-        receive_build_artifact_rpc_result(result, &request, &destination_path).await
+        sinomo_build::receive_build_artifact_rpc_result(result, &request, &destination_path)
+            .await
+            .map_err(Into::into)
     })
 }
 
@@ -2826,7 +2445,7 @@ pub fn send_daemon_build_artifact_to_endpoint(
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         let mut host =
             DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
-        let call = build_artifact_rpc_call(&request)?;
+        let call = sinomo_build::build_artifact_rpc_call(&request)?;
         let result = if sinomo_core::network::is_loopback_connect_address(&endpoint.address) {
             let mut client = sinomo_core::network::ClusterObjectRpcClient::endpoint_only(&mut host);
             client
@@ -2850,7 +2469,9 @@ pub fn send_daemon_build_artifact_to_endpoint(
                 )
                 .await?
         };
-        receive_build_artifact_rpc_result(result, &request, &destination_path).await
+        sinomo_build::receive_build_artifact_rpc_result(result, &request, &destination_path)
+            .await
+            .map_err(Into::into)
     })
 }
 
@@ -2873,156 +2494,14 @@ pub fn send_daemon_build_artifact_to_target(
             .call_target(
                 &state,
                 &target_node_id,
-                build_artifact_rpc_call(&request)?,
+                sinomo_build::build_artifact_rpc_call(&request)?,
                 main_daemon_build_target_rpc_options(daemon_build_transfer_rpc_options()),
             )
             .await?;
-        receive_build_artifact_rpc_result(result, &request, &destination_path).await
+        sinomo_build::receive_build_artifact_rpc_result(result, &request, &destination_path)
+            .await
+            .map_err(Into::into)
     })
-}
-
-fn build_artifact_rpc_call(request: &BuildArtifactRequest) -> Result<ObjectRpcCall, DaemonError> {
-    let head = ObjectRpcRequest::encode_body(BUILD_ARTIFACT_ROUTE, BUILD_RPC_CATEGORY, request)?
-        .with_operation_id(format!(
-            "build-artifact:{}:{}",
-            request.build_key.path_key(),
-            request.artifact_id
-        ))
-        .with_response_retry_safe();
-    Ok(ObjectRpcCall::new(
-        head,
-        sinomo_core::network::ObjectRpcBodySource::default(),
-    ))
-}
-
-async fn receive_build_artifact_rpc_result(
-    result: ObjectRpcResult,
-    request: &BuildArtifactRequest,
-    destination_path: &Path,
-) -> Result<BuildArtifactResponse, DaemonError> {
-    let mut result = result;
-    let response: BuildArtifactResponse = result.response.decode_body()?;
-    if response.artifact.artifact_id != request.artifact_id {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "build artifact response id {} does not match requested {}",
-                response.artifact.artifact_id, request.artifact_id
-            ),
-        });
-    }
-    if response.artifact.provenance.build_key != request.build_key {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "build artifact response key {} does not match requested {}",
-                response.artifact.provenance.build_key, request.build_key
-            ),
-        });
-    }
-    let parent = destination_path.parent().ok_or_else(|| DaemonError::Io {
-        path: destination_path.display().to_string(),
-        detail: "artifact destination has no parent directory".to_string(),
-    })?;
-    tokio::fs::create_dir_all(parent)
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let partial = destination_path.with_extension(format!(
-        "partial-{}-{}",
-        std::process::id(),
-        time::OffsetDateTime::now_utc().unix_timestamp_nanos()
-    ));
-    let mut output = tokio::fs::File::create(&partial)
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: partial.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    let mut received = 0_u64;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let count = result
-            .body
-            .read(&mut buffer)
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: partial.display().to_string(),
-                detail: format!("receive build artifact body: {source}"),
-            })?;
-        if count == 0 {
-            break;
-        }
-        received = received.saturating_add(count as u64);
-        if received > response.artifact.size_bytes {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "build artifact {} exceeded declared size {}",
-                    response.artifact.artifact_id, response.artifact.size_bytes
-                ),
-            });
-        }
-        if let Err(source) = output.write_all(&buffer[..count]).await {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(DaemonError::Io {
-                path: partial.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    }
-    if let Err(source) = output.flush().await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(DaemonError::Io {
-            path: partial.display().to_string(),
-            detail: source.to_string(),
-        });
-    }
-    if let Err(source) = output.sync_all().await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(DaemonError::Io {
-            path: partial.display().to_string(),
-            detail: source.to_string(),
-        });
-    }
-    drop(output);
-    if let Err(error) = sinomo_build::verify_artifact_file(&response.artifact, &partial) {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(DaemonError::Parse {
-            detail: error.to_string(),
-        });
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if let Err(source) = tokio::fs::set_permissions(
-            &partial,
-            std::fs::Permissions::from_mode(response.artifact.mode),
-        )
-        .await
-        {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(DaemonError::Io {
-                path: partial.display().to_string(),
-                detail: source.to_string(),
-            });
-        }
-    }
-    if destination_path.exists() {
-        tokio::fs::remove_file(destination_path)
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: destination_path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-    }
-    tokio::fs::rename(&partial, destination_path)
-        .await
-        .map_err(|source| DaemonError::Io {
-            path: format!("{} -> {}", partial.display(), destination_path.display()),
-            detail: source.to_string(),
-        })?;
-    Ok(response)
 }
 
 pub fn send_daemon_rollout_binary(
@@ -3153,40 +2632,6 @@ where
     block_on_daemon_client_on_process_runtime(future)
 }
 
-fn rollout_binary_rpc_call(
-    request: &ClusterRolloutBinaryRequest,
-    attachment_path: &Path,
-) -> Result<sinomo_core::network::ObjectRpcCall, DaemonError> {
-    let artifact = request
-        .manifest
-        .artifact(&request.artifact_id)
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!(
-                "rollout manifest does not contain artifact {}",
-                request.artifact_id
-            ),
-        })?;
-    let attachment =
-        sinomo_core::network::ObjectRpcBodySource::file(attachment_path.to_path_buf())?;
-    if attachment.total_bytes() != Some(artifact.total_bytes) {
-        return Err(DaemonError::Io {
-            path: attachment_path.display().to_string(),
-            detail: format!(
-                "rollout artifact size changed after preparation: expected {}, found {}",
-                artifact.total_bytes,
-                attachment.total_bytes().unwrap_or_default()
-            ),
-        });
-    }
-    let head = ObjectRpcRequest::encode_body(ROLLOUT_BINARY_ROUTE, ROLLOUT_RPC_CATEGORY, request)?
-        .with_operation_id(format!(
-            "{}:{}",
-            request.manifest.upload_id, request.artifact_id
-        ))
-        .with_response_retry_safe();
-    Ok(sinomo_core::network::ObjectRpcCall::new(head, attachment))
-}
-
 async fn send_daemon_rollout_binary_to_address_async(
     data_dir: sinomo_core::local::SinomoDataDir,
     address: String,
@@ -3231,7 +2676,7 @@ async fn send_daemon_rollout_binary_to_loopback_async(
         .call_loopback(
             &data_dir,
             &address,
-            rollout_binary_rpc_call(&request, &attachment_path)?,
+            sinomo_rollout::rollout_binary_rpc_call(&request, &attachment_path)?,
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
@@ -3259,7 +2704,7 @@ async fn send_daemon_rollout_binary_to_endpoint_async(
         .call_endpoint(
             &state,
             &endpoint,
-            rollout_binary_rpc_call(&request, &attachment_path)?,
+            sinomo_rollout::rollout_binary_rpc_call(&request, &attachment_path)?,
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
@@ -3281,7 +2726,7 @@ async fn send_daemon_rollout_binary_to_target_async(
         .call_target(
             &state,
             &target_node_id,
-            rollout_binary_rpc_call(&request, &attachment_path)?,
+            sinomo_rollout::rollout_binary_rpc_call(&request, &attachment_path)?,
             sinomo_core::network::ClusterObjectRpcOptions::default(),
         )
         .await?;
@@ -3348,7 +2793,7 @@ pub fn send_daemon_rollout_build(
                 .call_loopback(
                     &data_dir,
                     &address,
-                    rollout_build_rpc_call(request)?,
+                    sinomo_rollout::rollout_build_rpc_call(request)?,
                     sinomo_core::network::ClusterObjectRpcOptions::default(),
                 )
                 .await?
@@ -3361,7 +2806,7 @@ pub fn send_daemon_rollout_build(
                 .call_endpoint(
                     &state,
                     &endpoint,
-                    rollout_build_rpc_call(request)?,
+                    sinomo_rollout::rollout_build_rpc_call(request)?,
                     sinomo_core::network::ClusterObjectRpcOptions::default(),
                 )
                 .await?
@@ -3388,7 +2833,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
                 .call_loopback(
                     &data_dir,
                     &endpoint.address,
-                    rollout_build_rpc_call(request)?,
+                    sinomo_rollout::rollout_build_rpc_call(request)?,
                     sinomo_core::network::ClusterObjectRpcOptions::default(),
                 )
                 .await?
@@ -3400,7 +2845,7 @@ pub fn send_daemon_rollout_build_to_endpoint(
                 .call_endpoint(
                     &state,
                     &endpoint,
-                    rollout_build_rpc_call(request)?,
+                    sinomo_rollout::rollout_build_rpc_call(request)?,
                     sinomo_core::network::ClusterObjectRpcOptions::default(),
                 )
                 .await?
@@ -3426,33 +2871,12 @@ pub fn send_daemon_rollout_build_to_target(
             .call_target(
                 &state,
                 &target_node_id,
-                rollout_build_rpc_call(request)?,
+                sinomo_rollout::rollout_build_rpc_call(request)?,
                 sinomo_core::network::ClusterObjectRpcOptions::default(),
             )
             .await?;
         decode_rollout_build_rpc_result(result).await
     })
-}
-
-fn rollout_build_rpc_call(
-    mut head_payload: ClusterRolloutBuildRequest,
-) -> Result<ObjectRpcCall, DaemonError> {
-    let operation_id = format!("rollout-build:{}", head_payload.requested_at);
-    let source_bundle = match head_payload.source_bundle.take() {
-        Some(source_bundle) if !source_bundle.is_empty() => source_bundle,
-        Some(source_bundle) => {
-            head_payload.source_bundle = Some(source_bundle);
-            Vec::new()
-        }
-        None => Vec::new(),
-    };
-    let head =
-        ObjectRpcRequest::encode_body(ROLLOUT_BUILD_ROUTE, ROLLOUT_RPC_CATEGORY, &head_payload)?
-            .with_operation_id(operation_id);
-    Ok(ObjectRpcCall::new(
-        head,
-        sinomo_core::network::ObjectRpcBodySource::bytes(source_bundle),
-    ))
 }
 
 async fn decode_rollout_build_rpc_result(
@@ -3915,38 +3339,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rollout_build_session_moves_source_bundle_out_of_request_head() {
-        let source_bundle = vec![7_u8; 32 * 1024];
-        let request = sinomo_rollout::ClusterRolloutBuildRequest {
-            source: "test-source".to_string(),
-            remote_repo: None,
-            source_bundle: Some(source_bundle.clone()),
-            source_head: Some("abc123".to_string()),
-            force_source_overwrite: false,
-            host: "127.0.0.1".to_string(),
-            host_override: None,
-            port: 21_353,
-            shadow_port: 21_354,
-            requested_at: "2026-07-12T00:00:00Z".to_string(),
-        };
-
-        let call = super::rollout_build_rpc_call(request).expect("RPC call");
-        let head: sinomo_rollout::ClusterRolloutBuildRequest =
-            call.request.decode_body().expect("request head");
-
-        assert_eq!(head.source_bundle, None);
-        assert_eq!(call.body.total_bytes(), Some(source_bundle.len() as u64));
-        assert_eq!(
-            call.request.operation_id(),
-            Some("rollout-build:2026-07-12T00:00:00Z")
-        );
-        assert!(
-            !call.request.is_response_retry_safe(),
-            "remote builds are not idempotent and must not retry after possible delivery"
-        );
-    }
-
     #[tokio::test]
     async fn rollout_owned_stream_survives_backpressure() {
         let root = sinomo_testdir::TestDir::new("sinomo-rollout-binary-loopback-session");
@@ -4141,207 +3533,6 @@ mod tests {
 
         assert!(error.to_string().contains("address is ambiguous"));
         assert!(error.to_string().contains("target a node or endpoint"));
-    }
-
-    #[test]
-    fn earlier_success_cannot_acquire_a_newer_generation_after_failure_registration() {
-        let coordinator = std::sync::Arc::new(super::DaemonRpcObservationCoordinator::new(
-            4,
-            4,
-            Duration::ZERO,
-        ));
-        let success_sequence = coordinator.next_sequence();
-        let failure_sequence = coordinator.next_sequence();
-        let failure = coordinator
-            .try_reserve_failure("endpoint".to_string(), failure_sequence)
-            .expect("failure reservation");
-
-        assert!(
-            coordinator
-                .try_reserve_success("endpoint".to_string(), success_sequence)
-                .is_none(),
-            "an earlier success delayed before slot reservation must remain stale"
-        );
-        let mut writes = Vec::new();
-        super::publish_reserved_daemon_rpc_failure_observation(failure, || writes.push("failure"));
-        assert_eq!(writes, ["failure"]);
-
-        let reserved_success = coordinator
-            .try_reserve_success("reserved".to_string(), coordinator.next_sequence())
-            .expect("reserved success");
-        let later_failure = coordinator
-            .try_reserve_failure("reserved".to_string(), coordinator.next_sequence())
-            .expect("later failure reservation");
-        super::publish_reserved_daemon_rpc_success_observation(reserved_success, || {
-            writes.push("stale success")
-        });
-        super::publish_reserved_daemon_rpc_failure_observation(later_failure, || {
-            writes.push("later failure")
-        });
-        assert_eq!(writes, ["failure", "later failure"]);
-    }
-
-    #[test]
-    fn cancelled_success_reservation_releases_slot_and_task_permit() {
-        let coordinator = std::sync::Arc::new(super::DaemonRpcObservationCoordinator::new(
-            1,
-            1,
-            Duration::ZERO,
-        ));
-        let reservation = coordinator
-            .try_reserve_success("endpoint".to_string(), coordinator.next_sequence())
-            .expect("success reservation");
-        let slot = {
-            let slots = super::lock_daemon_rpc_observation(&coordinator.slots);
-            std::sync::Arc::clone(slots.get("endpoint").expect("endpoint slot"))
-        };
-        {
-            let state = super::lock_daemon_rpc_observation(&slot.state);
-            assert_eq!(state.active_operations, 1);
-            assert_eq!(state.success_in_flight, Some(reservation.sequence));
-        }
-        assert_eq!(coordinator.task_permits.available_permits(), 0);
-
-        // Dropping the queued closure during runtime cancellation drops its
-        // reservation before the blocking operation starts.
-        drop(reservation);
-
-        {
-            let state = super::lock_daemon_rpc_observation(&slot.state);
-            assert_eq!(state.active_operations, 0);
-            assert_eq!(state.success_in_flight, None);
-        }
-        assert_eq!(coordinator.task_permits.available_permits(), 1);
-        let recovered = coordinator
-            .try_reserve_success("endpoint".to_string(), coordinator.next_sequence())
-            .expect("reservation after cancellation cleanup");
-        drop(recovered);
-    }
-
-    #[test]
-    fn active_observation_slots_are_never_evicted_at_capacity() {
-        let coordinator = std::sync::Arc::new(super::DaemonRpcObservationCoordinator::new(
-            2,
-            3,
-            Duration::ZERO,
-        ));
-        let first = coordinator
-            .try_reserve_success("first".to_string(), coordinator.next_sequence())
-            .expect("first reservation");
-        let second = coordinator
-            .try_reserve_success("second".to_string(), coordinator.next_sequence())
-            .expect("second reservation");
-
-        assert!(
-            coordinator
-                .try_reserve_success("third".to_string(), coordinator.next_sequence())
-                .is_none(),
-            "a new success must be dropped when every bounded slot is active"
-        );
-        {
-            let slots = super::lock_daemon_rpc_observation(&coordinator.slots);
-            assert_eq!(slots.len(), 2);
-            assert!(slots.contains_key("first"));
-            assert!(slots.contains_key("second"));
-        }
-
-        drop(first);
-        let third = coordinator
-            .try_reserve_success("third".to_string(), coordinator.next_sequence())
-            .expect("inactive slot should be evictable");
-        {
-            let slots = super::lock_daemon_rpc_observation(&coordinator.slots);
-            assert_eq!(slots.len(), 2);
-            assert!(!slots.contains_key("first"));
-            assert!(slots.contains_key("second"));
-            assert!(slots.contains_key("third"));
-        }
-        drop(second);
-        drop(third);
-    }
-
-    #[test]
-    fn success_observation_tasks_and_per_key_work_are_strictly_bounded() {
-        let coordinator = std::sync::Arc::new(super::DaemonRpcObservationCoordinator::new(
-            8,
-            2,
-            Duration::ZERO,
-        ));
-        let first = coordinator
-            .try_reserve_success("first".to_string(), coordinator.next_sequence())
-            .expect("first reservation");
-        assert!(
-            coordinator
-                .try_reserve_success("first".to_string(), coordinator.next_sequence())
-                .is_none(),
-            "only one success may be active for a key"
-        );
-        let second = coordinator
-            .try_reserve_success("second".to_string(), coordinator.next_sequence())
-            .expect("second reservation");
-        assert_eq!(coordinator.task_permits.available_permits(), 0);
-        assert!(
-            coordinator
-                .try_reserve_success("third".to_string(), coordinator.next_sequence())
-                .is_none(),
-            "the global task bound must reject excess detached writes"
-        );
-
-        drop(first);
-        assert_eq!(coordinator.task_permits.available_permits(), 1);
-        let third = coordinator
-            .try_reserve_success("third".to_string(), coordinator.next_sequence())
-            .expect("released task permit");
-        assert_eq!(coordinator.task_permits.available_permits(), 0);
-        drop(second);
-        drop(third);
-    }
-
-    #[test]
-    fn failure_observation_storm_is_globally_and_per_key_bounded() {
-        let coordinator = std::sync::Arc::new(super::DaemonRpcObservationCoordinator::new(
-            8,
-            2,
-            Duration::ZERO,
-        ));
-        let first = coordinator
-            .try_reserve_failure("first".to_string(), coordinator.next_sequence())
-            .expect("first failure");
-        assert!(
-            coordinator
-                .try_reserve_failure("first".to_string(), coordinator.next_sequence())
-                .is_none(),
-            "same-key failures must coalesce behind one durable write"
-        );
-        let second = coordinator
-            .try_reserve_failure("second".to_string(), coordinator.next_sequence())
-            .expect("second failure");
-        assert_eq!(coordinator.task_permits.available_permits(), 0);
-        for index in 0..1_024 {
-            assert!(
-                coordinator
-                    .try_reserve_failure(
-                        format!("failure-storm-{index}"),
-                        coordinator.next_sequence(),
-                    )
-                    .is_none(),
-                "the global task bound must reject an unbounded outage queue"
-            );
-        }
-        assert_eq!(
-            super::lock_daemon_rpc_observation(&coordinator.slots).len(),
-            2,
-            "rejected failures must not grow the endpoint registry"
-        );
-
-        drop(first);
-        let replacement = coordinator
-            .try_reserve_failure("first".to_string(), coordinator.next_sequence())
-            .expect("released per-key and global reservation");
-        assert_eq!(coordinator.task_permits.available_permits(), 0);
-        drop(second);
-        drop(replacement);
-        assert_eq!(coordinator.task_permits.available_permits(), 2);
     }
 
     #[test]
@@ -4783,57 +3974,6 @@ mod tests {
         assert_eq!(record.consecutive_failures, 0);
         assert!(record.last_success_at.is_some());
         assert!(record.failure_reason.is_none());
-    }
-
-    #[test]
-    fn daemon_rpc_connectivity_observation_classifies_endpoint_failures() {
-        let healthy = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterObjectRpcObservation::success(Some(5)),
-        );
-        assert_eq!(
-            healthy.0,
-            sinomo_core::network::ClusterConnectivityState::Healthy
-        );
-        assert_eq!(healthy.1, Some(5));
-
-        let degraded = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterObjectRpcObservation::io_failure(),
-        );
-
-        let hard_failure = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterObjectRpcObservation::hard_io_failure(),
-        );
-        assert_eq!(
-            hard_failure,
-            (
-                sinomo_core::network::ClusterConnectivityState::Degraded,
-                None,
-                true,
-                false
-            )
-        );
-        assert_eq!(
-            degraded,
-            (
-                sinomo_core::network::ClusterConnectivityState::Degraded,
-                None,
-                false,
-                false
-            )
-        );
-
-        let auth_denied = super::daemon_rpc_connectivity_observation(
-            sinomo_core::network::ClusterObjectRpcObservation::auth_denied(),
-        );
-        assert_eq!(
-            auth_denied,
-            (
-                sinomo_core::network::ClusterConnectivityState::Unreachable,
-                None,
-                false,
-                true
-            )
-        );
     }
 
     #[test]

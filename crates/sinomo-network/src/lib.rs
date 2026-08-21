@@ -206,6 +206,7 @@ pub use maintenance::{
     ClusterNetworkMaintenanceSchedule, cluster_connectivity_probe_max_endpoints_per_tick_for_role,
     cluster_local_node_role, cluster_network_discovery_interval_for_role,
     cluster_network_maintenance_due, cluster_network_maintenance_interval_due,
+    cluster_network_maintenance_interval_remaining,
     cluster_network_maintenance_last_timestamp_for_next_due,
     cluster_network_maintenance_next_due_duration, cluster_network_module_republish_sleep_duration,
     cluster_network_module_start_retry_sleep_duration, cluster_network_probe_interval_for_role,

@@ -1,0 +1,21 @@
+[package]
+name = "sinomo-installer"
+version.workspace = true
+description = "Sinomo local runtime installation and boot-entry orchestration"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+sinomo-api = { path = "../sinomo-api" }
+sinomo-core = { path = "../sinomo-core" }
+sinomo-daemon = { path = "../sinomo-daemon" }
+sinomo-rollout = { path = "../sinomo-rollout" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }
