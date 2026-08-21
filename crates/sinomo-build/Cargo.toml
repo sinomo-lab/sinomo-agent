@@ -20,6 +20,8 @@ thiserror.workspace = true
 time.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-module = { path = "../sinomo-module" }
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

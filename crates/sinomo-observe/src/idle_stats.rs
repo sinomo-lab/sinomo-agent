@@ -140,11 +140,11 @@ pub fn process_idle_stats() -> Option<Arc<IdleStatsAtomics>> {
     PROCESS_IDLE_STATS.get().cloned()
 }
 
-struct DaemonIoObserver {
+struct RuntimeIoObserver {
     stats: Arc<IdleStatsAtomics>,
 }
 
-impl sinomo_core::network::IoObserver for DaemonIoObserver {
+impl sinomo_core::network::IoObserver for RuntimeIoObserver {
     fn on_disk_read(&self, bytes: u64) {
         self.stats
             .disk_bytes_read
@@ -188,6 +188,6 @@ impl sinomo_core::network::IoObserver for DaemonIoObserver {
 }
 
 pub fn register_io_observer(stats: Arc<IdleStatsAtomics>) {
-    let observer = Arc::new(DaemonIoObserver { stats });
+    let observer = Arc::new(RuntimeIoObserver { stats });
     let _ = sinomo_core::network::set_io_observer(Some(observer));
 }

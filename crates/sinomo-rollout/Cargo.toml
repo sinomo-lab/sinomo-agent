@@ -14,12 +14,15 @@ ring = "r1"
 [dependencies]
 blake3.workspace = true
 fs2.workspace = true
+notify.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 toml.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }

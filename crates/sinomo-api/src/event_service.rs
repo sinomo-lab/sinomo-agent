@@ -1,3 +1,5 @@
+//! Hosted daemon event subscriptions and the in-process publication hub.
+
 use std::sync::Arc;
 
 use sinomo_core::network::{
@@ -6,7 +8,7 @@ use sinomo_core::network::{
 };
 use sinomo_core::service::{
     Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
-    ServiceRoute,
+    ServiceRegistryBuilder, ServiceRoute,
 };
 use sinomo_core::{
     Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass, RoutingMetadata,
@@ -26,27 +28,27 @@ const DAEMON_EVENT_STREAM_BODY_BUFFER_BYTES: usize = 64 * 1_024;
 const DAEMON_EVENT_MAX_FILTERS: usize = 64;
 
 #[derive(Clone, Debug)]
-pub(crate) struct DaemonEventHub {
+pub struct DaemonEventHub {
     sender: broadcast::Sender<EventEnvelope>,
 }
 
 impl DaemonEventHub {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (sender, _) = broadcast::channel(DAEMON_EVENT_BUFFER_CAPACITY);
         Self { sender }
     }
 
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
+    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.sender.subscribe()
     }
 
-    pub(crate) fn publish(&self, event: EventEnvelope) {
-        // No receivers is a normal state. The durable DFS namespace remains the
-        // source of truth and subscribers load a snapshot after the Ready frame.
+    pub fn publish(&self, event: EventEnvelope) {
+        // No receivers is a normal state. The durable DFS namespace remains
+        // the source of truth and subscribers load a snapshot after Ready.
         let _ = self.sender.send(event);
     }
 
-    pub(crate) fn publish_dfs_namespace_change(
+    pub fn publish_dfs_namespace_change(
         &self,
         origin_node_id: Id,
         operation: &str,
@@ -74,7 +76,7 @@ impl DaemonEventHub {
         );
     }
 
-    pub(crate) fn publish_dfs_placement_change(
+    pub fn publish_dfs_placement_change(
         &self,
         origin_node_id: Id,
         operation: &str,
@@ -103,13 +105,19 @@ impl DaemonEventHub {
     }
 }
 
-pub(crate) struct DaemonEventService {
+impl Default for DaemonEventHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct DaemonEventService {
     runtime: Option<tokio::runtime::Handle>,
     hub: Arc<DaemonEventHub>,
 }
 
 impl DaemonEventService {
-    pub(crate) fn new(runtime: Option<tokio::runtime::Handle>, hub: Arc<DaemonEventHub>) -> Self {
+    pub fn new(runtime: Option<tokio::runtime::Handle>, hub: Arc<DaemonEventHub>) -> Self {
         Self { runtime, hub }
     }
 }
@@ -192,6 +200,14 @@ impl Service for DaemonEventService {
             Ok(ServiceDisposition::Continue)
         })
     }
+}
+
+pub fn register_daemon_event_service(
+    builder: ServiceRegistryBuilder,
+    runtime: Option<tokio::runtime::Handle>,
+    hub: Arc<DaemonEventHub>,
+) -> ServiceRegistryBuilder {
+    builder.register(DaemonEventService::new(runtime, hub))
 }
 
 fn validate_filters(filters: &DaemonEventSubscribeRequest) -> Result<(), ServiceError> {

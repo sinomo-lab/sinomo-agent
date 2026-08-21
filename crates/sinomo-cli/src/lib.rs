@@ -117,26 +117,15 @@ use sinomo_runtime::daemon::{
     sign_daemon_rpc_request_from_data_dir,
 };
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonClusterRegistration, DaemonStopBeforeInstallStart,
-    DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus, InstallLayout,
-    InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus, ManagedSourceRepoInstallStatus,
-    activate_boot_entries as daemon_activate_boot_entries, current_shadow_daemon_options,
+    DaemonClusterProcess, DaemonClusterRegistration, current_shadow_daemon_options,
     daemon_advertised_endpoints_for_state_with_manual_config, daemon_cluster_registration,
-    daemon_cluster_status, daemon_install_start_installed_sinomo_daemon,
-    daemon_install_stop_daemon_before_install, daemon_install_stop_daemon_if_running,
-    daemon_main_binary_for_shadow_start, deactivate_boot_entries as daemon_deactivate_boot_entries,
-    default_boot_dir as daemon_default_boot_dir,
-    ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
+    daemon_cluster_status, daemon_main_binary_for_shadow_start,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
-    git_is_available as daemon_git_is_available,
     handle_deferred_shadow_rollout_completion as daemon_handle_deferred_shadow_rollout_completion,
-    install_managed_source_repo as daemon_install_managed_source_repo,
-    installed_daemon_paths as daemon_installed_daemon_paths, invite_introducers_from_daemon_status,
-    managed_source_git_status_lines as daemon_managed_source_git_status_lines,
-    prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
+    invite_introducers_from_daemon_status,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
-    read_daemon_endpoint_advertisement_config, remove_boot_entry as daemon_remove_boot_entry,
+    read_daemon_endpoint_advertisement_config,
     run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
@@ -167,21 +156,11 @@ use sinomo_runtime::daemon::{
     start_daemon_command_process as daemon_start_daemon_command_process,
     wait_for_local_shadow_rollout_completion as daemon_wait_for_local_shadow_rollout_completion,
     wait_for_main_daemon_health as daemon_wait_for_main_daemon_health,
-    write_install_boot_entries as daemon_write_install_boot_entries,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
     DaemonLock, handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
     handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
-};
-#[cfg(not(windows))]
-use sinomo_runtime::daemon::{
-    LocalBinSymlinkStatus, SystemctlUserOutcome,
-    ensure_local_bin_symlink as daemon_ensure_local_bin_symlink,
-};
-#[cfg(windows)]
-use sinomo_runtime::daemon::{
-    UserPathUpdate, ensure_windows_user_path_contains as daemon_ensure_windows_user_path_contains,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
@@ -214,6 +193,33 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::events::{EventId, JsonlEventStore, SessionId};
 use sinomo_runtime::events::{EventStore, InMemoryEventStore};
+use sinomo_runtime::installer::{
+    DaemonStopBeforeInstallStart, DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus,
+    InstallLayout, InstalledDaemonInstallPlanRequest, InstalledDaemonStartStatus,
+    ManagedSourceRepoInstallStatus, activate_boot_entries as daemon_activate_boot_entries,
+    deactivate_boot_entries as daemon_deactivate_boot_entries,
+    default_boot_dir as daemon_default_boot_dir,
+    ensure_install_layout_dirs as daemon_ensure_install_layout_dirs,
+    git_is_available as daemon_git_is_available,
+    install_managed_source_repo as daemon_install_managed_source_repo,
+    installed_daemon_paths as daemon_installed_daemon_paths,
+    managed_source_git_status_lines as daemon_managed_source_git_status_lines,
+    prepare_installed_daemon_install_plan as daemon_prepare_installed_daemon_install_plan,
+    remove_boot_entry as daemon_remove_boot_entry,
+    start_installed_sinomo_daemon as daemon_install_start_installed_sinomo_daemon,
+    stop_daemon_before_install as daemon_install_stop_daemon_before_install,
+    stop_daemon_if_running as daemon_install_stop_daemon_if_running,
+    write_install_boot_entries as daemon_write_install_boot_entries,
+};
+#[cfg(not(windows))]
+use sinomo_runtime::installer::{
+    LocalBinSymlinkStatus, SystemctlUserOutcome,
+    ensure_local_bin_symlink as daemon_ensure_local_bin_symlink,
+};
+#[cfg(windows)]
+use sinomo_runtime::installer::{
+    UserPathUpdate, ensure_windows_user_path_contains as daemon_ensure_windows_user_path_contains,
+};
 #[cfg(test)]
 use sinomo_runtime::kv::KvTxnResponse;
 use sinomo_runtime::kv::{

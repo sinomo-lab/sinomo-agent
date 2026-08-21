@@ -1,12 +1,11 @@
-//! Daemon host adapter for the cluster build service.
+//! Host-agnostic service implementation for the cluster build service.
 //!
 //! Building is deliberately isolated from rollout activation: this service
 //! receives immutable source, runs one queued compiler worker, and publishes a
 //! verified content-addressed artifact set. It never stages or installs a
 //! rollout binary and never mutates the native-module loader state.
 
-use crate::DaemonPaths;
-use sinomo_build::{
+use crate::{
     BUILD_ARTIFACT_ROUTE, BUILD_CAPABILITIES_ROUTE, BUILD_OBJECT_RPC_ROUTES, BUILD_PROTOCOL,
     BUILD_STATUS_ROUTE, BUILD_SUBMIT_ROUTE, BuildArtifactKind, BuildArtifactRequest,
     BuildArtifactResponse, BuildArtifactSetManifest, BuildCapabilitiesRequest,
@@ -25,12 +24,9 @@ use sinomo_core::service::{
     Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRoute,
 };
-use sinomo_rollout::{
-    ManagedSourceDeployOptions, SelfRolloutPaths, deploy_managed_source_bundle_with_options,
-    ensure_rollout_layout, prepare_rollout_build_source, rollout_source_head, source_heads_match,
-};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -43,24 +39,69 @@ const BUILD_TRANSFER_CONCURRENCY: usize = 4;
 const BUILD_TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const BUILD_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) struct DaemonBuildService {
-    host: Arc<BuildQueueHost>,
+pub struct BuildService {
+    hosts: Mutex<BTreeMap<PathBuf, Arc<BuildQueueHost>>>,
 }
 
-impl DaemonBuildService {
-    pub(crate) fn new(paths: &DaemonPaths) -> Self {
-        let data_dir = paths
-            .root
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| paths.root.clone());
+impl BuildService {
+    pub fn new() -> Self {
         Self {
-            host: BuildQueueHost::new(data_dir),
+            hosts: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Creates a build service and eagerly recovers the queue for one host.
+    /// Daemon-style long-lived hosts use this constructor so interrupted jobs
+    /// resume at startup rather than waiting for the first request.
+    pub fn for_data_dir(data_dir: impl AsRef<Path>) -> Self {
+        let data_dir_root = data_dir.as_ref().to_path_buf();
+        let mut hosts = BTreeMap::new();
+        hosts.insert(data_dir_root.clone(), BuildQueueHost::new(data_dir_root));
+        Self {
+            hosts: Mutex::new(hosts),
+        }
+    }
+
+    fn host_for(&self, data_dir: &SinomoDataDir) -> Arc<BuildQueueHost> {
+        let data_dir_root = data_dir.root().to_path_buf();
+        let mut hosts = self
+            .hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(
+            hosts
+                .entry(data_dir_root.clone())
+                .or_insert_with(|| BuildQueueHost::new(data_dir_root)),
+        )
     }
 }
 
-impl Service for DaemonBuildService {
+impl Default for BuildService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Registers the build module's runtime service with an arbitrary service host.
+///
+/// Keeping this composition edge in `sinomo-build` lets daemon, embedded, and
+/// test hosts use the same implementation without teaching the build module
+/// about daemon paths or process state.
+pub fn register_services(
+    builder: sinomo_core::service::ServiceRegistryBuilder,
+) -> sinomo_core::service::ServiceRegistryBuilder {
+    builder.register(BuildService::new())
+}
+
+/// Registers a build service that eagerly recovers one long-lived host's queue.
+pub fn register_services_for_data_dir(
+    builder: sinomo_core::service::ServiceRegistryBuilder,
+    data_dir: &Path,
+) -> sinomo_core::service::ServiceRegistryBuilder {
+    builder.register(BuildService::for_data_dir(data_dir))
+}
+
+impl Service for BuildService {
     fn name(&self) -> &'static str {
         "build"
     }
@@ -70,7 +111,7 @@ impl Service for DaemonBuildService {
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        let surfaces = sinomo_build::build_module_surfaces();
+        let surfaces = crate::build_module_surfaces();
         self.routes()
             .iter()
             .copied()
@@ -106,7 +147,7 @@ impl Service for DaemonBuildService {
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
-        let host = Arc::clone(&self.host);
+        let host = self.host_for(&ctx.data_dir);
         Box::pin(async move {
             match request.route.as_str() {
                 BUILD_CAPABILITIES_ROUTE => {
@@ -147,7 +188,7 @@ struct QueuedBuildJob {
 }
 
 struct BuildQueueHost {
-    paths: sinomo_build::BuildPaths,
+    paths: crate::BuildPaths,
     node_id: NodeId,
     target_capabilities: Vec<BuildTargetCapability>,
     cargo_program: PathBuf,
@@ -162,7 +203,7 @@ struct BuildQueueHost {
 
 impl BuildQueueHost {
     fn new(data_dir_root: PathBuf) -> Arc<Self> {
-        let paths = sinomo_build::BuildPaths::new(&data_dir_root);
+        let paths = crate::BuildPaths::new(&data_dir_root);
         let layout_error = paths.ensure_layout().err().map(|error| error.to_string());
         let cargo_program = std::env::var_os("CARGO")
             .map(PathBuf::from)
@@ -419,7 +460,7 @@ impl BuildQueueHost {
             .paths
             .cache_artifacts_dir(&request.build_key)
             .join(&artifact.relative_path);
-        sinomo_build::verify_artifact_file(&artifact, &path).map_err(build_service_error)?;
+        crate::verify_artifact_file(&artifact, &path).map_err(build_service_error)?;
         let body = ObjectRpcBodySource::file(path).map_err(ServiceError::from)?;
         Ok((BuildArtifactResponse { artifact }, body))
     }
@@ -470,7 +511,7 @@ impl BuildQueueHost {
             for artifact in &manifest.artifacts {
                 let path = artifact_root.join(&artifact.relative_path);
                 if verify_content {
-                    sinomo_build::verify_artifact_file(artifact, &path)
+                    crate::verify_artifact_file(artifact, &path)
                         .map_err(|error| error.to_string())?;
                 } else {
                     let size_bytes = fs::metadata(&path)
@@ -815,7 +856,7 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
 }
 
 fn execute_and_cache_build(
-    paths: &sinomo_build::BuildPaths,
+    paths: &crate::BuildPaths,
     job_id: &BuildJobId,
     plan: &BuildPlan,
     executor: &CargoBuildExecutor,
@@ -828,17 +869,9 @@ fn execute_and_cache_build(
     }
     fs::create_dir_all(&work_dir)
         .map_err(|source| format!("create build workspace {}: {source}", work_dir.display()))?;
-    let rollout_paths = SelfRolloutPaths::new(&work_dir);
-    ensure_rollout_layout(&rollout_paths).map_err(|error| error.to_string())?;
-    deploy_managed_source_bundle_with_options(
-        &rollout_paths,
-        &paths.job_source_bundle(job_id),
-        ManagedSourceDeployOptions::default(),
-    )
-    .map_err(|error| format!("import build source bundle: {error}"))?;
+    let source_repo = materialize_build_source_bundle(&work_dir, &paths.job_source_bundle(job_id))?;
     if let Some(expected_revision) = plan.source.revision.as_deref() {
-        let actual_revision = rollout_source_head(&rollout_paths.source_repo)
-            .map_err(|error| format!("inspect imported source revision: {error}"))?;
+        let actual_revision = build_source_head(&source_repo)?;
         if !source_heads_match(Some(actual_revision.as_str()), expected_revision) {
             return Err(format!(
                 "imported source revision {actual_revision} does not match requested {expected_revision}"
@@ -846,18 +879,17 @@ fn execute_and_cache_build(
         }
     }
 
-    verify_build_lockfile(&rollout_paths.source_repo, plan)?;
-    let _source_guards = prepare_rollout_build_source(&rollout_paths.source_repo)
-        .map_err(|error| format!("prepare build source workspace: {error}"))?;
-    validate_requested_outputs(cargo_program, &rollout_paths.source_repo, plan)?;
+    verify_build_lockfile(&source_repo, plan)?;
+    let _source_guard = BuildSourceLockfileGuard::capture(&source_repo)?;
+    validate_requested_outputs(cargo_program, &source_repo, plan)?;
     let artifact_root = paths.job_work_dir(job_id).join("artifact-set");
     let result = executor
-        .execute(&rollout_paths.source_repo, plan, &artifact_root)
+        .execute(&source_repo, plan, &artifact_root)
         .map_err(|error| format!("Cargo build failed: {error}"))?;
     let log = format!(
         "command: {}\nrepo: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
         result.command.display(),
-        rollout_paths.source_repo.display(),
+        source_repo.display(),
         result.stdout,
         result.stderr
     );
@@ -871,14 +903,161 @@ fn execute_and_cache_build(
     )
 }
 
+fn materialize_build_source_bundle(work_dir: &Path, bundle_path: &Path) -> Result<PathBuf, String> {
+    if !bundle_path.is_file() {
+        return Err(format!(
+            "build source bundle {} does not exist",
+            bundle_path.display()
+        ));
+    }
+    let source_repo = work_dir.join("source").join("sinomo");
+    let parent = source_repo
+        .parent()
+        .expect("build source repository has a parent");
+    fs::create_dir_all(parent)
+        .map_err(|source| format!("create build source root {}: {source}", parent.display()))?;
+    let output = crate::process::noninteractive_command("git")
+        .arg("clone")
+        .arg(bundle_path)
+        .arg(&source_repo)
+        .output()
+        .map_err(|source| {
+            format!(
+                "clone build source bundle {}: {source}",
+                bundle_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git clone {} {} failed with status {}: {}",
+            bundle_path.display(),
+            source_repo.display(),
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    remove_build_source_remotes(&source_repo)?;
+    Ok(source_repo)
+}
+
+fn remove_build_source_remotes(repo: &Path) -> Result<(), String> {
+    let output = crate::process::noninteractive_command("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("remote")
+        .output()
+        .map_err(|source| format!("list build source remotes in {}: {source}", repo.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git remote in {} failed with status {}: {}",
+            repo.display(),
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    for remote in String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+    {
+        let output = crate::process::noninteractive_command("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["remote", "remove", remote])
+            .output()
+            .map_err(|source| {
+                format!(
+                    "remove build source remote {remote} in {}: {source}",
+                    repo.display()
+                )
+            })?;
+        if !output.status.success() {
+            return Err(format!(
+                "git remote remove {remote} in {} failed with status {}: {}",
+                repo.display(),
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_source_head(repo: &Path) -> Result<String, String> {
+    let output = crate::process::noninteractive_command("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--short=8", "HEAD"])
+        .output()
+        .map_err(|source| {
+            format!(
+                "inspect build source revision in {}: {source}",
+                repo.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse in {} failed with status {}: {}",
+            repo.display(),
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
+}
+
+struct BuildSourceLockfileGuard {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl BuildSourceLockfileGuard {
+    fn capture(repo: &Path) -> Result<Self, String> {
+        let path = repo.join("Cargo.lock");
+        let original = match fs::read(&path) {
+            Ok(original) => Some(original),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(format!(
+                    "capture build source lockfile {}: {source}",
+                    path.display()
+                ));
+            }
+        };
+        Ok(Self { path, original })
+    }
+}
+
+impl Drop for BuildSourceLockfileGuard {
+    fn drop(&mut self) {
+        match self.original.take() {
+            Some(original) => {
+                let _ = fs::write(&self.path, original);
+            }
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            },
+        }
+    }
+}
+
 fn publish_artifact_cache(
-    paths: &sinomo_build::BuildPaths,
+    paths: &crate::BuildPaths,
     plan: &BuildPlan,
     artifact_root: &Path,
     manifest: BuildArtifactSetManifest,
     job_id: &BuildJobId,
 ) -> Result<BuildArtifactSetManifest, String> {
-    let bundle = sinomo_build::create_artifact_bundle(manifest, artifact_root)
+    let bundle = crate::create_artifact_bundle(manifest, artifact_root)
         .map_err(|error| error.to_string())?;
     let entry = paths.cache_entry_dir(&plan.key);
     let staging = entry.with_extension(format!("next-{job_id}"));
@@ -952,12 +1131,12 @@ fn build_executor_for_targets(
     rustc_program: &Path,
     configured_targets: Option<std::borrow::Cow<'_, str>>,
 ) -> Result<CargoBuildExecutor, String> {
-    let toolchain = sinomo_build::inspect_cargo_toolchain(&rustc_program, cargo_program)
+    let toolchain = crate::inspect_cargo_toolchain(&rustc_program, cargo_program)
         .map_err(|error| format!("inspect build toolchain: {error}"))?;
     let mut triples = vec![toolchain.host_target.clone()];
     if let Some(configured) = configured_targets {
         triples.extend(
-            sinomo_build::parse_rust_target_list(&configured)
+            crate::parse_rust_target_list(&configured)
                 .map_err(|error| format!("parse SINOMO_BUILD_TARGETS: {error}"))?,
         );
     }
@@ -966,7 +1145,7 @@ fn build_executor_for_targets(
     let capabilities = triples
         .into_iter()
         .map(|triple| {
-            let target = sinomo_build::inspect_rust_target(&rustc_program, &triple)
+            let target = crate::inspect_rust_target(&rustc_program, &triple)
                 .map_err(|error| format!("inspect configured build target {triple}: {error}"))?;
             Ok(BuildTargetCapability {
                 target,
@@ -986,7 +1165,7 @@ fn verify_build_lockfile(source_repo: &Path, plan: &BuildPlan) -> Result<(), Str
     let lockfile = source_repo.join("Cargo.lock");
     let bytes = fs::read(&lockfile)
         .map_err(|source| format!("read build lockfile {}: {source}", lockfile.display()))?;
-    let actual = sinomo_build::build_content_hash(&bytes);
+    let actual = crate::build_content_hash(&bytes);
     if actual != plan.input.lockfile_hash {
         return Err(format!(
             "build lockfile hash mismatch: expected {}, got {actual}",
@@ -1034,7 +1213,7 @@ fn validate_requested_outputs(
     if requested_module_ids.is_empty() {
         return Ok(());
     }
-    let mut discovered = sinomo_build::discover_native_dylib_outputs(
+    let mut discovered = crate::discover_native_dylib_outputs(
         cargo_program,
         source_repo,
         &plan.input.target,
@@ -1093,11 +1272,17 @@ fn build_io_error(path: &Path, source: std::io::Error) -> ServiceError {
 mod tests {
     use super::*;
 
+    fn assert_command_succeeded(output: std::process::Output, operation: &str) {
+        assert!(
+            output.status.success(),
+            "{operation} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn build_service_declares_stream_modes_and_worker_safe_concurrency() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-build-service-routes");
-        let data_dir = SinomoDataDir::new(&root);
-        let service = DaemonBuildService::new(&DaemonPaths::new(&data_dir));
+        let service = BuildService::new();
         let routes = service
             .route_categories()
             .into_iter()
@@ -1154,5 +1339,91 @@ mod tests {
                 .expect("inflight lock")
                 .contains_key(&key)
         );
+    }
+
+    #[test]
+    fn build_source_bundle_is_materialized_without_rollout_state_or_remotes() {
+        let root = sinomo_testdir::TestDir::new("sinomo-build-source-bundle");
+        let source = root.join("source-repo");
+        let bundle = root.join("source.bundle");
+        fs::create_dir_all(&source).expect("source root");
+        assert_command_succeeded(
+            crate::process::noninteractive_command("git")
+                .arg("init")
+                .arg(&source)
+                .output()
+                .expect("git init"),
+            "git init",
+        );
+        for (key, value) in [
+            ("user.name", "Sinomo Build Test"),
+            ("user.email", "build-test@sinomo.invalid"),
+        ] {
+            assert_command_succeeded(
+                crate::process::noninteractive_command("git")
+                    .arg("-C")
+                    .arg(&source)
+                    .args(["config", key, value])
+                    .output()
+                    .expect("git config"),
+                "git config",
+            );
+        }
+        fs::write(
+            source.join("Cargo.toml"),
+            b"[workspace]\nresolver = \"3\"\n",
+        )
+        .expect("write source manifest");
+        assert_command_succeeded(
+            crate::process::noninteractive_command("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["add", "Cargo.toml"])
+                .output()
+                .expect("git add"),
+            "git add",
+        );
+        assert_command_succeeded(
+            crate::process::noninteractive_command("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["commit", "-m", "build source"])
+                .output()
+                .expect("git commit"),
+            "git commit",
+        );
+        assert_command_succeeded(
+            crate::process::noninteractive_command("git")
+                .arg("-C")
+                .arg(&source)
+                .args(["bundle", "create"])
+                .arg(&bundle)
+                .arg("HEAD")
+                .output()
+                .expect("git bundle"),
+            "git bundle",
+        );
+
+        let materialized = materialize_build_source_bundle(&root.join("work"), &bundle)
+            .expect("materialize source bundle");
+        assert!(materialized.join("Cargo.toml").is_file());
+        assert!(
+            !build_source_head(&materialized)
+                .expect("materialized head")
+                .is_empty()
+        );
+        let remotes = crate::process::noninteractive_command("git")
+            .arg("-C")
+            .arg(&materialized)
+            .arg("remote")
+            .output()
+            .expect("git remote");
+        assert!(
+            remotes.status.success(),
+            "git remote failed: {}",
+            String::from_utf8_lossy(&remotes.stderr)
+        );
+        assert!(String::from_utf8_lossy(&remotes.stdout).trim().is_empty());
+        assert!(!root.join("work").join("rollout").exists());
     }
 }

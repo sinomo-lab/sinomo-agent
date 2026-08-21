@@ -12,7 +12,7 @@ use sinomo_core::cluster::ClusterKvPathsExt;
 use sinomo_core::cluster::{
     ClusterControlPlaneTimeouts, ClusterInviteChallengeProof, ClusterInviteChallengeRequest,
 };
-use sinomo_core::kv::{ClusterKvRouteAuth, cluster_kv_rpc_route_policy};
+use sinomo_core::kv::cluster_kv_rpc_route_policy;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::ClusterPaths;
 #[cfg(test)]
@@ -26,14 +26,15 @@ use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
     ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
-use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+pub use sinomo_api::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 
 pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_core::network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
@@ -46,7 +47,7 @@ pub use sinomo_core::network::SignedDaemonCommand;
 /// zero. Replay protection is bounded by the signed-command clock-skew freshness
 /// check, so the only behavioral change is that a process restart forgets nonces
 /// from the trailing skew window — which the freshness check already constrains.
-static DAEMON_AUTH_NONCES: OnceLock<Mutex<HashMap<PathBuf, DaemonAuthNonceSet>>> = OnceLock::new();
+static DAEMON_AUTH_NONCES: OnceLock<sinomo_api::ScopedReplayNonceCache<PathBuf>> = OnceLock::new();
 static DAEMON_AUTH_VERIFIER_CONTEXTS: OnceLock<
     Mutex<HashMap<PathBuf, CachedDaemonAuthVerifierContext>>,
 > = OnceLock::new();
@@ -75,78 +76,6 @@ struct DaemonAuthFileMark {
     len: u64,
     modified: Option<SystemTime>,
     ino: u64,
-}
-
-#[derive(Debug)]
-struct DaemonAuthNonceSet {
-    // Membership and expiry ordering are separate so a high request rate never
-    // turns pruning into a full live-set scan on every authenticated request.
-    nonces: HashSet<Arc<[u8]>>,
-    expirations: BinaryHeap<Reverse<(OffsetDateTime, Arc<[u8]>)>>,
-}
-
-impl DaemonAuthNonceSet {
-    fn new() -> Self {
-        Self {
-            nonces: HashSet::new(),
-            expirations: BinaryHeap::new(),
-        }
-    }
-
-    fn remember(
-        &mut self,
-        nonce_key: Vec<u8>,
-        expires_at: OffsetDateTime,
-        now: OffsetDateTime,
-    ) -> bool {
-        self.prune_expired(now);
-        let nonce_key = Arc::<[u8]>::from(nonce_key);
-        if !self.nonces.insert(Arc::clone(&nonce_key)) {
-            return false;
-        }
-        self.expirations.push(Reverse((expires_at, nonce_key)));
-        true
-    }
-
-    fn prune_expired(&mut self, now: OffsetDateTime) {
-        while self
-            .expirations
-            .peek()
-            .is_some_and(|Reverse((expires_at, _))| now > *expires_at)
-        {
-            let Reverse((_expires_at, nonce_key)) =
-                self.expirations.pop().expect("checked nonce expiration");
-            self.nonces.remove(&nonce_key);
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuthenticatedDaemonCommand {
-    pub route: String,
-    pub signer: DaemonSignerAuthority,
-    pub signer_node_id: String,
-    /// Existing cluster membership state stores node public keys as URL-safe base64 strings.
-    pub signer_public_key: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DaemonSignerAuthority {
-    Local,
-    Voter,
-    Member,
-    JoinCandidate,
-    StatusProbe,
-}
-
-impl DaemonSignerAuthority {
-    pub fn can_run_admin_command(&self) -> bool {
-        matches!(self, Self::Local | Self::Voter)
-    }
-
-    pub fn can_run_local_command(&self) -> bool {
-        matches!(self, Self::Local)
-    }
 }
 
 pub fn sign_daemon_rpc_request_for_local_node(
@@ -332,13 +261,19 @@ pub fn authorize_authenticated_daemon_command(
 ) -> Result<(), DaemonError> {
     let route = authenticated.route.as_str();
     if let Some(policy) = cluster_kv_rpc_route_policy(route) {
-        if daemon_signer_authorizes_cluster_kv_route(&authenticated.signer, policy.auth) {
+        if authenticated
+            .signer
+            .authorizes_cluster_kv_route(policy.auth)
+        {
             return Ok(());
         }
         return Err(DaemonError::AuthDenied);
     }
     if let Some(policy) = sinomo_core::cluster::cluster_control_rpc_route_policy(route) {
-        if daemon_signer_authorizes_cluster_kv_route(&authenticated.signer, policy.auth) {
+        if authenticated
+            .signer
+            .authorizes_cluster_kv_route(policy.auth)
+        {
             return Ok(());
         }
         return Err(DaemonError::AuthDenied);
@@ -361,8 +296,8 @@ pub fn authorize_authenticated_daemon_command(
     }
     if matches!(
         route,
-        crate::service_adapter::NETWORK_MODULES_LIST_ROUTE
-            | crate::service_adapter::NETWORK_MODULES_SET_ENABLED_ROUTE
+        sinomo_module::NETWORK_MODULES_LIST_ROUTE
+            | sinomo_module::NETWORK_MODULES_SET_ENABLED_ROUTE
     ) {
         if authenticated.signer.can_run_admin_command() {
             return Ok(());
@@ -553,28 +488,6 @@ pub fn authorize_authenticated_daemon_command(
         Ok(())
     } else {
         Err(DaemonError::AuthDenied)
-    }
-}
-
-fn daemon_signer_authorizes_cluster_kv_route(
-    signer: &DaemonSignerAuthority,
-    auth: ClusterKvRouteAuth,
-) -> bool {
-    match auth {
-        ClusterKvRouteAuth::Authenticated => true,
-        ClusterKvRouteAuth::LocalOnly => matches!(signer, DaemonSignerAuthority::Local),
-        ClusterKvRouteAuth::LocalOrClusterMember => matches!(
-            signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
-        ClusterKvRouteAuth::LocalOrRaftVoter => {
-            matches!(
-                signer,
-                DaemonSignerAuthority::Local | DaemonSignerAuthority::Voter
-            )
-        }
     }
 }
 
@@ -1273,18 +1186,19 @@ fn remember_daemon_auth_nonce(
     let expires_at = signed_at
         .checked_add(time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS))
         .ok_or(DaemonError::AuthDenied)?;
-    let mut guard = DAEMON_AUTH_NONCES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
+    let remembered = DAEMON_AUTH_NONCES
+        .get_or_init(sinomo_api::ScopedReplayNonceCache::default)
+        .remember(
+            paths.root.clone(),
+            daemon_auth_nonce_key(envelope),
+            expires_at,
+            now,
+        )
         .map_err(|source| DaemonError::Io {
             path: paths.root.display().to_string(),
             detail: source.to_string(),
         })?;
-    let nonce_set = guard
-        .entry(paths.root.clone())
-        .or_insert_with(DaemonAuthNonceSet::new);
-    let nonce_key = daemon_auth_nonce_key(envelope);
-    if !nonce_set.remember(nonce_key, expires_at, now) {
+    if !remembered {
         return Err(DaemonError::AuthDenied);
     }
     Ok(())
@@ -1487,39 +1401,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_auth_nonce_bookkeeping_stays_incremental_past_legacy_trigger() {
-        const LEGACY_PRUNE_TRIGGER: usize = 8_192;
-        const EXTRA_NONCES: usize = 1_024;
-
-        let now = OffsetDateTime::now_utc();
-        let expires_at = now + time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS);
-        let mut nonce_set = DaemonAuthNonceSet::new();
-        for index in 0..LEGACY_PRUNE_TRIGGER + EXTRA_NONCES {
-            let nonce = format!("nonce-{index}").into_bytes();
-            assert!(nonce_set.remember(nonce, expires_at, now));
-        }
-
-        assert_eq!(nonce_set.nonces.len(), LEGACY_PRUNE_TRIGGER + EXTRA_NONCES);
-        assert_eq!(
-            nonce_set.expirations.len(),
-            LEGACY_PRUNE_TRIGGER + EXTRA_NONCES
-        );
-        assert!(
-            !nonce_set.remember(b"nonce-0".to_vec(), expires_at, now),
-            "crossing the former trigger must not weaken replay rejection"
-        );
-
-        let after_expiry = expires_at + time::Duration::nanoseconds(1);
-        assert!(nonce_set.remember(
-            b"post-expiry".to_vec(),
-            after_expiry + time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS),
-            after_expiry,
-        ));
-        assert_eq!(nonce_set.nonces.len(), 1);
-        assert_eq!(nonce_set.expirations.len(), 1);
-    }
-
-    #[test]
     fn cluster_kv_txn_authorizes_cluster_members_for_voter_forwarding() {
         let authenticated = authenticated_command(
             CLUSTER_KV_TXN_ROUTE.to_string(),
@@ -1673,8 +1554,8 @@ mod tests {
     #[test]
     fn network_module_control_routes_authorize_admin_signers() {
         for route in [
-            crate::service_adapter::NETWORK_MODULES_LIST_ROUTE,
-            crate::service_adapter::NETWORK_MODULES_SET_ENABLED_ROUTE,
+            sinomo_module::NETWORK_MODULES_LIST_ROUTE,
+            sinomo_module::NETWORK_MODULES_SET_ENABLED_ROUTE,
         ] {
             for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
                 let authenticated = authenticated_command(route.to_string(), signer);

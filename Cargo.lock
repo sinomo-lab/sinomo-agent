@@ -9590,6 +9590,8 @@ dependencies = [
  "tar",
  "thiserror 2.0.20",
  "time",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -9650,6 +9652,7 @@ dependencies = [
  "sinomo-network",
  "sinomo-node",
  "sinomo-object",
+ "sinomo-service",
  "sinomo-storage",
  "sinomo-testdir",
  "thiserror 2.0.20",
@@ -9717,7 +9720,6 @@ dependencies = [
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-testdir",
- "sysinfo",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -9876,6 +9878,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-installer"
+version = "0.1.0"
+dependencies = [
+ "sinomo-api",
+ "sinomo-core",
+ "sinomo-daemon",
+ "sinomo-rollout",
+ "sinomo-testdir",
+]
+
+[[package]]
 name = "sinomo-kv"
 version = "0.1.0"
 dependencies = [
@@ -9985,6 +9998,8 @@ dependencies = [
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
+ "tokio",
+ "tracing",
  "zip",
 ]
 
@@ -10080,10 +10095,13 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "sinomo-api",
  "sinomo-cli-registry",
  "sinomo-core",
+ "sinomo-dfs",
  "sinomo-module",
  "sinomo-testdir",
+ "sysinfo",
  "thiserror 2.0.20",
  "time",
  "tokio",
@@ -10164,6 +10182,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "fs2",
+ "notify",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -10178,6 +10197,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]
@@ -10194,6 +10214,7 @@ dependencies = [
  "sinomo-dfs",
  "sinomo-dfs-cloud-files-api",
  "sinomo-eval",
+ "sinomo-installer",
  "sinomo-memory-extension-api",
  "sinomo-module",
  "sinomo-module-api",
@@ -10233,6 +10254,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

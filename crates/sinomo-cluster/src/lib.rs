@@ -9,11 +9,17 @@
 
 pub use sinomo_base::cluster::*;
 
+mod command_observation;
+mod connectivity_import;
+mod connectivity_projection;
 mod connectivity_publish;
+mod consensus_service;
+mod control_authority;
 mod control_plane_adapters;
 mod control_plane_driver;
 mod control_plane_options;
 mod control_routes;
+mod control_service;
 mod health;
 mod invite;
 mod invite_publish;
@@ -24,6 +30,7 @@ mod kv_local_store;
 mod kv_read_model;
 #[cfg(any(test, feature = "test-support"))]
 mod kv_semantics;
+mod kv_service;
 mod kv_snapshot;
 mod kv_snapshot_observer;
 mod kv_txn_quorum;
@@ -34,7 +41,11 @@ mod member_publish;
 mod member_store;
 mod membership_forward;
 mod membership_rpc;
+mod membership_service;
 mod migration;
+mod network_maintenance;
+mod network_service;
+mod publication_cache;
 mod raft_election;
 mod raft_fanout;
 mod raft_quorum;
@@ -44,6 +55,24 @@ mod raft_rpc;
 mod state_authority_reachability;
 mod status_publish;
 
+pub use command_observation::{
+    CLUSTER_COMMAND_OBSERVATION_MAX_ENDPOINTS, CLUSTER_COMMAND_OBSERVATION_MAX_IN_FLIGHT,
+    CLUSTER_COMMAND_SUCCESS_OBSERVATION_INTERVAL, ClusterCommandConnectivityObservation,
+    ClusterCommandObservationCoordinator, ClusterCommandObservationReservation,
+    cluster_command_observation_key,
+};
+pub use connectivity_import::{
+    PeerConnectivityFetchScope, accepted_join_connectivity_record_groups,
+    filter_peer_connectivity_response_records, merge_connectivity_probe_records_with_live_unprobed,
+    newly_healthy_connectivity_target_node_ids, peer_connectivity_import_endpoint_for_record,
+    peer_connectivity_import_records_for_reachable_peers,
+};
+pub use connectivity_projection::{
+    ClusterConnectivityEndpointProjection, ClusterConnectivityMemberProjection,
+    ClusterConnectivityProjectionChange, ClusterConnectivityTopologyProjection,
+    ClusterConnectivityTopologyValue, cluster_connectivity_events_cover_revision_range,
+    cluster_connectivity_probe_input_projection, cluster_connectivity_probe_topology_is_current,
+};
 pub use connectivity_publish::{
     ClusterConnectivityPublishAsyncHost, ClusterConnectivityPublishHost,
     ClusterNetworkRecordExpiryHost, cluster_connectivity_publish_record_matches,
@@ -53,6 +82,10 @@ pub use connectivity_publish::{
     sync_cluster_connectivity_records_to_quorum_async_with_state_and_host,
     sync_cluster_connectivity_records_to_quorum_with_host,
 };
+pub use consensus_service::{
+    ClusterConsensusServiceHost, HostedClusterConsensusService, register_cluster_consensus_service,
+};
+pub use control_authority::RemoteClusterControlAuthorityFence;
 pub use control_plane_driver::{ClusterControlPlaneDriver, ClusterControlPlaneTransport};
 pub use control_plane_options::{
     ClusterControlPlaneTimeouts, ClusterKvTxnQuorumOptions,
@@ -83,8 +116,9 @@ pub use control_routes::{
     cluster_control_remove_response_rpc_payload, cluster_control_remove_rpc_payload,
     cluster_control_rename_response_rpc_payload, cluster_control_rename_rpc_payload,
     cluster_control_role_response_rpc_payload, cluster_control_role_rpc_payload,
-    cluster_control_rpc_route_policy, decode_cluster_control_init_rpc_request_body,
-    decode_cluster_control_init_rpc_response_body, decode_cluster_control_invite_rpc_request_body,
+    cluster_control_route_requires_runtime_restart, cluster_control_rpc_route_policy,
+    decode_cluster_control_init_rpc_request_body, decode_cluster_control_init_rpc_response_body,
+    decode_cluster_control_invite_rpc_request_body,
     decode_cluster_control_invite_rpc_response_body, decode_cluster_control_join_rpc_request_body,
     decode_cluster_control_join_rpc_response_body, decode_cluster_control_leave_rpc_request_body,
     decode_cluster_control_leave_rpc_response_body, decode_cluster_control_remove_rpc_request_body,
@@ -92,6 +126,10 @@ pub use control_routes::{
     decode_cluster_control_rename_rpc_request_body,
     decode_cluster_control_rename_rpc_response_body, decode_cluster_control_role_rpc_request_body,
     decode_cluster_control_role_rpc_response_body,
+};
+pub use control_service::{
+    ClusterControlServiceFuture, ClusterControlServiceHost, HostedClusterControlService,
+    register_cluster_control_service, validate_remote_cluster_control_authority,
 };
 pub use health::{
     CLUSTER_NETWORK_PING_ATTACHMENT_MAX_BYTES, ClusterDoctorFinding, ClusterHealthRow,
@@ -149,6 +187,11 @@ pub use kv_read_model::KvClusterDirectory;
 pub use kv_read_model::{
     read_cluster_connectivity_graph_from_kv, read_cluster_members_from_kv,
     read_cluster_members_from_snapshot, read_cluster_node_statuses_from_kv,
+};
+pub use kv_service::{
+    ClusterKvServiceFuture, ClusterKvServiceHost, HostedClusterKvService,
+    fence_remote_cluster_kv_txn_request_with_entries, register_cluster_kv_service,
+    remote_cluster_kv_authorization_keys,
 };
 pub use kv_snapshot::{
     ClusterKvSnapshotRefreshHost, ClusterKvSnapshotRefreshOptions, ClusterKvSnapshotRefreshOutcome,
@@ -215,6 +258,10 @@ pub use membership_rpc::{
     ClusterJoinRegistrationRequest, ClusterJoinRegistrationResponse, ClusterMemberPublishRequest,
     ClusterMemberPublishResponse, handle_cluster_membership_rpc_request_with_hosts,
 };
+pub use membership_service::{
+    ClusterMembershipServiceFuture, ClusterMembershipServiceHost, HostedClusterMembershipService,
+    register_cluster_membership_service,
+};
 pub use migration::{
     ClusterMigrationKvImportReport, ClusterMigrationPlanReport, ClusterMigrationQuarantine,
     cluster_migration_kv_import_report_path, cluster_storage_has_live_artifacts,
@@ -222,6 +269,24 @@ pub use migration::{
     quarantine_cluster_storage_for_leave, quarantine_cluster_storage_for_migration,
     rollback_cluster_storage_quarantine, write_cluster_migration_record_to_source_kv_with_host,
     write_local_cluster_migration_record,
+};
+pub use network_maintenance::{
+    CLUSTER_NETWORK_MAINTENANCE_FAILURE_BACKOFF,
+    CLUSTER_NETWORK_MAINTENANCE_FAILURE_INITIAL_BACKOFF,
+    CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION, ClusterConnectivityProbePlanAction,
+    ClusterNetworkMaintenanceCadence, ClusterNetworkMaintenanceDueClaims,
+    cluster_connectivity_probe_plan_action, cluster_connectivity_probe_result_needs_followup,
+    cluster_network_due_class_failure_backoff,
+};
+pub use network_service::{
+    ClusterNetworkServiceFuture, ClusterNetworkServiceHost, HostedClusterNetworkService,
+    handle_cluster_network_ping_service_request_for_node, register_cluster_network_service,
+};
+pub use publication_cache::{
+    CLUSTER_PUBLICATION_CACHE_MAX_CONNECTIVITY_RECORDS,
+    CLUSTER_PUBLICATION_CACHE_MAX_CONNECTIVITY_SOURCES, CLUSTER_PUBLICATION_CACHE_MAX_NODE_RECORDS,
+    CLUSTER_PUBLICATION_CACHE_MAX_RECORDS_PER_SOURCE, ClusterPublicationCache,
+    ClusterPublicationCacheLimits,
 };
 pub use raft_fanout::{
     ClusterKvCommittedFanoutAsyncHost, replicate_cluster_kv_to_node_async_with_host,

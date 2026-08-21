@@ -15,51 +15,48 @@ use fs2::FileExt;
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
     CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL, CLUSTER_ROLLOUT_PROGRESS_TOTAL,
-    ClusterRolloutBinaryManifest, ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse,
-    ClusterRolloutBuildRequest, ClusterRolloutNativeDylibModuleRequest,
-    ClusterRolloutNativeDylibModuleResponse, ClusterRolloutNativeDylibModuleUploadSpec,
-    ClusterRolloutProgressUpdate, ClusterRolloutUploadArtifactSpec, LocalRolloutArtifacts,
-    LocalRolloutNativeDylibModuleArtifact, MainExitObservation, ManagedSourceDeployOptions,
+    ClusterRolloutBinaryManifest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
+    ClusterRolloutNativeDylibModuleRequest, ClusterRolloutNativeDylibModuleResponse,
+    ClusterRolloutProgressUpdate, LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact,
+    MainExitObservation, ManagedSourceDeployOptions, PendingShadowCandidateExitAction,
     PendingShadowRolloutContext, ROLLOUT_DIAGNOSTIC_TAIL_BYTES, RolloutActivationStrategy,
     RolloutFailureDiagnostics, RolloutMainActivation, SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV,
-    SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths,
-    acquire_rollout_activation_guard, activate_staged_rollout_binary, classify_main_exit,
-    clear_rollout_status, cluster_rollout_progress_status,
-    deploy_managed_source_bundle_with_options, ensure_rollout_layout, managed_source_status,
-    prune_rollout_binary_recovery_backups, read_object, read_pending_shadow_rollout,
-    read_rollout_main_activation, read_tail_lossy, record_activation_failure,
-    record_main_activation_staged, record_main_rollout_failure_with_diagnostics,
-    record_rollout_main_exit, record_shadow_rollout_finalized,
-    recover_unresolved_native_dylib_loader_rollback_intents, remove_main_activation,
-    remove_native_dylib_loader_state_rollback, remove_shadow_finalize,
+    SHADOW_MAIN_PORT_ENV, SHADOW_START_DELAY_MS_ENV, SelfRolloutPaths, ShadowMainRestartBackoff,
+    SupervisedMainExitDecision, acquire_rollout_activation_guard, activate_staged_rollout_binary,
+    classify_main_exit, classify_supervised_main_exit, clear_rollout_status,
+    cluster_rollout_progress_status, deploy_managed_source_bundle_with_options,
+    ensure_rollout_layout, managed_source_status, pending_rollout_probe_matches_candidate,
+    pending_shadow_candidate_exit_action, prune_rollout_binary_recovery_backups,
+    read_pending_shadow_rollout, read_rollout_main_activation, read_tail_lossy,
+    record_activation_failure, record_main_activation_staged,
+    record_main_rollout_failure_with_diagnostics, record_rollout_main_exit,
+    record_shadow_rollout_finalized, recover_unresolved_native_dylib_loader_rollback_intents,
+    remove_main_activation, remove_native_dylib_loader_state_rollback, remove_shadow_finalize,
     restore_native_dylib_loader_state_for_activation, restore_native_dylib_loader_state_rollback,
-    restore_rollout_binary_from_backup, rollout_artifact_suffix, rollout_build_dev_artifacts,
+    restore_rollout_binary_from_backup, rollout_artifact_suffix,
+    rollout_bind_covers_manual_tcp_endpoint, rollout_build_dev_artifacts,
     rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
     rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    rollout_timestamp_now, source_heads_match, stage_native_dylib_loader_state_rollback,
-    stage_pending_shadow_rollout, stage_rollout_file, stage_rollout_file_pair, write_json,
-    write_main_activation, write_object, write_rollout_status,
+    rollout_timestamp_now, select_rollout_main_host, select_rollout_shadow_host,
+    shadow_main_should_start, source_heads_match, stage_native_dylib_loader_state_rollback,
+    stage_pending_shadow_rollout, stage_rollout_file, stage_rollout_file_pair,
+    validate_rollout_upload_component, verify_rollout_uploaded_artifact,
+    verify_rollout_uploaded_module, write_json, write_main_activation, write_rollout_status,
 };
 use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::io;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 const MAIN_ACTIVATION_SHUTDOWN_GRACE: Duration = Duration::from_millis(750);
 const STABLE_BINARY_COPY_TIMEOUT: Duration = Duration::from_secs(30);
 const STABLE_BINARY_COPY_RETRY_INTERVAL: Duration = Duration::from_millis(100);
-const CLUSTER_ROLLOUT_BODY_BUFFER_BYTES: usize = 64 * 1024;
-const SHADOW_MAIN_RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
-const SHADOW_MAIN_RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
-const SHADOW_MAIN_RESTART_STABLE_RESET_AFTER: Duration = Duration::from_secs(60);
 const SUPERVISED_MAIN_RESTART_REQUEST_FILE: &str = "supervised-main-restart.request";
 const SHADOW_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_millis(750);
 const SHADOW_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -68,655 +65,6 @@ const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
-const DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL: Duration = Duration::from_millis(250);
-const DAEMON_ROLLOUT_TELEMETRY_RETRY_MAX: Duration = Duration::from_secs(30);
-const DAEMON_ROLLOUT_TELEMETRY_INCOMPLETE_TAIL_RETRY: Duration = Duration::from_millis(10);
-const DAEMON_ROLLOUT_TELEMETRY_EVENT_READ_BUFFER_BYTES: usize = 64 * 1024;
-const DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES: usize = 16 * 1024 * 1024;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DaemonRolloutTelemetryEventTailOutcome {
-    relevant_event_observed: bool,
-    /// Absolute end offset of the observed incomplete record. This is source
-    /// progress, unlike filesystem watcher generations: one append may emit
-    /// several indistinguishable backend notifications.
-    incomplete_record_end_offset: Option<u64>,
-}
-
-#[derive(Debug)]
-struct DaemonRolloutTelemetryEventLogTailer {
-    path: PathBuf,
-    offset: u64,
-}
-
-#[derive(Clone, Debug)]
-struct DaemonRolloutTelemetrySourcePaths {
-    event_log: PathBuf,
-    runtime_state: PathBuf,
-    gate_config: PathBuf,
-}
-
-fn daemon_rollout_telemetry_source_watcher(
-    source_paths: &DaemonRolloutTelemetrySourcePaths,
-    runtime_source_tx: tokio::sync::watch::Sender<u64>,
-    gate_source_tx: tokio::sync::watch::Sender<u64>,
-    event_file_source_tx: tokio::sync::watch::Sender<u64>,
-    watcher_fault_tx: tokio::sync::watch::Sender<u64>,
-) -> Result<notify::RecommendedWatcher, DaemonError> {
-    let callback_runtime_path = source_paths.runtime_state.clone();
-    let callback_gate_path = source_paths.gate_config.clone();
-    let callback_event_path = source_paths.event_log.clone();
-    let watcher_error_path = source_paths.event_log.clone();
-    let mut source_watcher =
-        notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
-            match result {
-                Ok(event) => {
-                    let paths = event.paths;
-                    if paths.iter().any(|path| path == &callback_runtime_path) {
-                        runtime_source_tx.send_modify(|generation| {
-                            *generation = generation.saturating_add(1);
-                        });
-                    }
-                    if paths.iter().any(|path| path == &callback_gate_path) {
-                        gate_source_tx.send_modify(|generation| {
-                            *generation = generation.saturating_add(1);
-                        });
-                    }
-                    if paths.iter().any(|path| path == &callback_event_path) {
-                        event_file_source_tx.send_modify(|generation| {
-                            *generation = generation.saturating_add(1);
-                        });
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target: "sinomo.rollout.telemetry",
-                        path = %watcher_error_path.display(),
-                        "rollout telemetry source watcher failed: {error}"
-                    );
-                    // A backend watcher error means the current observation
-                    // boundary can no longer be trusted. The reactor owns the
-                    // fault as a generation so it can rebuild the watcher and
-                    // reconcile every durable source after the new watches are
-                    // installed.
-                    watcher_fault_tx.send_modify(|generation| {
-                        *generation = generation.saturating_add(1);
-                    });
-                }
-            }
-        })
-        .map_err(|source| DaemonError::Io {
-            path: source_paths.event_log.display().to_string(),
-            detail: format!("create rollout telemetry source watcher: {source}"),
-        })?;
-    let mut watched_directories = BTreeSet::new();
-    for directory in [
-        source_paths.event_log.parent(),
-        source_paths.runtime_state.parent(),
-        source_paths.gate_config.parent(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if watched_directories.insert(directory.to_path_buf()) {
-            notify::Watcher::watch(
-                &mut source_watcher,
-                directory,
-                notify::RecursiveMode::NonRecursive,
-            )
-            .map_err(|source| DaemonError::Io {
-                path: directory.display().to_string(),
-                detail: format!("watch rollout telemetry source directory: {source}"),
-            })?;
-        }
-    }
-    Ok(source_watcher)
-}
-
-impl DaemonRolloutTelemetryEventLogTailer {
-    fn at_end(path: PathBuf) -> Result<Self, DaemonError> {
-        let offset = match fs::metadata(&path) {
-            Ok(metadata) => metadata.len(),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => 0,
-            Err(source) => {
-                return Err(DaemonError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        };
-        Ok(Self { path, offset })
-    }
-
-    fn catch_up(&mut self) -> Result<DaemonRolloutTelemetryEventTailOutcome, DaemonError> {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                self.offset = 0;
-                return Ok(DaemonRolloutTelemetryEventTailOutcome::default());
-            }
-            Err(source) => {
-                return Err(DaemonError::Io {
-                    path: self.path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        };
-        let len = file
-            .metadata()
-            .map_err(|source| DaemonError::Io {
-                path: self.path.display().to_string(),
-                detail: source.to_string(),
-            })?
-            .len();
-        if len < self.offset {
-            self.offset = 0;
-        }
-        file.seek(SeekFrom::Start(self.offset))
-            .map_err(|source| DaemonError::Io {
-                path: self.path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        let mut buffer = [0_u8; DAEMON_ROLLOUT_TELEMETRY_EVENT_READ_BUFFER_BYTES];
-        let mut line = Vec::new();
-        let mut committed_bytes = 0_u64;
-        let mut pending_record_bytes = 0_u64;
-        let mut relevant_event_observed = false;
-        loop {
-            let read = file.read(&mut buffer).map_err(|source| DaemonError::Io {
-                path: self.path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            if read == 0 {
-                break;
-            }
-            let mut cursor = 0_usize;
-            while cursor < read {
-                let remaining = &buffer[cursor..read];
-                let relative_newline = remaining.iter().position(|byte| *byte == b'\n');
-                let segment_len = relative_newline.unwrap_or(remaining.len());
-                if line.len().saturating_add(segment_len)
-                    > DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES
-                {
-                    return Err(DaemonError::Parse {
-                        detail: format!(
-                            "committed rollout telemetry event at {}+{} exceeds {} bytes",
-                            self.path.display(),
-                            self.offset.saturating_add(committed_bytes),
-                            DAEMON_ROLLOUT_TELEMETRY_MAX_EVENT_RECORD_BYTES
-                        ),
-                    });
-                }
-                line.extend_from_slice(&remaining[..segment_len]);
-                pending_record_bytes = pending_record_bytes
-                    .saturating_add(u64::try_from(segment_len).unwrap_or(u64::MAX));
-                cursor = cursor.saturating_add(segment_len);
-                let Some(_) = relative_newline else {
-                    continue;
-                };
-
-                cursor = cursor.saturating_add(1);
-                pending_record_bytes = pending_record_bytes.saturating_add(1);
-                let record = line.strip_suffix(b"\r").unwrap_or(&line);
-                if !record.iter().all(u8::is_ascii_whitespace) {
-                    let stored: sinomo_core::events::StoredEvent =
-                        serde_json::from_slice(record).map_err(|source| DaemonError::Parse {
-                            detail: format!(
-                                "decode committed rollout telemetry event at {}+{}: {source}",
-                                self.path.display(),
-                                self.offset.saturating_add(committed_bytes)
-                            ),
-                        })?;
-                    relevant_event_observed |=
-                        sinomo_rollout::rollout_telemetry_event_kind_is_relevant(
-                            &stored.event.kind,
-                        );
-                }
-                committed_bytes = committed_bytes.saturating_add(pending_record_bytes);
-                pending_record_bytes = 0;
-                line.clear();
-            }
-        }
-        self.offset = self.offset.saturating_add(committed_bytes);
-        Ok(DaemonRolloutTelemetryEventTailOutcome {
-            relevant_event_observed,
-            incomplete_record_end_offset: (pending_record_bytes != 0)
-                .then(|| self.offset.saturating_add(pending_record_bytes)),
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DaemonRolloutTelemetrySourceGenerations {
-    runtime_state: u64,
-    gate_config: u64,
-    relevant_event: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DaemonRolloutTelemetryArming {
-    /// No event or gate can create a runtime state/candidate or leave a
-    /// terminal stage. Only the runtime-state owner can re-arm the reactor.
-    RuntimeStateOnly,
-    /// A live candidate can change from telemetry, gates, or runtime state.
-    LiveCandidateSources,
-}
-
-/// Reactive owner for local rollout telemetry advancement.
-///
-/// The initial generation reconciles durable sources left by a previous
-/// process. Afterwards exact runtime/config commits and relevant event-log
-/// appends are the only healthy wake sources. Timers exist only while an
-/// attempted generation is failing or for the single bounded retry attached
-/// to an observed partial JSONL append.
-pub(crate) struct DaemonRolloutTelemetryReactor {
-    runtime_source_tx: tokio::sync::watch::Sender<u64>,
-    runtime_source_rx: tokio::sync::watch::Receiver<u64>,
-    gate_source_tx: tokio::sync::watch::Sender<u64>,
-    gate_source_rx: tokio::sync::watch::Receiver<u64>,
-    event_source_tx: tokio::sync::watch::Sender<u64>,
-    event_source_rx: tokio::sync::watch::Receiver<u64>,
-    event_file_source_tx: tokio::sync::watch::Sender<u64>,
-    event_file_source_rx: tokio::sync::watch::Receiver<u64>,
-    watcher_fault_tx: tokio::sync::watch::Sender<u64>,
-    watcher_fault_rx: tokio::sync::watch::Receiver<u64>,
-    source_paths: DaemonRolloutTelemetrySourcePaths,
-    source_watcher: notify::RecommendedWatcher,
-    event_log_tailer: DaemonRolloutTelemetryEventLogTailer,
-    completed_watcher_fault_generation: u64,
-    completed_event_file_generation: u64,
-    event_tail_retry_at: Option<Instant>,
-    event_tail_retry_end_offset: Option<u64>,
-    completed_generations: DaemonRolloutTelemetrySourceGenerations,
-    arming: DaemonRolloutTelemetryArming,
-    consecutive_failures: u32,
-    retry_at: Option<Instant>,
-}
-
-impl std::fmt::Debug for DaemonRolloutTelemetryReactor {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DaemonRolloutTelemetryReactor")
-            .field(
-                "runtime_source_generation",
-                &*self.runtime_source_rx.borrow(),
-            )
-            .field("gate_source_generation", &*self.gate_source_rx.borrow())
-            .field("event_source_generation", &*self.event_source_rx.borrow())
-            .field(
-                "event_file_source_generation",
-                &*self.event_file_source_rx.borrow(),
-            )
-            .field("watcher_fault_generation", &*self.watcher_fault_rx.borrow())
-            .field("completed_generations", &self.completed_generations)
-            .field("arming", &self.arming)
-            .field("consecutive_failures", &self.consecutive_failures)
-            .field("retry_at", &self.retry_at)
-            .finish_non_exhaustive()
-    }
-}
-
-impl DaemonRolloutTelemetryReactor {
-    pub(crate) fn new(paths: &DaemonPaths) -> Result<Self, DaemonError> {
-        let data_dir = paths
-            .root
-            .parent()
-            .ok_or_else(|| DaemonError::Io {
-                path: paths.root.display().to_string(),
-                detail: "daemon root has no data directory parent".to_string(),
-            })?
-            .to_path_buf();
-        let rollout_paths = SelfRolloutPaths::new(&data_dir);
-        let source_paths = DaemonRolloutTelemetrySourcePaths {
-            event_log: data_dir.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
-            runtime_state: sinomo_rollout::rollout_runtime_state_path(&rollout_paths),
-            gate_config: sinomo_rollout::rollout_telemetry_gate_config_path(&rollout_paths),
-        };
-        for parent in [
-            source_paths.event_log.parent(),
-            source_paths.runtime_state.parent(),
-            source_paths.gate_config.parent(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            fs::create_dir_all(parent).map_err(|source| DaemonError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
-        // Generation one is the source-owned startup reconciliation for
-        // durable writes that occurred before this process started watching.
-        let (runtime_source_tx, runtime_source_rx) = tokio::sync::watch::channel(1_u64);
-        let (gate_source_tx, gate_source_rx) = tokio::sync::watch::channel(0_u64);
-        let (event_source_tx, event_source_rx) = tokio::sync::watch::channel(0_u64);
-        let (event_file_source_tx, event_file_source_rx) = tokio::sync::watch::channel(0_u64);
-        let (watcher_fault_tx, watcher_fault_rx) = tokio::sync::watch::channel(0_u64);
-        let source_watcher = daemon_rollout_telemetry_source_watcher(
-            &source_paths,
-            runtime_source_tx.clone(),
-            gate_source_tx.clone(),
-            event_file_source_tx.clone(),
-            watcher_fault_tx.clone(),
-        )?;
-        // Establish the OS watches first. The dirty startup generation owns
-        // the durable catch-up; later mutations cannot fall between sampling
-        // and watcher registration.
-        let event_log_tailer =
-            DaemonRolloutTelemetryEventLogTailer::at_end(source_paths.event_log.clone())?;
-        Ok(Self {
-            runtime_source_tx,
-            runtime_source_rx,
-            gate_source_tx,
-            gate_source_rx,
-            event_source_tx,
-            event_source_rx,
-            event_file_source_tx,
-            event_file_source_rx,
-            watcher_fault_tx,
-            watcher_fault_rx,
-            source_paths,
-            source_watcher,
-            event_log_tailer,
-            completed_watcher_fault_generation: 0,
-            completed_event_file_generation: 0,
-            event_tail_retry_at: None,
-            event_tail_retry_end_offset: None,
-            completed_generations: DaemonRolloutTelemetrySourceGenerations::default(),
-            arming: DaemonRolloutTelemetryArming::RuntimeStateOnly,
-            consecutive_failures: 0,
-            retry_at: None,
-        })
-    }
-
-    fn rebuild_source_watcher(&mut self) -> Result<(), DaemonError> {
-        // Install the replacement before dropping the old watcher. Once the
-        // exact-path watches are live, mark every durable source dirty so the
-        // reconciliation closes the observation gap that caused the fault.
-        let replacement = daemon_rollout_telemetry_source_watcher(
-            &self.source_paths,
-            self.runtime_source_tx.clone(),
-            self.gate_source_tx.clone(),
-            self.event_file_source_tx.clone(),
-            self.watcher_fault_tx.clone(),
-        )?;
-        self.source_watcher = replacement;
-        self.runtime_source_tx.send_modify(|generation| {
-            *generation = generation.saturating_add(1);
-        });
-        self.gate_source_tx.send_modify(|generation| {
-            *generation = generation.saturating_add(1);
-        });
-        self.event_file_source_tx.send_modify(|generation| {
-            *generation = generation.saturating_add(1);
-        });
-        Ok(())
-    }
-
-    fn prepare_runnable_generations(
-        &mut self,
-        now: Instant,
-    ) -> Result<Option<DaemonRolloutTelemetrySourceGenerations>, DaemonError> {
-        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
-            return Ok(None);
-        }
-
-        let watcher_fault_generation = *self.watcher_fault_rx.borrow_and_update();
-        if watcher_fault_generation > self.completed_watcher_fault_generation {
-            self.rebuild_source_watcher()?;
-            self.completed_watcher_fault_generation = watcher_fault_generation;
-        }
-
-        let runtime_state_generation = *self.runtime_source_rx.borrow_and_update();
-        let runtime_state_pending =
-            runtime_state_generation > self.completed_generations.runtime_state;
-        let event_file_generation = *self.event_file_source_rx.borrow_and_update();
-        let event_tail_retry_due = self
-            .event_tail_retry_at
-            .is_some_and(|retry_at| now >= retry_at);
-        let event_file_pending = event_file_generation > self.completed_event_file_generation;
-        if runtime_state_pending
-            || (self.arming == DaemonRolloutTelemetryArming::LiveCandidateSources
-                && (event_file_pending || event_tail_retry_due))
-        {
-            let tail_outcome = self.event_log_tailer.catch_up()?;
-            self.completed_event_file_generation = self
-                .completed_event_file_generation
-                .max(event_file_generation);
-            if tail_outcome.relevant_event_observed {
-                self.event_source_tx.send_modify(|generation| {
-                    *generation = generation.saturating_add(1);
-                });
-            }
-            if let Some(incomplete_record_end_offset) = tail_outcome.incomplete_record_end_offset {
-                // One short retry is attached to observed source progress, not
-                // a watcher generation. Backends may emit duplicate events for
-                // one append; the same incomplete length can neither extend a
-                // pending retry nor re-arm a consumed retry. Newly appended
-                // bytes produce a new end offset and may own one new retry.
-                if self.event_tail_retry_end_offset == Some(incomplete_record_end_offset) {
-                    if event_tail_retry_due {
-                        self.event_tail_retry_at = None;
-                    }
-                } else {
-                    self.event_tail_retry_at =
-                        now.checked_add(DAEMON_ROLLOUT_TELEMETRY_INCOMPLETE_TAIL_RETRY);
-                    self.event_tail_retry_end_offset = Some(incomplete_record_end_offset);
-                }
-            } else {
-                self.event_tail_retry_at = None;
-                self.event_tail_retry_end_offset = None;
-            }
-        }
-
-        let source_generations = DaemonRolloutTelemetrySourceGenerations {
-            runtime_state: runtime_state_generation,
-            gate_config: *self.gate_source_rx.borrow_and_update(),
-            relevant_event: *self.event_source_rx.borrow_and_update(),
-        };
-        let runtime_state_pending =
-            source_generations.runtime_state > self.completed_generations.runtime_state;
-        let live_candidate_source_pending = self.arming
-            == DaemonRolloutTelemetryArming::LiveCandidateSources
-            && (source_generations.gate_config > self.completed_generations.gate_config
-                || source_generations.relevant_event > self.completed_generations.relevant_event);
-        if !runtime_state_pending && !live_candidate_source_pending {
-            return Ok(None);
-        }
-        Ok(Some(source_generations))
-    }
-
-    fn complete_generations(
-        &mut self,
-        generations: DaemonRolloutTelemetrySourceGenerations,
-        status: &sinomo_rollout::RolloutTelemetryAdvanceStatus,
-    ) {
-        self.completed_generations.runtime_state = self
-            .completed_generations
-            .runtime_state
-            .max(generations.runtime_state);
-        self.completed_generations.gate_config = self
-            .completed_generations
-            .gate_config
-            .max(generations.gate_config);
-        self.completed_generations.relevant_event = self
-            .completed_generations
-            .relevant_event
-            .max(generations.relevant_event);
-        self.arming = daemon_rollout_telemetry_arming_after(status);
-        if self.arming == DaemonRolloutTelemetryArming::RuntimeStateOnly {
-            self.event_tail_retry_at = None;
-            self.event_tail_retry_end_offset = None;
-        }
-        self.consecutive_failures = 0;
-        self.retry_at = None;
-    }
-
-    fn fail_generation(&mut self, now: Instant) {
-        let retry_delay = daemon_rollout_telemetry_retry_delay(self.consecutive_failures);
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.retry_at = now.checked_add(retry_delay).or(Some(now));
-    }
-
-    #[cfg(test)]
-    fn reconcile_pending_with<T, E>(
-        &mut self,
-        now: Instant,
-        reconcile: impl FnOnce() -> Result<(T, sinomo_rollout::RolloutTelemetryAdvanceStatus), E>,
-    ) -> Result<Option<T>, E> {
-        let Some(generations) = self
-            .prepare_runnable_generations(now)
-            .expect("prepare rollout telemetry sources")
-        else {
-            return Ok(None);
-        };
-        match reconcile() {
-            Ok((value, status)) => {
-                self.complete_generations(generations, &status);
-                Ok(Some(value))
-            }
-            Err(error) => {
-                self.fail_generation(now);
-                Err(error)
-            }
-        }
-    }
-
-    async fn wait_for_source_retry_or_shutdown(
-        &mut self,
-        shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
-    ) -> bool {
-        if let Some(retry_at) = self.retry_at {
-            return tokio::select! {
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)) => false,
-                changed = shutdown_rx.changed() => {
-                    changed.is_err() || *shutdown_rx.borrow()
-                }
-            };
-        }
-        match self.arming {
-            DaemonRolloutTelemetryArming::RuntimeStateOnly => {
-                tokio::select! {
-                    changed = self.runtime_source_rx.changed() => changed.is_err(),
-                    changed = self.watcher_fault_rx.changed() => changed.is_err(),
-                    changed = shutdown_rx.changed() => {
-                        changed.is_err() || *shutdown_rx.borrow()
-                    }
-                }
-            }
-            DaemonRolloutTelemetryArming::LiveCandidateSources => {
-                let event_tail_retry_at = self.event_tail_retry_at;
-                tokio::select! {
-                    changed = self.runtime_source_rx.changed() => changed.is_err(),
-                    changed = self.gate_source_rx.changed() => changed.is_err(),
-                    changed = self.event_file_source_rx.changed() => changed.is_err(),
-                    changed = self.watcher_fault_rx.changed() => changed.is_err(),
-                    _ = daemon_rollout_telemetry_wait_for_optional_retry(event_tail_retry_at) => false,
-                    changed = shutdown_rx.changed() => {
-                        changed.is_err() || *shutdown_rx.borrow()
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) async fn run_until_stopped_async(
-        mut self,
-        paths: DaemonPaths,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-        label: String,
-    ) {
-        loop {
-            if *shutdown_rx.borrow() {
-                return;
-            }
-            let now = Instant::now();
-            let generations = match self.prepare_runnable_generations(now) {
-                Ok(generations) => generations,
-                Err(error) => {
-                    tracing::warn!(
-                        "sinomo {label} rollout telemetry source observation failed: {error}"
-                    );
-                    self.fail_generation(Instant::now());
-                    continue;
-                }
-            };
-            if let Some(generations) = generations {
-                let telemetry_paths = paths.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    crate::control::run_daemon_rollout_telemetry_reconciliation_tick(
-                        &telemetry_paths,
-                    )
-                })
-                .await;
-                match result {
-                    Ok(Ok(outcome)) => {
-                        if let Some(applied) = outcome.applied_transition {
-                            tracing::info!(
-                                "sinomo {label} rollout telemetry applied {:?} at {} bps",
-                                applied.transition.action,
-                                applied.transition.current_weight_bps
-                            );
-                        }
-                        self.complete_generations(generations, &outcome.status);
-                    }
-                    Ok(Err(error)) => {
-                        tracing::warn!(
-                            "sinomo {label} rollout telemetry reconciliation failed: {error}"
-                        );
-                        self.fail_generation(Instant::now());
-                    }
-                    Err(error) => {
-                        tracing::warn!("sinomo {label} rollout telemetry task failed: {error}");
-                        self.fail_generation(Instant::now());
-                    }
-                }
-                continue;
-            }
-            if self
-                .wait_for_source_retry_or_shutdown(&mut shutdown_rx)
-                .await
-            {
-                return;
-            }
-        }
-    }
-}
-
-async fn daemon_rollout_telemetry_wait_for_optional_retry(retry_at: Option<Instant>) {
-    match retry_at {
-        Some(retry_at) => {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
-        }
-        None => std::future::pending::<()>().await,
-    }
-}
-
-fn daemon_rollout_telemetry_arming_after(
-    status: &sinomo_rollout::RolloutTelemetryAdvanceStatus,
-) -> DaemonRolloutTelemetryArming {
-    match status {
-        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState
-        | sinomo_rollout::RolloutTelemetryAdvanceStatus::NoCandidate
-        | sinomo_rollout::RolloutTelemetryAdvanceStatus::TerminalStage
-        | sinomo_rollout::RolloutTelemetryAdvanceStatus::AppliedTransition => {
-            DaemonRolloutTelemetryArming::RuntimeStateOnly
-        }
-        sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry
-        | sinomo_rollout::RolloutTelemetryAdvanceStatus::PromotionGateBlocked => {
-            DaemonRolloutTelemetryArming::LiveCandidateSources
-        }
-    }
-}
-
-fn daemon_rollout_telemetry_retry_delay(consecutive_failures: u32) -> Duration {
-    let multiplier = 1_u32
-        .checked_shl(consecutive_failures.min(16))
-        .unwrap_or(u32::MAX);
-    DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL
-        .saturating_mul(multiplier)
-        .min(DAEMON_ROLLOUT_TELEMETRY_RETRY_MAX)
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RolloutTerminationMode {
@@ -1073,52 +421,6 @@ fn take_supervised_main_restart_request(
 pub struct LocalRolloutMainActivationPlan {
     pub activation: RolloutMainActivation,
     pub previous_main_status: Option<DaemonStatus>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct ShadowMainRestartBackoff {
-    consecutive_failures: u32,
-    next_restart_at: Option<Instant>,
-}
-
-impl ShadowMainRestartBackoff {
-    fn can_restart(&self, now: Instant) -> bool {
-        self.next_restart_at
-            .is_none_or(|next_restart_at| now >= next_restart_at)
-    }
-
-    fn schedule_after_failure(&mut self, now: Instant) -> Duration {
-        let shift = self.consecutive_failures.min(7);
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        let multiplier = 1_u32.checked_shl(shift).unwrap_or(u32::MAX);
-        let delay = SHADOW_MAIN_RESTART_INITIAL_BACKOFF
-            .saturating_mul(multiplier)
-            .min(SHADOW_MAIN_RESTART_MAX_BACKOFF);
-        self.next_restart_at = Some(now + delay);
-        delay
-    }
-
-    fn clear_schedule(&mut self) {
-        self.next_restart_at = None;
-    }
-
-    fn reset(&mut self) {
-        self.consecutive_failures = 0;
-        self.next_restart_at = None;
-    }
-
-    fn reset_after_stable_start(&mut self, started_at: Option<Instant>, now: Instant) {
-        let Some(started_at) = started_at else {
-            return;
-        };
-        if now.duration_since(started_at) >= SHADOW_MAIN_RESTART_STABLE_RESET_AFTER {
-            self.reset();
-        }
-    }
-}
-
-fn prepare_immediate_shadow_main_restart(backoff: &mut ShadowMainRestartBackoff) {
-    backoff.reset();
 }
 
 impl PendingShadowRolloutContext for ShadowMainRolloutMonitor {
@@ -1785,7 +1087,7 @@ pub fn run_shadow_daemon_supervision_loop(
 
         if let Some(pending) = pending_rollout.as_ref() {
             if pending_rollout_probe_matches_candidate(
-                &main_probe_status,
+                running_daemon_probe_pid(&main_probe_status),
                 supervised_main.as_ref().map(|child| child.id()),
             ) {
                 let promoted_main_binary = pending.activation.main_binary.clone();
@@ -1847,7 +1149,7 @@ pub fn run_shadow_daemon_supervision_loop(
             }
         }
 
-        if should_shadow_start_main(main_restart_suppressed, pending_main_activation)
+        if shadow_main_should_start(main_restart_suppressed, pending_main_activation)
             && supervised_main.is_none()
             && matches!(main_probe_status, DaemonProbeStatus::NotRunning)
             && (!pending_main_activation || main_data_owner_lock_released(&main_paths))
@@ -2086,7 +1388,7 @@ pub fn run_shadow_daemon_supervision_loop(
                         supervised_main = None;
                         supervised_main_started_at = None;
                         main_restart_suppressed = false;
-                        prepare_immediate_shadow_main_restart(&mut main_restart_backoff);
+                        main_restart_backoff.reset();
                         main_probe_status = DaemonProbeStatus::NotRunning;
                         last_main_probe = Instant::now();
                         crate::append_operational_event_best_effort(
@@ -2252,10 +1554,6 @@ fn shadow_main_probe_interval(pending_rollout: bool) -> Duration {
     }
 }
 
-fn should_shadow_start_main(main_restart_suppressed: bool, pending_main_activation: bool) -> bool {
-    pending_main_activation || !main_restart_suppressed
-}
-
 fn pending_main_activation_stop_target(status: &DaemonProbeStatus) -> bool {
     matches!(
         status,
@@ -2263,38 +1561,11 @@ fn pending_main_activation_stop_target(status: &DaemonProbeStatus) -> bool {
     )
 }
 
-fn pending_rollout_probe_matches_candidate(
-    probe_status: &DaemonProbeStatus,
-    candidate_pid: Option<u32>,
-) -> bool {
-    matches!(
-        (probe_status, candidate_pid),
-        (DaemonProbeStatus::Running(status), Some(pid)) if status.pid == pid
-    )
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PendingShadowCandidateExitAction {
-    Promote,
-    Retry,
-    Recover,
-}
-
-fn pending_shadow_candidate_exit_action(
-    probe_status: &DaemonProbeStatus,
-    candidate_pid: Option<u32>,
-    observation: MainExitObservation,
-    now: Instant,
-    deadline: Instant,
-) -> PendingShadowCandidateExitAction {
-    let clean_exit = observation.exit_code == Some(0) && observation.signal.is_none();
-    if clean_exit && pending_rollout_probe_matches_candidate(probe_status, candidate_pid) {
-        return PendingShadowCandidateExitAction::Promote;
+fn running_daemon_probe_pid(status: &DaemonProbeStatus) -> Option<u32> {
+    match status {
+        DaemonProbeStatus::Running(status) => Some(status.pid),
+        DaemonProbeStatus::Locked { .. } | DaemonProbeStatus::NotRunning => None,
     }
-    if clean_exit && now < deadline {
-        return PendingShadowCandidateExitAction::Retry;
-    }
-    PendingShadowCandidateExitAction::Recover
 }
 
 fn pending_main_activation_ready_for_shutdown(rollout_paths: &SelfRolloutPaths) -> bool {
@@ -2467,78 +1738,6 @@ fn terminate_process_for_rollout_stop(
     _mode: RolloutTerminationMode,
 ) -> Result<(), DaemonError> {
     Ok(())
-}
-
-pub async fn handle_daemon_rollout_binary_request<R>(
-    paths: &DaemonPaths,
-    request: ClusterRolloutBinaryRequest,
-    body: &mut R,
-) -> Result<ClusterRolloutBinaryResponse, DaemonError>
-where
-    R: AsyncRead + Unpin,
-{
-    validate_rollout_binary_manifest(&request.manifest)?;
-    let artifact = request
-        .manifest
-        .artifact(&request.artifact_id)
-        .cloned()
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!(
-                "rollout manifest does not contain artifact {}",
-                request.artifact_id
-            ),
-        })?;
-    let data_dir = daemon_data_dir(paths)?;
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    ensure_rollout_layout(&rollout_paths)?;
-    ensure_rollout_upload_manifest(&rollout_paths, &request.manifest)?;
-    receive_rollout_binary_artifact(&rollout_paths, &request.manifest, &artifact, body).await?;
-
-    if let Some(receipt) = read_rollout_binary_receipt(&rollout_paths, &request.manifest)? {
-        let _ = fs::remove_file(rollout_upload_artifact_path(
-            &rollout_paths,
-            &request.manifest.upload_id,
-            &artifact.artifact_id,
-        )?);
-        return Ok(receipt.response);
-    }
-
-    if !request.activate {
-        return Ok(ClusterRolloutBinaryResponse {
-            status: "staged".to_string(),
-            detail: format!(
-                "received and verified rollout artifact {} ({} bytes)",
-                artifact.artifact_id, artifact.total_bytes
-            ),
-            main_binary: rollout_paths.main_binary,
-            shadow_binary: rollout_paths.shadow_binary,
-            source_head: None,
-        });
-    }
-
-    preflight_cluster_rollout_main_bind(
-        paths,
-        data_dir,
-        &request.manifest.host,
-        request.manifest.host_override.as_deref(),
-        request.manifest.port,
-        request.manifest.shadow_port,
-    )?;
-
-    let paths = paths.clone();
-    let manifest = request.manifest;
-    let activation_manifest = manifest.clone();
-    let response = tokio::task::spawn_blocking(move || {
-        activate_daemon_rollout_binary_request(&paths, activation_manifest)
-    })
-    .await
-    .map_err(|source| DaemonError::Io {
-        path: "rollout binary activation task".to_string(),
-        detail: source.to_string(),
-    })??;
-    write_rollout_binary_receipt(&rollout_paths, &manifest, &response)?;
-    remove_rollout_uploaded_artifacts(&rollout_paths, &manifest);
-    Ok(response)
 }
 
 pub fn handle_daemon_rollout_native_dylib_module_request(
@@ -2716,13 +1915,21 @@ fn module_rollout_response_detail(response: &ClusterRolloutNativeDylibModuleResp
     )
 }
 
-fn activate_daemon_rollout_binary_request(
+pub(crate) fn activate_daemon_rollout_binary_manifest(
     paths: &DaemonPaths,
     manifest: ClusterRolloutBinaryManifest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
     validate_rollout_upload_component("upload id", &manifest.upload_id)?;
     validate_rollout_upload_component("artifact id", &manifest.binary.artifact_id)?;
     let data_dir = daemon_data_dir(paths)?;
+    preflight_cluster_rollout_main_bind(
+        paths,
+        data_dir,
+        &manifest.host,
+        manifest.host_override.as_deref(),
+        manifest.port,
+        manifest.shadow_port,
+    )?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
     let source = manifest.source.clone();
@@ -2909,355 +2116,6 @@ fn activate_daemon_rollout_binary_request(
         shadow_binary,
         source_head: None,
     })
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct ClusterRolloutBinaryReceipt {
-    manifest: ClusterRolloutBinaryManifest,
-    response: ClusterRolloutBinaryResponse,
-}
-
-fn validate_rollout_binary_manifest(
-    manifest: &ClusterRolloutBinaryManifest,
-) -> Result<(), DaemonError> {
-    validate_rollout_upload_component("upload id", &manifest.upload_id)?;
-    let mut artifact_ids = BTreeSet::new();
-    for artifact in manifest.artifacts() {
-        validate_rollout_upload_component("artifact id", &artifact.artifact_id)?;
-        if artifact.total_bytes == 0 {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "rollout artifact {} must contain at least one byte",
-                    artifact.artifact_id
-                ),
-            });
-        }
-        if artifact.blake3.len() != blake3::OUT_LEN {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "rollout artifact {} has a {}-byte blake3 digest; expected {}",
-                    artifact.artifact_id,
-                    artifact.blake3.len(),
-                    blake3::OUT_LEN
-                ),
-            });
-        }
-        if !artifact_ids.insert(artifact.artifact_id.as_str()) {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "rollout manifest contains duplicate artifact id {}",
-                    artifact.artifact_id
-                ),
-            });
-        }
-    }
-    manifest.total_bytes().ok_or_else(|| DaemonError::Parse {
-        detail: "rollout manifest total byte count overflowed u64".to_string(),
-    })?;
-    Ok(())
-}
-
-fn rollout_upload_manifest_path(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-) -> Result<PathBuf, DaemonError> {
-    Ok(rollout_upload_dir(rollout_paths, upload_id)?.join("manifest.sobj"))
-}
-
-fn rollout_upload_receipt_path(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-) -> Result<PathBuf, DaemonError> {
-    Ok(rollout_upload_dir(rollout_paths, upload_id)?.join("result.sobj"))
-}
-
-fn ensure_rollout_upload_manifest(
-    rollout_paths: &SelfRolloutPaths,
-    manifest: &ClusterRolloutBinaryManifest,
-) -> Result<(), DaemonError> {
-    let path = rollout_upload_manifest_path(rollout_paths, &manifest.upload_id)?;
-    if path.exists() {
-        let existing: ClusterRolloutBinaryManifest = read_object(&path)?;
-        if existing != *manifest {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "rollout upload id {} was already used with a different manifest",
-                    manifest.upload_id
-                ),
-            });
-        }
-        return Ok(());
-    }
-    write_object(&path, manifest)?;
-    sync_rollout_control_file(&path)
-}
-
-fn read_rollout_binary_receipt(
-    rollout_paths: &SelfRolloutPaths,
-    manifest: &ClusterRolloutBinaryManifest,
-) -> Result<Option<ClusterRolloutBinaryReceipt>, DaemonError> {
-    let path = rollout_upload_receipt_path(rollout_paths, &manifest.upload_id)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-    let receipt: ClusterRolloutBinaryReceipt = read_object(&path)?;
-    if receipt.manifest != *manifest {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "rollout upload id {} has a result for a different manifest",
-                manifest.upload_id
-            ),
-        });
-    }
-    Ok(Some(receipt))
-}
-
-fn write_rollout_binary_receipt(
-    rollout_paths: &SelfRolloutPaths,
-    manifest: &ClusterRolloutBinaryManifest,
-    response: &ClusterRolloutBinaryResponse,
-) -> Result<(), DaemonError> {
-    let path = rollout_upload_receipt_path(rollout_paths, &manifest.upload_id)?;
-    write_object(
-        &path,
-        &ClusterRolloutBinaryReceipt {
-            manifest: manifest.clone(),
-            response: response.clone(),
-        },
-    )?;
-    sync_rollout_control_file(&path)
-}
-
-fn sync_rollout_control_file(path: &Path) -> Result<(), DaemonError> {
-    // Windows' FlushFileBuffers requires a handle opened with write access.
-    // `File::open` is read-only and therefore made every streamed rollout fail
-    // after persisting its manifest or receipt with ERROR_ACCESS_DENIED.
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })
-}
-
-async fn receive_rollout_binary_artifact<R>(
-    rollout_paths: &SelfRolloutPaths,
-    manifest: &ClusterRolloutBinaryManifest,
-    artifact: &ClusterRolloutUploadArtifactSpec,
-    body: &mut R,
-) -> Result<(), DaemonError>
-where
-    R: AsyncRead + Unpin,
-{
-    let path =
-        rollout_upload_artifact_path(rollout_paths, &manifest.upload_id, &artifact.artifact_id)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-    }
-    let result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        let mut remaining = artifact.total_bytes;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = vec![0_u8; CLUSTER_ROLLOUT_BODY_BUFFER_BYTES];
-        while remaining != 0 {
-            let wanted = usize::try_from(remaining.min(buffer.len() as u64))
-                .expect("bounded rollout read size fits usize");
-            let read =
-                body.read(&mut buffer[..wanted])
-                    .await
-                    .map_err(|source| DaemonError::Io {
-                        path: format!("request body for {}", artifact.artifact_id),
-                        detail: source.to_string(),
-                    })?;
-            if read == 0 {
-                return Err(DaemonError::Parse {
-                    detail: format!(
-                        "rollout artifact {} ended {} bytes early",
-                        artifact.artifact_id, remaining
-                    ),
-                });
-            }
-            file.write_all(&buffer[..read])
-                .await
-                .map_err(|source| DaemonError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                })?;
-            hasher.update(&buffer[..read]);
-            remaining -= u64::try_from(read).expect("read length fits u64");
-        }
-        let mut extra = [0_u8; 1];
-        if body
-            .read(&mut extra)
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: format!("request body for {}", artifact.artifact_id),
-                detail: source.to_string(),
-            })?
-            != 0
-        {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "rollout artifact {} exceeded its declared {} bytes",
-                    artifact.artifact_id, artifact.total_bytes
-                ),
-            });
-        }
-        file.flush().await.map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        file.sync_all().await.map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let actual = hasher.finalize();
-        if actual.as_bytes().as_slice() != artifact.blake3.as_slice() {
-            return Err(DaemonError::Parse {
-                detail: format!("rollout artifact {} hash mismatch", artifact.artifact_id),
-            });
-        }
-        Ok(())
-    }
-    .await;
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-    result
-}
-
-fn remove_rollout_uploaded_artifacts(
-    rollout_paths: &SelfRolloutPaths,
-    manifest: &ClusterRolloutBinaryManifest,
-) {
-    for artifact in manifest.artifacts() {
-        if let Ok(path) =
-            rollout_upload_artifact_path(rollout_paths, &manifest.upload_id, &artifact.artifact_id)
-        {
-            let _ = fs::remove_file(path);
-        }
-    }
-}
-
-fn rollout_upload_dir(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-) -> Result<PathBuf, DaemonError> {
-    validate_rollout_upload_component("upload id", upload_id)?;
-    Ok(rollout_paths
-        .root
-        .join("staged")
-        .join("uploads")
-        .join(upload_id))
-}
-
-fn rollout_upload_artifact_path(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-    artifact_id: &str,
-) -> Result<PathBuf, DaemonError> {
-    validate_rollout_upload_component("artifact id", artifact_id)?;
-    Ok(rollout_upload_dir(rollout_paths, upload_id)?.join(format!("{artifact_id}.part")))
-}
-
-fn validate_rollout_upload_component(label: &str, value: &str) -> Result<(), DaemonError> {
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        return Err(DaemonError::Parse {
-            detail: format!("invalid rollout upload {label}: `{value}`"),
-        });
-    }
-    Ok(())
-}
-
-fn verify_rollout_uploaded_module(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-    module: &ClusterRolloutNativeDylibModuleUploadSpec,
-) -> Result<LocalRolloutNativeDylibModuleArtifact, DaemonError> {
-    let built_library =
-        verify_rollout_uploaded_artifact(rollout_paths, upload_id, &module.artifact)?;
-    Ok(LocalRolloutNativeDylibModuleArtifact {
-        module_id: module.module_id.clone(),
-        interface_version: module.interface_version.clone(),
-        cache_key: module.cache_key.clone(),
-        library_name: module.library_name.clone(),
-        built_library,
-        source: module.source.clone(),
-    })
-}
-
-fn verify_rollout_uploaded_artifact(
-    rollout_paths: &SelfRolloutPaths,
-    upload_id: &str,
-    spec: &ClusterRolloutUploadArtifactSpec,
-) -> Result<PathBuf, DaemonError> {
-    validate_rollout_upload_component("artifact id", &spec.artifact_id)?;
-    let path = rollout_upload_artifact_path(rollout_paths, upload_id, &spec.artifact_id)?;
-    let metadata = path.metadata().map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if metadata.len() != spec.total_bytes {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "rollout upload artifact {} is {} bytes, expected {}",
-                spec.artifact_id,
-                metadata.len(),
-                spec.total_bytes
-            ),
-        });
-    }
-    let actual = rollout_file_blake3(&path)?;
-    if actual != spec.blake3 {
-        return Err(DaemonError::Parse {
-            detail: format!("rollout upload artifact {} hash mismatch", spec.artifact_id),
-        });
-    }
-    Ok(path)
-}
-
-fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, DaemonError> {
-    let mut file = fs::File::open(path).map_err(|source| DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().as_bytes().to_vec())
 }
 
 pub fn stage_rollout_main_activation(
@@ -3559,104 +2417,6 @@ fn cluster_rollout_current_shadow_status(data_dir: &Path) -> Option<DaemonStatus
     }
 }
 
-fn select_cluster_rollout_main_host(
-    current_host: Option<&str>,
-    supervised_main_host: Option<&str>,
-    requested_host: &str,
-    requested_host_override: Option<&str>,
-) -> String {
-    requested_host_override
-        .or(current_host)
-        .or(supervised_main_host)
-        .unwrap_or(requested_host)
-        .to_string()
-}
-
-fn select_cluster_rollout_shadow_host(
-    current_shadow_host: Option<&str>,
-    candidate_main_host: &str,
-    requested_host_override: Option<&str>,
-) -> String {
-    requested_host_override
-        .or(current_shadow_host)
-        .unwrap_or(candidate_main_host)
-        .to_string()
-}
-
-fn manual_endpoint_host(address: &str) -> Option<&str> {
-    if let Some(rest) = address.strip_prefix('[') {
-        return rest.split_once("]:").map(|(host, _)| host);
-    }
-    address.rsplit_once(':').map(|(host, _)| host)
-}
-
-fn rollout_bind_covers_manual_tcp_endpoint(
-    bind_host: &str,
-    bind_port: u16,
-    endpoint_address: &str,
-) -> bool {
-    rollout_bind_covers_manual_tcp_endpoint_with(
-        bind_host,
-        bind_port,
-        endpoint_address,
-        |host, port| {
-            (host, port)
-                .to_socket_addrs()
-                .map(|addresses| addresses.collect())
-                .unwrap_or_default()
-        },
-    )
-}
-
-fn rollout_bind_covers_manual_tcp_endpoint_with<R>(
-    bind_host: &str,
-    bind_port: u16,
-    endpoint_address: &str,
-    mut resolve_host: R,
-) -> bool
-where
-    R: FnMut(&str, u16) -> Vec<SocketAddr>,
-{
-    let endpoint_port = endpoint_address
-        .parse::<SocketAddr>()
-        .ok()
-        .map(|socket| socket.port())
-        .or_else(|| {
-            endpoint_address
-                .rsplit_once(':')
-                .and_then(|(_, port)| port.parse::<u16>().ok())
-        });
-    if endpoint_port != Some(bind_port) {
-        return false;
-    }
-
-    let bind_host = bind_host
-        .trim()
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or_else(|| bind_host.trim());
-    if let Ok(bind_ip) = bind_host.parse::<IpAddr>() {
-        if bind_ip.is_unspecified() {
-            if let Ok(endpoint) = endpoint_address.parse::<SocketAddr>() {
-                return bind_ip.is_ipv4() == endpoint.ip().is_ipv4();
-            }
-            let Some(endpoint_host) = manual_endpoint_host(endpoint_address) else {
-                return false;
-            };
-            let resolved = resolve_host(endpoint_host, bind_port);
-            return !resolved.is_empty()
-                && resolved.into_iter().all(|endpoint| {
-                    endpoint.port() == bind_port && bind_ip.is_ipv4() == endpoint.ip().is_ipv4()
-                });
-        }
-        return endpoint_address
-            .parse::<SocketAddr>()
-            .is_ok_and(|endpoint| endpoint.ip() == bind_ip);
-    }
-    manual_endpoint_host(endpoint_address)
-        .is_some_and(|endpoint_host| endpoint_host.eq_ignore_ascii_case(bind_host))
-}
-
 fn preflight_cluster_rollout_main_bind(
     current_daemon_paths: &DaemonPaths,
     data_dir: &Path,
@@ -3668,7 +2428,7 @@ fn preflight_cluster_rollout_main_bind(
     let main_status = cluster_rollout_current_main_status(current_daemon_paths, data_dir)?;
     let shadow_status = cluster_rollout_current_shadow_status(data_dir);
     let supervised_main_host = env::var(SHADOW_MAIN_HOST_ENV).ok();
-    let candidate_host = select_cluster_rollout_main_host(
+    let candidate_host = select_rollout_main_host(
         main_status.as_ref().map(|status| status.host.as_str()),
         supervised_main_host.as_deref(),
         requested_host,
@@ -3683,7 +2443,7 @@ fn preflight_cluster_rollout_main_bind(
                 .and_then(|value| value.parse::<u16>().ok())
         })
         .unwrap_or(requested_port);
-    let candidate_shadow_host = select_cluster_rollout_shadow_host(
+    let candidate_shadow_host = select_rollout_shadow_host(
         shadow_status.as_ref().map(|status| status.host.as_str()),
         &candidate_host,
         requested_host_override,
@@ -3751,7 +2511,7 @@ fn prepare_cluster_rollout_main_activation(
         .and_then(|status| status.executable.clone())
         .unwrap_or_else(|| main_binary.clone());
     let supervised_main_host = env::var(SHADOW_MAIN_HOST_ENV).ok();
-    let main_host = select_cluster_rollout_main_host(
+    let main_host = select_rollout_main_host(
         main_status.as_ref().map(|status| status.host.as_str()),
         supervised_main_host.as_deref(),
         &requested_host,
@@ -3766,7 +2526,7 @@ fn prepare_cluster_rollout_main_activation(
                 .and_then(|value| value.parse::<u16>().ok())
         })
         .unwrap_or(requested_port);
-    let shadow_host = select_cluster_rollout_shadow_host(
+    let shadow_host = select_rollout_shadow_host(
         shadow_status.as_ref().map(|status| status.host.as_str()),
         &main_host,
         requested_host_override.as_deref(),
@@ -4688,20 +3448,10 @@ fn classify_shadow_main_exit(
     supervisor_restart_requested: bool,
     kind: sinomo_rollout::MainExitKind,
 ) -> ShadowMainExit {
-    if supervisor_restart_requested
-        && matches!(
-            kind,
-            sinomo_rollout::MainExitKind::CleanExit
-                | sinomo_rollout::MainExitKind::RequestedShutdown
-        )
-    {
-        ShadowMainExit::ImmediateRestartRequested
-    } else if supervisor_restart_requested || kind == sinomo_rollout::MainExitKind::Crash {
-        // Preserve the existing backoff for crashes and for an explicit
-        // request whose process did not exit cleanly.
-        ShadowMainExit::RestartRequested
-    } else {
-        ShadowMainExit::Suppressed
+    match classify_supervised_main_exit(supervisor_restart_requested, kind) {
+        SupervisedMainExitDecision::RestartImmediately => ShadowMainExit::ImmediateRestartRequested,
+        SupervisedMainExitDecision::RestartWithBackoff => ShadowMainExit::RestartRequested,
+        SupervisedMainExitDecision::SuppressRestart => ShadowMainExit::Suppressed,
     }
 }
 
@@ -4718,8 +3468,10 @@ pub fn handle_pending_shadow_main_process_exit(
     let observation = crate::main_exit_observation_from_status(status);
     let probe_status = probe_daemon_status(main_paths, probe_timeout);
     match pending_shadow_candidate_exit_action(
-        &probe_status,
-        Some(candidate_pid),
+        pending_rollout_probe_matches_candidate(
+            running_daemon_probe_pid(&probe_status),
+            Some(candidate_pid),
+        ),
         observation,
         Instant::now(),
         pending.deadline,
@@ -5297,626 +4049,6 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn rollout_telemetry_reactor_test_event(label: &str, kind: &str) -> sinomo_core::EventEnvelope {
-        sinomo_core::EventEnvelope::new(
-            sinomo_core::Id::from_legacy_named(format!("event_{label}")).expect("event id"),
-            time::OffsetDateTime::now_utc(),
-            sinomo_core::node::NodeId::from_legacy_named("node_rollout_reactor").expect("node id"),
-            sinomo_core::Source::new("test.rollout-reactor").expect("source"),
-            sinomo_core::EventKind::new(kind).expect("event kind"),
-            sinomo_core::Salience::new(0.5).expect("salience"),
-            sinomo_core::Confidence::new(0.9).expect("confidence"),
-            sinomo_core::RoutingMetadata::new(
-                sinomo_core::RoutingScope::Local,
-                sinomo_core::LatencyClass::Reactive,
-                sinomo_core::PrivacyClass::Derived,
-            ),
-        )
-    }
-
-    fn rollout_telemetry_test_reactor(
-        label: &str,
-    ) -> (
-        sinomo_testdir::TestDir,
-        DaemonPaths,
-        DaemonRolloutTelemetryReactor,
-    ) {
-        let root = temp_rollout_test_root(label);
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        fs::create_dir_all(&paths.root).expect("daemon root");
-        let reactor = DaemonRolloutTelemetryReactor::new(&paths).expect("telemetry reactor");
-        (root, paths, reactor)
-    }
-
-    fn complete_rollout_telemetry_startup(
-        reactor: &mut DaemonRolloutTelemetryReactor,
-        status: sinomo_rollout::RolloutTelemetryAdvanceStatus,
-    ) {
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(Instant::now(), || Ok::<_, ()>(("startup", status)))
-                .expect("startup reconciliation"),
-            Some("startup")
-        );
-    }
-
-    fn append_rollout_telemetry_event_raw(
-        path: &Path,
-        event: sinomo_core::EventEnvelope,
-        terminate_record: bool,
-    ) {
-        let stored = sinomo_core::events::StoredEvent {
-            sequence: sinomo_core::events::EventSequence(1),
-            appended_at: time::OffsetDateTime::now_utc(),
-            event,
-        };
-        let mut bytes = serde_json::to_vec(&stored).expect("stored event JSON");
-        if terminate_record {
-            bytes.push(b'\n');
-        }
-        append_rollout_telemetry_bytes_raw(path, &bytes);
-    }
-
-    fn append_rollout_telemetry_bytes_raw(path: &Path, bytes: &[u8]) {
-        use std::io::Write as _;
-
-        fs::create_dir_all(path.parent().expect("event log parent")).expect("event log parent");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .expect("raw event log append");
-        file.write_all(&bytes).expect("raw event bytes");
-        file.flush().expect("raw event flush");
-    }
-
-    fn replace_rollout_telemetry_source_raw(path: &Path, bytes: &[u8]) {
-        let parent = path.parent().expect("source parent");
-        fs::create_dir_all(parent).expect("source parent");
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("source file name");
-        let temporary = parent.join(format!(".{file_name}.external-replacement"));
-        fs::write(&temporary, bytes).expect("external source staging write");
-        sinomo_core::storage::durable_file::replace_file(&temporary, path)
-            .expect("external source atomic replacement");
-    }
-
-    async fn wait_for_source_generation_after(
-        source_rx: &mut tokio::sync::watch::Receiver<u64>,
-        generation: u64,
-    ) {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while *source_rx.borrow_and_update() <= generation {
-                source_rx.changed().await.expect("source owner retained");
-            }
-        })
-        .await
-        .expect("source filesystem notification");
-    }
-
-    fn prepared_rollout_telemetry_generations(
-        reactor: &mut DaemonRolloutTelemetryReactor,
-        now: Instant,
-    ) -> Option<DaemonRolloutTelemetrySourceGenerations> {
-        reactor
-            .prepare_runnable_generations(now)
-            .expect("prepare rollout telemetry sources")
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_idle_and_terminal_generations_have_no_healthy_wake() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-idle-terminal");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
-        );
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-        assert_eq!(reactor.retry_at, None);
-
-        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &event_log_path,
-            rollout_telemetry_reactor_test_event(
-                "no-runtime-relevant",
-                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-            ),
-            true,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-
-        let gate_generation = *reactor.gate_source_rx.borrow();
-        replace_rollout_telemetry_source_raw(&reactor.source_paths.gate_config, b"external gate");
-        wait_for_source_generation_after(&mut reactor.gate_source_rx, gate_generation).await;
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None,
-            "events and gates cannot create a missing runtime state"
-        );
-
-        let runtime_generation = *reactor.runtime_source_rx.borrow();
-        replace_rollout_telemetry_source_raw(
-            &reactor.source_paths.runtime_state,
-            b"external runtime state",
-        );
-        wait_for_source_generation_after(&mut reactor.runtime_source_rx, runtime_generation).await;
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(Instant::now(), || {
-                    Ok::<_, ()>((
-                        "terminal",
-                        sinomo_rollout::RolloutTelemetryAdvanceStatus::TerminalStage,
-                    ))
-                })
-                .expect("terminal reconciliation"),
-            Some("terminal")
-        );
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &event_log_path,
-            rollout_telemetry_reactor_test_event(
-                "terminal-relevant",
-                sinomo_module::MODULE_INVOCATION_DECISION_EVENT_KIND,
-            ),
-            true,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-        assert_eq!(
-            prepared_rollout_telemetry_generations(
-                &mut reactor,
-                Instant::now() + Duration::from_secs(24 * 60 * 60)
-            ),
-            None,
-            "terminal state ignores telemetry until runtime state changes"
-        );
-        let runtime_generation = *reactor.runtime_source_rx.borrow();
-        replace_rollout_telemetry_source_raw(
-            &reactor.source_paths.runtime_state,
-            b"new external runtime state",
-        );
-        wait_for_source_generation_after(&mut reactor.runtime_source_rx, runtime_generation).await;
-        assert!(prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some());
-        assert_eq!(reactor.retry_at, None, "success must not retain a timer");
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_disarmed_event_activity_does_not_wake_task() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-disarmed-wait");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
-        );
-        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
-        let event_writer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            append_rollout_telemetry_event_raw(
-                &event_log_path,
-                rollout_telemetry_reactor_test_event(
-                    "disarmed",
-                    sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-                ),
-                true,
-            );
-        });
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(100),
-                reactor.wait_for_source_retry_or_shutdown(&mut shutdown_rx)
-            )
-            .await
-            .is_err(),
-            "event-log activity must not wake a reactor with no live candidate"
-        );
-        event_writer.await.expect("event writer");
-        assert!(
-            *reactor.event_file_source_rx.borrow() > event_generation,
-            "the filesystem watcher did observe the ignored event append"
-        );
-
-        let runtime_path = reactor.source_paths.runtime_state.clone();
-        let runtime_writer = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            replace_rollout_telemetry_source_raw(&runtime_path, b"external runtime rearm");
-        });
-        assert!(
-            !tokio::time::timeout(
-                Duration::from_secs(2),
-                reactor.wait_for_source_retry_or_shutdown(&mut shutdown_rx)
-            )
-            .await
-            .expect("runtime source wake"),
-            "runtime source activity re-arms the reactor"
-        );
-        runtime_writer.await.expect("runtime writer");
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_irrelevant_external_event_does_not_wake_reactor() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-irrelevant-event");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-        );
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
-            rollout_telemetry_reactor_test_event("irrelevant", "daemon.status.observed"),
-            true,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_relevant_external_event_runs_exactly_once() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-relevant-event");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-        );
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
-            rollout_telemetry_reactor_test_event(
-                "relevant",
-                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-            ),
-            true,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-
-        let mut reconciliations = 0;
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(Instant::now(), || {
-                    reconciliations += 1;
-                    Ok::<_, ()>((
-                        (),
-                        sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-                    ))
-                })
-                .expect("event reconciliation"),
-            Some(())
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-        assert_eq!(reconciliations, 1);
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_partial_external_event_gets_one_activity_bound_retry() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-partial-event");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-        );
-        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &event_log_path,
-            rollout_telemetry_reactor_test_event(
-                "partial",
-                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-            ),
-            false,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-        // A single append can map to more than one backend notification.
-        // Let that finite burst coalesce into the source generation before
-        // asserting the one retry owned by this write.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None,
-            "an uncommitted JSONL record is not a telemetry source"
-        );
-        let retry_at = reactor
-            .event_tail_retry_at
-            .expect("activity-bound partial-record retry");
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
-            None
-        );
-        assert_eq!(
-            reactor.event_tail_retry_at, None,
-            "a torn writer cannot create an indefinite timer"
-        );
-
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_bytes_raw(&event_log_path, b"\n");
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-        assert!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some(),
-            "the next committed file mutation completes and emits the relevant event generation"
-        );
-    }
-
-    #[test]
-    fn rollout_telemetry_duplicate_notification_cannot_rearm_incomplete_tail_retry() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-duplicate-partial-notification");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-        );
-        let event_log_path = root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH);
-        append_rollout_telemetry_event_raw(
-            &event_log_path,
-            rollout_telemetry_reactor_test_event(
-                "partial-duplicate",
-                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-            ),
-            false,
-        );
-        reactor
-            .event_file_source_tx
-            .send_modify(|generation| *generation = generation.saturating_add(1));
-
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-        let retry_at = reactor
-            .event_tail_retry_at
-            .expect("first incomplete length owns one retry");
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
-            None
-        );
-        assert_eq!(reactor.event_tail_retry_at, None);
-
-        reactor
-            .event_file_source_tx
-            .send_modify(|generation| *generation = generation.saturating_add(1));
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-        assert_eq!(
-            reactor.event_tail_retry_at, None,
-            "a duplicate watcher notification at the same incomplete length cannot re-arm"
-        );
-
-        append_rollout_telemetry_bytes_raw(&event_log_path, b" ");
-        reactor
-            .event_file_source_tx
-            .send_modify(|generation| *generation = generation.saturating_add(1));
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-        assert!(
-            reactor.event_tail_retry_at.is_some(),
-            "newly appended bytes may own one bounded retry"
-        );
-    }
-
-    #[test]
-    fn rollout_telemetry_watcher_fault_is_owned_and_reconciles_all_sources() {
-        let (_root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-watcher-fault");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
-        );
-        reactor.watcher_fault_tx.send_modify(|generation| {
-            *generation = generation.saturating_add(1);
-        });
-        assert!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some(),
-            "rebuilding the watcher dirties durable runtime state after the observation gap"
-        );
-        assert_eq!(
-            reactor.completed_watcher_fault_generation,
-            *reactor.watcher_fault_rx.borrow()
-        );
-    }
-
-    #[tokio::test]
-    async fn rollout_telemetry_blocked_gate_rearms_from_external_atomic_replacement() {
-        let (root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-gate-source");
-        complete_rollout_telemetry_startup(
-            &mut reactor,
-            sinomo_rollout::RolloutTelemetryAdvanceStatus::WaitingForTelemetry,
-        );
-        let event_generation = *reactor.event_file_source_rx.borrow();
-        append_rollout_telemetry_event_raw(
-            &root.join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
-            rollout_telemetry_reactor_test_event(
-                "gate-blocked",
-                sinomo_module::MODULE_SHADOW_DECISION_EVENT_KIND,
-            ),
-            true,
-        );
-        wait_for_source_generation_after(&mut reactor.event_file_source_rx, event_generation).await;
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(Instant::now(), || {
-                    Ok::<_, ()>((
-                        "gate-blocked",
-                        sinomo_rollout::RolloutTelemetryAdvanceStatus::PromotionGateBlocked,
-                    ))
-                })
-                .expect("blocked gate reconciliation"),
-            Some("gate-blocked")
-        );
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, Instant::now()),
-            None
-        );
-
-        let gate_generation = *reactor.gate_source_rx.borrow();
-        replace_rollout_telemetry_source_raw(
-            &reactor.source_paths.gate_config,
-            b"external gate replacement",
-        );
-        wait_for_source_generation_after(&mut reactor.gate_source_rx, gate_generation).await;
-        assert!(prepared_rollout_telemetry_generations(&mut reactor, Instant::now()).is_some());
-    }
-
-    #[test]
-    fn rollout_telemetry_retry_timer_exists_only_after_failure() {
-        let (_root, _paths, mut reactor) =
-            rollout_telemetry_test_reactor("telemetry-reactor-failure-retry");
-        assert_eq!(reactor.retry_at, None);
-        let now = Instant::now();
-        let error = reactor
-            .reconcile_pending_with(now, || {
-                Err::<((), sinomo_rollout::RolloutTelemetryAdvanceStatus), _>("injected failure")
-            })
-            .expect_err("failed reconciliation");
-        assert_eq!(error, "injected failure");
-        let retry_at = reactor.retry_at.expect("failure-owned retry");
-        assert_eq!(
-            retry_at.saturating_duration_since(now),
-            DAEMON_ROLLOUT_TELEMETRY_RETRY_INITIAL
-        );
-
-        let mut ran_early = false;
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(retry_at - Duration::from_millis(1), || {
-                    ran_early = true;
-                    Ok::<_, ()>((
-                        (),
-                        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
-                    ))
-                })
-                .expect("retry not due"),
-            None
-        );
-        assert!(!ran_early);
-        assert_eq!(
-            reactor
-                .reconcile_pending_with(retry_at, || {
-                    Ok::<_, ()>((
-                        "recovered",
-                        sinomo_rollout::RolloutTelemetryAdvanceStatus::NoRuntimeState,
-                    ))
-                })
-                .expect("retry due"),
-            Some("recovered")
-        );
-        assert_eq!(reactor.retry_at, None);
-        assert_eq!(
-            prepared_rollout_telemetry_generations(&mut reactor, retry_at),
-            None
-        );
-    }
-
-    fn rollout_binary_test_manifest(bytes: &[u8]) -> ClusterRolloutBinaryManifest {
-        ClusterRolloutBinaryManifest {
-            upload_id: "upload-test".to_string(),
-            source: "test".to_string(),
-            target_os: env::consts::OS.to_string(),
-            target_arch: env::consts::ARCH.to_string(),
-            host: "127.0.0.1".to_string(),
-            host_override: None,
-            port: 21353,
-            shadow_port: 21354,
-            requested_at: "now".to_string(),
-            binary: ClusterRolloutUploadArtifactSpec {
-                artifact_id: "binary".to_string(),
-                total_bytes: bytes.len() as u64,
-                blake3: blake3::hash(bytes).as_bytes().to_vec(),
-            },
-            native_dylib_modules: Vec::new(),
-        }
-    }
-
-    #[tokio::test]
-    async fn rollout_binary_body_streams_to_a_durable_verified_artifact() {
-        let root = temp_rollout_test_root("binary-body-stream");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        fs::create_dir_all(&paths.root).expect("daemon root");
-        let bytes = b"hello world";
-        let manifest = rollout_binary_test_manifest(bytes);
-        let request = ClusterRolloutBinaryRequest {
-            manifest,
-            artifact_id: "binary".to_string(),
-            activate: false,
-        };
-        let mut body = bytes.as_slice();
-
-        let response = handle_daemon_rollout_binary_request(&paths, request, &mut body)
-            .await
-            .expect("streamed upload");
-        assert_eq!(response.status, "staged");
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
-            .expect("upload path");
-        assert_eq!(fs::read(uploaded).expect("uploaded bytes"), bytes);
-        assert!(
-            rollout_upload_manifest_path(&rollout_paths, "upload-test")
-                .expect("manifest path")
-                .exists()
-        );
-    }
-
-    #[tokio::test]
-    async fn rollout_binary_body_rejects_truncated_content_and_removes_partial_file() {
-        let root = temp_rollout_test_root("binary-body-truncated");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        fs::create_dir_all(&paths.root).expect("daemon root");
-        let expected = b"hello world";
-        let manifest = rollout_binary_test_manifest(expected);
-        let request = ClusterRolloutBinaryRequest {
-            manifest,
-            artifact_id: "binary".to_string(),
-            activate: false,
-        };
-        let mut body = b"hello".as_slice();
-
-        let error = handle_daemon_rollout_binary_request(&paths, request, &mut body)
-            .await
-            .expect_err("truncated upload");
-        assert!(error.to_string().contains("ended 6 bytes early"));
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let uploaded = rollout_upload_artifact_path(&rollout_paths, "upload-test", "binary")
-            .expect("upload path");
-        assert!(!uploaded.exists());
-    }
-
-    #[tokio::test]
-    async fn rollout_binary_body_rejects_hash_mismatch() {
-        let root = temp_rollout_test_root("binary-body-hash-mismatch");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        fs::create_dir_all(&paths.root).expect("daemon root");
-        let expected = b"hello world";
-        let manifest = rollout_binary_test_manifest(expected);
-        let request = ClusterRolloutBinaryRequest {
-            manifest,
-            artifact_id: "binary".to_string(),
-            activate: false,
-        };
-        let mut body = b"HELLO WORLD".as_slice();
-
-        let error = handle_daemon_rollout_binary_request(&paths, request, &mut body)
-            .await
-            .expect_err("hash mismatch");
-        assert!(error.to_string().contains("hash mismatch"));
-    }
-
     #[test]
     fn pending_shadow_rollout_uses_fast_main_health_probe() {
         assert!(shadow_main_probe_interval(true) < Duration::from_secs(1));
@@ -5951,13 +4083,6 @@ mod tests {
             shadow_runtime_task_join_timeout("control accept"),
             SHADOW_RUNTIME_TASK_JOIN_TIMEOUT
         );
-    }
-
-    #[test]
-    fn pending_main_activation_overrides_suppressed_restart() {
-        assert!(should_shadow_start_main(true, true));
-        assert!(!should_shadow_start_main(true, false));
-        assert!(should_shadow_start_main(false, false));
     }
 
     #[test]
@@ -6024,43 +4149,6 @@ mod tests {
         assert_eq!(
             staged_main_activation_shutdown_action(true),
             StagedMainActivationShutdown::Immediate
-        );
-    }
-
-    #[test]
-    fn pending_candidate_clean_exit_retries_before_activation_deadline() {
-        let now = Instant::now();
-        let observation = MainExitObservation::exit_code(0);
-
-        assert_eq!(
-            pending_shadow_candidate_exit_action(
-                &DaemonProbeStatus::NotRunning,
-                Some(42),
-                observation,
-                now,
-                now + Duration::from_secs(30)
-            ),
-            PendingShadowCandidateExitAction::Retry
-        );
-        assert_eq!(
-            pending_shadow_candidate_exit_action(
-                &DaemonProbeStatus::NotRunning,
-                Some(42),
-                observation,
-                now,
-                now
-            ),
-            PendingShadowCandidateExitAction::Recover
-        );
-        assert_eq!(
-            pending_shadow_candidate_exit_action(
-                &DaemonProbeStatus::Running(test_daemon_status(42)),
-                Some(42),
-                observation,
-                now,
-                now
-            ),
-            PendingShadowCandidateExitAction::Promote
         );
     }
 
@@ -6279,64 +4367,6 @@ mod tests {
             supervisor_exited,
             "descendant supervisor did not exit after publishing survival"
         );
-    }
-
-    #[test]
-    fn shadow_main_restart_backoff_caps_and_resets_after_stable_runtime() {
-        let mut backoff = ShadowMainRestartBackoff::default();
-        let start = Instant::now();
-
-        let first = backoff.schedule_after_failure(start);
-        assert_eq!(first, SHADOW_MAIN_RESTART_INITIAL_BACKOFF);
-        assert!(!backoff.can_restart(start));
-        assert!(backoff.can_restart(start + first));
-
-        let mut delay = first;
-        let mut now = start;
-        for _ in 0..16 {
-            now = now + delay;
-            delay = backoff.schedule_after_failure(now);
-        }
-        assert_eq!(delay, SHADOW_MAIN_RESTART_MAX_BACKOFF);
-
-        backoff.reset_after_stable_start(Some(now), now + SHADOW_MAIN_RESTART_STABLE_RESET_AFTER);
-        assert_eq!(backoff.consecutive_failures, 0);
-        assert!(backoff.next_restart_at.is_none());
-    }
-
-    #[test]
-    fn explicit_clean_supervised_restart_is_distinct_from_a_crash() {
-        assert_eq!(
-            classify_shadow_main_exit(true, sinomo_rollout::MainExitKind::CleanExit),
-            ShadowMainExit::ImmediateRestartRequested
-        );
-        assert_eq!(
-            classify_shadow_main_exit(true, sinomo_rollout::MainExitKind::Crash),
-            ShadowMainExit::RestartRequested
-        );
-        assert_eq!(
-            classify_shadow_main_exit(false, sinomo_rollout::MainExitKind::Crash),
-            ShadowMainExit::RestartRequested
-        );
-        assert_eq!(
-            classify_shadow_main_exit(false, sinomo_rollout::MainExitKind::CleanExit),
-            ShadowMainExit::Suppressed
-        );
-    }
-
-    #[test]
-    fn explicit_clean_supervised_restart_clears_existing_backoff() {
-        let mut backoff = ShadowMainRestartBackoff::default();
-        let now = Instant::now();
-        backoff.schedule_after_failure(now);
-        backoff.schedule_after_failure(now);
-        assert!(!backoff.can_restart(now));
-
-        prepare_immediate_shadow_main_restart(&mut backoff);
-
-        assert_eq!(backoff.consecutive_failures, 0);
-        assert!(backoff.next_restart_at.is_none());
-        assert!(backoff.can_restart(now));
     }
 
     #[test]
@@ -6629,18 +4659,6 @@ mod tests {
     }
 
     #[test]
-    fn default_cluster_rollout_host_preserves_existing_remote_listeners() {
-        assert_eq!(
-            select_cluster_rollout_main_host(Some("10.14.1.11"), None, "127.0.0.1", None,),
-            "10.14.1.11"
-        );
-        assert_eq!(
-            select_cluster_rollout_shadow_host(Some("10.14.1.12"), "10.14.1.11", None,),
-            "10.14.1.12"
-        );
-    }
-
-    #[test]
     fn shadow_rollout_readiness_requires_replacement_pid_executable_and_bind() {
         let current_exe = env::current_exe().expect("current executable");
         let expected_pid = std::process::id();
@@ -6759,94 +4777,6 @@ mod tests {
         .expect_err("loopback shadow cannot serve a LAN endpoint");
         assert!(error.to_string().contains("shadow endpoint"));
         assert!(error.to_string().contains("10.14.1.11:21354"));
-    }
-
-    #[test]
-    fn wildcard_ipv4_bind_requires_ipv4_hostname_resolution_proof() {
-        let resolve = |host: &str, port: u16| match host {
-            "v4.rollout.test" => vec![SocketAddr::from(([192, 0, 2, 41], port))],
-            "v6.rollout.test" => vec![SocketAddr::from((
-                "2001:db8::41".parse::<std::net::Ipv6Addr>().expect("IPv6"),
-                port,
-            ))],
-            "dual.rollout.test" => vec![
-                SocketAddr::from(([192, 0, 2, 43], port)),
-                SocketAddr::from((
-                    "2001:db8::43".parse::<std::net::Ipv6Addr>().expect("IPv6"),
-                    port,
-                )),
-            ],
-            _ => Vec::new(),
-        };
-
-        assert!(rollout_bind_covers_manual_tcp_endpoint_with(
-            "0.0.0.0",
-            21353,
-            "v4.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "0.0.0.0",
-            21353,
-            "v6.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "0.0.0.0",
-            21353,
-            "unresolved.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "0.0.0.0",
-            21353,
-            "dual.rollout.test:21353",
-            resolve,
-        ));
-    }
-
-    #[test]
-    fn wildcard_ipv6_bind_requires_ipv6_hostname_resolution_proof() {
-        let resolve = |host: &str, port: u16| match host {
-            "v4.rollout.test" => vec![SocketAddr::from(([192, 0, 2, 42], port))],
-            "v6.rollout.test" => vec![SocketAddr::from((
-                "2001:db8::42".parse::<std::net::Ipv6Addr>().expect("IPv6"),
-                port,
-            ))],
-            "dual.rollout.test" => vec![
-                SocketAddr::from(([192, 0, 2, 44], port)),
-                SocketAddr::from((
-                    "2001:db8::44".parse::<std::net::Ipv6Addr>().expect("IPv6"),
-                    port,
-                )),
-            ],
-            _ => Vec::new(),
-        };
-
-        assert!(rollout_bind_covers_manual_tcp_endpoint_with(
-            "::",
-            21353,
-            "v6.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "::",
-            21353,
-            "v4.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "::",
-            21353,
-            "unresolved.rollout.test:21353",
-            resolve,
-        ));
-        assert!(!rollout_bind_covers_manual_tcp_endpoint_with(
-            "::",
-            21353,
-            "dual.rollout.test:21353",
-            resolve,
-        ));
     }
 
     #[test]
@@ -7228,25 +5158,21 @@ mod tests {
     }
 
     #[test]
-    fn pending_rollout_probe_requires_candidate_pid() {
-        let mut status = test_daemon_status(42);
-        assert!(pending_rollout_probe_matches_candidate(
-            &DaemonProbeStatus::Running(status.clone()),
+    fn running_daemon_probe_pid_excludes_locked_and_stopped_daemons() {
+        assert_eq!(
+            running_daemon_probe_pid(&DaemonProbeStatus::Running(test_daemon_status(42))),
             Some(42)
-        ));
-        status.pid = 7;
-        assert!(!pending_rollout_probe_matches_candidate(
-            &DaemonProbeStatus::Running(status),
-            Some(42)
-        ));
-        assert!(!pending_rollout_probe_matches_candidate(
-            &DaemonProbeStatus::NotRunning,
-            Some(42)
-        ));
-        assert!(!pending_rollout_probe_matches_candidate(
-            &DaemonProbeStatus::Running(test_daemon_status(42)),
+        );
+        assert_eq!(
+            running_daemon_probe_pid(&DaemonProbeStatus::Locked {
+                status: Some(test_daemon_status(42)),
+            }),
             None
-        ));
+        );
+        assert_eq!(
+            running_daemon_probe_pid(&DaemonProbeStatus::NotRunning),
+            None
+        );
     }
 
     #[test]

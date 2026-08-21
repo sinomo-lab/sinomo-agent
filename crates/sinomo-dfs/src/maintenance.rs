@@ -5,14 +5,461 @@
 //! maintenance tick against configured metadata shards.
 
 use serde::{Deserialize, Serialize};
+use sinomo_core::ClusterNodeAvailability;
+use sinomo_core::kv::KvEntry;
 use sinomo_core::local::SinomoDataDir;
-use sinomo_core::network::ClusterPaths;
+use sinomo_core::network::{
+    ClusterConnectivityGraph, ClusterPaths, cluster_nodes_share_healthy_component,
+};
 use sinomo_core::node::NodeId;
 use sinomo_core::object::{LengthMode, serde_ext as sinomo_object_serde};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Bounded process-local projection used to schedule DFS maintenance without
+/// repeatedly running a broad maintenance pass.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DfsPendingMaintenanceWork {
+    pub pending_write_count: usize,
+    pub pending_repair_count: usize,
+    pub repair_attempt_count: usize,
+    pub due_repair_attempt_count: usize,
+    pub unattempted_repair_count: usize,
+    pub next_repair_retry_unix_nanos: Option<u64>,
+    pub due_time_based_maintenance_count: usize,
+    pub next_time_based_maintenance_unix_nanos: Option<u64>,
+    pub deferred_work_count: usize,
+    pub pending_namespace_job_count: usize,
+    pub actionable_conflict_count: usize,
+    pub actionable_placement_reconciliation_count: usize,
+    pub metadata_replica_lag_count: usize,
+    pub pending_local_membership_handoff_count: usize,
+    pub completed_local_primary_handoff_rebind_count: usize,
+    pub mounted_mutation_live_count: usize,
+    pub mounted_mutation_recoverable_exact_count: usize,
+    pub mounted_mutation_recoverable_full_count: usize,
+    pub mounted_mutation_overflow_count: usize,
+    pub next_mounted_mutation_reprobe_unix_nanos: Option<u64>,
+}
+
+pub const DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK: usize = 8;
+pub const DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
+pub const DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS: u64 = 256;
+pub const DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE: Duration =
+    Duration::from_secs(7 * 24 * 60 * 60);
+pub const DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS: u64 = 2;
+pub const DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS: u64 = 256;
+pub const DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS: u64 = 4_096;
+pub const DFS_RESIDENT_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET: usize = 64;
+pub const DFS_RESIDENT_METADATA_REPLICATION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DFS_RESIDENT_METADATA_REPLICATION_TARGET_TIMEOUT: Duration = Duration::from_secs(15);
+
+impl DfsPendingMaintenanceWork {
+    pub fn has_work(&self) -> bool {
+        self.pending_write_count > 0
+            || self.pending_repair_count > 0
+            || self.pending_namespace_job_count > 0
+            || self.actionable_conflict_count > 0
+            || self.actionable_placement_reconciliation_count > 0
+            || self.metadata_replica_lag_count > 0
+            || self.pending_local_membership_handoff_count > 0
+            || self.completed_local_primary_handoff_rebind_count > 0
+            || self.mounted_mutation_recoverable_exact_count > 0
+            || self.mounted_mutation_recoverable_full_count > 0
+            || self.due_time_based_maintenance_count > 0
+    }
+
+    pub fn should_trigger_background_maintenance(&self) -> bool {
+        // Metadata replica lag is deliberately absent: retained exact-shard
+        // publisher lanes own those durable cursors and connectivity wakes.
+        self.pending_write_count > 0
+            || self.pending_namespace_job_count > 0
+            || self.actionable_conflict_count > 0
+            || self.actionable_placement_reconciliation_count > 0
+            || self.pending_local_membership_handoff_count > 0
+            || self.completed_local_primary_handoff_rebind_count > 0
+            || self.mounted_mutation_recoverable_exact_count > 0
+            || self.mounted_mutation_recoverable_full_count > 0
+            || self.due_repair_attempt_count > 0
+            || self.unattempted_repair_count > 0
+            || self.due_time_based_maintenance_count > 0
+    }
+
+    pub fn next_maintenance_deadline_unix_nanos(&self) -> Option<u64> {
+        self.next_repair_retry_unix_nanos
+            .into_iter()
+            .chain(self.next_time_based_maintenance_unix_nanos)
+            .chain(self.next_mounted_mutation_reprobe_unix_nanos)
+            .min()
+    }
+
+    pub fn has_deferred_work(&self) -> bool {
+        self.deferred_work_count > 0
+    }
+}
+
+/// Whether a maintenance pass itself proved that bounded work remains and
+/// that the pass made progress toward it.
+pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -> bool {
+    let terminal_namespace_jobs = report
+        .namespace_jobs
+        .completed_job_count
+        .saturating_add(report.namespace_jobs.failed_job_count);
+    let resumed_namespace_jobs_still_running = report
+        .namespace_jobs
+        .resumed_job_count
+        .saturating_sub(terminal_namespace_jobs);
+    let skipped_namespace_jobs = report
+        .namespace_jobs
+        .remaining_running_job_count
+        .saturating_sub(resumed_namespace_jobs_still_running);
+    let namespace_job_limit_reached = terminal_namespace_jobs > 0 && skipped_namespace_jobs > 0;
+
+    let placement_page_remaining = report.placement_reconciliation.as_ref().is_some_and(|job| {
+        job.last_error.is_none()
+            && job.cursor.is_some()
+            && matches!(
+                job.state,
+                crate::DfsPlacementReconciliationState::Scanning
+                    | crate::DfsPlacementReconciliationState::Repairing
+            )
+    });
+    let lifecycle_limit_reached = report.lifecycle_reports.iter().any(|lifecycle| {
+        lifecycle
+            .stale_staging_gc
+            .as_ref()
+            .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_staging_count > 0)
+            || lifecycle
+                .version_gc
+                .as_ref()
+                .is_some_and(|gc| gc.max_deletions_reached && gc.deleted_version_count > 0)
+            || lifecycle.orphan_gc.as_ref().is_some_and(|gc| {
+                gc.max_deletions_reached
+                    && gc
+                        .deleted_orphan_count
+                        .saturating_add(gc.deleted_stale_orphan_observation_count)
+                        .saturating_add(gc.persisted_orphan_observation_count)
+                        .saturating_add(gc.compacted_packed_segment_count)
+                        > 0
+            })
+            || lifecycle
+                .metadata_history_gc
+                .as_ref()
+                .is_some_and(|gc| gc.max_removals_reached && gc.applied_record_count() > 0)
+            || lifecycle
+                .content_reservation_reconciliation
+                .as_ref()
+                .is_some_and(|reconciliation| {
+                    reconciliation.has_more && reconciliation.examined_reservation_count > 0
+                })
+            || lifecycle
+                .tombstone_compaction
+                .as_ref()
+                .is_some_and(|compaction| {
+                    compaction.max_compactions_reached && compaction.compacted_tombstone_count > 0
+                })
+    });
+
+    namespace_job_limit_reached
+        || placement_page_remaining
+        || lifecycle_limit_reached
+        || (report.repair_budget_exhausted && !report.scheduled_repairs.is_empty())
+}
+
+/// Bounded resident-daemon maintenance policy. Inventory-wide lifecycle work
+/// remains disabled and is enabled only by explicit recovery options.
+pub fn dfs_resident_routine_maintenance_tick_options() -> DfsMaintenanceTickOptions {
+    let mut options = DfsMaintenanceTickOptions::default();
+    options.repair_max_jobs = DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK;
+    options.lifecycle.repair_metadata = false;
+    options.lifecycle.cleanup_stale_staging = false;
+    options.lifecycle.compact_tombstones = false;
+    options.lifecycle.tombstone_compaction_min_age = DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE;
+    options.lifecycle.tombstone_compaction_max_records =
+        DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS;
+    options.lifecycle.collect_metadata_history = false;
+    options.lifecycle.metadata_history_gc_min_age = DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE;
+    options.lifecycle.metadata_history_gc_keep_latest_versions =
+        DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
+    options.lifecycle.metadata_history_gc_max_records =
+        DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS;
+    options.lifecycle.collect_content_versions = false;
+    options.lifecycle.collect_orphan_content = false;
+    options.lifecycle.reconcile_content_reservations = false;
+    options
+        .lifecycle
+        .content_reservation_reconciliation_max_records =
+        DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS;
+    options.publish_metadata = false;
+    options.metadata_replication = dfs_resident_metadata_replication_options();
+    options
+}
+
+pub fn dfs_explicit_disaster_recovery_tick_options(
+    content_gc_requested: bool,
+    content_reservation_reconciliation_requested: bool,
+) -> DfsMaintenanceTickOptions {
+    let mut options = dfs_resident_routine_maintenance_tick_options();
+    let inventory_requested = content_gc_requested || content_reservation_reconciliation_requested;
+    options.lifecycle.repair_metadata = inventory_requested;
+    options.lifecycle.cleanup_stale_staging = inventory_requested;
+    options.lifecycle.compact_tombstones = inventory_requested;
+    options.lifecycle.collect_metadata_history = inventory_requested;
+    options.lifecycle.collect_content_versions = content_gc_requested;
+    options.lifecycle.collect_orphan_content = content_gc_requested;
+    options.lifecycle.reconcile_content_reservations = inventory_requested;
+    options
+}
+
+pub fn dfs_resident_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
+    DfsMetadataJournalReplicationOptions {
+        max_batches_per_target: DFS_RESIDENT_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
+        attempt_timeout: DFS_RESIDENT_METADATA_REPLICATION_ATTEMPT_TIMEOUT,
+        target_timeout: DFS_RESIDENT_METADATA_REPLICATION_TARGET_TIMEOUT,
+        probe_caught_up_replicas: true,
+        ..DfsMetadataJournalReplicationOptions::default()
+    }
+}
+
+pub fn dfs_resident_smoke_options() -> crate::DfsSmokeOptions {
+    crate::DfsSmokeOptions {
+        stable_path: true,
+        remote_replica_candidates: false,
+        foreground_replica_repair: false,
+        inspect_pending_repairs: false,
+        publish_metadata: false,
+        metadata_replication: DfsMetadataJournalReplicationOptions {
+            max_batches_per_target: 0,
+            ..dfs_resident_metadata_replication_options()
+        },
+        ..crate::DfsSmokeOptions::default()
+    }
+}
+
+struct DfsConnectivityStatusProbe;
+
+impl sinomo_core::cluster::ClusterStatusProbe for DfsConnectivityStatusProbe {
+    fn probe_member_status(
+        &self,
+        _state: &sinomo_core::ClusterBootstrapState,
+        _member: &sinomo_core::ClusterMemberRecord,
+    ) -> Option<sinomo_core::ClusterNodeStatusRecord> {
+        None
+    }
+}
+
+pub fn dfs_node_is_offline_for_maintenance(
+    availability: &ClusterNodeAvailability,
+    connectivity: &ClusterConnectivityGraph,
+    local_node_id: &NodeId,
+    target_node_id: &NodeId,
+) -> bool {
+    availability != &ClusterNodeAvailability::Online
+        && local_node_id != target_node_id
+        && !cluster_nodes_share_healthy_component(connectivity, local_node_id, target_node_id)
+}
+
+/// Build the bounded reachability exclusion set used by DFS repair and
+/// detached-send scheduling.
+pub fn dfs_offline_node_ids(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> BTreeSet<NodeId> {
+    let connectivity = ClusterConnectivityGraph::read_for_local(cluster_paths, state);
+    sinomo_core::cluster::cluster_health_rows_with_probe(
+        cluster_paths,
+        state,
+        &DfsConnectivityStatusProbe,
+        false,
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .filter_map(|row| {
+        dfs_node_is_offline_for_maintenance(
+            &row.availability,
+            &connectivity,
+            &state.local_node_id,
+            &row.member.node_id,
+        )
+        .then_some(row.member.node_id)
+    })
+    .collect()
+}
+
+pub fn dfs_resident_maintenance_execution_exclusions(
+    cluster_paths: &ClusterPaths,
+    state: &sinomo_core::ClusterBootstrapState,
+) -> DfsMaintenanceExecutionExclusions {
+    DfsMaintenanceExecutionExclusions::new(dfs_offline_node_ids(cluster_paths, state))
+}
+
+/// Count placement jobs that can advance without waiting on an already-owned
+/// durable repair generation.
+pub fn dfs_actionable_placement_reconciliation_count(
+    jobs: &[crate::DfsPlacementReconciliationJob],
+    pending_repair_count: usize,
+) -> usize {
+    jobs.iter()
+        .filter(|job| match job.state {
+            crate::DfsPlacementReconciliationState::Pending
+            | crate::DfsPlacementReconciliationState::Scanning => true,
+            crate::DfsPlacementReconciliationState::Repairing => {
+                job.cursor.is_some() || job.pending_repair_count == 0 || pending_repair_count == 0
+            }
+            crate::DfsPlacementReconciliationState::Completed
+            | crate::DfsPlacementReconciliationState::Failed => false,
+        })
+        .count()
+}
+
+/// Count completed local-primary handoffs whose durable router generation has
+/// not consumed the exact completion proof yet.
+pub fn dfs_completed_local_primary_handoff_rebind_count(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    pending_handoffs: &[crate::DfsMetadataShardMembershipHandoff],
+    active_shards: &[crate::DfsMetadataShardConfig],
+    authority_entries: &[KvEntry],
+) -> Result<usize, DfsError> {
+    let pending_shards = pending_handoffs
+        .iter()
+        .map(|handoff| {
+            (
+                handoff.retiring_shard.file_system_id.clone(),
+                handoff.retiring_shard.shard_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut count = 0usize;
+    for active in active_shards
+        .iter()
+        .filter(|shard| shard.primary_node_id == *local_node_id)
+    {
+        if pending_shards.contains(&(active.file_system_id.clone(), active.shard_id.clone())) {
+            continue;
+        }
+        let shard_id = crate::DfsMetadataShardId::new(active.shard_id.clone());
+        let Some(freeze) = crate::read_local_dfs_metadata_shard_write_freeze(data_dir, &shard_id)?
+        else {
+            continue;
+        };
+        if freeze.activated_epoch.is_some() {
+            continue;
+        }
+        let proof_key = crate::metadata_shard_membership_handoff_proof_key(
+            &active.file_system_id,
+            &active.shard_id,
+        );
+        let Some(proof) = authority_entries
+            .binary_search_by(|entry| entry.key.as_str().cmp(proof_key.as_str()))
+            .ok()
+            .map(|index| {
+                authority_entries[index].decode::<crate::DfsMetadataShardMembershipHandoffProof>()
+            })
+            .transpose()?
+        else {
+            continue;
+        };
+        if freeze.journal_sequence == proof.journal_sequence
+            && freeze.state_fingerprint == proof.state_fingerprint
+            && crate::completed_promoted_primary_handoff_matches(
+                local_node_id,
+                active,
+                &freeze.handoff_id,
+                freeze.retiring_epoch,
+                &proof,
+            )
+        {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+/// Build the bounded production maintenance projection from the retained DFS
+/// authority prefix and the durable repair queue. This never hydrates metadata
+/// or enumerates content.
+pub fn dfs_pending_reactive_maintenance_work_from_authority_entries(
+    data_dir: &SinomoDataDir,
+    local_node_id: &NodeId,
+    authority_entries: &[KvEntry],
+    repair_attempt_records: &[DfsRepairAttemptRecord],
+    now_unix_nanos: u64,
+) -> Result<DfsPendingMaintenanceWork, DfsError> {
+    let mounted_mutation_work =
+        crate::mounted_sifs_mutation_pending_maintenance_work(data_dir, now_unix_nanos)?;
+    let due_repair_attempt_count = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos <= now_unix_nanos
+        })
+        .count();
+    let next_repair_retry_unix_nanos = repair_attempt_records
+        .iter()
+        .filter(|record| {
+            record.next_retry_unix_nanos != u64::MAX
+                && record.next_retry_unix_nanos > now_unix_nanos
+        })
+        .map(|record| record.next_retry_unix_nanos)
+        .min();
+    let placement_prefix = crate::placement_reconciliations_prefix(&crate::sifs_file_system_id());
+    let placement_reconciliation_jobs = authority_entries
+        .iter()
+        .filter(|entry| entry.key.starts_with(&placement_prefix))
+        .map(|entry| entry.decode::<crate::DfsPlacementReconciliationJob>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let actionable_placement_reconciliation_count = dfs_actionable_placement_reconciliation_count(
+        &placement_reconciliation_jobs,
+        repair_attempt_records.len(),
+    );
+    let membership_handoffs = authority_entries
+        .iter()
+        .filter(|entry| crate::dfs_metadata_shard_membership_handoff_key_is_exact(&entry.key))
+        .map(|entry| entry.decode::<crate::DfsMetadataShardMembershipHandoff>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let active_shards = authority_entries
+        .iter()
+        .filter(|entry| crate::dfs_metadata_shard_config_key_is_exact(&entry.key))
+        .map(|entry| entry.decode::<crate::DfsMetadataShardConfig>())
+        .collect::<Result<Vec<_>, _>>()?;
+    let pending_local_membership_handoff_count = membership_handoffs
+        .iter()
+        .filter(|handoff| handoff.retiring_shard.primary_node_id == *local_node_id)
+        .count();
+    let completed_local_primary_handoff_rebind_count =
+        dfs_completed_local_primary_handoff_rebind_count(
+            data_dir,
+            local_node_id,
+            &membership_handoffs,
+            &active_shards,
+            authority_entries,
+        )?;
+
+    Ok(DfsPendingMaintenanceWork {
+        pending_repair_count: repair_attempt_records.len(),
+        repair_attempt_count: repair_attempt_records.len(),
+        due_repair_attempt_count,
+        next_repair_retry_unix_nanos,
+        actionable_placement_reconciliation_count,
+        pending_local_membership_handoff_count,
+        completed_local_primary_handoff_rebind_count,
+        deferred_work_count: mounted_mutation_work.deferred_work_count,
+        mounted_mutation_live_count: mounted_mutation_work.mounted_mutation_live_count,
+        mounted_mutation_recoverable_exact_count: mounted_mutation_work
+            .mounted_mutation_recoverable_exact_count,
+        mounted_mutation_recoverable_full_count: mounted_mutation_work
+            .mounted_mutation_recoverable_full_count,
+        mounted_mutation_overflow_count: mounted_mutation_work.mounted_mutation_overflow_count,
+        next_mounted_mutation_reprobe_unix_nanos: mounted_mutation_work
+            .next_mounted_mutation_reprobe_unix_nanos,
+        ..DfsPendingMaintenanceWork::default()
+    })
+}
 
 use crate::{
     AsyncDfsMessageTransport, AsyncDfsMetadataJournalReplicationTransport,

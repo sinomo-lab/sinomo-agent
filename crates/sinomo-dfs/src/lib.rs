@@ -8,11 +8,15 @@
 
 mod advisory_lock;
 mod body_rpc;
+pub mod browser_api;
+mod browser_service;
 mod cluster_service;
 mod content_root_catalog;
 mod content_store;
 mod control_plane;
 mod default_cluster;
+mod default_projection;
+mod default_reconciliation;
 mod direct_read;
 mod discovery;
 mod distributed;
@@ -22,8 +26,11 @@ mod intent;
 mod local_service;
 mod local_state;
 mod maintenance;
+mod maintenance_schedule;
 mod message_transport;
 mod metadata_api;
+mod metadata_authority_projection;
+mod metadata_authority_runtime;
 mod metadata_backend;
 mod metadata_cursor;
 mod metadata_error;
@@ -73,6 +80,11 @@ mod renewable_lease;
 mod repair;
 mod repair_queue_store;
 mod routes;
+mod runtime_admission;
+mod runtime_authority;
+mod runtime_message;
+mod runtime_mounted_mutation;
+mod runtime_publish;
 mod service;
 mod service_async;
 mod service_commit;
@@ -117,6 +129,77 @@ pub use advisory_lock::{
 pub use body_rpc::{
     DfsAttachmentMessageCommand, DfsAttachmentMessageResponse, DfsRpcAttachmentDescriptor,
 };
+pub use browser_api::*;
+pub use browser_service::{
+    DfsBrowserServiceHost, HostedDfsBrowserService, HostedDfsPlacementAuthorityAdminService,
+    register_dfs_browser_services,
+};
+pub use default_projection::*;
+#[cfg(feature = "test-support")]
+pub use metadata_authority_runtime::DfsMetadataAuthorityDebugSnapshot;
+pub use metadata_authority_runtime::{
+    DFS_METADATA_AUTHORITY_PREFIX, DfsMetadataAuthorityDeltaObservation, DfsMetadataAuthorityHost,
+    DfsMetadataAuthorityReadFuture, DfsMetadataAuthorityRuntime,
+    DfsMetadataAuthorityRuntimeRegistry, DfsMetadataAuthorityState, DfsMetadataAuthorityTask,
+};
+pub use runtime_admission::{
+    DFS_MUTATION_SHARD_GATE_LIMIT, DfsMaintenanceForegroundPreemption,
+    DfsMaintenancePreemptionOutcome, DfsMetadataLaneKey, DfsMetadataSchedulerRegistry,
+    DfsMutationAdmission, DfsMutationGenerationFence, DfsMutationLaneKey, DfsMutationScheduler,
+    DfsMutationSchedulerRegistry, acquire_dfs_maintenance_admission_until_foreground_waits,
+    run_dfs_maintenance_until_foreground_waits,
+};
+pub use runtime_authority::{
+    DFS_AUTHORITY_PROJECTION_MAX_BYTES, DFS_AUTHORITY_PROJECTION_MAX_ENTRIES,
+    DFS_AUTHORITY_PROJECTION_MAX_SCOPES, DfsAuthoritativeProjectionCache,
+    dfs_metadata_prefix_probe_is_verification_only,
+};
+pub use runtime_message::{
+    DFS_ATTACHMENT_INGEST_BUFFERED_CHUNKS, DfsCommittedEffects, DfsCommittedEffectsHost,
+    DfsDetachedSendRuntime, DfsResidentMetadataScope, DfsRuntimeMaintenanceServiceLane,
+    DfsRuntimeMessageCacheEntry, DfsRuntimeMessageExecution, DfsRuntimeMessagePeerSnapshot,
+    DfsRuntimeMessageResult, DfsRuntimeMessageService, DfsRuntimeMessageServiceLane,
+    DfsRuntimeMessageServiceLaneHandle, DfsRuntimeMessageServiceSignature, DfsRuntimeTask,
+    DfsVisibleMutationEvent, dfs_detached_send_runtime_for_identity,
+    dfs_metadata_journal_rejection, dfs_metadata_journal_rejection_for,
+    dfs_metadata_snapshot_rejection, dfs_metadata_snapshot_rejection_for, dfs_network_message_kind,
+    dfs_response_committed_visible_mutation, dfs_runtime_message_cache,
+    dfs_runtime_message_supports_exact_service_lane, dfs_runtime_message_uses_content_read_lane,
+    dfs_visible_mutation_event, emit_runtime_committed_effects, execute_runtime_message_command,
+    ingest_dfs_message_attachment, read_dfs_runtime_message_peer_snapshot,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use runtime_message::{
+    test_clear_dfs_runtime_peer_discovery_cache, test_expire_dfs_runtime_peer_discovery_cache,
+};
+pub use runtime_mounted_mutation::{
+    MOUNTED_SIFS_MUTATION_REPROBE_INTERVAL, MountedSifsMutationHandoffHost,
+    MountedSifsMutationHandoffPhase, MountedSifsMutationHandoffRequest,
+    MountedSifsMutationHandoffResponse, MountedSifsMutationRecoveryBatch,
+    all_mounted_sifs_mutation_committed_work, handle_mounted_sifs_mutation_handoff,
+    mounted_sifs_mutation_pending_maintenance_work, mounted_sifs_mutation_startup_committed_work,
+    persist_default_dfs_repair_queue_records,
+};
+pub use runtime_publish::{
+    DfsMetadataPublishPlanningAttempt, metadata_publish_lanes_from_authority,
+    run_metadata_publish_blocking_execution, run_metadata_publish_lane_planning_with_admission,
+};
+#[cfg(feature = "test-support")]
+pub mod browser_test_support {
+    pub use super::browser_service::dfs_browser_backend_open_count as daemon_dfs_browser_backend_open_count;
+    pub use super::browser_service::{
+        DaemonDfsBrowserPlacementConnectivitySnapshot, DfsBrowserBackend,
+        DfsBrowserObservedControlPlaneKvClient, daemon_dfs_browser_bulk_file_read_response,
+        daemon_dfs_browser_conditional_write_error, daemon_dfs_browser_read_file_prefix_response,
+        daemon_dfs_browser_read_file_response, daemon_dfs_browser_route_is_path_access,
+        enrich_daemon_dfs_browser_placement_connectivity_from_snapshot,
+        extend_daemon_dfs_browser_preview_diagnostics, merge_daemon_dfs_browser_placement_impact,
+        mutate_daemon_dfs_browser_placement_config,
+        require_local_dfs_placement_authority_break_glass_signer,
+        require_matching_daemon_dfs_browser_placement_preview_token,
+        require_satisfiable_daemon_dfs_browser_placement, sifs_browser_write_candidates,
+    };
+}
 pub use cluster_service::{
     cluster_dfs_peer_node_ids, discovered_cluster_dfs_peer_node_ids,
     discovered_cluster_dfs_provider_node_ids,
@@ -237,6 +320,7 @@ pub use local_state::{
     cluster_dfs_all_metadata_shard_membership_handoffs, cluster_dfs_all_metadata_shards,
     cluster_dfs_metadata_shards, default_dfs_metadata_root, default_dfs_metadata_shards_root,
     default_dfs_pin_root, dfs_import_metadata_root, dfs_import_namespace_root, dfs_import_root,
+    dfs_metadata_shard_membership_handoff_key_is_exact,
     evict_cluster_aware_dfs_metadata_inspection_cache, inspect_cluster_aware_dfs,
     inspect_cluster_aware_dfs_from_metadata, inspect_cluster_aware_dfs_status,
     inspect_dfs_conflicts, inspect_dfs_file_system, inspect_dfs_object, inspect_dfs_path,
@@ -264,23 +348,35 @@ pub use maintenance::{
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_JOBS,
     DEFAULT_DFS_NAMESPACE_JOB_MAINTENANCE_MAX_STEPS_PER_JOB,
     DEFAULT_DFS_STALE_WRITE_INTENT_MIN_AGE, DEFAULT_DFS_WRITE_INTENT_MAINTENANCE_MAX_RECORDS,
+    DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
+    DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+    DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS, DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE,
+    DFS_RESIDENT_METADATA_REPLICATION_ATTEMPT_TIMEOUT,
+    DFS_RESIDENT_METADATA_REPLICATION_MAX_BATCHES_PER_TARGET,
+    DFS_RESIDENT_METADATA_REPLICATION_TARGET_TIMEOUT, DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK,
+    DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS, DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE,
     DfsAntiEntropyCursorRecord, DfsAntiEntropyIssue, DfsAntiEntropyOptions, DfsAntiEntropyReport,
     DfsConflictMaintenanceReport, DfsLifecycleMaintenanceOptions, DfsLifecycleMaintenanceReport,
     DfsMaintenanceExecutionExclusions, DfsMaintenanceHost, DfsMaintenanceRunOptions,
     DfsMaintenanceTickObservations, DfsMaintenanceTickOptions, DfsMaintenanceTickReport,
     DfsMetadataReplicationSuppressionRecord, DfsMetadataReplicationSuppressionSnapshot,
-    DfsRepairAttemptRecord, DfsRepairAttemptSnapshot, DfsWriteIntentMaintenanceReport,
-    LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost, clear_dfs_anti_entropy_cursor,
-    default_dfs_anti_entropy_cursor_path,
+    DfsPendingMaintenanceWork, DfsRepairAttemptRecord, DfsRepairAttemptSnapshot,
+    DfsWriteIntentMaintenanceReport, LegacyDfsMetadataReplicationCursor, LocalDfsMaintenanceHost,
+    clear_dfs_anti_entropy_cursor, default_dfs_anti_entropy_cursor_path,
     default_dfs_metadata_replication_suppression_snapshot_path,
-    default_dfs_repair_attempt_snapshot_path, dfs_events_should_wake_repair_maintenance,
-    dfs_lifecycle_maintenance_notice_lines, dfs_maintenance_tick_observations,
-    dfs_namespace_job_maintenance_notice_lines, dfs_repair_maintenance_notice_lines,
-    dfs_write_intent_maintenance_notice_lines, legacy_dfs_anti_entropy_cursor_path,
-    legacy_dfs_metadata_replication_cursor_path, migrate_legacy_dfs_metadata_replication_cursor,
-    put_local_dfs_metadata_replication_suppression, read_dfs_anti_entropy_cursor,
-    read_dfs_metadata_replication_suppression_snapshot, read_dfs_repair_attempt_snapshot,
-    run_cluster_dfs_maintenance_tick_with_async_peer_transport,
+    default_dfs_repair_attempt_snapshot_path, dfs_actionable_placement_reconciliation_count,
+    dfs_completed_local_primary_handoff_rebind_count, dfs_events_should_wake_repair_maintenance,
+    dfs_explicit_disaster_recovery_tick_options, dfs_lifecycle_maintenance_notice_lines,
+    dfs_maintenance_report_reached_limit, dfs_maintenance_tick_observations,
+    dfs_namespace_job_maintenance_notice_lines, dfs_node_is_offline_for_maintenance,
+    dfs_offline_node_ids, dfs_pending_reactive_maintenance_work_from_authority_entries,
+    dfs_repair_maintenance_notice_lines, dfs_resident_maintenance_execution_exclusions,
+    dfs_resident_metadata_replication_options, dfs_resident_routine_maintenance_tick_options,
+    dfs_resident_smoke_options, dfs_write_intent_maintenance_notice_lines,
+    legacy_dfs_anti_entropy_cursor_path, legacy_dfs_metadata_replication_cursor_path,
+    migrate_legacy_dfs_metadata_replication_cursor, put_local_dfs_metadata_replication_suppression,
+    read_dfs_anti_entropy_cursor, read_dfs_metadata_replication_suppression_snapshot,
+    read_dfs_repair_attempt_snapshot, run_cluster_dfs_maintenance_tick_with_async_peer_transport,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions,
     run_cluster_dfs_maintenance_tick_with_async_peer_transport_and_detached_state_and_execution_exclusions_and_committed_work_tracker,
@@ -296,6 +392,17 @@ pub use maintenance::{
 #[cfg(test)]
 pub(crate) use maintenance::{
     run_cluster_dfs_maintenance_tick, write_legacy_dfs_metadata_replication_cursor,
+};
+pub use maintenance_schedule::{
+    DFS_DEFERRED_WORK_REPROBE_INTERVAL, DFS_MAINTENANCE_LEASE_RETRY_DELAY,
+    DFS_MAINTENANCE_MEMBER_PHASE_SLOT, DFS_MAINTENANCE_MEMBER_PHASE_WINDOW,
+    DFS_MAINTENANCE_NETWORK_STARTUP_GRACE, DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+    DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL, DfsMaintenanceProbeDecision, DfsMaintenanceTickOutcome,
+    dfs_failed_maintenance_decision, dfs_initial_maintenance_delay,
+    dfs_maintenance_completion_decision, dfs_maintenance_due_in, dfs_maintenance_member_phase,
+    dfs_maintenance_notification_decision, dfs_maintenance_probe_decision,
+    dfs_maintenance_probe_is_due, dfs_maintenance_revalidation_decision,
+    dfs_maintenance_should_launch,
 };
 pub(crate) use message_transport::DfsMetadataJournalBatchDirectGroup;
 pub use message_transport::{
@@ -611,6 +718,27 @@ pub type DfsNodeId = NodeId;
 pub type DfsObjectId = sinomo_core::Id;
 /// Identifier for a committed DFS object version.
 pub type DfsVersion = sinomo_core::Id;
+
+pub use default_reconciliation::{
+    DefaultDfsExactRetryGeneration, DefaultDfsParkedHandoff, DefaultDfsPermitGeneration,
+    DefaultDfsReconciliationProjection, DefaultDfsReconciliationRuntime,
+    DefaultDfsReconciliationState, DefaultDfsReconciliationWork,
+    completed_promoted_primary_handoff_matches, default_dfs_locally_owned_pending_handoff,
+    notify_default_dfs_reconciliation_replica_progress,
+};
+#[cfg(any(test, feature = "test-support"))]
+pub use default_reconciliation::{
+    DefaultDfsReconciliationWakeSubscription, subscribe_default_dfs_reconciliation_replica_progress,
+};
+pub use metadata_authority_projection::{
+    DfsMetadataShardsByFileSystem, dfs_metadata_authority_key_is_exact,
+    dfs_metadata_shard_config_key_is_exact, dfs_metadata_shard_config_key_parts,
+    metadata_replica_context_from_authority_entries,
+    metadata_replica_context_from_authority_projection,
+    metadata_replica_context_matches_authority_entries,
+    metadata_shard_index_from_authority_entries, metadata_shards_from_authority_projection,
+    namespace_command_matches_authority_index,
+};
 
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,

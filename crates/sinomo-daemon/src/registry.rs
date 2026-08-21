@@ -1,10 +1,9 @@
-//! Daemon runtime registry: the single owner of internal module registration,
-//! module->route conversion, network-module surface adaptation, and the
-//! composed durable storage layout.
+//! Daemon runtime registry: composition for internal module registration and
+//! the durable storage layout assembled from owner crates.
 //!
 //! This machinery previously lived in the `sinomo-runtime` facade; the facade
 //! now re-exports it from here so it stays behavior-free while the daemon owns
-//! module and service loading (stage E of
+//! process composition (stage E of
 //! docs/plans/r0-r1-crate-boundary-refactor.md).
 
 pub use sinomo_core::storage::*;
@@ -53,14 +52,17 @@ pub use sinomo_module::{
     ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
     ModuleRegistrySnapshotStore,
 };
-use std::collections::BTreeSet;
-use std::sync::Arc;
-
 pub struct NativeRustModuleBinding {
     pub registration_key: &'static str,
     pub register_services: Option<
         fn(
             sinomo_core::service::ServiceRegistryBuilder,
+        ) -> sinomo_core::service::ServiceRegistryBuilder,
+    >,
+    pub register_services_for_data_dir: Option<
+        fn(
+            sinomo_core::service::ServiceRegistryBuilder,
+            &std::path::Path,
         ) -> sinomo_core::service::ServiceRegistryBuilder,
     >,
     pub register_storage_paths: Option<
@@ -78,30 +80,70 @@ pub struct InternalModuleTable {
 const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
     NativeRustModuleBinding {
         registration_key: sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY,
-        register_services: None,
+        register_services: Some(sinomo_build::register_services),
+        register_services_for_data_dir: Some(sinomo_build::register_services_for_data_dir),
         register_storage_paths: Some(sinomo_build::register_storage_paths),
     },
     NativeRustModuleBinding {
         registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
         register_services: Some(sinomo_dfs::register_services),
+        register_services_for_data_dir: None,
         register_storage_paths: Some(sinomo_dfs::register_storage_paths),
     },
     NativeRustModuleBinding {
         registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
         register_services: Some(sinomo_rollout::register_services),
+        register_services_for_data_dir: None,
         register_storage_paths: Some(sinomo_rollout::register_storage_paths),
     },
     NativeRustModuleBinding {
         registration_key: sinomo_core::network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
         register_services: None,
+        register_services_for_data_dir: None,
         register_storage_paths: None,
     },
     NativeRustModuleBinding {
         registration_key: sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
         register_services: Some(sinomo_observe::register_services),
+        register_services_for_data_dir: None,
         register_storage_paths: Some(sinomo_observe::register_storage_paths),
     },
 ];
+
+type StartNativeRustModuleRuntimeTask =
+    fn(
+        &crate::DaemonPaths,
+        &tokio::runtime::Handle,
+        tokio::sync::watch::Receiver<bool>,
+        &str,
+        bool,
+    ) -> Result<Option<NativeRustModuleRuntimeTask>, crate::DaemonError>;
+
+struct NativeRustModuleLifecycleBinding {
+    registration_key: &'static str,
+    start_runtime_task: StartNativeRustModuleRuntimeTask,
+}
+
+const INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS: &[NativeRustModuleLifecycleBinding] =
+    &[NativeRustModuleLifecycleBinding {
+        registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
+        start_runtime_task: crate::control::start_daemon_rollout_telemetry_runtime_task,
+    }];
+
+pub(crate) struct NativeRustModuleRuntimeTask {
+    label: &'static str,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl NativeRustModuleRuntimeTask {
+    pub(crate) fn new(label: &'static str, task: tokio::task::JoinHandle<()>) -> Self {
+        Self { label, task }
+    }
+
+    pub(crate) fn into_parts(self) -> (&'static str, tokio::task::JoinHandle<()>) {
+        (self.label, self.task)
+    }
+}
 
 pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
     let registry = internal_module_registry()?;
@@ -122,85 +164,48 @@ pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError>
     Ok(registry)
 }
 
-pub fn module_object_rpc_route_descriptor_to_service(
-    descriptor: &sinomo_module::ModuleObjectRpcRouteDescriptor,
-) -> sinomo_core::service::ServiceRoute {
-    let mut route = sinomo_core::service::ServiceRoute::describe(
-        descriptor.route.clone(),
-        descriptor.category.clone(),
-        format!(
-            "module object RPC operation {}",
-            descriptor.operation.as_str()
-        ),
-        "sinomo_core::network::ObjectRpcRequest",
-        "sinomo_core::network::ObjectRpcResponse",
-    )
-    .with_auth_scope(descriptor.auth_scope.clone())
-    .observable("module.operation", descriptor.operation.as_str());
-    for capability in &descriptor.required_capabilities {
-        route = route.require_capability(capability.as_str());
-    }
-    for permission in &descriptor.required_local_permissions {
-        route = route.require_local_permission(permission);
-    }
-    route.request_body_mode = native_module_body_mode_to_service(descriptor.request_body_mode);
-    route.response_body_mode = native_module_body_mode_to_service(descriptor.response_body_mode);
-    route
-}
-
-fn native_module_body_mode_to_service(
-    mode: sinomo_module_api::NativeModuleBodyMode,
-) -> sinomo_core::service::ServiceBodyMode {
-    match mode {
-        sinomo_module_api::NativeModuleBodyMode::None => {
-            sinomo_core::service::ServiceBodyMode::None
-        }
-        sinomo_module_api::NativeModuleBodyMode::Optional => {
-            sinomo_core::service::ServiceBodyMode::Optional
-        }
-        sinomo_module_api::NativeModuleBodyMode::Required => {
-            sinomo_core::service::ServiceBodyMode::Required
-        }
-    }
-}
-
-pub fn module_registration_object_rpc_route_descriptors(
-    registration: &ModuleRegistration,
-) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
-    Ok(registration
-        .surfaces
-        .object_rpc_route_descriptors()?
-        .iter()
-        .map(module_object_rpc_route_descriptor_to_service)
-        .collect::<Vec<_>>())
-}
-
-pub fn module_registry_object_rpc_route_descriptors(
-    registry: &ModuleRegistry,
-) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
-    let mut seen_routes = BTreeSet::new();
-    let mut descriptors = Vec::new();
-    for registration in registry.registrations() {
-        for descriptor in module_registration_object_rpc_route_descriptors(registration)? {
-            if !seen_routes.insert(descriptor.route.clone()) {
-                return Err(sinomo_module::ModuleSurfaceError::DuplicateObjectRpcRoute {
-                    route: descriptor.route,
-                });
-            }
-            descriptors.push(descriptor);
-        }
-    }
-    Ok(descriptors)
-}
-
-pub fn module_registry_snapshot_object_rpc_route_descriptors(
-    snapshot: &ModuleRegistrySnapshot,
-) -> Result<Vec<sinomo_core::service::ServiceRoute>, sinomo_module::ModuleSurfaceError> {
-    module_registry_object_rpc_route_descriptors(snapshot.registry())
-}
+pub use sinomo_module::{
+    module_object_rpc_route_descriptor_to_service,
+    module_registration_object_rpc_route_descriptors, module_registry_object_rpc_route_descriptors,
+    module_registry_snapshot_object_rpc_route_descriptors,
+};
 
 pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
     INTERNAL_NATIVE_RUST_MODULE_BINDINGS
+}
+
+/// Starts lifecycle workers contributed by the selected native-Rust modules.
+///
+/// The daemon control loop supplies process resources and supervises returned
+/// tasks; module-specific activation and worker construction stay behind this
+/// registration table beside each module's service binding.
+pub(crate) fn start_internal_native_rust_module_runtime_tasks(
+    registration_keys: impl IntoIterator<Item = &'static str>,
+    paths: &crate::DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    label: &str,
+    maintain_cluster_runtime: bool,
+) -> Result<Vec<NativeRustModuleRuntimeTask>, crate::DaemonError> {
+    let mut tasks = Vec::new();
+    for registration_key in registration_keys {
+        let Some(binding) = INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS
+            .iter()
+            .find(|binding| binding.registration_key == registration_key)
+        else {
+            continue;
+        };
+        if let Some(task) = (binding.start_runtime_task)(
+            paths,
+            runtime,
+            shutdown_rx.clone(),
+            label,
+            maintain_cluster_runtime,
+        )? {
+            tasks.push(task);
+        }
+    }
+    Ok(tasks)
 }
 
 pub fn native_rust_module_binding(
@@ -223,6 +228,31 @@ pub fn native_rust_binding_for_registration(
     native_rust_module_binding(&native_registration.registration_key)
 }
 
+/// Applies the service registrar declared by an internal native-Rust module.
+///
+/// The daemon composition root selects active modules; the binding table owns
+/// how each selected module contributes services. This keeps the daemon from
+/// constructing domain service implementations directly.
+pub fn register_internal_native_rust_module_services(
+    builder: sinomo_core::service::ServiceRegistryBuilder,
+    registration_keys: impl IntoIterator<Item = &'static str>,
+    data_dir_root: &std::path::Path,
+) -> sinomo_core::service::ServiceRegistryBuilder {
+    registration_keys.into_iter().fold(builder, |builder, key| {
+        let binding = native_rust_module_binding(key)
+            .unwrap_or_else(|| panic!("missing internal native-Rust module binding for {key}"));
+        match binding.register_services_for_data_dir {
+            Some(register) => register(builder, data_dir_root),
+            None => {
+                let register = binding.register_services.unwrap_or_else(|| {
+                    panic!("internal native-Rust module binding {key} has no service registrar")
+                });
+                register(builder)
+            }
+        }
+    })
+}
+
 pub fn register_internal_module_storage_paths(
     layout: &mut sinomo_core::storage::StorageLayout,
 ) -> Result<(), sinomo_core::storage::StorageContractError> {
@@ -234,372 +264,13 @@ pub fn register_internal_module_storage_paths(
     Ok(())
 }
 
-// --- network module surface adaptation (absorbed from sinomo-network-module) ---
-
-pub fn network_module_id() -> sinomo_module::ModuleId {
-    sinomo_module::ModuleId::from_legacy_named(sinomo_core::network::SINOMO_NETWORK_MODULE_ID)
-        .expect("valid network module id")
-}
-
-pub fn network_module_surfaces() -> sinomo_module::ModuleSurfaces {
-    let mut surfaces = sinomo_module::ModuleSurfaces::default()
-        .with_storage_owner(sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER);
-
-    for (route, category, operation, request_body_mode, response_body_mode) in [
-        (
-            sinomo_core::network::CLUSTER_HEALTH_ROUTE,
-            sinomo_core::network::CLUSTER_HEALTH_RPC_CATEGORY,
-            sinomo_core::network::CLUSTER_HEALTH_READ_CAPABILITY,
-            sinomo_module_api::NativeModuleBodyMode::None,
-            sinomo_module_api::NativeModuleBodyMode::None,
-        ),
-        (
-            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_ROUTE,
-            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-            sinomo_core::network::CLUSTER_NETWORK_CONNECTIVITY_READ_CAPABILITY,
-            sinomo_module_api::NativeModuleBodyMode::None,
-            sinomo_module_api::NativeModuleBodyMode::None,
-        ),
-        (
-            sinomo_core::network::CLUSTER_NETWORK_PING_ROUTE,
-            sinomo_core::network::CLUSTER_NETWORK_RPC_CATEGORY,
-            sinomo_core::network::CLUSTER_NETWORK_PING_CAPABILITY,
-            sinomo_module_api::NativeModuleBodyMode::Optional,
-            sinomo_module_api::NativeModuleBodyMode::Optional,
-        ),
-    ] {
-        surfaces = surfaces.with_object_rpc_route(
-            sinomo_module::ModuleObjectRpcRoute::new(
-                route,
-                category,
-                operation,
-                sinomo_module::ModuleRouteAuth::LocalOrClusterMember,
-            )
-            .with_request_body_mode(request_body_mode)
-            .with_response_body_mode(response_body_mode),
-        );
-    }
-
-    for resource in sinomo_core::network::NETWORK_DECLARATIVE_RESOURCE_SURFACES {
-        let mut export = sinomo_module::ModuleDeclarativeResourceExport::new(
-            resource.id,
-            module_declarative_resource_kind(resource.kind),
-            resource.path,
-        )
-        .with_description(resource.description);
-        for family in resource.model_families {
-            export = export.with_model_family(*family);
-        }
-        for tag in resource.activation_tags {
-            export = export.with_activation_tag(*tag);
-        }
-        for capability in resource.required_capabilities {
-            export = export.with_required_capability(network_capability(capability));
-        }
-        surfaces = surfaces.with_declarative_resource(export);
-    }
-
-    surfaces.capabilities = network_module_capabilities();
-    surfaces
-}
-
-pub fn network_module_registration() -> sinomo_module::ModuleRegistration {
-    let mut registration = sinomo_module::ModuleRegistration::native_rust(
-        network_module_id(),
-        env!("CARGO_PKG_VERSION"),
-        sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER,
-        sinomo_core::network::SINOMO_NETWORK_MODULE_OWNER,
-        sinomo_core::network::NETWORK_PROTOCOL,
-        sinomo_core::TrustRing::R1TrustedRuntime,
-        sinomo_core::network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
-    );
-    registration.manifest.capabilities = network_module_capabilities();
-    registration.manifest.limits = sinomo_core::ModuleResourceLimits {
-        network: sinomo_core::NetworkAccess::Allowlisted,
-        filesystem: sinomo_core::FileSystemAccess::Scoped,
-        ..sinomo_core::ModuleResourceLimits::default()
-    };
-    registration.surfaces = network_module_surfaces();
-    registration
-}
-
-pub fn network_module_capabilities() -> sinomo_core::ModuleCapabilities {
-    sinomo_core::ModuleCapabilities {
-        imports: sinomo_core::network::NETWORK_CAPABILITY_IMPORTS
-            .iter()
-            .map(|capability| network_capability(capability))
-            .collect(),
-        exports: sinomo_core::network::NETWORK_CAPABILITY_EXPORTS
-            .iter()
-            .map(|capability| network_capability(capability))
-            .collect(),
-    }
-}
-
-fn module_declarative_resource_kind(
-    kind: sinomo_core::network::NetworkDeclarativeResourceKind,
-) -> sinomo_module::ModuleDeclarativeResourceKind {
-    match kind {
-        sinomo_core::network::NetworkDeclarativeResourceKind::Skill => {
-            sinomo_module::ModuleDeclarativeResourceKind::Skill
-        }
-        sinomo_core::network::NetworkDeclarativeResourceKind::Prompt => {
-            sinomo_module::ModuleDeclarativeResourceKind::Prompt
-        }
-    }
-}
-
-fn network_capability(name: &str) -> sinomo_core::CapabilityName {
-    sinomo_core::CapabilityName::new(name).expect("valid network module capability")
-}
-
-// --- runtime network-module loading (stage C of
-// docs/plans/r0-r1-crate-boundary-refactor.md) ---
-//
-// Built-in transports (Loopback/LAN-TCP) keep their in-crate dial paths
-// inside `sinomo-network`; they are NOT wrapped as registry modules. The
-// registry carries native-dylib network modules, which routing consults
-// before the built-in paths.
-
-/// The daemon's loaded network modules: the registry routing dispatches
-/// through plus the loader-state module id behind each network-module id
-/// (used to persist the enabled flag).
-pub struct DaemonNetworkModules {
-    pub registry: Arc<sinomo_core::network::NetworkModuleRegistry>,
-    /// network-module id (`NetworkModuleDescriptor::id`) -> dylib module id.
-    pub loader_module_ids: std::collections::BTreeMap<String, sinomo_module::ModuleId>,
-}
-
-static DAEMON_NETWORK_MODULES: std::sync::Mutex<Option<Arc<DaemonNetworkModules>>> =
-    std::sync::Mutex::new(None);
-
-/// The most recently loaded daemon network modules (process-wide, like the
-/// `sinomo_network` registry handle they mirror).
-pub fn daemon_network_modules() -> Option<Arc<DaemonNetworkModules>> {
-    DAEMON_NETWORK_MODULES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-/// Persisted enabled flag for a network module's dylib. Network modules reuse
-/// the `NativeRustModuleRuntimeState`-style enablement store (keyed by module
-/// id under `module/loader-state/native-rust`) rather than growing a parallel
-/// mechanism; native-dylib module ids cannot collide with native-rust
-/// registration keys.
-pub fn network_module_enabled_state(
-    data_dir_root: &std::path::Path,
-    module_id: &sinomo_module::ModuleId,
-) -> bool {
-    sinomo_module::read_native_rust_module_runtime_state(data_dir_root, module_id)
-        .ok()
-        .flatten()
-        .map(|state| state.enabled)
-        .unwrap_or(true)
-}
-
-/// Persists a network module's enabled flag (see
-/// [`network_module_enabled_state`] for the store choice).
-pub fn persist_network_module_enabled_state(
-    data_dir_root: &std::path::Path,
-    module_id: &sinomo_module::ModuleId,
-    enabled: bool,
-    reason: impl Into<String>,
-) -> Result<(), sinomo_module::ModuleLoaderStoreError> {
-    sinomo_module::set_native_rust_module_enabled(
-        data_dir_root,
-        module_id,
-        enabled,
-        "daemon-network-modules",
-        reason,
-    )
-    .map(|_| ())
-}
-
-/// Provides `context` to every registered network module and starts the
-/// enabled ones whose listener is not yet running — the recovery path for
-/// modules registered before the node had a cluster identity (pre-cluster
-/// daemon that later runs `cluster init`/`join`). Idempotent per module.
-///
-/// Returns `true` when at least one module started.
-pub fn start_enabled_network_modules_with_context(
-    context: &sinomo_core::network::NetworkModuleContext,
-) -> bool {
-    let Some(modules) = daemon_network_modules() else {
-        return false;
-    };
-    let mut any_started = false;
-    for (id, result) in modules.registry.provide_context_and_start_enabled(context) {
-        match result {
-            Ok(()) => {
-                any_started = true;
-                tracing::info!(
-                    "sinomo daemon network module {id} started (cluster context now available)"
-                );
-            }
-            Err(error) => {
-                tracing::warn!("sinomo daemon network module {id} start failed: {error}");
-            }
-        }
-    }
-    any_started
-}
-
-/// Builds the daemon's [`sinomo_core::network::NetworkModuleRegistry`] from the
-/// installed native-dylib loader states, starts enabled modules, and installs
-/// the registry process-wide via
-/// [`sinomo_core::network::set_network_module_registry`].
-///
-/// Per-module failures (bad hash, missing entry symbol, start errors) are
-/// logged and skipped so one broken module cannot take the daemon down.
-/// `context` is `None` before the node has a cluster identity; modules are
-/// still registered (dial-only) and start once toggled with a context later.
-pub fn load_daemon_network_module_registry(
-    data_dir_root: &std::path::Path,
-    context: Option<sinomo_core::network::NetworkModuleContext>,
-) -> Arc<DaemonNetworkModules> {
-    let registry = Arc::new(sinomo_core::network::NetworkModuleRegistry::new());
-    let mut loader_module_ids = std::collections::BTreeMap::new();
-
-    let states = match sinomo_module::read_native_dylib_module_loader_states(data_dir_root) {
-        Ok(states) => states,
-        Err(error) => {
-            tracing::warn!("sinomo daemon network module loader states unreadable: {error}");
-            Vec::new()
-        }
-    };
-    for state in states {
-        if !sinomo_rollout::native_dylib_loader_state_is_host_compatible(&state) {
-            tracing::warn!(
-                "sinomo daemon native module {} skipped because its build platform or native ABI does not match this host",
-                state.module_id
-            );
-            continue;
-        }
-        match load_daemon_network_module_from_loader_state(data_dir_root, &state, context.as_ref())
-        {
-            Ok(Some((network_module_id, module, enabled, started))) => {
-                registry.register(module, context.clone(), enabled, started);
-                loader_module_ids.insert(network_module_id, state.module_id.clone());
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    "sinomo daemon network module {} load failed: {error}",
-                    state.module_id
-                );
-            }
-        }
-    }
-
-    // The registry is process-wide; in the unit-test binary a lifecycle test
-    // booting a daemon would replace it mid-run and perturb concurrently
-    // running endpoint-ranking tests. Tests exercise the loader through the
-    // returned handle instead.
-    #[cfg(not(test))]
-    sinomo_core::network::set_network_module_registry(registry.clone());
-    let modules = Arc::new(DaemonNetworkModules {
-        registry,
-        loader_module_ids,
-    });
-    *DAEMON_NETWORK_MODULES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(modules.clone());
-    modules
-}
-
-/// Loads one loader state's dylib as a network module when its descriptor
-/// surfaces declare `network_transports`. Returns `Ok(None)` for modules
-/// without a network surface.
-fn load_daemon_network_module_from_loader_state(
-    data_dir_root: &std::path::Path,
-    state: &sinomo_module::NativeDylibModuleLoaderState,
-    context: Option<&sinomo_core::network::NetworkModuleContext>,
-) -> Result<
-    Option<(
-        String,
-        Arc<dyn sinomo_core::network::NetworkModule>,
-        bool,
-        bool,
-    )>,
-    sinomo_core::network::NetworkError,
-> {
-    let network_error = |detail: String| sinomo_core::network::NetworkError::Io {
-        operation: format!("load network module {}", state.module_id),
-        detail,
-    };
-    // The registration carries the descriptor surfaces (network_transports)
-    // validated against the loader state.
-    let registration =
-        sinomo_module::native_dylib_module_registration_from_loader_state(data_dir_root, state)
-            .map_err(|error| network_error(error.to_string()))?;
-    if registration.surfaces.network_transports.is_empty() {
-        return Ok(None);
-    }
-    let library_path = sinomo_module::native_module_cache_path(
-        data_dir_root,
-        &state.cache_key,
-        &state.content_hash,
-        &state.library_name,
-    );
-    // SAFETY: trusted native-dylib module cache, blake3-verified against the
-    // loader state's content hash before any code from it runs.
-    let library = unsafe {
-        sinomo_module::NativeLibrary::load_from_content_addressed_path(
-            &library_path,
-            &state.content_hash,
-        )
-    }
-    .map_err(|error| network_error(error.to_string()))?;
-    // SAFETY: symbol type matches the pinned v1 entry signature.
-    let entry = unsafe {
-        library.symbol::<sinomo_core::network::network_module_abi::SinomoNetworkModuleCreateV1Fn>(
-            sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_ENTRY_SYMBOL,
-        )
-    }
-    .map_err(|error| network_error(error.to_string()))?;
-    let mut instance: *mut std::ffi::c_void = std::ptr::null_mut();
-    let mut vtable = sinomo_core::network::network_module_abi::SinomoNetworkModuleVtableV1::empty();
-    // SAFETY: calling the module's exported entry with valid out pointers.
-    let status = unsafe { entry(&mut instance, &mut vtable) };
-    if status != sinomo_core::network::network_module_abi::SINOMO_NETWORK_MODULE_STATUS_OK {
-        return Err(network_error(format!(
-            "network module entry returned status {status}"
-        )));
-    }
-    // SAFETY: instance/vtable come from the entry call above; the
-    // NativeLibrary keep-alive token keeps the dylib mapped for the adapter's
-    // lifetime (the registry never drops registered modules).
-    let module = unsafe {
-        sinomo_core::network::FfiNetworkModule::from_entry_parts(
-            instance,
-            vtable,
-            Box::new(library),
-        )
-    }?;
-    let descriptor = sinomo_core::network::NetworkModule::descriptor(&module);
-    let enabled = network_module_enabled_state(data_dir_root, &state.module_id);
-    let module: Arc<dyn sinomo_core::network::NetworkModule> = Arc::new(module);
-    let mut started = false;
-    if enabled && let Some(context) = context {
-        if let Err(error) = module.start(context) {
-            // Registered but not listening; dials may still work and the
-            // module can be toggled once the failure cause is fixed.
-            tracing::warn!(
-                "sinomo daemon network module {} start failed: {error}",
-                descriptor.id
-            );
-        } else {
-            started = true;
-            tracing::info!(
-                "sinomo daemon network module {} started (transports {:?})",
-                descriptor.id,
-                descriptor.transports
-            );
-        }
-    }
-    Ok(Some((descriptor.id, module, enabled, started)))
-}
+pub use sinomo_module::{
+    ProcessNetworkModules as DaemonNetworkModules,
+    load_process_network_module_registry as load_daemon_network_module_registry,
+    network_module_capabilities, network_module_enabled_state, network_module_id,
+    network_module_registration, network_module_surfaces, persist_network_module_enabled_state,
+    process_network_modules as daemon_network_modules, start_enabled_network_modules_with_context,
+};
 
 #[cfg(test)]
 mod tests {
@@ -666,8 +337,25 @@ mod tests {
             binding.registration_key,
             sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY
         );
-        assert!(binding.register_services.is_none());
+        assert!(binding.register_services.is_some());
+        assert!(binding.register_services_for_data_dir.is_some());
         assert!(binding.register_storage_paths.is_some());
+    }
+
+    #[test]
+    fn native_runtime_lifecycle_hooks_are_attached_to_registered_modules() {
+        assert_eq!(INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS.len(), 1);
+        for lifecycle in INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS {
+            assert!(
+                native_rust_module_binding(lifecycle.registration_key).is_some(),
+                "lifecycle hook {} must share a native module registration",
+                lifecycle.registration_key
+            );
+        }
+        assert_eq!(
+            INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS[0].registration_key,
+            sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY
+        );
     }
 
     #[test]

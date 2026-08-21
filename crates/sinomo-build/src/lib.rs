@@ -1,23 +1,27 @@
 //! Cluster build-service contracts and deterministic artifact preparation.
 //!
 //! This crate owns build inputs, target support, builder placement, queued-job
-//! protocol types, and immutable artifact bundles. It deliberately has no
-//! dependency on rollout: building produces verified artifacts; rollout decides
-//! where and whether those artifacts are activated.
+//! protocol types, runtime service implementation, and immutable artifact
+//! bundles. Building produces verified artifacts; rollout alone decides where
+//! and whether those artifacts are activated.
 
 mod artifact;
+mod client_protocol;
 mod executor;
 mod module;
 mod paths;
 mod process;
 mod protocol;
+mod service;
 mod target;
 
 pub use artifact::*;
+pub use client_protocol::*;
 pub use executor::*;
 pub use module::*;
 pub use paths::*;
 pub use protocol::*;
+pub use service::{BuildService, register_services, register_services_for_data_dir};
 pub use target::*;
 
 use thiserror::Error;

@@ -5245,6 +5245,22 @@ mod tests {
     use sinomo_node::ClusterId;
     use time::OffsetDateTime;
 
+    fn assert_bounded_authority_busy_preparations(
+        preparations_before: usize,
+        preparations_after: usize,
+        context: &str,
+    ) {
+        let preparations = preparations_after.saturating_sub(preparations_before);
+        let max_preparations = 1_usize.saturating_add(
+            (BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET.as_millis()
+                / LOCAL_READ_INDEX_BUSY_RETRY_INTERVAL.as_millis()) as usize,
+        );
+        assert!(
+            (2..=max_preparations).contains(&preparations),
+            "{context} must perform an initial busy probe and only bounded non-queued retries; before={preparations_before}, after={preparations_after}, max={max_preparations}"
+        );
+    }
+
     struct NoNetworkRequestOutcomeHost;
 
     impl ClusterObjectRpcAsyncHost for NoNetworkRequestOutcomeHost {}
@@ -8149,10 +8165,10 @@ mod tests {
         assert_eq!(host.forwarded_snapshot_reads, 1);
         assert_eq!(host.quorum_waves, 0);
         assert_eq!(host.vote_requests, 0);
-        assert_eq!(
+        assert_bounded_authority_busy_preparations(
+            preparations_before,
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root),
-            preparations_before.saturating_add(2),
-            "mixed-version failure must perform one busy probe and one bounded retry"
+            "mixed-version failure",
         );
         drop(held);
         assert_eq!(
@@ -8165,7 +8181,7 @@ mod tests {
             last_index_before
         );
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET + Duration::from_millis(250),
             "mixed-version still-busy retry took {:?}",
             started.elapsed()
         );
@@ -8353,13 +8369,13 @@ mod tests {
         assert_eq!(host.forwarded_exact_reads, 1);
         assert_eq!(host.quorum_waves, 0);
         assert_eq!(host.vote_requests, 0);
-        assert_eq!(
+        assert_bounded_authority_busy_preparations(
+            preparations_before,
             crate::raft_quorum::read_index_resident_preparations_for_root(&fixture.paths.root),
-            preparations_before.saturating_add(2),
-            "failed forwarding must perform one initial busy probe and one bounded retry"
+            "failed forwarding",
         );
         assert!(
-            started.elapsed() < Duration::from_millis(100),
+            started.elapsed() < BOUNDED_AUTHORITY_BUSY_RETRY_BUDGET + Duration::from_millis(250),
             "failed forwarding retried the held local admission for {:?}",
             started.elapsed()
         );

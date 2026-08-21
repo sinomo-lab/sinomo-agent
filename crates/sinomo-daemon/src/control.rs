@@ -17,23 +17,52 @@ use crate::{
     DaemonDataOwnerLock, DaemonError, DaemonLock, DaemonPaths, DaemonSignerAuthority,
     daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout, read_daemon_status,
 };
-use sinomo_core::cluster::ClusterKvPathsExt;
+use sinomo_core::ClusterModuleRolloutStatusRecord;
+use sinomo_core::cluster::{
+    ClusterConnectivityProjectionChange as DaemonConnectivityProjectionChange,
+    ClusterConnectivityTopologyProjection as DaemonConnectivityTopologyProjection,
+    ClusterKvPathsExt,
+};
+#[cfg(test)]
+use sinomo_core::cluster::{
+    ClusterConnectivityTopologyValue as DaemonConnectivityTopologyValue,
+    cluster_connectivity_events_cover_revision_range as daemon_connectivity_events_cover_revision_range,
+};
 use sinomo_core::events::EventStore;
 use sinomo_core::node::NodeId;
-use sinomo_core::{
-    ClusterEndpointPrivacy, ClusterEndpointRecord, ClusterEndpointSource, ClusterMemberRecord,
-    ClusterModuleRolloutStatusRecord, ClusterTransportKind,
+#[cfg(test)]
+use sinomo_core::{ClusterMemberRecord, ClusterTransportKind};
+#[cfg(test)]
+use sinomo_dfs::{
+    DFS_DEFERRED_WORK_REPROBE_INTERVAL as DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL,
+    DFS_MAINTENANCE_MEMBER_PHASE_SLOT as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT,
+    DFS_MAINTENANCE_MEMBER_PHASE_WINDOW as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW,
+    DFS_MAINTENANCE_NETWORK_STARTUP_GRACE as DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE,
+    DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL as DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+    dfs_maintenance_revalidation_decision as daemon_dfs_maintenance_revalidation_decision,
+};
+use sinomo_dfs::{
+    DFS_MAINTENANCE_LEASE_RETRY_DELAY as DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY,
+    DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL as DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
+    dfs_failed_maintenance_decision as daemon_dfs_failed_maintenance_decision,
+    dfs_initial_maintenance_delay as daemon_dfs_initial_maintenance_delay,
+    dfs_maintenance_completion_decision as daemon_dfs_maintenance_completion_decision,
+    dfs_maintenance_due_in as daemon_dfs_maintenance_due_in,
+    dfs_maintenance_member_phase as daemon_dfs_maintenance_member_phase,
+    dfs_maintenance_notification_decision as daemon_dfs_maintenance_notification_decision,
+    dfs_maintenance_probe_decision as daemon_dfs_maintenance_probe_decision,
+    dfs_maintenance_probe_is_due as daemon_dfs_maintenance_probe_is_due,
+    dfs_maintenance_should_launch as daemon_dfs_maintenance_should_launch,
 };
 use sinomo_rollout::{
-    AppliedRolloutTransition, RolloutController, RolloutTelemetryAdvanceOptions,
-    RolloutTelemetryAdvanceStatus, SelfRolloutPaths, read_rollout_status,
-    rollout_main_activation_path, rollout_shadow_finalize_path,
+    RolloutController, RolloutTelemetryAdvanceOptions, RolloutTelemetryAdvanceStatus,
+    SelfRolloutPaths, read_rollout_status, rollout_main_activation_path,
+    rollout_shadow_finalize_path,
 };
-use sinomo_sandbox::SandboxFileSystem;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::io::Read;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU8, AtomicU64, Ordering},
@@ -47,19 +76,12 @@ use tokio::io::AsyncWriteExt as _;
 // Durable work that is known but currently cannot run (for example, a repair
 // whose target is offline) retains a bounded retry cadence. Quiet nodes park:
 // an O(total-state) inventory is not an acceptable liveness probe.
-const DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL: Duration = Duration::from_secs(300);
-const DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-pub const DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL: Duration = Duration::from_secs(30);
-const DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DAEMON_DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 // Full DFS passes own the process's sole backend-bearing service lane. Stagger
 // their first acquisition by stable membership rank so a rolling restart does
 // not make every node hold its local lane while asking a peer to enter theirs.
-const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT: Duration = Duration::from_secs(20);
-const DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW: Duration = Duration::from_secs(300);
 // Reserve startup for liveness publication and one live doctor/readiness pass.
 // Rank-zero DFS work is intentionally not allowed to consume that same window.
-const DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE: Duration = Duration::from_secs(15);
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
     DAEMON_CLUSTER_PUBLISH_INTERVAL;
@@ -71,16 +93,8 @@ const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_CONNECTIVITY_EXTERNAL_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
 const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
 const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
-const DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT: &[u8] = b"sinomo-sandbox-lifecycle-lock-v1\n";
 #[cfg(feature = "sandbox")]
 const DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
-#[cfg(feature = "sandbox")]
-const DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
-const DAEMON_SANDBOX_LIFECYCLE_PENDING_DIR: &str = "pending";
-#[cfg(feature = "sandbox")]
-const DAEMON_SANDBOX_LIFECYCLE_SWEEP_STAMP: &str = "last-safety-sweep";
-const DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT: &[u8] =
-    b"sinomo-sandbox-authoritative-recovery-pending-v1\n";
 
 static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_CLUSTER_MAINTENANCE_DIRTY: AtomicU8 = AtomicU8::new(0);
@@ -340,367 +354,6 @@ fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: b
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonConnectivityEndpointProjection {
-    endpoint_id: sinomo_core::Id,
-    node_id: NodeId,
-    transport: ClusterTransportKind,
-    address: String,
-    source: ClusterEndpointSource,
-    privacy: ClusterEndpointPrivacy,
-    priority: u16,
-}
-
-impl From<&ClusterEndpointRecord> for DaemonConnectivityEndpointProjection {
-    fn from(endpoint: &ClusterEndpointRecord) -> Self {
-        Self {
-            endpoint_id: endpoint.endpoint_id.clone(),
-            node_id: endpoint.node_id.clone(),
-            transport: endpoint.transport.clone(),
-            address: endpoint.address.clone(),
-            source: endpoint.source.clone(),
-            privacy: endpoint.privacy.clone(),
-            priority: endpoint.priority,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DaemonConnectivityMemberProjection {
-    node_id: NodeId,
-    authorized: bool,
-    endpoints: Vec<DaemonConnectivityEndpointProjection>,
-}
-
-impl From<&ClusterMemberRecord> for DaemonConnectivityMemberProjection {
-    fn from(member: &ClusterMemberRecord) -> Self {
-        let mut endpoints = member
-            .endpoints
-            .iter()
-            .map(DaemonConnectivityEndpointProjection::from)
-            .collect::<Vec<_>>();
-        endpoints.sort_by(|left, right| {
-            (&left.node_id, &left.endpoint_id, &left.address).cmp(&(
-                &right.node_id,
-                &right.endpoint_id,
-                &right.address,
-            ))
-        });
-        Self {
-            node_id: member.node_id.clone(),
-            authorized: member.state.is_authorized(),
-            endpoints,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum DaemonConnectivityTopologyValue {
-    Member(DaemonConnectivityMemberProjection),
-    Endpoint(DaemonConnectivityEndpointProjection),
-    Connectivity(sinomo_core::network::__connectivity_store::ClusterConnectivityRoutingProjection),
-    Malformed(Vec<u8>),
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct DaemonConnectivityProjectionChange {
-    probe_inputs_changed: bool,
-    route_generation_changed: bool,
-}
-
-impl DaemonConnectivityProjectionChange {
-    fn record_key(&mut self, key: &str) {
-        if daemon_connectivity_probe_input_key(key) {
-            self.probe_inputs_changed = true;
-            self.route_generation_changed = true;
-        } else if daemon_connectivity_record_key(key) {
-            self.route_generation_changed = true;
-        }
-    }
-}
-
-#[derive(Debug)]
-struct DaemonConnectivityTopologyProjection {
-    revision: Option<u64>,
-    values: BTreeMap<String, DaemonConnectivityTopologyValue>,
-    include_connectivity_records: bool,
-}
-
-impl Default for DaemonConnectivityTopologyProjection {
-    fn default() -> Self {
-        Self::new(true)
-    }
-}
-
-impl DaemonConnectivityTopologyProjection {
-    fn new(include_connectivity_records: bool) -> Self {
-        Self {
-            revision: None,
-            values: BTreeMap::new(),
-            include_connectivity_records,
-        }
-    }
-
-    fn seed_if_newer(&mut self, snapshot: &sinomo_core::kv::KvSnapshot) {
-        if self
-            .revision
-            .is_some_and(|revision| snapshot.revision.0 <= revision)
-        {
-            return;
-        }
-        self.values = daemon_connectivity_topology_projection_from_snapshot(
-            snapshot,
-            self.include_connectivity_records,
-        );
-        self.revision = Some(snapshot.revision.0);
-    }
-
-    fn observe(
-        &mut self,
-        snapshot: &sinomo_core::kv::KvSnapshot,
-    ) -> DaemonConnectivityProjectionChange {
-        let Some(revision) = self.revision else {
-            let next = daemon_connectivity_topology_projection_from_snapshot(
-                snapshot,
-                self.include_connectivity_records,
-            );
-            let changed = daemon_connectivity_projection_change(&self.values, &next);
-            self.values = next;
-            self.revision = Some(snapshot.revision.0);
-            return changed;
-        };
-        if snapshot.revision.0 <= revision {
-            return DaemonConnectivityProjectionChange::default();
-        }
-        if revision < snapshot.compacted_revision.0 {
-            let next = daemon_connectivity_topology_projection_from_snapshot(
-                snapshot,
-                self.include_connectivity_records,
-            );
-            let changed = daemon_connectivity_projection_change(&self.values, &next);
-            self.values = next;
-            self.revision = Some(snapshot.revision.0);
-            return changed;
-        }
-
-        let first_new = snapshot
-            .events
-            .partition_point(|event| event.revision.0 <= revision);
-        let new_events = &snapshot.events[first_new..];
-        if !daemon_connectivity_events_cover_revision_range(
-            revision,
-            snapshot.revision.0,
-            new_events,
-        ) {
-            let next = daemon_connectivity_topology_projection_from_snapshot(
-                snapshot,
-                self.include_connectivity_records,
-            );
-            let changed = daemon_connectivity_projection_change(&self.values, &next);
-            self.values = next;
-            self.revision = Some(snapshot.revision.0);
-            return changed;
-        }
-        let mut before = BTreeMap::new();
-        for event in new_events {
-            if !daemon_connectivity_topology_key(&event.key, self.include_connectivity_records) {
-                continue;
-            }
-            before
-                .entry(event.key.clone())
-                .or_insert_with(|| self.values.get(&event.key).cloned());
-            match &event.kind {
-                sinomo_core::kv::KvEventKind::Put { value } => {
-                    self.values.insert(
-                        event.key.clone(),
-                        daemon_connectivity_topology_value(&event.key, value),
-                    );
-                }
-                sinomo_core::kv::KvEventKind::Delete => {
-                    self.values.remove(&event.key);
-                }
-            }
-        }
-        self.revision = Some(snapshot.revision.0);
-        let mut changed = DaemonConnectivityProjectionChange::default();
-        for (key, previous) in before {
-            if previous != self.values.get(&key).cloned() {
-                changed.record_key(&key);
-            }
-        }
-        changed
-    }
-
-    /// Applies one complete process-local commit delta.
-    ///
-    /// `None` requests a full resident projection rebuild. This is deliberately
-    /// conservative around startup races, compacted history, or a revision gap:
-    /// a partial topology image is worse than paying one exceptional O(N)
-    /// rebuild. The ordinary in-order path touches only the command's final key
-    /// states.
-    fn observe_delta(
-        &mut self,
-        delta: &sinomo_core::kv::ClusterKvCommittedDelta,
-    ) -> Option<DaemonConnectivityProjectionChange> {
-        let revision = self.revision?;
-        if delta.revision.0 <= revision {
-            return Some(DaemonConnectivityProjectionChange::default());
-        }
-        if revision < delta.compacted_revision.0 || delta.events.is_empty() {
-            return None;
-        }
-        if !daemon_connectivity_events_cover_revision_range(
-            revision,
-            delta.revision.0,
-            &delta.events,
-        ) {
-            return None;
-        }
-
-        let relevant_event_keys = delta
-            .events
-            .iter()
-            .filter(|event| {
-                daemon_connectivity_topology_key(&event.key, self.include_connectivity_records)
-            })
-            .map(|event| event.key.as_str())
-            .collect::<BTreeSet<_>>();
-        let mut final_keys = BTreeSet::new();
-        let mut relevant_final_keys = BTreeSet::new();
-        for state in &delta.final_key_states {
-            if !final_keys.insert(state.key.as_str())
-                || state
-                    .entry
-                    .as_ref()
-                    .is_some_and(|entry| entry.key != state.key)
-            {
-                return None;
-            }
-            if daemon_connectivity_topology_key(&state.key, self.include_connectivity_records) {
-                relevant_final_keys.insert(state.key.as_str());
-            }
-        }
-        if relevant_event_keys != relevant_final_keys {
-            return None;
-        }
-
-        let mut changed = DaemonConnectivityProjectionChange::default();
-        for state in &delta.final_key_states {
-            if !daemon_connectivity_topology_key(&state.key, self.include_connectivity_records) {
-                continue;
-            }
-            let previous = self.values.get(&state.key).cloned();
-            match state.entry.as_ref() {
-                Some(entry) => {
-                    self.values.insert(
-                        state.key.clone(),
-                        daemon_connectivity_topology_value(&state.key, &entry.value),
-                    );
-                }
-                None => {
-                    self.values.remove(&state.key);
-                }
-            }
-            if previous != self.values.get(&state.key).cloned() {
-                changed.record_key(&state.key);
-            }
-        }
-        self.revision = Some(delta.revision.0);
-        Some(changed)
-    }
-}
-
-fn daemon_connectivity_events_cover_revision_range(
-    previous_revision: u64,
-    current_revision: u64,
-    events: &[sinomo_core::kv::KvEvent],
-) -> bool {
-    current_revision <= previous_revision
-        || (events.first().map(|event| event.revision.0)
-            == Some(previous_revision.saturating_add(1))
-            && events.last().map(|event| event.revision.0) == Some(current_revision)
-            && events.windows(2).all(|events| {
-                let previous = events[0].revision.0;
-                let current = events[1].revision.0;
-                current == previous || current == previous.saturating_add(1)
-            }))
-}
-
-fn daemon_connectivity_projection_change(
-    before: &BTreeMap<String, DaemonConnectivityTopologyValue>,
-    after: &BTreeMap<String, DaemonConnectivityTopologyValue>,
-) -> DaemonConnectivityProjectionChange {
-    let mut changed = DaemonConnectivityProjectionChange::default();
-    let mut keys = before.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    keys.extend(after.keys().map(String::as_str));
-    for key in keys {
-        if before.get(key) != after.get(key) {
-            changed.record_key(key);
-        }
-    }
-    changed
-}
-
-fn daemon_connectivity_topology_projection_from_snapshot(
-    snapshot: &sinomo_core::kv::KvSnapshot,
-    include_connectivity_records: bool,
-) -> BTreeMap<String, DaemonConnectivityTopologyValue> {
-    snapshot
-        .entries
-        .iter()
-        .filter(|entry| daemon_connectivity_topology_key(&entry.key, include_connectivity_records))
-        .map(|entry| {
-            (
-                entry.key.clone(),
-                daemon_connectivity_topology_value(&entry.key, &entry.value),
-            )
-        })
-        .collect()
-}
-
-fn daemon_connectivity_topology_value(key: &str, value: &[u8]) -> DaemonConnectivityTopologyValue {
-    if key.starts_with("/cluster/members/") {
-        return sinomo_core::kv::decode_kv_value::<ClusterMemberRecord>(value)
-            .map(|member| {
-                DaemonConnectivityTopologyValue::Member(DaemonConnectivityMemberProjection::from(
-                    &member,
-                ))
-            })
-            .unwrap_or_else(|_| DaemonConnectivityTopologyValue::Malformed(value.to_vec()));
-    }
-    if key.starts_with("/cluster/endpoints/") {
-        return sinomo_core::kv::decode_kv_value::<ClusterEndpointRecord>(value)
-            .map(|endpoint| {
-                DaemonConnectivityTopologyValue::Endpoint(
-                    DaemonConnectivityEndpointProjection::from(&endpoint),
-                )
-            })
-            .unwrap_or_else(|_| DaemonConnectivityTopologyValue::Malformed(value.to_vec()));
-    }
-    sinomo_core::kv::decode_kv_value::<sinomo_core::network::ClusterConnectivityRecord>(value)
-        .map(|record| {
-            DaemonConnectivityTopologyValue::Connectivity(
-                sinomo_core::network::__connectivity_store::cluster_connectivity_routing_projection(
-                    &record,
-                ),
-            )
-        })
-        .unwrap_or_else(|_| DaemonConnectivityTopologyValue::Malformed(value.to_vec()))
-}
-
-fn daemon_connectivity_topology_key(key: &str, include_connectivity_records: bool) -> bool {
-    daemon_connectivity_probe_input_key(key)
-        || (include_connectivity_records && daemon_connectivity_record_key(key))
-}
-
-fn daemon_connectivity_probe_input_key(key: &str) -> bool {
-    key.starts_with("/cluster/members/") || key.starts_with("/cluster/endpoints/")
-}
-
-fn daemon_connectivity_record_key(key: &str) -> bool {
-    key.starts_with("/cluster/network/connectivity/")
-}
-
 struct DaemonConnectivityTopologySubscriptions {
     _snapshot_subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
     _delta_subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
@@ -759,7 +412,7 @@ impl DaemonConnectivityTopologyObserver {
                 .projection
                 .lock()
                 .ok()
-                .and_then(|projection| projection.revision),
+                .and_then(|projection| projection.revision()),
             delta_revision = delta.revision.0,
             compacted_revision = delta.compacted_revision.0,
             "connectivity topology delta has no continuous baseline; rebuilding its resident projection"
@@ -1058,323 +711,87 @@ async fn start_daemon_network_environment_watch(
     Some(DaemonNetworkEnvironmentWatch { task })
 }
 
-fn daemon_sandbox_lifecycle_recovery_state_dir(paths: &DaemonPaths) -> PathBuf {
-    paths.root.join(DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR)
-}
-
-fn daemon_sandbox_lifecycle_pending_dir(paths: &DaemonPaths) -> PathBuf {
-    daemon_sandbox_lifecycle_recovery_state_dir(paths).join(DAEMON_SANDBOX_LIFECYCLE_PENDING_DIR)
-}
-
-fn daemon_sandbox_lifecycle_pending_marker_path(
+fn daemon_sandbox_lifecycle_recovery_state(
     paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-) -> PathBuf {
-    daemon_sandbox_lifecycle_pending_dir(paths).join(sandbox_id.as_str())
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_lifecycle_sweep_stamp_path(paths: &DaemonPaths) -> PathBuf {
-    daemon_sandbox_lifecycle_recovery_state_dir(paths).join(DAEMON_SANDBOX_LIFECYCLE_SWEEP_STAMP)
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_lifecycle_io_error(path: &Path, source: std::io::Error) -> DaemonError {
-    DaemonError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    }
-}
-
-fn daemon_sandbox_lifecycle_durable_file_error(
-    source: sinomo_core::storage::durable_file::DurableFileError,
-) -> DaemonError {
-    DaemonError::Io {
-        path: source.path().to_string(),
-        detail: source.detail().to_string(),
-    }
-}
-
-fn ensure_daemon_sandbox_lifecycle_state_dirs(paths: &DaemonPaths) -> Result<(), DaemonError> {
-    let state_dir = daemon_sandbox_lifecycle_recovery_state_dir(paths);
-    let pending_dir = daemon_sandbox_lifecycle_pending_dir(paths);
-    // Create each level separately through the shared durable-file primitive.
-    // It syncs both the new directory and its already-existing parent, using a
-    // backup-semantics directory handle where Windows permits it. The periodic
-    // safety sweep remains the fallback on filesystems that cannot flush
-    // directory metadata explicitly.
-    sinomo_core::storage::durable_file::ensure_private_directory(&state_dir)
-        .map_err(daemon_sandbox_lifecycle_durable_file_error)?;
-    sinomo_core::storage::durable_file::ensure_private_directory(&pending_dir)
-        .map_err(daemon_sandbox_lifecycle_durable_file_error)
-}
-
-fn write_daemon_sandbox_lifecycle_state(path: &Path, bytes: &[u8]) -> Result<(), DaemonError> {
-    sinomo_core::storage::durable_file::write_file_atomic(
-        path,
-        bytes,
-        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
-            "sandbox-lifecycle-state",
-            "tmp",
-        )
-        .sync_all(),
-    )
-    .map_err(daemon_sandbox_lifecycle_durable_file_error)
-}
-
-fn mark_daemon_sandbox_authoritative_recovery_pending(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-) -> Result<(), DaemonError> {
-    ensure_daemon_sandbox_lifecycle_state_dirs(paths)?;
-    write_daemon_sandbox_lifecycle_state(
-        &daemon_sandbox_lifecycle_pending_marker_path(paths, sandbox_id),
-        DAEMON_SANDBOX_LIFECYCLE_PENDING_MARKER_CONTENT,
+) -> sinomo_sandbox::SandboxLifecycleRecoveryState {
+    sinomo_sandbox::SandboxLifecycleRecoveryState::new(
+        paths.root.join(DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
     )
 }
 
-fn clear_daemon_sandbox_authoritative_recovery_pending(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-) -> Result<(), DaemonError> {
-    let path = daemon_sandbox_lifecycle_pending_marker_path(paths, sandbox_id);
-    sinomo_core::storage::durable_file::remove_file_if_exists_and_sync_parent(&path)
-        .map(|_| ())
-        .map_err(daemon_sandbox_lifecycle_durable_file_error)
-}
-
-fn best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    context: &'static str,
-) {
-    if let Err(error) = clear_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id) {
-        // The authoritative operation has already settled. A stale marker is
-        // safe: the next maintenance tick rechecks DFS and clears it. Returning
-        // an RPC error here would make a committed mutation look retryable.
-        tracing::warn!(
-            sandbox_id = %sandbox_id,
-            context,
-            error = %error,
-            "failed to clear settled sandbox lifecycle recovery marker"
-        );
-    }
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_authoritative_recovery_pending_ids(
-    paths: &DaemonPaths,
-) -> Result<BTreeSet<sinomo_sandbox::SandboxId>, DaemonError> {
-    let pending_dir = daemon_sandbox_lifecycle_pending_dir(paths);
-    let entries = match std::fs::read_dir(&pending_dir) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(source) => return Err(daemon_sandbox_lifecycle_io_error(&pending_dir, source)),
-    };
-    let mut sandbox_ids = BTreeSet::new();
-    for entry in entries {
-        let entry =
-            entry.map_err(|source| daemon_sandbox_lifecycle_io_error(&pending_dir, source))?;
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .map_err(|source| daemon_sandbox_lifecycle_io_error(&path, source))?
-            .is_file()
-        {
-            return Err(DaemonError::Io {
-                path: path.display().to_string(),
-                detail: "sandbox lifecycle pending marker is not a regular file".to_string(),
-            });
-        }
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: "sandbox lifecycle pending marker name is not UTF-8".to_string(),
-            })?;
-        let sandbox_id =
-            sinomo_sandbox::SandboxId::new(name).map_err(|source| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: format!("invalid sandbox lifecycle pending marker: {source}"),
-            })?;
-        sandbox_ids.insert(sandbox_id);
-    }
-    Ok(sandbox_ids)
-}
-
-#[cfg(feature = "sandbox")]
-fn record_daemon_sandbox_lifecycle_safety_sweep(
-    paths: &DaemonPaths,
-    now_unix_nanos: u64,
-) -> Result<(), DaemonError> {
-    ensure_daemon_sandbox_lifecycle_state_dirs(paths)?;
-    write_daemon_sandbox_lifecycle_state(
-        &daemon_sandbox_lifecycle_sweep_stamp_path(paths),
-        now_unix_nanos.to_string().as_bytes(),
-    )
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_lifecycle_safety_sweep_due_or_initialize(
-    paths: &DaemonPaths,
-    now_unix_nanos: u64,
-) -> Result<bool, DaemonError> {
-    let path = daemon_sandbox_lifecycle_sweep_stamp_path(paths);
-    let stored = match std::fs::read_to_string(&path) {
-        Ok(stored) => stored,
-        // A one-time startup scan preserves recovery for fences written by an
-        // older binary that predates the local marker. The successful scan
-        // records the stamp, so subsequent quiet 30-second ticks stay local.
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-        Err(source) => return Err(daemon_sandbox_lifecycle_io_error(&path, source)),
-    };
-    let Ok(last_sweep_unix_nanos) = stored.trim().parse::<u64>() else {
-        return Ok(true);
-    };
-    if last_sweep_unix_nanos > now_unix_nanos {
-        return Ok(true);
-    }
-    let interval_nanos = u64::try_from(DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos())
-        .unwrap_or(u64::MAX);
-    Ok(now_unix_nanos.saturating_sub(last_sweep_unix_nanos) >= interval_nanos)
-}
-
-type DaemonSandboxLifecycleLease =
-    sinomo_dfs::DfsRenewableExclusiveLease<sinomo_dfs::DfsNodeTransport>;
 type DaemonSandboxDfsService = sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>;
 type DaemonSandboxInstanceStore =
     sinomo_sandbox::SifsSandboxInstanceStore<sinomo_dfs::DfsNodeTransport>;
+type DaemonSandboxExecutionLease =
+    sinomo_sandbox::ClusteredSandboxExecutionLease<sinomo_dfs::DfsNodeTransport>;
 
-struct DaemonSandboxExecutionLease {
-    lease: Option<DaemonSandboxLifecycleLease>,
-    loss_monitor: Option<std::thread::JoinHandle<()>>,
-    cancellation: sinomo_sandbox::SandboxCancellationToken,
+struct DaemonSandboxLifecycleHooks<'a> {
+    paths: &'a DaemonPaths,
 }
 
-impl DaemonSandboxExecutionLease {
-    fn start(
-        lease: DaemonSandboxLifecycleLease,
-        cancellation: sinomo_sandbox::SandboxCancellationToken,
-    ) -> Result<Self, DaemonError> {
-        let status = lease.status();
-        let monitor_cancellation = cancellation.clone();
-        let loss_monitor = std::thread::Builder::new()
-            .name("sinomo-sandbox-lease-loss".to_string())
-            .spawn(move || {
-                if status.wait_until_lost() {
-                    monitor_cancellation.fence_lifecycle_mutation();
-                }
-            })
-            .map_err(|source| DaemonError::Parse {
-                detail: format!("start sandbox lifecycle lease loss monitor: {source}"),
-            })?;
-        Ok(Self {
-            lease: Some(lease),
-            loss_monitor: Some(loss_monitor),
-            cancellation,
-        })
+impl sinomo_sandbox::ClusteredSandboxLifecycleHooks for DaemonSandboxLifecycleHooks<'_> {
+    type Error = DaemonError;
+
+    fn load_policy_config(
+        &mut self,
+    ) -> Result<sinomo_sandbox::SandboxClusterPolicyConfig, Self::Error> {
+        load_daemon_sandbox_policy_config(self.paths)
     }
 
-    fn ensure_held(&self) -> Result<(), sinomo_dfs::DfsRenewableLeaseError> {
-        self.lease
-            .as_ref()
-            .ok_or(sinomo_dfs::DfsRenewableLeaseError::Released)?
-            .ensure_held()
-    }
-
-    fn cancellation_token(&self) -> sinomo_sandbox::SandboxCancellationToken {
-        self.cancellation.clone()
-    }
-}
-
-impl Drop for DaemonSandboxExecutionLease {
-    fn drop(&mut self) {
-        if let Some(lease) = self.lease.take()
-            && let Err(error) = lease.release()
-        {
-            tracing::debug!(error = %error, "sandbox lifecycle lease release failed");
-        }
-        if let Some(monitor) = self.loss_monitor.take()
-            && monitor.join().is_err()
-        {
-            tracing::warn!("sandbox lifecycle lease loss monitor panicked");
-        }
-    }
-}
-
-fn acquire_daemon_sandbox_lifecycle_lease(
-    mut dfs: DaemonSandboxDfsService,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    replica_candidates: &[sinomo_core::node::NodeId],
-) -> Result<DaemonSandboxLifecycleLease, DaemonError> {
-    let lock_root = sinomo_sandbox::sandbox_lock_root();
-    dfs.posix_mkdir_all(&lock_root)?;
-    let anchor_path = sinomo_sandbox::sandbox_lock_anchor_path(sandbox_id);
-    let stat = match dfs.posix_stat_distributed(&anchor_path) {
-        Ok(stat) => stat,
-        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
-        | Err(sinomo_dfs::DfsPosixError::MissingParent { .. }) => {
-            match dfs.posix_write_file(
-                &anchor_path,
-                DAEMON_SANDBOX_LOCK_ANCHOR_CONTENT,
-                sinomo_dfs::DfsWriteOptions::replicated_eventual(replica_candidates.to_vec()),
-            ) {
-                Ok(stat) => stat,
-                Err(write_error) => match dfs.posix_stat_distributed(&anchor_path) {
-                    Ok(stat) => stat,
-                    Err(stat_error) => {
-                        return Err(DaemonError::Parse {
-                            detail: format!(
-                                "failed to create sandbox lifecycle lock anchor {anchor_path}: {write_error}; post-write stat also failed: {stat_error}"
-                            ),
-                        });
-                    }
-                },
+    fn append_event(
+        &mut self,
+        event: sinomo_core::EventEnvelope,
+        durability: sinomo_sandbox::SandboxAuditDurability,
+    ) -> Result<(), Self::Error> {
+        match durability {
+            sinomo_sandbox::SandboxAuditDurability::Buffered => {
+                append_daemon_sandbox_event(self.paths, event)
+            }
+            sinomo_sandbox::SandboxAuditDurability::Durable => {
+                append_daemon_sandbox_event_durable(self.paths, event)
             }
         }
-        Err(error) => return Err(error.into()),
-    };
-    if matches!(
-        stat.kind,
-        sinomo_dfs::DfsObjectKind::Directory | sinomo_dfs::DfsObjectKind::Tombstone
-    ) {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "sandbox lifecycle lock anchor is not a regular file: {anchor_path} ({:?})",
-                stat.kind
-            ),
-        });
     }
-    let anchor = sinomo_dfs::DfsRenewableLeaseAnchor::new(anchor_path, stat.object_id);
-    let session_id = sinomo_dfs::DfsAdvisoryLockSessionId::new(format!(
-        "sandbox-lifecycle:{}:{}:{}",
-        sandbox_id,
-        std::process::id(),
-        sinomo_core::Id::generate()
-    ));
-    sinomo_dfs::DfsRenewableExclusiveLease::try_acquire(
-        Arc::new(Mutex::new(dfs)),
-        anchor,
-        session_id,
-        Some(std::process::id()),
-        sinomo_dfs::DfsRenewableLeaseConfig::default(),
-    )
-    .map_err(|source| DaemonError::Parse {
-        detail: format!(
-            "sandbox {sandbox_id} is busy or its lifecycle lease is unavailable: {source}"
-        ),
-    })
+
+    fn clear_authoritative_recovery_pending(
+        &mut self,
+        sandbox_id: &sinomo_sandbox::SandboxId,
+        context: &'static str,
+    ) {
+        daemon_sandbox_lifecycle_recovery_state(self.paths)
+            .clear_authoritative_recovery_pending_best_effort(sandbox_id, context);
+    }
+
+    fn mark_authoritative_recovery_pending(
+        &mut self,
+        sandbox_id: &sinomo_sandbox::SandboxId,
+    ) -> Result<(), Self::Error> {
+        daemon_sandbox_lifecycle_recovery_state(self.paths)
+            .mark_authoritative_recovery_pending(sandbox_id)
+            .map_err(Into::into)
+    }
+
+    fn invalid(&mut self, detail: String) -> Self::Error {
+        DaemonError::Parse { detail }
+    }
 }
 
-fn ensure_daemon_sandbox_lifecycle_lease(
-    lease: &DaemonSandboxLifecycleLease,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    phase: &str,
-) -> Result<(), DaemonError> {
-    lease.ensure_held().map_err(|source| DaemonError::Parse {
-        detail: format!("sandbox {sandbox_id} lifecycle lease lost {phase}: {source}"),
-    })
+impl sinomo_sandbox::ClusteredSandboxToolchainHooks for DaemonSandboxLifecycleHooks<'_> {
+    type Error = DaemonError;
+
+    fn load_policy_config(
+        &mut self,
+    ) -> Result<sinomo_sandbox::SandboxClusterPolicyConfig, Self::Error> {
+        load_daemon_sandbox_policy_config(self.paths)
+    }
+
+    fn append_event(&mut self, event: sinomo_core::EventEnvelope) -> Result<(), Self::Error> {
+        append_daemon_sandbox_event(self.paths, event)
+    }
+
+    fn invalid(&mut self, detail: String) -> Self::Error {
+        DaemonError::Parse { detail }
+    }
 }
 
 fn open_daemon_sandbox_store_with_mutation_lease(
@@ -1389,7 +806,13 @@ fn open_daemon_sandbox_store_with_mutation_lease(
     ),
     DaemonError,
 > {
-    open_daemon_sandbox_store_with_lease(paths, sandbox_id, runtime, true)
+    open_daemon_sandbox_store_with_lease(
+        paths,
+        sandbox_id,
+        runtime,
+        sinomo_sandbox::ClusteredSandboxOperationKind::Mutation,
+        cfg!(feature = "sandbox"),
+    )
 }
 
 fn open_daemon_sandbox_store_with_transaction_lease(
@@ -1404,19 +827,21 @@ fn open_daemon_sandbox_store_with_transaction_lease(
     ),
     DaemonError,
 > {
-    let operation = open_daemon_sandbox_store_with_lease(paths, sandbox_id, runtime, false)?;
-    // Publish the marker through the durable-file path before any authoritative
-    // SIFS fence can be written. A crash in any later phase then makes the cheap
-    // 30-second precheck wake recovery without hydrating DFS while idle.
-    mark_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id)?;
-    Ok(operation)
+    open_daemon_sandbox_store_with_lease(
+        paths,
+        sandbox_id,
+        runtime,
+        sinomo_sandbox::ClusteredSandboxOperationKind::AuthoritativeTransaction,
+        false,
+    )
 }
 
 fn open_daemon_sandbox_store_with_lease(
     paths: &DaemonPaths,
     sandbox_id: &sinomo_sandbox::SandboxId,
     runtime: Option<&tokio::runtime::Handle>,
-    recover_authoritative: bool,
+    kind: sinomo_sandbox::ClusteredSandboxOperationKind,
+    recover_existing: bool,
 ) -> Result<
     (
         DaemonSandboxExecutionLease,
@@ -1435,263 +860,16 @@ fn open_daemon_sandbox_store_with_lease(
             runtime,
             content.clone(),
         )?;
-    let raw_lease =
-        acquire_daemon_sandbox_lifecycle_lease(lease_dfs, sandbox_id, &replica_candidates)?;
-    ensure_daemon_sandbox_lifecycle_lease(&raw_lease, sandbox_id, "before pending settlement")?;
-    let lease = DaemonSandboxExecutionLease::start(
-        raw_lease,
-        sinomo_sandbox::SandboxCancellationToken::new(),
-    )?;
     let dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(paths, runtime, content)?;
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates.clone());
-    recover_daemon_sandbox_lifecycle_transaction_under_lease(
-        paths,
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).open_operation(
+        lease_dfs,
+        dfs,
+        replica_candidates,
         sandbox_id,
-        &mut store,
-        &lease,
-        recover_authoritative,
-    )?;
-    lease.ensure_held().map_err(|source| DaemonError::Parse {
-        detail: format!(
-            "sandbox {sandbox_id} lifecycle lease lost after pending settlement: {source}"
-        ),
-    })?;
-    Ok((lease, store, replica_candidates))
-}
-
-fn ensure_daemon_sandbox_mutation_lease(
-    lease: &DaemonSandboxExecutionLease,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    phase: &str,
-) -> Result<(), DaemonError> {
-    lease.ensure_held().map_err(|source| DaemonError::Parse {
-        detail: format!("sandbox {sandbox_id} lifecycle lease lost {phase}: {source}"),
-    })
-}
-
-fn daemon_sandbox_store_mutation_checkpoint(
-    lease: &DaemonSandboxExecutionLease,
-    cancellation: &sinomo_sandbox::SandboxCancellationToken,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    phase: &str,
-) -> Result<(), sinomo_sandbox::SandboxStoreError> {
-    if cancellation.lifecycle_mutation_is_fenced() {
-        return Err(sinomo_sandbox::SandboxStoreError::Io {
-            path: sinomo_sandbox::sandbox_manifest_path(sandbox_id),
-            detail: format!("sandbox lifecycle lease was lost {phase}"),
-        });
-    }
-    ensure_daemon_sandbox_mutation_lease(lease, sandbox_id, phase).map_err(|error| {
-        sinomo_sandbox::SandboxStoreError::Io {
-            path: sinomo_sandbox::sandbox_manifest_path(sandbox_id),
-            detail: error.to_string(),
-        }
-    })
-}
-
-#[cfg(feature = "sandbox")]
-fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    store: &mut DaemonSandboxInstanceStore,
-    lifecycle_lease: &DaemonSandboxExecutionLease,
-    recover_authoritative: bool,
-) -> Result<(), DaemonError> {
-    if recover_authoritative {
-        recover_daemon_authoritative_sandbox_transaction(
-            paths,
-            sandbox_id,
-            store,
-            lifecycle_lease,
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(feature = "sandbox")]
-fn recover_daemon_authoritative_sandbox_transaction(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    store: &mut DaemonSandboxInstanceStore,
-    lifecycle_lease: &DaemonSandboxExecutionLease,
-) -> Result<(), DaemonError> {
-    ensure_daemon_sandbox_mutation_lease(
-        lifecycle_lease,
-        sandbox_id,
-        "before authoritative transaction recovery",
-    )?;
-    let node_id = store.dfs.node_id().clone();
-    let manifest = match store.load_allow_pending_reconciliation(sandbox_id) {
-        Ok(manifest) => manifest,
-        Err(sinomo_sandbox::SandboxStoreError::NotFound { .. })
-        | Err(sinomo_sandbox::SandboxStoreError::LegacyLayout { .. }) => {
-            best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-                paths,
-                sandbox_id,
-                "recovery target absent",
-            );
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let Some(pending) = manifest.pending_reconciliation.clone() else {
-        best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-            paths,
-            sandbox_id,
-            "recovery already settled",
-        );
-        return Ok(());
-    };
-    match pending.operation {
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::UnsupportedLegacyCommandTransaction => {
-            return Err(DaemonError::Parse {
-                detail: format!(
-                    "sandbox {sandbox_id} has obsolete command transaction {}; recreate the internal-development sandbox",
-                    pending.transaction_id
-                ),
-            });
-        }
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::Create => {
-            let manifest = store.recover_create(sandbox_id, OffsetDateTime::now_utc())?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_instance_created_event(node_id.clone(), &manifest),
-            )?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_toolchain_pinned_event(node_id.clone(), &manifest),
-            )?;
-            for mount in &manifest.mounts {
-                append_daemon_sandbox_event_durable(
-                    paths,
-                    sinomo_sandbox::sandbox_mount_added_event(node_id.clone(), &manifest, mount),
-                )?;
-            }
-            ensure_daemon_sandbox_mutation_lease(
-                lifecycle_lease,
-                sandbox_id,
-                "after recovered create audit",
-            )?;
-            store.clear_reconciliation_transaction(
-                sandbox_id,
-                &pending.transaction_id,
-                OffsetDateTime::now_utc(),
-            )?;
-        }
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::ResumeCheckpoint {
-            checkpoint_id,
-        } => {
-            let manifest =
-                store.resume_checkpoint(sandbox_id, &checkpoint_id, OffsetDateTime::now_utc())?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_instance_resumed_event(node_id, &manifest, &checkpoint_id),
-            )?;
-            ensure_daemon_sandbox_mutation_lease(
-                lifecycle_lease,
-                sandbox_id,
-                "after recovered resume audit",
-            )?;
-            store.clear_reconciliation_transaction(
-                sandbox_id,
-                &pending.transaction_id,
-                OffsetDateTime::now_utc(),
-            )?;
-        }
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::Reboot { .. } => {
-            let (manifest, cleared_tmp) =
-                store.reboot_session(sandbox_id, OffsetDateTime::now_utc())?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_instance_rebooted_event(node_id, &manifest, cleared_tmp),
-            )?;
-            ensure_daemon_sandbox_mutation_lease(
-                lifecycle_lease,
-                sandbox_id,
-                "after recovered reboot audit",
-            )?;
-            store.clear_reconciliation_transaction(
-                sandbox_id,
-                &pending.transaction_id,
-                OffsetDateTime::now_utc(),
-            )?;
-        }
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::LegacyMigration => {
-            let cancellation = lifecycle_lease.cancellation_token();
-            let manifest = store.migrate_legacy_instance_with_checkpoints(
-                sandbox_id,
-                OffsetDateTime::now_utc(),
-                || {
-                    daemon_sandbox_store_mutation_checkpoint(
-                        lifecycle_lease,
-                        &cancellation,
-                        sandbox_id,
-                        "during legacy migration",
-                    )
-                },
-            )?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_instance_migrated_event(node_id, &manifest),
-            )?;
-            ensure_daemon_sandbox_mutation_lease(
-                lifecycle_lease,
-                sandbox_id,
-                "after recovered migration audit",
-            )?;
-            store.clear_reconciliation_transaction(
-                sandbox_id,
-                &pending.transaction_id,
-                OffsetDateTime::now_utc(),
-            )?;
-        }
-        sinomo_sandbox::SandboxAuthoritativeMutationOperation::Destroy => {
-            let cancellation = lifecycle_lease.cancellation_token();
-            store.apply_destroy_with_checkpoints(sandbox_id, &pending.transaction_id, || {
-                daemon_sandbox_store_mutation_checkpoint(
-                    lifecycle_lease,
-                    &cancellation,
-                    sandbox_id,
-                    "during destroy recovery",
-                )
-            })?;
-            append_daemon_sandbox_event_durable(
-                paths,
-                sinomo_sandbox::sandbox_instance_destroyed_transaction_event(node_id, &manifest),
-            )?;
-            ensure_daemon_sandbox_mutation_lease(
-                lifecycle_lease,
-                sandbox_id,
-                "after recovered destroy audit",
-            )?;
-            store.finalize_destroy_with_checkpoints(sandbox_id, &pending.transaction_id, || {
-                daemon_sandbox_store_mutation_checkpoint(
-                    lifecycle_lease,
-                    &cancellation,
-                    sandbox_id,
-                    "during destroy finalization recovery",
-                )
-            })?;
-        }
-    }
-    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-        paths,
-        sandbox_id,
-        "authoritative recovery settled",
-    );
-    Ok(())
-}
-
-#[cfg(not(feature = "sandbox"))]
-fn recover_daemon_sandbox_lifecycle_transaction_under_lease(
-    _paths: &DaemonPaths,
-    _sandbox_id: &sinomo_sandbox::SandboxId,
-    _store: &mut DaemonSandboxInstanceStore,
-    _lifecycle_lease: &DaemonSandboxExecutionLease,
-    _recover_authoritative: bool,
-) -> Result<(), DaemonError> {
-    Ok(())
+        kind,
+        recover_existing,
+    )
 }
 
 pub fn run_daemon_control_loop(
@@ -1971,17 +1149,18 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             )),
         ));
     }
-    if daemon_rollout_telemetry_enabled(label, startup_cluster_runtime_enabled) {
-        let reactor = crate::rollout::DaemonRolloutTelemetryReactor::new(&paths)?;
-        runtime_tasks.push((
-            "rollout telemetry reconciliation",
-            daemon_runtime_handle.spawn(reactor.run_until_stopped_async(
-                paths.clone(),
-                shutdown_rx.clone(),
-                label.to_string(),
-            )),
-        ));
-    }
+    runtime_tasks.extend(
+        crate::registry::start_internal_native_rust_module_runtime_tasks(
+            [sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY],
+            &paths,
+            &daemon_runtime_handle,
+            shutdown_rx.clone(),
+            label,
+            startup_cluster_runtime_enabled,
+        )?
+        .into_iter()
+        .map(crate::registry::NativeRustModuleRuntimeTask::into_parts),
+    );
     runtime_tasks.push((
         "background maintenance",
         daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
@@ -2113,35 +1292,6 @@ fn drain_daemon_runtime_after_task_shutdown(runtime: &tokio::runtime::Runtime) {
     });
 }
 
-fn daemon_dfs_maintenance_member_phase(state: &sinomo_core::ClusterBootstrapState) -> Duration {
-    let mut member_node_ids = state
-        .members
-        .iter()
-        .filter(|member| member.state.is_authorized())
-        .map(|member| member.node_id.clone())
-        .collect::<Vec<_>>();
-    if !member_node_ids.contains(&state.local_node_id) {
-        member_node_ids.push(state.local_node_id.clone());
-    }
-    member_node_ids.sort();
-    member_node_ids.dedup();
-    let rank = member_node_ids
-        .iter()
-        .position(|node_id| node_id == &state.local_node_id)
-        .unwrap_or_default();
-    let member_count = u128::try_from(member_node_ids.len())
-        .unwrap_or(u128::MAX)
-        .max(1);
-    let rank = u128::try_from(rank).unwrap_or(u128::MAX);
-    // Keep the ordinary 20s spacing, but compress it evenly when a larger
-    // membership would otherwise make later ranks collide at the interval cap.
-    let slot_nanos = DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT
-        .as_nanos()
-        .min(DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW.as_nanos() / member_count);
-    let phase_nanos = slot_nanos.saturating_mul(rank);
-    Duration::from_nanos(u64::try_from(phase_nanos).unwrap_or(u64::MAX))
-}
-
 fn daemon_dfs_initial_maintenance_phase(paths: &DaemonPaths) -> Result<Duration, DaemonError> {
     let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
     if !cluster_paths.state.exists() {
@@ -2227,160 +1377,6 @@ async fn join_daemon_dfs_maintenance_task(
     daemon_dfs_maintenance_task_result(task.await, label)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DaemonDfsMaintenanceProbeDecision {
-    trigger_maintenance: bool,
-    immediate_continuation: bool,
-    next_probe_at: Option<Instant>,
-}
-
-fn daemon_dfs_maintenance_probe_decision(
-    observed_at: Instant,
-    observed_at_unix_nanos: u64,
-    work: Option<DaemonDfsPendingMaintenanceWork>,
-) -> DaemonDfsMaintenanceProbeDecision {
-    let Some(work) = work else {
-        return DaemonDfsMaintenanceProbeDecision {
-            trigger_maintenance: false,
-            immediate_continuation: false,
-            next_probe_at: Some(
-                observed_at
-                    .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
-                    .unwrap_or(observed_at),
-            ),
-        };
-    };
-    let trigger_maintenance = work.should_trigger_background_maintenance();
-    let next_probe_delay = if trigger_maintenance {
-        // A successful maintenance pass performs its own follow-up probe. Keep
-        // the short safety deadline in case the request is cancelled before a
-        // pass starts or completes.
-        Some(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
-    } else {
-        let projected_delay = work
-            .next_maintenance_deadline_unix_nanos()
-            .map(|retry_at| Duration::from_nanos(retry_at.saturating_sub(observed_at_unix_nanos)))
-            .into_iter()
-            .chain(
-                work.has_deferred_work()
-                    .then_some(DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL),
-            )
-            .min();
-        projected_delay
-    };
-    DaemonDfsMaintenanceProbeDecision {
-        trigger_maintenance,
-        // A probe classifies newly observed durable work. Only the follow-up
-        // probe owned by a successfully completed bounded pass may turn the
-        // same classification into a work-conserving continuation.
-        immediate_continuation: false,
-        next_probe_at: next_probe_delay
-            .map(|delay| observed_at.checked_add(delay).unwrap_or(observed_at)),
-    }
-}
-
-fn daemon_dfs_maintenance_completion_decision(
-    outcome: DaemonDfsMaintenanceTickOutcome,
-    observed_at: Instant,
-    observed_at_unix_nanos: u64,
-    work: Option<DaemonDfsPendingMaintenanceWork>,
-    committed_edge_latched: bool,
-) -> DaemonDfsMaintenanceProbeDecision {
-    let mut decision =
-        daemon_dfs_maintenance_probe_decision(observed_at, observed_at_unix_nanos, work);
-    match outcome {
-        DaemonDfsMaintenanceTickOutcome::Completed { reached_limit } => {
-            // Only the pass that produced an explicit bounded remainder owns
-            // a work-conserving continuation. The follow-up probe is still
-            // required so externally resolved work cannot retain that owner;
-            // unrelated work first observed by this probe remains ordinarily
-            // interval-gated.
-            decision.immediate_continuation = reached_limit && decision.trigger_maintenance;
-        }
-        DaemonDfsMaintenanceTickOutcome::Deferred => {
-            // A deferred pass is not evidence that actionable work remains. It
-            // may only mean that a quiet periodic pass yielded to foreground
-            // DFS traffic or lost cluster admission. Reclassify durable state
-            // like newly probed work so repeated preemption cannot turn an idle
-            // node into a short-cadence maintenance loop.
-            decision.immediate_continuation = false;
-        }
-    }
-    if committed_edge_latched {
-        // A notification received while the completed pass was running owns a
-        // newer bounded attempt independently of both that pass's result and
-        // the bounded classifier. In particular, the classifier deliberately
-        // does not inventory pending metadata writes, so an idle result cannot
-        // consume this committed edge.
-        decision.trigger_maintenance = true;
-        decision.immediate_continuation = true;
-    }
-    decision
-}
-
-#[cfg(test)]
-fn daemon_dfs_maintenance_revalidation_decision(
-    observed_at: Instant,
-    observed_at_unix_nanos: u64,
-    work: Option<DaemonDfsPendingMaintenanceWork>,
-    immediate_continuation_requested: bool,
-) -> DaemonDfsMaintenanceProbeDecision {
-    let mut decision =
-        daemon_dfs_maintenance_probe_decision(observed_at, observed_at_unix_nanos, work);
-    // Revalidation may preserve an already-owned continuation while the work
-    // remains actionable, but it must never promote newly discovered work.
-    decision.immediate_continuation =
-        immediate_continuation_requested && decision.trigger_maintenance;
-    decision
-}
-
-fn daemon_dfs_failed_maintenance_decision(
-    observed_at: Instant,
-    next_probe_at: Option<Instant>,
-) -> DaemonDfsMaintenanceProbeDecision {
-    let error_retry_at = observed_at
-        .checked_add(DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL)
-        .unwrap_or(observed_at);
-    DaemonDfsMaintenanceProbeDecision {
-        // A maintenance task exists only after a durable request was
-        // classified and launched. Launch clears the mutable request latch so
-        // notifications arriving while the task runs can own a newer edge;
-        // task failure must nevertheless retain the launched request itself.
-        trigger_maintenance: true,
-        // A failed pass is no longer a successful bounded continuation. Its
-        // next attempt uses the ordinary admission and error-backoff path.
-        immediate_continuation: false,
-        // A notification is a request to inspect pending work, not proof that
-        // a full pass is required. Preserve an already-due notification probe
-        // across task failure while retaining the bounded error retry.
-        next_probe_at: Some(
-            next_probe_at
-                .map(|next_probe_at| next_probe_at.min(error_retry_at))
-                .unwrap_or(error_retry_at),
-        ),
-    }
-}
-
-fn daemon_dfs_maintenance_notification_decision(
-    _observed_at: Instant,
-    _triggered_maintenance_requested: bool,
-    _immediate_continuation_requested: bool,
-    next_probe_at: Option<Instant>,
-) -> DaemonDfsMaintenanceProbeDecision {
-    // Notifications are committed queue edges. The normal pass is reactive
-    // and never reconstructs the complete metadata/content image, so it can
-    // be launched directly without an O(total-state) classifier.
-    DaemonDfsMaintenanceProbeDecision {
-        trigger_maintenance: true,
-        // A committed queue edge is the ownership transfer from a completed
-        // request to its background executor. It must not pay the generic
-        // maintenance interval or startup phase before making its first
-        // bounded attempt.
-        immediate_continuation: true,
-        next_probe_at,
-    }
-}
-
 fn apply_daemon_dfs_maintenance_probe_result(
     work: Option<DaemonDfsPendingMaintenanceWork>,
     triggered_maintenance_requested: &mut bool,
@@ -2394,40 +1390,29 @@ fn apply_daemon_dfs_maintenance_probe_result(
     *next_probe_at = decision.next_probe_at;
 }
 
-fn daemon_dfs_maintenance_due_in(
-    now: Instant,
-    initial_not_before: Instant,
-    last_maintenance: Instant,
-    triggered_maintenance_requested: bool,
-    immediate_continuation_requested: bool,
-) -> Option<Duration> {
-    triggered_maintenance_requested.then(|| {
-        if immediate_continuation_requested {
-            return Duration::ZERO;
-        }
-        let startup_remaining = initial_not_before.saturating_duration_since(now);
-        let interval_remaining = daemon_maintenance_interval_remaining(
-            now,
-            last_maintenance,
-            DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
-        );
-        startup_remaining.max(interval_remaining)
-    })
-}
-
-fn daemon_dfs_maintenance_probe_is_due(now: Instant, next_probe_at: Option<Instant>) -> bool {
-    next_probe_at.is_some_and(|next_probe_at| now >= next_probe_at)
-}
-
-fn daemon_dfs_maintenance_should_launch(
-    triggered_due: bool,
-    triggered_work_revalidated: bool,
-) -> bool {
-    triggered_due && triggered_work_revalidated
-}
-
 fn daemon_rollout_telemetry_enabled(label: &str, maintain_cluster_runtime: bool) -> bool {
     label == "daemon" && maintain_cluster_runtime
+}
+
+pub(crate) fn start_daemon_rollout_telemetry_runtime_task(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    label: &str,
+    maintain_cluster_runtime: bool,
+) -> Result<Option<crate::registry::NativeRustModuleRuntimeTask>, DaemonError> {
+    if !daemon_rollout_telemetry_enabled(label, maintain_cluster_runtime) {
+        return Ok(None);
+    }
+    let data_dir = daemon_data_dir_path(paths)?;
+    let reactor = sinomo_rollout::RolloutTelemetryReactor::new(&data_dir)?;
+    let host = Arc::new(DaemonRolloutTelemetryHost {
+        paths: paths.clone(),
+    });
+    Ok(Some(crate::registry::NativeRustModuleRuntimeTask::new(
+        "rollout telemetry reconciliation",
+        runtime.spawn(reactor.run_until_stopped_async(host, shutdown_rx, label.to_string())),
+    )))
 }
 
 #[cfg(feature = "sandbox")]
@@ -2443,17 +1428,6 @@ fn daemon_dfs_maintenance_allowed(
     startup_cluster_maintenance_attempted: bool,
 ) -> bool {
     maintain_default_dfs && startup_cluster_maintenance_attempted
-}
-
-fn daemon_dfs_initial_maintenance_delay(
-    member_phase: Duration,
-    maintain_cluster_runtime: bool,
-) -> Duration {
-    if maintain_cluster_runtime {
-        member_phase.saturating_add(DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE)
-    } else {
-        member_phase
-    }
 }
 
 async fn run_daemon_background_maintenance_loop(
@@ -4110,10 +3084,7 @@ async fn dispatch_daemon_object_rpc_call_request_async(
             payload.is_ok(),
         );
         let (mut payload, request_body) = payload?;
-        crate::service_adapter::enforce_daemon_object_rpc_forward_route_affinity(
-            &route,
-            &mut payload,
-        )?;
+        sinomo_api::enforce_daemon_object_rpc_forward_route_affinity(&route, &mut payload)?;
         let (forwarded, body) =
             crate::service_adapter::forward_object_rpc_call_from_daemon_control(
                 paths,
@@ -4283,6 +3254,7 @@ pub(crate) fn accepted_rollout_should_stop_current_daemon(
     response.status == "accepted" && !daemon_paths_are_shadow(paths)
 }
 
+#[cfg(feature = "sandbox")]
 fn daemon_maintenance_interval_remaining(
     now: Instant,
     last: Instant,
@@ -4377,129 +3349,16 @@ pub(crate) fn handle_daemon_sandbox_http_fetch_to_file_on_runtime(
     request: sinomo_sandbox::SandboxHttpFetchToFileRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxHttpFetchFileResult, DaemonError> {
-    let (lifecycle_lease, mut store, replica_candidates) =
+    let (lifecycle_lease, store, replica_candidates) =
         open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let execution_node_id = store.dfs.node_id().clone();
-    let manifest = store.load(&request.sandbox_id)?;
-    if let Err(denial) = config
-        .policy
-        .validate_manifest(&manifest, &execution_node_id)
-    {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(
-                execution_node_id,
-                Some(&request.sandbox_id),
-                "sandbox-fetch",
-                &denial,
-            ),
-        )?;
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    if let Err(denial) = config.policy.validate_http_request(&request.request) {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(
-                execution_node_id,
-                Some(&request.sandbox_id),
-                "sandbox-fetch",
-                &denial,
-            ),
-        )?;
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    let mut manifest = manifest;
-    manifest
-        .advance_generation()
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?;
-    manifest.updated_at = OffsetDateTime::now_utc();
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).http_fetch_to_file(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "before fetch generation fence",
-    )?;
-    store.save_manifest(&manifest)?;
-    ensure_daemon_sandbox_mutation_lease(
-        &lifecycle_lease,
-        &request.sandbox_id,
-        "after fetch generation fence",
-    )?;
-
-    let command_id = sinomo_sandbox::SandboxCommandId::generate();
-    let mut fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest)
-        .with_replica_candidates(replica_candidates.clone());
-    let fetch_result = sinomo_sandbox::sandbox_http_fetch_to_file(
-        &config.policy,
+        store,
+        replica_candidates,
         &DaemonSandboxHttpTransport,
-        &mut fs,
-        manifest.sandbox_id.clone(),
-        command_id.clone(),
-        &request.request,
-        &request.output_path,
-        &manifest.limits,
-    );
-    ensure_daemon_sandbox_mutation_lease(
-        &lifecycle_lease,
-        &request.sandbox_id,
-        "after fetch workspace mutation",
-    )?;
-    let result = match fetch_result {
-        Ok(result) => result,
-        Err(error) => {
-            if let sinomo_sandbox::SandboxRecordedHttpFetchError::Fs(
-                sinomo_sandbox::SandboxFsError::QuotaExceeded {
-                    kind,
-                    actual,
-                    limit,
-                },
-            ) = &error
-            {
-                append_daemon_sandbox_event(
-                    paths,
-                    sinomo_sandbox::sandbox_resource_exhausted_event(
-                        execution_node_id.clone(),
-                        &manifest.sandbox_id,
-                        "sandbox-fetch",
-                        kind.clone(),
-                        *actual,
-                        *limit,
-                    ),
-                )?;
-            }
-            if let Some(record) = daemon_sandbox_http_exchange_record_for_command(&fs, &command_id)?
-            {
-                append_daemon_sandbox_event(
-                    paths,
-                    sinomo_sandbox::sandbox_http_exchange_event(execution_node_id, &record),
-                )?;
-            }
-            return Err(error.into());
-        }
-    };
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_file_written_event_with_context(
-            execution_node_id.clone(),
-            &manifest.sandbox_id,
-            &request.output_path,
-            result.response_bytes,
-            "sandbox-fetch",
-            Some(&result.record.command_id),
-            Some(&result.request_id),
-        ),
-    )?;
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_http_exchange_event(execution_node_id, &result.record),
-    )?;
-    Ok(result)
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_create(
@@ -4509,147 +3368,24 @@ pub fn handle_daemon_sandbox_create(
     handle_daemon_sandbox_create_on_runtime(paths, request, None)
 }
 
-fn daemon_sandbox_create_limits(
-    request: &sinomo_sandbox::SandboxCreateInstanceRequest,
-    policy_max: &sinomo_sandbox::SandboxResourceLimits,
-) -> sinomo_sandbox::SandboxResourceLimits {
-    sinomo_sandbox::SandboxResourceLimits {
-        memory_mb: request.memory_mb.unwrap_or(policy_max.memory_mb),
-        wall_time_ms: request.wall_time_ms.unwrap_or(policy_max.wall_time_ms),
-        max_input_bytes: request
-            .max_input_bytes
-            .unwrap_or(policy_max.max_input_bytes),
-        max_output_bytes: request
-            .max_output_bytes
-            .unwrap_or(policy_max.max_output_bytes),
-        max_workspace_bytes: request
-            .max_workspace_bytes
-            .unwrap_or(policy_max.max_workspace_bytes),
-        max_written_bytes_per_command: request
-            .max_written_bytes_per_command
-            .unwrap_or(policy_max.max_written_bytes_per_command),
-        max_file_count: request.max_file_count.unwrap_or(policy_max.max_file_count),
-    }
-}
-
 pub(crate) fn handle_daemon_sandbox_create_on_runtime(
     paths: &DaemonPaths,
     request: sinomo_sandbox::SandboxCreateInstanceRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxCreateInstanceResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let create_limits = daemon_sandbox_create_limits(&request, &config.policy.max_limits);
     let sandbox_id = request
         .sandbox_id
+        .clone()
         .unwrap_or_else(sinomo_sandbox::SandboxId::generate);
     let (lifecycle_lease, mut store, _replica_candidates) =
         open_daemon_sandbox_store_with_transaction_lease(paths, &sandbox_id, runtime)?;
-    let execution_node_id = store.dfs.node_id().clone();
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "before create")?;
-    let mut manifest = sinomo_sandbox::SandboxInstanceManifest::new(
-        sandbox_id,
-        request.toolchain_id,
-        OffsetDateTime::now_utc(),
-    )
-    .map_err(|source| DaemonError::Parse {
-        detail: source.to_string(),
-    })?;
-    manifest.temp_policy = request.temp_policy;
-    manifest.limits = create_limits;
-    manifest.mounts = request.mounts;
-    if let Err(denial) = config
-        .policy
-        .validate_manifest(&manifest, &execution_node_id)
-    {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(
-                execution_node_id.clone(),
-                Some(&manifest.sandbox_id),
-                "sandbox-create",
-                &denial,
-            ),
-        )?;
-        if denial.code.starts_with("mount-") {
-            append_daemon_sandbox_event(
-                paths,
-                sinomo_sandbox::sandbox_mount_denied_event(
-                    execution_node_id,
-                    Some(&manifest.sandbox_id),
-                    "sandbox-create",
-                    &denial,
-                ),
-            )?;
-        }
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    validate_daemon_sandbox_resolved_mount_policy(
-        paths,
-        &config.policy,
-        &mut store.dfs,
-        &manifest,
-        &execution_node_id,
-        "sandbox-create-resolved-source",
-    )?;
-    let created = store
-        .create_manifest(&manifest)
-        .map_err(|source| DaemonError::Parse {
-            detail: format!("create sandbox SIFS state: {source}"),
-        })?;
-    manifest = created;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &manifest.sandbox_id, "after create")?;
-    let transaction_id = manifest
-        .pending_reconciliation
-        .as_ref()
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!(
-                "sandbox {} create lost its durable fence",
-                manifest.sandbox_id
-            ),
-        })?
-        .transaction_id
-        .clone();
-    append_daemon_sandbox_event_durable(
-        paths,
-        sinomo_sandbox::sandbox_instance_created_event(execution_node_id.clone(), &manifest),
-    )
-    .map_err(|source| DaemonError::Parse {
-        detail: format!("append sandbox created event: {source}"),
-    })?;
-    append_daemon_sandbox_event_durable(
-        paths,
-        sinomo_sandbox::sandbox_toolchain_pinned_event(execution_node_id.clone(), &manifest),
-    )
-    .map_err(|source| DaemonError::Parse {
-        detail: format!("append sandbox toolchain pinned event: {source}"),
-    })?;
-    for mount in &manifest.mounts {
-        append_daemon_sandbox_event_durable(
-            paths,
-            sinomo_sandbox::sandbox_mount_added_event(execution_node_id.clone(), &manifest, mount),
-        )
-        .map_err(|source| DaemonError::Parse {
-            detail: format!("append sandbox mount added event: {source}"),
-        })?;
-    }
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).create(
         &lifecycle_lease,
-        &manifest.sandbox_id,
-        "after durable create audit",
-    )?;
-    manifest = store.clear_reconciliation_transaction(
-        &manifest.sandbox_id,
-        &transaction_id,
-        OffsetDateTime::now_utc(),
-    )?;
-    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-        paths,
-        &manifest.sandbox_id,
-        "sandbox create committed",
-    );
-    Ok(sinomo_sandbox::SandboxCreateInstanceResponse { manifest })
+        &mut store,
+        sandbox_id,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_status(
@@ -4665,8 +3401,8 @@ pub(crate) fn handle_daemon_sandbox_status_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxStatusResponse, DaemonError> {
     let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let manifest = store.load(&request.sandbox_id)?;
-    Ok(sinomo_sandbox::SandboxStatusResponse { manifest })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).status(&mut store, request)
 }
 
 pub fn handle_daemon_sandbox_update(
@@ -4681,110 +3417,16 @@ pub(crate) fn handle_daemon_sandbox_update_on_runtime(
     request: sinomo_sandbox::SandboxUpdateInstanceRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxUpdateInstanceResponse, DaemonError> {
-    let sinomo_sandbox::SandboxUpdateInstanceRequest {
-        sandbox_id,
-        cwd,
-        mounts,
-        env_set,
-        env_unset,
-    } = request;
-    let (lifecycle_lease, mut store, replica_candidates) =
+    let sandbox_id = request.sandbox_id.clone();
+    let (lifecycle_lease, store, replica_candidates) =
         open_daemon_sandbox_store_with_mutation_lease(paths, &sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let node_id = store.dfs.node_id().clone();
-    let mut manifest = store.load(&sandbox_id)?;
-    let cwd_changed = cwd.is_some();
-    let mut env_set_keys = env_set.keys().cloned().collect::<Vec<_>>();
-    let mut env_unset_keys = env_unset.clone();
-    for key in env_set_keys.iter().chain(env_unset_keys.iter()) {
-        if !sinomo_sandbox::sandbox_env_name_is_valid(key) {
-            return Err(DaemonError::Parse {
-                detail: format!("invalid sandbox env name `{key}`"),
-            });
-        }
-    }
-    for (key, value) in &env_set {
-        if value.contains('\0') {
-            return Err(DaemonError::Parse {
-                detail: format!("sandbox env `{key}` contains an embedded NUL byte"),
-            });
-        }
-    }
-    env_set_keys.sort();
-    env_unset_keys.sort();
-    env_unset_keys.dedup();
-    let mounts_reconciliation =
-        sinomo_sandbox::reconcile_sandbox_mounts(&mut manifest.mounts, mounts);
-    if let Some(cwd) = cwd {
-        manifest.cwd = cwd;
-    }
-    for key in env_unset {
-        manifest.env.remove(&key);
-    }
-    manifest.env.extend(env_set);
-    validate_daemon_sandbox_manifest_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &manifest,
-        "sandbox-update",
-    )?;
-    if mounts_reconciliation.replacement_requested {
-        let mut dfs = store.into_inner();
-        validate_daemon_sandbox_resolved_mount_policy(
-            paths,
-            &config.policy,
-            &mut dfs,
-            &manifest,
-            &node_id,
-            "sandbox-update-resolved-source",
-        )?;
-        store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-            .with_replica_candidates(replica_candidates.clone());
-    }
-    if cwd_changed || mounts_reconciliation.replacement_requested {
-        let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-        sinomo_sandbox::validate_sandbox_working_directory(&fs, &manifest.cwd)?;
-        store = sinomo_sandbox::SifsSandboxInstanceStore::new(fs.into_inner())
-            .with_replica_candidates(replica_candidates);
-    }
-    manifest
-        .advance_generation()
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?;
-    manifest.updated_at = OffsetDateTime::now_utc();
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "before update")?;
-    store.save_manifest(&manifest)?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "after update")?;
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_instance_updated_event(
-            node_id.clone(),
-            &manifest,
-            cwd_changed,
-            &env_set_keys,
-            &env_unset_keys,
-            mounts_reconciliation.replacement_requested,
-            mounts_reconciliation.changed,
-            &mounts_reconciliation.added,
-            &mounts_reconciliation.removed,
-        ),
-    )?;
-    for mount in &mounts_reconciliation.removed {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_mount_removed_event(node_id.clone(), &manifest, mount),
-        )?;
-    }
-    for mount in &mounts_reconciliation.added {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_mount_added_event(node_id.clone(), &manifest, mount),
-        )?;
-    }
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &sandbox_id, "after update audit")?;
-    Ok(sinomo_sandbox::SandboxUpdateInstanceResponse { manifest })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).update(
+        &lifecycle_lease,
+        store,
+        replica_candidates,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_checkpoint(
@@ -4801,45 +3443,12 @@ pub(crate) fn handle_daemon_sandbox_checkpoint_on_runtime(
 ) -> Result<sinomo_sandbox::SandboxCheckpointResponse, DaemonError> {
     let (lifecycle_lease, mut store, _replica_candidates) =
         open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let node_id = store.dfs.node_id().clone();
-    let manifest = store.load(&request.sandbox_id)?;
-    validate_daemon_sandbox_manifest_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &manifest,
-        "sandbox-checkpoint",
-    )?;
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).checkpoint(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "before checkpoint",
-    )?;
-    let cancellation = lifecycle_lease.cancellation_token();
-    let checkpoint = store.create_checkpoint_with_checkpoints(
-        &request.sandbox_id,
-        OffsetDateTime::now_utc(),
-        || {
-            daemon_sandbox_store_mutation_checkpoint(
-                &lifecycle_lease,
-                &cancellation,
-                &request.sandbox_id,
-                "during checkpoint",
-            )
-        },
-    )?;
-    ensure_daemon_sandbox_mutation_lease(
-        &lifecycle_lease,
-        &request.sandbox_id,
-        "after checkpoint",
-    )?;
-    let manifest = store.load(&request.sandbox_id)?;
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_instance_checkpointed_event(node_id, &manifest, &checkpoint),
-    )?;
-    Ok(sinomo_sandbox::SandboxCheckpointResponse { checkpoint })
+        &mut store,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_resume(
@@ -4856,81 +3465,12 @@ pub(crate) fn handle_daemon_sandbox_resume_on_runtime(
 ) -> Result<sinomo_sandbox::SandboxResumeResponse, DaemonError> {
     let (lifecycle_lease, mut store, _replica_candidates) =
         open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let node_id = store.dfs.node_id().clone();
-    let current = store.load_allow_pending_reconciliation(&request.sandbox_id)?;
-    if let Some(pending) = current.pending_reconciliation.as_ref()
-        && !matches!(
-            &pending.operation,
-            sinomo_sandbox::SandboxAuthoritativeMutationOperation::ResumeCheckpoint {
-                checkpoint_id
-            } if checkpoint_id == &request.checkpoint_id
-        )
-    {
-        return Err(sinomo_sandbox::SandboxStoreError::ReconciliationPending {
-            sandbox_id: request.sandbox_id.clone(),
-            transaction_id: pending.transaction_id.clone(),
-        }
-        .into());
-    }
-    validate_daemon_sandbox_manifest_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &current,
-        "sandbox-resume",
-    )?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "before resume")?;
-    let cancellation = lifecycle_lease.cancellation_token();
-    let pending_manifest = store.resume_checkpoint_with_checkpoints(
-        &request.sandbox_id,
-        &request.checkpoint_id,
-        OffsetDateTime::now_utc(),
-        || {
-            daemon_sandbox_store_mutation_checkpoint(
-                &lifecycle_lease,
-                &cancellation,
-                &request.sandbox_id,
-                "during resume",
-            )
-        },
-    )?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "after resume")?;
-    let transaction_id = pending_manifest
-        .pending_reconciliation
-        .as_ref()
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!(
-                "sandbox {} resume committed without an authoritative transaction fence",
-                request.sandbox_id
-            ),
-        })?
-        .transaction_id
-        .clone();
-    append_daemon_sandbox_event_durable(
-        paths,
-        sinomo_sandbox::sandbox_instance_resumed_event(
-            node_id,
-            &pending_manifest,
-            &request.checkpoint_id,
-        ),
-    )?;
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).resume(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "after durable resume event",
-    )?;
-    let manifest = store.clear_reconciliation_transaction(
-        &request.sandbox_id,
-        &transaction_id,
-        OffsetDateTime::now_utc(),
-    )?;
-    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-        paths,
-        &request.sandbox_id,
-        "sandbox resume committed",
-    );
-    Ok(sinomo_sandbox::SandboxResumeResponse { manifest })
+        &mut store,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_reboot(
@@ -4947,77 +3487,12 @@ pub(crate) fn handle_daemon_sandbox_reboot_on_runtime(
 ) -> Result<sinomo_sandbox::SandboxRebootResponse, DaemonError> {
     let (lifecycle_lease, mut store, _replica_candidates) =
         open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let node_id = store.dfs.node_id().clone();
-    let manifest = store.load_allow_pending_reconciliation(&request.sandbox_id)?;
-    if let Some(pending) = manifest.pending_reconciliation.as_ref()
-        && !matches!(
-            pending.operation,
-            sinomo_sandbox::SandboxAuthoritativeMutationOperation::Reboot { .. }
-        )
-    {
-        return Err(sinomo_sandbox::SandboxStoreError::ReconciliationPending {
-            sandbox_id: request.sandbox_id.clone(),
-            transaction_id: pending.transaction_id.clone(),
-        }
-        .into());
-    }
-    validate_daemon_sandbox_manifest_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &manifest,
-        "sandbox-reboot",
-    )?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "before reboot")?;
-    let cancellation = lifecycle_lease.cancellation_token();
-    let (pending_manifest, cleared_tmp) = store.reboot_session_with_checkpoints(
-        &request.sandbox_id,
-        OffsetDateTime::now_utc(),
-        || {
-            daemon_sandbox_store_mutation_checkpoint(
-                &lifecycle_lease,
-                &cancellation,
-                &request.sandbox_id,
-                "during reboot",
-            )
-        },
-    )?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "after reboot")?;
-    let transaction_id = pending_manifest
-        .pending_reconciliation
-        .as_ref()
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!(
-                "sandbox {} reboot committed without an authoritative transaction fence",
-                request.sandbox_id
-            ),
-        })?
-        .transaction_id
-        .clone();
-    append_daemon_sandbox_event_durable(
-        paths,
-        sinomo_sandbox::sandbox_instance_rebooted_event(node_id, &pending_manifest, cleared_tmp),
-    )?;
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).reboot(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "after durable reboot event",
-    )?;
-    let manifest = store.clear_reconciliation_transaction(
-        &request.sandbox_id,
-        &transaction_id,
-        OffsetDateTime::now_utc(),
-    )?;
-    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-        paths,
-        &request.sandbox_id,
-        "sandbox reboot committed",
-    );
-    Ok(sinomo_sandbox::SandboxRebootResponse {
-        manifest,
-        cleared_tmp,
-    })
+        &mut store,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_destroy(
@@ -5034,50 +3509,12 @@ pub(crate) fn handle_daemon_sandbox_destroy_on_runtime(
 ) -> Result<sinomo_sandbox::SandboxDestroyResponse, DaemonError> {
     let (lifecycle_lease, mut store, _replica_candidates) =
         open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let node_id = store.dfs.node_id().clone();
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "before destroy")?;
-    let pending_manifest = store.prepare_destroy(&request.sandbox_id, OffsetDateTime::now_utc())?;
-    let transaction_id = pending_manifest
-        .pending_reconciliation
-        .as_ref()
-        .expect("destroy fence")
-        .transaction_id
-        .clone();
-    let cancellation = lifecycle_lease.cancellation_token();
-    store.apply_destroy_with_checkpoints(&request.sandbox_id, &transaction_id, || {
-        daemon_sandbox_store_mutation_checkpoint(
-            &lifecycle_lease,
-            &cancellation,
-            &request.sandbox_id,
-            "during destroy",
-        )
-    })?;
-    ensure_daemon_sandbox_mutation_lease(&lifecycle_lease, &request.sandbox_id, "after destroy")?;
-    append_daemon_sandbox_event_durable(
-        paths,
-        sinomo_sandbox::sandbox_instance_destroyed_transaction_event(node_id, &pending_manifest),
-    )?;
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).destroy(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "after durable destroy event",
-    )?;
-    store.finalize_destroy_with_checkpoints(&request.sandbox_id, &transaction_id, || {
-        daemon_sandbox_store_mutation_checkpoint(
-            &lifecycle_lease,
-            &cancellation,
-            &request.sandbox_id,
-            "during destroy finalization",
-        )
-    })?;
-    best_effort_clear_daemon_sandbox_authoritative_recovery_pending(
-        paths,
-        &request.sandbox_id,
-        "sandbox destroy committed",
-    );
-    Ok(sinomo_sandbox::SandboxDestroyResponse {
-        sandbox_id: request.sandbox_id,
-    })
+        &mut store,
+        request,
+    )
 }
 
 pub fn handle_daemon_sandbox_list(
@@ -5092,11 +3529,9 @@ pub(crate) fn handle_daemon_sandbox_list_on_runtime(
     request: sinomo_sandbox::SandboxListRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxListResponse, DaemonError> {
-    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let manifest = store.load(&request.sandbox_id)?;
-    let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-    let entries = fs.list(&request.path)?;
-    Ok(sinomo_sandbox::SandboxListResponse { entries })
+    let store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).list(store, request)
 }
 
 pub fn handle_daemon_sandbox_read(
@@ -5111,11 +3546,9 @@ pub(crate) fn handle_daemon_sandbox_read_on_runtime(
     request: sinomo_sandbox::SandboxReadRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxReadResponse, DaemonError> {
-    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let manifest = store.load(&request.sandbox_id)?;
-    let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest);
-    let bytes = fs.read(&request.path, request.range)?;
-    Ok(sinomo_sandbox::SandboxReadResponse { bytes })
+    let store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).read(store, request)
 }
 
 pub fn handle_daemon_sandbox_write(
@@ -5130,139 +3563,14 @@ pub(crate) fn handle_daemon_sandbox_write_on_runtime(
     request: sinomo_sandbox::SandboxWriteRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxWriteResponse, DaemonError> {
-    let (lifecycle_lease, mut store, replica_candidates) =
+    let (lifecycle_lease, store, replica_candidates) =
         open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    let node_id = store.dfs.node_id().clone();
-    let manifest = store.load(&request.sandbox_id)?;
-    validate_daemon_sandbox_manifest_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &manifest,
-        "sandbox-write",
-    )?;
-    let fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest)
-        .with_replica_candidates(replica_candidates.clone());
-    if let Err(error) = sinomo_sandbox::validate_sandbox_write_resource_limits(
-        &fs,
-        &request.path,
-        request.bytes.len() as u64,
-        &manifest.limits,
-    ) {
-        if let sinomo_sandbox::SandboxFsError::QuotaExceeded {
-            kind,
-            actual,
-            limit,
-        } = &error
-        {
-            append_daemon_sandbox_event(
-                paths,
-                sinomo_sandbox::sandbox_resource_exhausted_event(
-                    node_id.clone(),
-                    &request.sandbox_id,
-                    "sandbox-write",
-                    kind.clone(),
-                    *actual,
-                    *limit,
-                ),
-            )?;
-        }
-        append_daemon_sandbox_write_denial_event(
-            paths,
-            &node_id,
-            &request.sandbox_id,
-            &request.path,
-            &error,
-        )?;
-        return Err(error.into());
-    }
-    let mut manifest = manifest;
-    manifest
-        .advance_generation()
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?;
-    manifest.updated_at = OffsetDateTime::now_utc();
-    let mut store = sinomo_sandbox::SifsSandboxInstanceStore::new(fs.into_inner())
-        .with_replica_candidates(replica_candidates.clone());
-    ensure_daemon_sandbox_mutation_lease(
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).write(
         &lifecycle_lease,
-        &request.sandbox_id,
-        "before write generation fence",
-    )?;
-    store.save_manifest(&manifest)?;
-    ensure_daemon_sandbox_mutation_lease(
-        &lifecycle_lease,
-        &request.sandbox_id,
-        "after write generation fence",
-    )?;
-    let mut fs = sinomo_sandbox::SifsSandboxFileSystem::new(store.into_inner(), &manifest)
-        .with_replica_candidates(replica_candidates);
-    let write_result = fs.write(&request.path, &request.bytes);
-    ensure_daemon_sandbox_mutation_lease(
-        &lifecycle_lease,
-        &request.sandbox_id,
-        "after write workspace mutation",
-    )?;
-    if let Err(error) = write_result {
-        append_daemon_sandbox_write_denial_event(
-            paths,
-            &node_id,
-            &request.sandbox_id,
-            &request.path,
-            &error,
-        )?;
-        return Err(error.into());
-    }
-    if !sinomo_sandbox::sandbox_path_is_virtual_device_sink(&request.path) {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_file_written_event(
-                node_id,
-                &request.sandbox_id,
-                &request.path,
-                request.bytes.len() as u64,
-            ),
-        )?;
-    }
-    Ok(sinomo_sandbox::SandboxWriteResponse {
-        path: request.path,
-        bytes_written: request.bytes.len() as u64,
-    })
-}
-
-fn append_daemon_sandbox_write_denial_event(
-    paths: &DaemonPaths,
-    node_id: &sinomo_core::node::NodeId,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    request_path: &sinomo_sandbox::SandboxPath,
-    error: &sinomo_sandbox::SandboxFsError,
-) -> Result<(), DaemonError> {
-    let sinomo_sandbox::SandboxFsError::ReadOnly { path } = error else {
-        return Ok(());
-    };
-    let denial = sinomo_sandbox::SandboxPolicyDenial::new(
-        "mount-read-only-denied",
-        format!("write to read-only sandbox path {path} denied for request path {request_path}"),
-    );
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_policy_denied_event(
-            node_id.clone(),
-            Some(sandbox_id),
-            "sandbox-write",
-            &denial,
-        ),
-    )?;
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_mount_denied_event(
-            node_id.clone(),
-            Some(sandbox_id),
-            "sandbox-write",
-            &denial,
-        ),
+        store,
+        replica_candidates,
+        request,
     )
 }
 
@@ -5278,44 +3586,12 @@ pub(crate) fn handle_daemon_sandbox_import_busybox_on_runtime(
     request: sinomo_sandbox::SandboxImportBusyBoxToolchainRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxImportBusyBoxToolchainResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
     let (dfs, replica_candidates) =
         open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
+    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
-    let spec = sinomo_sandbox::SandboxBusyBoxToolchainSpec::new(
-        request.version,
-        request.provenance,
-        OffsetDateTime::now_utc(),
-    )?;
-    let module_hash = sinomo_sandbox::sandbox_module_hash(&request.module_bytes);
-    let candidate = spec.manifest(&request.module_bytes)?;
-    validate_daemon_sandbox_toolchain_update_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &candidate,
-        "sandbox-toolchain-import-busybox",
-    )?;
-    let manifest = sinomo_sandbox::install_busybox_toolchain_to_sifs_store(
-        &mut store,
-        &spec,
-        &request.module_bytes,
-    )?;
-    let origin_node_id = store.into_inner().node_id().clone();
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_toolchain_updated_event(
-            origin_node_id,
-            &manifest,
-            module_hash.clone(),
-        ),
-    )?;
-    Ok(sinomo_sandbox::SandboxImportBusyBoxToolchainResponse {
-        manifest,
-        module_hash,
-    })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).import_busybox(store, request)
 }
 
 pub fn handle_daemon_sandbox_toolchain_add_command(
@@ -5330,66 +3606,12 @@ pub(crate) fn handle_daemon_sandbox_toolchain_add_command_on_runtime(
     request: sinomo_sandbox::SandboxAddToolchainCommandRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxAddToolchainCommandResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
     let (dfs, replica_candidates) =
         open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
+    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
-    let mut manifest = match store.load_manifest(&request.toolchain_id) {
-        Ok(manifest) => manifest,
-        Err(sinomo_sandbox::SandboxToolchainError::NotFound { .. }) => {
-            sinomo_sandbox::SandboxToolchainManifest::new(
-                request.toolchain_id.clone(),
-                request.version,
-                request.target_abi.clone(),
-                request.provenance,
-                OffsetDateTime::now_utc(),
-            )?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let module_hash = sinomo_sandbox::sandbox_module_hash(&request.module_bytes);
-    let mut candidate = manifest.clone();
-    let mut command = sinomo_sandbox::SandboxToolchainCommand::new(
-        &candidate.toolchain_id,
-        &request.command_name,
-        &request.module_bytes,
-        request.default_limits.clone(),
-    )?;
-    command.target_abi = Some(request.target_abi.clone());
-    command.required_capabilities = request.required_capabilities.clone();
-    candidate.insert_command(command)?;
-    validate_daemon_sandbox_toolchain_update_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &candidate,
-        "sandbox-toolchain-add-command",
-    )?;
-    store.put_command_module_with_target_abi_capabilities_and_argv_prefix(
-        &mut manifest,
-        &request.command_name,
-        &request.module_bytes,
-        request.default_limits,
-        Some(request.target_abi),
-        request.required_capabilities,
-        Vec::new(),
-        BTreeMap::new(),
-    )?;
-    let origin_node_id = store.into_inner().node_id().clone();
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_toolchain_updated_event(
-            origin_node_id,
-            &manifest,
-            module_hash.clone(),
-        ),
-    )?;
-    Ok(sinomo_sandbox::SandboxAddToolchainCommandResponse {
-        manifest,
-        module_hash,
-    })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).add_command(store, request)
 }
 
 pub(crate) fn handle_daemon_sandbox_toolchain_import_package_from_path_on_runtime(
@@ -5397,102 +3619,8 @@ pub(crate) fn handle_daemon_sandbox_toolchain_import_package_from_path_on_runtim
     request: sinomo_sandbox::SandboxImportToolchainPackageFromPathRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
-    let package_path = PathBuf::from(&request.package_path);
-    let package_dir = package_path
-        .parent()
-        .ok_or_else(|| DaemonError::Parse {
-            detail: format!("package path has no parent: {}", package_path.display()),
-        })?
-        .to_path_buf();
-    let spec_bytes = std::fs::read(&package_path).map_err(|source| DaemonError::Io {
-        path: package_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let spec: sinomo_sandbox::SandboxToolchainPackageSpec = serde_json::from_slice(&spec_bytes)
-        .map_err(|source| DaemonError::Parse {
-            detail: format!(
-                "failed to parse package manifest {}: {source}",
-                package_path.display()
-            ),
-        })?;
-    let mut commands = Vec::new();
-    for command in &spec.commands {
-        let module_path = sandbox_package_file_path(&package_dir, &command.module)?;
-        let module_bytes = std::fs::read(&module_path).map_err(|source| DaemonError::Io {
-            path: module_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        verify_sandbox_package_hash(&module_path, &module_bytes, &command.content_hash)?;
-        commands.push(sinomo_sandbox::SandboxImportToolchainPackageCommand {
-            name: command.name.clone(),
-            module_bytes,
-            target_abi: command.target_abi.clone(),
-            argv_prefix: command.argv_prefix.clone(),
-            exec_name: command.exec_name.clone(),
-            default_env: command.default_env.clone(),
-            required_capabilities: command.required_capabilities.clone(),
-            default_limits: command.default_limits.clone(),
-        });
-    }
-    let mut artifacts = Vec::new();
-    for artifact in &spec.artifacts {
-        let artifact_path = sandbox_package_file_path(&package_dir, &artifact.file)?;
-        let bytes = std::fs::read(&artifact_path).map_err(|source| DaemonError::Io {
-            path: artifact_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        verify_sandbox_package_hash(&artifact_path, &bytes, &artifact.content_hash)?;
-        artifacts.push(sinomo_sandbox::SandboxImportToolchainPackageArtifact {
-            relative_path: artifact.relative_path.clone(),
-            bytes,
-        });
-    }
-    handle_daemon_sandbox_toolchain_import_package_on_runtime(
-        paths,
-        sinomo_sandbox::SandboxImportToolchainPackageRequest {
-            toolchain_id: request.toolchain_id.unwrap_or(spec.toolchain_id),
-            version: spec.version,
-            target_abi: spec.target_abi,
-            provenance: spec.provenance,
-            commands,
-            artifacts,
-        },
-        runtime,
-    )
-}
-
-fn sandbox_package_file_path(
-    package_dir: &Path,
-    relative_path: &str,
-) -> Result<PathBuf, DaemonError> {
-    let path = Path::new(relative_path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(DaemonError::Parse {
-            detail: format!("invalid package-relative path `{relative_path}`"),
-        });
-    }
-    Ok(package_dir.join(path))
-}
-
-fn verify_sandbox_package_hash(
-    path: &Path,
-    bytes: &[u8],
-    expected: &str,
-) -> Result<(), DaemonError> {
-    let actual = sinomo_sandbox::sandbox_module_hash(bytes);
-    if actual != expected {
-        return Err(DaemonError::Parse {
-            detail: format!(
-                "package file {} hash mismatch: expected {expected}, actual {actual}",
-                path.display()
-            ),
-        });
-    }
-    Ok(())
+    let request = sinomo_sandbox::load_sandbox_toolchain_package_from_path(request)?;
+    handle_daemon_sandbox_toolchain_import_package_on_runtime(paths, request, runtime)
 }
 
 pub fn handle_daemon_sandbox_toolchain_import_package(
@@ -5507,153 +3635,12 @@ pub(crate) fn handle_daemon_sandbox_toolchain_import_package_on_runtime(
     request: sinomo_sandbox::SandboxImportToolchainPackageRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
     let (dfs, replica_candidates) =
         open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
+    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
-    let mut manifest = match store.load_manifest(&request.toolchain_id) {
-        Ok(manifest) => manifest,
-        Err(sinomo_sandbox::SandboxToolchainError::NotFound { .. }) => {
-            sinomo_sandbox::SandboxToolchainManifest::new(
-                request.toolchain_id.clone(),
-                request.version,
-                request.target_abi.clone(),
-                request.provenance,
-                OffsetDateTime::now_utc(),
-            )?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    for command in &request.commands {
-        if manifest.commands.contains_key(&command.name) {
-            return Err(sinomo_sandbox::SandboxToolchainError::DuplicateCommand {
-                name: command.name.clone(),
-            }
-            .into());
-        }
-    }
-    for artifact in &request.artifacts {
-        if manifest.artifacts.contains_key(&artifact.relative_path) {
-            return Err(sinomo_sandbox::SandboxToolchainError::DuplicateArtifact {
-                path: artifact.relative_path.clone(),
-            }
-            .into());
-        }
-    }
-    let mut candidate = manifest.clone();
-    for command in &request.commands {
-        let mut candidate_command = sinomo_sandbox::SandboxToolchainCommand::new(
-            &candidate.toolchain_id,
-            &command.name,
-            &command.module_bytes,
-            command.default_limits.clone(),
-        )?;
-        candidate_command.target_abi = Some(
-            command
-                .target_abi
-                .clone()
-                .unwrap_or_else(|| request.target_abi.clone()),
-        );
-        candidate_command.required_capabilities = command.required_capabilities.clone();
-        candidate_command.argv_prefix = command.argv_prefix.clone();
-        candidate_command.exec_name = command.exec_name.clone();
-        candidate_command.default_env = command.default_env.clone();
-        candidate.insert_command(candidate_command)?;
-    }
-    for artifact in &request.artifacts {
-        let candidate_artifact = sinomo_sandbox::SandboxToolchainArtifact::new(
-            &candidate.toolchain_id,
-            &artifact.relative_path,
-            &artifact.bytes,
-        )?;
-        candidate.insert_artifact(candidate_artifact)?;
-    }
-    let artifact_bundle_bytes = if request.artifacts.is_empty() {
-        None
-    } else {
-        Some(sinomo_sandbox::pack_toolchain_artifact_bundle(
-            &request
-                .artifacts
-                .iter()
-                .map(|artifact| (artifact.relative_path.clone(), artifact.bytes.clone()))
-                .collect::<Vec<_>>(),
-        )?)
-    };
-    let artifact_bundle = if let Some(bytes) = &artifact_bundle_bytes {
-        let bundle_hash = sinomo_sandbox::sandbox_module_hash(bytes);
-        let bundle_name = format!(
-            "package-{}",
-            bundle_hash
-                .strip_prefix("blake3:")
-                .unwrap_or(bundle_hash.as_str())
-        );
-        let mut bundled_artifacts = Vec::new();
-        for artifact in &request.artifacts {
-            bundled_artifacts.push(candidate.artifact(&artifact.relative_path)?.clone());
-        }
-        let bundle = sinomo_sandbox::SandboxToolchainArtifactBundle::new(
-            &candidate.toolchain_id,
-            &bundle_name,
-            bytes,
-            bundled_artifacts,
-        )?;
-        candidate.insert_artifact_bundle(bundle.clone())?;
-        Some(bundle)
-    } else {
-        None
-    };
-    validate_daemon_sandbox_toolchain_update_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &candidate,
-        "sandbox-toolchain-import-package",
-    )?;
-    let mut package_hasher = sinomo_sandbox::SandboxModuleHasher::new();
-    for command in &request.commands {
-        package_hasher.update(command.name.as_bytes());
-        if let Some(target_abi) = &command.target_abi {
-            package_hasher.update(format!("{target_abi:?}").as_bytes());
-        }
-        for arg in &command.argv_prefix {
-            package_hasher.update(arg.as_bytes());
-        }
-        if let Some(exec_name) = &command.exec_name {
-            package_hasher.update(exec_name.as_bytes());
-        }
-        for (key, value) in &command.default_env {
-            package_hasher.update(key.as_bytes());
-            package_hasher.update(value.as_bytes());
-        }
-        package_hasher.update(&command.module_bytes);
-        let manifest_command = candidate.command(&command.name)?;
-        store.write_command_module_file(manifest_command, &command.module_bytes)?;
-    }
-    for artifact in &request.artifacts {
-        package_hasher.update(artifact.relative_path.as_bytes());
-        package_hasher.update(&artifact.bytes);
-    }
-    if let (Some(bundle), Some(bytes)) = (&artifact_bundle, &artifact_bundle_bytes) {
-        store.write_artifact_bundle_file(bundle, bytes)?;
-    }
-    store.save_manifest(&candidate)?;
-    manifest = candidate;
-    let package_hash = package_hasher.finalize();
-    let origin_node_id = store.into_inner().node_id().clone();
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_toolchain_updated_event(
-            origin_node_id,
-            &manifest,
-            package_hash.clone(),
-        ),
-    )?;
-    Ok(sinomo_sandbox::SandboxImportToolchainPackageResponse {
-        manifest,
-        package_hash,
-    })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).import_package(store, request)
 }
 
 pub fn handle_daemon_sandbox_toolchain_add_artifact(
@@ -5668,54 +3655,12 @@ pub(crate) fn handle_daemon_sandbox_toolchain_add_artifact_on_runtime(
     request: sinomo_sandbox::SandboxAddToolchainArtifactRequest,
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<sinomo_sandbox::SandboxAddToolchainArtifactResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
     let (dfs, replica_candidates) =
         open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let node_id = dfs.node_id().clone();
-    let mut store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
+    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
         .with_replica_candidates(replica_candidates);
-    let mut manifest = match store.load_manifest(&request.toolchain_id) {
-        Ok(manifest) => manifest,
-        Err(sinomo_sandbox::SandboxToolchainError::NotFound { .. }) => {
-            sinomo_sandbox::SandboxToolchainManifest::new(
-                request.toolchain_id.clone(),
-                request.version,
-                sinomo_sandbox::SandboxWasiAbi::Wasix,
-                request.provenance,
-                OffsetDateTime::now_utc(),
-            )?
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let artifact_hash = sinomo_sandbox::sandbox_module_hash(&request.bytes);
-    let mut candidate = manifest.clone();
-    let candidate_artifact = sinomo_sandbox::SandboxToolchainArtifact::new(
-        &candidate.toolchain_id,
-        &request.relative_path,
-        &request.bytes,
-    )?;
-    candidate.insert_artifact(candidate_artifact)?;
-    validate_daemon_sandbox_toolchain_update_policy(
-        paths,
-        &config.policy,
-        &node_id,
-        &candidate,
-        "sandbox-toolchain-add-artifact",
-    )?;
-    store.put_artifact(&mut manifest, &request.relative_path, &request.bytes)?;
-    let origin_node_id = store.into_inner().node_id().clone();
-    append_daemon_sandbox_event(
-        paths,
-        sinomo_sandbox::sandbox_toolchain_updated_event(
-            origin_node_id,
-            &manifest,
-            artifact_hash.clone(),
-        ),
-    )?;
-    Ok(sinomo_sandbox::SandboxAddToolchainArtifactResponse {
-        manifest,
-        artifact_hash,
-    })
+    let mut hooks = DaemonSandboxLifecycleHooks { paths };
+    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).add_artifact(store, request)
 }
 
 pub fn handle_daemon_sandbox_run_toolchain(
@@ -5878,7 +3823,8 @@ fn run_daemon_sandbox_lifecycle_maintenance_scan(
         // Safety sweeps can discover fences written by an older binary or a
         // direct store user. Persist the marker before attempting recovery so
         // a second crash cannot return the daemon to unindexed work.
-        mark_daemon_sandbox_authoritative_recovery_pending(paths, sandbox_id)?;
+        daemon_sandbox_lifecycle_recovery_state(paths)
+            .mark_authoritative_recovery_pending(sandbox_id)?;
         candidate_sandbox_ids.insert(sandbox_id.clone());
     }
 
@@ -5893,26 +3839,22 @@ fn run_daemon_sandbox_lifecycle_maintenance_scan(
                 Some(runtime),
                 content.clone(),
             )?;
-            let raw_lease = acquire_daemon_sandbox_lifecycle_lease(
-                lease_dfs,
-                &sandbox_id,
-                &replica_candidates,
-            )?;
-            let cancellation = sinomo_sandbox::SandboxCancellationToken::new();
-            let lifecycle_lease = DaemonSandboxExecutionLease::start(raw_lease, cancellation)?;
             let recovery_dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(
                 paths,
                 Some(runtime),
                 content.clone(),
             )?;
-            let mut recovery_store = sinomo_sandbox::SifsSandboxInstanceStore::new(recovery_dfs)
-                .with_replica_candidates(replica_candidates.clone());
-            recover_daemon_authoritative_sandbox_transaction(
-                paths,
-                &sandbox_id,
-                &mut recovery_store,
-                &lifecycle_lease,
-            )
+            let mut hooks = DaemonSandboxLifecycleHooks { paths };
+            sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks)
+                .open_operation(
+                    lease_dfs,
+                    recovery_dfs,
+                    replica_candidates.clone(),
+                    &sandbox_id,
+                    sinomo_sandbox::ClusteredSandboxOperationKind::Mutation,
+                    true,
+                )
+                .map(|_| ())
         })();
         match result {
             Ok(()) if pending_sandbox_ids.contains(&sandbox_id) => {
@@ -5938,16 +3880,7 @@ fn run_daemon_sandbox_lifecycle_maintenance_tick_with_scan<F>(
 where
     F: FnOnce(BTreeSet<sinomo_sandbox::SandboxId>) -> Result<usize, DaemonError>,
 {
-    let marked_sandbox_ids = daemon_sandbox_authoritative_recovery_pending_ids(paths)?;
-    let safety_sweep_due =
-        daemon_sandbox_lifecycle_safety_sweep_due_or_initialize(paths, now_unix_nanos)?;
-    if marked_sandbox_ids.is_empty() && !safety_sweep_due {
-        return Ok(0);
-    }
-
-    let recovered = scan(marked_sandbox_ids)?;
-    record_daemon_sandbox_lifecycle_safety_sweep(paths, now_unix_nanos)?;
-    Ok(recovered)
+    daemon_sandbox_lifecycle_recovery_state(paths).run_due_recovery(now_unix_nanos, scan)
 }
 
 #[cfg(feature = "sandbox")]
@@ -6002,7 +3935,7 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
     while let Some(message) = receiver.recv().await {
         let frame = match message {
             StreamMessage::Output(chunk) => {
-                sent_output_chunks.insert(sandbox_output_chunk_stream_key(&chunk));
+                sent_output_chunks.insert(sinomo_sandbox::sandbox_output_chunk_stream_key(&chunk));
                 sinomo_sandbox::SandboxRunToolchainStreamFrame::Output { chunk }
             }
             StreamMessage::Complete {
@@ -6011,21 +3944,27 @@ pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
             } => {
                 let mut completion_output_chunks = outcome.output_chunks.clone();
                 if completion_output_chunks.is_empty() {
-                    completion_output_chunks.extend(sandbox_output_chunks_from_bytes(
-                        &outcome.response.command_id,
-                        &sandbox_id,
-                        sinomo_sandbox::SandboxOutputStream::Stdout,
-                        &outcome.stdout,
-                    ));
-                    completion_output_chunks.extend(sandbox_output_chunks_from_bytes(
-                        &outcome.response.command_id,
-                        &sandbox_id,
-                        sinomo_sandbox::SandboxOutputStream::Stderr,
-                        &outcome.stderr,
-                    ));
+                    completion_output_chunks.extend(
+                        sinomo_sandbox::sandbox_output_chunks_from_bytes(
+                            &outcome.response.command_id,
+                            &sandbox_id,
+                            sinomo_sandbox::SandboxOutputStream::Stdout,
+                            &outcome.stdout,
+                        ),
+                    );
+                    completion_output_chunks.extend(
+                        sinomo_sandbox::sandbox_output_chunks_from_bytes(
+                            &outcome.response.command_id,
+                            &sandbox_id,
+                            sinomo_sandbox::SandboxOutputStream::Stderr,
+                            &outcome.stderr,
+                        ),
+                    );
                 }
                 for chunk in &completion_output_chunks {
-                    if sent_output_chunks.insert(sandbox_output_chunk_stream_key(chunk)) {
+                    if sent_output_chunks
+                        .insert(sinomo_sandbox::sandbox_output_chunk_stream_key(chunk))
+                    {
                         let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Output {
                             chunk: chunk.clone(),
                         };
@@ -6097,14 +4036,16 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
     while let Some(message) = receiver.recv().await {
         match message {
             StreamMessage::Output(chunk) => {
-                sent_output_chunks.insert(sandbox_output_chunk_stream_key(&chunk));
+                sent_output_chunks.insert(sinomo_sandbox::sandbox_output_chunk_stream_key(&chunk));
                 let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output { chunk };
                 write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
             }
             StreamMessage::Complete(Ok(outcome)) => {
                 for step in &outcome.step_outcomes {
                     for chunk in &step.output_chunks {
-                        if sent_output_chunks.insert(sandbox_output_chunk_stream_key(chunk)) {
+                        if sent_output_chunks
+                            .insert(sinomo_sandbox::sandbox_output_chunk_stream_key(chunk))
+                        {
                             let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output {
                                 chunk: chunk.clone(),
                             };
@@ -6138,35 +4079,6 @@ pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runti
         detail: format!("sandbox stream task failed: {source}"),
     })?;
     Ok(())
-}
-
-fn sandbox_output_chunks_from_bytes(
-    command_id: &sinomo_sandbox::SandboxCommandId,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    stream: sinomo_sandbox::SandboxOutputStream,
-    bytes: &[u8],
-) -> Vec<sinomo_sandbox::SandboxOutputChunk> {
-    bytes
-        .chunks(sinomo_sandbox::SANDBOX_OUTPUT_CHUNK_BYTES)
-        .enumerate()
-        .map(|(index, chunk)| sinomo_sandbox::SandboxOutputChunk {
-            sandbox_id: sandbox_id.clone(),
-            command_id: command_id.clone(),
-            stream: stream.clone(),
-            offset: (index * sinomo_sandbox::SANDBOX_OUTPUT_CHUNK_BYTES) as u64,
-            bytes: chunk.to_vec(),
-        })
-        .collect()
-}
-
-fn sandbox_output_chunk_stream_key(
-    chunk: &sinomo_sandbox::SandboxOutputChunk,
-) -> (String, &'static str, u64) {
-    let stream = match chunk.stream {
-        sinomo_sandbox::SandboxOutputStream::Stdout => "stdout",
-        sinomo_sandbox::SandboxOutputStream::Stderr => "stderr",
-    };
-    (chunk.command_id.to_string(), stream, chunk.offset)
 }
 
 async fn write_daemon_sandbox_stream_frame_async(
@@ -6216,90 +4128,6 @@ fn load_daemon_sandbox_policy_config(
         .map(Option::unwrap_or_default)
 }
 
-fn validate_daemon_sandbox_manifest_policy(
-    paths: &DaemonPaths,
-    policy: &sinomo_sandbox::SandboxPolicy,
-    node_id: &sinomo_core::node::NodeId,
-    manifest: &sinomo_sandbox::SandboxInstanceManifest,
-    phase: &str,
-) -> Result<(), DaemonError> {
-    if let Err(denial) = policy.validate_manifest(manifest, node_id) {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(
-                node_id.clone(),
-                Some(&manifest.sandbox_id),
-                phase,
-                &denial,
-            ),
-        )?;
-        if denial.code.starts_with("mount-") {
-            append_daemon_sandbox_event(
-                paths,
-                sinomo_sandbox::sandbox_mount_denied_event(
-                    node_id.clone(),
-                    Some(&manifest.sandbox_id),
-                    phase,
-                    &denial,
-                ),
-            )?;
-        }
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    Ok(())
-}
-
-fn validate_daemon_sandbox_resolved_mount_policy(
-    paths: &DaemonPaths,
-    policy: &sinomo_sandbox::SandboxPolicy,
-    dfs: &mut sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>,
-    manifest: &sinomo_sandbox::SandboxInstanceManifest,
-    node_id: &sinomo_core::node::NodeId,
-    phase: &str,
-) -> Result<(), DaemonError> {
-    for mount in &manifest.mounts {
-        let resolved = dfs.posix_resolve_path_distributed(&mount.source_sifs_path, true)?;
-        let mut resolved_mount = mount.clone();
-        resolved_mount.source_sifs_path = resolved;
-        if let Err(denial) = policy.validate_mounts(&[resolved_mount], node_id) {
-            append_daemon_sandbox_event(
-                paths,
-                sinomo_sandbox::sandbox_mount_denied_event(
-                    node_id.clone(),
-                    Some(&manifest.sandbox_id),
-                    phase,
-                    &denial,
-                ),
-            )?;
-            return Err(DaemonError::Parse {
-                detail: denial.to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_daemon_sandbox_toolchain_update_policy(
-    paths: &DaemonPaths,
-    policy: &sinomo_sandbox::SandboxPolicy,
-    node_id: &sinomo_core::node::NodeId,
-    manifest: &sinomo_sandbox::SandboxToolchainManifest,
-    phase: &str,
-) -> Result<(), DaemonError> {
-    if let Err(denial) = policy.validate_toolchain_update(manifest) {
-        append_daemon_sandbox_event(
-            paths,
-            sinomo_sandbox::sandbox_policy_denied_event(node_id.clone(), None, phase, &denial),
-        )?;
-        return Err(DaemonError::Parse {
-            detail: denial.to_string(),
-        });
-    }
-    Ok(())
-}
-
 fn daemon_sandbox_replica_candidates(
     paths: &DaemonPaths,
     local_node_id: &sinomo_core::node::NodeId,
@@ -6319,21 +4147,7 @@ fn daemon_sandbox_replica_candidates(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    daemon_sandbox_replica_candidates_from_content_advertisements(local_node_id, advertisements)
-}
-
-fn daemon_sandbox_replica_candidates_from_content_advertisements(
-    local_node_id: &sinomo_core::node::NodeId,
-    advertisements: Vec<sinomo_dfs::DfsNodeAdvertisement>,
-) -> Vec<sinomo_core::node::NodeId> {
-    let mut candidates = BTreeSet::new();
-    candidates.insert(local_node_id.clone());
-    for advertisement in advertisements {
-        if advertisement.accepts_content {
-            candidates.insert(advertisement.node_id);
-        }
-    }
-    candidates.into_iter().collect()
+    sinomo_sandbox::clustered_sandbox_replica_candidates(local_node_id, advertisements)
 }
 
 pub fn open_daemon_sandbox_dfs_service(
@@ -6429,15 +4243,23 @@ fn open_daemon_sandbox_dfs_service_with_content_on_runtime(
     Ok(dfs)
 }
 
-#[derive(Debug)]
-pub(crate) struct DaemonRolloutTelemetryTickOutcome {
-    pub(crate) status: RolloutTelemetryAdvanceStatus,
-    pub(crate) applied_transition: Option<AppliedRolloutTransition>,
+#[derive(Clone, Debug)]
+struct DaemonRolloutTelemetryHost {
+    paths: DaemonPaths,
+}
+
+impl sinomo_rollout::RolloutTelemetryHost for DaemonRolloutTelemetryHost {
+    fn reconcile_rollout_telemetry(
+        &self,
+    ) -> Result<sinomo_rollout::RolloutTelemetryReconcileOutcome, String> {
+        run_daemon_rollout_telemetry_reconciliation_tick(&self.paths)
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick(
     paths: &DaemonPaths,
-) -> Result<DaemonRolloutTelemetryTickOutcome, DaemonError> {
+) -> Result<sinomo_rollout::RolloutTelemetryReconcileOutcome, DaemonError> {
     let data_dir = daemon_data_dir_path(paths)?;
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let event_store = daemon_event_store(paths)?;
@@ -6458,7 +4280,7 @@ pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick(
         None
     };
     publish_daemon_module_rollout_status_from_data_dir(&data_dir, &rollout_paths)?;
-    Ok(DaemonRolloutTelemetryTickOutcome {
+    Ok(sinomo_rollout::RolloutTelemetryReconcileOutcome {
         status,
         applied_transition,
     })
@@ -6726,28 +4548,6 @@ impl sinomo_sandbox::SandboxHttpTransport for DaemonSandboxHttpTransport {
     }
 }
 
-fn daemon_sandbox_http_exchange_record_for_command<F>(
-    sandbox_fs: &F,
-    command_id: &sinomo_sandbox::SandboxCommandId,
-) -> Result<Option<sinomo_sandbox::SandboxHttpExchangeRecord>, DaemonError>
-where
-    F: sinomo_sandbox::SandboxFileSystem,
-{
-    let logs_path = sinomo_sandbox::SandboxPath::new("/logs").expect("static logs path");
-    let mut entries = sandbox_fs.list(&logs_path)?;
-    entries.sort_by(|left, right| left.path.cmp(&right.path));
-    let prefix = format!("/logs/{command_id}.");
-    for entry in entries {
-        let path = entry.path;
-        let path_text = path.as_str();
-        if path_text.starts_with(&prefix) && path_text.ends_with(".http.sobj") {
-            let bytes = sandbox_fs.read(&path, None)?;
-            return Ok(Some(sinomo_sandbox::decode_http_exchange_record(&bytes)?));
-        }
-    }
-    Ok(None)
-}
-
 pub(crate) async fn daemon_status_response_async(
     paths: &DaemonPaths,
     _runtime: Option<&tokio::runtime::Handle>,
@@ -6825,7 +4625,7 @@ mod tests {
             mounts: Vec::new(),
         };
 
-        let limits = daemon_sandbox_create_limits(&request, &policy_max);
+        let limits = sinomo_sandbox::sandbox_create_limits(&request, &policy_max);
 
         assert_eq!(limits.memory_mb, policy_max.memory_mb);
         assert_eq!(limits.wall_time_ms, 12_345);
@@ -7294,7 +5094,7 @@ mod tests {
                 route_generation_changed: true,
             })
         );
-        assert_eq!(projection.revision, Some(2));
+        assert_eq!(projection.revision(), Some(2));
         assert_eq!(
             projection.observe_delta(&delta),
             Some(DaemonConnectivityProjectionChange::default()),
@@ -7314,7 +5114,7 @@ mod tests {
             None,
             "a missing revision must request a conservative full rebuild"
         );
-        assert_eq!(projection.revision, Some(2));
+        assert_eq!(projection.revision(), Some(2));
 
         let mut compacted = delta;
         compacted.revision = KvRevision(3);
@@ -7325,7 +5125,7 @@ mod tests {
             None,
             "a delta beyond the retained baseline must request a full rebuild"
         );
-        assert_eq!(projection.revision, Some(2));
+        assert_eq!(projection.revision(), Some(2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7365,7 +5165,7 @@ mod tests {
             ._projection
             .lock()
             .expect("initial projection")
-            .revision
+            .revision()
             .expect("initial revision");
 
         let current = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
@@ -7398,7 +5198,7 @@ mod tests {
                 ._projection
                 .lock()
                 .expect("observed projection")
-                .revision;
+                .revision();
             if observed == Some(external_snapshot.revision.0) {
                 break;
             }
@@ -7433,7 +5233,7 @@ mod tests {
             DaemonConnectivityProjectionChange::default(),
             "a stale shared snapshot must not regress or retrigger the observer"
         );
-        assert_eq!(projection.revision, Some(external_snapshot.revision.0));
+        assert_eq!(projection.revision(), Some(external_snapshot.revision.0));
         assert_eq!(projection.values, observed_values);
     }
 
@@ -8578,25 +6378,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_replica_candidates_use_advertised_content_services_and_local_fallback() {
-        let local = NodeId::from_legacy_named("node_local").expect("local node");
-        let replica = NodeId::from_legacy_named("node_replica").expect("replica node");
-        let metadata_only = NodeId::from_legacy_named("node_metadata").expect("metadata node");
-        let candidates = daemon_sandbox_replica_candidates_from_content_advertisements(
-            &local,
-            vec![
-                sinomo_dfs::DfsNodeAdvertisement::metadata(metadata_only),
-                sinomo_dfs::DfsNodeAdvertisement::content(replica.clone()),
-                sinomo_dfs::DfsNodeAdvertisement::content(local.clone()),
-            ],
-        );
-
-        assert!(candidates.contains(&local));
-        assert!(candidates.contains(&replica));
-        assert_eq!(candidates.len(), 2);
-    }
-
-    #[test]
     fn daemon_rollout_telemetry_tick_advances_from_event_log() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-telemetry");
         let data_dir = SinomoDataDir::new(&root);
@@ -9043,6 +6824,17 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
 
+        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
+            .expect("shutdown request");
+        daemon
+            .join()
+            .expect("daemon thread")
+            .expect("daemon exits cleanly");
+
+        // Read durable startup output only after the daemon has released its
+        // Raft and DFS ownership. The successful status response above is the
+        // readiness boundary; racing the live owner here tests lock timing,
+        // not publication-before-serving.
         let file_system = sinomo_dfs::default_cluster_sifs(&state);
         let shard_entries = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
             .expect("current canonical shard authority")
@@ -9061,13 +6853,6 @@ mod tests {
         let services_anchor = backend
             .get_object_by_path(&file_system.file_system_id, sinomo_dfs::SIFS_SERVICES_PATH)
             .expect("services anchor lookup");
-
-        send_test_shutdown_request(&data_dir, &address, Duration::from_secs(3))
-            .expect("shutdown request");
-        daemon
-            .join()
-            .expect("daemon thread")
-            .expect("daemon exits cleanly");
 
         assert_eq!(
             shard_entries.len(),
@@ -9863,7 +7648,7 @@ mod tests {
         assert_eq!(scan_count, 1, "two quiet ticks must not hydrate DFS");
 
         let safety_interval_nanos =
-            u64::try_from(DAEMON_SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos())
+            u64::try_from(sinomo_sandbox::SANDBOX_LIFECYCLE_SAFETY_SWEEP_INTERVAL.as_nanos())
                 .expect("safety interval nanos");
         run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(
             &paths,
@@ -9885,11 +7670,14 @@ mod tests {
         let paths = DaemonPaths::with_root(root.join("daemon"));
         fs::create_dir_all(&paths.root).expect("daemon root");
         let now = 2_000_000_000_000_u64;
-        record_daemon_sandbox_lifecycle_safety_sweep(&paths, now).expect("sweep stamp");
+        daemon_sandbox_lifecycle_recovery_state(&paths)
+            .record_safety_sweep(now)
+            .expect("sweep stamp");
         let sandbox_id =
             sinomo_sandbox::SandboxId::from_legacy_named("sandbox_pending_marker_recovery")
                 .expect("sandbox id");
-        mark_daemon_sandbox_authoritative_recovery_pending(&paths, &sandbox_id)
+        daemon_sandbox_lifecycle_recovery_state(&paths)
+            .mark_authoritative_recovery_pending(&sandbox_id)
             .expect("pending marker");
 
         run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now, |marked| {
@@ -9900,18 +7688,22 @@ mod tests {
         })
         .expect_err("failed recovery");
         assert_eq!(
-            daemon_sandbox_authoritative_recovery_pending_ids(&paths).expect("pending ids"),
+            daemon_sandbox_lifecycle_recovery_state(&paths)
+                .pending_sandbox_ids()
+                .expect("pending ids"),
             BTreeSet::from([sandbox_id.clone()])
         );
 
         run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now + 1, |marked| {
             assert_eq!(marked, BTreeSet::from([sandbox_id.clone()]));
-            clear_daemon_sandbox_authoritative_recovery_pending(&paths, &sandbox_id)?;
+            daemon_sandbox_lifecycle_recovery_state(&paths)
+                .clear_authoritative_recovery_pending(&sandbox_id)?;
             Ok(1)
         })
         .expect("successful recovery");
         assert!(
-            daemon_sandbox_authoritative_recovery_pending_ids(&paths)
+            daemon_sandbox_lifecycle_recovery_state(&paths)
+                .pending_sandbox_ids()
                 .expect("settled ids")
                 .is_empty()
         );

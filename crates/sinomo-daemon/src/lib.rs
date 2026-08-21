@@ -1,14 +1,10 @@
 mod api;
 mod auth;
-mod build_service;
 mod client;
 mod cluster;
 mod control;
 mod dfs;
 mod error;
-mod event_stream;
-mod idle_stats;
-mod install;
 mod observe;
 mod paths;
 mod process;
@@ -260,40 +256,21 @@ pub use control::{
     run_daemon_control_loop_with_services_and_profile,
 };
 pub use error::DaemonError;
-pub(crate) use idle_stats::{
-    IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
-};
-pub use install::{
-    DaemonStopBeforeInstallStart, DaemonStopBeforeInstallStatus, DaemonStopIfRunningStatus,
-    InstallLayout, InstalledDaemonInstallPlan, InstalledDaemonInstallPlanRequest,
-    InstalledDaemonPaths, InstalledDaemonStartSpec, InstalledDaemonStartStatus,
-    ManagedSourceRepoInstallStatus, activate_boot_entries, deactivate_boot_entries,
-    default_boot_dir, ensure_install_layout_dirs, git_is_available, install_managed_source_repo,
-    installed_daemon_paths, managed_source_git_status_lines, prepare_installed_daemon_install_plan,
-    remove_boot_entry,
-    start_installed_sinomo_daemon as daemon_install_start_installed_sinomo_daemon,
-    stop_daemon_before_install as daemon_install_stop_daemon_before_install,
-    stop_daemon_if_running as daemon_install_stop_daemon_if_running, write_install_boot_entries,
-};
-#[cfg(not(windows))]
-pub use install::{LocalBinSymlinkStatus, SystemctlUserOutcome, ensure_local_bin_symlink};
-#[cfg(windows)]
-pub use install::{UserPathUpdate, ensure_windows_user_path_contains};
 pub(crate) use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
 #[cfg(windows)]
-pub(crate) use process::prepare_noninteractive_command;
+pub use process::prepare_noninteractive_command;
 #[cfg(not(unix))]
 pub(crate) use process::spawn_shadow_rollout_completion_helper_process;
 pub(crate) use process::{
     CandidateMainDiagnostics, build_daemon_async_runtime, build_daemon_async_runtime_with_profile,
-    main_exit_observation_from_status, prepare_background_command,
-    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
-    spawn_shadow_rollout_recovery_helper_process,
+    main_exit_observation_from_status, spawn_candidate_main_daemon_process,
+    spawn_main_daemon_process, spawn_shadow_rollout_recovery_helper_process,
 };
 pub use process::{
-    DaemonExecutionProfile, daemon_main_binary_for_shadow_start, start_daemon_command_process,
+    DaemonExecutionProfile, daemon_main_binary_for_shadow_start, prepare_background_command,
+    start_daemon_command_process,
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
@@ -304,6 +281,9 @@ pub use rollout::{
     wait_for_main_daemon_health,
 };
 pub(crate) use rollout::{daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout};
+pub(crate) use sinomo_observe::{
+    IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
+};
 pub use status::{
     DaemonClusterProcess, DaemonClusterRegistration, DaemonDataOwnerLock,
     DaemonEndpointAdvertisementConfig, DaemonLock, DaemonManualEndpointConfig,
@@ -317,7 +297,7 @@ pub use status::{
 pub(crate) use status::{
     current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
-    daemon_cluster_status_matches, daemon_probe_status_needs_restart_for_options,
+    daemon_cluster_status_matches,
 };
 
 pub fn register_storage_paths(

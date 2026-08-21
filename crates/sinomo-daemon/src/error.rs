@@ -145,6 +145,17 @@ impl From<sinomo_core::local::LocalDataError> for DaemonError {
     }
 }
 
+impl From<sinomo_build::BuildError> for DaemonError {
+    fn from(error: sinomo_build::BuildError) -> Self {
+        match error {
+            sinomo_build::BuildError::Io { path, detail } => Self::Io { path, detail },
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<sinomo_dfs::MetadataBackendError> for DaemonError {
     fn from(error: sinomo_dfs::MetadataBackendError) -> Self {
         match error {
@@ -201,6 +212,24 @@ impl From<sinomo_sandbox::SandboxStoreError> for DaemonError {
     fn from(error: sinomo_sandbox::SandboxStoreError) -> Self {
         Self::Parse {
             detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::ClusteredSandboxLeaseError> for DaemonError {
+    fn from(error: sinomo_sandbox::ClusteredSandboxLeaseError) -> Self {
+        Self::Parse {
+            detail: error.to_string(),
+        }
+    }
+}
+
+impl From<sinomo_sandbox::SandboxLifecycleRecoveryError> for DaemonError {
+    fn from(error: sinomo_sandbox::SandboxLifecycleRecoveryError) -> Self {
+        match error {
+            sinomo_sandbox::SandboxLifecycleRecoveryError::Io { path, detail } => {
+                Self::Io { path, detail }
+            }
         }
     }
 }

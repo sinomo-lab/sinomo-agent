@@ -22,6 +22,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
