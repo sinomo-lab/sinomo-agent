@@ -362,6 +362,28 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         resident_metadata_scope,
         ..
     } = lane;
+    let local_advertisement = daemon_dfs_local_content_advertisement(
+        &data_dir,
+        &cluster_state.local_node_id,
+        daemon_dfs_local_zone(),
+    );
+    if let Err(error) =
+        maintenance_service.publish_local_content_advertisement_if_needed(local_advertisement)
+    {
+        tracing::warn!(
+            target: "sinomo.dfs.placement",
+            "could not refresh cached DFS storage advertisement: {error}"
+        );
+    }
+    let placement_advertisements = maintenance_service
+        .placement_content_candidates()
+        .unwrap_or_default();
+    refresh_daemon_dfs_placement_snapshot(
+        &data_dir,
+        &cluster_paths,
+        &cluster_state.local_node_id,
+        placement_advertisements,
+    );
     let authority_generation_before_maintenance = signature.metadata_authority_generation;
     let authoritative_topology = metadata_authority_generation
         .current_complete_prefix_for_generation(authority_generation_before_maintenance)

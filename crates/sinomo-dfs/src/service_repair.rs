@@ -1611,7 +1611,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn stage_blob_sources(&self, intent_id: &str) -> Vec<NodeId> {
-        self.coordinator
+        let sources = self
+            .coordinator
             .receipts_for_intent(intent_id)
             .into_iter()
             .filter_map(|receipt| {
@@ -1619,7 +1620,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        self.ranked_transfer_sources(sources)
     }
 
     fn record_fetch_inflight(
@@ -1629,6 +1631,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request_id: String,
     ) {
         let tick = self.repair_retry_tick;
+        self.passive_fetch_started_at.insert(
+            (intent_id.to_string(), source_node_id.clone()),
+            std::time::Instant::now(),
+        );
         if let Some(pending) = self.pending_writes.get_mut(intent_id) {
             pending.fetch_inflight_from.insert(source_node_id.clone());
             pending
@@ -1648,7 +1654,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn expire_stale_fetch_requests(&mut self) {
         let tick = self.repair_retry_tick;
-        for pending in self.pending_writes.values_mut() {
+        for (intent_id, pending) in &mut self.pending_writes {
             let expired_sources = pending
                 .fetch_inflight_started_ticks
                 .iter()
@@ -1663,6 +1669,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             for source_node_id in expired_sources {
                 pending.fetch_inflight_from.remove(&source_node_id);
                 pending.fetch_inflight_started_ticks.remove(&source_node_id);
+                self.passive_fetch_started_at
+                    .remove(&(intent_id.clone(), source_node_id.clone()));
                 pending.fetch_failed_from.insert(source_node_id);
             }
             for state in pending.stage_retries.values_mut() {
@@ -2360,6 +2368,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             Err(DfsError::UnknownObject { .. }) => {}
             Err(error) => return Err(error),
         }
-        Ok(candidates.into_iter().collect())
+        Ok(self.ranked_transfer_sources(candidates))
     }
 }

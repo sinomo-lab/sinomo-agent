@@ -9,10 +9,11 @@ use crate::service_state::DfsMetadataBackendOwner;
 use crate::{
     AsyncDfsMessageTransport, DfsCancellationFlag, DfsCommittedWorkTracker, DfsConflictStatus,
     DfsControlPlaneKvClient, DfsError, DfsFileSystem, DfsMessageCommittedWork, DfsMessageTransport,
-    DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsOperationalMetrics, DfsRoutedCall,
-    DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator, LocalContentStore,
-    NetworkedDfsService, NetworkedDfsServiceEvent, ResidentLocalMetadataShardLease,
-    ResidentLocalShardedMetadataBackendLease, build_dfs_routed_message,
+    DfsMetadataBackend, DfsMetadataStore, DfsNetworkMessage, DfsObjectId, DfsOperationalMetrics,
+    DfsRoutedCall, DfsRoutedMessage, DfsTransportIdentity, DistributedEventualCoordinator,
+    LocalContentStore, NetworkedDfsService, NetworkedDfsServiceEvent,
+    ResidentLocalMetadataShardLease, ResidentLocalShardedMetadataBackendLease,
+    build_dfs_routed_message,
 };
 
 impl<T> NetworkedDfsService<T> {
@@ -53,11 +54,14 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             content,
             coordinator: DistributedEventualCoordinator::new(),
             control_plane: None,
+            placement_snapshot_cache: Default::default(),
+            content_pin_node_ids: BTreeMap::new(),
             metadata_backend: None,
             metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
             active_replica_stages: BTreeMap::new(),
             pending_writes: BTreeMap::new(),
+            passive_fetch_started_at: BTreeMap::new(),
             pending_reads: BTreeMap::new(),
             repair_attempt_records: BTreeMap::new(),
             transient_remote_read_pruned_locations: BTreeMap::new(),
@@ -238,6 +242,47 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn with_boxed_control_plane(mut self, kv: Box<dyn DfsControlPlaneKvClient>) -> Self {
         self.control_plane = Some(kv);
         self
+    }
+
+    pub fn with_placement_snapshot_cache(
+        mut self,
+        cache: crate::DfsPlacementSnapshotCache,
+    ) -> Self {
+        self.placement_snapshot_cache = cache;
+        self
+    }
+
+    pub fn placement_snapshot_cache(&self) -> crate::DfsPlacementSnapshotCache {
+        self.placement_snapshot_cache.clone()
+    }
+
+    pub fn set_content_pin_snapshot(
+        &mut self,
+        pins: impl IntoIterator<Item = (DfsObjectId, NodeId)>,
+    ) {
+        self.content_pin_node_ids.clear();
+        for (object_id, node_id) in pins {
+            self.content_pin_node_ids
+                .entry(object_id)
+                .or_default()
+                .insert(node_id);
+        }
+    }
+
+    pub fn content_pin_nodes(&self, object_id: &DfsObjectId) -> Vec<NodeId> {
+        self.content_pin_node_ids
+            .get(object_id)
+            .into_iter()
+            .flat_map(|node_ids| node_ids.iter().cloned())
+            .collect()
+    }
+
+    pub(crate) fn ranked_transfer_sources(
+        &self,
+        sources: impl IntoIterator<Item = NodeId>,
+    ) -> Vec<NodeId> {
+        self.placement_snapshot_cache
+            .rank_sources(&self.node_id, sources)
     }
 
     pub(crate) fn refresh_control_plane_latest(&mut self) -> Result<(), DfsError> {

@@ -199,6 +199,22 @@ pub struct DfsReplicaPlacementDecision {
     pub selected: bool,
     pub preferred_for_commit: bool,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_health: Option<crate::DfsHealthState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_freshness: Option<crate::DfsObservationFreshness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_capacity_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_state: Option<crate::DfsPlacementPathState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_latency_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_throughput_bytes_per_second: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_metering: Option<crate::DfsNetworkMetering>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_freshness: Option<crate::DfsObservationFreshness>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -206,6 +222,14 @@ pub struct DfsReplicaPlacementExplanation {
     pub plan: DfsReplicaPlacementPlan,
     pub represented_zone_count: usize,
     pub decisions: Vec<DfsReplicaPlacementDecision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_generation: Option<u64>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub snapshot_observed_at: Option<time::OffsetDateTime>,
 }
 
 pub fn plan_replicas(
@@ -370,6 +394,14 @@ fn explain_replicas_with_environment_validation(
                 selected,
                 preferred_for_commit,
                 reason,
+                storage_health: None,
+                storage_freshness: None,
+                usable_capacity_bytes: None,
+                path_state: None,
+                path_latency_micros: None,
+                path_throughput_bytes_per_second: None,
+                path_metering: None,
+                observation_freshness: None,
             }
         })
         .collect();
@@ -377,6 +409,8 @@ fn explain_replicas_with_environment_validation(
         plan,
         represented_zone_count,
         decisions,
+        snapshot_generation: None,
+        snapshot_observed_at: None,
     })
 }
 
@@ -1382,7 +1416,7 @@ fn validate_replica_set(
     Ok(())
 }
 
-fn validate_candidate_set(
+pub(crate) fn validate_candidate_set(
     candidates: &[DfsReplicaCandidate],
     policy: &DfsReplicationPolicy,
 ) -> Result<(), DfsDistributedError> {

@@ -33,6 +33,14 @@ pub trait DfsBrowserServiceHost: Send + Sync + 'static {
         runtime: &tokio::runtime::Handle,
     ) -> (Arc<dyn DfsPeerTransport>, Arc<dyn AsyncDfsPeerTransport>);
 
+    fn placement_snapshot_cache(
+        &self,
+        _data_dir: &SinomoDataDir,
+        _node_id: &sinomo_core::node::NodeId,
+    ) -> DfsPlacementSnapshotCache {
+        DfsPlacementSnapshotCache::default()
+    }
+
     fn schedule_metadata_publish(
         &self,
         data_dir: &SinomoDataDir,
@@ -310,10 +318,14 @@ impl DfsBrowserBackend {
             control_plane,
         )
         .map_err(dfs_browser_service_error)?;
+        let node_id = opened.service.node_id().clone();
+        let cache = host.placement_snapshot_cache(&data_dir, &node_id);
+        let mut service = opened.service.with_placement_snapshot_cache(cache);
+        refresh_browser_content_pin_snapshot(&data_dir, &mut service);
         Ok(Self {
             data_dir,
             host,
-            service: Mutex::new(opened.service),
+            service: Mutex::new(service),
             replica_control_plane: Mutex::new(replica_control_plane),
             peer_targets_refreshed_at: Mutex::new(Some(Instant::now())),
             stat_cache: Mutex::new(HashMap::new()),
@@ -882,6 +894,9 @@ impl DfsBrowserBackend {
             },
         )
         .map_err(dfs_browser_service_error)?;
+        if let Ok(mut service) = self.lock_service() {
+            refresh_browser_content_pin_snapshot(&self.data_dir, &mut service);
+        }
         self.invalidate_stat_cache();
         Ok(node_id.to_string())
     }
@@ -903,6 +918,9 @@ impl DfsBrowserBackend {
         )
         .map_err(dfs_browser_service_error)?;
         if removed {
+            if let Ok(mut service) = self.lock_service() {
+                refresh_browser_content_pin_snapshot(&self.data_dir, &mut service);
+            }
             self.invalidate_stat_cache();
         }
         Ok(removed)
@@ -1070,7 +1088,7 @@ impl DfsBrowserBackend {
         // `config` already contains the proposed mutation, including a
         // `policy=None` removal. Passing a materialized config through the
         // shared helper prevents a second override from restoring that rule.
-        let (preview, _, _) = self.preview_placement_for_config(
+        let (preview, _, _, _) = self.preview_placement_for_config(
             &cluster_paths,
             &base_config,
             &config,
@@ -1126,7 +1144,7 @@ impl DfsBrowserBackend {
             })?;
         let mut desired = expected.clone();
         mutate_daemon_dfs_browser_placement_config(&mut desired, &path, scope, policy)?;
-        let (preview, unavailable_node_ids, candidate_snapshot) =
+        let (preview, unavailable_node_ids, candidate_snapshot, placement_snapshot) =
             self.preview_placement_for_config(&cluster_paths, &expected, &desired, &path, scope)?;
         require_matching_daemon_dfs_browser_placement_preview_token(
             &expected_preview_token,
@@ -1145,6 +1163,10 @@ impl DfsBrowserBackend {
             scope,
             unavailable_node_ids,
             candidate_snapshot,
+            placement_snapshot,
+            adaptive: false,
+            adaptive_budget: None,
+            processed_content_bytes: 0,
             accepted_config: Some(desired.clone()),
             state: crate::DfsPlacementReconciliationState::Pending,
             cursor: None,
@@ -1197,10 +1219,11 @@ impl DfsBrowserBackend {
             crate::DfsPlacementPreview,
             BTreeSet<sinomo_core::node::NodeId>,
             Vec<crate::DfsNodeAdvertisement>,
+            Option<crate::DfsPlacementSnapshot>,
         ),
         ServiceError,
     > {
-        let (stat, observer_node_id, candidates) = {
+        let (stat, observer_node_id, candidates, placement_snapshot, pinned_replica_node_ids) = {
             let mut service = self.lock_service_for_read()?;
             self.refresh_peer_targets(&mut service);
             let stat = service
@@ -1210,7 +1233,18 @@ impl DfsBrowserBackend {
             let candidates = service
                 .placement_content_candidates()
                 .map_err(dfs_browser_service_error)?;
-            (stat, observer_node_id, candidates)
+            let placement_snapshot = service
+                .placement_snapshot_cache()
+                .snapshot()
+                .map(|snapshot| (*snapshot).clone());
+            let pinned_replica_node_ids = service.content_pin_nodes(&stat.object_id);
+            (
+                stat,
+                observer_node_id,
+                candidates,
+                placement_snapshot,
+                pinned_replica_node_ids,
+            )
         };
         if candidates.is_empty() {
             return Err(ServiceError::Service(
@@ -1221,7 +1255,7 @@ impl DfsBrowserBackend {
         let initial_connectivity =
             daemon_dfs_browser_placement_connectivity_snapshot(cluster_paths);
         let unavailable_node_ids = initial_connectivity.explicitly_unavailable_node_ids();
-        let mut preview = crate::preview_placement_with_unavailable_nodes(
+        let mut preview = crate::preview_placement_with_snapshot_and_unavailable_nodes(
             config,
             &stat.path,
             stat.object_id.clone(),
@@ -1232,6 +1266,8 @@ impl DfsBrowserBackend {
             candidates.clone(),
             None,
             scope,
+            placement_snapshot.as_ref(),
+            &pinned_replica_node_ids,
             &unavailable_node_ids,
         )
         .map_err(dfs_browser_service_error)?;
@@ -1312,16 +1348,27 @@ impl DfsBrowserBackend {
             &reconciliation_unavailable_node_ids,
         )
         .map_err(dfs_browser_service_error)?;
-        Ok((preview, reconciliation_unavailable_node_ids, candidates))
+        Ok((
+            preview,
+            reconciliation_unavailable_node_ids,
+            candidates,
+            placement_snapshot,
+        ))
     }
 
     fn placement_progress(
         &self,
         request: crate::DaemonDfsBrowserPlacementProgressRequest,
     ) -> Result<crate::DaemonDfsBrowserPlacementProgressResponse, ServiceError> {
-        let cluster_paths = ClusterPaths::new(&self.data_dir);
-        let mut kv = DfsBrowserObservedControlPlaneKvClient::new(&cluster_paths);
-        let reconciliation = crate::DfsControlPlaneStore::new(&mut kv)
+        let mut control_plane = self.replica_control_plane.lock().map_err(|_| {
+            ServiceError::Service("daemon DFS browser control-plane mutex poisoned".to_string())
+        })?;
+        let kv = control_plane.as_deref_mut().ok_or_else(|| {
+            ServiceError::Service(
+                "managed DFS placement progress has no authoritative control plane".to_string(),
+            )
+        })?;
+        let reconciliation = crate::DfsControlPlaneStore::new(kv)
             .placement_reconciliation(&crate::sifs_file_system_id(), &request.job_id)
             .map_err(dfs_browser_service_error)?
             .ok_or_else(|| {
@@ -1378,6 +1425,21 @@ impl DfsBrowserBackend {
             .map_err(dfs_browser_service_error)?;
         Ok(())
     }
+}
+
+fn refresh_browser_content_pin_snapshot(
+    data_dir: &SinomoDataDir,
+    service: &mut crate::MountedSifsService,
+) {
+    let pins = crate::list_local_dfs_pins(crate::default_dfs_pin_root(data_dir), None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pin| pin.mode == crate::DfsPinMode::Content)
+        .filter_map(|pin| {
+            pin.object_id
+                .map(|object_id| (object_id, pin.pinned_by_node_id))
+        });
+    service.set_content_pin_snapshot(pins);
 }
 
 impl Service for HostedDfsBrowserService {

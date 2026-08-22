@@ -759,12 +759,16 @@ pub(super) fn with_daemon_dfs_control_plane_seeded_on_runtime<
         return service;
     };
     if cluster_paths.state.exists() {
-        let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_seeded_on_runtime(
+        let mut control_plane = DaemonDfsControlPlaneKvClient::new_seeded_on_runtime(
             cluster_paths,
             runtime,
             authoritative_prefix,
-        )) as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>;
-        service.with_boxed_control_plane(control_plane)
+        );
+        let service =
+            with_daemon_dfs_placement_environment(service, cluster_paths, &mut control_plane);
+        service.with_boxed_control_plane(
+            Box::new(control_plane) as Box<dyn sinomo_dfs::DfsControlPlaneKvClient>
+        )
     } else {
         service
     }
@@ -785,9 +789,33 @@ pub(crate) fn with_daemon_owned_dfs_control_plane_on_runtime<T: sinomo_dfs::DfsM
     if !cluster_paths.state.exists() {
         return service;
     }
-    service.with_boxed_control_plane(Box::new(
-        DaemonDfsControlPlaneKvClient::new_owned_on_runtime(cluster_paths, runtime),
-    ))
+    let mut control_plane =
+        DaemonDfsControlPlaneKvClient::new_owned_on_runtime(cluster_paths, runtime);
+    let service = with_daemon_dfs_placement_environment(service, cluster_paths, &mut control_plane);
+    service.with_boxed_control_plane(Box::new(control_plane))
+}
+
+fn with_daemon_dfs_placement_environment<T: sinomo_dfs::DfsMessageTransport>(
+    mut service: NetworkedDfsService<T>,
+    cluster_paths: &ClusterPaths,
+    _control_plane: &mut dyn sinomo_dfs::DfsControlPlaneKvClient,
+) -> NetworkedDfsService<T> {
+    let Some(data_root) = cluster_paths.root.parent() else {
+        return service;
+    };
+    let data_dir = SinomoDataDir::new(data_root);
+    let cache = cached_daemon_dfs_placement_snapshot_cache(&data_dir, service.node_id());
+    service = service.with_placement_snapshot_cache(cache);
+    let pins = sinomo_dfs::list_local_dfs_pins(sinomo_dfs::default_dfs_pin_root(&data_dir), None)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|pin| pin.mode == sinomo_dfs::DfsPinMode::Content)
+        .filter_map(|pin| {
+            pin.object_id
+                .map(|object_id| (object_id, pin.pinned_by_node_id))
+        });
+    service.set_content_pin_snapshot(pins);
+    service
 }
 
 pub(crate) fn daemon_dfs_control_plane_client_on_runtime(

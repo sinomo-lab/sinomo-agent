@@ -834,6 +834,7 @@ pub(super) async fn run_daemon_dfs_smoke_async(
                     publish_cluster_control: false,
                     materialize_local_metadata: false,
                     local_zone: None,
+                    local_content_advertisement: None,
                 },
                 smoke: daemon_dfs_smoke_options(),
             },

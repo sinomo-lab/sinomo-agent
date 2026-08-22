@@ -9,6 +9,7 @@ use crate::control_plane::DfsControlPlaneStore;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_core::kv::{KvEntry, KvError, encode_kv_value};
 use sinomo_core::node::NodeId;
+use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
 const DFS_KV_PREFIX: &str = "/dfs";
@@ -40,8 +41,30 @@ pub struct DfsNodeAdvertisement {
     pub accepts_content: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone: Option<String>,
+    /// Sanitized aggregate storage state. Physical locations remain node-local
+    /// observation data and never become independent replica identities.
+    #[serde(default)]
+    pub storage_health: crate::DfsHealthState,
+    #[serde(default)]
+    pub storage_freshness: crate::DfsObservationFreshness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_capacity_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_free_bytes: Option<u64>,
+    #[serde(default)]
+    pub content_location_count: u32,
+    #[serde(default)]
+    pub network_metering: crate::DfsNetworkMetering,
+    #[serde(default)]
+    pub advertisement_generation: u64,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 impl DfsNodeAdvertisement {
@@ -52,7 +75,15 @@ impl DfsNodeAdvertisement {
             accepts_metadata: true,
             accepts_content: false,
             zone: None,
+            storage_health: crate::DfsHealthState::Unknown,
+            storage_freshness: crate::DfsObservationFreshness::NeverSampled,
+            usable_capacity_bytes: None,
+            reserved_free_bytes: None,
+            content_location_count: 0,
+            network_metering: crate::DfsNetworkMetering::Unknown,
+            advertisement_generation: 0,
             updated_at: OffsetDateTime::now_utc(),
+            expires_at: None,
         }
     }
 
@@ -63,7 +94,15 @@ impl DfsNodeAdvertisement {
             accepts_metadata: false,
             accepts_content: true,
             zone: None,
+            storage_health: crate::DfsHealthState::Unknown,
+            storage_freshness: crate::DfsObservationFreshness::NeverSampled,
+            usable_capacity_bytes: None,
+            reserved_free_bytes: None,
+            content_location_count: 1,
+            network_metering: crate::DfsNetworkMetering::Unknown,
+            advertisement_generation: 0,
             updated_at: OffsetDateTime::now_utc(),
+            expires_at: None,
         }
     }
 }
@@ -120,6 +159,26 @@ impl<'a> DfsControlPlaneStore<'a> {
         })
     }
 
+    pub fn cluster_view_for_node_ids(
+        &self,
+        node_ids: impl IntoIterator<Item = NodeId>,
+    ) -> Result<DfsClusterView, KvError> {
+        let mut metadata_nodes = Vec::new();
+        let mut content_nodes = Vec::new();
+        for node_id in node_ids.into_iter().collect::<BTreeSet<_>>() {
+            if let Some(advertisement) = self.metadata_service(&node_id)? {
+                metadata_nodes.push(advertisement);
+            }
+            if let Some(advertisement) = self.content_service(&node_id)? {
+                content_nodes.push(advertisement);
+            }
+        }
+        Ok(DfsClusterView {
+            metadata_nodes,
+            content_nodes,
+        })
+    }
+
     fn put_control_value<T>(&mut self, key: &str, value: &T) -> Result<(), KvError>
     where
         T: Serialize,
@@ -147,6 +206,50 @@ impl<'a> DfsControlPlaneStore<'a> {
             values.push(entry.decode()?);
         }
         Ok(values)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_scoped_cluster_view_uses_point_reads_and_deduplicates_nodes() {
+        let first = NodeId::from_legacy_named("dfs-discovery-point-first").expect("first node");
+        let second = NodeId::from_legacy_named("dfs-discovery-point-second").expect("second node");
+        let missing =
+            NodeId::from_legacy_named("dfs-discovery-point-missing").expect("missing node");
+        let mut kv = sinomo_core::kv::InProcessKvStore::new();
+        let mut store = DfsControlPlaneStore::new(&mut kv);
+        store
+            .advertise_metadata_service(&DfsNodeAdvertisement::metadata(first.clone()))
+            .expect("advertise metadata");
+        store
+            .advertise_content_service(&DfsNodeAdvertisement::content(first.clone()))
+            .expect("advertise first content");
+        store
+            .advertise_content_service(&DfsNodeAdvertisement::content(second.clone()))
+            .expect("advertise second content");
+
+        let view = store
+            .cluster_view_for_node_ids([second.clone(), first.clone(), first.clone(), missing])
+            .expect("member-scoped view");
+        assert_eq!(
+            view.metadata_nodes
+                .iter()
+                .map(|node| node.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![first.clone()]
+        );
+        let mut expected_content = vec![first, second];
+        expected_content.sort();
+        assert_eq!(
+            view.content_nodes
+                .iter()
+                .map(|node| node.node_id.clone())
+                .collect::<Vec<_>>(),
+            expected_content
+        );
     }
 }
 

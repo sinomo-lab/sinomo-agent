@@ -646,6 +646,20 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
+    // The shadow shares the data root but never owns a second device sampler.
+    let local_content_advertisement = (!crate::daemon_paths_are_shadow(paths))
+        .then(|| {
+            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+                .ok()
+                .map(|state| {
+                    daemon_dfs_local_content_advertisement(
+                        &data_dir,
+                        &state.local_node_id,
+                        daemon_dfs_local_zone(),
+                    )
+                })
+        })
+        .flatten();
     let control_plane = Box::new(DaemonDfsControlPlaneKvClient::new_on_runtime(
         &cluster_paths,
         &runtime,
@@ -659,6 +673,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
             publish_cluster_control,
             materialize_local_metadata: true,
             local_zone: daemon_dfs_local_zone(),
+            local_content_advertisement,
         },
     )
     .await

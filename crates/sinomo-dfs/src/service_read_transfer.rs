@@ -821,6 +821,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
         }
+        let delivered_bytes = match &response.result {
+            DfsReadResult::Found(data) => Some(data.bytes.len()),
+            DfsReadResult::RangeFound(data) => Some(data.bytes.len()),
+            DfsReadResult::NotFound | DfsReadResult::Rejected { .. } => None,
+        };
+        if let Some(delivered_bytes) = delivered_bytes {
+            let started_at = pending
+                .next_retry_at
+                .checked_sub(DFS_REMOTE_READ_RETRY_DELAY)
+                .unwrap_or(pending.next_retry_at);
+            self.placement_snapshot_cache.observe_transfer(
+                &source_node_id,
+                &self.node_id,
+                delivered_bytes.try_into().unwrap_or(u64::MAX),
+                started_at.elapsed(),
+            );
+        }
         Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
             request_id: response.request_id,
             object_id: response.object_id,

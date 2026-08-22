@@ -460,12 +460,23 @@ pub struct NetworkedDfsService<T> {
     pub(crate) content: LocalContentStore,
     pub(crate) coordinator: DistributedEventualCoordinator,
     pub(crate) control_plane: Option<Box<dyn DfsControlPlaneKvClient>>,
+    /// Daemon-owned immutable placement evidence shared by request shells.
+    /// Reads clone one `Arc`; collectors and filesystem probes never run here.
+    pub(crate) placement_snapshot_cache: crate::DfsPlacementSnapshotCache,
+    /// Object-scoped manual content pins known to this service generation.
+    /// Pins are hard retention/placement constraints but remain distinct from
+    /// the filesystem's configured W/N durability policy.
+    pub(crate) content_pin_node_ids: BTreeMap<DfsObjectId, BTreeSet<NodeId>>,
     pub(crate) metadata_backend: Option<DfsMetadataBackendOwner>,
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
     pub(crate) active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
     pub(crate) pending_writes: BTreeMap<String, PendingNetworkedWrite>,
+    /// Wall-clock starts for passive repair/fetch throughput observations.
+    /// Retry ticks remain the durable scheduling clock; these instants are
+    /// deliberately process-local measurement evidence only.
+    pub(crate) passive_fetch_started_at: BTreeMap<(String, NodeId), Instant>,
     pub(crate) pending_reads: BTreeMap<String, PendingNetworkedRead>,
     pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
     pub(crate) transient_remote_read_pruned_locations:

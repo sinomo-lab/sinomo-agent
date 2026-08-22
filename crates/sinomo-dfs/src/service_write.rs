@@ -42,9 +42,86 @@ struct PreparedDistributedWrite {
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn snapshot_replication_plan(
+        &self,
+        object: &DfsObjectMetadata,
+        target_version: &DfsVersion,
+        _supplied_replica_nodes: &[NodeId],
+        policy: &DfsReplicationPolicy,
+    ) -> Result<Option<(Vec<NodeId>, DfsReplicationPolicy)>, DfsError> {
+        let Some(snapshot) = self.placement_snapshot_cache.snapshot() else {
+            return Ok(None);
+        };
+        if snapshot.nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let pinned = self
+            .content_pin_node_ids
+            .get(&object.object_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut node_zones = policy.node_zones.clone();
+        for node in &snapshot.nodes {
+            if let Some(zone) = &node.zone {
+                node_zones.insert(node.node_id.clone(), zone.clone());
+            }
+        }
+        let effective_policy =
+            DfsReplicationPolicy::new(policy.min_commit_replicas, policy.desired_replicas)?
+                .with_placement_constraints(
+                    policy.required_node_ids.clone(),
+                    policy.forbidden_node_ids.clone(),
+                    policy.min_distinct_zones,
+                    node_zones,
+                )?;
+
+        let mut candidate_ids = snapshot
+            .nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<BTreeSet<_>>();
+        candidate_ids.extend(object.current_locations.iter().cloned());
+        candidate_ids.extend(effective_policy.required_node_ids.iter().cloned());
+        candidate_ids.insert(object.owner_node_id.clone());
+        let candidates = candidate_ids
+            .into_iter()
+            .map(|node_id| {
+                let weight = snapshot
+                    .node(&node_id)
+                    .map(|node| node.capacity_weight.max(1))
+                    .unwrap_or(1);
+                DfsReplicaCandidate::weighted(node_id.clone(), weight).map(|candidate| {
+                    candidate.with_zone(effective_policy.node_zones.get(&node_id).cloned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let request = DfsReplicaPlacementRequest {
+            file_system_id: object.file_system_id.clone(),
+            object_id: object.object_id.clone(),
+            // Version is provenance in the explanation; stable placement
+            // scoring deliberately excludes it so normal writes do not churn.
+            target_version: target_version.clone(),
+            coordinator_node_id: self.node_id.clone(),
+            policy: effective_policy.clone(),
+            candidates,
+        };
+        let explanation = explain_replicas_with_placement_snapshot(
+            &request,
+            &snapshot,
+            &object.current_locations,
+            &pinned.into_iter().collect::<Vec<_>>(),
+        )?;
+        Ok(Some((
+            explanation.plan.desired_replica_nodes,
+            effective_policy,
+        )))
+    }
+
     fn normalize_distributed_write_replication_plan(
         &self,
         object: &DfsObjectMetadata,
+        target_version: &DfsVersion,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<(Vec<NodeId>, DfsReplicationPolicy), DfsError> {
@@ -57,6 +134,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         validate_replication_plan(&desired_replica_nodes, &policy)?;
+        // The metadata primary repeats this step after a routed command arrives,
+        // so caller-provided candidates are only a compatibility hint. The
+        // durable intent is bound to the primary's immutable snapshot.
+        let (desired_replica_nodes, policy) = self
+            .snapshot_replication_plan(object, target_version, &desired_replica_nodes, &policy)?
+            .unwrap_or((desired_replica_nodes, policy));
         let desired_replica_nodes =
             self.normalize_desired_replica_nodes(object, desired_replica_nodes, &policy);
         let policy = if desired_replica_nodes.len() > policy.desired_replicas {
@@ -80,6 +163,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn prepare_distributed_write(
         &mut self,
         object_id: &DfsObjectId,
+        target_version: &DfsVersion,
         desired_replica_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
         touch_parent_on_create: bool,
@@ -95,6 +179,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
             &object,
+            target_version,
             desired_replica_nodes,
             policy,
         )?;
@@ -198,6 +283,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         candidate_nodes: Vec<NodeId>,
         policy: DfsReplicationPolicy,
     ) -> Result<DfsReplicaPlacementPlan, DfsError> {
+        if let Ok(object) = self.current_read_object_metadata(&request.object_id)
+            && let Some((desired_replica_nodes, effective_policy)) = self
+                .snapshot_replication_plan(
+                    &object,
+                    &request.target_version,
+                    &candidate_nodes,
+                    &policy,
+                )?
+        {
+            let preferred_commit_nodes = desired_replica_nodes
+                .iter()
+                .take(effective_policy.min_commit_replicas)
+                .cloned()
+                .collect();
+            return Ok(DfsReplicaPlacementPlan {
+                desired_replica_nodes,
+                preferred_commit_nodes,
+            });
+        }
         let candidates = candidate_nodes
             .into_iter()
             .map(|node_id| {
@@ -646,6 +750,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
             &object,
+            &request.target_version,
             desired_replica_nodes,
             policy,
         )?;
@@ -800,6 +905,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
             &object,
+            &request.target_version,
             desired_replica_nodes,
             policy,
         )?;
@@ -935,6 +1041,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
             &object,
+            &request.target_version,
             desired_replica_nodes,
             policy,
         )?;
@@ -1014,6 +1121,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let (desired_replica_nodes, policy) = self.normalize_distributed_write_replication_plan(
             &object,
+            &request.target_version,
             desired_replica_nodes,
             policy,
         )?;
@@ -1181,6 +1289,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
             &request.object_id,
+            &request.target_version,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1665,6 +1774,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
             &request.object_id,
+            &request.target_version,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,
@@ -1833,6 +1943,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let receipt_node_ids = initial_receipt_node_ids;
         if !foreground_replica_repair
             && updated_intent.policy.min_commit_replicas <= 1
+            // Snapshot planning can replace the caller's initially durable
+            // node with a healthier replica. In that case the manifest path
+            // starts with zero receipts and must stage before visibility; the
+            // one-batch fast path is valid only after W is already satisfied.
+            && self
+                .coordinator
+                .is_commit_ready(&updated_intent.intent_id)?
             && self.can_commit_ready_intent_batched(&updated_intent)?
         {
             self.commit_ready_intent_batched(
@@ -2014,6 +2131,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             create_predecessor_object_id,
         } = self.prepare_distributed_write(
             &request.object_id,
+            &request.target_version,
             desired_replica_nodes,
             policy,
             touch_parent_on_create,

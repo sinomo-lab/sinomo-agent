@@ -386,6 +386,7 @@ struct JournalSegmentIndex {
     modified: Option<SystemTime>,
     indexed_bytes: u64,
     entries: Vec<JournalSegmentEntryOffset>,
+    sequences_monotonic: bool,
 }
 
 impl JournalSegmentIndex {
@@ -803,6 +804,9 @@ fn cache_journal_segment_durable_append(
         {
             let mut index = cached.index.clone();
             index.entries.extend(offsets.iter().copied());
+            index.sequences_monotonic &= offsets
+                .windows(2)
+                .all(|pair| pair[0].sequence <= pair[1].sequence);
             index.identity = after.identity.clone();
             index.observed_file_len = after.file_len;
             index.modified = after.modified;
@@ -817,6 +821,9 @@ fn cache_journal_segment_durable_append(
                 modified: after.modified,
                 indexed_bytes: after.file_len,
                 entries: offsets.clone(),
+                sequences_monotonic: offsets
+                    .windows(2)
+                    .all(|pair| pair[0].sequence <= pair[1].sequence),
             }
         } else {
             return;
@@ -1786,7 +1793,23 @@ fn segmented_journal_entries_since_limited(
         }
     }
     entries.sort_by_key(|entry| entry.sequence);
-    entries.truncate(max_entries);
+    let mut distinct = Vec::<DfsMetadataJournalEntry>::with_capacity(entries.len());
+    for entry in entries {
+        if let Some(previous) = distinct.last()
+            && previous.sequence == entry.sequence
+        {
+            if previous != &entry {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata journal contains conflicting duplicate sequence {} under {}",
+                    entry.sequence,
+                    root.display()
+                )));
+            }
+            continue;
+        }
+        distinct.push(entry);
+    }
+    distinct.truncate(max_entries);
     let traceparent = crate::current_dfs_traceparent().unwrap_or_default();
     tracing::trace!(
         target: "sinomo.dfs.perf",
@@ -1795,11 +1818,11 @@ fn segmented_journal_entries_since_limited(
         max_entries,
         candidate_segments,
         opened_segments,
-        returned_entries = entries.len(),
+        returned_entries = distinct.len(),
         total_ms = trace_started.elapsed().as_millis(),
         "metadata-journal-suffix-scan"
     );
-    Ok(entries)
+    Ok(distinct)
 }
 
 fn journal_segment_file_matches_index(
@@ -1874,6 +1897,7 @@ fn open_indexed_journal_segment(path: &Path) -> Result<IndexedJournalSegment> {
             modified: None,
             indexed_bytes: 0,
             entries: Vec::new(),
+            sequences_monotonic: true,
         }
     };
     let index_rebuilt = !cache_hit && !index_extended;
@@ -1913,6 +1937,13 @@ fn open_indexed_journal_segment(path: &Path) -> Result<IndexedJournalSegment> {
             #[cfg(test)]
             METADATA_JOURNAL_DECODED_RECORDS
                 .set(METADATA_JOURNAL_DECODED_RECORDS.get().saturating_add(1));
+            if index
+                .entries
+                .last()
+                .is_some_and(|previous| previous.sequence > entry.sequence)
+            {
+                index.sequences_monotonic = false;
+            }
             index.entries.push(JournalSegmentEntryOffset {
                 sequence: entry.sequence,
                 record_start,
@@ -1960,13 +1991,26 @@ pub(crate) fn read_segmented_journal_file_since_limited(
         mut scanned_bytes,
     } = open_indexed_journal_segment(path)?;
 
-    let first_entry = index
-        .entries
-        .partition_point(|entry| entry.sequence <= after_sequence);
-    let selected = &index.entries[first_entry
-        ..first_entry
-            .saturating_add(max_entries)
-            .min(index.entries.len())];
+    let selected_owned = (!index.sequences_monotonic).then(|| {
+        let mut selected = index
+            .entries
+            .iter()
+            .copied()
+            .filter(|entry| entry.sequence > after_sequence)
+            .collect::<Vec<_>>();
+        selected.sort_by_key(|entry| (entry.sequence, entry.record_start));
+        selected.truncate(max_entries);
+        selected
+    });
+    let selected = selected_owned.as_deref().unwrap_or_else(|| {
+        let first_entry = index
+            .entries
+            .partition_point(|entry| entry.sequence <= after_sequence);
+        &index.entries[first_entry
+            ..first_entry
+                .saturating_add(max_entries)
+                .min(index.entries.len())]
+    });
     let all_selected_were_refreshed = selected
         .iter()
         .all(|offset| refreshed_entries.contains_key(&offset.record_start));
@@ -1994,6 +2038,42 @@ pub(crate) fn read_segmented_journal_file_since_limited(
             .into_iter()
             .map(|entry| entry.as_ref().clone())
             .collect()
+    } else if !index.sequences_monotonic {
+        let mut entries = Vec::with_capacity(selected.len());
+        for expected in selected {
+            file.seek(SeekFrom::Start(expected.record_start))
+                .map_err(|source| MetadataBackendError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let Some(entry) = read_next_segmented_journal_entry(&mut file, path)? else {
+                return Err(MetadataBackendError::Serde(format!(
+                    "metadata journal entry {} disappeared while reading non-monotonic segment index at {}",
+                    expected.sequence,
+                    path.display()
+                )));
+            };
+            decoded_records = decoded_records.saturating_add(1);
+            #[cfg(test)]
+            METADATA_JOURNAL_DECODED_RECORDS
+                .set(METADATA_JOURNAL_DECODED_RECORDS.get().saturating_add(1));
+            if entry.sequence != expected.sequence {
+                return Err(MetadataBackendError::Serde(format!(
+                    "non-monotonic metadata journal segment index at {} expected sequence {}, found {}",
+                    path.display(),
+                    expected.sequence,
+                    entry.sequence
+                )));
+            }
+            let record_end = file.stream_position().unwrap_or(expected.record_start);
+            scanned_bytes =
+                scanned_bytes.saturating_add(record_end.saturating_sub(expected.record_start));
+            entries.push(entry);
+        }
+        if journal_segment_file_matches_index(&file, path, &index)? {
+            cache_journal_segment_decoded_entries(path, &index, selected, &entries);
+        }
+        entries
     } else if let Some(first) = selected.first() {
         file.seek(SeekFrom::Start(first.record_start))
             .map_err(|source| MetadataBackendError::Io {
@@ -2419,6 +2499,65 @@ mod tests {
             .expect("second frame");
         assert_eq!(decoded_second.entry(), &second);
         assert_eq!(decoded_second.exact_bytes(), expected_second.exact_bytes());
+    }
+
+    #[test]
+    fn durable_suffix_collapses_exact_duplicate_sequences() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-duplicate-journal-sequence");
+        let first = test_journal_entry(1);
+        let second = test_journal_entry(2);
+        append_segmented_journal_entry(root.path(), &first).expect("append first");
+        append_segmented_journal_entry(root.path(), &first).expect("append exact retry");
+        append_segmented_journal_entry(root.path(), &second).expect("append second");
+
+        assert_eq!(
+            durable_journal_entries_since_limited(root.path(), 0, 3)
+                .expect("read deduplicated suffix"),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn durable_suffix_filters_out_of_order_exact_retries_before_paging() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-out-of-order-journal-retry");
+        let first = test_journal_entry(1);
+        let second = test_journal_entry(2);
+        append_segmented_journal_entry(root.path(), &first).expect("append first");
+        append_segmented_journal_entry(root.path(), &second).expect("append second");
+        append_segmented_journal_entry(root.path(), &first).expect("append delayed exact retry");
+
+        assert_eq!(
+            durable_journal_entries_since_limited(root.path(), 0, 1)
+                .expect("prime only the first decoded entry"),
+            vec![first]
+        );
+        assert_eq!(
+            durable_journal_entries_since_limited(root.path(), 1, 2)
+                .expect("read suffix past physical sequence regression"),
+            vec![second]
+        );
+    }
+
+    #[test]
+    fn durable_suffix_rejects_conflicting_duplicate_sequences() {
+        let _cache_guard = journal_cache_test_guard();
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-conflicting-journal-sequence");
+        let first = test_journal_entry(1);
+        let mut conflicting = first.clone();
+        conflicting.created_at += time::Duration::seconds(1);
+        append_segmented_journal_entry(root.path(), &first).expect("append first");
+        append_segmented_journal_entry(root.path(), &conflicting)
+            .expect("append conflicting durable record");
+
+        let error = durable_journal_entries_since_limited(root.path(), 0, 2)
+            .expect_err("conflicting sequence must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting duplicate sequence 1")
+        );
     }
 
     #[test]

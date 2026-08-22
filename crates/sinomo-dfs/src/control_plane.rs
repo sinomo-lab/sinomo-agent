@@ -12,7 +12,7 @@ use crate::placement::{
     placement_reconciliation_activity_page_from_summaries, scoped_placement_config_for_job,
 };
 use crate::{
-    DfsFileSystem, DfsPlacementReconciliationActivityCursor,
+    DfsAdaptivePlacementObservationState, DfsFileSystem, DfsPlacementReconciliationActivityCursor,
     DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
     DfsPlacementReconciliationActivitySummary, DfsPlacementReconciliationJob, DfsSubtreePolicy,
     sifs_file_system_id,
@@ -357,6 +357,10 @@ fn placement_reconciliation_queue_key(file_system_id: &DfsFileSystemId) -> Strin
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-reconciliation-queue-v1")
 }
 
+fn adaptive_placement_observation_key(file_system_id: &DfsFileSystemId) -> String {
+    format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/adaptive-placement-observation-v1")
+}
+
 /// Bounded cluster-control projection for recent placement-job activity.
 ///
 /// A filesystem's first config transaction creates the empty index alongside
@@ -532,6 +536,35 @@ fn validate_v1_placement_reconciliation_job(
                 job.job_id
             ),
         });
+    }
+    if job.adaptive {
+        if job.placement_snapshot.is_none() {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "adaptive placement reconciliation job {} is missing its placement snapshot",
+                    job.job_id
+                ),
+            });
+        }
+        let Some(budget) = job.adaptive_budget.as_ref() else {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "adaptive placement reconciliation job {} is missing its execution budget",
+                    job.job_id
+                ),
+            });
+        };
+        if budget.max_objects_per_tick == 0
+            || budget.max_bytes_per_tick == 0
+            || budget.max_millis_per_tick == 0
+        {
+            return Err(KvError::Serialization {
+                detail: format!(
+                    "adaptive placement reconciliation job {} has a zero execution budget",
+                    job.job_id
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -2231,6 +2264,46 @@ impl<'a> DfsControlPlaneStore<'a> {
             .txn(KvTxn {
                 compares,
                 success,
+                failure: Vec::new(),
+            })?
+            .succeeded)
+    }
+
+    /// Load the compact, primary-owned debounce record for adaptive placement.
+    /// Object metadata and health samples stay out of cluster KV; only the
+    /// semantic snapshot identity and sustained-observation counters live here
+    /// so a metadata-primary failover does not reset hysteresis.
+    pub fn adaptive_placement_observation(
+        &self,
+        file_system_id: &DfsFileSystemId,
+    ) -> Result<Option<DfsAdaptivePlacementObservationState>, KvError> {
+        self.get_serde(&adaptive_placement_observation_key(file_system_id))
+    }
+
+    pub fn compare_and_put_adaptive_placement_observation(
+        &mut self,
+        file_system_id: &DfsFileSystemId,
+        expected: Option<&DfsAdaptivePlacementObservationState>,
+        desired: &DfsAdaptivePlacementObservationState,
+    ) -> Result<bool, KvError> {
+        let key = adaptive_placement_observation_key(file_system_id);
+        let current_entry = self.kv.get(&key)?;
+        let current = current_entry.as_ref().map(KvEntry::decode).transpose()?;
+        if current.as_ref() != expected {
+            return Ok(false);
+        }
+        let compare = current_entry.map_or_else(
+            || KvCompare::Missing { key: key.clone() },
+            |entry| KvCompare::ValueEquals {
+                key: key.clone(),
+                value: entry.value,
+            },
+        );
+        Ok(self
+            .kv
+            .txn(KvTxn {
+                compares: vec![compare],
+                success: vec![KvOp::put_serde(key, desired, None)?],
                 failure: Vec::new(),
             })?
             .succeeded)
@@ -5985,6 +6058,10 @@ mod tests {
             scope: DfsPlacementScope::Subtree,
             unavailable_node_ids: BTreeSet::new(),
             candidate_snapshot: vec![DfsNodeAdvertisement::content(owner.clone())],
+            placement_snapshot: None,
+            adaptive: false,
+            adaptive_budget: None,
+            processed_content_bytes: 0,
             accepted_config: None,
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
@@ -6157,6 +6234,10 @@ mod tests {
             scope: DfsPlacementScope::Subtree,
             unavailable_node_ids: BTreeSet::new(),
             candidate_snapshot: vec![DfsNodeAdvertisement::content(node("placement-owner"))],
+            placement_snapshot: None,
+            adaptive: false,
+            adaptive_budget: None,
+            processed_content_bytes: 0,
             accepted_config: None,
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,

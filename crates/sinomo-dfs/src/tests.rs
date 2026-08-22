@@ -9201,6 +9201,7 @@ fn default_cluster_smoke_bootstraps_dfs_before_running_smoke() {
                 publish_cluster_control: true,
                 materialize_local_metadata: true,
                 local_zone: None,
+                local_content_advertisement: None,
             },
             smoke: DfsSmokeOptions {
                 nonce: Some(13579),
@@ -9265,6 +9266,7 @@ fn default_cluster_dfs_helper_writes_default_records_to_cluster_kv() {
             publish_cluster_control: true,
             materialize_local_metadata: true,
             local_zone: None,
+            local_content_advertisement: None,
         },
     )
     .expect("default cluster dfs")
@@ -9387,6 +9389,7 @@ fn control_plane_default_bootstrap_host_writes_default_dfs_records() {
             publish_cluster_control: true,
             materialize_local_metadata: true,
             local_zone: Some("zone-a".to_string()),
+            local_content_advertisement: None,
         },
     )
     .expect("default dfs bootstrap");
@@ -9486,6 +9489,7 @@ fn non_authority_default_bootstrap_publishes_only_its_local_zone() {
             publish_cluster_control: false,
             materialize_local_metadata: false,
             local_zone: Some("zone-local".to_string()),
+            local_content_advertisement: None,
         },
     )
     .expect("local service advertisement");
@@ -49713,6 +49717,10 @@ fn placement_reconciliation_resumes_durable_cursor_and_updates_existing_file() {
             scope: DfsPlacementScope::SelfOnly,
             unavailable_node_ids: BTreeSet::new(),
             candidate_snapshot: vec![DfsNodeAdvertisement::content(local.clone())],
+            placement_snapshot: None,
+            adaptive: false,
+            adaptive_budget: None,
+            processed_content_bytes: 0,
             accepted_config: Some(desired.clone()),
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,

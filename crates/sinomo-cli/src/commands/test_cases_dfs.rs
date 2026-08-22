@@ -83,6 +83,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
+const DEFAULT_PLACEMENT_EXPECT_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
 const MAX_ROUTED_STATUS_CONCURRENCY: usize = 16;
 const DEFAULT_BULK_FILE_COUNT: usize = 128;
@@ -1890,7 +1891,11 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
 }
 
 fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let timeout = expect_timeout(ctx)?;
+    let timeout = if ctx.parameter("timeout-seconds").is_some() {
+        expect_timeout(ctx)?
+    } else {
+        Duration::from_secs(DEFAULT_PLACEMENT_EXPECT_TIMEOUT_SECONDS)
+    };
     let requested_min_zones = optional_usize_parameter(ctx, "min-zones", 0)?;
     let data_dir = SinomoDataDir::new(ctx.data_dir());
     let cluster_paths = ClusterPaths::new(&data_dir);
@@ -1957,11 +1962,13 @@ fn run_placement_management(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     browser
         .create_dir_all(&base)
         .map_err(|error| placement_test_error("create test directory", error))?;
+    let inherited_body = format!("placement inheritance probe {nonce}");
+    let override_body = format!("placement self override probe {nonce}");
     browser
-        .write_file(&inherited_path, b"placement inheritance probe")
+        .write_file(&inherited_path, inherited_body.as_bytes())
         .map_err(|error| placement_test_error("write inherited test file", error))?;
     browser
-        .write_file(&override_path, b"placement self override probe")
+        .write_file(&override_path, override_body.as_bytes())
         .map_err(|error| placement_test_error("write override test file", error))?;
 
     let initial_inherited = browser

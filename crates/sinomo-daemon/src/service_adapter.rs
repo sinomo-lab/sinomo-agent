@@ -1602,6 +1602,14 @@ impl sinomo_dfs::DfsBrowserServiceHost for DaemonDfsBrowserServiceHost {
         daemon_dfs_peer_transports_on_runtime(data_dir, runtime)
     }
 
+    fn placement_snapshot_cache(
+        &self,
+        data_dir: &SinomoDataDir,
+        node_id: &sinomo_core::node::NodeId,
+    ) -> sinomo_dfs::DfsPlacementSnapshotCache {
+        crate::dfs::cached_daemon_dfs_placement_snapshot_cache(data_dir, node_id)
+    }
+
     fn schedule_metadata_publish(
         &self,
         _data_dir: &SinomoDataDir,
@@ -5108,6 +5116,10 @@ mod tests {
                 scope: sinomo_dfs::DfsPlacementScope::SelfOnly,
                 unavailable_node_ids: BTreeSet::new(),
                 candidate_snapshot: vec![sinomo_dfs::DfsNodeAdvertisement::content(owner.clone())],
+                placement_snapshot: None,
+                adaptive: false,
+                adaptive_budget: None,
+                processed_content_bytes: 0,
                 accepted_config: None,
                 state: sinomo_dfs::DfsPlacementReconciliationState::Pending,
                 cursor: None,

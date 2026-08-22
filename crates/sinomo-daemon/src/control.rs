@@ -10,7 +10,9 @@ use crate::dfs::{
     daemon_dfs_repair_queue_work_is_known, evict_daemon_dfs_message_service_cache_on_shutdown,
     notify_daemon_dfs_maintenance_work,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
-    register_daemon_dfs_data_owner_lock, run_daemon_dfs_maintenance_tick_in_blocking_task,
+    refresh_daemon_dfs_remote_placement_observation_on_runtime,
+    refresh_daemon_dfs_storage_environment_on_runtime, register_daemon_dfs_data_owner_lock,
+    run_daemon_dfs_maintenance_tick_in_blocking_task,
 };
 use crate::{
     AuthenticatedDaemonCommand, DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR, DaemonClusterStatus,
@@ -32,16 +34,8 @@ use sinomo_core::events::EventStore;
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_core::{ClusterMemberRecord, ClusterTransportKind};
-#[cfg(test)]
 use sinomo_dfs::{
-    DFS_DEFERRED_WORK_REPROBE_INTERVAL as DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL,
-    DFS_MAINTENANCE_MEMBER_PHASE_SLOT as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT,
-    DFS_MAINTENANCE_MEMBER_PHASE_WINDOW as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW,
-    DFS_MAINTENANCE_NETWORK_STARTUP_GRACE as DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE,
-    DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL as DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
-    dfs_maintenance_revalidation_decision as daemon_dfs_maintenance_revalidation_decision,
-};
-use sinomo_dfs::{
+    DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL as DAEMON_DFS_STORAGE_SAMPLE_INTERVAL,
     DFS_MAINTENANCE_LEASE_RETRY_DELAY as DAEMON_DFS_MAINTENANCE_LEASE_RETRY_DELAY,
     DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL as DAEMON_DFS_TRIGGERED_MAINTENANCE_MIN_INTERVAL,
     dfs_failed_maintenance_decision as daemon_dfs_failed_maintenance_decision,
@@ -53,6 +47,15 @@ use sinomo_dfs::{
     dfs_maintenance_probe_decision as daemon_dfs_maintenance_probe_decision,
     dfs_maintenance_probe_is_due as daemon_dfs_maintenance_probe_is_due,
     dfs_maintenance_should_launch as daemon_dfs_maintenance_should_launch,
+};
+#[cfg(test)]
+use sinomo_dfs::{
+    DFS_DEFERRED_WORK_REPROBE_INTERVAL as DAEMON_DFS_DEFERRED_WORK_REPROBE_INTERVAL,
+    DFS_MAINTENANCE_MEMBER_PHASE_SLOT as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_SLOT,
+    DFS_MAINTENANCE_MEMBER_PHASE_WINDOW as DAEMON_DFS_MAINTENANCE_MEMBER_PHASE_WINDOW,
+    DFS_MAINTENANCE_NETWORK_STARTUP_GRACE as DAEMON_DFS_MAINTENANCE_NETWORK_STARTUP_GRACE,
+    DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL as DAEMON_DFS_MAINTENANCE_PROBE_ERROR_RETRY_INTERVAL,
+    dfs_maintenance_revalidation_decision as daemon_dfs_maintenance_revalidation_decision,
 };
 use sinomo_rollout::{
     RolloutController, RolloutTelemetryAdvanceOptions, RolloutTelemetryAdvanceStatus,
@@ -1113,6 +1116,24 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     } else {
         None
     };
+    if daemon_owns_enabled_default_dfs(&paths, label) {
+        runtime_tasks.push((
+            "DFS storage environment",
+            daemon_runtime_handle.spawn(run_daemon_dfs_storage_environment_runtime_task(
+                paths.clone(),
+                daemon_runtime_handle.clone(),
+                shutdown_rx.clone(),
+            )),
+        ));
+        runtime_tasks.push((
+            "DFS remote placement observations",
+            daemon_runtime_handle.spawn(run_daemon_dfs_remote_placement_observation_runtime_task(
+                paths.clone(),
+                daemon_runtime_handle.clone(),
+                shutdown_rx.clone(),
+            )),
+        ));
+    }
     // A daemon that started without cluster identity is intentionally short-lived
     // after a successful join. Its replacement owns distributed DFS maintenance;
     // the stale process must not acquire a backend generation while draining.
@@ -1392,6 +1413,68 @@ fn apply_daemon_dfs_maintenance_probe_result(
 
 fn daemon_rollout_telemetry_enabled(label: &str, maintain_cluster_runtime: bool) -> bool {
     label == "daemon" && maintain_cluster_runtime
+}
+
+async fn run_daemon_dfs_storage_environment_runtime_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
+        }
+        if !daemon_rollout_handoff_pending(&paths) {
+            match refresh_daemon_dfs_storage_environment_on_runtime(&paths, &runtime).await {
+                Ok(true) => tracing::info!(
+                    target: "sinomo.dfs.placement",
+                    "published refreshed DFS storage environment advertisement"
+                ),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    target: "sinomo.dfs.placement",
+                    "DFS storage environment refresh failed: {error}"
+                ),
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DAEMON_DFS_STORAGE_SAMPLE_INTERVAL) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn run_daemon_dfs_remote_placement_observation_runtime_task(
+    paths: DaemonPaths,
+    runtime: tokio::runtime::Handle,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    loop {
+        if daemon_shutdown_requested(&shutdown_rx) {
+            break;
+        }
+        if !daemon_rollout_handoff_pending(&paths)
+            && let Err(error) =
+                refresh_daemon_dfs_remote_placement_observation_on_runtime(&paths, &runtime).await
+        {
+            tracing::warn!(
+                target: "sinomo.dfs.placement",
+                "DFS remote placement observation failed: {error}"
+            );
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DAEMON_DFS_STORAGE_SAMPLE_INTERVAL) => {}
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn start_daemon_rollout_telemetry_runtime_task(

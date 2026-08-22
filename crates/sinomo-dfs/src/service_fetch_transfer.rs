@@ -236,6 +236,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 reason: "unexpected DFS fetch response request id".to_string(),
             });
         }
+        let transfer_started_at = self
+            .passive_fetch_started_at
+            .remove(&(response.intent_id.clone(), frame_source_node_id.clone()));
         if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
             pending.fetch_inflight_from.remove(&frame_source_node_id);
             pending
@@ -275,6 +278,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &response.version,
                     &content_hash,
                 ) {
+                    if let Some(started_at) = transfer_started_at {
+                        self.placement_snapshot_cache.observe_transfer(
+                            &frame_source_node_id,
+                            &self.node_id,
+                            local_size_bytes,
+                            started_at.elapsed(),
+                        );
+                    }
                     return self.complete_fetched_blob(
                         response.intent_id,
                         response.object_id,
@@ -300,6 +311,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         source_node_id: response.source_node_id,
                         reason: error.to_string(),
                     });
+                }
+                if let Some(started_at) = transfer_started_at {
+                    self.placement_snapshot_cache.observe_transfer(
+                        &frame_source_node_id,
+                        &self.node_id,
+                        bytes.len().try_into().unwrap_or(u64::MAX),
+                        started_at.elapsed(),
+                    );
                 }
                 self.complete_fetched_blob(
                     response.intent_id,

@@ -198,7 +198,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let now = Instant::now();
         let mut seen_locations = BTreeSet::new();
         let mut expired_candidates = Vec::new();
-        for node_id in &object.current_locations {
+        let ranked_sources = self.ranked_transfer_sources(object.current_locations.clone());
+        for node_id in &ranked_sources {
             if node_id == &self.node_id {
                 continue;
             }

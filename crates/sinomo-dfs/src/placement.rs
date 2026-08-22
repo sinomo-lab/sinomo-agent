@@ -4,12 +4,13 @@ use crate::control_plane::DfsPlacementAuthorityPermit;
 use crate::distributed::explain_replicas_best_effort;
 use crate::posix_path::normalize_posix_path;
 use crate::{
-    DfsControlPlaneStore, DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig,
-    DfsFileSystemId, DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement, DfsObjectId,
-    DfsObjectKind, DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor, DfsPlacementScope,
-    DfsReplicaCandidate, DfsReplicaPlacementExplanation, DfsReplicaPlacementRequest,
-    DfsReplicationPolicy, DfsStat, DfsSubtreePolicy, DfsVersion, DfsWriteIntentState,
-    DistributedWriteIntent, NetworkedDfsService, dfs_now_unix_nanos, explain_replicas,
+    AsyncDfsControlPlaneKvClient, DfsControlPlaneKvClient, DfsControlPlaneStore,
+    DfsDistributedError, DfsError, DfsFileSystem, DfsFileSystemConfig, DfsFileSystemId,
+    DfsMessageTransport, DfsNamespaceOperation, DfsNodeAdvertisement, DfsObjectId, DfsObjectKind,
+    DfsObjectMetadata, DfsObjectPage, DfsObjectPageCursor, DfsPlacementScope, DfsReplicaCandidate,
+    DfsReplicaPlacementExplanation, DfsReplicaPlacementRequest, DfsReplicationPolicy, DfsStat,
+    DfsSubtreePolicy, DfsVersion, DfsWriteIntentState, DistributedWriteIntent, NetworkedDfsService,
+    dfs_now_unix_nanos, explain_replicas, explain_replicas_with_placement_snapshot,
     validate_replication_plan,
 };
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use sinomo_core::node::{
 };
 use sinomo_core::{ClusterBootstrapState, DfsObjectPolicy};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 const PLACEMENT_IMPACT_PAGE_SIZE: usize = 256;
 const PLACEMENT_AUTHORITY_ACQUIRE_RETRIES: usize = 4;
@@ -27,6 +29,35 @@ pub const DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE: usize = 50;
 pub const MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE: usize = 100;
 const PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR: &str =
     "superseded because a newer placement configuration is authoritative";
+const ADAPTIVE_PLACEMENT_MIN_CONSECUTIVE_OBSERVATIONS: u32 = 3;
+const ADAPTIVE_PLACEMENT_MIN_SUSTAINED_NANOS: u64 = 120_000_000_000;
+
+fn advance_adaptive_placement_observation(
+    current: Option<&DfsAdaptivePlacementObservationState>,
+    snapshot_digest: &str,
+    snapshot_generation: u64,
+    now_unix_nanos: u64,
+) -> (DfsAdaptivePlacementObservationState, bool) {
+    let mut desired = current.cloned().unwrap_or_default();
+    if desired.pending_snapshot_digest != snapshot_digest {
+        desired.pending_snapshot_digest = snapshot_digest.to_string();
+        desired.pending_snapshot_generation = snapshot_generation;
+        desired.first_observed_at_unix_nanos = now_unix_nanos;
+        desired.consecutive_observations = 1;
+    } else {
+        desired.pending_snapshot_generation = snapshot_generation;
+        desired.consecutive_observations = desired
+            .consecutive_observations
+            .saturating_add(1)
+            .min(ADAPTIVE_PLACEMENT_MIN_CONSECUTIVE_OBSERVATIONS);
+    }
+    let sustained = desired.consecutive_observations
+        >= ADAPTIVE_PLACEMENT_MIN_CONSECUTIVE_OBSERVATIONS
+        && now_unix_nanos.saturating_sub(desired.first_observed_at_unix_nanos)
+            >= ADAPTIVE_PLACEMENT_MIN_SUSTAINED_NANOS
+        && desired.last_enqueued_snapshot_digest != snapshot_digest;
+    (desired, sustained)
+}
 
 enum PlacementIntentAuthority {
     Ordinary,
@@ -774,6 +805,24 @@ pub struct DfsPlacementNodePreview {
     pub required: bool,
     #[serde(default)]
     pub forbidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_health: Option<crate::DfsHealthState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_freshness: Option<crate::DfsObservationFreshness>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_capacity_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_state: Option<crate::DfsPlacementPathState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_latency_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_throughput_bytes_per_second: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_metering: Option<crate::DfsNetworkMetering>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_freshness: Option<crate::DfsObservationFreshness>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub explanation: String,
 }
@@ -1006,6 +1055,43 @@ pub fn preview_placement_with_unavailable_nodes(
     override_scope: DfsPlacementScope,
     unavailable_node_ids: &BTreeSet<NodeId>,
 ) -> Result<DfsPlacementPreview, DfsDistributedError> {
+    preview_placement_with_snapshot_and_unavailable_nodes(
+        config,
+        path,
+        object_id,
+        version,
+        object_policy,
+        observer_node_id,
+        current_replica_node_ids,
+        candidates,
+        override_policy,
+        override_scope,
+        None,
+        &[],
+        unavailable_node_ids,
+    )
+}
+
+/// Preview placement from the same primary-owned environmental snapshot used
+/// by new writes and adaptive reconciliation. Manual content pins are included
+/// in the desired set, so an accepted preview cannot later disagree with the
+/// durable reconciler about additive retention constraints.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_placement_with_snapshot_and_unavailable_nodes(
+    config: &DfsFileSystemConfig,
+    path: &str,
+    object_id: DfsObjectId,
+    version: DfsVersion,
+    object_policy: DfsObjectPolicy,
+    observer_node_id: NodeId,
+    current_replica_node_ids: Vec<NodeId>,
+    candidates: Vec<DfsNodeAdvertisement>,
+    override_policy: Option<DfsPlacementPolicy>,
+    override_scope: DfsPlacementScope,
+    placement_snapshot: Option<&crate::DfsPlacementSnapshot>,
+    pinned_replica_node_ids: &[NodeId],
+    unavailable_node_ids: &BTreeSet<NodeId>,
+) -> Result<DfsPlacementPreview, DfsDistributedError> {
     let normalized_path =
         normalize_posix_path(path).map_err(|error| DfsDistributedError::InvalidPolicy {
             reason: error.to_string(),
@@ -1063,7 +1149,15 @@ pub fn preview_placement_with_unavailable_nodes(
         candidates: replica_candidates,
     };
     let placement = if blocking_diagnostics.is_empty() {
-        explain_replicas(&placement_request)?
+        match placement_snapshot {
+            Some(snapshot) => crate::explain_replicas_with_placement_snapshot(
+                &placement_request,
+                snapshot,
+                &current_replica_node_ids,
+                pinned_replica_node_ids,
+            )?,
+            None => explain_replicas(&placement_request)?,
+        }
     } else {
         explain_replicas_best_effort(&placement_request)?
     };
@@ -1381,6 +1475,24 @@ fn placement_node_previews(
                 preferred_for_commit: placement.plan.preferred_commit_nodes.contains(&node_id),
                 required,
                 forbidden,
+                storage_health: decision
+                    .and_then(|value| value.storage_health)
+                    .or_else(|| advertisement.map(|value| value.storage_health)),
+                storage_freshness: decision
+                    .and_then(|value| value.storage_freshness)
+                    .or_else(|| advertisement.map(|value| value.storage_freshness)),
+                usable_capacity_bytes: decision
+                    .and_then(|value| value.usable_capacity_bytes)
+                    .or_else(|| advertisement.and_then(|value| value.usable_capacity_bytes)),
+                reserved_free_bytes: advertisement.and_then(|value| value.reserved_free_bytes),
+                path_state: decision.and_then(|value| value.path_state),
+                path_latency_micros: decision.and_then(|value| value.path_latency_micros),
+                path_throughput_bytes_per_second: decision
+                    .and_then(|value| value.path_throughput_bytes_per_second),
+                path_metering: decision
+                    .and_then(|value| value.path_metering)
+                    .or_else(|| advertisement.map(|value| value.network_metering)),
+                observation_freshness: decision.and_then(|value| value.observation_freshness),
                 explanation,
             }
         })
@@ -1447,6 +1559,35 @@ pub enum DfsPlacementReconciliationState {
     Failed,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct DfsAdaptivePlacementBudget {
+    pub max_objects_per_tick: usize,
+    pub max_bytes_per_tick: u64,
+    pub max_millis_per_tick: u64,
+}
+
+impl Default for DfsAdaptivePlacementBudget {
+    fn default() -> Self {
+        Self {
+            max_objects_per_tick: 64,
+            max_bytes_per_tick: 512 * 1024 * 1024,
+            max_millis_per_tick: 250,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct DfsAdaptivePlacementObservationState {
+    pub pending_snapshot_digest: String,
+    pub pending_snapshot_generation: u64,
+    pub first_observed_at_unix_nanos: u64,
+    pub consecutive_observations: u32,
+    pub last_enqueued_snapshot_digest: String,
+    pub last_enqueued_snapshot_generation: u64,
+}
+
 impl DfsPlacementReconciliationState {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed)
@@ -1476,6 +1617,16 @@ pub struct DfsPlacementReconciliationJob {
     /// accepted by the v1 writer or runner.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub candidate_snapshot: Vec<DfsNodeAdvertisement>,
+    /// Primary-owned health/network evidence used for adaptive jobs. Manual
+    /// policy jobs without this field retain their exact legacy planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement_snapshot: Option<crate::DfsPlacementSnapshot>,
+    #[serde(default)]
+    pub adaptive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_budget: Option<DfsAdaptivePlacementBudget>,
+    #[serde(default)]
+    pub processed_content_bytes: u64,
     /// Exact filesystem config accepted atomically with this job. Legacy jobs
     /// deserialize with no snapshot but remain read-only; v1 writers persist
     /// it so stale jobs can be superseded safely.
@@ -1718,6 +1869,100 @@ pub(crate) fn placement_reconciliation_activity_page_from_summaries(
     }
 }
 
+pub fn publish_dfs_content_advertisement_if_needed(
+    control_plane: &mut dyn DfsControlPlaneKvClient,
+    local_node_id: &NodeId,
+    mut desired: DfsNodeAdvertisement,
+) -> Result<bool, DfsError> {
+    if desired.node_id != *local_node_id {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "local content advertisement names node {} but service owns {}",
+                desired.node_id, local_node_id
+            ),
+        });
+    }
+    desired.accepts_metadata = false;
+    let mut store = DfsControlPlaneStore::new(control_plane);
+    if let Some(current) = store.content_service(local_node_id)? {
+        if dfs_content_advertisement_is_current(&current, &desired) {
+            return Ok(false);
+        }
+    }
+    store.advertise_content_service(&desired)?;
+    Ok(true)
+}
+
+pub async fn publish_dfs_content_advertisement_if_needed_async(
+    control_plane: &mut dyn AsyncDfsControlPlaneKvClient,
+    local_node_id: &NodeId,
+    mut desired: DfsNodeAdvertisement,
+) -> Result<bool, DfsError> {
+    if desired.node_id != *local_node_id {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "local content advertisement names node {} but service owns {}",
+                desired.node_id, local_node_id
+            ),
+        });
+    }
+    desired.accepts_metadata = false;
+    let key = crate::content_service_key(local_node_id);
+    if let Some(current) = control_plane
+        .get_async(&key)
+        .await?
+        .map(|entry| entry.decode::<DfsNodeAdvertisement>())
+        .transpose()?
+        && dfs_content_advertisement_is_current(&current, &desired)
+    {
+        return Ok(false);
+    }
+    publish_dfs_content_advertisement_async(control_plane, local_node_id, desired).await?;
+    Ok(true)
+}
+
+pub async fn publish_dfs_content_advertisement_async(
+    control_plane: &mut dyn AsyncDfsControlPlaneKvClient,
+    local_node_id: &NodeId,
+    mut desired: DfsNodeAdvertisement,
+) -> Result<(), DfsError> {
+    if desired.node_id != *local_node_id {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "local content advertisement names node {} but service owns {}",
+                desired.node_id, local_node_id
+            ),
+        });
+    }
+    desired.accepts_metadata = false;
+    control_plane
+        .put_async(
+            crate::content_service_key(local_node_id),
+            sinomo_core::kv::encode_kv_value(&desired)?,
+        )
+        .await?;
+    Ok(())
+}
+
+fn dfs_content_advertisement_is_current(
+    current: &DfsNodeAdvertisement,
+    desired: &DfsNodeAdvertisement,
+) -> bool {
+    let lease_is_fresh = desired.expires_at.is_none()
+        || current.expires_at.is_some_and(|expires_at| {
+            expires_at > time::OffsetDateTime::now_utc() + time::Duration::seconds(30)
+        });
+    lease_is_fresh
+        && current.node_id == desired.node_id
+        && current.accepts_content == desired.accepts_content
+        && current.capacity_weight == desired.capacity_weight
+        && current.zone == desired.zone
+        && current.storage_health == desired.storage_health
+        && current.storage_freshness == desired.storage_freshness
+        && current.content_location_count == desired.content_location_count
+        && current.network_metering == desired.network_metering
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn current_placement_file_system_config(&mut self) -> Result<DfsFileSystemConfig, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
@@ -1780,6 +2025,18 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         candidates.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         candidates.dedup_by(|left, right| left.node_id == right.node_id);
         Ok(candidates)
+    }
+
+    /// Refresh this node's compact content advertisement only when its
+    /// hysteretic semantics changed or its lease is near expiry.
+    pub fn publish_local_content_advertisement_if_needed(
+        &mut self,
+        desired: DfsNodeAdvertisement,
+    ) -> Result<bool, DfsError> {
+        let Some(control_plane) = self.control_plane.as_mut() else {
+            return Ok(false);
+        };
+        publish_dfs_content_advertisement_if_needed(control_plane.as_mut(), &self.node_id, desired)
     }
 
     /// Preview one placement proposal and replace the single-object impact
@@ -2201,8 +2458,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // next reconciliation page/pass will see the authoritative state.
             return Ok(());
         }
+        let pinned_node_ids = self.content_pin_nodes(object_id);
         let (expected_resolved, expected_replication, expected_placement) =
-            reconciliation_placement_for_object(accepted_config, job, &object)?;
+            reconciliation_placement_for_object_with_pins(
+                accepted_config,
+                job,
+                &object,
+                &pinned_node_ids,
+            )?;
         if object_policy != expected_resolved.policy.consistency
             || replication_policy != expected_replication
             || desired_replica_node_ids != expected_placement.plan.desired_replica_nodes
@@ -2246,6 +2509,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<BTreeSet<_>>();
         if desired.is_subset(&current) {
             for node_id in current.difference(&desired).cloned().collect::<Vec<_>>() {
+                // A content pin is an additive retention constraint. Adaptive
+                // policy may choose a different W/N set, but it must never use
+                // metadata cleanup to revoke a replica an operator pinned.
+                if self
+                    .content_pin_node_ids
+                    .get(object_id)
+                    .is_some_and(|pinned| pinned.contains(&node_id))
+                {
+                    continue;
+                }
                 self.mark_remote_read_location_missing(
                     object_id,
                     expected_version,
@@ -2294,6 +2567,168 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
+    fn observe_adaptive_placement_and_enqueue(
+        &mut self,
+        config: &DfsFileSystemConfig,
+    ) -> Result<bool, DfsError> {
+        let Some(snapshot) = self.placement_snapshot_cache.snapshot() else {
+            return Ok(false);
+        };
+        let now = time::OffsetDateTime::now_utc();
+        // Only the elected root metadata primary may turn local observations
+        // into cluster-wide placement intent. Never move data from an expired
+        // snapshot; expiry degrades source ranking to unknown instead.
+        if snapshot.primary_node_id != self.node_id
+            || snapshot.nodes.is_empty()
+            || now > snapshot.expires_at
+        {
+            return Ok(false);
+        }
+
+        let digest = snapshot.semantic_digest();
+        let now_nanos = dfs_now_unix_nanos();
+        let current = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(false);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .adaptive_placement_observation(&config.file_system_id)?
+        };
+        if current
+            .as_ref()
+            .is_some_and(|state| state.last_enqueued_snapshot_digest == digest)
+        {
+            return Ok(false);
+        }
+        let (desired, sustained) = advance_adaptive_placement_observation(
+            current.as_ref(),
+            &digest,
+            snapshot.generation,
+            now_nanos,
+        );
+        let observation_updated = if current.as_ref() == Some(&desired) {
+            true
+        } else {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(false);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .compare_and_put_adaptive_placement_observation(
+                    &config.file_system_id,
+                    current.as_ref(),
+                    &desired,
+                )?
+        };
+        if !observation_updated || !sustained {
+            return Ok(false);
+        }
+
+        let mut candidate_snapshot = self.placement_content_candidates()?;
+        for node in &snapshot.nodes {
+            if candidate_snapshot
+                .iter()
+                .any(|candidate| candidate.node_id == node.node_id)
+            {
+                continue;
+            }
+            candidate_snapshot.push(DfsNodeAdvertisement {
+                node_id: node.node_id.clone(),
+                capacity_weight: node.capacity_weight.max(1),
+                accepts_metadata: false,
+                accepts_content: node.accepts_new_content,
+                zone: node.zone.clone(),
+                storage_health: node.storage_health,
+                storage_freshness: node.storage_freshness,
+                usable_capacity_bytes: node.usable_capacity_bytes,
+                reserved_free_bytes: node.reserved_free_bytes,
+                content_location_count: node.content_location_count,
+                network_metering: node.network_metering,
+                advertisement_generation: snapshot.generation,
+                updated_at: node.observed_at,
+                expires_at: Some(node.expires_at),
+            });
+        }
+        candidate_snapshot.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        candidate_snapshot.dedup_by(|left, right| left.node_id == right.node_id);
+
+        let digest_segment = digest
+            .strip_prefix("blake3:")
+            .unwrap_or(&digest)
+            .chars()
+            .take(20)
+            .collect::<String>();
+        let job_id = format!("adaptive-{}-{digest_segment}", snapshot.generation);
+        let budget = DfsAdaptivePlacementBudget::default();
+        let job = DfsPlacementReconciliationJob {
+            schema_version: DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
+            job_id: job_id.clone(),
+            file_system_id: config.file_system_id.clone(),
+            path: "/".to_string(),
+            scope: DfsPlacementScope::Subtree,
+            unavailable_node_ids: BTreeSet::new(),
+            candidate_snapshot,
+            placement_snapshot: Some((*snapshot).clone()),
+            adaptive: true,
+            adaptive_budget: Some(budget),
+            processed_content_bytes: 0,
+            accepted_config: Some(config.clone()),
+            state: DfsPlacementReconciliationState::Pending,
+            cursor: None,
+            total_object_count: 0,
+            scanned_object_count: 0,
+            matched_object_count: 0,
+            updated_object_count: 0,
+            scheduled_repair_count: 0,
+            completed_repair_count: 0,
+            pending_repair_count: 0,
+            revision: 0,
+            created_at_unix_nanos: now_nanos,
+            updated_at_unix_nanos: now_nanos,
+            last_error: None,
+        };
+        let enqueued = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(false);
+            };
+            let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
+            if store
+                .placement_reconciliation(&config.file_system_id, &job_id)?
+                .is_some()
+            {
+                true
+            } else {
+                store.compare_and_put_placement_update(config, config, &job)?
+            }
+        };
+        if !enqueued {
+            return Ok(false);
+        }
+
+        let observed = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(true);
+            };
+            DfsControlPlaneStore::new(control_plane.as_mut())
+                .adaptive_placement_observation(&config.file_system_id)?
+        };
+        if let Some(mut recorded) = observed.clone()
+            && recorded.pending_snapshot_digest == digest
+        {
+            recorded.last_enqueued_snapshot_digest = digest;
+            recorded.last_enqueued_snapshot_generation = snapshot.generation;
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(true);
+            };
+            let _ = DfsControlPlaneStore::new(control_plane.as_mut())
+                .compare_and_put_adaptive_placement_observation(
+                    &config.file_system_id,
+                    observed.as_ref(),
+                    &recorded,
+                )?;
+        }
+        Ok(true)
+    }
+
     /// Advance at most one durable placement job by a bounded object page.
     /// Progress is compare-and-swapped in cluster KV, so concurrent daemon
     /// ticks may help without losing a cursor or double-counting work.
@@ -2302,11 +2737,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         max_objects: usize,
     ) -> Result<Option<DfsPlacementReconciliationJob>, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
-        let (expected, current_config, coordinator_node_id) = {
+        let (current_config, coordinator_node_id) = {
             let Some(control_plane) = self.control_plane.as_mut() else {
                 return Ok(None);
             };
-            let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
+            let store = DfsControlPlaneStore::new(control_plane.as_mut());
             // A maintenance tick may run before the default filesystem has
             // been published to cluster KV. No managed placement job can be
             // accepted without that config, so placement is simply idle; it
@@ -2324,10 +2759,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let coordinator_node_id = store
                 .select_metadata_shard_for_path_strict_default_sifs_split(&file_system_id, "/")?
                 .map(|shard| shard.primary_node_id);
-            let Some(job) = store.next_placement_reconciliation(&file_system_id, &config)? else {
-                return Ok(None);
-            };
-            (job, config, coordinator_node_id)
+            (config, coordinator_node_id)
         };
         // Advancing a job performs durable object-side effects before the
         // progress CAS. Without one deterministic runner, every daemon can
@@ -2343,6 +2775,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return Ok(None);
         }
+        self.observe_adaptive_placement_and_enqueue(&current_config)?;
+        let expected = {
+            let Some(control_plane) = self.control_plane.as_mut() else {
+                return Ok(None);
+            };
+            let mut store = DfsControlPlaneStore::new(control_plane.as_mut());
+            let Some(job) =
+                store.next_placement_reconciliation(&file_system_id, &current_config)?
+            else {
+                return Ok(None);
+            };
+            job
+        };
         let mut desired = expected.clone();
         if expected.accepted_config.as_ref().is_some_and(|accepted| {
             !placement_config_remains_authoritative_for_job(accepted, &current_config, &expected)
@@ -2433,75 +2878,125 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             job.state = DfsPlacementReconciliationState::Scanning;
             job.cursor = None;
         }
-        let page = self.placement_object_page(job, max_objects)?;
+        let adaptive_budget = job.adaptive_budget.clone().filter(|_| job.adaptive);
+        let object_limit = adaptive_budget
+            .as_ref()
+            .map(|budget| max_objects.min(budget.max_objects_per_tick))
+            .unwrap_or(max_objects)
+            .max(1);
+        let started = Instant::now();
+        let mut processed_objects = 0usize;
+        let mut processed_bytes = 0u64;
         let mut pass_pending_repairs =
             if job.state == DfsPlacementReconciliationState::Repairing && job.cursor.is_none() {
                 0
             } else {
                 job.pending_repair_count
             };
-        for object in &page.objects {
-            if job.state == DfsPlacementReconciliationState::Scanning {
-                job.scanned_object_count = job.scanned_object_count.saturating_add(1);
+        loop {
+            if processed_objects >= object_limit {
+                break;
             }
-            if object.kind == DfsObjectKind::Tombstone || !placement_job_matches(job, &object.path)
+            if processed_objects > 0
+                && adaptive_budget.as_ref().is_some_and(|budget| {
+                    processed_bytes >= budget.max_bytes_per_tick
+                        || started.elapsed() >= Duration::from_millis(budget.max_millis_per_tick)
+                })
             {
-                continue;
+                break;
             }
-            if job.state == DfsPlacementReconciliationState::Scanning {
-                job.matched_object_count = job.matched_object_count.saturating_add(1);
-            }
-            let (resolved, replication, placement) =
-                reconciliation_placement_for_object(config, job, object)?;
-            let desired_nodes = placement.plan.desired_replica_nodes;
-            let content_bearing = matches!(
-                object.kind,
-                DfsObjectKind::File | DfsObjectKind::Symlink | DfsObjectKind::Artifact
-            ) && object.content_hash.is_some();
-            let missing_before = if content_bearing {
-                desired_nodes
-                    .iter()
-                    .filter(|node_id| !object.current_locations.contains(node_id))
-                    .count()
+            // Adaptive jobs page one object at a time. An object/intent is the
+            // smallest crash-safe unit, so an individual oversized or slow
+            // object may exceed a byte/time budget once to guarantee progress;
+            // no second object starts after that budget is consumed.
+            let page_size = if adaptive_budget.is_some() {
+                1
             } else {
-                0
+                object_limit.saturating_sub(processed_objects)
             };
-            let obsolete_before = if content_bearing {
-                object
-                    .current_locations
-                    .iter()
-                    .filter(|node_id| !desired_nodes.contains(node_id))
-                    .count()
-            } else {
-                0
-            };
-            if job.state == DfsPlacementReconciliationState::Scanning
-                && (object.policy != resolved.policy.consistency
-                    || missing_before > 0
-                    || obsolete_before > 0)
-            {
-                job.updated_object_count = job.updated_object_count.saturating_add(1);
-                job.scheduled_repair_count =
-                    job.scheduled_repair_count.saturating_add(missing_before);
-            }
-            self.route_placement_reconciliation_object(
-                job,
-                object,
-                resolved.policy.consistency,
-                replication,
-                desired_nodes.clone(),
-            )?;
-            if job.state == DfsPlacementReconciliationState::Repairing && content_bearing {
-                let current = self.current_read_object_metadata(&object.object_id)?;
-                pass_pending_repairs = pass_pending_repairs.saturating_add(
+            let page = self.placement_object_page(job, page_size)?;
+            for object in &page.objects {
+                processed_objects = processed_objects.saturating_add(1);
+                if job.state == DfsPlacementReconciliationState::Scanning {
+                    job.scanned_object_count = job.scanned_object_count.saturating_add(1);
+                }
+                if object.kind == DfsObjectKind::Tombstone
+                    || !placement_job_matches(job, &object.path)
+                {
+                    continue;
+                }
+                if job.state == DfsPlacementReconciliationState::Scanning {
+                    job.matched_object_count = job.matched_object_count.saturating_add(1);
+                }
+                let pinned_node_ids = self.content_pin_nodes(&object.object_id);
+                let (resolved, replication, placement) =
+                    reconciliation_placement_for_object_with_pins(
+                        config,
+                        job,
+                        object,
+                        &pinned_node_ids,
+                    )?;
+                let desired_nodes = placement.plan.desired_replica_nodes;
+                let content_bearing = matches!(
+                    object.kind,
+                    DfsObjectKind::File | DfsObjectKind::Symlink | DfsObjectKind::Artifact
+                ) && object.content_hash.is_some();
+                let missing_before = if content_bearing {
                     desired_nodes
                         .iter()
-                        .filter(|node_id| !current.current_locations.contains(node_id))
-                        .count(),
-                );
+                        .filter(|node_id| !object.current_locations.contains(node_id))
+                        .count()
+                } else {
+                    0
+                };
+                let obsolete_before = if content_bearing {
+                    object
+                        .current_locations
+                        .iter()
+                        .filter(|node_id| !desired_nodes.contains(node_id))
+                        .count()
+                } else {
+                    0
+                };
+                let object_transfer_bytes = object
+                    .content_size_bytes
+                    .unwrap_or_default()
+                    .saturating_mul(u64::try_from(missing_before).unwrap_or(u64::MAX));
+                processed_bytes = processed_bytes.saturating_add(object_transfer_bytes);
+                job.processed_content_bytes = job
+                    .processed_content_bytes
+                    .saturating_add(object_transfer_bytes);
+                if job.state == DfsPlacementReconciliationState::Scanning
+                    && (object.policy != resolved.policy.consistency
+                        || missing_before > 0
+                        || obsolete_before > 0)
+                {
+                    job.updated_object_count = job.updated_object_count.saturating_add(1);
+                    job.scheduled_repair_count =
+                        job.scheduled_repair_count.saturating_add(missing_before);
+                }
+                self.route_placement_reconciliation_object(
+                    job,
+                    object,
+                    resolved.policy.consistency,
+                    replication,
+                    desired_nodes.clone(),
+                )?;
+                if job.state == DfsPlacementReconciliationState::Repairing && content_bearing {
+                    let current = self.current_read_object_metadata(&object.object_id)?;
+                    pass_pending_repairs = pass_pending_repairs.saturating_add(
+                        desired_nodes
+                            .iter()
+                            .filter(|node_id| !current.current_locations.contains(node_id))
+                            .count(),
+                    );
+                }
+            }
+            job.cursor = page.next_cursor;
+            if job.cursor.is_none() || page.objects.is_empty() || adaptive_budget.is_none() {
+                break;
             }
         }
-        job.cursor = page.next_cursor;
         if job.cursor.is_none() {
             match job.state {
                 DfsPlacementReconciliationState::Scanning => {
@@ -2638,10 +3133,27 @@ fn mark_placement_reconciliation_superseded(job: &mut DfsPlacementReconciliation
     job.last_error = Some(PLACEMENT_RECONCILIATION_SUPERSEDED_ERROR.to_string());
 }
 
+#[cfg(test)]
 fn reconciliation_placement_for_object(
     config: &DfsFileSystemConfig,
     job: &DfsPlacementReconciliationJob,
     object: &DfsObjectMetadata,
+) -> Result<
+    (
+        DfsResolvedPlacementPolicy,
+        DfsReplicationPolicy,
+        DfsReplicaPlacementExplanation,
+    ),
+    DfsError,
+> {
+    reconciliation_placement_for_object_with_pins(config, job, object, &[])
+}
+
+fn reconciliation_placement_for_object_with_pins(
+    config: &DfsFileSystemConfig,
+    job: &DfsPlacementReconciliationJob,
+    object: &DfsObjectMetadata,
+    pinned_node_ids: &[NodeId],
 ) -> Result<
     (
         DfsResolvedPlacementPolicy,
@@ -2669,20 +3181,31 @@ fn reconciliation_placement_for_object(
     let (replication, replica_candidates, _) =
         placement_inputs(&resolved.policy, candidates, &job.unavailable_node_ids)
             .map_err(placement_reconciliation_policy_error)?;
-    let placement = explain_replicas(&DfsReplicaPlacementRequest {
+    let request = DfsReplicaPlacementRequest {
         file_system_id: object.file_system_id.clone(),
         object_id: object.object_id.clone(),
         target_version: object.version.clone(),
         coordinator_node_id: config.owner_node_id.clone(),
         policy: replication.clone(),
         candidates: replica_candidates,
-    })?;
+    };
+    let placement = match job.placement_snapshot.as_ref() {
+        Some(snapshot) => explain_replicas_with_placement_snapshot(
+            &request,
+            snapshot,
+            &object.current_locations,
+            pinned_node_ids,
+        )
+        .map_err(placement_reconciliation_policy_error)?,
+        None => explain_replicas(&request).map_err(placement_reconciliation_policy_error)?,
+    };
     Ok((resolved, replication, placement))
 }
 
 fn placement_reconciliation_policy_error(error: DfsDistributedError) -> DfsError {
     match error {
-        DfsDistributedError::InvalidPolicy { reason } => {
+        DfsDistributedError::InvalidPolicy { reason }
+        | DfsDistributedError::InvalidReplicaSet { reason } => {
             DfsError::InvalidReplicationPolicy { message: reason }
         }
         error => DfsError::from(error),
@@ -2979,6 +3502,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(PlacementIntentAuthority::Ordinary);
         };
         let object = self.current_read_object_metadata(&intent.object_id)?;
+        let pinned_node_ids = self.content_pin_nodes(&intent.object_id);
         let path = object.path.clone();
         let mut authority = self.acquire_authoritative_placement_reconciliation_for_path(
             &intent.file_system_id,
@@ -2989,7 +3513,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .map(|(job, config, _)| {
                 let (_, expected_replication, expected_placement) =
-                    reconciliation_placement_for_object(config, job, &object)?;
+                    reconciliation_placement_for_object_with_pins(
+                        config,
+                        job,
+                        &object,
+                        &pinned_node_ids,
+                    )?;
                 Ok::<_, DfsError>(
                     intent.policy == expected_replication
                         && intent.desired_replica_nodes
@@ -3195,6 +3724,68 @@ mod tests {
         NodeId::from_legacy_named(value).expect("node")
     }
 
+    #[test]
+    fn adaptive_placement_requires_sustained_change_and_enqueues_once() {
+        let digest = "blake3:changed";
+        let start = 10;
+        let (first, ready) = advance_adaptive_placement_observation(None, digest, 7, start);
+        assert!(!ready);
+        let (second, ready) = advance_adaptive_placement_observation(
+            Some(&first),
+            digest,
+            7,
+            start + ADAPTIVE_PLACEMENT_MIN_SUSTAINED_NANOS,
+        );
+        assert!(!ready);
+        let (mut third, ready) = advance_adaptive_placement_observation(
+            Some(&second),
+            digest,
+            7,
+            start + ADAPTIVE_PLACEMENT_MIN_SUSTAINED_NANOS + 1,
+        );
+        assert!(ready);
+        third.last_enqueued_snapshot_digest = digest.to_string();
+        let (_, ready) = advance_adaptive_placement_observation(
+            Some(&third),
+            digest,
+            7,
+            start + ADAPTIVE_PLACEMENT_MIN_SUSTAINED_NANOS + 2,
+        );
+        assert!(!ready);
+    }
+
+    #[test]
+    fn async_content_advertisement_publication_is_lease_gated() {
+        let local = node("async-content-advertisement");
+        let now = time::OffsetDateTime::now_utc();
+        let mut desired = DfsNodeAdvertisement::content(local.clone());
+        desired.storage_health = crate::DfsHealthState::Healthy;
+        desired.storage_freshness = crate::DfsObservationFreshness::Fresh;
+        desired.expires_at = Some(now + time::Duration::seconds(90));
+        let mut kv = InProcessKvStore::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            assert!(
+                publish_dfs_content_advertisement_if_needed_async(
+                    &mut kv,
+                    &local,
+                    desired.clone(),
+                )
+                .await
+                .expect("first publication")
+            );
+            assert!(
+                !publish_dfs_content_advertisement_if_needed_async(&mut kv, &local, desired,)
+                    .await
+                    .expect("lease-gated publication")
+            );
+        });
+    }
+
     fn advertisement(node_id: &str, zone: &str) -> DfsNodeAdvertisement {
         DfsNodeAdvertisement {
             node_id: node(node_id),
@@ -3202,7 +3793,15 @@ mod tests {
             accepts_metadata: false,
             accepts_content: true,
             zone: Some(zone.to_string()),
+            storage_health: crate::DfsHealthState::Unknown,
+            storage_freshness: crate::DfsObservationFreshness::NeverSampled,
+            usable_capacity_bytes: None,
+            reserved_free_bytes: None,
+            content_location_count: 1,
+            network_metering: crate::DfsNetworkMetering::Unknown,
+            advertisement_generation: 0,
             updated_at: time::OffsetDateTime::now_utc(),
+            expires_at: None,
         }
     }
 
@@ -3228,6 +3827,10 @@ mod tests {
             scope,
             unavailable_node_ids,
             candidate_snapshot: vec![advertisement("node-a", "east")],
+            placement_snapshot: None,
+            adaptive: false,
+            adaptive_budget: None,
+            processed_content_bytes: 0,
             accepted_config: None,
             state: DfsPlacementReconciliationState::Pending,
             cursor: None,
@@ -3628,7 +4231,15 @@ mod tests {
             accepts_metadata: false,
             accepts_content: true,
             zone: Some(zone.to_string()),
+            storage_health: crate::DfsHealthState::Unknown,
+            storage_freshness: crate::DfsObservationFreshness::NeverSampled,
+            usable_capacity_bytes: None,
+            reserved_free_bytes: None,
+            content_location_count: 1,
+            network_metering: crate::DfsNetworkMetering::Unknown,
+            advertisement_generation: 0,
             updated_at: time::OffsetDateTime::now_utc(),
+            expires_at: None,
         })
         .collect();
         let preview = preview_placement(
@@ -4134,6 +4745,10 @@ mod tests {
             object.remove("schema_version");
             object.remove("unavailable_node_ids");
             object.remove("candidate_snapshot");
+            object.remove("placement_snapshot");
+            object.remove("adaptive");
+            object.remove("adaptive_budget");
+            object.remove("processed_content_bytes");
             object.remove("accepted_config");
             let key = format!(
                 "/dfs/filesystems/{}/placement-reconciliations/{}",
@@ -4694,6 +5309,10 @@ mod tests {
         object.remove("schema_version");
         object.remove("unavailable_node_ids");
         object.remove("candidate_snapshot");
+        object.remove("placement_snapshot");
+        object.remove("adaptive");
+        object.remove("adaptive_budget");
+        object.remove("processed_content_bytes");
         object.remove("accepted_config");
 
         let decoded: DfsPlacementReconciliationJob =
@@ -4701,6 +5320,10 @@ mod tests {
         assert_eq!(decoded.schema_version, 0);
         assert!(decoded.unavailable_node_ids.is_empty());
         assert!(decoded.candidate_snapshot.is_empty());
+        assert!(decoded.placement_snapshot.is_none());
+        assert!(!decoded.adaptive);
+        assert!(decoded.adaptive_budget.is_none());
+        assert_eq!(decoded.processed_content_bytes, 0);
         assert!(decoded.accepted_config.is_none());
     }
 

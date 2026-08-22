@@ -71,6 +71,7 @@ mod node_transport;
 mod operator;
 mod performance_metrics;
 mod placement;
+mod placement_environment;
 mod posix;
 mod posix_model;
 mod posix_object;
@@ -611,18 +612,30 @@ pub use operator::{
 pub use placement::{
     DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE, DFS_PLACEMENT_PREVIEW_SCHEMA_VERSION,
     DFS_PLACEMENT_PREVIEW_TOKEN_SCHEMA_VERSION, DFS_PLACEMENT_RECONCILIATION_SCHEMA_VERSION,
-    DfsExactPlacementPolicy, DfsPlacementBlockingDiagnostic, DfsPlacementImpact,
-    DfsPlacementImpactPage, DfsPlacementNodePreview, DfsPlacementNodeReachability,
-    DfsPlacementPolicy, DfsPlacementPreview, DfsPlacementPreviewObjectFence,
-    DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
-    DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
-    DfsPlacementReconciliationActivitySummary, DfsPlacementReconciliationJob,
-    DfsPlacementReconciliationState, DfsPlacementScopeResolution, DfsResolvedPlacementPolicy,
-    MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE, bind_placement_preview_token,
-    merge_placement_impact, normalize_placement_rule, placement_reconciliation_activity_page,
-    placement_reconciliation_compatibility_diagnostic, placement_rule_matches, preview_placement,
-    preview_placement_with_unavailable_nodes, remove_placement_rule, resolve_placement_policy,
-    upsert_placement_rule,
+    DfsAdaptivePlacementBudget, DfsAdaptivePlacementObservationState, DfsExactPlacementPolicy,
+    DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementImpactPage,
+    DfsPlacementNodePreview, DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
+    DfsPlacementPreviewObjectFence, DfsPlacementPreviewToken,
+    DfsPlacementReconciliationActivityCursor, DfsPlacementReconciliationActivityPage,
+    DfsPlacementReconciliationActivityStatus, DfsPlacementReconciliationActivitySummary,
+    DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScopeResolution,
+    DfsResolvedPlacementPolicy, MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE,
+    bind_placement_preview_token, merge_placement_impact, normalize_placement_rule,
+    placement_reconciliation_activity_page, placement_reconciliation_compatibility_diagnostic,
+    placement_rule_matches, preview_placement,
+    preview_placement_with_snapshot_and_unavailable_nodes,
+    preview_placement_with_unavailable_nodes, publish_dfs_content_advertisement_async,
+    publish_dfs_content_advertisement_if_needed, publish_dfs_content_advertisement_if_needed_async,
+    remove_placement_rule, resolve_placement_policy, upsert_placement_rule,
+};
+pub use placement_environment::{
+    DEFAULT_DFS_STORAGE_OBSERVATION_TTL, DEFAULT_DFS_STORAGE_RESERVE_BYTES,
+    DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL, DFS_NODE_HEALTH_SNAPSHOT_SCHEMA_VERSION,
+    DFS_PLACEMENT_SNAPSHOT_SCHEMA_VERSION, DfsContentLocationConfig, DfsContentLocationLifecycle,
+    DfsContentLocationObservation, DfsDeviceHealthMonitor, DfsHealthState, DfsNetworkMetering,
+    DfsNodeHealthSnapshot, DfsObservationFreshness, DfsPlacementNodeObservation,
+    DfsPlacementPathObservation, DfsPlacementPathState, DfsPlacementSnapshot,
+    DfsPlacementSnapshotCache, explain_replicas_with_placement_snapshot,
 };
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{

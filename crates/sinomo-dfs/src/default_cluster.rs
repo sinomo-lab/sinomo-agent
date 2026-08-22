@@ -55,6 +55,9 @@ pub struct DfsDefaultClusterBootstrapOptions {
     /// Each enabled DFS node owns only its local advertisement, so a bootstrap
     /// pass cannot manufacture or overwrite another node's topology.
     pub local_zone: Option<String>,
+    /// Daemon-sampled aggregate content state for this node. The record may
+    /// summarize several physical locations but always retains one node id.
+    pub local_content_advertisement: Option<DfsNodeAdvertisement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1425,7 +1428,12 @@ pub fn ensure_default_distributed_dfs_with_host(
         // Service discovery is independent of metadata-shard handoff. Publish
         // it first so a fenced or retrying shard transition cannot hide
         // otherwise eligible content nodes from placement planning.
-        publish_dfs_service_advertisements_with_host(host, state, options.local_zone.as_deref())?;
+        publish_dfs_service_advertisements_with_host(
+            host,
+            state,
+            options.local_zone.as_deref(),
+            options.local_content_advertisement.as_ref(),
+        )?;
         metadata_shards = default_cluster_metadata_shards_with_host(host, state, &file_system)?;
         let local_has_primary_metadata_shards = metadata_shards
             .iter()
@@ -1447,11 +1455,12 @@ pub fn ensure_default_distributed_dfs_with_host(
         }
         local_has_primary_metadata_shards
     } else {
-        if options.local_zone.is_some() {
+        if options.local_zone.is_some() || options.local_content_advertisement.is_some() {
             publish_local_dfs_service_advertisement_with_host(
                 host,
                 state,
                 options.local_zone.as_deref(),
+                options.local_content_advertisement.as_ref(),
             )?;
         }
         default_cluster_sifs_owner(state) == state.local_node_id
@@ -1493,6 +1502,7 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
             host,
             state,
             options.local_zone.as_deref(),
+            options.local_content_advertisement.as_ref(),
         )
         .await?;
         metadata_shards =
@@ -1518,11 +1528,12 @@ pub async fn ensure_default_distributed_dfs_with_async_host(
         }
         local_has_primary_metadata_shards
     } else {
-        if options.local_zone.is_some() {
+        if options.local_zone.is_some() || options.local_content_advertisement.is_some() {
             publish_local_dfs_service_advertisement_with_async_host(
                 host,
                 state,
                 options.local_zone.as_deref(),
+                options.local_content_advertisement.as_ref(),
             )
             .await?;
         }
@@ -2126,17 +2137,24 @@ fn publish_dfs_service_advertisements_with_host(
     host: &mut impl DfsDefaultClusterBootstrapHost,
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
+    local_content_advertisement: Option<&DfsNodeAdvertisement>,
 ) -> Result<(), DfsError> {
     // A node may advertise only the service it actually materialized. Cluster
     // membership is not evidence that another member runs DFS; every enabled
     // DFS module publishes its own record during its local lifecycle.
-    publish_local_dfs_service_advertisement_with_host(host, state, local_zone)
+    publish_local_dfs_service_advertisement_with_host(
+        host,
+        state,
+        local_zone,
+        local_content_advertisement,
+    )
 }
 
 fn publish_local_dfs_service_advertisement_with_host(
     host: &mut impl DfsDefaultClusterBootstrapHost,
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
+    local_content_advertisement: Option<&DfsNodeAdvertisement>,
 ) -> Result<(), DfsError> {
     let member = dfs_service_members(state)
         .into_iter()
@@ -2150,7 +2168,18 @@ fn publish_local_dfs_service_advertisement_with_host(
     let metadata_key = metadata_service_key(&member.node_id);
     let content_key = content_service_key(&member.node_id);
     let mut metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
-    let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
+    let mut content = local_content_advertisement
+        .cloned()
+        .unwrap_or_else(|| DfsNodeAdvertisement::content(member.node_id.clone()));
+    if content.node_id != member.node_id {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "local DFS content advertisement names node {} but daemon owns {}",
+                content.node_id, member.node_id
+            ),
+        });
+    }
+    content.accepts_metadata = false;
     metadata.zone = local_zone.map(str::to_string);
     content.zone = local_zone.map(str::to_string);
     let metadata = stable_dfs_advertisement(host, &metadata_key, metadata, false)?;
@@ -2163,14 +2192,22 @@ async fn publish_dfs_service_advertisements_with_async_host(
     host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
+    local_content_advertisement: Option<&DfsNodeAdvertisement>,
 ) -> Result<(), DfsError> {
-    publish_local_dfs_service_advertisement_with_async_host(host, state, local_zone).await
+    publish_local_dfs_service_advertisement_with_async_host(
+        host,
+        state,
+        local_zone,
+        local_content_advertisement,
+    )
+    .await
 }
 
 async fn publish_local_dfs_service_advertisement_with_async_host(
     host: &mut impl DfsDefaultClusterAsyncBootstrapHost,
     state: &ClusterBootstrapState,
     local_zone: Option<&str>,
+    local_content_advertisement: Option<&DfsNodeAdvertisement>,
 ) -> Result<(), DfsError> {
     let member = dfs_service_members(state)
         .into_iter()
@@ -2184,7 +2221,18 @@ async fn publish_local_dfs_service_advertisement_with_async_host(
     let metadata_key = metadata_service_key(&member.node_id);
     let content_key = content_service_key(&member.node_id);
     let mut metadata = DfsNodeAdvertisement::metadata(member.node_id.clone());
-    let mut content = DfsNodeAdvertisement::content(member.node_id.clone());
+    let mut content = local_content_advertisement
+        .cloned()
+        .unwrap_or_else(|| DfsNodeAdvertisement::content(member.node_id.clone()));
+    if content.node_id != member.node_id {
+        return Err(DfsError::Distributed {
+            message: format!(
+                "local DFS content advertisement names node {} but daemon owns {}",
+                content.node_id, member.node_id
+            ),
+        });
+    }
+    content.accepts_metadata = false;
     metadata.zone = local_zone.map(str::to_string);
     content.zone = local_zone.map(str::to_string);
     let metadata =
@@ -2208,11 +2256,23 @@ fn stable_dfs_advertisement(
     if preserve_current_zone {
         desired.zone.clone_from(&current.zone);
     }
-    if current.node_id == desired.node_id
+    let lease_is_fresh = desired.expires_at.is_none()
+        || current.expires_at.is_some_and(|expires_at| {
+            expires_at > OffsetDateTime::now_utc() + time::Duration::seconds(30)
+        });
+    if lease_is_fresh
+        && current.node_id == desired.node_id
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content
         && current.capacity_weight == desired.capacity_weight
         && current.zone == desired.zone
+        && current.storage_health == desired.storage_health
+        && current.storage_freshness == desired.storage_freshness
+        && current.usable_capacity_bytes == desired.usable_capacity_bytes
+        && current.reserved_free_bytes == desired.reserved_free_bytes
+        && current.content_location_count == desired.content_location_count
+        && current.network_metering == desired.network_metering
+        && current.advertisement_generation == desired.advertisement_generation
     {
         return Ok(current);
     }
@@ -2231,11 +2291,23 @@ async fn stable_dfs_advertisement_async(
     if preserve_current_zone {
         desired.zone.clone_from(&current.zone);
     }
-    if current.node_id == desired.node_id
+    let lease_is_fresh = desired.expires_at.is_none()
+        || current.expires_at.is_some_and(|expires_at| {
+            expires_at > OffsetDateTime::now_utc() + time::Duration::seconds(30)
+        });
+    if lease_is_fresh
+        && current.node_id == desired.node_id
         && current.accepts_metadata == desired.accepts_metadata
         && current.accepts_content == desired.accepts_content
         && current.capacity_weight == desired.capacity_weight
         && current.zone == desired.zone
+        && current.storage_health == desired.storage_health
+        && current.storage_freshness == desired.storage_freshness
+        && current.usable_capacity_bytes == desired.usable_capacity_bytes
+        && current.reserved_free_bytes == desired.reserved_free_bytes
+        && current.content_location_count == desired.content_location_count
+        && current.network_metering == desired.network_metering
+        && current.advertisement_generation == desired.advertisement_generation
     {
         return Ok(current);
     }
@@ -3134,6 +3206,7 @@ mod tests {
             publish_cluster_control: true,
             materialize_local_metadata: true,
             local_zone: None,
+            local_content_advertisement: None,
         };
 
         let first =
@@ -4239,6 +4312,7 @@ mod tests {
             publish_cluster_control: false,
             materialize_local_metadata: false,
             local_zone: Some("rack-a".to_string()),
+            local_content_advertisement: None,
         };
 
         ensure_default_distributed_dfs_with_host(&state, &mut host, options.clone())

@@ -5,6 +5,7 @@ use crate::{
     rollout_staged_shadow_binary, stage_rollout_file_pair,
 };
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVE
 const ROLLOUT_NATIVE_DYLIB_TARGET_DIR: &str = "rollout-native-dylib";
 
 #[cfg(windows)]
-fn rollout_child_command(program: &str) -> Command {
+fn rollout_child_command(program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     use std::os::windows::process::CommandExt;
 
@@ -25,8 +26,42 @@ fn rollout_child_command(program: &str) -> Command {
 }
 
 #[cfg(not(windows))]
-fn rollout_child_command(program: &str) -> Command {
+fn rollout_child_command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
+}
+
+fn rollout_cargo_program() -> OsString {
+    rollout_cargo_program_from_environment(
+        env::var_os("CARGO"),
+        env::var_os("CARGO_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+        env::var_os("USERPROFILE").map(PathBuf::from),
+    )
+}
+
+fn rollout_cargo_program_from_environment(
+    explicit_cargo: Option<OsString>,
+    cargo_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    user_profile: Option<PathBuf>,
+) -> OsString {
+    if let Some(explicit_cargo) = explicit_cargo.filter(|value| !value.is_empty()) {
+        return explicit_cargo;
+    }
+
+    let executable = format!("cargo{}", env::consts::EXE_SUFFIX);
+    let mut candidates = Vec::new();
+    if let Some(cargo_home) = cargo_home {
+        candidates.push(cargo_home.join("bin").join(&executable));
+    }
+    for home in [home, user_profile].into_iter().flatten() {
+        candidates.push(home.join(".cargo").join("bin").join(&executable));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from("cargo"))
 }
 
 pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
@@ -411,7 +446,7 @@ fn rollout_cargo_build_command(
     target_dir: Option<&Path>,
 ) -> Result<Command, RolloutError> {
     let commit = rollout_build_commit_override(repo)?;
-    let mut command = rollout_child_command("cargo");
+    let mut command = rollout_child_command(rollout_cargo_program());
     command
         .args(build_args)
         .current_dir(repo)
@@ -1369,6 +1404,22 @@ mod tests {
                 "CARGO_TARGET_DIR={} cargo build --locked -p sinomo",
                 target_dir.display()
             )
+        );
+    }
+
+    #[test]
+    fn rollout_cargo_program_finds_user_toolchain_with_sanitized_path() {
+        let root = unique_temp("sinomo-rollout-cargo-program");
+        let cargo = root
+            .join(".cargo")
+            .join("bin")
+            .join(format!("cargo{}", env::consts::EXE_SUFFIX));
+        fs::create_dir_all(cargo.parent().expect("cargo parent")).expect("cargo home");
+        fs::write(&cargo, b"test cargo").expect("cargo executable");
+
+        assert_eq!(
+            rollout_cargo_program_from_environment(None, None, Some(root.to_path_buf()), None),
+            cargo.into_os_string()
         );
     }
 
