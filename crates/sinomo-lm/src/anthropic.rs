@@ -2,8 +2,8 @@ use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelRequest,
-    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelStreamEvent, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
+    LanguageModelResponse, LanguageModelResponseFormat, LanguageModelResponseItem,
+    LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
     apply_provider_vendor_options_to_payload, read_server_sent_events, render_plain_prompt,
     selected_model,
 };
@@ -368,6 +368,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut usage = LanguageModelUsage {
         input_tokens: None,
         output_tokens: None,
@@ -408,10 +409,10 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
                 }
             }
             "content_block_delta" => {
-                if value
+                let delta_type = value
                     .pointer("/delta/type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("text_delta")
+                    .and_then(serde_json::Value::as_str);
+                if delta_type == Some("text_delta")
                     && let Some(delta) = value
                         .pointer("/delta/text")
                         .and_then(serde_json::Value::as_str)
@@ -419,6 +420,15 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
                 {
                     content.push_str(delta);
                     on_event(LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    });
+                }
+                if delta_type == Some("thinking_delta")
+                    && let Some(delta) = anthropic_thinking_delta(&value)
+                    && !delta.is_empty()
+                {
+                    reasoning.push_str(delta);
+                    on_event(LanguageModelStreamEvent::ReasoningDelta {
                         delta: delta.to_string(),
                     });
                 }
@@ -481,14 +491,24 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
         });
     }
 
+    let items = (!reasoning.trim().is_empty())
+        .then(|| LanguageModelResponseItem::ReasoningSummary { summary: reasoning })
+        .into_iter()
+        .collect();
     Ok(LanguageModelResponse {
         provider: provider.to_string(),
         model: model.to_string(),
         content,
-        items: Vec::new(),
+        items,
         tool_calls: Vec::new(),
         usage,
     })
+}
+
+fn anthropic_thinking_delta(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/delta/thinking")
+        .and_then(serde_json::Value::as_str)
 }
 
 #[cfg(test)]
@@ -519,6 +539,18 @@ mod tests {
             response_format: LanguageModelResponseFormat::JsonObject,
             metadata: serde_json::json!({ "job_id": "task_test" }),
         }
+    }
+
+    #[test]
+    fn explicit_thinking_delta_is_available_as_reasoning_output() {
+        let value = serde_json::json!({
+            "type": "content_block_delta",
+            "delta": { "type": "thinking_delta", "thinking": "Check the constraints." }
+        });
+        assert_eq!(
+            anthropic_thinking_delta(&value),
+            Some("Check the constraints.")
+        );
     }
 
     #[test]

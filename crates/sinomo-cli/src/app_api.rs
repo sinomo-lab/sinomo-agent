@@ -470,6 +470,12 @@ impl ChatToolRuntimeSelection {
 pub enum ChatStreamEvent {
     /// A visible answer fragment.
     Token(String),
+    /// A step-indexed assistant fragment emitted directly by the model.
+    AssistantTextDelta { step_index: usize, text: String },
+    /// Provider-emitted reasoning summary. This is explicit model output, not inferred reasoning.
+    ReasoningDelta { step_index: usize, delta: String },
+    /// Completed provider-emitted reasoning summary.
+    ReasoningSummary { step_index: usize, summary: String },
     /// A visible answer fragment with channel participant metadata.
     AgentToken { speaker: ChatSpeaker, text: String },
     /// A transient progress / status note (e.g. "waiting for model runtime").
@@ -4743,6 +4749,7 @@ impl AgentChat {
         self.save_channel()?;
 
         let mut streamed_answer = String::new();
+        let mut streamed_step = None;
         let mut wrapped_event = |event: ChatStreamEvent| match event {
             ChatStreamEvent::Token(text) => {
                 streamed_answer.push_str(&text);
@@ -4750,6 +4757,14 @@ impl AgentChat {
                     speaker: speaker.clone(),
                     text,
                 });
+            }
+            ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+                if streamed_step != Some(step_index) {
+                    streamed_step = Some(step_index);
+                    streamed_answer.clear();
+                }
+                streamed_answer.push_str(&text);
+                on_event(ChatStreamEvent::AssistantTextDelta { step_index, text });
             }
             ChatStreamEvent::AgentToken { speaker, text } => {
                 streamed_answer.push_str(&text);
@@ -6495,9 +6510,18 @@ enum RuntimeDrainState {
 struct ChatStreamState {
     visible_text: String,
     structured_json: String,
+    active_step_index: Option<usize>,
 }
 
 impl ChatStreamState {
+    fn begin_model_step(&mut self, step_index: usize) {
+        if self.active_step_index != Some(step_index) {
+            self.active_step_index = Some(step_index);
+            self.visible_text.clear();
+            self.structured_json.clear();
+        }
+    }
+
     fn append_plain_token(&mut self, token: &str) {
         self.structured_json.clear();
         self.visible_text.push_str(token);
@@ -6594,7 +6618,8 @@ fn forward_model_event(
         AgentModelEvent::ContextAssembled { report, .. } => {
             on_event(ChatStreamEvent::Context(chat_context_snapshot(report)));
         }
-        AgentModelEvent::AssistantTextDelta { delta, .. } => {
+        AgentModelEvent::AssistantTextDelta { step_index, delta } => {
+            stream_state.begin_model_step(step_index);
             if !stream_state.structured_json.is_empty()
                 || tui::starts_structured_agent_json_delta(&delta)
             {
@@ -6602,15 +6627,32 @@ fn forward_model_event(
                 return;
             }
             for event in split_chunk(&delta) {
-                if let ChatStreamEvent::Token(token) = &event {
-                    stream_state.append_plain_token(token);
+                match event {
+                    ChatStreamEvent::Token(token) => {
+                        stream_state.append_plain_token(&token);
+                        on_event(ChatStreamEvent::AssistantTextDelta {
+                            step_index,
+                            text: token,
+                        });
+                    }
+                    event => on_event(event),
                 }
-                on_event(event);
             }
         }
-        AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
+        AgentModelEvent::AssistantReasoningDelta { step_index, delta } => {
+            if !delta.is_empty() {
+                on_event(ChatStreamEvent::ReasoningDelta { step_index, delta });
+            }
+        }
+        AgentModelEvent::AssistantReasoningSummary {
+            step_index,
+            summary,
+        } => {
             if !summary.trim().is_empty() {
-                on_event(ChatStreamEvent::Notice(summary));
+                on_event(ChatStreamEvent::ReasoningSummary {
+                    step_index,
+                    summary,
+                });
             }
         }
         AgentModelEvent::ToolCallStarted {
@@ -10061,6 +10103,18 @@ mod tests {
     fn chat_event_label(event: ChatStreamEvent) -> String {
         match event {
             ChatStreamEvent::Token(token) => format!("token:{token}"),
+            ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+                format!("assistant-delta:{step_index}:{text}")
+            }
+            ChatStreamEvent::ReasoningDelta { step_index, delta } => {
+                format!("reasoning-delta:{step_index}:{delta}")
+            }
+            ChatStreamEvent::ReasoningSummary {
+                step_index,
+                summary,
+            } => {
+                format!("reasoning:{step_index}:{summary}")
+            }
             ChatStreamEvent::AgentToken { speaker, text } => {
                 format!("agent-token:{}:{text}", speaker.agent_key)
             }
@@ -10399,7 +10453,7 @@ mod tests {
 
         assert!(matches!(first, RuntimeDrainState::Running));
         assert!(matches!(final_state, RuntimeDrainState::Running));
-        assert_eq!(events, vec!["token:hello", "token: world"]);
+        assert_eq!(events, vec!["assistant-delta:0:hello", "token: world"]);
         assert_eq!(stream_state.visible_text, "hello world");
     }
 
@@ -10580,6 +10634,76 @@ mod tests {
 
         assert_eq!(events, vec!["notice:waiting for configured model runtime"]);
         assert!(stream_state.visible_text.is_empty());
+    }
+
+    #[test]
+    fn model_reasoning_and_step_text_keep_their_stream_kinds() {
+        let mut stream_state = ChatStreamState::default();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        forward_model_event(
+            AgentModelEvent::AssistantReasoningDelta {
+                step_index: 2,
+                delta: "Inspecting ".to_string(),
+            },
+            &mut stream_state,
+            &mut on_event,
+        );
+        forward_model_event(
+            AgentModelEvent::AssistantReasoningSummary {
+                step_index: 2,
+                summary: "Context checked".to_string(),
+            },
+            &mut stream_state,
+            &mut on_event,
+        );
+        forward_model_event(
+            AgentModelEvent::AssistantTextDelta {
+                step_index: 2,
+                delta: "I will read the file.".to_string(),
+            },
+            &mut stream_state,
+            &mut on_event,
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                "reasoning-delta:2:Inspecting ",
+                "reasoning:2:Context checked",
+                "assistant-delta:2:I will read the file.",
+            ]
+        );
+        assert_eq!(stream_state.visible_text, "I will read the file.");
+    }
+
+    #[test]
+    fn final_decision_does_not_repeat_last_model_step_after_intermediate_output() {
+        let mut stream_state = ChatStreamState::default();
+        let mut events = Vec::new();
+        let mut on_event = |event| events.push(chat_event_label(event));
+
+        for (step_index, delta) in [(0, "intermediate"), (1, "final answer")] {
+            forward_model_event(
+                AgentModelEvent::AssistantTextDelta {
+                    step_index,
+                    delta: delta.to_string(),
+                },
+                &mut stream_state,
+                &mut on_event,
+            );
+        }
+        stream_state.emit_final_text("final answer", &mut on_event);
+
+        assert_eq!(
+            events,
+            vec![
+                "assistant-delta:0:intermediate",
+                "assistant-delta:1:final answer",
+            ]
+        );
+        assert_eq!(stream_state.visible_text, "final answer");
     }
 
     #[test]

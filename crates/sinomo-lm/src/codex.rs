@@ -2556,6 +2556,7 @@ struct OpenAiResponsesCodexSseDecoder {
     output: Vec<serde_json::Value>,
     output_text: String,
     saw_output_text_delta: bool,
+    saw_reasoning_delta: bool,
     stream_events: Vec<LanguageModelStreamEvent>,
 }
 
@@ -2651,6 +2652,14 @@ impl OpenAiResponsesCodexSseDecoder {
                         {
                             continue;
                         }
+                        if self.saw_reasoning_delta
+                            && matches!(
+                                &stream_event,
+                                LanguageModelStreamEvent::ReasoningSummary { .. }
+                            )
+                        {
+                            continue;
+                        }
                         on_event(stream_event.clone());
                         self.stream_events.push(stream_event);
                     }
@@ -2662,6 +2671,20 @@ impl OpenAiResponsesCodexSseDecoder {
                     self.saw_output_text_delta = true;
                     self.output_text.push_str(delta);
                     let stream_event = LanguageModelStreamEvent::TextDelta {
+                        delta: delta.to_string(),
+                    };
+                    on_event(stream_event.clone());
+                    self.stream_events.push(stream_event);
+                }
+            }
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary.delta"
+            | "response.reasoning_text.delta" => {
+                if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
+                    && !delta.is_empty()
+                {
+                    self.saw_reasoning_delta = true;
+                    let stream_event = LanguageModelStreamEvent::ReasoningDelta {
                         delta: delta.to_string(),
                     };
                     on_event(stream_event.clone());
@@ -4615,6 +4638,40 @@ mod tests {
         assert!(streamed.iter().any(|event| {
             matches!(event, LanguageModelStreamEvent::Error { detail } if detail == "bad stream")
         }));
+    }
+
+    #[test]
+    fn openai_responses_sse_parser_streams_reasoning_summary_deltas() {
+        let body = concat!(
+            "event: response.reasoning_summary_text.delta\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"check \"}\n\n",
+            "event: response.reasoning_summary_text.delta\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"context\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\"}}\n\n",
+        );
+        let mut streamed = Vec::new();
+
+        let parsed = parse_openai_responses_codex_sse_response_with_events(
+            body,
+            CODEX_DEFAULT_MODEL,
+            &mut |event| streamed.push(event),
+        )
+        .expect("sse");
+
+        assert_eq!(parsed.content, "done");
+        assert_eq!(
+            streamed
+                .iter()
+                .filter_map(|event| match event {
+                    LanguageModelStreamEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["check ", "context"]
+        );
     }
 
     #[test]

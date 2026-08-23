@@ -307,6 +307,9 @@ pub enum LanguageModelStreamEvent {
     TextDelta {
         delta: String,
     },
+    ReasoningDelta {
+        delta: String,
+    },
     ReasoningSummary {
         summary: String,
     },
@@ -3152,6 +3155,7 @@ where
     R: Read,
 {
     let mut content = String::new();
+    let mut reasoning = String::new();
     let mut tool_calls = Vec::<ChatCompletionToolCallAccumulator>::new();
     let mut usage = None;
     let mut finish_reason = None;
@@ -3195,6 +3199,18 @@ where
                 delta: delta.to_string(),
             });
         }
+        if let Some(delta) = value
+            .pointer("/choices/0/delta/reasoning_content")
+            .or_else(|| value.pointer("/choices/0/delta/reasoning"))
+            .or_else(|| value.pointer("/choices/0/delta/thinking"))
+            .and_then(serde_json::Value::as_str)
+            && !delta.is_empty()
+        {
+            reasoning.push_str(delta);
+            on_event(LanguageModelStreamEvent::ReasoningDelta {
+                delta: delta.to_string(),
+            });
+        }
         if let Some(delta_tool_calls) = value
             .pointer("/choices/0/delta/tool_calls")
             .and_then(serde_json::Value::as_array)
@@ -3219,11 +3235,16 @@ where
         .into_iter()
         .filter_map(|call| call.complete(on_event))
         .collect::<Vec<_>>();
-    let items = completed_tool_calls
-        .iter()
-        .cloned()
-        .map(|call| LanguageModelResponseItem::ToolCall { call })
-        .collect();
+    let mut items = Vec::new();
+    if !reasoning.trim().is_empty() {
+        items.push(LanguageModelResponseItem::ReasoningSummary { summary: reasoning });
+    }
+    items.extend(
+        completed_tool_calls
+            .iter()
+            .cloned()
+            .map(|call| LanguageModelResponseItem::ToolCall { call }),
+    );
     if let Some(usage) = &usage {
         on_event(LanguageModelStreamEvent::Usage {
             usage: usage.clone(),
@@ -5711,6 +5732,41 @@ mod tests {
                     finish_reason: Some("stop".to_string())
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn chat_completion_stream_emits_provider_reasoning_fragments() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect \"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"context\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut events = Vec::new();
+
+        let response = stream_openai_chat_completion_response(
+            body.as_bytes(),
+            "test",
+            "reasoner",
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &response.items[0],
+            LanguageModelResponseItem::ReasoningSummary { summary }
+                if summary == "inspect context"
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    LanguageModelStreamEvent::ReasoningDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["inspect ", "context"]
         );
     }
 
