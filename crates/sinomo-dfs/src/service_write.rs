@@ -2522,9 +2522,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // semantic attachment. Sending a zero-length `ObjectRpcBodySource`
         // would clear the attachment body role at the network boundary while
         // retaining an attachment-shaped request head. Route the command as an
-        // ordinary value instead; the metadata primary persists `bytes == []`
-        // through the normal content-store path and derives the canonical
-        // empty manifest/hash there.
+        // ordinary value instead; the metadata primary derives the canonical
+        // empty manifest/hash through the normal content-store path. Empty
+        // content is intrinsic and needs neither a blob file nor a pre-catalog
+        // content reservation.
         let attachment = if bytes.is_empty() {
             None
         } else {

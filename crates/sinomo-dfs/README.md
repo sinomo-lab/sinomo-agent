@@ -4,6 +4,8 @@
 
 The crate is not a replacement for the host filesystem, Git, or the cluster KV. It is a policy-aware workspace layer: file bytes stay in node-local content stores, high-cardinality filesystem metadata stays in DFS metadata backends, and the cluster KV is used only for compact DFS control-plane configuration.
 
+The canonical hash of zero-length content is intrinsic: readers reconstruct it without a physical blob file, and namespace creation does not publish a redundant content-store reservation for it. The namespace metadata commit remains durable before an empty file creation is acknowledged.
+
 See also:
 
 - `docs/dfs-architecture.md` for the full distributed design.

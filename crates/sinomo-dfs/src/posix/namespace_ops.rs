@@ -104,19 +104,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_unlink(&mut self, path: &str) -> Result<DfsStat> {
         self.with_posix_commit_operation_deadline(|service| {
-            // The CAS protects the namespace entry being removed. Ordinary POSIX lstat
-            // intentionally projects a hardlink alias as its shared target inode, whose
-            // object/version cannot match the alias record checked by the authority.
-            let observed = service.posix_namespace_lstat_distributed(path)?;
-            let operation_id = service.next_request_id();
-            service.posix_unlink_if_generation_with_current_deadline(
-                path,
-                operation_id,
-                DfsNamespaceObjectPrecondition {
-                    object_id: observed.object_id,
-                    version: observed.version,
-                },
-            )
+            service.with_metadata_lookup_cache_mut(|service| {
+                // The CAS protects the namespace entry being removed. Ordinary POSIX lstat
+                // intentionally projects a hardlink alias as its shared target inode, whose
+                // object/version cannot match the alias record checked by the authority.
+                // Reuse the exact path observations during this one serialized operation;
+                // namespace publication invalidates the cache before any later lookup.
+                let observed = service.posix_namespace_lstat_distributed(path)?;
+                let operation_id = service.next_request_id();
+                service.posix_unlink_if_generation_with_current_deadline(
+                    path,
+                    operation_id,
+                    DfsNamespaceObjectPrecondition {
+                        object_id: observed.object_id,
+                        version: observed.version,
+                    },
+                )
+            })
         })
     }
 
@@ -150,6 +154,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     expected,
                 },
             )?;
+            // The mutation ran on another request shell, so it cannot clear
+            // this caller's operation-scoped lookup cache. Observe the
+            // durable outcome from fresh metadata instead of replaying the
+            // live generation captured before the unlink.
+            self.clear_metadata_lookup_cache();
             return conditional_delete_result(
                 &normalized,
                 self.stat_replayed_tombstone_synced(&normalized)?,
@@ -163,6 +172,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     expected,
                 },
             )?;
+            self.clear_metadata_lookup_cache();
             return conditional_delete_result(
                 &normalized,
                 self.stat_replayed_tombstone(&normalized)?,
@@ -174,9 +184,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn posix_unlink_local(&mut self, path: &str) -> Result<DfsStat> {
         let path = self.resolve_existing_posix_path_distributed(path, false)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
-        let mut object = self
+        let object = self
             .lookup_sifs_path(&path)?
             .ok_or_else(|| DfsPosixError::NotFound { path: path.clone() })?;
+        self.posix_unlink_resolved_object(path, object)
+    }
+
+    fn posix_unlink_resolved_object(
+        &mut self,
+        path: String,
+        mut object: DfsObjectMetadata,
+    ) -> Result<DfsStat> {
         if object.kind == DfsObjectKind::Directory {
             return Err(DfsPosixError::IsDirectory { path });
         }
@@ -300,7 +318,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 current.as_ref(),
             ));
         }
-        self.posix_unlink_local(&resolved)
+        self.ensure_resolved_path_not_in_cross_shard_flight(&resolved)?;
+        self.posix_unlink_resolved_object(
+            resolved,
+            current.expect("validated unlink generation is present"),
+        )
     }
 
     pub fn posix_rmdir(&mut self, path: &str) -> Result<DfsStat> {

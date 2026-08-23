@@ -9,7 +9,7 @@ use std::sync::Arc;
 /// stream large DFS payloads without buffering the full blob in memory.
 #[derive(Debug)]
 pub struct BlobReader {
-    file: fs::File,
+    file: Option<fs::File>,
     size_bytes: u64,
     remaining_bytes: u64,
 }
@@ -17,7 +17,7 @@ pub struct BlobReader {
 impl BlobReader {
     pub(super) fn new(file: fs::File, size_bytes: u64) -> Self {
         Self {
-            file,
+            file: Some(file),
             size_bytes,
             remaining_bytes: size_bytes,
         }
@@ -25,9 +25,17 @@ impl BlobReader {
 
     pub(super) fn with_remaining(file: fs::File, size_bytes: u64, remaining_bytes: u64) -> Self {
         Self {
-            file,
+            file: Some(file),
             size_bytes,
             remaining_bytes,
+        }
+    }
+
+    pub(super) fn empty() -> Self {
+        Self {
+            file: None,
+            size_bytes: 0,
+            remaining_bytes: 0,
         }
     }
 
@@ -44,7 +52,11 @@ impl Read for BlobReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self.file.read(&mut buffer[..limit])?;
+        let read = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("non-empty blob reader has no backing file"))?
+            .read(&mut buffer[..limit])?;
         self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
         Ok(read)
     }
@@ -56,7 +68,7 @@ impl Read for BlobReader {
 /// the bounded slice that is still available from this reader.
 #[derive(Debug)]
 pub struct BlobRangeReader {
-    file: fs::File,
+    file: Option<fs::File>,
     offset: u64,
     size_bytes: u64,
     remaining_bytes: u64,
@@ -65,10 +77,19 @@ pub struct BlobRangeReader {
 impl BlobRangeReader {
     pub(super) fn new(file: fs::File, offset: u64, size_bytes: u64, remaining_bytes: u64) -> Self {
         Self {
-            file,
+            file: Some(file),
             offset,
             size_bytes,
             remaining_bytes,
+        }
+    }
+
+    pub(super) fn empty() -> Self {
+        Self {
+            file: None,
+            offset: 0,
+            size_bytes: 0,
+            remaining_bytes: 0,
         }
     }
 
@@ -93,7 +114,11 @@ impl Read for BlobRangeReader {
         let limit = buffer
             .len()
             .min(usize::try_from(self.remaining_bytes).unwrap_or(usize::MAX));
-        let read = self.file.read(&mut buffer[..limit])?;
+        let read = self
+            .file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("non-empty blob range reader has no backing file"))?
+            .read(&mut buffer[..limit])?;
         self.remaining_bytes = self.remaining_bytes.saturating_sub(read as u64);
         Ok(read)
     }

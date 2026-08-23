@@ -2925,20 +2925,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let result = (|| {
             loop {
-                match self.posix_write_file_bytes_checked_parent_once_with_operation_id(
-                    path,
-                    bytes,
-                    options.clone(),
-                    check_parent,
-                    touch_parent_on_create,
-                    replay_response_journal,
-                    create_attrs,
-                    exclusive_create,
-                    follow_final_for_exclusive_create,
-                    None,
-                    true,
-                    operation_id.as_deref(),
-                ) {
+                // Resolution, parent validation, and terminal lookup overlap
+                // heavily for a single write. Reuse their exact observations
+                // within one attempt; every metadata mutation below clears the
+                // cache before later reads can observe stale state.
+                let attempt = self.with_metadata_lookup_cache_mut(|service| {
+                    service.posix_write_file_bytes_checked_parent_once_with_operation_id(
+                        path,
+                        bytes,
+                        options.clone(),
+                        check_parent,
+                        touch_parent_on_create,
+                        replay_response_journal,
+                        create_attrs,
+                        exclusive_create,
+                        follow_final_for_exclusive_create,
+                        None,
+                        true,
+                        operation_id.as_deref(),
+                    )
+                });
+                match attempt {
                     Ok(stat) => return Ok(stat),
                     Err(error)
                         if posix_error_is_retryable_write_serialization(&error)

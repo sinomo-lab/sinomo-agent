@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
@@ -71,6 +71,11 @@ const MANIFEST_ABSENCE_OBSERVATION_FORMAT_VERSION: u32 = 1;
 const MANIFEST_ABSENCE_OBSERVATION_DIR: &str = "manifest-absence-observations";
 const VERSION_GC_DELETE_BATCH_SIZE: usize = 1024;
 const ORPHAN_GC_PACKED_TOMBSTONE_BATCH_SIZE: usize = 1024;
+
+fn intrinsic_empty_content_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| content_hash(&[]))
+}
 
 fn content_store_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs content store perf");
@@ -1766,6 +1771,7 @@ impl LocalContentStore {
             .iter()
             .map(|(_, _, bytes)| content_hash(bytes))
             .collect::<Vec<_>>();
+        let empty_hash = intrinsic_empty_content_hash();
         let mut existing_manifests = Vec::with_capacity(versions.len());
         let mut reservation_identities = Vec::with_capacity(versions.len());
         for ((object_id, version, _), hash) in versions.iter().zip(&hashes) {
@@ -1784,20 +1790,22 @@ impl LocalContentStore {
             } else {
                 None
             };
-            reservation_identities.push(
-                existing
-                    .as_ref()
-                    .map(|manifest| ContentStoreReservationIdentity {
-                        object_id: manifest.object_id.clone(),
-                        version: manifest.version.clone(),
-                        content_hash: manifest.content_hash.clone(),
-                    })
-                    .unwrap_or_else(|| ContentStoreReservationIdentity {
-                        object_id: (*object_id).to_owned(),
-                        version: (*version).to_owned(),
-                        content_hash: hash.clone(),
-                    }),
-            );
+            if hash != empty_hash {
+                reservation_identities.push(
+                    existing
+                        .as_ref()
+                        .map(|manifest| ContentStoreReservationIdentity {
+                            object_id: manifest.object_id.clone(),
+                            version: manifest.version.clone(),
+                            content_hash: manifest.content_hash.clone(),
+                        })
+                        .unwrap_or_else(|| ContentStoreReservationIdentity {
+                            object_id: (*object_id).to_owned(),
+                            version: (*version).to_owned(),
+                            content_hash: hash.clone(),
+                        }),
+                );
+            }
             existing_manifests.push(existing);
         }
         self.ensure_content_reservations_batch(&reservation_identities)?;
@@ -1806,13 +1814,27 @@ impl LocalContentStore {
         let mut blob_writes = Vec::new();
         let mut quota_delta = ContentStoreQuotaDelta::default();
         {
-            let _locks =
-                self.lock_packed_blob_lanes_for_hashes(hashes.iter().map(String::as_str))?;
+            let _locks = self.lock_packed_blob_lanes_for_hashes(
+                hashes
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|hash| *hash != empty_hash),
+            )?;
             for (((object_id, version, bytes), hash), existing) in versions
                 .iter()
                 .zip(&hashes)
                 .zip(existing_manifests.into_iter())
             {
+                if hash == empty_hash {
+                    manifests.push(existing.unwrap_or_else(|| ContentManifest {
+                        object_id: (*object_id).to_owned(),
+                        version: (*version).to_owned(),
+                        content_hash: hash.clone(),
+                        size_bytes: 0,
+                        extents: Vec::new(),
+                    }));
+                    continue;
+                }
                 if let Some(existing) = existing {
                     self.clear_orphan_observations_before_manifest_publish(std::iter::once(
                         &existing,
@@ -1968,6 +1990,9 @@ impl LocalContentStore {
     }
 
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(Vec::new());
+        }
         let mut reader = self.open_blob_reader(hash)?;
         let mut bytes =
             Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
@@ -1984,6 +2009,9 @@ impl LocalContentStore {
     }
 
     pub fn read_blob_range(&self, hash: &str, offset: u64, max_bytes: usize) -> Result<Vec<u8>> {
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(Vec::new());
+        }
         let mut reader = self.open_blob_range_stream(hash, offset, max_bytes)?;
         let mut bytes =
             Vec::with_capacity(usize::try_from(reader.remaining_bytes()).unwrap_or(usize::MAX));
@@ -1999,6 +2027,9 @@ impl LocalContentStore {
     }
 
     pub fn open_blob_reader(&self, hash: &str) -> Result<BlobReader> {
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(BlobReader::empty());
+        }
         let path = self.blob_path(hash)?;
         if path.is_file() {
             let (actual_hash, size_bytes) = file_content_hash_and_size(&path)?;
@@ -2050,6 +2081,9 @@ impl LocalContentStore {
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(BlobReader::empty());
+        }
         let path = self.blob_path(hash)?;
         if path.is_file() {
             let file = fs::File::open(&path).map_err(|source| ContentStoreError::Io {
@@ -2086,6 +2120,9 @@ impl LocalContentStore {
     ) -> Result<BlobRangeReader> {
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(BlobRangeReader::empty());
+        }
         let path = self.blob_path(hash)?;
         if !path.is_file() {
             let Some((_, reader)) = self.open_packed_blob_range_reader(hash, offset, max_bytes)?
@@ -3196,6 +3233,9 @@ impl LocalContentStore {
     }
 
     pub fn has_blob(&self, hash: &str) -> Result<bool> {
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(true);
+        }
         let path = self.blob_path(hash)?;
         if path.is_file() {
             return Ok(file_content_hash(&path).is_ok_and(|actual| actual == hash));
@@ -3222,6 +3262,9 @@ impl LocalContentStore {
     /// hash the blob bytes. Callers that consume the content remain responsible
     /// for end-to-end integrity validation.
     pub fn blob_storage_candidate_exists(&self, hash: &str) -> Result<bool> {
+        if hash == intrinsic_empty_content_hash() {
+            return Ok(true);
+        }
         let path = self.blob_path(hash)?;
         match fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => return Ok(true),
@@ -3846,11 +3889,13 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
-            self.ensure_content_reservation(
-                &existing.object_id,
-                &existing.version,
-                &existing.content_hash,
-            )?;
+            if existing.content_hash != intrinsic_empty_content_hash() {
+                self.ensure_content_reservation(
+                    &existing.object_id,
+                    &existing.version,
+                    &existing.content_hash,
+                )?;
+            }
             let blob_path = self.blob_path(&hash)?;
             if !self.has_blob(&hash)? {
                 self.ensure_quota_delta(ContentStoreQuotaDelta {
@@ -3873,11 +3918,13 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
             extents: Vec::new(),
         };
-        self.ensure_content_reservation(
-            &manifest.object_id,
-            &manifest.version,
-            &manifest.content_hash,
-        )?;
+        if manifest.content_hash != intrinsic_empty_content_hash() {
+            self.ensure_content_reservation(
+                &manifest.object_id,
+                &manifest.version,
+                &manifest.content_hash,
+            )?;
+        }
         let manifest_bytes = encode_manifest(&manifest)?;
         self.ensure_quota_delta(ContentStoreQuotaDelta {
             blob_bytes: if blob_needs_write {
@@ -4071,11 +4118,13 @@ impl LocalContentStore {
                     new_hash: hash,
                 });
             }
-            self.ensure_content_reservation(
-                &existing.object_id,
-                &existing.version,
-                &existing.content_hash,
-            )?;
+            if existing.content_hash != intrinsic_empty_content_hash() {
+                self.ensure_content_reservation(
+                    &existing.object_id,
+                    &existing.version,
+                    &existing.content_hash,
+                )?;
+            }
             content_store_perf_trace(format_args!(
                 "blob-only-write object={} version={} bytes={} existing_manifest=true hash_ms={} manifest_check_ms={} total_ms={}",
                 object_id,
@@ -4112,6 +4161,17 @@ impl LocalContentStore {
             size_bytes: bytes.len() as u64,
             extents: Vec::new(),
         };
+        if manifest.content_hash == intrinsic_empty_content_hash() {
+            content_store_perf_trace(format_args!(
+                "blob-only-write object={} version={} bytes=0 existing_manifest=false intrinsic_empty=true hash_ms={} manifest_check_ms={} total_ms={}",
+                object_id,
+                version,
+                hash_ms,
+                manifest_check_ms,
+                trace_started.elapsed().as_millis()
+            ));
+            return Ok(manifest);
+        }
         self.ensure_content_reservation(
             &manifest.object_id,
             &manifest.version,
@@ -8908,6 +8968,77 @@ mod tests {
             store.read_manifest("object-blob-only-b", "v1").is_err(),
             "blob-only batch writes should not create per-object manifests"
         );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn empty_blob_only_versions_are_intrinsic_without_storage_or_reservations() {
+        let root = temp_root("empty_blob_only_versions_are_intrinsic");
+        let store = LocalContentStore::new(&root).expect("create store");
+        let empty_hash = content_hash(&[]);
+
+        let manifests = store
+            .put_object_version_blobs_only([
+                ("empty-batch-a", "v1", [].as_slice()),
+                ("empty-batch-b", "v1", [].as_slice()),
+            ])
+            .expect("put empty blob-only batch");
+        let direct = store
+            .put_object_version_blob_only("empty-direct", "v1", &[])
+            .expect("put direct empty blob-only version");
+
+        assert_eq!(manifests.len(), 2);
+        assert!(
+            manifests
+                .iter()
+                .all(|manifest| manifest.content_hash == empty_hash && manifest.size_bytes == 0)
+        );
+        assert_eq!(direct.content_hash, empty_hash);
+        assert_eq!(direct.size_bytes, 0);
+        assert_eq!(store.read_blob(&empty_hash).expect("read empty blob"), b"");
+        assert_eq!(
+            store
+                .read_blob_range(&empty_hash, 0, usize::MAX)
+                .expect("read empty blob range"),
+            b""
+        );
+        let mut reader = store
+            .open_blob_stream(&empty_hash)
+            .expect("open empty blob stream");
+        let mut streamed = Vec::new();
+        reader
+            .read_to_end(&mut streamed)
+            .expect("stream empty blob");
+        assert_eq!(reader.size_bytes(), 0);
+        assert!(streamed.is_empty());
+        assert!(store.has_blob(&empty_hash).expect("check empty blob"));
+        assert!(
+            store
+                .blob_storage_candidate_exists(&empty_hash)
+                .expect("check empty storage candidate")
+        );
+        assert!(
+            !store
+                .blob_path(&empty_hash)
+                .expect("empty blob path")
+                .exists(),
+            "canonical empty content must not require a physical blob file"
+        );
+        assert!(
+            store
+                .read_packed_blob_index_unlocked()
+                .expect("read packed index")
+                .entries
+                .is_empty(),
+            "canonical empty content must not occupy packed blob storage"
+        );
+        let roots = store
+            .content_reservation_roots()
+            .expect("read content reservations");
+        assert_eq!(roots.reservation_count, 0);
+        assert!(roots.reservations.is_empty());
+        assert!(roots.content_hashes.is_empty());
 
         cleanup(&root);
     }
