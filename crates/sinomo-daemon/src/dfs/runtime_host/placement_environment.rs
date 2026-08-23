@@ -485,21 +485,37 @@ fn sample_os_network_metering() -> sinomo_dfs::DfsNetworkMetering {
     }
     #[cfg(target_os = "windows")]
     {
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -or $_.IPv6Connectivity -ne 'Disconnected'} | Select-Object -ExpandProperty NetworkCostType",
-        ]);
-        return command_stdout_bounded(command, DAEMON_DFS_METERING_COMMAND_TIMEOUT)
-            .map(|output| parse_windows_network_cost(&output))
-            .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
+        return command_stdout_bounded(
+            windows_network_metering_command(),
+            DAEMON_DFS_METERING_COMMAND_TIMEOUT,
+        )
+        .map(|output| parse_windows_network_cost(&output))
+        .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         sinomo_dfs::DfsNetworkMetering::Unknown
     }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_network_metering_command() -> Command {
+    let mut command = Command::new("powershell.exe");
+    // The daemon normally has no attached console, so starting a console
+    // program without Windows creation flags flashes a foreground window.
+    // Keep both the process-level flag and PowerShell's own window policy so
+    // this periodic observation remains invisible to the interactive user.
+    crate::prepare_noninteractive_command(&mut command);
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-Command",
+        "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -or $_.IPv6Connectivity -ne 'Disconnected'} | Select-Object -ExpandProperty NetworkCostType",
+    ]);
+    command
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -624,5 +640,21 @@ mod tests {
             parse_network_manager_metering("GENERAL.STATE:100 (connected)\nGENERAL.METERED:yes\n"),
             sinomo_dfs::DfsNetworkMetering::Metered
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_metering_probe_is_hidden_and_noninteractive() {
+        use std::ffi::OsStr;
+
+        let command = windows_network_metering_command();
+        assert_eq!(command.get_program(), OsStr::new("powershell.exe"));
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|args| { args == [OsStr::new("-WindowStyle"), OsStr::new("Hidden")] })
+        );
+        assert!(args.contains(&OsStr::new("-NonInteractive")));
+        assert!(args.contains(&OsStr::new("Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -or $_.IPv6Connectivity -ne 'Disconnected'} | Select-Object -ExpandProperty NetworkCostType")));
     }
 }
