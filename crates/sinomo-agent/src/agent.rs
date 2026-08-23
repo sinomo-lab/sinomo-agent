@@ -2969,6 +2969,10 @@ pub enum AgentModelEvent {
         step_index: usize,
         delta: String,
     },
+    AssistantReasoningDelta {
+        step_index: usize,
+        delta: String,
+    },
     AssistantReasoningSummary {
         step_index: usize,
         summary: String,
@@ -3037,6 +3041,12 @@ impl AgentModelEvent {
             }),
             LanguageModelStreamEvent::TextDelta { delta } => {
                 (!delta.is_empty()).then(|| Self::AssistantTextDelta {
+                    step_index,
+                    delta: delta.clone(),
+                })
+            }
+            LanguageModelStreamEvent::ReasoningDelta { delta } => {
+                Some(Self::AssistantReasoningDelta {
                     step_index,
                     delta: delta.clone(),
                 })
@@ -3126,6 +3136,9 @@ impl AgentModelEvent {
                         saw_text_delta = true;
                         events.push(AgentModelEvent::AssistantTextDelta { step_index, delta });
                     }
+                }
+                LanguageModelStreamEvent::ReasoningDelta { delta } => {
+                    events.push(AgentModelEvent::AssistantReasoningDelta { step_index, delta });
                 }
                 LanguageModelStreamEvent::ReasoningSummary { summary } => {
                     events.push(AgentModelEvent::AssistantReasoningSummary {
@@ -3285,6 +3298,9 @@ impl AgentModelEvent {
                         saw_text_delta = true;
                         events.push(AgentModelEvent::AssistantTextDelta { step_index, delta });
                     }
+                }
+                LanguageModelStreamEvent::ReasoningDelta { delta } => {
+                    events.push(AgentModelEvent::AssistantReasoningDelta { step_index, delta });
                 }
                 LanguageModelStreamEvent::ReasoningSummary { summary } => {
                     events.push(AgentModelEvent::AssistantReasoningSummary {
@@ -13368,6 +13384,9 @@ mod tests {
                         provider: "fake".to_string(),
                         model: "fake".to_string(),
                     },
+                    LanguageModelStreamEvent::ReasoningDelta {
+                        delta: "checking ".to_string(),
+                    },
                     LanguageModelStreamEvent::ReasoningSummary {
                         summary: "checking workspace".to_string(),
                     },
@@ -13408,6 +13427,13 @@ mod tests {
 
         let run = agent.run(&agent_input("inspect")).expect("run");
 
+        assert!(run.model_events.iter().any(|event| {
+            matches!(
+                event,
+                AgentModelEvent::AssistantReasoningDelta { delta, .. }
+                    if delta == "checking "
+            )
+        }));
         assert!(run.model_events.iter().any(|event| {
             matches!(
                 event,

@@ -2814,6 +2814,10 @@ impl TuiState {
                 }
                 self.append_streamed_message(TuiMessageKind::Agent, &delta, "streaming");
             }
+            AgentModelEvent::AssistantReasoningDelta { delta, .. } => {
+                self.runtime_activity.active = true;
+                self.append_streamed_message(TuiMessageKind::Thinking, &delta, "streaming");
+            }
             AgentModelEvent::AssistantReasoningSummary { summary, .. } => {
                 self.runtime_activity.active = true;
                 self.append_streamed_message(TuiMessageKind::Thinking, &summary, "streaming");

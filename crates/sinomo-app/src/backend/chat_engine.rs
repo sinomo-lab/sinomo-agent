@@ -171,6 +171,21 @@ pub enum ChatEvent {
         session_id: String,
         text: String,
     },
+    AssistantTextDelta {
+        session_id: String,
+        step_index: usize,
+        text: String,
+    },
+    ReasoningSummary {
+        session_id: String,
+        step_index: usize,
+        summary: String,
+    },
+    ReasoningDelta {
+        session_id: String,
+        step_index: usize,
+        delta: String,
+    },
     AgentToken {
         session_id: String,
         speaker: ChatSpeaker,
@@ -237,6 +252,9 @@ impl ChatEvent {
     pub fn session_id(&self) -> Option<&str> {
         match self {
             ChatEvent::Token { session_id, .. }
+            | ChatEvent::AssistantTextDelta { session_id, .. }
+            | ChatEvent::ReasoningDelta { session_id, .. }
+            | ChatEvent::ReasoningSummary { session_id, .. }
             | ChatEvent::AgentToken { session_id, .. }
             | ChatEvent::Notice { session_id, .. }
             | ChatEvent::SystemMessage { session_id, .. }
@@ -845,9 +863,9 @@ fn worker(
                 let mut answer = String::new();
                 let result = chat.send(&input, &mut |event| {
                     match &event {
-                        ChatStreamEvent::Token(text) | ChatStreamEvent::AgentToken { text, .. } => {
-                            answer.push_str(text)
-                        }
+                        ChatStreamEvent::Token(text)
+                        | ChatStreamEvent::AssistantTextDelta { text, .. }
+                        | ChatStreamEvent::AgentToken { text, .. } => answer.push_str(text),
                         _ => {}
                     }
                     if let Some(event) = map_chat_stream_event(event, &event_session_id) {
@@ -1083,6 +1101,26 @@ fn map_chat_stream_event(event: ChatStreamEvent, session_id: &str) -> Option<Cha
         ChatStreamEvent::Token(text) => Some(ChatEvent::Token {
             session_id: session_id.to_string(),
             text,
+        }),
+        ChatStreamEvent::AssistantTextDelta { step_index, text } => {
+            Some(ChatEvent::AssistantTextDelta {
+                session_id: session_id.to_string(),
+                step_index,
+                text,
+            })
+        }
+        ChatStreamEvent::ReasoningDelta { step_index, delta } => Some(ChatEvent::ReasoningDelta {
+            session_id: session_id.to_string(),
+            step_index,
+            delta,
+        }),
+        ChatStreamEvent::ReasoningSummary {
+            step_index,
+            summary,
+        } => Some(ChatEvent::ReasoningSummary {
+            session_id: session_id.to_string(),
+            step_index,
+            summary,
         }),
         ChatStreamEvent::AgentToken { speaker, text } => Some(ChatEvent::AgentToken {
             session_id: speaker.channel_id.clone(),

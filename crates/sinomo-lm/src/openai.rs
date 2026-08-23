@@ -1000,6 +1000,7 @@ pub(crate) fn stream_openai_responses_response(
 ) -> Result<LanguageModelResponse, LanguageModelError> {
     let mut output = Vec::new();
     let mut output_text = String::new();
+    let mut emitted_reasoning_delta = false;
     let mut completed_response = None;
     let mut emitted_text = false;
     let mut emitted_finished = false;
@@ -1035,6 +1036,18 @@ pub(crate) fn stream_openai_responses_response(
                     });
                 }
             }
+            "response.reasoning_summary_text.delta"
+            | "response.reasoning_summary.delta"
+            | "response.reasoning_text.delta" => {
+                if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str)
+                    && !delta.is_empty()
+                {
+                    emitted_reasoning_delta = true;
+                    on_event(LanguageModelStreamEvent::ReasoningDelta {
+                        delta: delta.to_string(),
+                    });
+                }
+            }
             "response.output_item.done" => {
                 if let Some(item) = value.get("item") {
                     if let Some(call) = openai_output_item_tool_call(item) {
@@ -1047,6 +1060,11 @@ pub(crate) fn stream_openai_responses_response(
                             name: call.name,
                             input: call.input,
                         });
+                    }
+                    if !emitted_reasoning_delta {
+                        for summary in openai_reasoning_summaries(item) {
+                            on_event(LanguageModelStreamEvent::ReasoningSummary { summary });
+                        }
                     }
                     output.push(item.clone());
                 }
@@ -1118,11 +1136,16 @@ pub(crate) fn stream_openai_responses_response(
         });
     }
     let tool_calls = extract_openai_tool_calls(&final_response);
-    let items = tool_calls
-        .iter()
-        .cloned()
-        .map(|call| LanguageModelResponseItem::ToolCall { call })
-        .collect();
+    let mut items = extract_openai_reasoning_summaries(&final_response)
+        .into_iter()
+        .map(|summary| LanguageModelResponseItem::ReasoningSummary { summary })
+        .collect::<Vec<_>>();
+    items.extend(
+        tool_calls
+            .iter()
+            .cloned()
+            .map(|call| LanguageModelResponseItem::ToolCall { call }),
+    );
     let usage = extract_openai_usage(&final_response);
     if !emitted_finished {
         if let Some(usage) = &usage {
@@ -1189,6 +1212,34 @@ pub(crate) fn extract_openai_tool_calls(value: &serde_json::Value) -> Vec<Langua
         .into_iter()
         .flatten()
         .filter_map(openai_output_item_tool_call)
+        .collect()
+}
+
+fn extract_openai_reasoning_summaries(value: &serde_json::Value) -> Vec<String> {
+    value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(openai_reasoning_summaries)
+        .collect()
+}
+
+fn openai_reasoning_summaries(item: &serde_json::Value) -> Vec<String> {
+    if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+        return Vec::new();
+    }
+    item.get("summary")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            part.as_str()
+                .or_else(|| part.get("text").and_then(serde_json::Value::as_str))
+                .or_else(|| part.get("summary").and_then(serde_json::Value::as_str))
+        })
+        .map(str::to_string)
+        .filter(|summary| !summary.trim().is_empty())
         .collect()
 }
 
