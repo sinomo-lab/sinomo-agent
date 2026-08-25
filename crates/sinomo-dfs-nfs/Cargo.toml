@@ -1,0 +1,32 @@
+[package]
+name = "sinomo-dfs-nfs"
+version.workspace = true
+description = "Direct, zero-projection NFSv3 mount adapter for Sinomo DFS/SIFS"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+blake3.workspace = true
+nfs3_server.workspace = true
+notify.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sinomo-api = { path = "../sinomo-api" }
+sinomo-config = { path = "../sinomo-config" }
+sinomo-core = { path = "../sinomo-core" }
+sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-module = { path = "../sinomo-module" }
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+nfs3_client = { workspace = true, features = ["tokio"] }
+sinomo-testdir = { path = "../sinomo-testdir" }

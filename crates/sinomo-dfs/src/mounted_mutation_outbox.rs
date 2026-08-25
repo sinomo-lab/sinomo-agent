@@ -78,6 +78,7 @@ pub type MountedSifsMutationArmRequestId = Id;
 pub enum MountedSifsMutationAdapter {
     Fuse,
     CloudFiles,
+    Nfs,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

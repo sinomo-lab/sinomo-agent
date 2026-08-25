@@ -73,6 +73,7 @@ trust model, state ownership, execution model, and invariants.
 | Cluster identity, membership, KV/Raft authority, and failure | [Clustering](clustering-architecture.md) |
 | Direct links, connectivity, routed streams, relays, and object RPC | [Network](network-architecture.md) |
 | DFS metadata, content, placement, replication, repair, and POSIX semantics | [DFS](dfs-architecture.md) |
+| Direct SIFS NFSv3 presentation and Windows drive mapping | [NFSv3](nfs-architecture.md) |
 | Windows SIFS projection, hydration, writeback, reconciliation, and recovery | [Windows Cloud Files](cloud-files-architecture.md) |
 | Indexed-file memory, retrieval, overlays, maintenance, and scope | [Memory](memory-architecture.md) |
 | Module identity, compatibility, activation, observation, and replacement | [Module lifecycle](module-lifecycle-architecture.md) |

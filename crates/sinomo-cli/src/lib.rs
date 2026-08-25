@@ -1484,14 +1484,20 @@ pub(crate) fn with_cli_force_local_mode<T>(force_local: bool, f: impl FnOnce() -
     f()
 }
 
-pub fn default_cli_command_registry() -> CliCommandRegistry {
-    let local_data_dir = SinomoDataDir::from_env_or_home().ok();
+fn default_module_cli_command_config(
+    local_data_dir: Option<&SinomoDataDir>,
+) -> sinomo_runtime::module::ModuleCliCommandConfig {
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
         .with_toggleable_native_rust_module_name(
             sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
             "distributed filesystem provider module",
         )
         .expect("DFS module id is valid")
+        .with_toggleable_native_rust_module_name(
+            sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
+            "direct SIFS NFS mount module",
+        )
+        .expect("NFS module id is valid")
         .with_toggleable_native_rust_module_name(
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
             "operational observation module",
@@ -1503,7 +1509,6 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
                 sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION,
         });
     let module_config = local_data_dir
-        .as_ref()
         .and_then(|data_dir| {
             module_config
                 .clone()
@@ -1511,6 +1516,12 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
                 .ok()
         })
         .unwrap_or(module_config);
+    module_config
+}
+
+pub fn default_cli_command_registry() -> CliCommandRegistry {
+    let local_data_dir = SinomoDataDir::from_env_or_home().ok();
+    let module_config = default_module_cli_command_config(local_data_dir.as_ref());
     let mut registry = CliCommandRegistry::new()
         .register(help_cli_command_handler())
         .register(cluster_cli_command_handler())

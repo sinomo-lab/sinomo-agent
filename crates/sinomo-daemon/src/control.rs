@@ -1170,9 +1170,13 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             )),
         ));
     }
+    let mut lifecycle_modules = vec![sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY];
+    if crate::service_adapter::nfs_module_should_register(&paths) {
+        lifecycle_modules.push(sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY);
+    }
     runtime_tasks.extend(
         crate::registry::start_internal_native_rust_module_runtime_tasks(
-            [sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY],
+            lifecycle_modules,
             &paths,
             &daemon_runtime_handle,
             shutdown_rx.clone(),

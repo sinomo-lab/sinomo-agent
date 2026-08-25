@@ -228,15 +228,28 @@ impl DaemonDefaultDfsReconciliationReactor {
             // the projection generation.
             let locally_owned_pending_handoff =
                 daemon_default_dfs_locally_owned_pending_handoff(expected_node_id, &work.inputs);
-            match ensure_default_distributed_dfs_outcome_async_on_runtime(
+            let lifecycle_outcome = match ensure_default_distributed_dfs_outcome_async_on_runtime(
                 paths,
                 options,
                 publish_cluster_control,
                 runtime.clone(),
                 foreground_preemptible,
             )
-            .await?
+            .await
             {
+                Ok(outcome) => outcome,
+                Err(lifecycle_error) => {
+                    if let Some(recovery_error) = deferred_recovery_error {
+                        tracing::warn!(
+                            target: "sinomo.dfs.placement",
+                            "default SIFS lifecycle also failed while prior-process placement authority recovery remains pending: {lifecycle_error}"
+                        );
+                        return Err(recovery_error);
+                    }
+                    return Err(lifecycle_error);
+                }
+            };
+            match lifecycle_outcome {
                 DaemonDefaultDfsLifecycleOutcome::Completed => {
                     if let Some(handoff) = locally_owned_pending_handoff {
                         self.park_default_reconciliation(&work, handoff);

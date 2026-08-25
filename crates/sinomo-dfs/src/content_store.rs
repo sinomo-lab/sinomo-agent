@@ -1437,6 +1437,21 @@ impl LocalContentStore {
         Ok(true)
     }
 
+    pub(crate) fn release_all_content_reservations_for_runtime_probe(&self) -> Result<u64> {
+        let _lock = self.lock_content_reservations_for_write()?;
+        let inventory = self.read_content_reservation_inventory_unlocked()?;
+        let resolved_identities = inventory
+            .reservations
+            .iter()
+            .map(|reservation| reservation.identity.clone())
+            .collect::<BTreeSet<_>>();
+        let released = resolved_identities.len() as u64;
+        if released != 0 {
+            self.apply_content_reservation_resolutions_unlocked(&inventory, &resolved_identities)?;
+        }
+        Ok(released)
+    }
+
     /// Test-support hook for releasing a fixture reservation.
     ///
     /// Production callers cannot assert catalog coverage directly; only the
@@ -7650,6 +7665,191 @@ fn write_content_addressed_blob_bytes_prehashed_defer_dir_sync_inner(
     Ok(deferred_sync_dir)
 }
 
+impl LocalContentStore {
+    pub(crate) fn run_version_gc_runtime_probe(
+        root: &Path,
+        options: crate::DfsContentVersionGcRuntimeProbeOptions,
+    ) -> std::result::Result<crate::DfsContentVersionGcRuntimeProbeReport, crate::DfsError> {
+        if options.version_count < 2 {
+            return Err(crate::DfsError::ContentStore {
+                message: "content-version GC runtime probe requires at least two versions"
+                    .to_string(),
+            });
+        }
+        if options.write_batch_size == 0 {
+            return Err(crate::DfsError::ContentStore {
+                message: "content-version GC runtime probe write batch size must be positive"
+                    .to_string(),
+            });
+        }
+        if root.exists()
+            && fs::read_dir(root)
+                .map_err(|source| ContentStoreError::Io {
+                    path: root.to_path_buf(),
+                    source,
+                })?
+                .next()
+                .is_some()
+        {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime probe requires an empty root: {}",
+                    root.display()
+                ),
+            });
+        }
+
+        let total_started = Instant::now();
+        let store = Self::new(root)?;
+        let write_started = Instant::now();
+        for batch_start in (0..options.version_count).step_by(options.write_batch_size) {
+            let batch_end = batch_start
+                .saturating_add(options.write_batch_size)
+                .min(options.version_count);
+            let versions = (batch_start..batch_end)
+                .map(|index| format!("version_{index:06}"))
+                .collect::<Vec<_>>();
+            let payloads = (batch_start..batch_end)
+                .map(|index| {
+                    let mut payload = [0_u8; 128];
+                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
+                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
+                            as u8)
+                            .rotate_left((offset % 8) as u32);
+                    }
+                    payload
+                })
+                .collect::<Vec<_>>();
+            store.put_object_versions(versions.iter().zip(&payloads).map(
+                |(version, payload)| {
+                    (
+                        "content-version-gc-runtime-probe-object",
+                        version.as_str(),
+                        payload.as_slice(),
+                    )
+                },
+            ))?;
+        }
+        let write_elapsed = write_started.elapsed();
+
+        let reservation_release_started = Instant::now();
+        store.release_all_content_reservations_for_runtime_probe()?;
+        let reservation_release_elapsed = reservation_release_started.elapsed();
+        let remaining_reservations = store.content_reservation_roots()?.reservation_count;
+        if remaining_reservations != 0 {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime probe retained {remaining_reservations} fixture reservations after simulated catalog coverage"
+                ),
+            });
+        }
+
+        let projection_started = Instant::now();
+        let projection =
+            store.collect_versions(ContentStoreVersionGcOptions::dry_run(Duration::ZERO, 1))?;
+        let projection_elapsed = projection_started.elapsed();
+        let expected_deleted = options.version_count.saturating_sub(1) as u64;
+        if projection.eligible_version_count != expected_deleted {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime projection found {} eligible versions, expected {expected_deleted}",
+                    projection.eligible_version_count
+                ),
+            });
+        }
+
+        let observed = store.collect_versions(
+            ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                .with_min_absence_age(Duration::ZERO)
+                .with_catalog_observation("runtime-probe-catalog-generation-1", 1),
+        )?;
+        if observed.deleted_version_count != 0
+            || observed.persisted_absence_observation_count
+                != observed.newly_observed_absent_version_count
+        {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime observation was not a durable no-delete pass: {observed:?}"
+                ),
+            });
+        }
+
+        let gc_started = Instant::now();
+        let report = store.collect_versions(
+            ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                .with_catalog_observation("runtime-probe-catalog-generation-2", u64::MAX),
+        )?;
+        let gc_elapsed = gc_started.elapsed();
+        if report.deleted_version_count != expected_deleted {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime probe deleted {} versions, expected {expected_deleted}",
+                    report.deleted_version_count
+                ),
+            });
+        }
+        let expected_delete_batches = options
+            .version_count
+            .saturating_sub(1)
+            .div_ceil(VERSION_GC_DELETE_BATCH_SIZE) as u64;
+        if report.durable_delete_batch_count != expected_delete_batches
+            || report.durable_directory_sync_count != 1
+        {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime durability amplification changed: batches={} expected={expected_delete_batches} directory_syncs={} expected=1",
+                    report.durable_delete_batch_count, report.durable_directory_sync_count
+                ),
+            });
+        }
+        let retained_manifest_count = store
+            .manifests_for_object("content-version-gc-runtime-probe-object")?
+            .len() as u64;
+        if retained_manifest_count != 1 {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime probe retained {retained_manifest_count} manifests, expected 1"
+                ),
+            });
+        }
+
+        drop(store);
+        let restart_started = Instant::now();
+        let reopened = Self::new(root)?;
+        let restart_elapsed = restart_started.elapsed();
+        let reopened_manifest_count = reopened
+            .manifests_for_object("content-version-gc-runtime-probe-object")?
+            .len() as u64;
+        if reopened_manifest_count != 1 {
+            return Err(crate::DfsError::ContentStore {
+                message: format!(
+                    "content-version GC runtime probe reopened with {reopened_manifest_count} manifests, expected 1"
+                ),
+            });
+        }
+
+        Ok(crate::DfsContentVersionGcRuntimeProbeReport {
+            version_count: options.version_count as u64,
+            write_elapsed_ms: write_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            reservation_release_elapsed_ms: reservation_release_elapsed
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            projection_elapsed_ms: projection_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            gc_elapsed_ms: gc_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            restart_elapsed_ms: restart_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+            total_elapsed_ms: total_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            deleted_version_count: report.deleted_version_count,
+            durable_delete_batch_count: report.durable_delete_batch_count,
+            durable_directory_sync_count: report.durable_directory_sync_count,
+            retained_manifest_count,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10156,103 +10356,6 @@ mod tests {
                 .is_healthy()
         );
 
-        cleanup(&root);
-    }
-
-    #[test]
-    #[ignore = "manual 10k version-manifest GC throughput probe"]
-    fn content_version_gc_10k_throughput_probe() {
-        const VERSION_COUNT: usize = 10_000;
-        const WRITE_BATCH_SIZE: usize = 4_096;
-
-        let root = temp_root("content-version-gc-10k-throughput");
-        let store = LocalContentStore::new(&root).expect("create store");
-        let write_started = Instant::now();
-        for batch_start in (0..VERSION_COUNT).step_by(WRITE_BATCH_SIZE) {
-            let batch_end = batch_start
-                .saturating_add(WRITE_BATCH_SIZE)
-                .min(VERSION_COUNT);
-            let versions = (batch_start..batch_end)
-                .map(|index| format!("version_{index:06}"))
-                .collect::<Vec<_>>();
-            let payloads = (batch_start..batch_end)
-                .map(|index| {
-                    let mut payload = [0_u8; 128];
-                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
-                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
-                            as u8)
-                            .rotate_left((offset % 8) as u32);
-                    }
-                    payload
-                })
-                .collect::<Vec<_>>();
-            store
-                .put_object_versions(versions.iter().zip(&payloads).map(|(version, payload)| {
-                    (
-                        "content-version-gc-throughput-object",
-                        version.as_str(),
-                        payload.as_slice(),
-                    )
-                }))
-                .expect("write throughput fixture");
-        }
-        let write_elapsed = write_started.elapsed();
-        release_all_content_reservations(&store);
-
-        let projection_started = Instant::now();
-        let projection = store
-            .collect_versions(ContentStoreVersionGcOptions::dry_run(Duration::ZERO, 1))
-            .expect("project throughput fixture");
-        let projection_elapsed = projection_started.elapsed();
-        assert_eq!(
-            projection.eligible_version_count,
-            (VERSION_COUNT - 1) as u64
-        );
-        observe_collectible_versions(&store, 1);
-
-        let gc_started = Instant::now();
-        let report = store
-            .collect_versions(
-                ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
-                    .with_catalog_observation("test-catalog-generation-2", u64::MAX),
-            )
-            .expect("collect throughput fixture");
-        let gc_elapsed = gc_started.elapsed();
-        eprintln!(
-            "content-version-gc-throughput versions={} write_ms={} projection_ms={} gc_ms={} deleted={} delete_groups={} directory_syncs={}",
-            VERSION_COUNT,
-            write_elapsed.as_millis(),
-            projection_elapsed.as_millis(),
-            gc_elapsed.as_millis(),
-            report.deleted_version_count,
-            report.durable_delete_batch_count,
-            report.durable_directory_sync_count,
-        );
-
-        assert_eq!(report.deleted_version_count, (VERSION_COUNT - 1) as u64);
-        assert_eq!(
-            report.durable_delete_batch_count,
-            (VERSION_COUNT - 1).div_ceil(VERSION_GC_DELETE_BATCH_SIZE) as u64
-        );
-        assert_eq!(report.durable_directory_sync_count, 1);
-        assert_eq!(
-            store
-                .manifests_for_object("content-version-gc-throughput-object")
-                .expect("read retained manifests")
-                .len(),
-            1
-        );
-
-        drop(store);
-        let reopened = LocalContentStore::new(&root).expect("reopen store");
-        assert_eq!(
-            reopened
-                .manifests_for_object("content-version-gc-throughput-object")
-                .expect("read retained manifests after restart")
-                .len(),
-            1
-        );
         cleanup(&root);
     }
 

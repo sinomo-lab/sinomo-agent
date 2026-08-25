@@ -27,6 +27,7 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
 sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-eval = { path = "../sinomo-eval" }
 sinomo-installer = { path = "../sinomo-installer" }

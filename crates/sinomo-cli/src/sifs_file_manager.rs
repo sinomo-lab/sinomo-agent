@@ -8373,6 +8373,15 @@ mod tests {
             preferred_for_commit: false,
             required,
             forbidden: false,
+            storage_health: None,
+            storage_freshness: None,
+            usable_capacity_bytes: None,
+            reserved_free_bytes: None,
+            path_state: None,
+            path_latency_micros: None,
+            path_throughput_bytes_per_second: None,
+            path_metering: None,
+            observation_freshness: None,
             explanation: String::new(),
         }
     }

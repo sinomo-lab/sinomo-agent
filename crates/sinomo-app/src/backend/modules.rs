@@ -142,6 +142,7 @@ impl Backend {
         node_id: &str,
         module_id: &str,
         enabled: Option<bool>,
+        native_rust: bool,
     ) -> Result<(), String> {
         if self.module_config_node_is_local(node_id) {
             self.set_local_module_override(module_id, enabled)?;
@@ -151,7 +152,7 @@ impl Backend {
             self.set_remote_node_module_config(node_id, &config)?;
         }
         if let Some(enabled) = enabled
-            && native_rust_module_is_toggleable(module_id)
+            && native_rust
         {
             self.set_node_native_rust_module_enabled(node_id, module_id, enabled)?;
         }
@@ -461,6 +462,37 @@ impl Backend {
         {
             module.backend = "native-dylib".to_string();
             module.detail = "Privileged node administration module".to_string();
+        }
+
+        match self.config.catalog(None) {
+            Ok(definitions) => {
+                for definition in definitions {
+                    let Some(module_id) = definition.module_id.as_deref() else {
+                        continue;
+                    };
+                    insert_module_summary(
+                        &mut modules,
+                        module_id,
+                        "settings",
+                        "Module-owned settings surface",
+                    );
+                    let matching = modules
+                        .keys()
+                        .find(|existing| module_ids_match(existing, module_id))
+                        .cloned();
+                    if let Some(module) = matching.and_then(|key| modules.get_mut(&key)) {
+                        if let Some(label) = definition.module_label {
+                            module.label = label;
+                        }
+                        if let Some(description) = definition.module_description {
+                            module.detail = description;
+                        }
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!(
+                "module settings presentation metadata unavailable: {error}"
+            )),
         }
 
         let selected_is_local = selected_node.is_some_and(|node| node.summary.local);
@@ -797,15 +829,6 @@ fn parse_module_id(module_id: &str) -> Result<sinomo_runtime::module::ModuleId, 
         .map_err(|error| format!("invalid module id `{module_id}`: {error}"))
 }
 
-pub(crate) fn native_rust_module_is_toggleable(module_id: &str) -> bool {
-    [
-        sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
-        sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
-    ]
-    .into_iter()
-    .any(|toggleable| module_ids_match(module_id, toggleable))
-}
-
 fn module_label(module_id: &str) -> String {
     match module_id {
         "module.observe" => return "Observability".to_string(),
@@ -870,6 +893,24 @@ mod tests {
     }
 
     #[test]
+    fn catalog_uses_module_registered_nfs_presentation() {
+        let backend = Backend::local_fallback();
+        let snapshot = backend.module_config_snapshot(None);
+        let nfs = snapshot
+            .modules
+            .iter()
+            .find(|module| {
+                module_ids_match(
+                    &module.module_id,
+                    sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
+                )
+            })
+            .expect("NFS module settings card");
+        assert_eq!(nfs.label, sinomo_runtime::dfs_nfs::NFS_MODULE_LABEL);
+        assert_eq!(nfs.detail, sinomo_runtime::dfs_nfs::NFS_MODULE_DESCRIPTION);
+    }
+
+    #[test]
     fn local_dfs_node_override_persists_native_rust_enablement() {
         let backend = Backend::local_fallback();
         let node_id = backend.node.node_id.to_string();
@@ -879,6 +920,7 @@ mod tests {
                 &node_id,
                 sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
                 Some(false),
+                true,
             )
             .expect("disable DFS from module settings");
 
@@ -899,6 +941,24 @@ mod tests {
                 })
                 .map(|setting| setting.enabled),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn local_nfs_node_override_uses_generic_native_rust_path() {
+        let backend = Backend::local_fallback();
+        let node_id = backend.node.node_id.to_string();
+        backend
+            .set_node_module_override(
+                &node_id,
+                sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
+                Some(false),
+                true,
+            )
+            .expect("disable NFS module from generic settings path");
+        assert!(
+            !sinomo_runtime::dfs_nfs::nfs_module_enabled(&backend.data_dir)
+                .expect("read NFS native Rust state")
         );
     }
 

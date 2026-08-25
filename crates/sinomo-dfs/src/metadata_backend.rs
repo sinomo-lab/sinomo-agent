@@ -119,9 +119,13 @@ use crate::metadata_visible_commit::{
     visible_commit_record_from_parts, visible_commit_recovery_order, visible_commit_should_recover,
     visible_commit_table_ops, visible_object_location_recovery_ops,
 };
-use crate::{DfsFileSystem, DfsObjectKind, DfsObjectMetadata, namespace_transaction_id_for_batch};
+use crate::{
+    ContentStoreGcOptions, ContentStoreVersionGcOptions, DfsError, DfsFileSystem, DfsObjectKind,
+    DfsObjectMetadata, LocalContentStore, namespace_transaction_id_for_batch,
+};
 use crate::{DfsFileSystemId, DfsObjectId, DfsVersion};
 use crate::{DfsNamespaceOperation, DfsNamespaceResult};
+use sinomo_core::DfsObjectPolicy;
 #[cfg(test)]
 use sinomo_core::DfsWriteReceipt;
 #[cfg(test)]
@@ -141,7 +145,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use time::OffsetDateTime;
 
 // Table-log replay is paid by every full SIFS service open. Keep the active
@@ -11769,6 +11773,434 @@ impl LocalSobjMetadataBackend {
         Ok(())
     }
 
+    pub(crate) fn run_history_gc_runtime_probe(
+        root: &Path,
+        options: crate::DfsMetadataHistoryGcRuntimeProbeOptions,
+    ) -> std::result::Result<crate::DfsMetadataHistoryGcRuntimeProbeReport, DfsError> {
+        const MAX_RETAINED_METADATA_RECORDS: u64 = 32;
+        const MAX_RETAINED_METADATA_BYTES: u64 = 256 * 1024;
+        const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+        const MAX_CONTENT_STORE_BYTES: u64 = 4 * 1024 * 1024;
+
+        let failed = |message: String| DfsError::Metadata { message };
+        if options.overwrite_count < 2 {
+            return Err(failed(
+                "metadata-history GC runtime probe requires at least two overwrites".to_string(),
+            ));
+        }
+        if options.content_batch_size == 0 || options.gc_batch_size == 0 {
+            return Err(failed(
+                "metadata-history GC runtime probe batch sizes must be positive".to_string(),
+            ));
+        }
+        if root.exists()
+            && fs::read_dir(root)
+                .map_err(|source| failed(format!("read probe root {}: {source}", root.display())))?
+                .next()
+                .is_some()
+        {
+            return Err(failed(format!(
+                "metadata-history GC runtime probe requires an empty root: {}",
+                root.display()
+            )));
+        }
+
+        let total_started = Instant::now();
+        let node = NodeId::from_legacy_named("node_metadata_history_runtime_probe")
+            .map_err(|source| failed(format!("construct probe node id: {source}")))?;
+        let file_system_id = DfsFileSystemId::from_legacy_named("sifs")
+            .map_err(|source| failed(format!("construct probe filesystem id: {source}")))?;
+        let object_id = DfsObjectId::from_legacy_named("obj_metadata_history_runtime_probe")
+            .map_err(|source| failed(format!("construct probe object id: {source}")))?;
+        let shard_id = DfsMetadataShardId::new("root");
+        let file_system = DfsFileSystem {
+            file_system_id: file_system_id.clone(),
+            display_name: "metadata history runtime probe".to_string(),
+            owner_node_id: node.clone(),
+            subtree_policies: Vec::new(),
+        };
+        let initial_version = DfsVersion::from_legacy_named("version_churn_000000")
+            .map_err(|source| failed(format!("construct initial probe version: {source}")))?;
+        let mut current = DfsObjectMetadata {
+            object_id: object_id.clone(),
+            file_system_id: file_system_id.clone(),
+            path: "/runtime-probes/metadata-history.bin".to_string(),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: node.clone(),
+            current_locations: vec![node.clone()],
+            content_hash: None,
+            content_size_bytes: Some(128),
+            link_target_object_id: None,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version: initial_version,
+            policy: DfsObjectPolicy::ReplicatedEventual,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        };
+
+        let content_root = root.join("content");
+        let content = LocalContentStore::new(&content_root)?;
+        let mut mutations = Vec::with_capacity(
+            options
+                .overwrite_count
+                .saturating_add(options.namespace_request_count),
+        );
+        let content_write_started = Instant::now();
+        let mut distinct_content_hashes = BTreeSet::new();
+        for batch_start in (0..options.overwrite_count).step_by(options.content_batch_size) {
+            let batch_end = batch_start
+                .saturating_add(options.content_batch_size)
+                .min(options.overwrite_count);
+            let versions = (batch_start..batch_end)
+                .map(|index| {
+                    DfsVersion::from_legacy_named(format!("version_churn_{index:06}"))
+                        .map_err(|source| failed(format!("construct probe version: {source}")))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let payloads = (batch_start..batch_end)
+                .map(|index| {
+                    let mut payload = [0_u8; 128];
+                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
+                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
+                            as u8)
+                            .rotate_left((offset % 8) as u32);
+                    }
+                    payload
+                })
+                .collect::<Vec<_>>();
+            let manifests = content.put_object_versions(versions.iter().zip(&payloads).map(
+                |(version, payload)| (object_id.as_str(), version.as_str(), payload.as_slice()),
+            ))?;
+            for (((index, version), payload), manifest) in (batch_start..batch_end)
+                .zip(versions)
+                .zip(payloads)
+                .zip(manifests)
+            {
+                if !distinct_content_hashes.insert(manifest.content_hash.clone()) {
+                    return Err(failed(format!(
+                        "metadata-history GC overwrite {index} did not produce unique content"
+                    )));
+                }
+                if index + 1 == options.overwrite_count {
+                    current.version = version.clone();
+                    current.content_hash = Some(manifest.content_hash.clone());
+                }
+                mutations.push(DfsMetadataMutation::put_version(&DfsObjectVersionRecord {
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    version,
+                    content_hash: Some(manifest.content_hash),
+                    size_bytes: Some(payload.len() as u64),
+                    locations: current.current_locations.clone(),
+                    created_by_event_id: None,
+                    created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index as i64),
+                    visible: true,
+                }));
+            }
+        }
+        if distinct_content_hashes.len() != options.overwrite_count {
+            return Err(failed(format!(
+                "metadata-history GC produced {} unique hashes for {} overwrites",
+                distinct_content_hashes.len(),
+                options.overwrite_count
+            )));
+        }
+        for index in 0..options.namespace_request_count {
+            let timestamp = OffsetDateTime::from_unix_timestamp(index as i64)
+                .map_err(|source| failed(format!("construct probe timestamp: {source}")))?;
+            let request = DfsNamespaceRequestRecord {
+                file_system_id: file_system_id.clone(),
+                requester_node_id: node.clone(),
+                request_id: format!("runtime-probe-request-{index:06}"),
+                operation_id: format!("runtime-probe-operation-{index:06}"),
+                authority_shard_id: shard_id.clone(),
+                operation: DfsNamespaceOperation::SetMode {
+                    path: format!("/runtime-probes/requests/{index}"),
+                    mode: 0o644,
+                },
+                command_digest: format!("blake3:runtime-probe-request-{index:06}"),
+                status: DfsNamespaceRequestStatus::Completed,
+                result: Some(DfsNamespaceResult::Applied),
+                posix_coordination_result: None,
+                recovery_attempts: 0,
+                last_recovery_error: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            };
+            mutations.push(DfsMetadataMutation::put_namespace_request(&request));
+        }
+        let content_write_elapsed = content_write_started.elapsed();
+
+        let metadata_write_started = Instant::now();
+        let mut backend = Self::new(shard_id.clone(), root)?;
+        backend.put_file_system(&file_system)?;
+        backend.put_object(&current)?;
+        {
+            let _lock = backend.begin_metadata_write()?;
+            let entries = backend.write_journal_entries_unlocked(mutations)?;
+            backend.materialize_written_journal_entries_unlocked(&entries)?;
+        }
+        let metadata_write_elapsed = metadata_write_started.elapsed();
+        let journal_bytes_before = runtime_probe_tree_file_bytes(&root.join("journal"))
+            .map_err(|source| failed(format!("measure pre-GC journal: {source}")))?;
+        backend.compact_metadata_table_log_if_needed(0)?;
+        let snapshot_bytes_before = fs::metadata(metadata_table_snapshot_path(root))
+            .map_err(|source| failed(format!("measure pre-GC snapshot: {source}")))?
+            .len();
+        let content_bytes_before = runtime_probe_tree_file_bytes(&content_root)
+            .map_err(|source| failed(format!("measure pre-GC content: {source}")))?;
+
+        let gc_started = Instant::now();
+        let mut metadata_gc_passes = 0_u64;
+        loop {
+            let report = backend.gc_metadata_history_authoritative(
+                DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
+                    .with_now_unix_nanos(u64::MAX)
+                    .with_max_removals(options.gc_batch_size),
+            )?;
+            metadata_gc_passes = metadata_gc_passes.saturating_add(1);
+            if report.applied_record_count() == 0 {
+                break;
+            }
+            if metadata_gc_passes >= 1_000 {
+                return Err(failed(
+                    "metadata-history GC did not converge within 1,000 bounded passes".to_string(),
+                ));
+            }
+        }
+        let metadata_gc_elapsed = gc_started.elapsed();
+        let protection = backend.metadata_content_protection()?;
+
+        let reservation_release_started = Instant::now();
+        content.release_all_content_reservations_for_runtime_probe()?;
+        let reservation_release_elapsed = reservation_release_started.elapsed();
+        let content_gc_started = Instant::now();
+        let version_gc = content.collect_versions(
+            ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                .with_min_absence_age(Duration::ZERO)
+                .with_catalog_observation("runtime-probe-metadata-catalog-generation-1", 1)
+                .with_protected_versions(
+                    protection
+                        .versions
+                        .iter()
+                        .map(|identity| (identity.object_id.as_str(), identity.version.as_str())),
+                ),
+        )?;
+        let version_gc =
+            if version_gc.deleted_version_count == 0 {
+                content.collect_versions(
+                    ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
+                        .with_min_absence_age(Duration::ZERO)
+                        .with_catalog_observation(
+                            "runtime-probe-metadata-catalog-generation-2",
+                            u64::MAX,
+                        )
+                        .with_protected_versions(protection.versions.iter().map(|identity| {
+                            (identity.object_id.as_str(), identity.version.as_str())
+                        })),
+                )?
+            } else {
+                version_gc
+            };
+        let retained_manifest_count =
+            (options.overwrite_count as u64).saturating_sub(version_gc.deleted_version_count);
+        if !(1..=2).contains(&retained_manifest_count) {
+            return Err(failed(format!(
+                "metadata-history content GC retained {retained_manifest_count} manifests, expected one or two: {version_gc:?}"
+            )));
+        }
+
+        let mut orphan_gc_passes = 0_u64;
+        let mut deleted_orphan_count = 0_u64;
+        let mut reclaimed_packed_segment_bytes = 0_u64;
+        loop {
+            let catalog_sequence = orphan_gc_passes.saturating_add(1);
+            let catalog_observed_at_unix_nanos =
+                u64::MAX.saturating_sub(64).saturating_add(catalog_sequence);
+            let report = content.collect_garbage(
+                ContentStoreGcOptions::delete_eligible(Duration::ZERO)
+                    .with_catalog_observation(
+                        format!("runtime-probe-content-catalog-generation-{catalog_sequence}"),
+                        catalog_observed_at_unix_nanos,
+                    )
+                    .with_protected_content_hashes(
+                        protection.content_hashes.iter().map(String::as_str),
+                    ),
+            )?;
+            orphan_gc_passes = orphan_gc_passes.saturating_add(1);
+            deleted_orphan_count = deleted_orphan_count.saturating_add(report.deleted_orphan_count);
+            reclaimed_packed_segment_bytes = reclaimed_packed_segment_bytes
+                .saturating_add(report.reclaimed_packed_segment_bytes);
+            let work_remains = report.newly_observed_orphan_count != 0
+                || report.eligible_orphan_count != 0
+                || report.stale_orphan_observation_count != 0
+                || report.eligible_packed_segment_count != 0;
+            if !work_remains {
+                break;
+            }
+            if orphan_gc_passes >= 64 {
+                return Err(failed(format!(
+                    "metadata-history packed content GC did not converge within 64 passes: {report:?}"
+                )));
+            }
+        }
+        let content_gc_elapsed = content_gc_started.elapsed();
+        let post_gc = backend.metadata_history_gc_projection(
+            DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1).with_now_unix_nanos(u64::MAX),
+        )?;
+        let shard = post_gc.shards.first().ok_or_else(|| {
+            failed("metadata-history GC projection omitted the root shard".to_string())
+        })?;
+        if post_gc.eligible_record_count() != 0
+            || backend.tables.versions.len() != 1
+            || !backend.tables.namespace_requests.is_empty()
+            || !backend.tables.namespace_request_receipts.is_empty()
+            || backend.tables.namespace_receipt_retention.is_empty()
+        {
+            return Err(failed(format!(
+                "metadata-history GC retained unexpected logical history: projection={post_gc:?} versions={} requests={} receipts={} retention_empty={}",
+                backend.tables.versions.len(),
+                backend.tables.namespace_requests.len(),
+                backend.tables.namespace_request_receipts.len(),
+                backend.tables.namespace_receipt_retention.is_empty()
+            )));
+        }
+        if shard.total_record_count > MAX_RETAINED_METADATA_RECORDS
+            || shard.estimated_serialized_bytes > MAX_RETAINED_METADATA_BYTES
+        {
+            return Err(failed(format!(
+                "metadata-history GC exceeded retained metadata bounds: {shard:?}"
+            )));
+        }
+
+        let journal_bytes_after = runtime_probe_tree_file_bytes(&root.join("journal"))
+            .map_err(|source| failed(format!("measure post-GC journal: {source}")))?;
+        let materialized_table_bytes = fs::metadata(metadata_table_path(root))
+            .map_err(|source| failed(format!("measure post-GC table: {source}")))?
+            .len();
+        let snapshot_bytes_after = fs::metadata(metadata_table_snapshot_path(root))
+            .map_err(|source| failed(format!("measure post-GC snapshot: {source}")))?
+            .len();
+        let content_bytes_after = runtime_probe_tree_file_bytes(&content_root)
+            .map_err(|source| failed(format!("measure post-GC content: {source}")))?;
+        if (journal_bytes_before > MAX_JOURNAL_BYTES && journal_bytes_after >= journal_bytes_before)
+            || (snapshot_bytes_before > MAX_SNAPSHOT_BYTES
+                && snapshot_bytes_after >= snapshot_bytes_before)
+            || (content_bytes_before > MAX_CONTENT_STORE_BYTES
+                && content_bytes_after >= content_bytes_before)
+            || shard.journal_segment_count != 1
+            || journal_bytes_after > MAX_JOURNAL_BYTES
+            || materialized_table_bytes != 0
+            || snapshot_bytes_after > MAX_SNAPSHOT_BYTES
+            || content_bytes_after > MAX_CONTENT_STORE_BYTES
+        {
+            return Err(failed(format!(
+                "metadata-history GC physical bounds failed: journal={journal_bytes_before}->{journal_bytes_after} segments={} table={materialized_table_bytes} snapshot={snapshot_bytes_before}->{snapshot_bytes_after} content={content_bytes_before}->{content_bytes_after}",
+                shard.journal_segment_count
+            )));
+        }
+        let content_projection = content.collect_garbage(
+            ContentStoreGcOptions::dry_run(Duration::ZERO).with_protected_content_hashes(
+                protection.content_hashes.iter().map(String::as_str),
+            ),
+        )?;
+        if content_projection.newly_observed_orphan_count != 0
+            || content_projection.eligible_orphan_count != 0
+            || content_projection.stale_orphan_observation_count != 0
+            || content_projection.eligible_packed_segment_count != 0
+        {
+            return Err(failed(format!(
+                "metadata-history GC left collectible content: {content_projection:?}"
+            )));
+        }
+        let content_stats = content.stats()?;
+        if content_stats.manifest_count != retained_manifest_count
+            || content_stats.blob_count != retained_manifest_count
+            || content_stats.logical_object_bytes != retained_manifest_count.saturating_mul(128)
+        {
+            return Err(failed(format!(
+                "metadata-history GC content stats are inconsistent: {content_stats:?} retained_manifests={retained_manifest_count}"
+            )));
+        }
+
+        drop(backend);
+        drop(content);
+        let restart_started = Instant::now();
+        let reopened = Self::new(shard_id, root)?;
+        let reopened_content = LocalContentStore::new(&content_root)?;
+        let restart_elapsed = restart_started.elapsed();
+        if reopened.tables.versions.len() != 1
+            || !reopened.tables.namespace_requests.is_empty()
+            || !reopened.tables.namespace_request_receipts.is_empty()
+        {
+            return Err(failed(
+                "metadata-history GC reopened with unbounded logical history".to_string(),
+            ));
+        }
+        let current_hash = current.content_hash.as_deref().ok_or_else(|| {
+            failed("metadata-history current content hash is missing".to_string())
+        })?;
+        let reopened_manifest =
+            reopened_content.read_manifest(object_id.as_str(), current.version.as_str())?;
+        if reopened_manifest.content_hash != current_hash {
+            return Err(failed(format!(
+                "metadata-history current manifest hash changed across restart: expected {current_hash}, actual {}",
+                reopened_manifest.content_hash
+            )));
+        }
+        let current_index = options.overwrite_count - 1;
+        let mut expected_current_payload = [0_u8; 128];
+        expected_current_payload[..8].copy_from_slice(&(current_index as u64).to_le_bytes());
+        for (offset, byte) in expected_current_payload[8..].iter_mut().enumerate() {
+            *byte = (current_index
+                .wrapping_mul(131)
+                .wrapping_add(offset)
+                .wrapping_add(1) as u8)
+                .rotate_left((offset % 8) as u32);
+        }
+        if reopened_content.read_blob(current_hash)? != expected_current_payload {
+            return Err(failed(
+                "metadata-history current payload changed across restart".to_string(),
+            ));
+        }
+
+        Ok(crate::DfsMetadataHistoryGcRuntimeProbeReport {
+            overwrite_count: options.overwrite_count as u64,
+            namespace_request_count: options.namespace_request_count as u64,
+            unique_content_hash_count: distinct_content_hashes.len() as u64,
+            metadata_gc_passes,
+            orphan_gc_passes,
+            content_write_elapsed_ms: duration_millis(content_write_elapsed),
+            reservation_release_elapsed_ms: duration_millis(reservation_release_elapsed),
+            metadata_write_elapsed_ms: duration_millis(metadata_write_elapsed),
+            metadata_gc_elapsed_ms: duration_millis(metadata_gc_elapsed),
+            content_gc_elapsed_ms: duration_millis(content_gc_elapsed),
+            restart_elapsed_ms: duration_millis(restart_elapsed),
+            total_elapsed_ms: duration_millis(total_started.elapsed()),
+            deleted_orphan_count,
+            reclaimed_packed_segment_bytes,
+            retained_manifest_count,
+            retained_metadata_record_count: shard.total_record_count,
+            retained_metadata_bytes: shard.estimated_serialized_bytes,
+            journal_bytes_before,
+            journal_bytes_after,
+            materialized_table_bytes,
+            snapshot_bytes_before,
+            snapshot_bytes_after,
+            content_bytes_before,
+            content_bytes_after,
+        })
+    }
+
     fn materialize_visible_version_commit(
         &mut self,
         commit: &DfsVisibleVersionCommitRecord,
@@ -11776,6 +12208,22 @@ impl LocalSobjMetadataBackend {
     ) -> Result<()> {
         self.append_and_apply_table_ops(sequence, visible_commit_table_ops(&self.tables, commit))
     }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn runtime_probe_tree_file_bytes(path: &Path) -> std::io::Result<u64> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        return Ok(metadata.len());
+    }
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(path)? {
+        bytes = bytes.saturating_add(runtime_probe_tree_file_bytes(&entry?.path())?);
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -11791,7 +12239,6 @@ mod tests {
         dentry_key, key_segment, normalize_path, path_hash, path_record_for_object,
     };
     use crate::{
-        ContentStoreGcOptions, ContentStoreVersionGcOptions,
         DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES, DfsAdvisoryLockMode, DfsAdvisoryLockOutcome,
         DfsAdvisoryLockRequestId, DfsAdvisoryLockSessionId, DfsContentRootCatalogShardIdentity,
         DfsMetadataAuthorityOperation, DfsMetadataAuthorityProbe, DfsMetadataShardAssignment,
@@ -25021,7 +25468,17 @@ mod tests {
 
         let open_error = LocalSobjMetadataBackend::new(shard_id.clone(), &replica_root)
             .expect_err("conflicting duplicate must make ordinary replay fail");
-        assert!(open_error.to_string().contains("cannot extend prefix"));
+        assert!(
+            matches!(
+                &open_error,
+                MetadataBackendError::Serde(detail)
+                    if detail.contains(&format!(
+                        "conflicting duplicate sequence {}",
+                        object_entry.sequence
+                    ))
+            ),
+            "unexpected conflicting duplicate error: {open_error}"
+        );
 
         let permit = DfsMetadataReplicaIngestPermit::new_validated(
             file_system.file_system_id.clone(),
@@ -29867,335 +30324,8 @@ mod tests {
         cleanup(&root);
     }
 
-    #[test]
-    #[ignore = "100k overwrite and namespace churn acceptance benchmark"]
-    fn metadata_history_gc_high_churn_100k_remains_bounded() {
-        const OVERWRITES: usize = 100_000;
-        const NAMESPACE_REQUESTS: usize = 1_000;
-        const CONTENT_BATCH: usize = 4_096;
-        const GC_BATCH: u64 = 256;
-        const MAX_RETAINED_METADATA_RECORDS: u64 = 32;
-        const MAX_RETAINED_METADATA_BYTES: u64 = 256 * 1024;
-        const MAX_JOURNAL_BYTES: u64 = 16 * 1024 * 1024;
-        const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
-        const MAX_CONTENT_STORE_BYTES: u64 = 4 * 1024 * 1024;
-
-        let root = temp_root("metadata-history-gc-high-churn-100k");
-        let shard_id = DfsMetadataShardId::new("root");
-        let content_root = root.join("content");
-        let content = crate::LocalContentStore::new(&content_root).expect("content store");
-        let mut mutations = Vec::with_capacity(OVERWRITES + NAMESPACE_REQUESTS);
-        let mut current = object(version("version_churn_000000"));
-        current.content_size_bytes = Some(128);
-        let content_write_started = Instant::now();
-        let mut distinct_content_hashes = BTreeSet::new();
-        for batch_start in (0..OVERWRITES).step_by(CONTENT_BATCH) {
-            let batch_end = batch_start.saturating_add(CONTENT_BATCH).min(OVERWRITES);
-            let versions = (batch_start..batch_end)
-                .map(|index| version(&format!("version_churn_{index:06}")))
-                .collect::<Vec<_>>();
-            let payloads = (batch_start..batch_end)
-                .map(|index| {
-                    let mut payload = [0_u8; 128];
-                    payload[..8].copy_from_slice(&(index as u64).to_le_bytes());
-                    for (offset, byte) in payload[8..].iter_mut().enumerate() {
-                        *byte = (index.wrapping_mul(131).wrapping_add(offset).wrapping_add(1)
-                            as u8)
-                            .rotate_left((offset % 8) as u32);
-                    }
-                    payload
-                })
-                .collect::<Vec<_>>();
-            let manifests = content
-                .put_object_versions(versions.iter().zip(&payloads).map(|(version, payload)| {
-                    (
-                        current.object_id.as_str(),
-                        version.as_str(),
-                        payload.as_slice(),
-                    )
-                }))
-                .expect("write unique churn manifests");
-            for (((index, version), payload), manifest) in (batch_start..batch_end)
-                .zip(versions)
-                .zip(payloads)
-                .zip(manifests)
-            {
-                assert!(
-                    distinct_content_hashes.insert(manifest.content_hash.clone()),
-                    "overwrite {index} must produce a unique content hash"
-                );
-                if index + 1 == OVERWRITES {
-                    current.version = version.clone();
-                    current.content_hash = Some(manifest.content_hash.clone());
-                    assert_eq!(payload[..8], (index as u64).to_le_bytes());
-                }
-                mutations.push(DfsMetadataMutation::put_version(&DfsObjectVersionRecord {
-                    file_system_id: current.file_system_id.clone(),
-                    object_id: current.object_id.clone(),
-                    version,
-                    content_hash: Some(manifest.content_hash),
-                    size_bytes: Some(payload.len() as u64),
-                    locations: current.current_locations.clone(),
-                    created_by_event_id: None,
-                    created_at: OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(index as i64),
-                    visible: true,
-                }));
-            }
-        }
-        assert_eq!(distinct_content_hashes.len(), OVERWRITES);
-        let namespace_requester = node("node_metadata_history_gc_churn_requester");
-        for index in 0..NAMESPACE_REQUESTS {
-            let mut request =
-                namespace_request(10_000 + index, DfsNamespaceRequestStatus::Completed);
-            request.requester_node_id = namespace_requester.clone();
-            request.created_at = OffsetDateTime::UNIX_EPOCH;
-            request.updated_at = OffsetDateTime::UNIX_EPOCH;
-            mutations.push(DfsMetadataMutation::put_namespace_request(&request));
-        }
-        let content_write_elapsed = content_write_started.elapsed();
-
-        let metadata_write_started = Instant::now();
-        let mut backend =
-            LocalSobjMetadataBackend::new(shard_id.clone(), &root).expect("metadata backend");
-        backend.put_file_system(&file_system()).expect("filesystem");
-        backend.put_object(&current).expect("current object");
-        {
-            let _lock = backend.begin_metadata_write().expect("metadata write lock");
-            let entries = backend
-                .write_journal_entries_unlocked(mutations)
-                .expect("append high-churn journal batch");
-            backend
-                .materialize_written_journal_entries_unlocked(&entries)
-                .expect("materialize high-churn batch");
-        }
-        let metadata_write_elapsed = metadata_write_started.elapsed();
-        let journal_bytes_before = tree_file_bytes(&root.join("journal"));
-        backend
-            .compact_metadata_table_log_if_needed(0)
-            .expect("publish high-churn pre-GC snapshot");
-        let snapshot_bytes_before = fs::metadata(metadata_table_snapshot_path(&root))
-            .expect("pre-GC snapshot")
-            .len();
-        let content_bytes_before = tree_file_bytes(&content_root);
-        let gc_started = Instant::now();
-        let mut passes = 0_u64;
-        loop {
-            let report = backend
-                .gc_metadata_history_authoritative(
-                    DfsMetadataHistoryGcOptions::delete_eligible(Duration::ZERO, 1)
-                        .with_now_unix_nanos(u64::MAX)
-                        .with_max_removals(GC_BATCH),
-                )
-                .expect("bounded high-churn GC pass");
-            passes = passes.saturating_add(1);
-            if report.applied_record_count() == 0 {
-                break;
-            }
-            assert!(passes < 1_000, "metadata GC did not converge");
-        }
-        let metadata_gc_elapsed = gc_started.elapsed();
-        let protection = backend
-            .metadata_content_protection()
-            .expect("post-GC content roots");
-        let content_gc_started = Instant::now();
-        let version_gc =
-            content
-                .collect_versions(
-                    ContentStoreVersionGcOptions::delete_eligible(Duration::ZERO, 1)
-                        .with_protected_versions(protection.versions.iter().map(|identity| {
-                            (identity.object_id.as_str(), identity.version.as_str())
-                        })),
-                )
-                .expect("collect high-churn manifests");
-        let retained_manifest_count =
-            (OVERWRITES as u64).saturating_sub(version_gc.deleted_version_count);
-        assert!(
-            (1..=2).contains(&retained_manifest_count),
-            "content GC must retain only the protected current version and, when filesystem timestamps tie, at most one separate keep-latest version: {version_gc:?}"
-        );
-        let mut orphan_gc_passes = 0_u64;
-        let mut deleted_orphan_count = 0_u64;
-        let mut reclaimed_packed_segment_bytes = 0_u64;
-        loop {
-            let report = content
-                .collect_garbage(
-                    ContentStoreGcOptions::delete_eligible(Duration::ZERO)
-                        .with_protected_content_hashes(
-                            protection.content_hashes.iter().map(String::as_str),
-                        ),
-                )
-                .expect("collect observed high-churn orphan blobs and packed segments");
-            orphan_gc_passes = orphan_gc_passes.saturating_add(1);
-            deleted_orphan_count = deleted_orphan_count.saturating_add(report.deleted_orphan_count);
-            reclaimed_packed_segment_bytes = reclaimed_packed_segment_bytes
-                .saturating_add(report.reclaimed_packed_segment_bytes);
-            let work_remains = report.newly_observed_orphan_count != 0
-                || report.eligible_orphan_count != 0
-                || report.stale_orphan_observation_count != 0
-                || report.eligible_packed_segment_count != 0;
-            if !work_remains {
-                break;
-            }
-            assert!(
-                orphan_gc_passes < 64,
-                "bounded packed GC did not converge after {orphan_gc_passes} passes: {report:?}"
-            );
-        }
-        let content_gc_elapsed = content_gc_started.elapsed();
-        assert_eq!(deleted_orphan_count, version_gc.deleted_version_count);
-        assert!(
-            reclaimed_packed_segment_bytes >= version_gc.deleted_version_count.saturating_mul(128),
-            "physical packed reclamation must cover the deleted unique payloads"
-        );
-
-        let post_gc = backend
-            .metadata_history_gc_projection(
-                DfsMetadataHistoryGcOptions::dry_run(Duration::ZERO, 1)
-                    .with_now_unix_nanos(u64::MAX),
-            )
-            .expect("post-GC projection");
-        assert_eq!(post_gc.eligible_record_count(), 0);
-        assert_eq!(backend.tables.versions.len(), 1);
-        assert!(backend.tables.namespace_requests.is_empty());
-        assert!(backend.tables.namespace_request_receipts.is_empty());
-        assert!(
-            !backend.tables.namespace_receipt_retention.is_empty(),
-            "request bodies and receipts collapse to one durable eviction floor"
-        );
-        assert!(
-            post_gc.shards[0].total_record_count <= MAX_RETAINED_METADATA_RECORDS,
-            "retained metadata records exceed the absolute bound: {:?}",
-            post_gc.shards[0]
-        );
-        assert!(
-            post_gc.shards[0].estimated_serialized_bytes <= MAX_RETAINED_METADATA_BYTES,
-            "retained metadata bytes exceed the absolute bound: {:?}",
-            post_gc.shards[0]
-        );
-        let journal_bytes_after = tree_file_bytes(&root.join("journal"));
-        let materialized_table_bytes = fs::metadata(metadata_table_path(&root))
-            .expect("post-GC materialized table log")
-            .len();
-        let snapshot_bytes_after = fs::metadata(metadata_table_snapshot_path(&root))
-            .expect("post-GC snapshot")
-            .len();
-        let content_bytes_after = tree_file_bytes(&content_root);
-        assert!(journal_bytes_after < journal_bytes_before);
-        assert!(snapshot_bytes_after < snapshot_bytes_before);
-        assert!(content_bytes_after < content_bytes_before);
-        assert_eq!(
-            post_gc.shards[0].journal_segment_count, 1,
-            "only the checkpoint gap-witness segment should remain"
-        );
-        assert!(
-            journal_bytes_after <= MAX_JOURNAL_BYTES,
-            "post-GC journal is not absolutely bounded: {journal_bytes_after} > {MAX_JOURNAL_BYTES}"
-        );
-        assert_eq!(
-            materialized_table_bytes, 0,
-            "the materialized cache log must be truncated after checkpoint"
-        );
-        assert!(
-            snapshot_bytes_after <= MAX_SNAPSHOT_BYTES,
-            "post-GC snapshot is not absolutely bounded: {snapshot_bytes_after} > {MAX_SNAPSHOT_BYTES}"
-        );
-        assert!(
-            content_bytes_after <= MAX_CONTENT_STORE_BYTES,
-            "post-GC content store is not absolutely bounded: {content_bytes_after} > {MAX_CONTENT_STORE_BYTES}"
-        );
-        let content_projection = content
-            .collect_garbage(
-                ContentStoreGcOptions::dry_run(Duration::ZERO).with_protected_content_hashes(
-                    protection.content_hashes.iter().map(String::as_str),
-                ),
-            )
-            .expect("post-GC content projection");
-        assert_eq!(content_projection.newly_observed_orphan_count, 0);
-        assert_eq!(content_projection.eligible_orphan_count, 0);
-        assert_eq!(content_projection.stale_orphan_observation_count, 0);
-        assert_eq!(content_projection.eligible_packed_segment_count, 0);
-        let content_stats = content.stats().expect("post-GC content stats");
-        assert_eq!(content_stats.manifest_count, retained_manifest_count);
-        assert_eq!(content_stats.blob_count, retained_manifest_count);
-        assert_eq!(
-            content_stats.logical_object_bytes,
-            retained_manifest_count.saturating_mul(128)
-        );
-
-        drop(backend);
-        drop(content);
-        let restart_started = Instant::now();
-        let reopened =
-            LocalSobjMetadataBackend::new(shard_id, &root).expect("restart bounded metadata");
-        let reopened_content =
-            crate::LocalContentStore::new(&content_root).expect("restart bounded content");
-        let restart_elapsed = restart_started.elapsed();
-        assert_eq!(reopened.tables.versions.len(), 1);
-        assert!(reopened.tables.namespace_requests.is_empty());
-        assert!(reopened.tables.namespace_request_receipts.is_empty());
-        let current_hash = current
-            .content_hash
-            .as_deref()
-            .expect("current content hash");
-        assert_eq!(
-            reopened_content
-                .read_manifest(current.object_id.as_str(), current.version.as_str())
-                .expect("reopened current manifest")
-                .content_hash,
-            current_hash
-        );
-        let mut expected_current_payload = [0_u8; 128];
-        let current_index = OVERWRITES - 1;
-        expected_current_payload[..8].copy_from_slice(&(current_index as u64).to_le_bytes());
-        for (offset, byte) in expected_current_payload[8..].iter_mut().enumerate() {
-            *byte = (current_index
-                .wrapping_mul(131)
-                .wrapping_add(offset)
-                .wrapping_add(1) as u8)
-                .rotate_left((offset % 8) as u32);
-        }
-        assert_eq!(
-            reopened_content
-                .read_blob(current_hash)
-                .expect("reopened current blob"),
-            expected_current_payload
-        );
-        assert!(
-            restart_elapsed < Duration::from_secs(30),
-            "bounded post-GC restart took {restart_elapsed:?}"
-        );
-        eprintln!(
-            "metadata-history-gc-high-churn overwrites={OVERWRITES} namespace_requests={NAMESPACE_REQUESTS} unique_hashes={} metadata_gc_passes={passes} orphan_gc_passes={orphan_gc_passes} content_write_ms={} metadata_write_ms={} metadata_gc_ms={} content_gc_ms={} reclaimed_packed_bytes={reclaimed_packed_segment_bytes} retained_manifests={retained_manifest_count} retained_records={} retained_metadata_bytes={} journal_bytes_before={journal_bytes_before} journal_bytes_after={journal_bytes_after} materialized_table_bytes={materialized_table_bytes} snapshot_bytes_before={snapshot_bytes_before} snapshot_bytes_after={snapshot_bytes_after} content_bytes_before={content_bytes_before} content_bytes_after={content_bytes_after} restart_ms={}",
-            distinct_content_hashes.len(),
-            content_write_elapsed.as_millis(),
-            metadata_write_elapsed.as_millis(),
-            metadata_gc_elapsed.as_millis(),
-            content_gc_elapsed.as_millis(),
-            post_gc.shards[0].total_record_count,
-            post_gc.shards[0].estimated_serialized_bytes,
-            restart_elapsed.as_millis(),
-        );
-
-        cleanup(&root);
-    }
-
     fn temp_root(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-dfs-metadata-{name}"))
-    }
-
-    fn tree_file_bytes(path: &Path) -> u64 {
-        let Ok(metadata) = fs::metadata(path) else {
-            return 0;
-        };
-        if metadata.is_file() {
-            return metadata.len();
-        }
-        fs::read_dir(path)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| tree_file_bytes(&entry.path()))
-            .fold(0_u64, u64::saturating_add)
     }
 
     fn cleanup(root: &Path) {

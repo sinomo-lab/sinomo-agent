@@ -52,10 +52,33 @@ pub(crate) enum DfsCliCommand {
     MetadataShardTransferPrimary(DfsMetadataShardTransferPrimaryOptions),
     PlacementAuthority(DfsPlacementAuthorityCliCommand),
     Mount(DfsMountOptions),
+    Nfs(DfsNfsCliCommand),
     Services {
         json: bool,
     },
     Pin(DfsPinCliCommand),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum DfsNfsCliCommand {
+    Serve(DfsNfsServerCliOptions),
+    Mount(DfsNfsMountCliOptions),
+    Unmount { target: String },
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsNfsServerCliOptions {
+    pub(crate) bind: String,
+    pub(crate) export_name: String,
+    pub(crate) root_path: String,
+    pub(crate) data_dir: Option<PathBuf>,
+    pub(crate) read_only: bool,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct DfsNfsMountCliOptions {
+    pub(crate) target: String,
+    pub(crate) server: DfsNfsServerCliOptions,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
@@ -377,6 +400,15 @@ fn dfs_cli_spec() -> CliCommandSpec {
             ])
             .restricted()
     };
+    let nfs_options = || {
+        [
+            option("--bind", "loopback NFS listen address", "address"),
+            option("--export", "NFS export name", "name"),
+            option("--root", "SIFS root path", "path").with_aliases(["--path"]),
+            option("--data-dir", "Sinomo data directory", "path"),
+            CliOptionSpec::flag("--read-only", "serve the export read-only").with_aliases(["--ro"]),
+        ]
+    };
     CliCommandSpec::new("dfs", "inspect and manage SIFS and DFS state")
         .help_on_empty()
         .with_children([
@@ -517,6 +549,25 @@ fn dfs_cli_spec() -> CliCommandSpec {
                     "mount-point",
                     "local mount directory",
                 ))]),
+            CliCommandSpec::new("nfs", "expose SIFS directly through loopback NFSv3")
+                .with_children([
+                    CliCommandSpec::new("serve", "run the loopback SIFS NFS server")
+                        .with_options(nfs_options()),
+                    CliCommandSpec::new(
+                        "mount",
+                        "run the server and mount it through the native NFS client",
+                    )
+                    .with_options(nfs_options())
+                    .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                        "target",
+                        "Linux directory or Windows drive letter",
+                    ))]),
+                    CliCommandSpec::new("unmount", "unmount a native NFS mapping")
+                        .with_positionals([CliPositionalSpec::required(CliValueSpec::new(
+                            "target",
+                            "Linux directory or Windows drive letter",
+                        ))]),
+                ]),
             CliCommandSpec::new("pin", "manage local DFS pins").with_children([
                 CliCommandSpec::new("list", "list local DFS pins").with_options([
                     filesystem(),
@@ -815,10 +866,43 @@ fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliPa
             ))
         }
         ["dfs", "mount"] => parse_dfs_mount_matches(matches).map(DfsCliCommand::Mount),
+        ["dfs", "nfs", "serve"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Serve(
+            parse_dfs_nfs_server_matches(matches, "127.0.0.1:111"),
+        ))),
+        ["dfs", "nfs", "mount"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Mount(
+            DfsNfsMountCliOptions {
+                target: required_positional(matches, 0)?.to_string(),
+                server: parse_dfs_nfs_server_matches(matches, default_nfs_mount_bind()),
+            },
+        ))),
+        ["dfs", "nfs", "unmount"] => Ok(DfsCliCommand::Nfs(DfsNfsCliCommand::Unmount {
+            target: required_positional(matches, 0)?.to_string(),
+        })),
         ["dfs", "pin", command] => parse_dfs_pin_matches(command, matches).map(DfsCliCommand::Pin),
         _ => Err(CliParseError::Parse {
             detail: "dfs requires a subcommand".to_string(),
         }),
+    }
+}
+
+fn parse_dfs_nfs_server_matches(
+    matches: &CliCommandMatches,
+    default_bind: &str,
+) -> DfsNfsServerCliOptions {
+    DfsNfsServerCliOptions {
+        bind: matches.value("--bind").unwrap_or(default_bind).to_string(),
+        export_name: matches.value("--export").unwrap_or("sifs").to_string(),
+        root_path: matches.value("--root").unwrap_or("/").to_string(),
+        data_dir: matches.value("--data-dir").map(PathBuf::from),
+        read_only: matches.contains("--read-only"),
+    }
+}
+
+const fn default_nfs_mount_bind() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "127.0.0.1:0"
+    } else {
+        "127.0.0.1:111"
     }
 }
 
@@ -1517,6 +1601,7 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
         }
         DfsCliCommand::PlacementAuthority(command) => run_dfs_placement_authority_command(command),
         DfsCliCommand::Mount(options) => run_dfs_mount_command(options),
+        DfsCliCommand::Nfs(command) => run_dfs_nfs_command(command),
         DfsCliCommand::Pin(command) => run_dfs_pin_command(command),
     }
 }
@@ -2677,6 +2762,499 @@ pub(crate) fn run_dfs_mount_command(options: DfsMountOptions) -> Result<(), CliE
     }
 }
 
+fn run_dfs_nfs_command(command: DfsNfsCliCommand) -> Result<(), CliError> {
+    match command {
+        DfsNfsCliCommand::Serve(options) => run_dfs_nfs_server(options, None),
+        DfsNfsCliCommand::Mount(options) => run_dfs_nfs_mount(options),
+        DfsNfsCliCommand::Unmount { target } => run_dfs_nfs_unmount(&target),
+    }
+}
+
+fn run_dfs_nfs_server(
+    options: DfsNfsServerCliOptions,
+    native_mount_target: Option<String>,
+) -> Result<(), CliError> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("sinomo-dfs-nfs")
+        .build()
+        .map_err(|source| CliError::Parse {
+            detail: format!("create NFS runtime: {source}"),
+        })?;
+    runtime.block_on(async move {
+        let server_options = sinomo_dfs_nfs::DfsNfsServerOptions {
+            data_dir: options.data_dir,
+            bind: options.bind,
+            export_name: options.export_name,
+            root_path: options.root_path,
+            read_only: options.read_only,
+        };
+        let read_only = server_options.read_only;
+        let server = sinomo_dfs_nfs::DfsNfsServer::bind(server_options)
+            .await
+            .map_err(|source| CliError::Parse {
+                detail: source.to_string(),
+            })?;
+        println!(
+            "serving SIFS through NFSv3 at {} export /{}{}",
+            server.local_addr(),
+            server.export_name(),
+            if read_only { " (read-only)" } else { "" }
+        );
+        if let Some(target) = native_mount_target {
+            let address = server.local_addr();
+            let export_name = server.export_name().to_string();
+            let serving = tokio::spawn(server.serve_until_unmounted());
+            if let Err(error) =
+                mount_native_nfs_target(&target, address, &export_name, read_only).await
+            {
+                serving.abort();
+                let _ = serving.await;
+                return Err(error);
+            }
+            println!(
+                "mounted SIFS NFS export at {target}; keep this process running or use `sinomo dfs nfs unmount {target}` to stop it cleanly"
+            );
+            return serving
+                .await
+                .map_err(|source| CliError::Parse {
+                    detail: format!("NFS server task failed: {source}"),
+                })?
+                .map_err(|source| CliError::Parse {
+                    detail: source.to_string(),
+                });
+        }
+        server.serve().await.map_err(|source| CliError::Parse {
+            detail: source.to_string(),
+        })
+    })
+}
+
+fn run_dfs_nfs_mount(options: DfsNfsMountCliOptions) -> Result<(), CliError> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = options;
+        Err(CliError::Parse {
+            detail: "`sinomo dfs nfs mount` is currently supported on Linux and Windows"
+                .to_string(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let drive = normalize_windows_drive(&options.target)?;
+        let address = options
+            .server
+            .bind
+            .parse::<std::net::SocketAddr>()
+            .map_err(|source| CliError::Parse {
+                detail: format!("invalid NFS bind address: {source}"),
+            })?;
+        if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            || address.port() != 111
+        {
+            return Err(CliError::Parse {
+                detail: "Windows Client for NFS discovers the local service through 127.0.0.1:111; `dfs nfs mount` requires --bind 127.0.0.1:111"
+                    .to_string(),
+            });
+        }
+        run_dfs_nfs_server(options.server, Some(drive))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mount_point = validate_linux_nfs_mount_point(&options.target, true)?;
+        run_dfs_nfs_server(options.server, Some(mount_point.display().to_string()))
+    }
+}
+
+#[cfg(windows)]
+async fn mount_native_nfs_target(
+    drive: &str,
+    address: std::net::SocketAddr,
+    export_name: &str,
+    _read_only: bool,
+) -> Result<(), CliError> {
+    let drive = drive.to_string();
+    let export = format!(r"\\{}\{}", address.ip(), export_name);
+    tokio::task::spawn_blocking(move || {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("mount.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args([
+                "-o",
+                "anon,nolock,mtype=soft,fileaccess=764,casesensitive,rsize=32,wsize=32,timeout=1,retry=2",
+                &export,
+                &drive,
+            ])
+            .output()
+            .map_err(|source| CliError::Parse {
+                detail: format!(
+                    "start Windows Client for NFS mount utility (is Client for NFS installed?): {source}"
+                ),
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(CliError::Parse {
+            detail: format!(
+                "Windows Client for NFS could not map {export} to {drive}: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ),
+        })
+    })
+    .await
+    .map_err(|source| CliError::Parse {
+        detail: format!("Windows NFS mount worker failed: {source}"),
+    })?
+}
+
+#[cfg(target_os = "linux")]
+async fn mount_native_nfs_target(
+    target: &str,
+    address: std::net::SocketAddr,
+    export_name: &str,
+    read_only: bool,
+) -> Result<(), CliError> {
+    let target = target.to_string();
+    let export_name = export_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mount_point = validate_linux_nfs_mount_point(&target, true)?;
+        let source = linux_nfs_source(address.ip(), &export_name);
+        let options = linux_nfs_mount_options(address.port(), read_only);
+        let direct = std::process::Command::new("mount.nfs")
+            .args(["-o", &options, &source])
+            .arg(&mount_point)
+            .output();
+        let output = match direct {
+            Ok(output) => output,
+            Err(direct_error) if direct_error.kind() == std::io::ErrorKind::NotFound => {
+                std::process::Command::new("mount")
+                    .args(["-t", "nfs", "-o", &options, &source])
+                    .arg(&mount_point)
+                    .output()
+                    .map_err(|fallback| CliError::Parse {
+                        detail: format!(
+                            "start the Linux NFS mount helper (`mount.nfs` was not found and `mount -t nfs` also failed): {fallback}"
+                        ),
+                    })?
+            }
+            Err(direct_error) => {
+                return Err(CliError::Parse {
+                    detail: format!("start Linux NFS mount helper: {direct_error}"),
+                });
+            }
+        };
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(CliError::Parse {
+            detail: format!(
+                "Linux NFS client could not mount {source} at {}: {}",
+                mount_point.display(),
+                command_output_detail(&output)
+            ),
+        })
+    })
+    .await
+    .map_err(|source| CliError::Parse {
+        detail: format!("Linux NFS mount worker failed: {source}"),
+    })?
+}
+
+#[cfg(target_os = "linux")]
+fn linux_nfs_source(address: std::net::IpAddr, export_name: &str) -> String {
+    match address {
+        std::net::IpAddr::V4(address) => format!("{address}:/{export_name}"),
+        std::net::IpAddr::V6(address) => format!("[{address}]:/{export_name}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_nfs_mount_options(port: u16, read_only: bool) -> String {
+    format!(
+        "{},vers=3,proto=tcp,mountproto=tcp,nolock,soft,timeo=10,retrans=2,port={port},mountport={port},rsize=1048576,wsize=1048576,actimeo=1",
+        if read_only { "ro" } else { "rw" }
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_nfs_mount_point(value: &str, require_empty: bool) -> Result<PathBuf, CliError> {
+    if value.is_empty() || value.trim() != value || value.contains('\0') {
+        return Err(CliError::Parse {
+            detail: "Linux NFS mount point must be a non-empty path without surrounding whitespace or NUL bytes"
+                .to_string(),
+        });
+    }
+    let requested = PathBuf::from(value);
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        std::env::current_dir()
+            .map_err(|source| CliError::Io {
+                path: ".".to_string(),
+                detail: source.to_string(),
+            })?
+            .join(requested)
+    };
+    let metadata = std::fs::symlink_metadata(&requested).map_err(|source| CliError::Io {
+        path: requested.display().to_string(),
+        detail: format!("inspect Linux NFS mount point: {source}"),
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "refusing symlink as Linux NFS mount point: {}",
+                requested.display()
+            ),
+        });
+    }
+    if !metadata.is_dir() {
+        return Err(CliError::Parse {
+            detail: format!(
+                "Linux NFS mount point is not a directory: {}",
+                requested.display()
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(&requested).map_err(|source| CliError::Io {
+        path: requested.display().to_string(),
+        detail: format!("resolve Linux NFS mount point: {source}"),
+    })?;
+    if canonical.parent().is_none() {
+        return Err(CliError::Parse {
+            detail: "refusing to use the filesystem root as an NFS mount point".to_string(),
+        });
+    }
+    let mounted = linux_path_is_mount_point(&canonical)?;
+    if require_empty {
+        if mounted {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "Linux NFS mount point is already mounted: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        let mut entries = std::fs::read_dir(&canonical).map_err(|source| CliError::Io {
+            path: canonical.display().to_string(),
+            detail: format!("inspect Linux NFS mount-point contents: {source}"),
+        })?;
+        if entries
+            .next()
+            .transpose()
+            .map_err(|source| CliError::Io {
+                path: canonical.display().to_string(),
+                detail: format!("inspect Linux NFS mount-point entry: {source}"),
+            })?
+            .is_some()
+        {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "refusing to hide existing files beneath non-empty NFS mount point {}",
+                    canonical.display()
+                ),
+            });
+        }
+    } else if !mounted {
+        return Err(CliError::Parse {
+            detail: format!(
+                "refusing to unmount a path that is not a mount point: {}",
+                canonical.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_path_is_mount_point(path: &Path) -> Result<bool, CliError> {
+    let mountinfo =
+        std::fs::read_to_string("/proc/self/mountinfo").map_err(|source| CliError::Io {
+            path: "/proc/self/mountinfo".to_string(),
+            detail: format!("inspect Linux mount topology: {source}"),
+        })?;
+    Ok(parse_linux_mountinfo_for_path(&mountinfo, path).is_some())
+}
+
+#[cfg(target_os = "linux")]
+fn decode_linux_mountinfo_path(value: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            let escape = bytes.get(index + 1..index + 4)?;
+            let value = match escape {
+                b"040" => b' ',
+                b"011" => b'\t',
+                b"012" => b'\n',
+                b"134" => b'\\',
+                _ => return None,
+            };
+            decoded.push(value);
+            index += 4;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LinuxMountInfo {
+    file_system_type: String,
+    source: String,
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_mountinfo_for_path(contents: &str, path: &Path) -> Option<LinuxMountInfo> {
+    contents.lines().find_map(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let separator = fields.iter().position(|field| *field == "-")?;
+        if separator + 2 >= fields.len()
+            || decode_linux_mountinfo_path(*fields.get(4)?)?.as_path() != path
+        {
+            return None;
+        }
+        Some(LinuxMountInfo {
+            file_system_type: fields[separator + 1].to_string(),
+            source: fields[separator + 2].to_string(),
+        })
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn command_output_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("process exited with {}", output.status)
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+async fn mount_native_nfs_target(
+    _target: &str,
+    _address: std::net::SocketAddr,
+    _export_name: &str,
+    _read_only: bool,
+) -> Result<(), CliError> {
+    Err(CliError::Parse {
+        detail: "native NFS mounting is unavailable on this platform".to_string(),
+    })
+}
+
+fn run_dfs_nfs_unmount(target: &str) -> Result<(), CliError> {
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = target;
+        Err(CliError::Parse {
+            detail: "`sinomo dfs nfs unmount` is currently supported on Linux and Windows"
+                .to_string(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let drive = normalize_windows_drive(target)?;
+        let output = std::process::Command::new("umount.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .arg(&drive)
+            .output()
+            .map_err(|source| CliError::Parse {
+                detail: format!("start Windows Client for NFS unmount utility: {source}"),
+            })?;
+        if output.status.success() {
+            println!("unmapped SIFS NFS drive {drive}");
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        Err(CliError::Parse {
+            detail: format!(
+                "Windows Client for NFS could not unmap {drive}: {}",
+                if stderr.is_empty() { stdout } else { stderr }
+            ),
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unmount_linux_nfs_target(target)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_linux_nfs_target(target: &str) -> Result<(), CliError> {
+    let mount_point = validate_linux_nfs_mount_point(target, false)?;
+    let mountinfo =
+        std::fs::read_to_string("/proc/self/mountinfo").map_err(|source| CliError::Io {
+            path: "/proc/self/mountinfo".to_string(),
+            detail: format!("revalidate Linux mount topology before unmount: {source}"),
+        })?;
+    let mounted = parse_linux_mountinfo_for_path(&mountinfo, &mount_point).ok_or_else(|| {
+        CliError::Parse {
+            detail: format!(
+                "Linux NFS mount disappeared before unmount: {}",
+                mount_point.display()
+            ),
+        }
+    })?;
+    let loopback_source = mounted.source.starts_with("127.0.0.1:/")
+        || mounted.source.starts_with("[::1]:/")
+        || mounted.source.starts_with("::1:/");
+    if mounted.file_system_type != "nfs" || !loopback_source {
+        return Err(CliError::Parse {
+            detail: format!(
+                "refusing to unmount non-Sinomo candidate {} (type={}, source={})",
+                mount_point.display(),
+                mounted.file_system_type,
+                mounted.source
+            ),
+        });
+    }
+    let output = std::process::Command::new("umount")
+        .arg(&mount_point)
+        .output()
+        .map_err(|source| CliError::Parse {
+            detail: format!("start Linux unmount utility: {source}"),
+        })?;
+    if output.status.success() {
+        println!("unmounted SIFS NFS mount {}", mount_point.display());
+        return Ok(());
+    }
+    Err(CliError::Parse {
+        detail: format!(
+            "Linux could not unmount {}: {}",
+            mount_point.display(),
+            command_output_detail(&output)
+        ),
+    })
+}
+
+#[cfg(windows)]
+fn normalize_windows_drive(value: &str) -> Result<String, CliError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return Err(CliError::Parse {
+            detail: format!("invalid Windows drive `{value}`; expected a drive letter such as S:"),
+        });
+    }
+    Ok(format!("{}:", (bytes[0] as char).to_ascii_uppercase()))
+}
+
 fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliError> {
     #[cfg(windows)]
     if options.foreground {
@@ -2795,11 +3373,14 @@ pub(crate) fn validate_dfs_mount_options_for_platform(
 #[cfg(test)]
 mod dfs_mount_tests {
     use std::cell::{Cell, RefCell};
+    #[cfg(target_os = "linux")]
+    use std::path::{Path, PathBuf};
 
     use super::{
         DfsCliCommand, DfsHostMountOptions, DfsMountOptions, DfsMountSupervisorControl,
-        disable_managed_dfs_mount, parse_dfs_schema_for_test, query_live_dfs_mount_status,
-        request_cursor_only_recovery, run_dfs_mount_command,
+        DfsNfsCliCommand, DfsNfsMountCliOptions, DfsNfsServerCliOptions, disable_managed_dfs_mount,
+        parse_dfs_schema_for_test, query_live_dfs_mount_status, request_cursor_only_recovery,
+        run_dfs_mount_command,
     };
     use sinomo_runtime::dfs::{
         SifsMountConfig, SifsMountCursorOnlyRecoveryRequest, SifsMountCursorOnlyRecoveryResponse,
@@ -2840,6 +3421,116 @@ mod dfs_mount_tests {
                 config_writes: RefCell::new(Vec::new()),
             }
         }
+    }
+
+    #[test]
+    fn nfs_schema_parses_server_and_native_mount_commands() {
+        assert_eq!(
+            parse_dfs_schema_for_test(&[
+                "nfs".to_string(),
+                "serve".to_string(),
+                "--bind".to_string(),
+                "127.0.0.1:2049".to_string(),
+                "--export".to_string(),
+                "agents".to_string(),
+                "--root".to_string(),
+                "/agents".to_string(),
+                "--read-only".to_string(),
+            ])
+            .expect("parse NFS server"),
+            DfsCliCommand::Nfs(DfsNfsCliCommand::Serve(DfsNfsServerCliOptions {
+                bind: "127.0.0.1:2049".to_string(),
+                export_name: "agents".to_string(),
+                root_path: "/agents".to_string(),
+                data_dir: None,
+                read_only: true,
+            }))
+        );
+        assert_eq!(
+            parse_dfs_schema_for_test(&["nfs".to_string(), "mount".to_string(), "S:".to_string(),])
+                .expect("parse native NFS mount"),
+            DfsCliCommand::Nfs(DfsNfsCliCommand::Mount(DfsNfsMountCliOptions {
+                target: "S:".to_string(),
+                server: DfsNfsServerCliOptions {
+                    bind: super::default_nfs_mount_bind().to_string(),
+                    export_name: "sifs".to_string(),
+                    root_path: "/".to_string(),
+                    data_dir: None,
+                    read_only: false,
+                },
+            }))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_nfs_mount_plan_uses_explicit_ephemeral_server_port_and_safe_target() {
+        let root = sinomo_testdir::TestDir::new("sinomo-cli-linux-nfs-mount-plan");
+        let mount_point = root.path().join("mount");
+        std::fs::create_dir(&mount_point).expect("create empty mount point");
+        assert_eq!(
+            super::validate_linux_nfs_mount_point(
+                mount_point.to_str().expect("UTF-8 test path"),
+                true,
+            )
+            .expect("validate empty mount point"),
+            std::fs::canonicalize(&mount_point).expect("canonical mount point")
+        );
+        assert_eq!(
+            super::linux_nfs_source("127.0.0.1".parse().unwrap(), "sifs"),
+            "127.0.0.1:/sifs"
+        );
+        assert_eq!(
+            super::linux_nfs_source("::1".parse().unwrap(), "agents"),
+            "[::1]:/agents"
+        );
+        assert_eq!(
+            super::decode_linux_mountinfo_path(r"/tmp/with\040space\134name"),
+            Some(PathBuf::from("/tmp/with space\\name"))
+        );
+        assert_eq!(
+            super::parse_linux_mountinfo_for_path(
+                "41 30 0:52 / /tmp/sinomo\\040mount rw - nfs 127.0.0.1:/sifs rw,vers=3\n",
+                Path::new("/tmp/sinomo mount"),
+            ),
+            Some(super::LinuxMountInfo {
+                file_system_type: "nfs".to_string(),
+                source: "127.0.0.1:/sifs".to_string(),
+            })
+        );
+        assert!(super::linux_path_is_mount_point(Path::new("/")).expect("inspect mountinfo"));
+        let options = super::linux_nfs_mount_options(43123, false);
+        assert!(options.starts_with("rw,"));
+        assert!(options.contains("vers=3"));
+        assert!(options.contains("port=43123"));
+        assert!(options.contains("mountport=43123"));
+        assert!(options.contains("rsize=1048576"));
+        assert!(options.contains("wsize=1048576"));
+        assert!(super::linux_nfs_mount_options(43123, true).starts_with("ro,"));
+
+        let mount_link = root.path().join("mount-link");
+        std::os::unix::fs::symlink(&mount_point, &mount_link).expect("create mount-point symlink");
+        assert!(
+            super::validate_linux_nfs_mount_point(
+                mount_link.to_str().expect("UTF-8 test path"),
+                true,
+            )
+            .expect_err("symlink mount point must be rejected")
+            .to_string()
+            .contains("symlink")
+        );
+
+        std::fs::write(mount_point.join("existing.txt"), b"do not hide")
+            .expect("create existing file");
+        assert!(
+            super::validate_linux_nfs_mount_point(
+                mount_point.to_str().expect("UTF-8 test path"),
+                true,
+            )
+            .expect_err("non-empty mount point must be rejected")
+            .to_string()
+            .contains("non-empty")
+        );
     }
 
     impl DfsMountSupervisorControl for FakeMountSupervisorControl {

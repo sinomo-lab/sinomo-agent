@@ -5,7 +5,11 @@
 //! code.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::Path;
+use std::time::Instant;
 
+use sinomo_core::DfsObjectPolicy;
 use sinomo_core::DfsWriteReceipt;
 use sinomo_core::events::EventId;
 use time::OffsetDateTime;
@@ -33,6 +37,171 @@ pub(crate) fn full_metadata_hydration_calls() -> usize {
 
 fn hydration_never_cancelled() -> bool {
     false
+}
+
+pub(crate) fn run_metadata_hydration_runtime_probe(
+    root: &Path,
+    options: crate::DfsMetadataHydrationRuntimeProbeOptions,
+) -> Result<crate::DfsMetadataHydrationRuntimeProbeReport, DfsError> {
+    if options.object_count == 0 {
+        return Err(DfsError::Metadata {
+            message: "metadata hydration runtime probe object count must be positive".to_string(),
+        });
+    }
+    if root.exists()
+        && fs::read_dir(root)
+            .map_err(|source| DfsError::Metadata {
+                message: format!("read hydration probe root {}: {source}", root.display()),
+            })?
+            .next()
+            .is_some()
+    {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "metadata hydration runtime probe requires an empty root: {}",
+                root.display()
+            ),
+        });
+    }
+
+    let total_started = Instant::now();
+    let node_id =
+        NodeId::from_legacy_named("node_metadata_hydration_runtime_probe").map_err(|source| {
+            DfsError::Metadata {
+                message: format!("construct hydration probe node id: {source}"),
+            }
+        })?;
+    let file_system_id =
+        DfsFileSystemId::from_legacy_named("sifs").map_err(|source| DfsError::Metadata {
+            message: format!("construct hydration probe filesystem id: {source}"),
+        })?;
+    let network = sinomo_core::network::InProcessNetwork::new();
+    let transport = network.add_node(node_id.clone());
+    let content = LocalContentStore::new(root.join("content"))?;
+    let backend =
+        LocalSobjMetadataBackend::new(DfsMetadataShardId::new("root"), root.join("metadata"))?;
+    let mut dfs = NetworkedDfsService::new(transport, content).with_metadata_backend(backend)?;
+    dfs.add_file_system(DfsFileSystem {
+        file_system_id: file_system_id.clone(),
+        display_name: "metadata hydration runtime probe".to_string(),
+        owner_node_id: node_id.clone(),
+        subtree_policies: Vec::new(),
+    })?;
+
+    let write_started = Instant::now();
+    let mut tail_object_id = None;
+    let mut objects = Vec::with_capacity(options.object_count.saturating_add(1));
+    for index in 0..options.object_count {
+        let object_id =
+            DfsObjectId::from_legacy_named(format!("obj_hydration_runtime_probe_{index:06}"))
+                .map_err(|source| DfsError::Metadata {
+                    message: format!("construct hydration probe object id: {source}"),
+                })?;
+        let version =
+            DfsVersion::from_legacy_named(format!("version_hydration_runtime_probe_{index:06}"))
+                .map_err(|source| DfsError::Metadata {
+                    message: format!("construct hydration probe version: {source}"),
+                })?;
+        if index + 1 == options.object_count {
+            tail_object_id = Some(object_id.clone());
+        }
+        objects.push(DfsObjectMetadata {
+            object_id,
+            file_system_id: file_system_id.clone(),
+            path: format!("/runtime-probes/hydration/page-{index:06}.txt"),
+            kind: DfsObjectKind::File,
+            tombstone_provenance: None,
+            owner_node_id: node_id.clone(),
+            current_locations: vec![node_id.clone()],
+            content_hash: None,
+            content_size_bytes: Some(0),
+            link_target_object_id: None,
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            accessed_at_unix_nanos: 0,
+            modified_at_unix_nanos: 0,
+            created_at_unix_nanos: 0,
+            changed_at_unix_nanos: 0,
+            version,
+            policy: DfsObjectPolicy::LocalOwned,
+            created_by_event_id: None,
+            last_modified_by_event_id: None,
+        });
+    }
+    let tombstone_id = DfsObjectId::from_legacy_named("obj_hydration_runtime_probe_tombstone")
+        .map_err(|source| DfsError::Metadata {
+            message: format!("construct hydration probe tombstone id: {source}"),
+        })?;
+    let tombstone_path = "/runtime-probes/hydration/deleted.txt".to_string();
+    objects.push(DfsObjectMetadata {
+        object_id: tombstone_id,
+        file_system_id: file_system_id.clone(),
+        path: tombstone_path.clone(),
+        kind: DfsObjectKind::Tombstone,
+        tombstone_provenance: None,
+        owner_node_id: node_id.clone(),
+        current_locations: vec![node_id],
+        content_hash: None,
+        content_size_bytes: None,
+        link_target_object_id: None,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        accessed_at_unix_nanos: 0,
+        modified_at_unix_nanos: 0,
+        created_at_unix_nanos: 0,
+        changed_at_unix_nanos: 0,
+        version: DfsVersion::from_legacy_named("version_hydration_runtime_probe_tombstone")
+            .map_err(|source| DfsError::Metadata {
+                message: format!("construct hydration probe tombstone version: {source}"),
+            })?,
+        policy: DfsObjectPolicy::LocalOwned,
+        created_by_event_id: None,
+        last_modified_by_event_id: None,
+    });
+    dfs.add_object_metadata_batch(objects)?;
+    let write_elapsed = write_started.elapsed();
+
+    dfs.reset_reconstructable_metadata_projection();
+    let hydration_started = Instant::now();
+    dfs.hydrate_from_metadata_backend()?;
+    let hydration_elapsed = hydration_started.elapsed();
+
+    let tail_object_id = tail_object_id.ok_or_else(|| DfsError::Metadata {
+        message: "metadata hydration runtime probe did not create a tail object".to_string(),
+    })?;
+    let expected_tail_path = format!(
+        "/runtime-probes/hydration/page-{:06}.txt",
+        options.object_count - 1
+    );
+    let tail_object_restored = dfs
+        .current_read_object_metadata(&tail_object_id)
+        .is_ok_and(|object| object.path == expected_tail_path);
+    let tombstone_restored = dfs
+        .tombstones_by_metadata_path
+        .contains_key(&(file_system_id, metadata_path(&tombstone_path)));
+    if !tail_object_restored || !tombstone_restored {
+        return Err(DfsError::Metadata {
+            message: format!(
+                "metadata hydration runtime probe lost durable state: tail_restored={tail_object_restored} tombstone_restored={tombstone_restored}"
+            ),
+        });
+    }
+
+    Ok(crate::DfsMetadataHydrationRuntimeProbeReport {
+        object_count: options.object_count as u64,
+        page_size: DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE as u64,
+        crossed_page_boundary: options.object_count > DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE,
+        write_elapsed_ms: write_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        hydration_elapsed_ms: hydration_elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+        total_elapsed_ms: total_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64,
+        tail_object_restored,
+        tombstone_restored,
+    })
 }
 
 /// Whether one hydrated committed intent can still own repair work for the

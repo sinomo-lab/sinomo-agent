@@ -25,17 +25,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 return Ok(reader);
             }
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "pending write manifest mismatch for {} {}: expected hash {} size {}, actual hash {} size {}",
-                    pending.object_id,
-                    pending.version,
-                    pending.content_hash,
-                    pending.size_bytes,
-                    manifest.content_hash,
-                    manifest.size_bytes
-                ),
-            });
+            // Concurrent serialized writers can transiently share an
+            // object/version identity while retaining distinct immutable
+            // blobs. The manifest names only the latest contender; fall back
+            // to the pending intent's exact content hash below.
         }
 
         let reader = self.content.open_blob_stream(&pending.content_hash)?;

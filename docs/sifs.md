@@ -78,6 +78,22 @@ sinomo dfs mount <mount-point> [--root <sifs-path>]
 Unix uses FUSE where supported. Windows uses the Cloud Files integration. Both
 adapters preserve the same SIFS namespace and policy model.
 
+SIFS can also be served directly through the loopback NFSv3 adapter:
+
+```sh
+sinomo dfs nfs serve --bind 127.0.0.1:111 --export sifs --root /
+```
+
+On Windows Pro or Server with Client for NFS installed,
+`sinomo dfs nfs mount S:` starts the foreground server and maps the export to a
+drive letter without materializing a second host-side file tree. On Linux,
+`sinomo dfs nfs mount /mnt/sinomo` provides an explicit kernel-NFS alternative
+while `sinomo dfs mount /mnt/sinomo` continues to select FUSE by default. The
+NFS module also registers daemon-supervised controls and actionable status
+under **Settings > Modules > NFS Mount**. See the [SIFS NFSv3
+architecture](nfs-architecture.md) for its durability, confinement,
+compatibility, and lifecycle contracts.
+
 The [Windows Cloud Files architecture](cloud-files-architecture.md) defines
 the provider's placeholder identities, hydration, durable local writeback,
 remote-feed reconciliation, registration ownership, and crash recovery. It is

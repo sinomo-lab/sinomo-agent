@@ -339,6 +339,15 @@ pub struct ConfigDefinition {
     /// explicit catalog metadata; clients must not infer it from crate names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_id: Option<String>,
+    /// Module-provided user-facing identity for generic settings catalogs.
+    /// Clients must treat this as presentation metadata, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_description: Option<String>,
+    /// Module-declared paths for generic actionable-error presentation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operational_error: Option<ConfigOperationalErrorPresentation>,
     pub value_type: ConfigValueType,
     pub description: String,
     pub cluster_mode: ConfigClusterMode,
@@ -369,6 +378,9 @@ impl ConfigDefinition {
             key: ConfigKey::new(key)?,
             owner: owner.into(),
             module_id: None,
+            module_label: None,
+            module_description: None,
+            operational_error: None,
             value_type,
             description: description.into(),
             cluster_mode,
@@ -434,6 +446,51 @@ impl ConfigDefinition {
         Ok(self)
     }
 
+    pub fn with_module_presentation(
+        mut self,
+        label: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let label = label.into();
+        let description = description.into();
+        if self.module_id.is_none() {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module presentation requires a module id".to_string(),
+            });
+        }
+        if label.trim().is_empty() || label.trim() != label {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module label must be non-empty without surrounding whitespace".to_string(),
+            });
+        }
+        if description.trim().is_empty() || description.trim() != description {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module description must be non-empty without surrounding whitespace"
+                    .to_string(),
+            });
+        }
+        self.module_label = Some(label);
+        self.module_description = Some(description);
+        self.validate_contract()?;
+        Ok(self)
+    }
+
+    pub fn with_operational_error_presentation(
+        mut self,
+        error_field: impl Into<String>,
+        resolution_field: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        self.operational_error = Some(ConfigOperationalErrorPresentation {
+            error_field: error_field.into(),
+            resolution_field: resolution_field.into(),
+        });
+        self.validate_contract()?;
+        Ok(self)
+    }
+
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
@@ -474,6 +531,70 @@ impl ConfigDefinition {
                 detail: "module-owned settings require a detailed schema".to_string(),
             });
         }
+        if self.module_id.is_none()
+            && (self.module_label.is_some() || self.module_description.is_some())
+        {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module presentation requires a module id".to_string(),
+            });
+        }
+        if self.module_label.is_some() != self.module_description.is_some() {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module presentation requires both label and description".to_string(),
+            });
+        }
+        if let Some(label) = &self.module_label
+            && (label.trim().is_empty() || label.trim() != label)
+        {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module label must be non-empty without surrounding whitespace".to_string(),
+            });
+        }
+        if let Some(description) = &self.module_description
+            && (description.trim().is_empty() || description.trim() != description)
+        {
+            return Err(ConfigError::InvalidValue {
+                key: self.key.to_string(),
+                detail: "module description must be non-empty without surrounding whitespace"
+                    .to_string(),
+            });
+        }
+        if let Some(presentation) = &self.operational_error {
+            if !self.read_only {
+                return Err(ConfigError::InvalidValue {
+                    key: self.key.to_string(),
+                    detail: "operational error presentation requires a read-only definition"
+                        .to_string(),
+                });
+            }
+            if presentation.error_field.trim().is_empty()
+                || presentation.resolution_field.trim().is_empty()
+            {
+                return Err(ConfigError::InvalidValue {
+                    key: self.key.to_string(),
+                    detail: "operational error and resolution fields must be non-empty".to_string(),
+                });
+            }
+            let fields = self.schema.as_ref().and_then(|schema| match &schema.value {
+                ConfigSchemaValue::Object { fields, .. } => Some(fields),
+                _ => None,
+            });
+            for field in [&presentation.error_field, &presentation.resolution_field] {
+                if fields
+                    .is_none_or(|fields| !fields.iter().any(|candidate| &candidate.name == field))
+                {
+                    return Err(ConfigError::InvalidValue {
+                        key: self.key.to_string(),
+                        detail: format!(
+                            "operational presentation field `{field}` is absent from the root schema"
+                        ),
+                    });
+                }
+            }
+        }
         if let Some(schema) = &self.schema {
             schema.validate_declaration(&self.key)?;
             validate_schema_root_type(&self.key, &self.value_type, schema)?;
@@ -496,6 +617,12 @@ impl ConfigDefinition {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ConfigOperationalErrorPresentation {
+    pub error_field: String,
+    pub resolution_field: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2191,6 +2318,68 @@ mod tests {
         .expect("schema")
         .with_module_id("module.test")
         .expect("module id")
+    }
+
+    #[test]
+    fn operational_error_presentation_is_read_only_and_schema_bound() {
+        let definition = ConfigDefinition::new(
+            "test.module-status",
+            "test",
+            ConfigValueType::Object {
+                schema_name: "TestModuleStatus".to_string(),
+            },
+            "test module status",
+            ConfigClusterMode::LocalOnly,
+        )
+        .expect("definition")
+        .with_default(&serde_json::json!({
+            "last_error": null,
+            "resolution": null,
+        }))
+        .expect("default")
+        .with_schema(ConfigSchema::object(
+            "TestModuleStatus",
+            "test module status",
+            vec![
+                ConfigSchemaField::new(
+                    "last_error",
+                    "Error",
+                    "Current failure.",
+                    ConfigSchemaValue::string(),
+                )
+                .optional(),
+                ConfigSchemaField::new(
+                    "resolution",
+                    "Resolution",
+                    "How to resolve the failure.",
+                    ConfigSchemaValue::string(),
+                )
+                .optional(),
+            ],
+        ))
+        .expect("schema")
+        .with_module_id("module.test-status")
+        .expect("module id");
+        assert!(
+            definition
+                .clone()
+                .with_operational_error_presentation("last_error", "resolution")
+                .expect_err("editable operational status must be rejected")
+                .to_string()
+                .contains("read-only")
+        );
+        let definition = definition
+            .read_only()
+            .with_operational_error_presentation("last_error", "resolution")
+            .expect("read-only operational presentation");
+        definition.validate_contract().expect("valid contract");
+        assert_eq!(
+            definition.operational_error,
+            Some(ConfigOperationalErrorPresentation {
+                error_field: "last_error".to_string(),
+                resolution_field: "resolution".to_string(),
+            })
+        );
     }
 
     fn registry() -> ConfigRegistry {

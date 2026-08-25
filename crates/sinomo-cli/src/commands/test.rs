@@ -703,6 +703,7 @@ mod tests {
             summary: "example result".to_string(),
             duration_ms: 0,
             diagnostics: serde_json::Value::Object(Default::default()),
+            metrics: BTreeMap::new(),
             errors: Vec::new(),
         }
     }

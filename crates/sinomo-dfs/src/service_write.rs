@@ -41,6 +41,35 @@ struct PreparedDistributedWrite {
     create_predecessor_object_id: Option<DfsObjectId>,
 }
 
+fn planned_initial_receipt_nodes(
+    node_ids: impl IntoIterator<Item = NodeId>,
+    desired_replica_nodes: &[NodeId],
+) -> Vec<NodeId> {
+    node_ids
+        .into_iter()
+        .filter(|node_id| desired_replica_nodes.contains(node_id))
+        .collect()
+}
+
+#[cfg(test)]
+mod initial_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_replanning_drops_non_replica_receipts() {
+        let requester = NodeId::from_legacy_named("receipt-requester").expect("requester");
+        let replica = NodeId::from_legacy_named("receipt-replica").expect("replica");
+
+        assert_eq!(
+            planned_initial_receipt_nodes(
+                [requester, replica.clone()],
+                std::slice::from_ref(&replica),
+            ),
+            vec![replica]
+        );
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn snapshot_replication_plan(
         &self,
@@ -1779,17 +1808,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             policy,
             touch_parent_on_create,
         )?;
-        if let Some(invalid_receipt_node_id) = initial_receipt_node_ids
-            .iter()
-            .find(|node_id| !desired_replica_nodes.contains(node_id))
-        {
-            return Err(DfsError::Distributed {
-                message: format!(
-                    "routed write for {} cannot record initial receipt for non-replica {}",
-                    request.object_id, invalid_receipt_node_id
-                ),
-            });
-        }
+        // Snapshot planning may replace the requester with healthier content
+        // replicas. Its pre-staged blob remains a valid transfer source via
+        // intent.requesting_node_id, but it must not count as a W/N receipt.
+        let initial_receipt_node_ids =
+            planned_initial_receipt_nodes(initial_receipt_node_ids, &desired_replica_nodes);
         // Creating the in-memory intent is not the visible linearization
         // point. The commit path certifies this hinted epoch through a fresh
         // operation-bound full-shard acknowledgement immediately before

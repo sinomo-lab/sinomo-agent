@@ -213,9 +213,10 @@ bounded, operation-specific permit and head watermark for the exact assignment
 and epoch. This deliberately reuses the cluster's existing Raft consensus to
 fence failover; it does not put DFS metadata or content in KV.
 
-See [DFS architecture](dfs-architecture.md), the [SIFS layout](sifs.md), and
-the [Windows Cloud Files architecture](cloud-files-architecture.md) for the
-durable NTFS projection, writeback, and recovery boundary.
+See [DFS architecture](dfs-architecture.md), the [SIFS layout](sifs.md), the
+[direct NFSv3 adapter](nfs-architecture.md), and the
+[Windows Cloud Files architecture](cloud-files-architecture.md) for host
+filesystem presentation and its durability boundaries.
 
 ### Build and Artifact Distribution
 

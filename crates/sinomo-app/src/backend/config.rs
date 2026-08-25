@@ -19,8 +19,8 @@ use sinomo_lm::{
     provider_health_account_key, upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
-    ConfigClient, ConfigClusterMode, ConfigSchema, ConfigStore, ConfigValueSource, ConfigValueType,
-    ConfigWriteTarget,
+    ConfigClient, ConfigClusterMode, ConfigOperationalErrorPresentation, ConfigSchema, ConfigStore,
+    ConfigValueSource, ConfigValueType, ConfigWriteTarget,
 };
 use sinomo_runtime::local::SinomoDataDir;
 
@@ -60,6 +60,9 @@ pub struct ConfigItem {
     /// Explicit module lifecycle identity supplied by the config catalog.
     /// Settings surfaces must not infer this association from crate/owner names.
     pub module_id: Option<String>,
+    pub module_label: Option<String>,
+    pub module_description: Option<String>,
+    pub operational_error: Option<ConfigOperationalErrorPresentation>,
     pub description: String,
     pub value: String,
     pub source: &'static str,
@@ -98,10 +101,8 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
         .map_err(|e| format!("rollout config: {e:?}"))?;
     let builder = sinomo_runtime::sandbox::register_config_definitions(builder)
         .map_err(|e| format!("sandbox config: {e:?}"))?;
-    let builder = sinomo_runtime::dfs::dfs_module_registration()
-        .surfaces
-        .register_config_definitions(builder)
-        .map_err(|e| format!("dfs config: {e:?}"))?;
+    let builder = sinomo_runtime::modules::register_internal_module_config_definitions(builder)
+        .map_err(|e| format!("built-in module config: {e}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
     let builder = sinomo_evolution::register_config_definitions(builder)
@@ -130,6 +131,9 @@ pub fn resolve_items(client: &dyn ConfigClient) -> Vec<ConfigItem> {
             key,
             owner: def.owner.clone(),
             module_id: def.module_id.clone(),
+            module_label: def.module_label.clone(),
+            module_description: def.module_description.clone(),
+            operational_error: def.operational_error.clone(),
             description: def.description.clone(),
             value: compact(&value),
             source,
@@ -294,6 +298,29 @@ mod tests {
         assert!(status.read_only);
         assert!(status.schema.is_some());
         assert_eq!(status.module_id, mount.module_id);
+    }
+
+    #[test]
+    fn app_fallback_registry_discovers_nfs_module_ui_from_surfaces() {
+        let store = build_config_store().expect("config store");
+        let config = store
+            .registry()
+            .get(sinomo_runtime::dfs_nfs::NFS_MOUNT_CONFIG_KEY)
+            .expect("NFS config definition");
+        assert_eq!(
+            config.module_id.as_deref(),
+            Some(sinomo_runtime::dfs_nfs::nfs_module_id().as_str())
+        );
+        assert_eq!(
+            config.module_label.as_deref(),
+            Some(sinomo_runtime::dfs_nfs::NFS_MODULE_LABEL)
+        );
+        let status = store
+            .registry()
+            .get(sinomo_runtime::dfs_nfs::NFS_MOUNT_STATUS_CONFIG_KEY)
+            .expect("NFS status definition");
+        assert!(status.read_only);
+        assert!(status.operational_error.is_some());
     }
 
     #[test]

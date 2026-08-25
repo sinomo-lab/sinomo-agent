@@ -1611,7 +1611,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn stage_blob_sources(&self, intent_id: &str) -> Vec<NodeId> {
-        let sources = self
+        let mut sources = self
             .coordinator
             .receipts_for_intent(intent_id)
             .into_iter()
@@ -1620,7 +1620,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect::<Vec<_>>();
+            .collect::<BTreeSet<_>>();
+        if let Some(intent) = self.coordinator.intent(intent_id) {
+            if intent.requesting_node_id != self.node_id {
+                // A requester whose pre-staged blob was excluded by snapshot
+                // replanning is a transfer source, not a durable replica.
+                // Content-hash verification still gates every fetch response.
+                sources.insert(intent.requesting_node_id.clone());
+            }
+        }
         self.ranked_transfer_sources(sources)
     }
 

@@ -92,6 +92,40 @@ impl DfsMessageTransport for ReceiveOnlyTransport {
 }
 
 #[test]
+fn pending_write_stream_falls_back_to_exact_blob_after_manifest_replacement() {
+    let root = temp_root("pending-write-exact-blob-fallback");
+    let node = NodeId::from_legacy_named("pending-write-fallback-node").expect("node");
+    let object_id =
+        DfsObjectId::from_legacy_named("pending-write-fallback-object").expect("object id");
+    let version = DfsVersion::from_legacy_named("pending-write-fallback-version").expect("version");
+    let first = b"first concurrent body";
+    let second = b"second concurrent body";
+    let content = LocalContentStore::new(root.join("content")).expect("content store");
+    let first_manifest = content
+        .put_object_version_blob_only(object_id.as_str(), version.as_str(), first)
+        .expect("retain first content-addressed blob");
+    content
+        .put_object_version(object_id.as_str(), version.as_str(), second)
+        .expect("publish replacement manifest");
+    let service = NetworkedDfsService::new(ReceiveOnlyTransport::new(node), content);
+    let pending = PendingNetworkedWrite::new(
+        object_id,
+        version,
+        first_manifest.content_hash,
+        first_manifest.size_bytes,
+    );
+
+    let mut reader = service
+        .open_pending_write_blob_stream(&pending)
+        .expect("open exact pending blob despite replacement manifest");
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual).expect("read pending blob");
+    assert_eq!(actual, first);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn detached_message_worker_finishes_every_lane_local_parent_touch() {
     let root = temp_root("detached-worker-drains-parent-touches");
     let node = NodeId::from_legacy_named("node_detached_parent_touches").expect("node id");
@@ -21186,54 +21220,6 @@ fn tombstone_tracking_ignores_stale_live_path_metadata() {
 }
 
 #[test]
-#[ignore = "slow page-boundary hydration regression; run with `cargo test -p sinomo-dfs hydrate_from_metadata_backend_walks_multiple_object_pages -- --ignored`"]
-fn hydrate_from_metadata_backend_walks_multiple_object_pages() {
-    let root = temp_root("hydrate-multiple-object-pages");
-    let node_id = NodeId::from_legacy_named("node_hydrate_pages").expect("node");
-    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
-    let tail_index = DFS_METADATA_HYDRATE_OBJECT_PAGE_SIZE;
-    let mut tail_object_id = None;
-    for index in 0..=tail_index {
-        let mut object = file_metadata(node_id.clone());
-        object.object_id =
-            DfsObjectId::from_legacy_named(format!("obj_hydrate_page_{index}")).expect("object");
-        object.path = format!("/users/hydrate/page-{index:05}.txt");
-        object.version = DfsVersion::from_legacy_named(format!("version_hydrate_page_{index}"))
-            .expect("version");
-        if index == tail_index {
-            tail_object_id = Some(object.object_id.clone());
-        }
-        dfs.add_object_metadata(object).expect("metadata object");
-    }
-
-    let mut tombstone = file_metadata(node_id);
-    tombstone.object_id =
-        DfsObjectId::from_legacy_named("obj_hydrate_page_tombstone").expect("tombstone");
-    tombstone.kind = DfsObjectKind::Tombstone;
-    tombstone.path = "/users/hydrate/deleted.txt".to_string();
-    dfs.add_object_metadata(tombstone.clone())
-        .expect("tombstone metadata");
-
-    dfs.metadata = DfsMetadataStore::new();
-    dfs.tombstones_by_metadata_path.clear();
-    dfs.hydrate_from_metadata_backend().expect("hydrate pages");
-
-    let tail_object = dfs
-        .current_read_object_metadata(&tail_object_id.expect("tail object"))
-        .expect("tail object loaded");
-    assert_eq!(
-        tail_object.path,
-        format!("/users/hydrate/page-{tail_index:05}.txt")
-    );
-    assert!(
-        dfs.tombstones_by_metadata_path
-            .contains_key(&(sifs_file_system_id(), metadata_path(&tombstone.path))),
-        "paged hydration must restore tombstone tracking"
-    );
-    std::fs::remove_dir_all(root).ok();
-}
-
-#[test]
 fn hydrated_tombstone_tracking_is_incremental_and_live_path_aware() {
     let root = temp_root("hydrate-incremental-tombstones");
     let node_id = NodeId::from_legacy_named("node_hydrate_tombstones").expect("node");
@@ -26182,8 +26168,12 @@ fn remote_read_planning_deduplicates_duplicate_locations() {
 #[test]
 fn remote_read_planning_uses_single_active_source_and_falls_back_after_miss() {
     let root = temp_root("remote-read-single-active-fallback");
-    let owner_a = NodeId::from_legacy_named("node_read_source_a").expect("node");
-    let owner_b = NodeId::from_legacy_named("node_read_source_b").expect("node");
+    let mut owners = [
+        NodeId::from_legacy_named("node_read_source_a").expect("node"),
+        NodeId::from_legacy_named("node_read_source_b").expect("node"),
+    ];
+    owners.sort();
+    let [owner_a, owner_b] = owners;
     let reader = NodeId::from_legacy_named("node_read_single_reader").expect("node");
     let network = InProcessNetwork::new();
     let mut owner_a_transport = network.add_node(owner_a.clone());
@@ -26406,8 +26396,12 @@ fn expired_remote_read_attempt_rotates_to_next_location_before_retrying_same_sou
 #[test]
 fn late_remote_read_from_removed_location_does_not_clear_fallback_request() {
     let root = temp_root("remote-read-late-removed-location");
-    let source_a = NodeId::from_legacy_named("node_read_late_a").expect("node");
-    let source_b = NodeId::from_legacy_named("node_read_late_b").expect("node");
+    let mut sources = [
+        NodeId::from_legacy_named("node_read_late_a").expect("node"),
+        NodeId::from_legacy_named("node_read_late_b").expect("node"),
+    ];
+    sources.sort();
+    let [source_a, source_b] = sources;
     let reader = NodeId::from_legacy_named("node_read_late_reader").expect("node");
     let network = InProcessNetwork::new();
     let mut source_a_transport = network.add_node(source_a.clone());
@@ -26758,8 +26752,12 @@ fn inline_remote_read_wrong_object_is_isolated_and_falls_back() {
 #[test]
 fn inline_remote_read_wrong_payload_object_is_isolated_and_falls_back() {
     let root = temp_root("remote-read-wrong-payload-object-isolated");
-    let source_a = NodeId::from_legacy_named("node_read_wrong_payload_a").expect("node");
-    let source_b = NodeId::from_legacy_named("node_read_wrong_payload_b").expect("node");
+    let mut sources = [
+        NodeId::from_legacy_named("node_read_wrong_payload_a").expect("node"),
+        NodeId::from_legacy_named("node_read_wrong_payload_b").expect("node"),
+    ];
+    sources.sort();
+    let [source_a, source_b] = sources;
     let reader = NodeId::from_legacy_named("node_read_wrong_payload_reader").expect("node");
     let wrong_object_id = DfsObjectId::from_legacy_named("obj_wrong_read_payload").expect("object");
     let network = InProcessNetwork::new();

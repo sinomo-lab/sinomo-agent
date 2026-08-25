@@ -85,6 +85,7 @@ mod runtime_admission;
 mod runtime_authority;
 mod runtime_message;
 mod runtime_mounted_mutation;
+mod runtime_probe;
 mod runtime_publish;
 mod service;
 mod service_async;
@@ -180,6 +181,13 @@ pub use runtime_mounted_mutation::{
     all_mounted_sifs_mutation_committed_work, handle_mounted_sifs_mutation_handoff,
     mounted_sifs_mutation_pending_maintenance_work, mounted_sifs_mutation_startup_committed_work,
     persist_default_dfs_repair_queue_records,
+};
+pub use runtime_probe::{
+    DfsContentVersionGcRuntimeProbeOptions, DfsContentVersionGcRuntimeProbeReport,
+    DfsMetadataHistoryGcRuntimeProbeOptions, DfsMetadataHistoryGcRuntimeProbeReport,
+    DfsMetadataHydrationRuntimeProbeOptions, DfsMetadataHydrationRuntimeProbeReport,
+    run_content_version_gc_runtime_probe, run_metadata_history_gc_runtime_probe,
+    run_metadata_hydration_runtime_probe,
 };
 pub use runtime_publish::{
     DfsMetadataPublishPlanningAttempt, metadata_publish_lanes_from_authority,

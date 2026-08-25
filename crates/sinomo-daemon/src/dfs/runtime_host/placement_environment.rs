@@ -1,6 +1,6 @@
 use super::*;
 use sinomo_core::cluster::ClusterKvPathsExt;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
 #[derive(Debug)]
@@ -20,7 +20,7 @@ static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
 
 const DAEMON_DFS_METERING_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-const DAEMON_DFS_METERING_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_DFS_METERING_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn placement_environments() -> &'static Mutex<BTreeMap<PathBuf, DaemonDfsPlacementEnvironment>> {
     DAEMON_DFS_PLACEMENT_ENVIRONMENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -479,18 +479,13 @@ fn sample_os_network_metering() -> sinomo_dfs::DfsNetworkMetering {
             "device",
             "show",
         ]);
-        return command_stdout_bounded(command, DAEMON_DFS_METERING_COMMAND_TIMEOUT)
+        return command_stdout_bounded(command, DAEMON_DFS_METERING_QUERY_TIMEOUT)
             .map(|output| parse_network_manager_metering(&output))
             .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
     }
     #[cfg(target_os = "windows")]
     {
-        return command_stdout_bounded(
-            windows_network_metering_command(),
-            DAEMON_DFS_METERING_COMMAND_TIMEOUT,
-        )
-        .map(|output| parse_windows_network_cost(&output))
-        .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
+        return sample_windows_network_metering();
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
@@ -499,26 +494,137 @@ fn sample_os_network_metering() -> sinomo_dfs::DfsNetworkMetering {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_network_metering_command() -> Command {
-    let mut command = Command::new("powershell.exe");
-    // The daemon normally has no attached console, so starting a console
-    // program without Windows creation flags flashes a foreground window.
-    // Keep both the process-level flag and PowerShell's own window policy so
-    // this periodic observation remains invisible to the interactive user.
-    crate::prepare_noninteractive_command(&mut command);
-    command.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-WindowStyle",
-        "Hidden",
-        "-Command",
-        "Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -or $_.IPv6Connectivity -ne 'Disconnected'} | Select-Object -ExpandProperty NetworkCostType",
-    ]);
-    command
+struct WindowsRuntimeApartment;
+
+#[cfg(target_os = "windows")]
+struct WindowsNetworkMeteringWorker {
+    requests:
+        std::sync::mpsc::SyncSender<std::sync::mpsc::SyncSender<sinomo_dfs::DfsNetworkMetering>>,
 }
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(target_os = "windows")]
+impl WindowsNetworkMeteringWorker {
+    fn start() -> Option<Self> {
+        let (request_tx, request_rx) = std::sync::mpsc::sync_channel(1);
+        // The worker owns WinRT's thread-scoped apartment and keeps a bounded
+        // synchronous OS query off Tokio workers. It deliberately uses Rust's
+        // standard thread stack; stack growth is not an error-handling policy.
+        std::thread::Builder::new()
+            .name("sinomo-winrt-metering".to_string())
+            .spawn(move || run_windows_network_metering_worker(request_rx))
+            .ok()?;
+        Some(Self {
+            requests: request_tx,
+        })
+    }
+
+    fn sample(&self) -> sinomo_dfs::DfsNetworkMetering {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        if self.requests.try_send(reply_tx).is_err() {
+            return sinomo_dfs::DfsNetworkMetering::Unknown;
+        }
+        reply_rx
+            .recv_timeout(DAEMON_DFS_METERING_QUERY_TIMEOUT)
+            .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsRuntimeApartment {
+    fn initialize() -> windows::core::Result<Self> {
+        use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
+
+        // SAFETY: this call initializes WinRT for only the current sampling
+        // thread and the guard balances every successful initialization.
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED)? };
+        Ok(Self)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for WindowsRuntimeApartment {
+    fn drop(&mut self) {
+        use windows::Win32::System::WinRT::RoUninitialize;
+
+        // SAFETY: this guard exists only after RoInitialize succeeded on this
+        // thread and is dropped before the sampling call returns.
+        unsafe { RoUninitialize() };
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn sample_windows_network_metering() -> sinomo_dfs::DfsNetworkMetering {
+    static WORKER: OnceLock<Option<WindowsNetworkMeteringWorker>> = OnceLock::new();
+    WORKER
+        .get_or_init(WindowsNetworkMeteringWorker::start)
+        .as_ref()
+        .map(WindowsNetworkMeteringWorker::sample)
+        .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown)
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_network_metering_worker(
+    requests: std::sync::mpsc::Receiver<
+        std::sync::mpsc::SyncSender<sinomo_dfs::DfsNetworkMetering>,
+    >,
+) {
+    let Ok(_apartment) = WindowsRuntimeApartment::initialize() else {
+        return;
+    };
+    while let Ok(reply) = requests.recv() {
+        let observation =
+            query_windows_network_metering().unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
+        let _ = reply.send(observation);
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn query_windows_network_metering() -> windows::core::Result<sinomo_dfs::DfsNetworkMetering> {
+    use windows::Networking::Connectivity::{
+        NetworkConnectivityLevel, NetworkCostType, NetworkInformation,
+    };
+
+    let profiles = NetworkInformation::GetConnectionProfiles()?;
+    let mut observations = Vec::new();
+    for index in 0..profiles.Size()? {
+        let profile = profiles.GetAt(index)?;
+        if profile.GetNetworkConnectivityLevel()? == NetworkConnectivityLevel::None {
+            continue;
+        }
+        let cost = profile.GetConnectionCost()?.NetworkCostType()?;
+        observations.push(if cost == NetworkCostType::Unrestricted {
+            sinomo_dfs::DfsNetworkMetering::Unmetered
+        } else if cost == NetworkCostType::Fixed || cost == NetworkCostType::Variable {
+            sinomo_dfs::DfsNetworkMetering::Metered
+        } else {
+            sinomo_dfs::DfsNetworkMetering::Unknown
+        });
+    }
+    Ok(aggregate_active_windows_network_metering(observations))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn aggregate_active_windows_network_metering(
+    observations: impl IntoIterator<Item = sinomo_dfs::DfsNetworkMetering>,
+) -> sinomo_dfs::DfsNetworkMetering {
+    let mut saw_active = false;
+    let mut saw_unknown = false;
+    for observation in observations {
+        saw_active = true;
+        match observation {
+            sinomo_dfs::DfsNetworkMetering::Metered => return observation,
+            sinomo_dfs::DfsNetworkMetering::Unknown => saw_unknown = true,
+            sinomo_dfs::DfsNetworkMetering::Unmetered => {}
+        }
+    }
+    if saw_active && !saw_unknown {
+        sinomo_dfs::DfsNetworkMetering::Unmetered
+    } else {
+        sinomo_dfs::DfsNetworkMetering::Unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn command_stdout_bounded(mut command: Command, timeout: Duration) -> Option<String> {
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
@@ -575,28 +681,6 @@ fn parse_network_manager_metering(output: &str) -> sinomo_dfs::DfsNetworkMeterin
     }
 }
 
-#[cfg(target_os = "windows")]
-fn parse_windows_network_cost(output: &str) -> sinomo_dfs::DfsNetworkMetering {
-    let mut saw_unrestricted = false;
-    let mut saw_unknown = false;
-    for cost in output
-        .lines()
-        .map(str::trim)
-        .filter(|cost| !cost.is_empty())
-    {
-        match cost.to_ascii_lowercase().as_str() {
-            "fixed" | "variable" => return sinomo_dfs::DfsNetworkMetering::Metered,
-            "unrestricted" => saw_unrestricted = true,
-            _ => saw_unknown = true,
-        }
-    }
-    if saw_unrestricted && !saw_unknown {
-        sinomo_dfs::DfsNetworkMetering::Unmetered
-    } else {
-        sinomo_dfs::DfsNetworkMetering::Unknown
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,19 +726,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn windows_metering_aggregation_preserves_unknowns() {
+        use sinomo_dfs::DfsNetworkMetering::{Metered, Unknown, Unmetered};
+
+        assert_eq!(aggregate_active_windows_network_metering([]), Unknown);
+        assert_eq!(
+            aggregate_active_windows_network_metering([Unmetered, Unmetered]),
+            Unmetered
+        );
+        assert_eq!(
+            aggregate_active_windows_network_metering([Unmetered, Unknown]),
+            Unknown
+        );
+        assert_eq!(
+            aggregate_active_windows_network_metering([Unknown, Metered]),
+            Metered
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_metering_probe_is_hidden_and_noninteractive() {
-        use std::ffi::OsStr;
-
-        let command = windows_network_metering_command();
-        assert_eq!(command.get_program(), OsStr::new("powershell.exe"));
-        let args = command.get_args().collect::<Vec<_>>();
+    fn windows_native_metering_probe_is_bounded() {
+        let started = Instant::now();
+        let observation = sample_windows_network_metering();
+        assert!(matches!(
+            observation,
+            sinomo_dfs::DfsNetworkMetering::Unknown
+                | sinomo_dfs::DfsNetworkMetering::Unmetered
+                | sinomo_dfs::DfsNetworkMetering::Metered
+        ));
         assert!(
-            args.windows(2)
-                .any(|args| { args == [OsStr::new("-WindowStyle"), OsStr::new("Hidden")] })
+            started.elapsed() <= DAEMON_DFS_METERING_QUERY_TIMEOUT + Duration::from_secs(1),
+            "native Windows metering must not block daemon lease renewal"
         );
-        assert!(args.contains(&OsStr::new("-NonInteractive")));
-        assert!(args.contains(&OsStr::new("Get-NetConnectionProfile | Where-Object {$_.IPv4Connectivity -ne 'Disconnected' -or $_.IPv6Connectivity -ne 'Disconnected'} | Select-Object -ExpandProperty NetworkCostType")));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_native_metering_query_uses_standard_thread_stack() {
+        let query = std::thread::Builder::new()
+            .name("sinomo-winrt-metering-stack-test".to_string())
+            .spawn(|| {
+                let _apartment = WindowsRuntimeApartment::initialize()?;
+                query_windows_network_metering()
+            })
+            .expect("spawn standard-stack WinRT query")
+            .join()
+            .expect("standard-stack WinRT query thread must not overflow")
+            .expect("standard-stack WinRT query must complete");
+        assert!(matches!(
+            query,
+            sinomo_dfs::DfsNetworkMetering::Unknown
+                | sinomo_dfs::DfsNetworkMetering::Unmetered
+                | sinomo_dfs::DfsNetworkMetering::Metered
+        ));
     }
 }

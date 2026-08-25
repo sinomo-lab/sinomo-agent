@@ -34,6 +34,7 @@ sinomo-build = { path = "../sinomo-build" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
+sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-remote-management = { path = "../sinomo-remote-management" }
@@ -47,6 +48,12 @@ tokio.workspace = true
 tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Networking_Connectivity",
+    "Win32_System_WinRT",
+] }
 
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }

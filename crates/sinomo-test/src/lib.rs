@@ -120,6 +120,7 @@ impl SinomoTestCase {
                 status: skip.status,
                 summary: skip.summary,
                 diagnostics: skip.diagnostics,
+                metrics: BTreeMap::new(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: Vec::new(),
             };
@@ -130,6 +131,7 @@ impl SinomoTestCase {
                 status: outcome.status,
                 summary: outcome.summary,
                 diagnostics: merge_diagnostics(context.take_diagnostics(), outcome.diagnostics),
+                metrics: context.take_metrics(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: Vec::new(),
             },
@@ -138,6 +140,7 @@ impl SinomoTestCase {
                 status: SinomoTestStatus::Failed,
                 summary: error.to_string(),
                 diagnostics: context.take_diagnostics(),
+                metrics: context.take_metrics(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 errors: vec![error.to_string()],
             },
@@ -243,6 +246,24 @@ impl SinomoTestOutcome {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum SinomoTestMetricUnit {
+    Count,
+    Bytes,
+    Milliseconds,
+    Microseconds,
+    BytesPerSecond,
+    OperationsPerSecond,
+    Ratio,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SinomoTestMetric {
+    pub value: f64,
+    pub unit: SinomoTestMetricUnit,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SinomoTestReport {
     pub case: SinomoTestCaseMetadata,
@@ -251,6 +272,8 @@ pub struct SinomoTestReport {
     pub duration_ms: u64,
     #[serde(default)]
     pub diagnostics: serde_json::Value,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metrics: BTreeMap<String, SinomoTestMetric>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<String>,
 }
@@ -296,6 +319,7 @@ pub struct SinomoTestContext {
     cluster_snapshot: Option<SinomoTestClusterSnapshotEvidence>,
     runtime_capabilities: BTreeSet<String>,
     diagnostics: serde_json::Map<String, serde_json::Value>,
+    metrics: BTreeMap<String, SinomoTestMetric>,
 }
 
 impl SinomoTestContext {
@@ -310,6 +334,7 @@ impl SinomoTestContext {
             cluster_snapshot: None,
             runtime_capabilities: BTreeSet::new(),
             diagnostics: Default::default(),
+            metrics: BTreeMap::new(),
         }
     }
 
@@ -458,8 +483,26 @@ impl SinomoTestContext {
         self.diagnostics.insert(key.into(), value);
     }
 
+    pub fn record_metric(
+        &mut self,
+        key: impl Into<String>,
+        value: f64,
+        unit: SinomoTestMetricUnit,
+    ) {
+        let key = key.into();
+        if value.is_finite() {
+            self.metrics.insert(key, SinomoTestMetric { value, unit });
+        } else {
+            self.record(format!("{key}_metric_error"), "metric value must be finite");
+        }
+    }
+
     pub fn take_diagnostics(&mut self) -> serde_json::Value {
         serde_json::Value::Object(std::mem::take(&mut self.diagnostics))
+    }
+
+    pub fn take_metrics(&mut self) -> BTreeMap<String, SinomoTestMetric> {
+        std::mem::take(&mut self.metrics)
     }
 }
 
@@ -587,6 +630,7 @@ mod tests {
             requirements: [],
             run: {
                 ctx.record("seen", true);
+                ctx.record_metric("elapsed_ms", 12.0, SinomoTestMetricUnit::Milliseconds);
                 Ok(SinomoTestOutcome::passed("ok"))
             }
         }
@@ -604,6 +648,13 @@ mod tests {
 
         assert_eq!(report.status, SinomoTestStatus::Passed);
         assert_eq!(report.diagnostics["seen"], true);
+        assert_eq!(
+            report.metrics["elapsed_ms"],
+            SinomoTestMetric {
+                value: 12.0,
+                unit: SinomoTestMetricUnit::Milliseconds,
+            }
+        );
     }
 
     #[test]

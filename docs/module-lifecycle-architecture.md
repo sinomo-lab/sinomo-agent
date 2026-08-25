@@ -242,6 +242,14 @@ legacy compatibility case, not the normal module contract. Catalog entries use
 an explicit module ID to associate settings with a module; clients must not
 infer ownership from display names or key prefixes.
 
+A settings definition may additionally carry module-owned presentation
+metadata: a user-facing module label and description. Generic settings clients
+use that metadata for lifecycle cards instead of maintaining per-module label
+tables. A read-only operational definition may declare which root fields carry
+an error and its resolution. Clients can then render actionable failure UI
+without knowing domain-specific field names; this metadata is presentation
+only and grants no write or lifecycle authority.
+
 SOBJ is the native settings representation across the module ABI, object RPC,
 and cluster KV. Human-editable JSON files and JSON-shaped interface values
 are projections for local inspection and editing, not a parallel distributed

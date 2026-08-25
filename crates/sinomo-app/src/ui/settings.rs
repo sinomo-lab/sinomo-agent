@@ -81,9 +81,7 @@ use crate::backend::config::{
     set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
     text_verbosity_index,
 };
-use crate::backend::modules::{
-    ModuleConfigSnapshot, ModuleObservedState, module_ids_match, native_rust_module_is_toggleable,
-};
+use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
 use crate::backend::mounts::{
     SifsMountSettingsSnapshot, validate_connected_cloud_files_status_at, validate_sifs_mount_config,
 };
@@ -1140,6 +1138,7 @@ enum SettingsOperation {
         node_id: String,
         module_id: String,
         enabled: Option<bool>,
+        native_rust: bool,
     },
     RefreshSifsMount {
         update_feedback: bool,
@@ -4392,8 +4391,9 @@ fn execute_settings_operation(
             node_id,
             module_id,
             enabled,
+            native_rust,
         } => SettingsOperationPayload::Modules((|| {
-            backend.set_node_module_override(&node_id, &module_id, enabled)?;
+            backend.set_node_module_override(&node_id, &module_id, enabled, native_rust)?;
             let mut message = match enabled {
                 Some(true) => format!(
                     "Node override enabled for {}",
@@ -4410,7 +4410,7 @@ fn execute_settings_operation(
                     module_display_id(&module_id)
                 ),
             };
-            if enabled.is_some() && native_rust_module_is_toggleable(&module_id) {
+            if enabled.is_some() && native_rust {
                 message.push_str("; restart that node's daemon to apply it");
             }
             let snapshot = backend.module_config_snapshot(Some(&node_id));
@@ -5414,7 +5414,14 @@ fn available_agent_tool_specs(selected: &[AgentToolSpec]) -> Vec<AgentToolSpec> 
     tools
 }
 
-fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot) -> String {
+fn module_sidebar_preview(snapshot: &ModuleConfigSnapshot, items: &[ConfigItem]) -> String {
+    let actionable = items
+        .iter()
+        .filter(|item| item.module_id.is_some() && module_operational_error(item).is_some())
+        .count();
+    if actionable > 0 {
+        return format!("{actionable} action required");
+    }
     if snapshot.modules.is_empty() {
         return "No modules".to_string();
     }
@@ -5629,7 +5636,7 @@ pub fn section_preview(shared: &Shared, section: SettingsSection) -> String {
         }
         SettingsSection::Modules => {
             let settings = shared.settings();
-            module_sidebar_preview(&settings.module_snapshot)
+            module_sidebar_preview(&settings.module_snapshot, &settings.config_items)
         }
         SettingsSection::Skills => {
             let settings = shared.settings();
@@ -5916,13 +5923,16 @@ fn configuration_key(shared: &Shared) -> String {
 #[cfg(test)]
 fn config_item_rebuild_signature(item: &ConfigItem) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}",
+        "{}:{}:{}:{}:{}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{}:{:?}:{:?}",
         item.key,
         item.owner,
         item.description,
         item.source,
         item.scope,
         item.module_id,
+        item.module_label,
+        item.module_description,
+        item.operational_error,
         item.edit_kind,
         item.bool_value,
         item.read_only,
@@ -12298,6 +12308,7 @@ fn module_config_section(
     module_config_items: Vec<(usize, ConfigItem)>,
 ) -> impl Widget + use<> {
     let module_id = module.module_id.clone();
+    let native_rust = module.backend == "native-rust";
     let selected_node_label = {
         let settings = shared.settings();
         settings
@@ -12365,6 +12376,7 @@ fn module_config_section(
                             node_id,
                             module_id: selected_module_id.clone(),
                             enabled,
+                            native_rust,
                         },
                     );
                 } else {
@@ -12504,6 +12516,28 @@ fn module_config_editor_row(
             short_one_line(&item.description, 160),
         ));
     }
+    if let Some((error, resolution)) = module_operational_error(item) {
+        settings_body = settings_body
+            .with_child(
+                Stack::horizontal().with_child(
+                    StatusBadge::new("Action required")
+                        .icon(IconGlyph::Alert)
+                        .tone(SemanticTone::Danger)
+                        .theme_when(clone_reader(reader)),
+                ),
+            )
+            .with_child(selectable_read_only_area(
+                reader,
+                &format!("module-operational-error-{index}"),
+                error,
+            ))
+            .with_child(muted_meta_label(shared, "How to resolve"))
+            .with_child(selectable_read_only_area(
+                reader,
+                &format!("module-operational-resolution-{index}"),
+                resolution,
+            ));
+    }
     settings_body = settings_body.with_child(PodHost::new(editor));
     WidgetPod::new(
         FormRow::new(
@@ -12513,6 +12547,22 @@ fn module_config_editor_row(
         .stacked()
         .theme_when(clone_reader(reader)),
     )
+}
+
+fn module_operational_error(item: &ConfigItem) -> Option<(String, String)> {
+    let presentation = item.operational_error.as_ref()?;
+    let object = item.raw_value.as_object()?;
+    let error = object.get(&presentation.error_field)?.as_str()?.trim();
+    if error.is_empty() {
+        return None;
+    }
+    let resolution = object
+        .get(&presentation.resolution_field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Resolve the reported module error and refresh this page.");
+    Some((error.to_string(), resolution.to_string()))
 }
 
 fn module_node_option(node: &crate::backend::modules::ModuleConfigNodeSummary) -> String {
@@ -15262,7 +15312,13 @@ fn section_status_tone(shared: &Shared, section: SettingsSection) -> SemanticTon
             }
         }
         SettingsSection::Modules => {
-            if settings.module_snapshot.warnings.is_empty() {
+            if settings.module_action_error.is_some()
+                || settings.config_items.iter().any(|item| {
+                    item.module_id.is_some() && module_operational_error(item).is_some()
+                })
+            {
+                SemanticTone::Danger
+            } else if settings.module_snapshot.warnings.is_empty() {
                 SemanticTone::Accent
             } else {
                 SemanticTone::Warning
@@ -18479,6 +18535,8 @@ mod tests {
         let shared = Shared::new(AppState::ready(backend));
         let associated_index;
         let cloud_files_index;
+        let nfs_config_index;
+        let nfs_status_index;
         let unmatched_index;
         {
             let mut app = shared.borrow_mut();
@@ -18522,6 +18580,18 @@ mod tests {
                         effective_source: ModuleRuntimeConfigSource::Node,
                         observed: ModuleObservedState::Running,
                         observed_detail: "Native provider is active".to_string(),
+                    },
+                    crate::backend::modules::ModuleConfigModuleSummary {
+                        module_id: sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID
+                            .to_string(),
+                        label: sinomo_runtime::dfs_nfs::NFS_MODULE_LABEL.to_string(),
+                        backend: "native-rust".to_string(),
+                        detail: sinomo_runtime::dfs_nfs::NFS_MODULE_DESCRIPTION.to_string(),
+                        desired_enabled: Some(true),
+                        effective_enabled: true,
+                        effective_source: ModuleRuntimeConfigSource::Node,
+                        observed: ModuleObservedState::Running,
+                        observed_detail: "NFS supervisor is active".to_string(),
                     },
                 ],
                 warnings: Vec::new(),
@@ -18573,6 +18643,52 @@ mod tests {
             cloud_files.description = definition.description;
             cloud_files.schema = definition.schema;
             settings.config_items.push(cloud_files);
+
+            nfs_config_index = settings.config_items.len();
+            let definition = sinomo_runtime::dfs_nfs::nfs_mount_config_definition();
+            let default_value = definition
+                .default_value
+                .clone()
+                .expect("NFS config default");
+            let mut nfs_config = test_config_item(
+                sinomo_runtime::dfs_nfs::NFS_MOUNT_CONFIG_KEY,
+                ConfigEditKind::Json,
+                &serde_json::to_string(&default_value).expect("NFS config text"),
+            );
+            nfs_config.owner = definition.owner;
+            nfs_config.module_id = definition.module_id;
+            nfs_config.module_label = definition.module_label;
+            nfs_config.module_description = definition.module_description;
+            nfs_config.description = definition.description;
+            nfs_config.schema = definition.schema;
+            nfs_config.raw_value = default_value;
+            settings.config_items.push(nfs_config);
+
+            nfs_status_index = settings.config_items.len();
+            let definition = sinomo_runtime::dfs_nfs::nfs_mount_status_config_definition();
+            let status = sinomo_runtime::dfs_nfs::NfsMountRuntimeStatus::error(
+                &sinomo_runtime::dfs_nfs::NfsMountConfig::default(),
+                Some("/mnt/sinomo".to_string()),
+                "mount-permission-required",
+                "mount.nfs: Operation not permitted",
+                "Grant the daemon mount authority and retry.",
+            );
+            let raw_value = serde_json::to_value(status).expect("NFS status JSON");
+            let mut nfs_status = test_config_item(
+                sinomo_runtime::dfs_nfs::NFS_MOUNT_STATUS_CONFIG_KEY,
+                ConfigEditKind::Json,
+                &serde_json::to_string(&raw_value).expect("NFS status text"),
+            );
+            nfs_status.owner = definition.owner;
+            nfs_status.module_id = definition.module_id;
+            nfs_status.module_label = definition.module_label;
+            nfs_status.module_description = definition.module_description;
+            nfs_status.operational_error = definition.operational_error;
+            nfs_status.description = definition.description;
+            nfs_status.schema = definition.schema;
+            nfs_status.read_only = true;
+            nfs_status.raw_value = raw_value;
+            settings.config_items.push(nfs_status);
 
             unmatched_index = settings.config_items.len();
             let mut unmatched = test_config_item(
@@ -18659,6 +18775,26 @@ mod tests {
             .with_name(format!("config-{cloud_files_index}-schema-root_path"))
             .expect()
             .to_have_value("/")?;
+        window.get_by_text("NFS Mount").expect().to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("config-{nfs_config_index}-schema-target"))
+            .expect()
+            .to_have_value(&sinomo_runtime::dfs_nfs::NfsMountConfig::default().target)?;
+        window
+            .get_by_text("Action required")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("module-operational-error-{nfs_status_index}"))
+            .expect()
+            .to_have_value("mount.nfs: Operation not permitted")?;
+        window
+            .get_by_role(sui::SemanticsRole::TextInput)
+            .with_name(format!("module-operational-resolution-{nfs_status_index}"))
+            .expect()
+            .to_have_value("Grant the daemon mount authority and retry.")?;
         window
             .get_by_text("Additional module settings")
             .expect()
@@ -19238,6 +19374,7 @@ mod tests {
                 node_id,
                 module_id: sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
                 enabled: Some(false),
+                native_rust: true,
             },
         );
         let selected = state
@@ -19384,6 +19521,7 @@ mod tests {
                 module_id: sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID
                     .to_string(),
                 enabled: Some(false),
+                native_rust: false,
             },
         );
         assert_eq!(
@@ -20223,6 +20361,9 @@ mod tests {
             key: key.to_string(),
             owner: "test".to_string(),
             module_id: None,
+            module_label: None,
+            module_description: None,
+            operational_error: None,
             description: "test setting".to_string(),
             value: raw.to_string(),
             source: "cluster",
@@ -20234,6 +20375,27 @@ mod tests {
             schema: None,
             read_only: false,
         }
+    }
+
+    #[test]
+    fn module_operational_error_uses_registered_field_paths() {
+        let mut item = test_config_item(
+            "storage.test-status",
+            ConfigEditKind::Json,
+            r#"{"failure":"mount.nfs: Operation not permitted","fix":"Grant mount authority and retry."}"#,
+        );
+        item.read_only = true;
+        item.operational_error = Some(sinomo_runtime::config::ConfigOperationalErrorPresentation {
+            error_field: "failure".to_string(),
+            resolution_field: "fix".to_string(),
+        });
+        assert_eq!(
+            module_operational_error(&item),
+            Some((
+                "mount.nfs: Operation not permitted".to_string(),
+                "Grant mount authority and retry.".to_string(),
+            ))
+        );
     }
 
     #[test]

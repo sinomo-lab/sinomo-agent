@@ -11,6 +11,56 @@ use crate::service_content::object_content_identity;
 use crate::transfer::PendingNetworkedWrite;
 use crate::*;
 
+fn active_replica_stage_conflicts(
+    active_intent_id: &str,
+    active_version: &DfsVersion,
+    active_content_hash: &str,
+    incoming_intent_id: &str,
+    incoming_version: &DfsVersion,
+    incoming_content_hash: &str,
+) -> bool {
+    active_intent_id != incoming_intent_id
+        && active_version >= incoming_version
+        && (active_version != incoming_version || active_content_hash != incoming_content_hash)
+}
+
+#[cfg(test)]
+mod active_stage_tests {
+    use super::*;
+
+    fn version(value: &str) -> DfsVersion {
+        DfsVersion::from_legacy_named(value).expect("version")
+    }
+
+    #[test]
+    fn newer_replica_stage_supersedes_older_active_stage() {
+        assert!(!active_replica_stage_conflicts(
+            "intent-old",
+            &version("version-1"),
+            "hash-old",
+            "intent-new",
+            &version("version-2"),
+            "hash-new",
+        ));
+        assert!(active_replica_stage_conflicts(
+            "intent-new",
+            &version("version-2"),
+            "hash-new",
+            "intent-old",
+            &version("version-1"),
+            "hash-old",
+        ));
+        assert!(active_replica_stage_conflicts(
+            "intent-a",
+            &version("version-2"),
+            "hash-a",
+            "intent-b",
+            &version("version-2"),
+            "hash-b",
+        ));
+    }
+}
+
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn ensure_command_base_matches_current(
         &self,
@@ -87,9 +137,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
     ) -> Result<(), DfsError> {
         if let Some(stage) = self.active_replica_stages.get(object_id) {
-            if stage.intent_id != intent_id
-                && (stage.version != *version || stage.content_hash != content_hash)
-            {
+            if active_replica_stage_conflicts(
+                &stage.intent_id,
+                &stage.version,
+                &stage.content_hash,
+                intent_id,
+                version,
+                content_hash,
+            ) {
                 return Err(DfsError::Distributed {
                     message: format!(
                         "conflicting active DFS {operation} for {object_id}: local stage {} from {} targets {} ({}) while remote intent {intent_id} from {} targets {} ({})",

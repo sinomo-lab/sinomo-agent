@@ -91,6 +91,12 @@ const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
         register_storage_paths: Some(sinomo_dfs::register_storage_paths),
     },
     NativeRustModuleBinding {
+        registration_key: sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY,
+        register_services: None,
+        register_services_for_data_dir: None,
+        register_storage_paths: None,
+    },
+    NativeRustModuleBinding {
         registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
         register_services: Some(sinomo_rollout::register_services),
         register_services_for_data_dir: None,
@@ -124,11 +130,16 @@ struct NativeRustModuleLifecycleBinding {
     start_runtime_task: StartNativeRustModuleRuntimeTask,
 }
 
-const INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS: &[NativeRustModuleLifecycleBinding] =
-    &[NativeRustModuleLifecycleBinding {
+const INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS: &[NativeRustModuleLifecycleBinding] = &[
+    NativeRustModuleLifecycleBinding {
         registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
         start_runtime_task: crate::control::start_daemon_rollout_telemetry_runtime_task,
-    }];
+    },
+    NativeRustModuleLifecycleBinding {
+        registration_key: sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY,
+        start_runtime_task: start_nfs_mount_runtime_task,
+    },
+];
 
 pub(crate) struct NativeRustModuleRuntimeTask {
     label: &'static str,
@@ -157,11 +168,69 @@ pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError>
     let registry = sinomo_module::ModuleRegistry::builder()
         .register(sinomo_build::build_module_registration())?
         .register(sinomo_dfs::dfs_module_registration())?
+        .register(sinomo_dfs_nfs::nfs_module_registration())?
         .register(network_module_registration())?
         .register(sinomo_rollout::rollout_module_registration())?
         .register(sinomo_observe::observe_module_registration())?
         .try_build()?;
     Ok(registry)
+}
+
+/// Compose settings from every built-in module registration without requiring
+/// clients to name individual modules. Definitions already present in the
+/// host catalog may repeat only when byte-for-byte equal.
+pub fn register_internal_module_config_definitions(
+    mut builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    let registry = internal_module_registry().map_err(|error| error.to_string())?;
+    for registration in registry.registrations() {
+        for definition in registration
+            .surfaces
+            .config_definitions()
+            .map_err(|error| error.to_string())?
+        {
+            if let Ok(existing) = builder.get(definition.key.as_str()) {
+                if existing == &definition {
+                    continue;
+                }
+                return Err(format!(
+                    "module {} settings key {} conflicts with an existing host definition",
+                    registration.module_id(),
+                    definition.key
+                ));
+            }
+            builder = builder
+                .register(definition)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(builder)
+}
+
+fn start_nfs_mount_runtime_task(
+    paths: &crate::DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    _label: &str,
+    maintain_cluster_runtime: bool,
+) -> Result<Option<NativeRustModuleRuntimeTask>, crate::DaemonError> {
+    if !maintain_cluster_runtime {
+        return Ok(None);
+    }
+    let data_root = paths
+        .root
+        .parent()
+        .ok_or_else(|| crate::DaemonError::Parse {
+            detail: format!(
+                "daemon path {} has no Sinomo data-directory parent",
+                paths.root.display()
+            ),
+        })?;
+    let data_dir = sinomo_core::local::SinomoDataDir::new(data_root);
+    Ok(Some(NativeRustModuleRuntimeTask::new(
+        "NFS mount supervisor",
+        sinomo_dfs_nfs::spawn_nfs_mount_supervisor(data_dir, runtime, shutdown_rx),
+    )))
 }
 
 pub use sinomo_module::{
@@ -344,7 +413,7 @@ mod tests {
 
     #[test]
     fn native_runtime_lifecycle_hooks_are_attached_to_registered_modules() {
-        assert_eq!(INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS.len(), 1);
+        assert_eq!(INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS.len(), 2);
         for lifecycle in INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS {
             assert!(
                 native_rust_module_binding(lifecycle.registration_key).is_some(),
@@ -356,6 +425,43 @@ mod tests {
             INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS[0].registration_key,
             sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY
         );
+        assert_eq!(
+            INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS[1].registration_key,
+            sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
+        );
+    }
+
+    #[test]
+    fn nfs_module_registers_its_own_settings_and_lifecycle_binding() {
+        let table = internal_module_table().expect("internal module table");
+        let registration = table
+            .registry
+            .get(&sinomo_dfs_nfs::nfs_module_id())
+            .expect("NFS module registration");
+        let binding =
+            native_rust_binding_for_registration(registration).expect("NFS native binding");
+        assert_eq!(
+            binding.registration_key,
+            sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
+        );
+        let definitions = registration
+            .surfaces
+            .config_definitions()
+            .expect("NFS settings surfaces");
+        assert!(
+            definitions.iter().any(|definition| {
+                definition.key.as_str() == sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY
+            })
+        );
+        assert!(definitions.iter().any(|definition| {
+            definition.key.as_str() == sinomo_dfs_nfs::NFS_MOUNT_STATUS_CONFIG_KEY
+                && definition.read_only
+        }));
+        let catalog =
+            register_internal_module_config_definitions(sinomo_config::ConfigRegistry::builder())
+                .expect("compose built-in module config")
+                .build();
+        assert!(catalog.get(sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY).is_ok());
     }
 
     #[test]

@@ -1445,7 +1445,7 @@ pub(crate) fn mark_cluster_identity_restart_after_response(
 
 fn daemon_native_rust_module_service_targets(
     paths: &DaemonPaths,
-) -> [sinomo_module::NativeRustModuleServiceTarget; 2] {
+) -> [sinomo_module::NativeRustModuleServiceTarget; 3] {
     [
         sinomo_module::NativeRustModuleServiceTarget::new(
             sinomo_dfs::SINOMO_DFS_MODULE_LEGACY_ID,
@@ -1458,6 +1458,12 @@ fn daemon_native_rust_module_service_targets(
             observe_module_should_register(paths),
             true,
             "operational observation module",
+        ),
+        sinomo_module::NativeRustModuleServiceTarget::new(
+            sinomo_dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
+            nfs_module_should_register(paths),
+            true,
+            "direct SIFS NFS mount module",
         ),
     ]
 }
@@ -2268,6 +2274,14 @@ pub(crate) fn dfs_module_should_register(paths: &DaemonPaths) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn nfs_module_should_register(paths: &DaemonPaths) -> bool {
+    daemon_data_dir_path(paths)
+        .ok()
+        .map(sinomo_core::local::SinomoDataDir::new)
+        .and_then(|data_dir| sinomo_dfs_nfs::nfs_module_enabled(&data_dir).ok())
+        .unwrap_or(false)
+}
+
 fn daemon_config_registry(
     paths: &DaemonPaths,
     service_hooks: &[crate::DaemonServiceRegistryHook],
@@ -2292,6 +2306,7 @@ fn register_daemon_config_definitions(
         sinomo_sandbox::register_config_definitions(builder).map_err(|error| error.to_string())?;
     for registration in [
         sinomo_dfs::dfs_module_registration(),
+        sinomo_dfs_nfs::nfs_module_registration(),
         sinomo_rollout::rollout_module_registration(),
     ] {
         builder = registration
@@ -2328,8 +2343,10 @@ fn register_daemon_dynamic_module_config_definitions(
     };
     let dfs_module_id = sinomo_dfs::dfs_module_id();
     let rollout_module_id = sinomo_rollout::rollout_module_id();
+    let nfs_module_id = sinomo_dfs_nfs::nfs_module_id();
     for registration in modules.registrations() {
         if registration.module_id() == &dfs_module_id
+            || registration.module_id() == &nfs_module_id
             || registration.module_id() == &rollout_module_id
         {
             continue;
@@ -2628,6 +2645,12 @@ fn daemon_internal_module_registry(
     if sinomo_dfs::dfs_module_enabled(data_dir_root).unwrap_or(false) {
         builder = builder
             .register(sinomo_dfs::dfs_module_registration())
+            .map_err(module_error_to_network_error)?;
+    }
+    let data_dir = sinomo_core::local::SinomoDataDir::new(data_dir_root);
+    if sinomo_dfs_nfs::nfs_module_enabled(&data_dir).unwrap_or(false) {
+        builder = builder
+            .register(sinomo_dfs_nfs::nfs_module_registration())
             .map_err(module_error_to_network_error)?;
     }
     if register_observe_module {
@@ -7485,6 +7508,23 @@ mod tests {
             .get(sinomo_sandbox::SANDBOX_POLICY_CONFIG_KEY)
             .expect("sandbox settings");
         assert!(sandbox.schema.is_some());
+
+        let nfs = registry
+            .get(sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY)
+            .expect("NFS module settings");
+        assert_eq!(
+            nfs.module_id.as_deref(),
+            Some(sinomo_dfs_nfs::nfs_module_id().as_str())
+        );
+        assert_eq!(
+            nfs.module_label.as_deref(),
+            Some(sinomo_dfs_nfs::NFS_MODULE_LABEL)
+        );
+        let nfs_status = registry
+            .get(sinomo_dfs_nfs::NFS_MOUNT_STATUS_CONFIG_KEY)
+            .expect("NFS module status");
+        assert!(nfs_status.read_only);
+        assert!(nfs_status.operational_error.is_some());
     }
 
     #[test]

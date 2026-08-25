@@ -32,6 +32,11 @@
 //! - `cluster.dfs.protocol-codec-baseline` — in-memory DFS body-aware object-RPC
 //!   head codec throughput for representative large-object messages, independent
 //!   of attachment I/O, disk, and live network conditions.
+//! - `cluster.dfs.content-version-gc` / `cluster.dfs.metadata-history-gc` —
+//!   isolated runtime storage-maintenance acceptance workloads with phase,
+//!   reclamation, durability-amplification, and restart metrics.
+//! - `cluster.dfs.metadata-hydration` — isolated durable metadata hydration
+//!   correctness and latency across the production object-page boundary.
 //! - `cluster.dfs.write` / `cluster.dfs.expect-file` / `cluster.dfs.expect-absent`
 //!   / `cluster.dfs.rename` / `cluster.dfs.remove` — parameterized probes
 //!   (`--param path=... --param payload=...`); the expect-* probes poll with a
@@ -72,13 +77,13 @@ use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::test::{
-    SinomoTestContext, SinomoTestError, SinomoTestOutcome, SinomoTestRegistryBuilder,
-    SinomoTestRequirement, SinomoTestResult,
+    SinomoTestContext, SinomoTestError, SinomoTestMetricUnit, SinomoTestOutcome,
+    SinomoTestRegistryBuilder, SinomoTestRequirement, SinomoTestResult,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -98,6 +103,20 @@ const MAX_LIGHTWEIGHT_LATENCY_PAYLOAD_BYTES: usize = 64 * 1024;
 const DEFAULT_LARGE_FILE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_PROTOCOL_CODEC_ITERATIONS: usize = 8;
+const DEFAULT_CONTENT_VERSION_GC_VERSIONS: usize = 10_000;
+const DEFAULT_CONTENT_VERSION_GC_WRITE_BATCH: usize = 4_096;
+const DEFAULT_CONTENT_VERSION_GC_MAX_TOTAL_MS: u64 = 120_000;
+const DEFAULT_CONTENT_VERSION_GC_MAX_RESTART_MS: u64 = 10_000;
+const DEFAULT_METADATA_HISTORY_GC_OVERWRITES: usize = 100_000;
+const DEFAULT_METADATA_HISTORY_GC_NAMESPACE_REQUESTS: usize = 1_000;
+const DEFAULT_METADATA_HISTORY_GC_CONTENT_BATCH: usize = 4_096;
+const DEFAULT_METADATA_HISTORY_GC_BATCH: u64 = 256;
+const DEFAULT_METADATA_HISTORY_GC_MAX_TOTAL_MS: u64 = 120_000;
+const DEFAULT_METADATA_HISTORY_GC_MAX_RESTART_MS: u64 = 30_000;
+const DEFAULT_METADATA_HYDRATION_OBJECTS: usize = 4_097;
+const DEFAULT_METADATA_HYDRATION_MAX_TOTAL_MS: u64 = 120_000;
+const DEFAULT_METADATA_HYDRATION_MAX_HYDRATE_MS: u64 = 30_000;
+const MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS: usize = 1_000_000;
 const EXPECT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DEFAULT_ROUNDTRIP_BASE: &str = "/services/cluster-tests";
 const MAX_RECORDED_BULK_RETRY_REASONS: usize = 8;
@@ -111,6 +130,74 @@ const DFS_TEST_NAMESPACE_ROOTS: [&str; 3] = [
 struct ScopedSifsTestNamespace {
     browser: SifsBrowser,
     roots: Vec<String>,
+}
+
+struct ScopedDfsRuntimeProbeRoot {
+    root: PathBuf,
+    run_root: PathBuf,
+}
+
+impl ScopedDfsRuntimeProbeRoot {
+    fn create(ctx: &SinomoTestContext, case: &str) -> Result<Self, SinomoTestError> {
+        if case.is_empty()
+            || !case
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(SinomoTestError::failed(format!(
+                "invalid DFS runtime probe case name `{case}`"
+            )));
+        }
+        let run_root = ctx
+            .data_dir()
+            .join("runtime-tests")
+            .join("dfs")
+            .join(ctx.run_id());
+        let root = run_root.join(case);
+        if root.exists() {
+            return Err(SinomoTestError::failed(format!(
+                "DFS runtime probe root already exists: {}",
+                root.display()
+            )));
+        }
+        fs::create_dir_all(&root).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot create DFS runtime probe root {}: {source}",
+                root.display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(&root).map_err(|source| {
+            SinomoTestError::failed(format!(
+                "cannot inspect DFS runtime probe root {}: {source}",
+                root.display()
+            ))
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(SinomoTestError::failed(format!(
+                "DFS runtime probe root is not a real directory: {}",
+                root.display()
+            )));
+        }
+        Ok(Self { root, run_root })
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Drop for ScopedDfsRuntimeProbeRoot {
+    fn drop(&mut self) {
+        if self.root.parent() != Some(self.run_root.as_path()) || self.root == self.run_root {
+            return;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&self.root) else {
+            return;
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 }
 
 impl ScopedSifsTestNamespace {
@@ -239,6 +326,9 @@ pub fn register_dfs_cluster_test_cases(
         .register(dfs_lightweight_latency())
         .register(dfs_raw_lightweight_latency())
         .register(dfs_protocol_codec_baseline())
+        .register(dfs_content_version_gc())
+        .register(dfs_metadata_history_gc())
+        .register(dfs_metadata_hydration())
         .register(dfs_write())
         .register(dfs_expect_file())
         .register(dfs_expect_absent())
@@ -262,6 +352,42 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_read_your_write(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_content_version_gc(ctx) {
+        id: "cluster.dfs.content-version-gc",
+        summary: "Run isolated 10k content-version GC and report phase, durability-amplification, and restart metrics",
+        tags: ["cluster-dfs", "probe", "performance", "storage-maintenance", "dfs-storage-runtime-acceptance"],
+        requirements: [],
+        run: {
+            run_content_version_gc(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_metadata_history_gc(ctx) {
+        id: "cluster.dfs.metadata-history-gc",
+        summary: "Run isolated 100k metadata/content churn GC and enforce bounded retained state and restart performance",
+        tags: ["cluster-dfs", "probe", "performance", "storage-maintenance", "dfs-storage-runtime-acceptance"],
+        requirements: [],
+        run: {
+            run_metadata_history_gc(ctx)
+        }
+    }
+}
+
+sinomo_runtime::test::sinomo_test_case! {
+    pub fn dfs_metadata_hydration(ctx) {
+        id: "cluster.dfs.metadata-hydration",
+        summary: "Hydrate isolated durable DFS metadata across the 4096-object page boundary and report latency",
+        tags: ["cluster-dfs", "probe", "performance", "correctness", "storage-maintenance", "dfs-storage-runtime-acceptance"],
+        requirements: [],
+        run: {
+            run_metadata_hydration(ctx)
         }
     }
 }
@@ -2783,6 +2909,365 @@ fn run_protocol_codec_baseline(ctx: &mut SinomoTestContext) -> SinomoTestResult 
     Ok(SinomoTestOutcome::passed(format!(
         "DFS protocol codec processed {total_messages} body-aware heads describing {bytes}-byte attachments (encode {head_encode_messages_per_second:.2} heads/s, decode {head_decode_messages_per_second:.2} heads/s)"
     )))
+}
+
+fn run_content_version_gc(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let version_count =
+        optional_usize_parameter(ctx, "versions", DEFAULT_CONTENT_VERSION_GC_VERSIONS)?;
+    let write_batch_size =
+        optional_usize_parameter(ctx, "write-batch", DEFAULT_CONTENT_VERSION_GC_WRITE_BATCH)?;
+    let max_total_ms = optional_u64_parameter(ctx, "max-total-ms")?
+        .unwrap_or(DEFAULT_CONTENT_VERSION_GC_MAX_TOTAL_MS);
+    let max_restart_ms = optional_u64_parameter(ctx, "max-restart-ms")?
+        .unwrap_or(DEFAULT_CONTENT_VERSION_GC_MAX_RESTART_MS);
+    require_runtime_probe_count("versions", version_count, 2)?;
+    require_runtime_probe_count("write-batch", write_batch_size, 1)?;
+
+    let root = ScopedDfsRuntimeProbeRoot::create(ctx, "content-version-gc")?;
+    let report = dfs::run_content_version_gc_runtime_probe(
+        root.path(),
+        dfs::DfsContentVersionGcRuntimeProbeOptions {
+            version_count,
+            write_batch_size,
+        },
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!("content-version GC runtime probe failed: {error}"))
+    })?;
+
+    ctx.record("root", root.path().display().to_string());
+    ctx.record("performance", &report);
+    ctx.record("max_total_ms", max_total_ms);
+    ctx.record("max_restart_ms", max_restart_ms);
+    record_u64_metric(
+        ctx,
+        "versions",
+        report.version_count,
+        SinomoTestMetricUnit::Count,
+    );
+    record_u64_metric(
+        ctx,
+        "write_elapsed_ms",
+        report.write_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "reservation_release_elapsed_ms",
+        report.reservation_release_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "projection_elapsed_ms",
+        report.projection_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "gc_elapsed_ms",
+        report.gc_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "restart_elapsed_ms",
+        report.restart_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "total_elapsed_ms",
+        report.total_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    let write_rate = rate_per_second(
+        report.version_count as f64,
+        Duration::from_millis(report.write_elapsed_ms.max(1)),
+    );
+    ctx.record_metric(
+        "write_versions_per_second",
+        write_rate,
+        SinomoTestMetricUnit::OperationsPerSecond,
+    );
+
+    if max_total_ms > 0 && report.total_elapsed_ms > max_total_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "content-version GC runtime probe took {}ms, above allowed {max_total_ms}ms",
+            report.total_elapsed_ms
+        )));
+    }
+    if max_restart_ms > 0 && report.restart_elapsed_ms > max_restart_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "content-version GC restart took {}ms, above allowed {max_restart_ms}ms",
+            report.restart_elapsed_ms
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "content-version GC deleted {} of {} versions in {}ms and reopened in {}ms",
+        report.deleted_version_count,
+        report.version_count,
+        report.gc_elapsed_ms,
+        report.restart_elapsed_ms
+    )))
+}
+
+fn run_metadata_history_gc(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let overwrite_count =
+        optional_usize_parameter(ctx, "overwrites", DEFAULT_METADATA_HISTORY_GC_OVERWRITES)?;
+    let namespace_request_count = optional_usize_parameter(
+        ctx,
+        "namespace-requests",
+        DEFAULT_METADATA_HISTORY_GC_NAMESPACE_REQUESTS,
+    )?;
+    let content_batch_size = optional_usize_parameter(
+        ctx,
+        "content-batch",
+        DEFAULT_METADATA_HISTORY_GC_CONTENT_BATCH,
+    )?;
+    let gc_batch_size =
+        optional_u64_parameter(ctx, "gc-batch")?.unwrap_or(DEFAULT_METADATA_HISTORY_GC_BATCH);
+    let max_total_ms = optional_u64_parameter(ctx, "max-total-ms")?
+        .unwrap_or(DEFAULT_METADATA_HISTORY_GC_MAX_TOTAL_MS);
+    let max_restart_ms = optional_u64_parameter(ctx, "max-restart-ms")?
+        .unwrap_or(DEFAULT_METADATA_HISTORY_GC_MAX_RESTART_MS);
+    require_runtime_probe_count("overwrites", overwrite_count, 2)?;
+    require_runtime_probe_count("namespace-requests", namespace_request_count, 0)?;
+    require_runtime_probe_count("content-batch", content_batch_size, 1)?;
+    if gc_batch_size == 0 || gc_batch_size > MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS as u64 {
+        return Err(SinomoTestError::InvalidParameter {
+            name: "gc-batch".to_string(),
+            detail: format!(
+                "must be between 1 and {MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS}, got {gc_batch_size}"
+            ),
+        });
+    }
+
+    let root = ScopedDfsRuntimeProbeRoot::create(ctx, "metadata-history-gc")?;
+    let report = dfs::run_metadata_history_gc_runtime_probe(
+        root.path(),
+        dfs::DfsMetadataHistoryGcRuntimeProbeOptions {
+            overwrite_count,
+            namespace_request_count,
+            content_batch_size,
+            gc_batch_size,
+        },
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!("metadata-history GC runtime probe failed: {error}"))
+    })?;
+
+    ctx.record("root", root.path().display().to_string());
+    ctx.record("performance", &report);
+    ctx.record("max_total_ms", max_total_ms);
+    ctx.record("max_restart_ms", max_restart_ms);
+    for (name, value, unit) in [
+        (
+            "overwrites",
+            report.overwrite_count,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "namespace_requests",
+            report.namespace_request_count,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "metadata_gc_passes",
+            report.metadata_gc_passes,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "orphan_gc_passes",
+            report.orphan_gc_passes,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "deleted_orphan_count",
+            report.deleted_orphan_count,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "content_write_elapsed_ms",
+            report.content_write_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "reservation_release_elapsed_ms",
+            report.reservation_release_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "metadata_write_elapsed_ms",
+            report.metadata_write_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "metadata_gc_elapsed_ms",
+            report.metadata_gc_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "content_gc_elapsed_ms",
+            report.content_gc_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "restart_elapsed_ms",
+            report.restart_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "total_elapsed_ms",
+            report.total_elapsed_ms,
+            SinomoTestMetricUnit::Milliseconds,
+        ),
+        (
+            "retained_metadata_records",
+            report.retained_metadata_record_count,
+            SinomoTestMetricUnit::Count,
+        ),
+        (
+            "retained_metadata_bytes",
+            report.retained_metadata_bytes,
+            SinomoTestMetricUnit::Bytes,
+        ),
+        (
+            "journal_bytes_after",
+            report.journal_bytes_after,
+            SinomoTestMetricUnit::Bytes,
+        ),
+        (
+            "snapshot_bytes_after",
+            report.snapshot_bytes_after,
+            SinomoTestMetricUnit::Bytes,
+        ),
+        (
+            "content_bytes_after",
+            report.content_bytes_after,
+            SinomoTestMetricUnit::Bytes,
+        ),
+    ] {
+        record_u64_metric(ctx, name, value, unit);
+    }
+
+    if max_total_ms > 0 && report.total_elapsed_ms > max_total_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "metadata-history GC runtime probe took {}ms, above allowed {max_total_ms}ms",
+            report.total_elapsed_ms
+        )));
+    }
+    if max_restart_ms > 0 && report.restart_elapsed_ms > max_restart_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "metadata-history GC restart took {}ms, above allowed {max_restart_ms}ms",
+            report.restart_elapsed_ms
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "metadata-history GC bounded {} overwrites to {} retained records and {} retained manifests; restart {}ms",
+        report.overwrite_count,
+        report.retained_metadata_record_count,
+        report.retained_manifest_count,
+        report.restart_elapsed_ms
+    )))
+}
+
+fn run_metadata_hydration(ctx: &mut SinomoTestContext) -> SinomoTestResult {
+    let object_count =
+        optional_usize_parameter(ctx, "objects", DEFAULT_METADATA_HYDRATION_OBJECTS)?;
+    let require_page_boundary = optional_bool_parameter(ctx, "require-page-boundary", true)?;
+    let max_total_ms = optional_u64_parameter(ctx, "max-total-ms")?
+        .unwrap_or(DEFAULT_METADATA_HYDRATION_MAX_TOTAL_MS);
+    let max_hydration_ms = optional_u64_parameter(ctx, "max-hydration-ms")?
+        .unwrap_or(DEFAULT_METADATA_HYDRATION_MAX_HYDRATE_MS);
+    require_runtime_probe_count("objects", object_count, 1)?;
+
+    let root = ScopedDfsRuntimeProbeRoot::create(ctx, "metadata-hydration")?;
+    let report = dfs::run_metadata_hydration_runtime_probe(
+        root.path(),
+        dfs::DfsMetadataHydrationRuntimeProbeOptions { object_count },
+    )
+    .map_err(|error| {
+        SinomoTestError::failed(format!("metadata hydration runtime probe failed: {error}"))
+    })?;
+
+    ctx.record("root", root.path().display().to_string());
+    ctx.record("performance", &report);
+    ctx.record("require_page_boundary", require_page_boundary);
+    ctx.record("max_total_ms", max_total_ms);
+    ctx.record("max_hydration_ms", max_hydration_ms);
+    record_u64_metric(
+        ctx,
+        "objects",
+        report.object_count,
+        SinomoTestMetricUnit::Count,
+    );
+    record_u64_metric(
+        ctx,
+        "write_elapsed_ms",
+        report.write_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "hydration_elapsed_ms",
+        report.hydration_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+    record_u64_metric(
+        ctx,
+        "total_elapsed_ms",
+        report.total_elapsed_ms,
+        SinomoTestMetricUnit::Milliseconds,
+    );
+
+    if require_page_boundary && !report.crossed_page_boundary {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "metadata hydration used {} objects and did not cross the {}-object page boundary",
+            report.object_count, report.page_size
+        )));
+    }
+    if max_total_ms > 0 && report.total_elapsed_ms > max_total_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "metadata hydration runtime probe took {}ms, above allowed {max_total_ms}ms",
+            report.total_elapsed_ms
+        )));
+    }
+    if max_hydration_ms > 0 && report.hydration_elapsed_ms > max_hydration_ms {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "metadata hydration took {}ms, above allowed {max_hydration_ms}ms",
+            report.hydration_elapsed_ms
+        )));
+    }
+    Ok(SinomoTestOutcome::passed(format!(
+        "metadata hydration restored {} objects across page size {} in {}ms",
+        report.object_count, report.page_size, report.hydration_elapsed_ms
+    )))
+}
+
+fn require_runtime_probe_count(
+    name: &str,
+    value: usize,
+    minimum: usize,
+) -> Result<(), SinomoTestError> {
+    if value < minimum || value > MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS {
+        return Err(SinomoTestError::InvalidParameter {
+            name: name.to_string(),
+            detail: format!(
+                "must be between {minimum} and {MAX_DFS_STORAGE_RUNTIME_PROBE_ITEMS}, got {value}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn record_u64_metric(
+    ctx: &mut SinomoTestContext,
+    name: &'static str,
+    value: u64,
+    unit: SinomoTestMetricUnit,
+) {
+    ctx.record_metric(name, value as f64, unit);
 }
 
 fn run_invariants(ctx: &mut SinomoTestContext) -> SinomoTestResult {

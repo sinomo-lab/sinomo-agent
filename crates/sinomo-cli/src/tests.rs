@@ -789,6 +789,17 @@ fn top_level_cli_parser_routes_subcommands() {
     assert!(!list.requires_rollout_admission());
     assert!(parse_cli_command(&["evolve".to_string()]).is_err());
 }
+
+#[test]
+fn default_module_cli_catalog_includes_nfs_mount_module() {
+    let config = super::default_module_cli_command_config(None);
+
+    assert!(config.toggleable_native_rust_modules.iter().any(|module| {
+        module.value == sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID
+            && module.detail == "direct SIFS NFS mount module"
+    }));
+}
+
 #[test]
 fn models_registry_uses_schema_for_alias_help_and_errors() {
     let alias = parse_cli_command(&[
