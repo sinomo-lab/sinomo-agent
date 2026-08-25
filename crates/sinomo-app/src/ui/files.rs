@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use sui::WindowEvent;
@@ -39,16 +39,17 @@ use sui::{
     Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, MenuItem, NumberInput,
     Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Point, PointerButton,
     PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect, RichText,
-    ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem, SemanticRegion,
-    SemanticTone, SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, Separator,
-    SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
-    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextCellPaint,
-    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow,
+    ScrollDelta, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
+    Select, SemanticRegion, SemanticTone, SemanticsAction, SemanticsActionRequest, SemanticsCtx,
+    SemanticsNode, SemanticsRole, SemanticsValue, Separator, SideSheet, SideSheetPlacement, Size,
+    SizedBox, SplitView, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment,
+    Surface, SurfaceBorder, SurfaceRole, SwitchView, TextAlign, TextBlockPaint, TextCellPaint,
+    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, Vector,
     VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
     VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
-    VirtualTableSortDirection, VirtualTableState, Widget, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, paint_checkbox_indicator,
-    paint_leading_label_cell, paint_placement_badge_with, paint_text_cell,
+    VirtualTableSortDirection, VirtualTableState, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_checkbox_indicator,
+    paint_leading_label_cell, paint_placement_badge_with, paint_text_block, paint_text_cell,
 };
 
 use sinomo_cli::app_api::{
@@ -84,6 +85,7 @@ const WIDE_THRESHOLD: f32 = 880.0;
 #[cfg(test)]
 const INSPECTOR_W: f32 = 340.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
+const FILE_ICON_GRID_DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(450);
 /// At narrower list widths Details yields to Placement, which is required for every file row.
 const COMPLETE_FILE_TABLE_MIN_W: f32 = 560.0;
 const COMPACT_FILE_NAME_MIN_W: f32 = 120.0;
@@ -186,6 +188,48 @@ enum FileSortMode {
     Kind,
     SizeDesc,
     SizeAsc,
+}
+
+/// The four presentation choices intentionally mirror Explorer's familiar density ladder. The
+/// existing details table remains the default; each icon choice uses the same entries and actions.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum FilesViewMode {
+    #[default]
+    Details,
+    SmallIcons,
+    MediumIcons,
+    LargeIcons,
+}
+
+impl FilesViewMode {
+    const OPTIONS: [&'static str; 4] = ["Details", "Small icons", "Medium icons", "Large icons"];
+
+    const fn selected_index(self) -> usize {
+        match self {
+            Self::Details => 0,
+            Self::SmallIcons => 1,
+            Self::MediumIcons => 2,
+            Self::LargeIcons => 3,
+        }
+    }
+
+    const fn from_selected_index(index: usize) -> Self {
+        match index {
+            1 => Self::SmallIcons,
+            2 => Self::MediumIcons,
+            3 => Self::LargeIcons,
+            _ => Self::Details,
+        }
+    }
+
+    const fn icon_label(self) -> Option<&'static str> {
+        match self {
+            Self::Details => None,
+            Self::SmallIcons => Some("Small"),
+            Self::MediumIcons => Some("Medium"),
+            Self::LargeIcons => Some("Large"),
+        }
+    }
 }
 
 impl FileSortMode {
@@ -1107,6 +1151,7 @@ pub struct FilesState {
     action_prompt_revision: u64,
     marked_entries: BTreeSet<usize>,
     sort_mode: FileSortMode,
+    view_mode: FilesViewMode,
     tasks: Vec<FilesTask>,
     pending_select_path: Option<String>,
     pub scroll: f32,
@@ -1182,6 +1227,7 @@ struct FilesListStructure {
     entry_metadata: BTreeMap<String, SifsEntryMetadata>,
     entries_total_count: usize,
     sort_mode: FileSortMode,
+    view_mode: FilesViewMode,
     tasks: Vec<FilesTask>,
 }
 
@@ -1198,6 +1244,7 @@ struct FilesHeaderStructure {
     selected: Option<usize>,
     marked_entries: BTreeSet<usize>,
     sort_mode: FileSortMode,
+    view_mode: FilesViewMode,
     picker_action: Option<FilesPickerAction>,
     picker_error: Option<String>,
     external_file_hovered: bool,
@@ -1332,6 +1379,7 @@ impl FilesStructureKey {
                     entry_metadata: BTreeMap::new(),
                     entries_total_count: 0,
                     sort_mode: FileSortMode::default(),
+                    view_mode: FilesViewMode::default(),
                     tasks: Vec::new(),
                 },
                 header: FilesHeaderStructure {
@@ -1346,6 +1394,7 @@ impl FilesStructureKey {
                     selected: None,
                     marked_entries: BTreeSet::new(),
                     sort_mode: FileSortMode::default(),
+                    view_mode: FilesViewMode::default(),
                     picker_action: None,
                     picker_error: None,
                     external_file_hovered: false,
@@ -1403,6 +1452,7 @@ impl FilesStructureKey {
             entry_metadata: state.entry_metadata.clone(),
             entries_total_count: state.entries_total_count,
             sort_mode: state.sort_mode,
+            view_mode: state.view_mode,
             tasks: state.tasks.clone(),
         };
         let header = FilesHeaderStructure {
@@ -1417,6 +1467,7 @@ impl FilesStructureKey {
             selected: state.selected,
             marked_entries: state.marked_entries.clone(),
             sort_mode: state.sort_mode,
+            view_mode: state.view_mode,
             picker_action: state.picker_action,
             picker_error: state.picker_error.clone(),
             external_file_hovered: state.external_file_hovered,
@@ -1592,6 +1643,7 @@ impl FilesState {
             action_prompt_revision: 0,
             marked_entries: BTreeSet::new(),
             sort_mode: FileSortMode::default(),
+            view_mode: FilesViewMode::default(),
             tasks: Vec::new(),
             pending_select_path: None,
             scroll: 0.0,
@@ -4822,6 +4874,10 @@ impl FilesState {
     fn toggle_sort_column(&mut self, column: FilesSortColumn) {
         let mode = self.sort_mode.next_for_column(column);
         self.set_sort_mode(mode);
+    }
+
+    fn set_view_mode(&mut self, mode: FilesViewMode) {
+        self.view_mode = mode;
     }
 
     fn submit_action_prompt(&mut self, waker: Option<sui::UiHandle>) {
@@ -11108,12 +11164,13 @@ fn files_action_bar_content(
     reader: &ThemeReader,
     contextual_selection: bool,
 ) -> WidgetPod {
-    let (marked_count, selected_entry, source) = {
+    let (marked_count, selected_entry, source, current_view_mode) = {
         let files = shared.files();
         (
             files.marked_count(),
             files.selected_entry().cloned(),
             files.source,
+            files.view_mode,
         )
     };
 
@@ -11211,6 +11268,29 @@ fn files_action_bar_content(
             .with_child(more)
     };
 
+    let view_control = {
+        let selected = current_view_mode.selected_index();
+        let s = shared.clone();
+        Select::new("File view")
+            .options(FilesViewMode::OPTIONS)
+            .selected(selected)
+            .theme_when(clone_reader(reader))
+            .on_change(move |index, _label| {
+                s.files_mut()
+                    .set_view_mode(FilesViewMode::from_selected_index(index));
+            })
+    };
+    let mut view_commands = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
+    if current_view_mode != FilesViewMode::Details {
+        view_commands = view_commands.with_child(files_sort_menu(shared, reader));
+    }
+    view_commands = view_commands.with_child(SizedBox::new().width(140.0).with_child(view_control));
+    let view_commands_width = if current_view_mode == FilesViewMode::Details {
+        140.0
+    } else {
+        204.0
+    };
+
     WidgetPod::new(
         Stack::vertical()
             .alignment(Alignment::Stretch)
@@ -11219,8 +11299,15 @@ fn files_action_bar_content(
                     WidgetPadding::horizontal(
                         10.0,
                         Flex::horizontal()
+                            .justify(sui::FlexJustify::SpaceBetween)
                             .align_items(Alignment::Center)
-                            .with_item(controls, FlexItem::new().no_shrink()),
+                            .with_item(controls, FlexItem::new().no_shrink())
+                            .with_item(
+                                SizedBox::new()
+                                    .width(view_commands_width)
+                                    .with_child(view_commands),
+                                FlexItem::fixed(view_commands_width),
+                            ),
                     )
                     .fill_child_width()
                     .fill_child_height(),
@@ -11228,6 +11315,45 @@ fn files_action_bar_content(
             )
             .with_child(Separator::horizontal().theme_when(clone_reader(reader))),
     )
+}
+
+fn files_sort_menu(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
+    let current = shared.files().sort_mode;
+    let options = [
+        (FileSortMode::NameAsc, "Name (A to Z)"),
+        (FileSortMode::NameDesc, "Name (Z to A)"),
+        (FileSortMode::Kind, "Kind"),
+        (FileSortMode::SizeDesc, "Size (largest first)"),
+        (FileSortMode::SizeAsc, "Size (smallest first)"),
+    ];
+    let items = options.map(|(mode, label)| {
+        MenuItem::new(if mode == current {
+            format!("✓ {label}")
+        } else {
+            label.to_string()
+        })
+    });
+    let trigger = sui::Button::new("Sort")
+        .icon(IconGlyph::ChevronDown)
+        .semantic_name("Sort icon view")
+        .min_height(32.0)
+        .appearance(ButtonAppearance::Ghost)
+        .theme_when(clone_reader(reader));
+    let s = shared.clone();
+    ContextMenu::new("files-sort-menu", trigger)
+        .items(items)
+        .theme_when(clone_reader(reader))
+        .activation_button(PointerButton::Primary)
+        .on_activate(move |index, _item| {
+            let mode = match index {
+                1 => FileSortMode::NameDesc,
+                2 => FileSortMode::Kind,
+                3 => FileSortMode::SizeDesc,
+                4 => FileSortMode::SizeAsc,
+                _ => FileSortMode::NameAsc,
+            };
+            s.files_mut().set_sort_mode(mode);
+        })
 }
 
 fn files_action_bar(
@@ -11407,7 +11533,7 @@ fn files_list_body_rebuild(
     let ss = scroll_state.clone();
     let table_state = VirtualTableState::new();
     RebuildOnChange::new_observable(source, move |_key| {
-        files_list_body_table(&s, &r, &ss, &table_state)
+        files_list_body(&s, &r, &ss, &table_state)
     })
 }
 
@@ -11638,6 +11764,18 @@ fn file_action_button(
         .on_press_with_ctx(move |ctx| {
             activate_file_context_action(&action_shared, action, ctx);
         })
+}
+
+fn files_list_body(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+    table_state: &VirtualTableState,
+) -> WidgetPod {
+    match shared.files().view_mode {
+        FilesViewMode::Details => files_list_body_table(shared, reader, scroll_state, table_state),
+        icon_mode => files_list_body_icons(shared, reader, scroll_state, icon_mode),
+    }
 }
 
 fn files_list_body_table(
@@ -11902,6 +12040,751 @@ fn paint_file_table_row(
                 .padding(8.0, 8.0),
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FileIconGridMetrics {
+    icon_side: f32,
+    tile_width: f32,
+    tile_height: f32,
+    gap: f32,
+    padding: f32,
+    label_height: f32,
+}
+
+fn file_icon_grid_metrics(mode: FilesViewMode) -> FileIconGridMetrics {
+    match mode {
+        FilesViewMode::SmallIcons => FileIconGridMetrics {
+            icon_side: 24.0,
+            tile_width: 92.0,
+            tile_height: 70.0,
+            gap: 6.0,
+            padding: 10.0,
+            label_height: 30.0,
+        },
+        FilesViewMode::MediumIcons => FileIconGridMetrics {
+            icon_side: 48.0,
+            tile_width: 116.0,
+            tile_height: 108.0,
+            gap: 8.0,
+            padding: 12.0,
+            label_height: 38.0,
+        },
+        FilesViewMode::LargeIcons => FileIconGridMetrics {
+            icon_side: 72.0,
+            tile_width: 148.0,
+            tile_height: 142.0,
+            gap: 10.0,
+            padding: 14.0,
+            label_height: 44.0,
+        },
+        FilesViewMode::Details => file_icon_grid_metrics(FilesViewMode::MediumIcons),
+    }
+}
+
+fn files_list_body_icons(
+    shared: &Shared,
+    reader: &ThemeReader,
+    scroll_state: &ScrollState,
+    mode: FilesViewMode,
+) -> WidgetPod {
+    let (entries, total_count) = {
+        let files = shared.files();
+        (files.entries.clone(), files.entries_total_count)
+    };
+    let context_target = Rc::new(Cell::new(FileContextMenuTarget::Selection));
+    let grid = FileIconGrid::new(
+        shared.clone(),
+        entries,
+        total_count,
+        mode,
+        scroll_state.clone(),
+        Rc::clone(&context_target),
+    );
+    let scroll = ScrollView::vertical(grid)
+        .state(scroll_state.clone())
+        .name(format!(
+            "{} file icons",
+            mode.icon_label().unwrap_or("Medium")
+        ))
+        .theme_when(clone_gray_data_scrollbar_reader(reader))
+        .viewport_width_hint(true);
+    let trigger = FileIconGridContextTarget::new(
+        shared.clone(),
+        scroll_state.clone(),
+        file_icon_grid_metrics(mode).tile_height,
+        Rc::clone(&context_target),
+        scroll,
+    );
+    WidgetPod::new(file_context_menu(
+        "files-icons-context-menu",
+        shared,
+        reader,
+        context_target,
+        PointerButton::Secondary,
+        true,
+        trigger,
+    ))
+}
+
+/// Resets blank-space context clicks to the current folder before the nested grid gets a chance to
+/// refine a tile hit to `Selection` during target/bubble routing.
+struct FileIconGridContextTarget {
+    shared: Shared,
+    scroll_state: ScrollState,
+    tile_height: f32,
+    context_target: Rc<Cell<FileContextMenuTarget>>,
+    child: WidgetPod,
+}
+
+impl FileIconGridContextTarget {
+    fn new<W>(
+        shared: Shared,
+        scroll_state: ScrollState,
+        tile_height: f32,
+        context_target: Rc<Cell<FileContextMenuTarget>>,
+        child: W,
+    ) -> Self
+    where
+        W: Widget + 'static,
+    {
+        Self {
+            shared,
+            scroll_state,
+            tile_height,
+            context_target,
+            child: WidgetPod::new(child),
+        }
+    }
+
+    fn maybe_request_more(&self) {
+        let should_request = {
+            let files = self.shared.files();
+            if files.entries.len() >= files.entries_total_count {
+                false
+            } else {
+                let offset = self.scroll_state.current_offset().y;
+                let viewport_height = self.scroll_state.viewport_size().height;
+                let remaining =
+                    (self.scroll_state.content_size().height - viewport_height - offset).max(0.0);
+                remaining <= self.tile_height * 3.0
+            }
+        };
+        if should_request {
+            let waker = { self.shared.borrow().waker.clone() };
+            self.shared.files_mut().request_more_entries(waker);
+        }
+    }
+}
+
+impl Widget for FileIconGridContextTarget {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() == EventPhase::Capture
+            && let Event::Pointer(pointer) = event
+            && pointer.kind == PointerEventKind::Down
+            && pointer.button == Some(PointerButton::Secondary)
+            && ctx.bounds().contains(pointer.position)
+        {
+            self.context_target
+                .set(FileContextMenuTarget::CurrentLocation);
+        }
+        if ctx.phase() != EventPhase::Capture
+            && (matches!(
+                event,
+                Event::Pointer(pointer)
+                    if matches!(
+                        pointer.kind,
+                        PointerEventKind::Move
+                            | PointerEventKind::Up
+                            | PointerEventKind::Scroll
+                    )
+            ) || matches!(event, Event::Keyboard(_)))
+        {
+            self.maybe_request_more();
+        }
+    }
+
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
+    }
+}
+
+/// Responsive icon layout for Files. Scrolling stays in SUI's stock [`ScrollView`], while this
+/// content widget paints only visible tiles and maps pointer/keyboard actions back to the same
+/// [`FilesState`] operations used by the details table.
+struct FileIconGrid {
+    shared: Shared,
+    entries: Vec<SifsEntry>,
+    total_count: usize,
+    mode: FilesViewMode,
+    metrics: FileIconGridMetrics,
+    scroll_state: ScrollState,
+    context_target: Rc<Cell<FileContextMenuTarget>>,
+    columns: usize,
+    tile_width: f32,
+    grid_start_x: f32,
+    content_height: f32,
+    hovered: Option<usize>,
+    pressed: Option<(usize, bool)>,
+    last_click: Option<(usize, Instant)>,
+}
+
+impl FileIconGrid {
+    fn new(
+        shared: Shared,
+        entries: Vec<SifsEntry>,
+        total_count: usize,
+        mode: FilesViewMode,
+        scroll_state: ScrollState,
+        context_target: Rc<Cell<FileContextMenuTarget>>,
+    ) -> Self {
+        Self {
+            shared,
+            entries,
+            total_count,
+            mode,
+            metrics: file_icon_grid_metrics(mode),
+            scroll_state,
+            context_target,
+            columns: 1,
+            tile_width: 1.0,
+            grid_start_x: 0.0,
+            content_height: 0.0,
+            hovered: None,
+            pressed: None,
+            last_click: None,
+        }
+    }
+
+    fn update_layout(&mut self, width: f32) {
+        let usable = (width - self.metrics.padding * 2.0).max(1.0);
+        self.tile_width = self.metrics.tile_width.min(usable);
+        self.columns =
+            (((usable + self.metrics.gap) / (self.tile_width + self.metrics.gap)).floor() as usize)
+                .max(1);
+        if !self.entries.is_empty() {
+            self.columns = self.columns.min(self.entries.len());
+        }
+        let grid_width = self.columns as f32 * self.tile_width
+            + self.columns.saturating_sub(1) as f32 * self.metrics.gap;
+        self.grid_start_x = ((width - grid_width) * 0.5).max(self.metrics.padding);
+        let rows = self.entries.len().div_ceil(self.columns);
+        self.content_height = self.metrics.padding * 2.0
+            + rows as f32 * self.metrics.tile_height
+            + rows.saturating_sub(1) as f32 * self.metrics.gap;
+    }
+
+    fn tile_rect(&self, bounds: Rect, index: usize) -> Rect {
+        let row = index / self.columns;
+        let column = index % self.columns;
+        Rect::new(
+            bounds.x() + self.grid_start_x + column as f32 * (self.tile_width + self.metrics.gap),
+            bounds.y()
+                + self.metrics.padding
+                + row as f32 * (self.metrics.tile_height + self.metrics.gap),
+            self.tile_width,
+            self.metrics.tile_height,
+        )
+    }
+
+    fn icon_rect(&self, tile: Rect) -> Rect {
+        Rect::new(
+            tile.x() + (tile.width() - self.metrics.icon_side) * 0.5,
+            tile.y() + 7.0,
+            self.metrics.icon_side,
+            self.metrics.icon_side,
+        )
+    }
+
+    fn label_rect(&self, tile: Rect) -> Rect {
+        Rect::new(
+            tile.x() + 4.0,
+            tile.max_y() - self.metrics.label_height - 4.0,
+            (tile.width() - 8.0).max(0.0),
+            self.metrics.label_height,
+        )
+    }
+
+    fn checkbox_rect(&self, tile: Rect, theme: &DefaultTheme) -> Rect {
+        let side = theme.metrics.checkbox_indicator_size.min(18.0);
+        Rect::new(tile.x() + 5.0, tile.y() + 5.0, side, side)
+    }
+
+    fn index_at_position(&self, bounds: Rect, position: Point) -> Option<usize> {
+        let x = position.x - bounds.x() - self.grid_start_x;
+        let y = position.y - bounds.y() - self.metrics.padding;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let column = (x / (self.tile_width + self.metrics.gap)).floor() as usize;
+        let row = (y / (self.metrics.tile_height + self.metrics.gap)).floor() as usize;
+        if column >= self.columns
+            || x - column as f32 * (self.tile_width + self.metrics.gap) > self.tile_width
+            || y - row as f32 * (self.metrics.tile_height + self.metrics.gap)
+                > self.metrics.tile_height
+        {
+            return None;
+        }
+        let index = row.saturating_mul(self.columns).saturating_add(column);
+        (index < self.entries.len()).then_some(index)
+    }
+
+    fn visible_indices(&self) -> std::ops::Range<usize> {
+        if self.entries.is_empty() {
+            return 0..0;
+        }
+        let viewport = self.scroll_state.viewport_size();
+        if viewport.height <= 0.0 {
+            return 0..self.entries.len();
+        }
+        let offset = self.scroll_state.current_offset().y;
+        let row_step = self.metrics.tile_height + self.metrics.gap;
+        let first_row = ((offset - self.metrics.padding).max(0.0) / row_step).floor() as usize;
+        let last_row = (((offset + viewport.height - self.metrics.padding).max(0.0) / row_step)
+            .ceil() as usize)
+            .saturating_add(1);
+        let start = first_row
+            .saturating_mul(self.columns)
+            .min(self.entries.len());
+        let end = last_row
+            .saturating_mul(self.columns)
+            .min(self.entries.len());
+        start..end
+    }
+
+    fn row_activation_kind(&mut self, index: usize) -> VirtualTableRowActivationKind {
+        let now = Instant::now();
+        let double_click = self.last_click.take().is_some_and(|(previous, instant)| {
+            previous == index && now.duration_since(instant) <= FILE_ICON_GRID_DOUBLE_CLICK_WINDOW
+        });
+        if double_click {
+            VirtualTableRowActivationKind::Double
+        } else {
+            self.last_click = Some((index, now));
+            VirtualTableRowActivationKind::Single
+        }
+    }
+
+    fn ensure_visible(&self, index: usize, ctx: &mut EventCtx) {
+        let row = index / self.columns;
+        let top = self.metrics.padding + row as f32 * (self.metrics.tile_height + self.metrics.gap);
+        let bottom = top + self.metrics.tile_height;
+        let viewport = self.scroll_state.viewport_size();
+        let current = self.scroll_state.current_offset().y;
+        let next = if top < current {
+            top
+        } else if bottom > current + viewport.height {
+            (bottom - viewport.height).max(0.0)
+        } else {
+            current
+        };
+        if self.scroll_state.set_offset(Vector::new(0.0, next)) {
+            ctx.request_arrange();
+            ctx.request_paint();
+            ctx.request_semantics();
+        }
+    }
+
+    fn maybe_request_more(&self, predicted_scroll_delta: f32) {
+        if self.entries.len() >= self.total_count {
+            return;
+        }
+        let viewport = self.scroll_state.viewport_size();
+        let offset = (self.scroll_state.current_offset().y + predicted_scroll_delta).max(0.0);
+        let remaining = (self.content_height - viewport.height - offset).max(0.0);
+        if remaining <= (self.metrics.tile_height + self.metrics.gap) * 3.0 {
+            let waker = { self.shared.borrow().waker.clone() };
+            self.shared.files_mut().request_more_entries(waker);
+        }
+    }
+
+    fn select_from_keyboard(&self, index: usize, ctx: &mut EventCtx) {
+        self.shared.files_mut().select_entry(index);
+        self.ensure_visible(index, ctx);
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+
+    fn entry_description(&self, index: usize) -> String {
+        let Some(entry) = self.entries.get(index) else {
+            return String::new();
+        };
+        let files = self.shared.files();
+        let kind = if entry.is_dir {
+            "Folder"
+        } else if entry.is_link {
+            "Link"
+        } else {
+            "File"
+        };
+        let mut description = format!(
+            "{kind}, {} {}. Item {} of {}",
+            files.source.path_label(),
+            entry.path,
+            index + 1,
+            self.total_count
+        );
+        if entry.is_dir {
+            description.push_str(". Single click selects; double click opens the folder");
+        }
+        if files.entry_marked(index) {
+            description.push_str(". Marked for a batch action");
+        }
+        if files.source == FilesSourceKind::Sifs {
+            let placement = file_row_placement_badge(entry, &files);
+            description.push_str(". Placement: ");
+            description.push_str(&placement.label);
+            if let Some((current, desired)) = placement.replicas {
+                description.push_str(&format!("; {current}/{desired} replicas"));
+            }
+        }
+        description
+    }
+}
+
+impl Widget for FileIconGrid {
+    fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
+        if ctx.phase() == EventPhase::Capture {
+            return;
+        }
+        let bounds = ctx.bounds();
+        match event {
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Move => {
+                let hovered = self.index_at_position(bounds, pointer.position);
+                if self.hovered != hovered {
+                    self.hovered = hovered;
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+                self.maybe_request_more(0.0);
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Scroll => {
+                let delta = match pointer.scroll_delta {
+                    Some(ScrollDelta::Lines(delta)) => -delta.y * 40.0,
+                    Some(ScrollDelta::Pixels(delta)) => -delta.y,
+                    None => -pointer.delta.y,
+                };
+                self.maybe_request_more(delta);
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                if let Some(index) = self.index_at_position(bounds, pointer.position) {
+                    let mark = self
+                        .checkbox_rect(self.tile_rect(bounds, index), &self.shared.theme())
+                        .contains(pointer.position);
+                    self.pressed = Some((index, mark));
+                    self.hovered = Some(index);
+                    ctx.request_focus();
+                    ctx.request_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Up
+                    && pointer.button == Some(PointerButton::Primary) =>
+            {
+                let hovered = self.index_at_position(bounds, pointer.position);
+                if let Some((index, mark)) = self.pressed.take() {
+                    if hovered == Some(index) {
+                        if mark
+                            && self
+                                .checkbox_rect(self.tile_rect(bounds, index), &self.shared.theme())
+                                .contains(pointer.position)
+                        {
+                            self.shared.files_mut().toggle_marked_entry(index);
+                            self.last_click = None;
+                        } else {
+                            let activation = self.row_activation_kind(index);
+                            self.shared.files_mut().click_row(index, activation);
+                        }
+                    }
+                    self.hovered = hovered;
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                    ctx.set_handled();
+                }
+            }
+            Event::Pointer(pointer)
+                if pointer.kind == PointerEventKind::Down
+                    && pointer.button == Some(PointerButton::Secondary) =>
+            {
+                if let Some(index) = self.index_at_position(bounds, pointer.position) {
+                    self.context_target.set(FileContextMenuTarget::Selection);
+                    self.shared.files_mut().select_context_entry(index);
+                } else if bounds.contains(pointer.position) {
+                    self.context_target
+                        .set(FileContextMenuTarget::CurrentLocation);
+                }
+                ctx.request_paint();
+                ctx.request_semantics();
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Leave => {
+                if self.hovered.take().is_some() {
+                    ctx.request_paint();
+                    ctx.request_semantics();
+                }
+            }
+            Event::Pointer(pointer) if pointer.kind == PointerEventKind::Cancel => {
+                if self.pressed.take().is_some() {
+                    ctx.release_pointer_capture(pointer.pointer_id);
+                    ctx.request_paint();
+                    ctx.set_handled();
+                }
+            }
+            Event::Keyboard(key) if ctx.is_focused() && key.state == KeyState::Pressed => {
+                if self.entries.is_empty() {
+                    return;
+                }
+                let current = self
+                    .shared
+                    .files()
+                    .selected
+                    .filter(|index| *index < self.entries.len())
+                    .unwrap_or(0);
+                let next = match key.key.as_str() {
+                    "ArrowLeft" => Some(current.saturating_sub(1)),
+                    "ArrowRight" => Some((current + 1).min(self.entries.len() - 1)),
+                    "ArrowUp" => Some(current.saturating_sub(self.columns)),
+                    "ArrowDown" => Some((current + self.columns).min(self.entries.len() - 1)),
+                    "PageUp" => Some(
+                        current.saturating_sub(
+                            self.columns
+                                * (self.scroll_state.viewport_size().height
+                                    / (self.metrics.tile_height + self.metrics.gap))
+                                    .floor()
+                                    .max(1.0) as usize,
+                        ),
+                    ),
+                    "PageDown" => Some(
+                        (current
+                            + self.columns
+                                * (self.scroll_state.viewport_size().height
+                                    / (self.metrics.tile_height + self.metrics.gap))
+                                    .floor()
+                                    .max(1.0) as usize)
+                            .min(self.entries.len() - 1),
+                    ),
+                    "Home" => Some(0),
+                    "End" => Some(self.entries.len() - 1),
+                    "Enter" => {
+                        self.shared.files_mut().activate_row(current);
+                        ctx.request_measure();
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                        ctx.set_handled();
+                        return;
+                    }
+                    " " => {
+                        self.shared.files_mut().toggle_marked_entry(current);
+                        ctx.request_paint();
+                        ctx.request_semantics();
+                        ctx.set_handled();
+                        return;
+                    }
+                    _ => None,
+                };
+                if let Some(next) = next {
+                    self.select_from_keyboard(next, ctx);
+                    self.maybe_request_more(0.0);
+                    ctx.set_handled();
+                }
+            }
+            Event::Semantics(semantics) => {
+                let target = self.entries.iter().enumerate().find_map(|(index, entry)| {
+                    (file_icon_semantics_id(ctx.widget_id(), file_entry_key(entry))
+                        == semantics.target)
+                        .then_some(index)
+                });
+                if let Some(index) = target {
+                    match semantics.action {
+                        SemanticsActionRequest::Activate => {
+                            self.shared.files_mut().activate_row(index);
+                            ctx.request_measure();
+                            ctx.request_paint();
+                            ctx.request_semantics();
+                            ctx.set_handled();
+                        }
+                        SemanticsActionRequest::Focus => {
+                            self.select_from_keyboard(index, ctx);
+                            ctx.request_focus();
+                            ctx.set_handled();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let desired_width = if constraints.max.width.is_finite() {
+            constraints.max.width
+        } else {
+            self.metrics.tile_width * 4.0 + self.metrics.gap * 3.0 + self.metrics.padding * 2.0
+        };
+        let width = constraints.clamp(Size::new(desired_width, 0.0)).width;
+        self.update_layout(width);
+        constraints.clamp(Size::new(width, self.content_height.max(1.0)))
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let theme = self.shared.theme();
+        let pal = palette(&self.shared);
+        let files = self.shared.files();
+        let bounds = ctx.bounds();
+        for index in self.visible_indices() {
+            let Some(entry) = self.entries.get(index) else {
+                continue;
+            };
+            let tile = self.tile_rect(bounds, index);
+            let active = files.selected == Some(index);
+            let marked = files.entry_marked(index);
+            let hovered = self.hovered == Some(index);
+            let pressed = self.pressed.is_some_and(|(pressed, _)| pressed == index);
+            if active || marked {
+                widgets::fill_round_rect(
+                    ctx,
+                    tile.inflate(-2.0, -2.0),
+                    theme.palette.selection,
+                    6.0,
+                );
+            } else if hovered || pressed {
+                widgets::fill_round_rect(
+                    ctx,
+                    tile.inflate(-2.0, -2.0),
+                    theme.palette.control_hover,
+                    6.0,
+                );
+            }
+
+            let icon_color = if entry.is_dir || entry.is_link || active {
+                pal.accent
+            } else {
+                pal.text_faint
+            };
+            draw_glyph(ctx, entry_icon(entry), self.icon_rect(tile), icon_color);
+
+            let label_rect = self.label_rect(tile);
+            let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
+            let display =
+                display_name_for_width(&entry.name, label_rect.width() * 1.8, average_char_width);
+            let text_token = if self.mode == FilesViewMode::SmallIcons {
+                theme.text.xs
+            } else {
+                theme.text.sm
+            };
+            paint_text_block(
+                ctx,
+                &theme,
+                label_rect,
+                &display,
+                TextBlockPaint::new()
+                    .text_token(text_token)
+                    .color(if active { pal.text } else { pal.text_muted })
+                    .weight(FontWeight::MEDIUM)
+                    .wrap(TextWrap::Character)
+                    .alignment(TextAlign::Center)
+                    .padding(Insets {
+                        left: 0.0,
+                        top: 1.0,
+                        right: 0.0,
+                        bottom: 1.0,
+                    }),
+            );
+
+            if marked || hovered {
+                paint_checkbox_indicator(
+                    ctx,
+                    &theme,
+                    self.checkbox_rect(tile, &theme),
+                    CheckboxIndicatorState::new(marked).hovered(hovered),
+                );
+            }
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut root = SemanticsNode::new(ctx.widget_id(), SemanticsRole::List, ctx.bounds());
+        root.name = Some("files-icons".to_string());
+        root.description = Some(format!(
+            "{} icon view; {} loaded of {} items",
+            self.mode.icon_label().unwrap_or("Medium"),
+            self.entries.len(),
+            self.total_count
+        ));
+        root.value = Some(SemanticsValue::Text(format!("{} items", self.total_count)));
+        root.state.focused = ctx.is_focused();
+        root.actions = vec![SemanticsAction::Focus];
+        ctx.push(root);
+
+        let files = self.shared.files();
+        for index in self.visible_indices() {
+            let Some(entry) = self.entries.get(index) else {
+                continue;
+            };
+            let mut node = SemanticsNode::new(
+                file_icon_semantics_id(ctx.widget_id(), file_entry_key(entry)),
+                SemanticsRole::ListItem,
+                self.tile_rect(ctx.bounds(), index),
+            );
+            node.parent = Some(ctx.widget_id());
+            node.name = Some(entry.name.clone());
+            node.description = Some(self.entry_description(index));
+            node.state.selected = files.selected == Some(index);
+            node.state.checked = files
+                .entry_marked(index)
+                .then_some(ToggleState::Checked)
+                .or(Some(ToggleState::Unchecked));
+            node.state.hovered = self.hovered == Some(index);
+            node.actions = vec![SemanticsAction::Focus, SemanticsAction::Activate];
+            ctx.push(node);
+        }
+    }
+
+    fn accepts_focus(&self) -> bool {
+        true
+    }
+
+    fn focus_changed(&mut self, ctx: &mut EventCtx, _focused: bool) {
+        ctx.request_paint();
+        ctx.request_semantics();
+    }
+}
+
+fn file_icon_semantics_id(parent: WidgetId, entry_key: u64) -> WidgetId {
+    const TAG: u64 = 9_u64 << 50;
+    const LOW_MASK: u64 = (1_u64 << 50) - 1;
+    let mixed = entry_key
+        .wrapping_add(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(parent.get().rotate_left(19));
+    let mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    let mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    WidgetId::new(TAG | ((mixed ^ (mixed >> 31)) & LOW_MASK))
 }
 
 /// A centered empty/error placeholder themed off the chrome palette.
@@ -27102,6 +27985,212 @@ mod tests {
             table.description
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn file_icon_sizes_form_an_explorer_density_ladder() {
+        let small = file_icon_grid_metrics(FilesViewMode::SmallIcons);
+        let medium = file_icon_grid_metrics(FilesViewMode::MediumIcons);
+        let large = file_icon_grid_metrics(FilesViewMode::LargeIcons);
+
+        assert!(small.icon_side < medium.icon_side && medium.icon_side < large.icon_side);
+        assert!(small.tile_width < medium.tile_width && medium.tile_width < large.tile_width);
+        assert!(small.tile_height < medium.tile_height && medium.tile_height < large.tile_height);
+    }
+
+    #[test]
+    fn file_view_mode_rebuilds_the_listing_and_toolbar_projection() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        let before =
+            FilesStructureKey::new(AppThemeMode::Dark, AppTextScale::Standard, Some(&files));
+
+        files.set_view_mode(FilesViewMode::LargeIcons);
+        let after =
+            FilesStructureKey::new(AppThemeMode::Dark, AppTextScale::Standard, Some(&files));
+
+        assert_ne!(before.list, after.list);
+        assert_ne!(before.header, after.header);
+        assert_eq!(after.list.view_mode, FilesViewMode::LargeIcons);
+        assert_eq!(after.header.view_mode, FilesViewMode::LargeIcons);
+    }
+
+    #[test]
+    fn file_icon_views_render_accessible_tiles_at_all_three_sizes() -> sui::Result<()> {
+        let mut tile_sizes = Vec::new();
+        for mode in [
+            FilesViewMode::SmallIcons,
+            FilesViewMode::MediumIcons,
+            FilesViewMode::LargeIcons,
+        ] {
+            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            {
+                let mut files = shared.files_mut();
+                files.loaded = true;
+                files.loading = false;
+                files.error = None;
+                files.path = "/icons".to_string();
+                files.view_mode = mode;
+                files.entries = vec![
+                    SifsEntry {
+                        name: "workspace".to_string(),
+                        path: "/icons/workspace".to_string(),
+                        is_dir: true,
+                        is_link: false,
+                        size: None,
+                    },
+                    SifsEntry {
+                        name: "artifact.txt".to_string(),
+                        path: "/icons/artifact.txt".to_string(),
+                        is_dir: false,
+                        is_link: false,
+                        size: Some(42),
+                    },
+                ];
+                files.entries_total_count = files.entries.len();
+            }
+
+            let runtime = sui::Application::new()
+                .window(
+                    sui::WindowBuilder::new().title("File icons").root(
+                        SizedBox::new()
+                            .width(720.0)
+                            .height(520.0)
+                            .with_child(view(shared)),
+                    ),
+                )
+                .build()?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            let snapshot = window.snapshot()?;
+            let grid = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::List && node.name.as_deref() == Some("files-icons")
+                })
+                .expect("file icon list semantics");
+            assert!(grid.description.as_deref().is_some_and(|description| {
+                description.starts_with(mode.icon_label().expect("icon mode"))
+            }));
+            let tile = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::ListItem
+                        && node.name.as_deref() == Some("artifact.txt")
+                })
+                .expect("file icon tile semantics");
+            tile_sizes.push(tile.bounds.size);
+        }
+
+        assert!(tile_sizes[0].width < tile_sizes[1].width);
+        assert!(tile_sizes[1].width < tile_sizes[2].width);
+        assert!(tile_sizes[0].height < tile_sizes[1].height);
+        assert!(tile_sizes[1].height < tile_sizes[2].height);
+        Ok(())
+    }
+
+    #[test]
+    fn file_icon_tiles_select_and_double_click_open_directories() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = "/icons".to_string();
+            files.view_mode = FilesViewMode::MediumIcons;
+            files.entries = vec![
+                SifsEntry {
+                    name: "artifact.txt".to_string(),
+                    path: "/icons/artifact.txt".to_string(),
+                    is_dir: false,
+                    is_link: false,
+                    size: Some(42),
+                },
+                SifsEntry {
+                    name: "workspace".to_string(),
+                    path: "/icons/workspace".to_string(),
+                    is_dir: true,
+                    is_link: false,
+                    size: None,
+                },
+            ];
+            files.entries_total_count = files.entries.len();
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("File icon actions").root(
+                    SizedBox::new()
+                        .width(720.0)
+                        .height(520.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let workspace = window
+            .get_by_role(SemanticsRole::ListItem)
+            .with_name("workspace");
+
+        workspace.click()?;
+        assert_eq!(shared.files().selected, Some(1));
+        assert_eq!(shared.files().path, "/icons");
+
+        workspace.click()?;
+        assert_eq!(shared.files().path, "/icons/workspace");
+        Ok(())
+    }
+
+    #[test]
+    fn file_icon_view_keeps_sorting_reachable_from_the_toolbar() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = "/icons".to_string();
+            files.view_mode = FilesViewMode::MediumIcons;
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/icons/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(42),
+            }];
+            files.entries_total_count = 1;
+        }
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("File icon sorting").root(
+                    SizedBox::new()
+                        .width(720.0)
+                        .height(520.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Sort icon view")
+            .click()?;
+        window.advance_time(0.2)?;
+        window
+            .get_by_role(SemanticsRole::MenuItem)
+            .with_name("Size (largest first)")
+            .click()?;
+
+        assert_eq!(shared.files().sort_mode, FileSortMode::SizeDesc);
         Ok(())
     }
 
