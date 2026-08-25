@@ -7,17 +7,18 @@
 //! retains wide-split and narrow-list presentations through `ConstraintView`, while
 //! [`FilesView`] remains only as the lazy-load boundary. Both branches use stock `Breadcrumb` /
 //! `IconButton` / `VirtualTable` / `ScrollView` / `SideSheet` / `PanelSection` /
-//! `DetailRow` / `StatusBadge` widgets. State lives entirely in [`FilesState`]; the
-//! interactive app lists SIFS on a background worker so tab layout never blocks
-//! on DFS metadata or network work.
+//! `DetailRow` / `StatusBadge` widgets around a file-specific icon grid. State lives entirely in
+//! [`FilesState`]; the interactive app lists SIFS and generates bounded thumbnails on separate
+//! background lanes so tab layout never blocks on DFS metadata, network work, or image decoding.
 //!
 //! The file listing changes on navigation and sort. It is rebuilt by
-//! [`RebuildOnChange`] and rendered with [`VirtualTable`], so large folders only
-//! paint visible rows while the header stays pinned. Sorting and pagination are
-//! requested through the worker/daemon boundary instead of doing heavy listing
-//! work on the UI path.
+//! [`RebuildOnChange`] and rendered as either a [`VirtualTable`] or a visible-range icon grid, so
+//! large folders only paint visible content while the details header stays pinned. Medium and
+//! large icon views request exact-version raster snapshots, decode them under strict limits, and
+//! keep decoded pixels plus renderer registrations bounded. Sorting and pagination are requested
+//! through worker/daemon boundaries instead of doing heavy work on the UI path.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -35,20 +36,21 @@ use sui::{
     Alignment, ArrangeCtx, Background, Breadcrumb, BreadcrumbItem, ButtonAppearance, Checkbox,
     CheckboxIndicatorState, CollectionWindow, Color, ConstraintQuery, ConstraintView, Constraints,
     ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx,
-    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, Insets, KeyState,
-    Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx, MenuItem, NumberInput,
-    Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint, Point, PointerButton,
-    PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect, RichText,
-    ScrollDelta, ScrollState, ScrollView, SectionLabel, SegmentedControl, SegmentedControlItem,
-    Select, SemanticRegion, SemanticTone, SemanticsAction, SemanticsActionRequest, SemanticsCtx,
-    SemanticsNode, SemanticsRole, SemanticsValue, Separator, SideSheet, SideSheetPlacement, Size,
-    SizedBox, SplitView, Stack, StackHostOptions, StatusBadge, StatusBar, StatusBarSegment,
-    Surface, SurfaceBorder, SurfaceRole, SwitchView, TextAlign, TextBlockPaint, TextCellPaint,
-    TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, Vector,
-    VirtualCollectionModel, VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable,
-    VirtualTableColumn, VirtualTableRowActivationKind, VirtualTableRowContext,
-    VirtualTableSortDirection, VirtualTableState, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor,
-    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_checkbox_indicator,
+    EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, ImageHandle,
+    ImageSource, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx,
+    MenuItem, NumberInput, Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint,
+    Point, PointerButton, PointerEventKind, Popover, PopoverAlignment, RadioButton,
+    RebuildOnChange, Rect, RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView,
+    SectionLabel, SegmentedControl, SegmentedControlItem, Select, SemanticRegion, SemanticTone,
+    SemanticsAction, SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole,
+    SemanticsValue, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack,
+    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
+    SurfaceRole, SwitchView, TextAlign, TextBlockPaint, TextCellPaint, TextSurface, TextWrap,
+    ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, Vector, VirtualCollectionModel,
+    VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
+    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
+    VirtualTableState, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
+    containers::Padding as WidgetPadding, draw_glyph, paint_checkbox_indicator,
     paint_leading_label_cell, paint_placement_badge_with, paint_text_block, paint_text_cell,
 };
 
@@ -75,6 +77,11 @@ use crate::backend::Backend;
 use crate::native_picker::{NativePickerKind, NativePickerLane, NativePickerOutcome};
 use crate::state::{Shared, Tab};
 use crate::theme::{AppTextScale, AppThemeMode, Palette};
+use crate::ui::files_thumbnail::{
+    THUMBNAIL_CACHE_MAX_BYTES, THUMBNAIL_CACHE_MAX_ENTRIES, THUMBNAIL_MAX_SOURCE_BYTES,
+    ThumbnailBitmap, ThumbnailBucket, ThumbnailCache, ThumbnailCacheEntry, ThumbnailIdentity,
+    ThumbnailRequest, ThumbnailRequestKey, decode_thumbnail, thumbnail_candidate,
+};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
@@ -131,7 +138,7 @@ const PLACEMENT_ACTIVITY_IDLE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// Appearance toggle restyles the whole tab live, with no rebuild. (Same pattern as `settings.rs`.)
 type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FilesSourceKind {
     Sifs,
     Local,
@@ -1165,6 +1172,12 @@ pub struct FilesState {
     worker_rx: Option<Receiver<FilesWorkerResult>>,
     worker_result_tx: Option<Sender<FilesWorkerResult>>,
     worker_waker: Option<sui::UiHandle>,
+    thumbnail_tx: Option<Sender<ThumbnailWorkerCommand>>,
+    thumbnail_rx: Option<Receiver<ThumbnailWorkerResult>>,
+    thumbnail_cache: ThumbnailCache,
+    thumbnail_inflight: BTreeSet<ThumbnailRequestKey>,
+    thumbnail_listing_epoch: u64,
+    thumbnail_revision: u64,
     live_event_abort: Option<tokio::task::AbortHandle>,
     live_refresh_pending: bool,
     worker_cancellations: Arc<Mutex<BTreeSet<u64>>>,
@@ -1655,6 +1668,15 @@ impl FilesState {
             worker_rx: None,
             worker_result_tx: None,
             worker_waker: None,
+            thumbnail_tx: None,
+            thumbnail_rx: None,
+            thumbnail_cache: ThumbnailCache::new(
+                THUMBNAIL_CACHE_MAX_BYTES,
+                THUMBNAIL_CACHE_MAX_ENTRIES,
+            ),
+            thumbnail_inflight: BTreeSet::new(),
+            thumbnail_listing_epoch: 0,
+            thumbnail_revision: 0,
             live_event_abort: None,
             live_updates_connected: false,
             live_updates_error: None,
@@ -1875,6 +1897,7 @@ impl FilesState {
     }
 
     fn reload_sync(&mut self) {
+        self.begin_thumbnail_listing();
         self.selected = None;
         self.marked_entries.clear();
         self.clear_selected_details();
@@ -1948,6 +1971,7 @@ impl FilesState {
         let Some(tx) = self.worker_tx.clone() else {
             return;
         };
+        self.begin_thumbnail_listing();
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1);
         self.pending_request_id = Some(request_id);
@@ -2141,6 +2165,9 @@ impl FilesState {
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
+        self.thumbnail_tx = None;
+        self.thumbnail_rx = None;
+        self.thumbnail_inflight.clear();
         if let Some(abort) = self.live_event_abort.take() {
             abort.abort();
         }
@@ -2206,8 +2233,167 @@ impl FilesState {
         }
     }
 
+    fn ensure_thumbnail_worker(&mut self, waker: sui::UiHandle) {
+        if self.thumbnail_tx.is_some() {
+            return;
+        }
+        let (command_tx, command_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let daemon_address = self.daemon_address.clone();
+        let daemon_unavailable_detail = self.daemon_unavailable_detail.clone();
+        let app_runtime = self.app_runtime.clone();
+        if thread::Builder::new()
+            .name("sinomo-app-thumbnails".to_string())
+            .spawn(move || {
+                thumbnail_worker_loop(
+                    daemon_address,
+                    daemon_unavailable_detail,
+                    app_runtime,
+                    command_rx,
+                    result_tx,
+                    waker,
+                )
+            })
+            .is_ok()
+        {
+            self.thumbnail_tx = Some(command_tx);
+            self.thumbnail_rx = Some(result_rx);
+        }
+    }
+
+    fn begin_thumbnail_listing(&mut self) {
+        self.thumbnail_listing_epoch = self.thumbnail_listing_epoch.wrapping_add(1);
+        self.thumbnail_inflight.clear();
+        self.thumbnail_cache.remove_unavailable();
+        if let Some(tx) = &self.thumbnail_tx {
+            let _ = tx.send(ThumbnailWorkerCommand {
+                requests: Vec::new(),
+            });
+        }
+    }
+
+    fn thumbnail_request_for_entry(
+        &self,
+        entry: &SifsEntry,
+        bucket: ThumbnailBucket,
+    ) -> Option<ThumbnailRequest> {
+        if entry.is_dir || entry.is_link || !thumbnail_candidate(&entry.name) {
+            return None;
+        }
+        let identity = if self.source == FilesSourceKind::Sifs {
+            self.entry_metadata
+                .get(&entry.path)
+                .map(|metadata| ThumbnailIdentity::Sifs {
+                    object_id: metadata.object_id.clone(),
+                    version: metadata.version.clone(),
+                })
+                .unwrap_or(ThumbnailIdentity::Listing(self.thumbnail_listing_epoch))
+        } else {
+            ThumbnailIdentity::Listing(self.thumbnail_listing_epoch)
+        };
+        Some(ThumbnailRequest {
+            key: ThumbnailRequestKey {
+                source: self.source,
+                path: entry.path.clone(),
+                identity,
+                bucket,
+            },
+        })
+    }
+
+    fn request_visible_thumbnails(
+        &mut self,
+        entries: &[SifsEntry],
+        range: std::ops::Range<usize>,
+        bucket: ThumbnailBucket,
+        waker: Option<sui::UiHandle>,
+    ) {
+        if self.thumbnail_tx.is_none()
+            && let Some(waker) = waker
+        {
+            self.ensure_thumbnail_worker(waker);
+        }
+        let mut requests = Vec::new();
+        for entry in entries.get(range).into_iter().flatten() {
+            let Some(request) = self.thumbnail_request_for_entry(entry, bucket) else {
+                continue;
+            };
+            if self.thumbnail_cache.contains(&request.key) {
+                self.thumbnail_cache.touch(&request.key);
+                continue;
+            }
+            self.thumbnail_inflight.insert(request.key.clone());
+            requests.push(request);
+        }
+        let Some(tx) = &self.thumbnail_tx else {
+            for request in requests {
+                self.thumbnail_inflight.remove(&request.key);
+            }
+            return;
+        };
+        if let Err(error) = tx.send(ThumbnailWorkerCommand { requests }) {
+            for request in error.0.requests {
+                self.thumbnail_inflight.remove(&request.key);
+            }
+            self.thumbnail_tx = None;
+            self.thumbnail_rx = None;
+        }
+    }
+
+    fn cancel_thumbnail_requests(&mut self) {
+        self.thumbnail_inflight.clear();
+        if let Some(tx) = &self.thumbnail_tx {
+            let _ = tx.send(ThumbnailWorkerCommand {
+                requests: Vec::new(),
+            });
+        }
+    }
+
+    fn thumbnail_result_is_current(&self, key: &ThumbnailRequestKey) -> bool {
+        if key.source != self.source {
+            return false;
+        }
+        self.entries
+            .iter()
+            .find(|entry| entry.path == key.path)
+            .and_then(|entry| self.thumbnail_request_for_entry(entry, key.bucket))
+            .is_some_and(|request| request.key == *key)
+    }
+
+    fn pump_thumbnail_results(&mut self) -> bool {
+        let mut changed = false;
+        loop {
+            let result = match self.thumbnail_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(result)) => result,
+                Some(Err(TryRecvError::Empty)) | None => break,
+                Some(Err(TryRecvError::Disconnected)) => {
+                    self.thumbnail_tx = None;
+                    self.thumbnail_rx = None;
+                    self.thumbnail_inflight.clear();
+                    break;
+                }
+            };
+            self.thumbnail_inflight.remove(&result.key);
+            if !self.thumbnail_result_is_current(&result.key) {
+                continue;
+            }
+            let entry = match result.result {
+                Ok(bitmap) => ThumbnailCacheEntry::Ready(bitmap),
+                Err(_) => ThumbnailCacheEntry::Unavailable,
+            };
+            self.thumbnail_cache.insert(result.key, entry);
+            self.thumbnail_revision = self.thumbnail_revision.wrapping_add(1);
+            changed = true;
+        }
+        changed
+    }
+
+    pub(crate) const fn thumbnail_revision(&self) -> u64 {
+        self.thumbnail_revision
+    }
+
     pub fn pump_load(&mut self) -> bool {
-        let mut changed = self.poll_native_picker();
+        let mut changed = self.poll_native_picker() | self.pump_thumbnail_results();
         loop {
             let result = match self.worker_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(result)) => result,
@@ -4877,6 +5063,9 @@ impl FilesState {
     }
 
     fn set_view_mode(&mut self, mode: FilesViewMode) {
+        if self.view_mode != mode {
+            self.cancel_thumbnail_requests();
+        }
         self.view_mode = mode;
     }
 
@@ -6072,6 +6261,17 @@ enum FilesWorkerCommand {
     },
 }
 
+#[derive(Clone, Debug)]
+struct ThumbnailWorkerCommand {
+    requests: Vec<ThumbnailRequest>,
+}
+
+#[derive(Debug)]
+struct ThumbnailWorkerResult {
+    key: ThumbnailRequestKey,
+    result: Result<Arc<ThumbnailBitmap>, String>,
+}
+
 struct FilesOperationProgress<'a> {
     request_id: u64,
     result_tx: &'a Sender<FilesWorkerResult>,
@@ -6983,6 +7183,96 @@ fn files_worker_loop(
         }
         waker.wake();
     }
+}
+
+fn thumbnail_worker_loop(
+    daemon_address: Option<String>,
+    daemon_unavailable_detail: Option<String>,
+    app_runtime: tokio::runtime::Handle,
+    command_rx: Receiver<ThumbnailWorkerCommand>,
+    result_tx: Sender<ThumbnailWorkerResult>,
+    waker: sui::UiHandle,
+) {
+    let mut browser = None;
+    let mut browser_error = daemon_unavailable_detail;
+    while let Ok(mut command) = command_rx.recv() {
+        'latest: loop {
+            while let Ok(newer) = command_rx.try_recv() {
+                command = newer;
+            }
+            for request in command.requests {
+                if let Ok(newer) = command_rx.try_recv() {
+                    command = newer;
+                    continue 'latest;
+                }
+                let key = request.key.clone();
+                let result = load_thumbnail_request(
+                    &request,
+                    &mut browser,
+                    &mut browser_error,
+                    daemon_address.as_deref(),
+                    &app_runtime,
+                );
+                if result_tx
+                    .send(ThumbnailWorkerResult { key, result })
+                    .is_err()
+                {
+                    return;
+                }
+                waker.wake();
+            }
+            break;
+        }
+    }
+}
+
+fn load_thumbnail_request(
+    request: &ThumbnailRequest,
+    browser: &mut Option<SifsBrowser>,
+    browser_error: &mut Option<String>,
+    daemon_address: Option<&str>,
+    app_runtime: &tokio::runtime::Handle,
+) -> Result<Arc<ThumbnailBitmap>, String> {
+    let bytes = match request.key.source {
+        FilesSourceKind::Local => {
+            let (bytes, _) =
+                read_local_file_snapshot(&request.key.path, THUMBNAIL_MAX_SOURCE_BYTES)?;
+            bytes
+        }
+        FilesSourceKind::Sifs => {
+            if browser.is_none() && browser_error.is_none() {
+                match daemon_address {
+                    Some(address) => {
+                        match SifsBrowser::open_daemon_on_runtime(address, app_runtime) {
+                            Ok(opened) => *browser = Some(opened),
+                            Err(error) => *browser_error = Some(error),
+                        }
+                    }
+                    None => {
+                        *browser_error =
+                            Some("SIFS thumbnails require a daemon connection".to_string())
+                    }
+                }
+            }
+            let browser = browser.as_ref().ok_or_else(|| {
+                browser_error
+                    .clone()
+                    .unwrap_or_else(|| "SIFS thumbnail browser did not start".to_string())
+            })?;
+            let (bytes, fingerprint, _) =
+                read_sifs_file_snapshot(browser, &request.key.path, THUMBNAIL_MAX_SOURCE_BYTES)?;
+            if let ThumbnailIdentity::Sifs { object_id, version } = &request.key.identity
+                && (&fingerprint.object_id != object_id || &fingerprint.version != version)
+            {
+                return Err(format!(
+                    "{} changed before its thumbnail snapshot was read",
+                    request.key.path
+                ));
+            }
+            bytes
+        }
+    };
+    decode_thumbnail(&bytes, request.key.bucket)
 }
 
 fn ensure_files_worker_browser(
@@ -11532,8 +11822,9 @@ fn files_list_body_rebuild(
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
     let table_state = VirtualTableState::new();
+    let thumbnail_registration = Rc::new(RefCell::new(ThumbnailRegistrationPool::default()));
     RebuildOnChange::new_observable(source, move |_key| {
-        files_list_body(&s, &r, &ss, &table_state)
+        files_list_body(&s, &r, &ss, &table_state, &thumbnail_registration)
     })
 }
 
@@ -11771,10 +12062,17 @@ fn files_list_body(
     reader: &ThemeReader,
     scroll_state: &ScrollState,
     table_state: &VirtualTableState,
+    thumbnail_registration: &Rc<RefCell<ThumbnailRegistrationPool>>,
 ) -> WidgetPod {
     match shared.files().view_mode {
         FilesViewMode::Details => files_list_body_table(shared, reader, scroll_state, table_state),
-        icon_mode => files_list_body_icons(shared, reader, scroll_state, icon_mode),
+        icon_mode => files_list_body_icons(
+            shared,
+            reader,
+            scroll_state,
+            icon_mode,
+            thumbnail_registration,
+        ),
     }
 }
 
@@ -12082,11 +12380,30 @@ fn file_icon_grid_metrics(mode: FilesViewMode) -> FileIconGridMetrics {
     }
 }
 
+fn file_thumbnail_bucket(mode: FilesViewMode) -> Option<ThumbnailBucket> {
+    match mode {
+        FilesViewMode::MediumIcons => Some(ThumbnailBucket::Medium),
+        FilesViewMode::LargeIcons => Some(ThumbnailBucket::Large),
+        FilesViewMode::Details | FilesViewMode::SmallIcons => None,
+    }
+}
+
+fn file_cached_thumbnail_buckets(mode: FilesViewMode) -> [Option<ThumbnailBucket>; 2] {
+    match mode {
+        FilesViewMode::SmallIcons | FilesViewMode::MediumIcons => {
+            [Some(ThumbnailBucket::Medium), Some(ThumbnailBucket::Large)]
+        }
+        FilesViewMode::LargeIcons => [Some(ThumbnailBucket::Large), Some(ThumbnailBucket::Medium)],
+        FilesViewMode::Details => [None, None],
+    }
+}
+
 fn files_list_body_icons(
     shared: &Shared,
     reader: &ThemeReader,
     scroll_state: &ScrollState,
     mode: FilesViewMode,
+    thumbnail_registration: &Rc<RefCell<ThumbnailRegistrationPool>>,
 ) -> WidgetPod {
     let (entries, total_count) = {
         let files = shared.files();
@@ -12100,6 +12417,7 @@ fn files_list_body_icons(
         mode,
         scroll_state.clone(),
         Rc::clone(&context_target),
+        Rc::clone(thumbnail_registration),
     );
     let scroll = ScrollView::vertical(grid)
         .state(scroll_state.clone())
@@ -12234,6 +12552,7 @@ impl Widget for FileIconGridContextTarget {
 /// [`FilesState`] operations used by the details table.
 struct FileIconGrid {
     shared: Shared,
+    thumbnail_revision: sui::Signal<u64>,
     entries: Vec<SifsEntry>,
     total_count: usize,
     mode: FilesViewMode,
@@ -12247,6 +12566,14 @@ struct FileIconGrid {
     hovered: Option<usize>,
     pressed: Option<(usize, bool)>,
     last_click: Option<(usize, Instant)>,
+    last_thumbnail_keys: Vec<ThumbnailRequestKey>,
+    thumbnail_registration: Rc<RefCell<ThumbnailRegistrationPool>>,
+}
+
+#[derive(Default)]
+struct ThumbnailRegistrationPool {
+    handles: BTreeMap<u64, ImageHandle>,
+    bindings: BTreeMap<u64, ThumbnailRequestKey>,
 }
 
 impl FileIconGrid {
@@ -12257,9 +12584,12 @@ impl FileIconGrid {
         mode: FilesViewMode,
         scroll_state: ScrollState,
         context_target: Rc<Cell<FileContextMenuTarget>>,
+        thumbnail_registration: Rc<RefCell<ThumbnailRegistrationPool>>,
     ) -> Self {
+        let thumbnail_revision = shared.signals().files_thumbnail_revision.clone();
         Self {
             shared,
+            thumbnail_revision,
             entries,
             total_count,
             mode,
@@ -12273,6 +12603,8 @@ impl FileIconGrid {
             hovered: None,
             pressed: None,
             last_click: None,
+            last_thumbnail_keys: Vec::new(),
+            thumbnail_registration,
         }
     }
 
@@ -12372,6 +12704,41 @@ impl FileIconGrid {
         start..end
     }
 
+    fn thumbnail_request_range(&self) -> std::ops::Range<usize> {
+        let visible = self.visible_indices();
+        visible.start.saturating_sub(self.columns)
+            ..visible
+                .end
+                .saturating_add(self.columns)
+                .min(self.entries.len())
+    }
+
+    fn schedule_visible_thumbnails(&mut self) {
+        let Some(bucket) = file_thumbnail_bucket(self.mode) else {
+            self.last_thumbnail_keys.clear();
+            return;
+        };
+        let range = self.thumbnail_request_range();
+        let keys = {
+            let files = self.shared.files();
+            self.entries
+                .get(range.clone())
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| files.thumbnail_request_for_entry(entry, bucket))
+                .map(|request| request.key)
+                .collect::<Vec<_>>()
+        };
+        if keys == self.last_thumbnail_keys {
+            return;
+        }
+        self.last_thumbnail_keys = keys;
+        let waker = { self.shared.borrow().waker.clone() };
+        self.shared
+            .files_mut_unpublished()
+            .request_visible_thumbnails(&self.entries, range, bucket, waker);
+    }
+
     fn row_activation_kind(&mut self, index: usize) -> VirtualTableRowActivationKind {
         let now = Instant::now();
         let double_click = self.last_click.take().is_some_and(|(previous, instant)| {
@@ -12459,6 +12826,59 @@ impl FileIconGrid {
             }
         }
         description
+    }
+
+    fn paint_thumbnail(
+        &self,
+        ctx: &mut PaintCtx,
+        visible_slot: u64,
+        key: &ThumbnailRequestKey,
+        tile: Rect,
+        bitmap: &ThumbnailBitmap,
+        theme: &DefaultTheme,
+    ) -> bool {
+        let frame = self.icon_rect(tile);
+        let (handle, binding_changed) = {
+            let mut registration = self.thumbnail_registration.borrow_mut();
+            let handle = *registration.handles.entry(visible_slot).or_insert_with(|| {
+                ctx.widget_image_handle(10_000_u64.saturating_add(visible_slot))
+            });
+            let binding_changed = registration.bindings.get(&visible_slot) != Some(key);
+            (handle, binding_changed)
+        };
+        if binding_changed || !ctx.image_registered(handle) {
+            let Ok(image) = RegisteredImage::from_rgba8(
+                bitmap.width,
+                bitmap.height,
+                bitmap.rgba.as_ref().to_vec(),
+            ) else {
+                return false;
+            };
+            ctx.register_image(handle, image);
+            self.thumbnail_registration
+                .borrow_mut()
+                .bindings
+                .insert(visible_slot, key.clone());
+        }
+        if !ctx.image_registered(handle) || bitmap.width == 0 || bitmap.height == 0 {
+            return false;
+        }
+        widgets::fill_round_rect(ctx, frame, theme.palette.control, 5.0);
+        let source = Size::new(bitmap.width as f32, bitmap.height as f32);
+        let scale = (frame.width() / source.width)
+            .min(frame.height() / source.height)
+            .max(0.0);
+        let image_size = Size::new(source.width * scale, source.height * scale);
+        let image_rect = Rect::new(
+            frame.x() + (frame.width() - image_size.width) * 0.5,
+            frame.y() + (frame.height() - image_size.height) * 0.5,
+            image_size.width,
+            image_size.height,
+        );
+        ctx.push_clip(sui::Path::rounded_rect(frame, 5.0));
+        ctx.draw_image_source(image_rect, ImageSource::new(handle));
+        ctx.pop_clip();
+        true
     }
 }
 
@@ -12641,7 +13061,8 @@ impl Widget for FileIconGrid {
         }
     }
 
-    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let _ = ctx.observe(&self.thumbnail_revision);
         let desired_width = if constraints.max.width.is_finite() {
             constraints.max.width
         } else {
@@ -12652,12 +13073,17 @@ impl Widget for FileIconGrid {
         constraints.clamp(Size::new(width, self.content_height.max(1.0)))
     }
 
+    fn arrange(&mut self, _ctx: &mut ArrangeCtx, _bounds: Rect) {
+        self.schedule_visible_thumbnails();
+    }
+
     fn paint(&self, ctx: &mut PaintCtx) {
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
         let files = self.shared.files();
         let bounds = ctx.bounds();
-        for index in self.visible_indices() {
+        let visible = self.visible_indices();
+        for (visible_slot, index) in visible.clone().enumerate() {
             let Some(entry) = self.entries.get(index) else {
                 continue;
             };
@@ -12682,12 +13108,25 @@ impl Widget for FileIconGrid {
                 );
             }
 
-            let icon_color = if entry.is_dir || entry.is_link || active {
-                pal.accent
-            } else {
-                pal.text_faint
-            };
-            draw_glyph(ctx, entry_icon(entry), self.icon_rect(tile), icon_color);
+            let thumbnail = file_cached_thumbnail_buckets(self.mode)
+                .into_iter()
+                .flatten()
+                .find_map(|bucket| {
+                    let request = files.thumbnail_request_for_entry(entry, bucket)?;
+                    let bitmap = files.thumbnail_cache.ready(&request.key)?;
+                    Some((request.key, bitmap))
+                });
+            let painted_thumbnail = thumbnail.is_some_and(|(key, thumbnail)| {
+                self.paint_thumbnail(ctx, visible_slot as u64, &key, tile, &thumbnail, &theme)
+            });
+            if !painted_thumbnail {
+                let icon_color = if entry.is_dir || entry.is_link || active {
+                    pal.accent
+                } else {
+                    pal.text_faint
+                };
+                draw_glyph(ctx, entry_icon(entry), self.icon_rect(tile), icon_color);
+            }
 
             let label_rect = self.label_rect(tile);
             let average_char_width = (theme.text.sm.size * 0.55).max(5.0);
@@ -27997,6 +28436,11 @@ mod tests {
         assert!(small.icon_side < medium.icon_side && medium.icon_side < large.icon_side);
         assert!(small.tile_width < medium.tile_width && medium.tile_width < large.tile_width);
         assert!(small.tile_height < medium.tile_height && medium.tile_height < large.tile_height);
+        assert_eq!(file_thumbnail_bucket(FilesViewMode::SmallIcons), None);
+        assert_eq!(
+            file_cached_thumbnail_buckets(FilesViewMode::SmallIcons)[0],
+            Some(ThumbnailBucket::Medium)
+        );
     }
 
     #[test]
@@ -28191,6 +28635,222 @@ mod tests {
             .click()?;
 
         assert_eq!(shared.files().sort_mode, FileSortMode::SizeDesc);
+        Ok(())
+    }
+
+    #[test]
+    fn local_thumbnail_loader_reads_and_decodes_a_consistent_snapshot() {
+        let root = files_test_temp_dir("thumbnail-loader");
+        let path = root.join("landscape.png");
+        let source = image::RgbaImage::from_pixel(80, 40, image::Rgba([20, 210, 40, 255]));
+        image::DynamicImage::ImageRgba8(source)
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("write thumbnail fixture");
+        let backend = Backend::local_fallback();
+        let request = ThumbnailRequest {
+            key: ThumbnailRequestKey {
+                source: FilesSourceKind::Local,
+                path: path.to_string_lossy().into_owned(),
+                identity: ThumbnailIdentity::Listing(1),
+                bucket: ThumbnailBucket::Medium,
+            },
+        };
+        let mut browser = None;
+        let mut browser_error = None;
+
+        let thumbnail = load_thumbnail_request(
+            &request,
+            &mut browser,
+            &mut browser_error,
+            None,
+            backend.app_runtime.handle(),
+        )
+        .expect("load local thumbnail");
+
+        assert_eq!((thumbnail.width, thumbnail.height), (128, 64));
+        assert_eq!(thumbnail.rgba.len(), 128 * 64 * 4);
+        fs::remove_dir_all(root).expect("remove thumbnail fixture");
+    }
+
+    #[test]
+    fn stale_thumbnail_worker_results_are_discarded_after_a_listing_refresh() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        files.source = FilesSourceKind::Local;
+        files.entries = vec![SifsEntry {
+            name: "photo.png".to_string(),
+            path: "C:\\photos\\photo.png".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(128),
+        }];
+        files.thumbnail_listing_epoch = 9;
+        let key = files
+            .thumbnail_request_for_entry(&files.entries[0], ThumbnailBucket::Medium)
+            .expect("thumbnail request")
+            .key;
+        let (tx, rx) = mpsc::channel();
+        files.thumbnail_rx = Some(rx);
+        files.begin_thumbnail_listing();
+        tx.send(ThumbnailWorkerResult {
+            key: key.clone(),
+            result: Ok(Arc::new(ThumbnailBitmap {
+                width: 2,
+                height: 2,
+                rgba: Arc::from(vec![255; 16]),
+            })),
+        })
+        .expect("send stale result");
+
+        assert!(!files.pump_thumbnail_results());
+        assert!(!files.thumbnail_cache.contains(&key));
+        assert_eq!(files.thumbnail_revision, 0);
+    }
+
+    #[test]
+    fn sifs_thumbnail_keys_follow_immutable_object_versions() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        files.source = FilesSourceKind::Sifs;
+        let entry = SifsEntry {
+            name: "photo.webp".to_string(),
+            path: "/photos/photo.webp".to_string(),
+            is_dir: false,
+            is_link: false,
+            size: Some(128),
+        };
+        files.entry_metadata.insert(
+            entry.path.clone(),
+            SifsEntryMetadata {
+                path: entry.path.clone(),
+                object_id: "object-photo".to_string(),
+                version: "version-one".to_string(),
+                modified_at_unix_nanos: 1,
+                policy: "replicated-eventual".to_string(),
+                current_locations: vec!["node-a".to_string()],
+                placement: None,
+            },
+        );
+        let first = files
+            .thumbnail_request_for_entry(&entry, ThumbnailBucket::Large)
+            .expect("SIFS thumbnail request");
+        assert_eq!(
+            first.key.identity,
+            ThumbnailIdentity::Sifs {
+                object_id: "object-photo".to_string(),
+                version: "version-one".to_string(),
+            }
+        );
+
+        files
+            .entry_metadata
+            .get_mut(&entry.path)
+            .expect("entry metadata")
+            .version = "version-two".to_string();
+        let second = files
+            .thumbnail_request_for_entry(&entry, ThumbnailBucket::Large)
+            .expect("updated SIFS thumbnail request");
+        assert_ne!(first.key, second.key);
+    }
+
+    #[test]
+    fn thumbnail_signal_repaints_a_retained_icon_grid_with_registered_pixels() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let (thumbnail_commands, thumbnail_command_rx) = mpsc::channel();
+        let key = {
+            let mut files = shared.files_mut();
+            files.source = FilesSourceKind::Local;
+            files.loaded = true;
+            files.loading = false;
+            files.error = None;
+            files.path = "C:\\photos".to_string();
+            files.view_mode = FilesViewMode::MediumIcons;
+            files.thumbnail_listing_epoch = 4;
+            files.entries = vec![SifsEntry {
+                name: "photo.png".to_string(),
+                path: "C:\\photos\\photo.png".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(128),
+            }];
+            files.entries_total_count = 1;
+            files.thumbnail_tx = Some(thumbnail_commands);
+            files
+                .thumbnail_request_for_entry(&files.entries[0], ThumbnailBucket::Medium)
+                .expect("thumbnail request")
+                .key
+        };
+
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new().title("Thumbnail repaint").root(
+                    SizedBox::new()
+                        .width(720.0)
+                        .height(520.0)
+                        .with_child(view(shared.clone())),
+                ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let tile = window
+            .snapshot()?
+            .accessibility
+            .nodes
+            .into_iter()
+            .find(|node| {
+                node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("photo.png")
+            })
+            .expect("photo tile")
+            .bounds;
+        let command = thumbnail_command_rx
+            .try_recv()
+            .expect("visible thumbnail command");
+        assert_eq!(command.requests.len(), 1);
+        assert_eq!(command.requests[0].key.path, "C:\\photos\\photo.png");
+
+        {
+            let mut files = shared.files_mut();
+            files.thumbnail_cache.insert(
+                key,
+                ThumbnailCacheEntry::Ready(Arc::new(ThumbnailBitmap {
+                    width: 8,
+                    height: 8,
+                    rgba: Arc::from(
+                        [20_u8, 230, 40, 255]
+                            .into_iter()
+                            .cycle()
+                            .take(8 * 8 * 4)
+                            .collect::<Vec<_>>(),
+                    ),
+                })),
+            );
+            files.thumbnail_revision = files.thumbnail_revision.wrapping_add(1);
+        }
+        window.run_until_idle()?;
+        let icon_side = file_icon_grid_metrics(FilesViewMode::MediumIcons).icon_side;
+        let icon_rect = Rect::new(
+            tile.x() + (tile.width() - icon_side) * 0.5,
+            tile.y() + 7.0,
+            icon_side,
+            icon_side,
+        );
+        let screenshot = window.capture_screenshot()?;
+        let thumbnail = screenshot.crop(icon_rect)?;
+        let (red, green, blue, pixels) = thumbnail.pixels().chunks_exact(4).fold(
+            (0_u64, 0_u64, 0_u64, 0_u64),
+            |(red, green, blue, count), pixel| {
+                (
+                    red + u64::from(pixel[0]),
+                    green + u64::from(pixel[1]),
+                    blue + u64::from(pixel[2]),
+                    count + 1,
+                )
+            },
+        );
+        assert!(
+            green / pixels > 160,
+            "thumbnail should retain its green channel"
+        );
+        assert!(green > red * 3 && green > blue * 3);
         Ok(())
     }
 
