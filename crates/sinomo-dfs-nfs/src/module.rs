@@ -322,6 +322,37 @@ pub fn nfs_config_store() -> Result<ConfigStore, String> {
     Ok(ConfigStore::new(builder.build()))
 }
 
+pub fn register_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    builder
+        .register(nfs_mount_config_definition())
+        .map_err(|error| error.to_string())?
+        .register(nfs_mount_status_config_definition())
+        .map_err(|error| error.to_string())
+}
+
+pub fn component_factory()
+-> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor =
+        sinomo_module::component_descriptor_from_registration(&nfs_module_registration())?;
+    Ok(sinomo_module::StaticComponentFactory::new(
+        descriptor,
+        |context, scope| {
+            let runtime = context.runtime().ok_or_else(|| {
+                sinomo_module::ComponentError::RuntimeUnavailable {
+                    component_id: SINOMO_DFS_NFS_MODULE_LEGACY_ID.to_string(),
+                }
+            })?;
+            let data_dir = SinomoDataDir::new(context.data_dir_root());
+            let task =
+                crate::spawn_nfs_mount_supervisor(data_dir, runtime, scope.shutdown_receiver());
+            scope.own_task("NFS mount supervisor", task);
+            Ok(())
+        },
+    )?)
+}
+
 pub fn nfs_module_enabled(data_dir: &SinomoDataDir) -> Result<bool, String> {
     sinomo_module::native_rust_module_enabled(&data_dir.root(), &nfs_module_id(), true)
         .map_err(|error| error.to_string())

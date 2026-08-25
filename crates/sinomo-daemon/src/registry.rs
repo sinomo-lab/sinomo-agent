@@ -52,116 +52,14 @@ pub use sinomo_module::{
     ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
     ModuleRegistrySnapshotStore,
 };
-pub struct NativeRustModuleBinding {
-    pub registration_key: &'static str,
-    pub register_services: Option<
-        fn(
-            sinomo_core::service::ServiceRegistryBuilder,
-        ) -> sinomo_core::service::ServiceRegistryBuilder,
-    >,
-    pub register_services_for_data_dir: Option<
-        fn(
-            sinomo_core::service::ServiceRegistryBuilder,
-            &std::path::Path,
-        ) -> sinomo_core::service::ServiceRegistryBuilder,
-    >,
-    pub register_storage_paths: Option<
-        fn(
-            &mut sinomo_core::storage::StorageLayout,
-        ) -> Result<(), sinomo_core::storage::StorageContractError>,
-    >,
-}
 
 pub struct InternalModuleTable {
     pub registry: ModuleRegistry,
-    pub native_rust_bindings: &'static [NativeRustModuleBinding],
-}
-
-const INTERNAL_NATIVE_RUST_MODULE_BINDINGS: &[NativeRustModuleBinding] = &[
-    NativeRustModuleBinding {
-        registration_key: sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY,
-        register_services: Some(sinomo_build::register_services),
-        register_services_for_data_dir: Some(sinomo_build::register_services_for_data_dir),
-        register_storage_paths: Some(sinomo_build::register_storage_paths),
-    },
-    NativeRustModuleBinding {
-        registration_key: sinomo_dfs::SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-        register_services: Some(sinomo_dfs::register_services),
-        register_services_for_data_dir: None,
-        register_storage_paths: Some(sinomo_dfs::register_storage_paths),
-    },
-    NativeRustModuleBinding {
-        registration_key: sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY,
-        register_services: None,
-        register_services_for_data_dir: None,
-        register_storage_paths: None,
-    },
-    NativeRustModuleBinding {
-        registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
-        register_services: Some(sinomo_rollout::register_services),
-        register_services_for_data_dir: None,
-        register_storage_paths: Some(sinomo_rollout::register_storage_paths),
-    },
-    NativeRustModuleBinding {
-        registration_key: sinomo_core::network::SINOMO_NETWORK_NATIVE_REGISTRATION_KEY,
-        register_services: None,
-        register_services_for_data_dir: None,
-        register_storage_paths: None,
-    },
-    NativeRustModuleBinding {
-        registration_key: sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY,
-        register_services: Some(sinomo_observe::register_services),
-        register_services_for_data_dir: None,
-        register_storage_paths: Some(sinomo_observe::register_storage_paths),
-    },
-];
-
-type StartNativeRustModuleRuntimeTask =
-    fn(
-        &crate::DaemonPaths,
-        &tokio::runtime::Handle,
-        tokio::sync::watch::Receiver<bool>,
-        &str,
-        bool,
-    ) -> Result<Option<NativeRustModuleRuntimeTask>, crate::DaemonError>;
-
-struct NativeRustModuleLifecycleBinding {
-    registration_key: &'static str,
-    start_runtime_task: StartNativeRustModuleRuntimeTask,
-}
-
-const INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS: &[NativeRustModuleLifecycleBinding] = &[
-    NativeRustModuleLifecycleBinding {
-        registration_key: sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY,
-        start_runtime_task: crate::control::start_daemon_rollout_telemetry_runtime_task,
-    },
-    NativeRustModuleLifecycleBinding {
-        registration_key: sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY,
-        start_runtime_task: start_nfs_mount_runtime_task,
-    },
-];
-
-pub(crate) struct NativeRustModuleRuntimeTask {
-    label: &'static str,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl NativeRustModuleRuntimeTask {
-    pub(crate) fn new(label: &'static str, task: tokio::task::JoinHandle<()>) -> Self {
-        Self { label, task }
-    }
-
-    pub(crate) fn into_parts(self) -> (&'static str, tokio::task::JoinHandle<()>) {
-        (self.label, self.task)
-    }
 }
 
 pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
     let registry = internal_module_registry()?;
-    Ok(InternalModuleTable {
-        registry,
-        native_rust_bindings: internal_native_rust_module_bindings(),
-    })
+    Ok(InternalModuleTable { registry })
 }
 
 pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
@@ -207,129 +105,19 @@ pub fn register_internal_module_config_definitions(
     Ok(builder)
 }
 
-fn start_nfs_mount_runtime_task(
-    paths: &crate::DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    _label: &str,
-    maintain_cluster_runtime: bool,
-) -> Result<Option<NativeRustModuleRuntimeTask>, crate::DaemonError> {
-    if !maintain_cluster_runtime {
-        return Ok(None);
-    }
-    let data_root = paths
-        .root
-        .parent()
-        .ok_or_else(|| crate::DaemonError::Parse {
-            detail: format!(
-                "daemon path {} has no Sinomo data-directory parent",
-                paths.root.display()
-            ),
-        })?;
-    let data_dir = sinomo_core::local::SinomoDataDir::new(data_root);
-    Ok(Some(NativeRustModuleRuntimeTask::new(
-        "NFS mount supervisor",
-        sinomo_dfs_nfs::spawn_nfs_mount_supervisor(data_dir, runtime, shutdown_rx),
-    )))
-}
-
 pub use sinomo_module::{
     module_object_rpc_route_descriptor_to_service,
     module_registration_object_rpc_route_descriptors, module_registry_object_rpc_route_descriptors,
     module_registry_snapshot_object_rpc_route_descriptors,
 };
 
-pub fn internal_native_rust_module_bindings() -> &'static [NativeRustModuleBinding] {
-    INTERNAL_NATIVE_RUST_MODULE_BINDINGS
-}
-
-/// Starts lifecycle workers contributed by the selected native-Rust modules.
-///
-/// The daemon control loop supplies process resources and supervises returned
-/// tasks; module-specific activation and worker construction stay behind this
-/// registration table beside each module's service binding.
-pub(crate) fn start_internal_native_rust_module_runtime_tasks(
-    registration_keys: impl IntoIterator<Item = &'static str>,
-    paths: &crate::DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    label: &str,
-    maintain_cluster_runtime: bool,
-) -> Result<Vec<NativeRustModuleRuntimeTask>, crate::DaemonError> {
-    let mut tasks = Vec::new();
-    for registration_key in registration_keys {
-        let Some(binding) = INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS
-            .iter()
-            .find(|binding| binding.registration_key == registration_key)
-        else {
-            continue;
-        };
-        if let Some(task) = (binding.start_runtime_task)(
-            paths,
-            runtime,
-            shutdown_rx.clone(),
-            label,
-            maintain_cluster_runtime,
-        )? {
-            tasks.push(task);
-        }
-    }
-    Ok(tasks)
-}
-
-pub fn native_rust_module_binding(
-    registration_key: &str,
-) -> Option<&'static NativeRustModuleBinding> {
-    internal_native_rust_module_bindings()
-        .iter()
-        .find(|binding| binding.registration_key == registration_key)
-}
-
-pub fn native_rust_binding_for_registration(
-    registration: &ModuleRegistration,
-) -> Option<&'static NativeRustModuleBinding> {
-    let sinomo_module::ModuleBackendRegistration::NativeRust {
-        registration: native_registration,
-    } = &registration.backend
-    else {
-        return None;
-    };
-    native_rust_module_binding(&native_registration.registration_key)
-}
-
-/// Applies the service registrar declared by an internal native-Rust module.
-///
-/// The daemon composition root selects active modules; the binding table owns
-/// how each selected module contributes services. This keeps the daemon from
-/// constructing domain service implementations directly.
-pub fn register_internal_native_rust_module_services(
-    builder: sinomo_core::service::ServiceRegistryBuilder,
-    registration_keys: impl IntoIterator<Item = &'static str>,
-    data_dir_root: &std::path::Path,
-) -> sinomo_core::service::ServiceRegistryBuilder {
-    registration_keys.into_iter().fold(builder, |builder, key| {
-        let binding = native_rust_module_binding(key)
-            .unwrap_or_else(|| panic!("missing internal native-Rust module binding for {key}"));
-        match binding.register_services_for_data_dir {
-            Some(register) => register(builder, data_dir_root),
-            None => {
-                let register = binding.register_services.unwrap_or_else(|| {
-                    panic!("internal native-Rust module binding {key} has no service registrar")
-                });
-                register(builder)
-            }
-        }
-    })
-}
-
 pub fn register_internal_module_storage_paths(
     layout: &mut sinomo_core::storage::StorageLayout,
 ) -> Result<(), sinomo_core::storage::StorageContractError> {
-    for binding in internal_native_rust_module_bindings() {
-        if let Some(register_storage_paths) = binding.register_storage_paths {
-            register_storage_paths(layout)?;
-        }
-    }
+    sinomo_build::register_storage_paths(layout)?;
+    sinomo_dfs::register_storage_paths(layout)?;
+    sinomo_rollout::register_storage_paths(layout)?;
+    sinomo_observe::register_storage_paths(layout)?;
     Ok(())
 }
 
@@ -393,57 +181,31 @@ mod tests {
     }
 
     #[test]
-    fn build_module_is_registered_with_daemon_storage_binding() {
+    fn build_module_is_registered_with_component_factory() {
         let table = internal_module_table().expect("internal module table");
         let registration = table
             .registry
             .get(&sinomo_build::build_module_id())
             .expect("build module registration");
-        let binding =
-            native_rust_binding_for_registration(registration).expect("build native-rust binding");
-
+        let factory = sinomo_build::component_factory().expect("build component factory");
         assert_eq!(
-            binding.registration_key,
-            sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY
-        );
-        assert!(binding.register_services.is_some());
-        assert!(binding.register_services_for_data_dir.is_some());
-        assert!(binding.register_storage_paths.is_some());
-    }
-
-    #[test]
-    fn native_runtime_lifecycle_hooks_are_attached_to_registered_modules() {
-        assert_eq!(INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS.len(), 2);
-        for lifecycle in INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS {
-            assert!(
-                native_rust_module_binding(lifecycle.registration_key).is_some(),
-                "lifecycle hook {} must share a native module registration",
-                lifecycle.registration_key
-            );
-        }
-        assert_eq!(
-            INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS[0].registration_key,
-            sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY
-        );
-        assert_eq!(
-            INTERNAL_NATIVE_RUST_MODULE_LIFECYCLE_BINDINGS[1].registration_key,
-            sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
+            sinomo_module::ComponentFactory::descriptor(&factory).component_id,
+            registration.module_id().as_str()
         );
     }
 
     #[test]
-    fn nfs_module_registers_its_own_settings_and_lifecycle_binding() {
+    fn nfs_module_registers_its_own_settings_and_component_factory() {
         let table = internal_module_table().expect("internal module table");
         let registration = table
             .registry
             .get(&sinomo_dfs_nfs::nfs_module_id())
             .expect("NFS module registration");
-        let binding =
-            native_rust_binding_for_registration(registration).expect("NFS native binding");
-        assert_eq!(
-            binding.registration_key,
-            sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
-        );
+        assert!(matches!(
+            &registration.backend,
+            sinomo_module::ModuleBackendRegistration::NativeRust { registration }
+                if registration.registration_key == sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
+        ));
         let definitions = registration
             .surfaces
             .config_definitions()
@@ -462,6 +224,11 @@ mod tests {
                 .expect("compose built-in module config")
                 .build();
         assert!(catalog.get(sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY).is_ok());
+        let factory = sinomo_dfs_nfs::component_factory().expect("NFS component factory");
+        assert_eq!(
+            sinomo_module::ComponentFactory::descriptor(&factory).component_id,
+            registration.module_id().as_str()
+        );
     }
 
     #[test]

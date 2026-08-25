@@ -37,11 +37,11 @@ use sinomo_core::network::{
 };
 use sinomo_core::node::{ClusterId, NodeId, shadow_daemon_node_id};
 use sinomo_module_api::{
-    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
-    NativeModuleErrorResponse, NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
-    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    ComponentDescriptor, NativeModuleBackend, NativeModuleCapabilitiesResponse,
+    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleRequest, NativeModuleResponse,
+    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
     SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
     SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use std::collections::HashSet;
@@ -142,6 +142,14 @@ pub fn iroh_native_module_descriptor() -> NativeModuleDescriptor {
             network_transports: vec![SINOMO_NETWORK_IROH_NETWORK_MODULE_ID.to_string()],
             ..Default::default()
         },
+        component: ComponentDescriptor::new(
+            SINOMO_NETWORK_IROH_MODULE_ID,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_offer(
+            ServiceOffer::new("network-transport", "sinomo.network-transport/v1", "1.0.0")
+                .with_provider_capability("network.transport.iroh"),
+        ),
     }
 }
 

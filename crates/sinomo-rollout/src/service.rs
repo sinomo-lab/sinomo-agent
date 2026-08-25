@@ -327,6 +327,59 @@ pub fn register_host_services(
     builder.register(HostedRolloutService::new(host))
 }
 
+/// Component factory for rollout-owned generic and host-effect services.
+pub fn component_factory(
+    host: Arc<dyn RolloutServiceHost>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    component_factory_with_telemetry(host, None, "daemon")
+}
+
+pub fn component_factory_with_telemetry(
+    host: Arc<dyn RolloutServiceHost>,
+    telemetry_host: Option<Arc<dyn crate::RolloutTelemetryHost>>,
+    label: impl Into<String>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor = sinomo_module::component_descriptor_from_registration(
+        &crate::rollout_module_registration(),
+    )?;
+    let label = label.into();
+    Ok(
+        sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
+            let builder = register_services(ServiceRegistryBuilder::default());
+            scope.set_services(register_host_services(builder, Arc::clone(&host)).build());
+            if let Some(telemetry_host) = telemetry_host.as_ref() {
+                let runtime = context.runtime().ok_or_else(|| {
+                    sinomo_module::ComponentError::RuntimeUnavailable {
+                        component_id: crate::SINOMO_ROLLOUT_MODULE_LEGACY_ID.to_string(),
+                    }
+                })?;
+                let reactor = crate::RolloutTelemetryReactor::new(context.data_dir_root())
+                    .map_err(|error| {
+                        sinomo_module::ComponentError::component(
+                            crate::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+                            error,
+                        )
+                    })?;
+                let task = runtime.spawn(reactor.run_until_stopped_async(
+                    Arc::clone(telemetry_host),
+                    scope.shutdown_receiver(),
+                    label.clone(),
+                ));
+                scope.own_task("rollout telemetry reconciliation", task);
+            }
+            Ok(())
+        })?
+        .with_storage_paths(crate::register_storage_paths)
+        .with_config_definitions(register_component_config_definitions),
+    )
+}
+
+fn register_component_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    crate::register_config_definitions(builder).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

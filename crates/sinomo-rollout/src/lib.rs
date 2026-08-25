@@ -12,6 +12,7 @@ mod module_load;
 mod native_install;
 mod paths;
 mod process;
+mod profile;
 mod progress;
 mod protocol;
 mod service;
@@ -111,23 +112,16 @@ pub use native_install::{
     native_dylib_module_install_request,
 };
 pub use paths::{
-    BENCHMARKS_MODULE_ID, BENCHMARKS_MODULE_INTERFACE_VERSION, BENCHMARKS_MODULE_PACKAGE,
-    BENCHMARKS_NATIVE_MODULE_CACHE_KEY, BENCHMARKS_NATIVE_MODULE_SOURCE,
-    DFS_CLOUD_FILES_MODULE_PACKAGE, DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY,
-    DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE, NativeDylibModulePlatformPolicy,
-    NativeDylibPlatformReconciliationReport, SANDBOX_WASIX_MODULE_PACKAGE,
-    SANDBOX_WASIX_MODULE_RUNTIME_FEATURE, SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY,
-    SANDBOX_WASIX_NATIVE_MODULE_SOURCE, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    SelfRolloutPlan, append_native_dylib_module_build_args, benchmark_native_dylib_module_build,
-    benchmarks_native_module_library_name, default_native_dylib_module_builds,
-    dfs_cloud_files_native_dylib_module_build, dfs_cloud_files_native_module_library_name,
+    NativeDylibModulePlatformPolicy, NativeDylibPlatformReconciliationReport,
+    SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths, SelfRolloutPlan,
+    append_native_dylib_module_build_args, default_native_dylib_module_builds,
     discover_all_native_dylib_module_builds, discover_default_native_dylib_module_builds,
     discover_native_dylib_module_builds, discover_native_dylib_module_platform_policies,
     ensure_rollout_layout, executable_name, native_dylib_library_name,
     native_dylib_loader_state_is_host_compatible, reconcile_rollout_native_dylib_platforms,
-    sandbox_wasix_native_module_library_name,
 };
 pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
+pub use profile::*;
 pub use progress::{
     CLUSTER_ROLLOUT_BUILD_HEARTBEAT_INTERVAL, CLUSTER_ROLLOUT_PROGRESS_TOTAL,
     ClusterRolloutProgressUpdate, cluster_rollout_progress_status, rollout_timestamp_now,
@@ -142,8 +136,8 @@ pub use protocol::{
     unique_rollout_targets,
 };
 pub use service::{
-    HostedRolloutService, RolloutHostFuture, RolloutService, RolloutServiceHost,
-    register_host_services, register_services,
+    HostedRolloutService, RolloutHostFuture, RolloutService, RolloutServiceHost, component_factory,
+    component_factory_with_telemetry, register_host_services, register_services,
 };
 pub use source::{
     LocalRolloutArtifacts, LocalRolloutNativeDylibModuleArtifact, ManagedSourceDeployOptions,

@@ -26,7 +26,7 @@ is a version/rollout boundary, not a sandbox.
 | [`Cargo.toml`](Cargo.toml) | R1 trust-ring and native-dylib identity, interface, source, and Windows platform declaration. |
 
 The typed ABI is owned by
-[`sinomo-dfs-cloud-files-api`](../../../crates/sinomo-dfs-cloud-files-api/src/lib.rs).
+[`protocol.rs`](src/protocol.rs), which is private to this external module.
 The main-daemon supervisor and host-side recovery authority live in
 [`dfs_mount_supervisor.rs`](../../../crates/sinomo-cli/src/dfs_mount_supervisor.rs).
 
@@ -105,7 +105,7 @@ and cursor-provenance artifacts to be absent.
 Fast platform-neutral and API checks:
 
 ```sh
-cargo test -p sinomo-dfs-cloud-files-api
+cargo test -p sinomo-dfs-cloud-files
 cargo test -p sinomo-dfs-cloud-files
 ```
 
@@ -113,7 +113,7 @@ Compile production and test surfaces for Windows:
 
 ```sh
 cargo check -p sinomo-dfs-cloud-files --target x86_64-pc-windows-gnu
-cargo test -p sinomo-dfs-cloud-files-api \
+cargo test -p sinomo-dfs-cloud-files \
   -p sinomo-dfs-cloud-files -p sinomo-cli \
   --target x86_64-pc-windows-gnu --no-run
 ```

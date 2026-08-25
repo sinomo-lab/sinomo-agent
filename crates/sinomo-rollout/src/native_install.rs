@@ -101,11 +101,11 @@ mod tests {
     #[test]
     fn native_dylib_module_install_request_accepts_legacy_module_ids() {
         let request = native_dylib_module_install_request(
-            "module.sandbox.wasix",
-            "sinomo-sandbox-wasix-v1",
-            "sandbox-wasix",
-            "libsinomo_sandbox_wasix_module.so",
-            "modules/sandbox/wasix",
+            "module.external-fixture",
+            "sinomo-external-fixture-v1",
+            "external-fixture",
+            "libexternal_fixture_module.so",
+            "profile:external-fixture",
         )
         .expect("legacy module id should parse");
 
@@ -114,13 +114,13 @@ mod tests {
                 .expected_module_id
                 .as_ref()
                 .expect("module id should be present"),
-            &sinomo_module::ModuleId::from_legacy_named("module.sandbox.wasix")
+            &sinomo_module::ModuleId::from_legacy_named("module.external-fixture")
                 .expect("expected legacy module id should parse")
         );
         assert_eq!(
             request.expected_interface_version.as_deref(),
-            Some("sinomo-sandbox-wasix-v1")
+            Some("sinomo-external-fixture-v1")
         );
-        assert_eq!(request.cache_key.as_deref(), Some("sandbox-wasix"));
+        assert_eq!(request.cache_key.as_deref(), Some("external-fixture"));
     }
 }

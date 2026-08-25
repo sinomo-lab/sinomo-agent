@@ -341,7 +341,7 @@ fn mounted_mutation_handoff_requires_adapter_proof_and_exact_unknown_error() {
         .expect("mounted-mutation outbox");
     let session = store
         .open_host_mount_session(
-            sinomo_dfs::MountedSifsMutationAdapter::CloudFiles,
+            sinomo_dfs::MountedSifsMutationAdapter::ExternalProvider,
             "sync-root",
         )
         .expect("mount session");
@@ -583,7 +583,7 @@ fn mounted_mutation_classifier_reports_pending_overflow_without_unbounded_scan_r
         .expect("mounted-mutation outbox");
     let session = store
         .open_host_mount_session(
-            sinomo_dfs::MountedSifsMutationAdapter::CloudFiles,
+            sinomo_dfs::MountedSifsMutationAdapter::ExternalProvider,
             "sync-root",
         )
         .expect("mount session");
@@ -11754,14 +11754,10 @@ fn default_dfs_reactor_tracks_service_provider_semantics_without_refresh_loop() 
     reactor.complete_prior_process_recovery(&startup);
 
     let key = sinomo_core::service::cluster_service_instance_key("dfs", &local);
-    let mut instance = sinomo_core::service::ServiceInstanceRecord {
-        service: "dfs".to_string(),
-        node_id: local.clone(),
-        registry_version: 1,
-        routes: vec!["dfs.metadata".to_string()],
-        capabilities: vec!["dfs.metadata.replicate".to_string()],
-        updated_at: time::OffsetDateTime::now_utc(),
-    };
+    let mut instance = sinomo_core::service::ServiceInstanceRecord::new("dfs", local.clone());
+    instance.routes = vec!["dfs.metadata".to_string()];
+    instance.provider_capabilities = vec!["dfs.metadata.replicate".to_string()];
+    instance.updated_at = time::OffsetDateTime::now_utc();
     observe_daemon_default_dfs_reconciliation(
         &reactor._projection_tx,
         &local,
@@ -11796,7 +11792,7 @@ fn default_dfs_reactor_tracks_service_provider_semantics_without_refresh_loop() 
         "service registry refreshes are not placement topology"
     );
 
-    instance.capabilities.clear();
+    instance.provider_capabilities.clear();
     observe_daemon_default_dfs_reconciliation(
         &reactor._projection_tx,
         &local,

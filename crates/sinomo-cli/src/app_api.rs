@@ -9460,14 +9460,11 @@ mod tests {
         ]
         .into_iter()
         .map(|(node_id, capabilities)| {
-            let record = sinomo_runtime::service::ServiceInstanceRecord {
-                service: "daemon".to_string(),
-                node_id: node_id.clone(),
-                registry_version: 1,
-                routes: vec![sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE.to_string()],
-                capabilities,
-                updated_at: now,
-            };
+            let mut record =
+                sinomo_runtime::service::ServiceInstanceRecord::new("daemon", node_id.clone());
+            record.routes = vec![sinomo_runtime::api::DAEMON_DFS_BROWSER_STATUS_ROUTE.to_string()];
+            record.provider_capabilities = capabilities;
+            record.updated_at = now;
             sinomo_runtime::kv::KvEntry {
                 key: sinomo_runtime::service::cluster_service_instance_key("daemon", &node_id),
                 value: sinomo_runtime::kv::encode_kv_value(&record).expect("encode service"),

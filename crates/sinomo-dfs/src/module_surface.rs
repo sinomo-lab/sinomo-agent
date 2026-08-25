@@ -97,10 +97,6 @@ pub fn register_storage_paths(
             "crash-safe host-mount mutation ambiguity markers, leases, and daemon handoff receipts",
         ),
         (
-            "dfs/cloud-files-unregister-recovery",
-            "content-addressed Cloud Files provider artifacts and retirement intents needed for crash-safe sync-root cleanup",
-        ),
-        (
             "dfs/metadata",
             "dynamic DFS metadata shard directories with object records and journal entries",
         ),
@@ -208,9 +204,9 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
     }
     // Unix hosts mount SIFS through the built-in FUSE adapter, so the DFS
     // registration owns the shared mount settings there. Windows delegates
-    // the adapter to the separately rolled out Cloud Files module, which must
-    // be the sole module-registry owner of these keys. Registering both owners
-    // makes a native-module refresh ambiguous and is rejected fail-closed.
+    // the adapter through the generic host-filesystem provider interface; the
+    // active external component is the sole module-registry owner of these
+    // keys. Registering both owners is rejected fail-closed.
     #[cfg(not(windows))]
     {
         surfaces = surfaces
@@ -368,7 +364,7 @@ mod tests {
         #[cfg(windows)]
         assert!(
             settings.is_empty(),
-            "the native Cloud Files module must be the sole Windows mount-settings owner"
+            "the active external component must be the sole Windows mount-settings owner"
         );
     }
 

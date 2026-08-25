@@ -32,7 +32,6 @@ const MODULE_POLICY: CliCommandPolicy = CliCommandPolicy {
 pub struct ModuleCliCommandConfig {
     pub toggleable_native_rust_modules: Vec<ModuleNativeRustToggleTarget>,
     pub native_dylib_modules: Vec<ModuleNativeDylibKnownTarget>,
-    pub wasix: Option<ModuleWasixCliConfig>,
 }
 
 impl ModuleCliCommandConfig {
@@ -166,11 +165,6 @@ impl ModuleCliCommandConfig {
             .dedup_by(|left, right| left.module_id == right.module_id);
         Ok(self)
     }
-
-    pub fn with_wasix(mut self, wasix: ModuleWasixCliConfig) -> Self {
-        self.wasix = Some(wasix);
-        self
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,12 +181,6 @@ pub struct ModuleNativeDylibKnownTarget {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ModuleWasixCliConfig {
-    pub module_id: &'static str,
-    pub interface_version: &'static str,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ModuleCliCommand {
     Help,
@@ -201,7 +189,6 @@ enum ModuleCliCommand {
     Inspect(ModuleInspectOptions),
     NativeDylib(ModuleNativeDylibCliCommand),
     NativeRust(ModuleNativeRustCliCommand),
-    Wasix(ModuleWasixCliCommand),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -216,12 +203,6 @@ enum ModuleNativeRustCliCommand {
     Disable(ModuleNativeRustToggleOptions),
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum ModuleWasixCliCommand {
-    Activate(ModuleWasixActivateOptions),
-    Unload,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 struct ModuleNativeDylibActivateOptions {
     source_path: PathBuf,
@@ -229,14 +210,6 @@ struct ModuleNativeDylibActivateOptions {
     artifact_id: Option<ArtifactId>,
     expected_interface_version: Option<String>,
     cache_key: Option<String>,
-    library_name: Option<String>,
-    source: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct ModuleWasixActivateOptions {
-    source_path: PathBuf,
-    artifact_id: Option<ArtifactId>,
     library_name: Option<String>,
     source: Option<String>,
 }
@@ -344,8 +317,8 @@ fn module_cli_metadata() -> CliCommandMetadata {
     )
 }
 
-fn module_cli_help(config: &ModuleCliCommandConfig) -> CliCommandHelp {
-    let mut lines = vec![
+fn module_cli_help(_config: &ModuleCliCommandConfig) -> CliCommandHelp {
+    let lines = vec![
         "  sinomo module".to_string(),
         "      Show module commands.".to_string(),
         "  sinomo module list".to_string(),
@@ -363,14 +336,6 @@ fn module_cli_help(config: &ModuleCliCommandConfig) -> CliCommandHelp {
         "  sinomo module native-rust disable <module-id> [--reason <text>]".to_string(),
         "      Disable a toggleable built-in native Rust module at runtime.".to_string(),
     ];
-    if config.wasix.is_some() {
-        lines.extend([
-            "  sinomo module wasix activate [--artifact <artifact-id>] [--library-name <file-name>] [--source <text>] <library>".to_string(),
-            "      Activate the trusted WASIX sandbox runtime module.".to_string(),
-            "  sinomo module wasix unload".to_string(),
-            "      Unload the active trusted WASIX sandbox runtime module state.".to_string(),
-        ]);
-    }
     CliCommandHelp::new("Module:", lines)
 }
 
@@ -395,7 +360,7 @@ fn module_cli_autocomplete(config: &ModuleCliCommandConfig) -> CliAutocompleteSp
         )
     };
 
-    let mut children = vec![
+    let children = vec![
         CliAutocompleteSpec::new("list", "list locally registered and activated modules"),
         CliAutocompleteSpec::new("install", "install a declarative module package")
             .with_options([
@@ -479,46 +444,12 @@ fn module_cli_autocomplete(config: &ModuleCliCommandConfig) -> CliAutocompleteSp
                     .with_values([module_value()]),
             ]),
     ];
-    if config.wasix.is_some() {
-        children.push(
-            CliAutocompleteSpec::new("wasix", "manage the WASIX sandbox runtime module")
-                .with_children([
-                    CliAutocompleteSpec::new("activate", "activate the WASIX runtime module")
-                        .with_options([
-                            CliAutocompleteOption::with_value(
-                                "--artifact",
-                                "artifact id",
-                                CliAutocompleteValue::new("artifact-id", "artifact id", []),
-                            ),
-                            CliAutocompleteOption::with_value(
-                                "--library-name",
-                                "cached library file name",
-                                CliAutocompleteValue::new("file-name", "library file name", []),
-                            ),
-                            CliAutocompleteOption::with_value(
-                                "--source",
-                                "source label",
-                                CliAutocompleteValue::new("text", "source label", []),
-                            ),
-                        ])
-                        .with_values([CliAutocompleteValue::new(
-                            "library",
-                            "WASIX native dynamic library path",
-                            [],
-                        )]),
-                    CliAutocompleteSpec::new(
-                        "unload",
-                        "remove the active WASIX runtime module state",
-                    ),
-                ]),
-        );
-    }
     CliAutocompleteSpec::new("module", "manage local module activation").with_children(children)
 }
 
 fn parse_module_command(
     args: &[String],
-    config: &ModuleCliCommandConfig,
+    _config: &ModuleCliCommandConfig,
 ) -> Result<ModuleCliCommand, CliParseError> {
     match args.split_first() {
         None => Ok(ModuleCliCommand::Help),
@@ -536,12 +467,6 @@ fn parse_module_command(
             parse_module_native_dylib_command(rest)
         }
         Some((command, rest)) if command == "native-rust" => parse_module_native_rust_command(rest),
-        Some((command, rest)) if command == "wasix" && config.wasix.is_some() => {
-            parse_module_wasix_command(rest)
-        }
-        Some((command, _)) if command == "wasix" => Err(CliParseError::Parse {
-            detail: "WASIX module CLI support is not configured".to_string(),
-        }),
         Some((command, _)) => Err(CliParseError::Parse {
             detail: format!(
                 "module command `{command}` is not implemented; run `sinomo module help`"
@@ -637,18 +562,6 @@ fn parse_module_inspect_options(args: &[String]) -> Result<ModuleInspectOptions,
     Ok(ModuleInspectOptions {
         module_id: module_id.ok_or(CliParseError::Usage)?,
     })
-}
-
-fn parse_module_wasix_command(args: &[String]) -> Result<ModuleCliCommand, CliParseError> {
-    match args.split_first() {
-        Some((command, rest)) if command == "activate" => Ok(ModuleCliCommand::Wasix(
-            ModuleWasixCliCommand::Activate(parse_module_wasix_activate_options(rest)?),
-        )),
-        Some((command, [])) if command == "unload" => {
-            Ok(ModuleCliCommand::Wasix(ModuleWasixCliCommand::Unload))
-        }
-        _ => Err(CliParseError::Usage),
-    }
 }
 
 fn parse_module_native_rust_toggle_options(
@@ -756,56 +669,6 @@ fn parse_module_native_dylib_activate_options(
     Ok(options)
 }
 
-fn parse_module_wasix_activate_options(
-    args: &[String],
-) -> Result<ModuleWasixActivateOptions, CliParseError> {
-    let mut source_path = None;
-    let mut artifact_id = None;
-    let mut library_name = None;
-    let mut source = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--artifact" | "--artifact-id" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliParseError::Usage);
-                };
-                artifact_id = Some(parse_cli_module_artifact_id(value)?);
-            }
-            "--library-name" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliParseError::Usage);
-                };
-                library_name = Some(validate_native_module_library_name(value)?);
-            }
-            "--source" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(CliParseError::Usage);
-                };
-                source = Some(non_empty_value(value, "source")?);
-            }
-            value if value.starts_with('-') => return Err(CliParseError::Usage),
-            value => {
-                if source_path.is_none() {
-                    source_path = Some(PathBuf::from(value));
-                } else {
-                    return Err(CliParseError::Usage);
-                }
-            }
-        }
-        index += 1;
-    }
-    Ok(ModuleWasixActivateOptions {
-        source_path: source_path.ok_or(CliParseError::Usage)?,
-        artifact_id,
-        library_name,
-        source,
-    })
-}
-
 fn parse_module_native_dylib_unload_options(
     args: &[String],
 ) -> Result<ModuleNativeDylibUnloadOptions, CliParseError> {
@@ -857,12 +720,6 @@ fn run_module_cli_command(
         }
         ModuleCliCommand::NativeRust(ModuleNativeRustCliCommand::Disable(options)) => {
             set_native_rust_module_runtime_enabled(context, options, config, false)
-        }
-        ModuleCliCommand::Wasix(ModuleWasixCliCommand::Activate(options)) => {
-            activate_wasix_native_module(context, options, config)
-        }
-        ModuleCliCommand::Wasix(ModuleWasixCliCommand::Unload) => {
-            unload_wasix_native_module(context, config)
         }
     }
 }
@@ -1092,45 +949,6 @@ fn write_declarative_resource_summary(
         ))?;
     }
     Ok(())
-}
-
-fn activate_wasix_native_module(
-    context: &mut CliCommandContext<'_>,
-    options: ModuleWasixActivateOptions,
-    config: &ModuleCliCommandConfig,
-) -> Result<(), CliCommandError> {
-    let wasix = config
-        .wasix
-        .as_ref()
-        .ok_or_else(|| CliCommandError::new("WASIX module CLI support is not configured"))?;
-    activate_native_dylib_module(
-        context,
-        ModuleNativeDylibActivateOptions {
-            source_path: options.source_path,
-            expected_module_id: Some(parse_cli_module_id(wasix.module_id).map_err(command_error)?),
-            artifact_id: options.artifact_id,
-            expected_interface_version: Some(wasix.interface_version.to_string()),
-            cache_key: Some("module/sandbox/wasix".to_string()),
-            library_name: options.library_name,
-            source: options.source,
-        },
-    )
-}
-
-fn unload_wasix_native_module(
-    context: &mut CliCommandContext<'_>,
-    config: &ModuleCliCommandConfig,
-) -> Result<(), CliCommandError> {
-    let wasix = config
-        .wasix
-        .as_ref()
-        .ok_or_else(|| CliCommandError::new("WASIX module CLI support is not configured"))?;
-    unload_native_dylib_module(
-        context,
-        ModuleNativeDylibUnloadOptions {
-            module_id: parse_cli_module_id(wasix.module_id).map_err(command_error)?,
-        },
-    )
 }
 
 fn set_native_rust_module_runtime_enabled(
@@ -1402,10 +1220,6 @@ mod tests {
                 "operational observation module",
             )
             .expect("module id")
-            .with_wasix(ModuleWasixCliConfig {
-                module_id: "module.sandbox.wasix",
-                interface_version: "sinomo.sandbox.wasix.v1",
-            })
     }
 
     fn unique_temp(prefix: &str) -> sinomo_testdir::TestDir {
@@ -1498,7 +1312,8 @@ mod tests {
             autocomplete
                 .children
                 .iter()
-                .any(|child| child.word == "wasix")
+                .all(|child| child.word != "wasix"),
+            "provider-specific module commands must not be built into the generic module CLI"
         );
     }
 

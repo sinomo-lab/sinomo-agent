@@ -5,7 +5,6 @@
 //! model session. Agent command cancellation is verified through the supported
 //! local-workspace simple-sandbox path on the cluster node.
 
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use sinomo_agent::{
@@ -35,9 +34,6 @@ use sinomo_runtime::test::{
 
 use crate::app_api::SifsAgentChannelStore;
 
-const BENCHMARK_CANCEL_PROBE_ROUTE: &str = "/benchmarks/cancel-probe";
-const BENCHMARK_RPC_CATEGORY: &str = "benchmarks";
-const BENCHMARK_MODULE_ID: &str = "module.benchmarks";
 const DAEMON_OBJECT_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 const AGENT_CHANNEL_EXPECT_DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const AGENT_CHANNEL_EXPECT_MAX_TIMEOUT_SECONDS: u64 = 300;
@@ -46,29 +42,10 @@ const AGENT_CHANNEL_PROBE_DEFAULT_TITLE: &str = "Cluster sync probe";
 const AGENT_CHANNEL_PROBE_SOURCE_ADAPTER: &str = "sinomo-cli.cluster-test";
 const AGENT_CHANNEL_TEST_RUNS_ROOT: &str = "/services/cluster-tests/runs";
 
-#[derive(Clone, Debug, serde::Serialize)]
-struct BenchmarkCancelProbeRequest {
-    max_runtime_ms: u64,
-    poll_interval_ms: u64,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct BenchmarkCancelProbeResponse {
-    cancelled: bool,
-    elapsed_ms: u64,
-    polls: u64,
-}
-
 pub(super) fn native_dylib_runtime_capability(
     module_id: &sinomo_runtime::module::ModuleId,
 ) -> String {
     format!("module.native-dylib:{module_id}")
-}
-
-fn benchmark_native_dylib_runtime_capability() -> String {
-    let module_id = sinomo_runtime::module::ModuleId::from_legacy_named(BENCHMARK_MODULE_ID)
-        .expect("benchmark module id");
-    native_dylib_runtime_capability(&module_id)
 }
 
 pub fn register_agent_cluster_test_cases(
@@ -80,7 +57,6 @@ pub fn register_agent_cluster_test_cases(
         .register(agent_channel_write())
         .register(agent_channel_expect())
         .register(module_native_dylib_cancel_route())
-        .register(module_native_dylib_active_cancel())
         .register(agent_simple_sandbox_active_cancel())
 }
 
@@ -140,21 +116,6 @@ sinomo_runtime::test::sinomo_test_case! {
         requirements: [SinomoTestRequirement::ClusterRuntime],
         run: {
             run_module_native_dylib_cancel_route(ctx)
-        }
-    }
-}
-
-sinomo_runtime::test::sinomo_test_case! {
-    pub fn module_native_dylib_active_cancel(ctx) {
-        id: "cluster.agent.module-native-dylib-active-cancel",
-        summary: "Daemon-hosted native-dylib module work observes operation-id cancellation",
-        tags: ["cluster-agent", "agent-readiness-extended", "module-cancellation"],
-        requirements: [
-            SinomoTestRequirement::ClusterRuntime,
-            SinomoTestRequirement::runtime_capability(benchmark_native_dylib_runtime_capability()),
-        ],
-        run: {
-            run_module_native_dylib_active_cancel(ctx)
         }
     }
 }
@@ -742,97 +703,6 @@ fn run_module_native_dylib_cancel_route(ctx: &mut SinomoTestContext) -> SinomoTe
     )))
 }
 
-fn run_module_native_dylib_active_cancel(ctx: &mut SinomoTestContext) -> SinomoTestResult {
-    let operation_id = "agent_cluster_module_native_dylib_active_cancel_probe";
-    ctx.record("operation_id", operation_id);
-    ctx.record("route", BENCHMARK_CANCEL_PROBE_ROUTE);
-    let run = BenchmarkCancelProbeRequest {
-        max_runtime_ms: 30_000,
-        poll_interval_ms: 25,
-    };
-    let run_request =
-        ObjectRpcRequest::encode_body(BENCHMARK_CANCEL_PROBE_ROUTE, BENCHMARK_RPC_CATEGORY, &run)
-            .map_err(|source| SinomoTestError::failed(source.to_string()))?
-            .with_operation_id(operation_id);
-
-    let (run_sender, run_receiver) =
-        mpsc::channel::<Result<BenchmarkCancelProbeResponse, crate::CliError>>();
-    std::thread::spawn(move || {
-        let result = probe_daemon_object_rpc::<BenchmarkCancelProbeResponse>(&run_request);
-        let _ = run_sender.send(result);
-    });
-
-    let mut inactive_responses = 0_u64;
-    let cancel_response = loop {
-        match run_receiver.try_recv() {
-            Ok(result) => return Ok(module_active_cancel_early_run_outcome(result)),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                return Ok(SinomoTestOutcome::failed(
-                    "native dylib module cancel-probe worker disconnected before cancellation",
-                ));
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-        }
-
-        let cancel_request = ObjectRpcRequest::encode_body(
-            MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
-            MODULE_RPC_CATEGORY,
-            &ObjectRpcCancelRequest::new(
-                operation_id,
-                "active native dylib module cancellation probe",
-            ),
-        )
-        .map_err(|source| SinomoTestError::failed(source.to_string()))?
-        .with_cancels_operation_id(operation_id);
-        let response: ObjectRpcCancelResponse =
-            match probe_daemon_object_rpc::<ObjectRpcCancelResponse>(&cancel_request) {
-                Ok(response) => response,
-                Err(error) => {
-                    return Ok(SinomoTestOutcome::failed(format!(
-                        "native dylib module cancel RPC failed while run was active: {error}"
-                    )));
-                }
-            };
-        ctx.record("last_cancel_response", &response);
-        if response.cancelled {
-            break response;
-        }
-        inactive_responses = inactive_responses.saturating_add(1);
-        if inactive_responses > 100 {
-            return Ok(SinomoTestOutcome::failed(
-                "native dylib module run did not become cancellable before the probe deadline",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-
-    ctx.record("cancel_response", &cancel_response);
-    match run_receiver.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(response)) if response.cancelled => Ok(SinomoTestOutcome::passed(
-            "active native dylib module work observed operation-id cancellation",
-        )
-        .with_diagnostics(serde_json::json!({
-            "operation_id": operation_id,
-            "cancel_response": cancel_response,
-            "run_response": response,
-            "inactive_cancel_responses_before_active": inactive_responses,
-        }))),
-        Ok(Ok(response)) => Ok(SinomoTestOutcome::failed(format!(
-            "native dylib module run completed without observing cancellation after {}ms and {} polls",
-            response.elapsed_ms, response.polls
-        ))),
-        Ok(Err(error)) => Ok(SinomoTestOutcome::failed(format!(
-            "native dylib module run ended with an error after cancel was accepted: {error}"
-        ))),
-        Err(mpsc::RecvTimeoutError::Timeout) => Ok(SinomoTestOutcome::failed(
-            "native dylib module run did not finish within 10s after cancel was accepted",
-        )),
-        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(SinomoTestOutcome::failed(
-            "native dylib module cancel-probe worker disconnected after cancel was accepted",
-        )),
-    }
-}
-
 fn run_agent_simple_sandbox_active_cancel(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let check = run_agent_simple_sandbox_active_cancellation_readiness();
     ctx.record("agent_readiness_check", &check);
@@ -884,20 +754,6 @@ fn send_daemon_object_rpc_with_timeout(
         });
     };
     crate::daemon_send_daemon_rpc(&status.address, request, timeout).map_err(crate::CliError::from)
-}
-
-fn module_active_cancel_early_run_outcome(
-    result: Result<BenchmarkCancelProbeResponse, crate::CliError>,
-) -> SinomoTestOutcome {
-    match result {
-        Ok(response) => SinomoTestOutcome::failed(format!(
-            "native dylib module run completed before cancellation; cancelled={} elapsed_ms={} polls={}",
-            response.cancelled, response.elapsed_ms, response.polls
-        )),
-        Err(error) => SinomoTestOutcome::failed(format!(
-            "native dylib module run failed before cancellation: {error}"
-        )),
-    }
 }
 
 #[cfg(test)]

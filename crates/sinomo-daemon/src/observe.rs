@@ -8,15 +8,6 @@ use crate::{DaemonError, DaemonPaths, read_daemon_status};
 
 pub use sinomo_observe::OperationalSeverity;
 
-pub(crate) fn register_observe_metric_exporters(
-    service_hooks: &[crate::DaemonServiceRegistryHook],
-) {
-    sinomo_observe::register_builtin_observe_metric_exporters();
-    for hook in service_hooks {
-        hook.register_observe_metric_exporters();
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn append_operational_event_best_effort(
     paths: &DaemonPaths,

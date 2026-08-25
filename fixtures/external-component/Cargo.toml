@@ -1,0 +1,15 @@
+[package]
+name = "sinomo-external-component-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Deliberately separate from the Sinomo workspace. This fixture models an
+# independently built module artifact and must never become a core dependency.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sinomo-module-api = { path = "../../crates/sinomo-module-api" }

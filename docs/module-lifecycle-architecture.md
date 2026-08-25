@@ -130,6 +130,14 @@ SOBJ request and response envelopes. Native descriptors may declare object-RPC
 methods and embedded declarative resources so the host can expose a module at
 runtime without linking module-specific crates into the main binary.
 
+Active native providers bind through one generic
+`sinomo_module::ActiveNativeComponent` path. The selector accepts a
+`ServiceRequirement`, verifies every candidate descriptor, rejects zero or
+ambiguous matches, and owns content-addressed loading plus SOBJ invocation.
+Typed protocol clients remain in their owning domain crates (`sinomo-dfs` and
+`sinomo-sandbox`); neither the module loader nor `sinomo-runtime` contains a
+filesystem- or sandbox-specific host adapter.
+
 Unloading native dynamic libraries is best effort. The lifecycle transition can
 remove the module from active routing and ask the module to shut down, but the
 platform loader or module-global state may keep code resident until process
@@ -219,9 +227,10 @@ Local configuration supports development, bootstrap, and pre-cluster operation.
 Cluster desired state overrides shared local configuration after the node joins
 a cluster.
 
-Executable artifacts are never selected by ambient plugin discovery. A loader
-may only apply an artifact chosen through manifest, content hash, provenance,
-compatibility, policy, and loader or rollout state.
+Executable artifacts are never selected by ambient plugin or source-tree
+discovery. A loader may only apply an artifact chosen through a signed module
+distribution profile, manifest, content hash, provenance, compatibility,
+policy, and loader or rollout state.
 
 ### Catalog Surfaces And Runtime Binding
 
@@ -259,10 +268,12 @@ declared as dynamic JSON. A catalog may also expose operational documents as
 read-only, in which case interfaces present their structured values without
 offering mutation.
 
-Runtime binding is separate. A static native Rust module may have a compile-time
-binding table that maps a `native-rust` registration key to service builders,
-storage contract hooks, maintenance hooks, or other host callbacks. That
-binding table is not catalog state and is not shipped as cluster-desired data.
+Runtime binding is separate. Every static or external implementation provides a
+`ComponentFactory`. Its `ComponentDescriptor` declares versioned service offers
+and requirements; mounting returns a `ComponentScope` that owns services,
+workers, readiness callbacks, and reverse-order compensations. Static factories
+may additionally contribute storage and configuration schemas. These factories
+are deterministic host assembly and are not shipped as cluster-desired data.
 It is deterministic process assembly for a particular Sinomo binary.
 
 This split keeps module activation auditable:
@@ -283,12 +294,12 @@ implement the behavior.
 
 ### Host Event Loop
 
-The daemon should trend toward a generic service/event loop that reads module
-catalog surfaces and asks active module bindings to register their runtime
-handlers. Daemon-owned foundational methods, such as process status, shutdown,
-and cluster transport, can remain host services. Domain behavior such as DFS
-metadata repair, object transfer, and operator inspection should live in the
-domain module crate or in a module-owned service binding.
+The daemon runs a generic component reconciler over one live service-registry
+snapshot. Components remain pending until required services are available;
+registry replacement preserves unchanged scopes and atomically publishes one
+new generation. Daemon-owned foundational methods, such as process status,
+shutdown, and cluster transport, remain host services. Domain behavior and
+long-lived workers live in their owner component.
 
 This does not require every module to be dynamically loaded. Static native Rust
 modules still participate through the same catalog and binding split: the
@@ -535,9 +546,11 @@ The crate boundary follows the trust-ring architecture:
   module telemetry contracts, and serializable module surface declarations. It
   must not own policy decisions, rollout admission, rollout transition state,
   or self-evolution scoring.
-- `sinomo-module-api` owns the stable native dynamic-library ABI surface,
-  including generic descriptor fields for self-described object-RPC methods,
-  embedded declarative resources, and declared network transports.
+- `sinomo-module-api` owns the sole stable native dynamic-library ABI and the
+  provider-neutral component descriptor vocabulary. There are no
+  provider-specific API crates in the runtime facade; an external module keeps
+  private provider protocols inside its own package and exposes standardized
+  services through component offers.
 - The direct-link layer inside `sinomo-network` owns the network-transport
   registry, descriptors, and network-module dylib vtable that transport modules
   implement.
@@ -590,4 +603,14 @@ R2 and application crates cross into these foundations through
 12. Self-evolution targets modules only when the behavior has a natural,
     evaluable boundary.
 13. Module catalog data must not contain executable bindings; native runtime
-    binding is deterministic host assembly keyed by catalog entries.
+    binding is deterministic `ComponentFactory` assembly keyed by catalog
+    entries.
+14. Every mounted runtime effect belongs to a `ComponentScope`; durable effects
+    register replayable compensation rather than relying on process-local drop.
+15. Default external modules come from the verified signed data profile at
+    `distribution/module-profile.json`, never Cargo source-tree scanning or
+    provider constants in rollout. Library stems in that profile are resolved
+    to the current platform's native filename by the generic rollout loader.
+16. Active-provider discovery and native loading have one implementation in
+    `sinomo-module`; domain crates may own typed clients but not parallel loader
+    scans or standalone host-adapter crates.

@@ -117,6 +117,8 @@ pub fn module_service_snapshot_from_snapshot(
     let mut routes = Vec::new();
     let mut native_dylib_routes = BTreeMap::new();
     for registration in snapshot.registry().registrations() {
+        let component = crate::component_descriptor_from_registration(registration)
+            .map_err(module_network_error)?;
         for descriptor in registration
             .surfaces
             .object_rpc_route_descriptors()
@@ -127,7 +129,10 @@ pub fn module_service_snapshot_from_snapshot(
                 native_module_body_mode_to_service(descriptor.request_body_mode);
             let response_body_mode =
                 native_module_body_mode_to_service(descriptor.response_body_mode);
-            let route = module_object_rpc_route_descriptor_to_service(&descriptor);
+            let route = crate::service_route_with_component_identity(
+                module_object_rpc_route_descriptor_to_service(&descriptor),
+                &component,
+            );
             if !seen_routes.insert(route.route.clone()) {
                 return Err(sinomo_core::network::NetworkError::Serialization {
                     detail: format!("duplicate module object rpc route {}", route.route),

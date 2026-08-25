@@ -693,10 +693,11 @@ versioned `sinomo.memory.<role>/v1` interface ids through `sinomo-runtime`. This
 preserves the trust-ring direction while allowing modules to add formats and
 workspace detectors.
 
-The versioned wire vocabulary may live in a data/ABI-only R1 package such as
-`sinomo-memory-extension-api`, re-exported by `sinomo-runtime`. That package
-contains descriptors and SOBJ request/result values only; all scheduling,
-validation, policy, storage, and retrieval behavior remains in R2
+The versioned wire vocabulary is shipped with the external component as schema
+and descriptor data. `sinomo-runtime` does not re-export a memory-provider API
+crate. The memory service understands standardized interface and schema IDs;
+all provider-specific protocol and implementation types remain external. All
+scheduling, validation, policy, storage, and retrieval behavior remains in R2
 `sinomo-memory`.
 
 An out-of-process extractor receives an authorized VFS/SIFS snapshot handle or

@@ -1,6 +1,6 @@
 //! Crash-safe ownership handoff for mutations issued by host filesystem mounts.
 //!
-//! FUSE and Cloud Files adapters execute against a process-local
+//! Built-in and external host-filesystem adapters execute against a process-local
 //! [`crate::NetworkedDfsService`]. A mutation can therefore commit metadata or
 //! create repair work without passing through the daemon's normal served-message
 //! boundary. This outbox brackets that mutation with an fsynced ambiguity marker
@@ -77,7 +77,8 @@ pub type MountedSifsMutationArmRequestId = Id;
 #[serde(rename_all = "kebab-case")]
 pub enum MountedSifsMutationAdapter {
     Fuse,
-    CloudFiles,
+    #[serde(alias = "cloud-files")]
+    ExternalProvider,
     Nfs,
 }
 
@@ -300,7 +301,7 @@ pub struct MountedSifsMutationOutboxStore {
     root: PathBuf,
 }
 
-/// Raw, owner-validated evidence used only by the explicit Cloud Files
+/// Raw, owner-validated evidence used only by an explicit external-provider
 /// cursor-only recovery token. Constructing this value never creates a path,
 /// opens the normal self-healing store, repairs state, prunes history, or
 /// creates a lock file.
@@ -384,7 +385,7 @@ fn committed_work_contains(current: DfsCommittedWork, original: DfsCommittedWork
 }
 
 /// Inspect the outbox in the only state compatible with adopting cursor-only
-/// Cloud Files history: no session, operation, staging, or retired evidence
+/// external-provider history: no session, operation, staging, or retired evidence
 /// exists. A pre-existing store lock is acquired without `create` and held by
 /// the returned guard for the complete snapshot/effect fence; its bytes are
 /// included in the evidence.
@@ -2585,7 +2586,7 @@ impl Drop for ExclusiveFileLock {
         // `fs2` recommends explicitly unlocking instead of relying on closing
         // the file handle because close-time lock release differs by platform.
         // This is especially important on Windows where the main executable
-        // and the Cloud Files provider DLL independently open `outbox.lock`.
+        // and an external provider DLL independently open `outbox.lock`.
         match FileExt::unlock(&self.file) {
             Ok(()) => {
                 if self.path.file_name().and_then(|name| name.to_str()) == Some(STORE_LOCK_FILE) {
@@ -3498,7 +3499,7 @@ mod tests {
     fn error_capture_remains_full_recovery_gated() {
         let (_root, store) = store("mounted-mutation-unknown");
         let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("session");
         let mut mutation = store
             .prepare(&session, Some("rename-1".into()), "rename")
@@ -3660,7 +3661,7 @@ mod tests {
     fn daemon_accept_latches_work_before_retryable_terminal_ack() {
         let (_root, store) = store("mounted-mutation-terminal-receipt");
         let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("session");
         let mut mutation = store
             .prepare(&session, Some("write-1".into()), "write")
@@ -3742,7 +3743,7 @@ mod tests {
     fn exact_unknown_retry_retains_and_compares_error_evidence() {
         let (_root, store) = store("mounted-mutation-exact-unknown-evidence");
         let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("session");
         let mut mutation = store
             .prepare(&session, Some("rename-evidence".into()), "rename")
@@ -3827,7 +3828,7 @@ mod tests {
             .expect("second store");
         assert!(
             second_store
-                .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+                .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
                 .is_err(),
             "single-session ownership is enforced inside the outbox"
         );
@@ -3884,7 +3885,7 @@ mod tests {
             .expect("second store");
         assert!(
             second_store
-                .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+                .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
                 .is_err(),
             "session admission cannot pass between Closed persistence and lease Drop"
         );
@@ -3897,7 +3898,7 @@ mod tests {
         );
         store.status().expect("prune released session");
         store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("new session after actual lease death");
     }
 
@@ -3909,7 +3910,7 @@ mod tests {
             .expect("session");
         let origin = session.origin(None, "validate-session").expect("origin");
         let mut wrong_adapter_origin = origin.clone();
-        wrong_adapter_origin.adapter = MountedSifsMutationAdapter::CloudFiles;
+        wrong_adapter_origin.adapter = MountedSifsMutationAdapter::ExternalProvider;
         assert_eq!(
             store
                 .session_liveness(&wrong_adapter_origin)
@@ -3947,7 +3948,7 @@ mod tests {
         let (_session_id, preparing_directory, published_directory, staged_lease) =
             stage_host_mount_session_for_publication(
                 &store,
-                MountedSifsMutationAdapter::CloudFiles,
+                MountedSifsMutationAdapter::ExternalProvider,
                 "sync-root",
             );
         let preparing_lease_path = preparing_directory.join(LEASE_FILE);
@@ -3994,7 +3995,7 @@ mod tests {
         assert!(!published_directory.exists());
 
         reopened
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("replacement session after dead private staging");
     }
 
@@ -4006,7 +4007,7 @@ mod tests {
         let (_session_id, preparing_directory, published_directory, staged_lease) =
             stage_host_mount_session_for_publication(
                 &store,
-                MountedSifsMutationAdapter::CloudFiles,
+                MountedSifsMutationAdapter::ExternalProvider,
                 "sync-root",
             );
         let preparing_lease_path = preparing_directory.join(LEASE_FILE);
@@ -4062,7 +4063,7 @@ mod tests {
         assert!(!published_directory.exists());
 
         let replacement = reopened
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("replacement session after dead publication cut");
         let replacement_directory = reopened.session_directory(&replacement.marker().session_id);
         assert_eq!(
@@ -4092,7 +4093,7 @@ mod tests {
         let (_session_id, preparing_directory, published_directory, staged_lease) =
             stage_host_mount_session_for_publication(
                 &store,
-                MountedSifsMutationAdapter::CloudFiles,
+                MountedSifsMutationAdapter::ExternalProvider,
                 "sync-root",
             );
 
@@ -4123,7 +4124,7 @@ mod tests {
             .expect("reopen missing-lease session");
         assert!(
             reopened
-                .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+                .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
                 .is_err(),
             "missing authoritative liveness proof must block admission instead of being recreated"
         );
@@ -4190,7 +4191,7 @@ mod tests {
             .expect("prune pre-lease staging cut");
         assert!(!preparing_directory.exists());
         reopened
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("staging cut cannot poison future sessions");
     }
 
@@ -4498,7 +4499,7 @@ mod tests {
     fn unreferenced_session_pruning_uses_the_same_scan_budget() {
         let (_root, store) = store("mounted-mutation-bounded-session-prune");
         let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("session");
         let session_id = session.marker().session_id.clone();
         drop(session);
@@ -4623,7 +4624,10 @@ mod tests {
         );
         assert!(
             store
-                .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "must-not-open")
+                .open_host_mount_session(
+                    MountedSifsMutationAdapter::ExternalProvider,
+                    "must-not-open"
+                )
                 .is_err(),
             "Probe/new-session admission must remain fail closed"
         );
@@ -4745,7 +4749,7 @@ mod tests {
     fn optional_retired_cleanup_cannot_suppress_proven_full_candidate() {
         let (_root, store) = store("mounted-mutation-retired-cleanup-after-full-proof");
         let session = store
-            .open_host_mount_session(MountedSifsMutationAdapter::CloudFiles, "sync-root")
+            .open_host_mount_session(MountedSifsMutationAdapter::ExternalProvider, "sync-root")
             .expect("session");
         let mut exact_mutation = store
             .prepare(&session, Some("exact-before-cleanup".into()), "create")

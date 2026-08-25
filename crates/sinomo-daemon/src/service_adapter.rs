@@ -135,6 +135,7 @@ use sinomo_dfs::register_services as register_dfs_services;
 #[cfg(test)]
 use sinomo_module::inspect_native_module_staged_body as inspect_native_dylib_staged_body;
 use sinomo_module::{
+    ComponentContext, ComponentFactory, ComponentHostRole, ComponentReconciler,
     MODULE_NATIVE_DYLIB_CANCEL_ROUTE, MODULE_RPC_CATEGORY,
     ModuleServiceSnapshot as DaemonInternalModuleSnapshot,
     NativeDylibModuleRouteTarget as DaemonNativeDylibRouteTarget,
@@ -1956,38 +1957,23 @@ impl SandboxBackendFactory for DaemonSandboxBackendFactory {
 /// Build the registry of services the daemon serves through the seam, bound to this
 /// daemon's `paths` so foundational services act for the right process. Request-specific
 /// identity is supplied through [`ServiceContext::signer`] at dispatch time.
-fn daemon_service_registry(
+fn daemon_base_service_registry(
     paths: &DaemonPaths,
     service_runtime: Option<&tokio::runtime::Handle>,
-    service_hooks: &[crate::DaemonServiceRegistryHook],
+    component_factories: &[Arc<dyn ComponentFactory>],
 ) -> ServiceRegistry {
     let is_shadow = crate::daemon_paths_are_shadow(paths);
     let dfs_enabled = dfs_module_should_register(paths);
     let event_hub = Arc::new(DaemonEventHub::new());
     let data_dir_root = paths.root.parent().unwrap_or(paths.root.as_path());
     let mut builder = ServiceRegistry::builder();
-    let mut foundational_modules = vec![sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY];
-    if observe_module_should_register(paths) {
-        foundational_modules.push(sinomo_observe::SINOMO_OBSERVE_NATIVE_REGISTRATION_KEY);
-    }
-    builder = crate::registry::register_internal_native_rust_module_services(
-        builder,
-        foundational_modules,
-        data_dir_root,
-    );
     // Config definitions and arbitrary extension hooks may receive
     // `DaemonClusterAccess`; keep them with the main authority owner. The
     // shadow remains a bounded passive/recovery endpoint.
     if !is_shadow {
-        let config_registry = daemon_config_registry(paths, service_hooks);
+        let config_registry = daemon_config_registry(paths, component_factories);
         builder = register_config_services(builder, config_registry);
     }
-    builder = sinomo_rollout::register_host_services(
-        builder,
-        Arc::new(DaemonRolloutServiceHost {
-            paths: paths.clone(),
-        }),
-    );
     builder = sinomo_api::register_hosted_daemon_lifecycle_service(
         builder,
         Arc::new(DaemonLifecycleServiceHost {
@@ -2054,11 +2040,6 @@ fn daemon_service_registry(
                 }),
             );
         }
-        builder = crate::registry::register_internal_native_rust_module_services(
-            builder,
-            [sinomo_build::SINOMO_BUILD_NATIVE_REGISTRATION_KEY],
-            data_dir_root,
-        );
         builder = sinomo_sandbox::register_services_with_factory(
             builder,
             Arc::new(DaemonSandboxBackendFactory {
@@ -2066,11 +2047,84 @@ fn daemon_service_registry(
                 runtime: service_runtime.cloned(),
             }),
         );
-        for hook in service_hooks {
-            builder = hook.register(builder);
-        }
     }
     builder.build()
+}
+
+#[cfg(test)]
+fn daemon_service_registry(
+    paths: &DaemonPaths,
+    service_runtime: Option<&tokio::runtime::Handle>,
+    supplied_components: &[crate::DaemonComponentFactory],
+) -> ServiceRegistry {
+    let is_shadow = crate::daemon_paths_are_shadow(paths);
+    let component_factories =
+        daemon_component_factories(paths, service_runtime, supplied_components);
+    let base_registry = daemon_base_service_registry(paths, service_runtime, &component_factories);
+    let data_dir_root = paths.root.parent().unwrap_or(paths.root.as_path());
+    let data_dir = Arc::new(SinomoDataDir::new(data_dir_root));
+    let mut component_context = ComponentContext::new(data_dir).with_host_role(if is_shadow {
+        ComponentHostRole::Shadow
+    } else {
+        ComponentHostRole::Main
+    });
+    if let Some(runtime) = service_runtime {
+        component_context = component_context.with_runtime(runtime.clone());
+    }
+    let mut reconciler = ComponentReconciler::new(component_context, base_registry);
+    reconciler
+        .reconcile(&component_factories)
+        .expect("daemon component graph must be valid");
+    reconciler
+        .service_registry()
+        .active_snapshot()
+        .registry()
+        .clone()
+}
+
+fn daemon_component_factories(
+    paths: &DaemonPaths,
+    _service_runtime: Option<&tokio::runtime::Handle>,
+    supplied_components: &[crate::DaemonComponentFactory],
+) -> Vec<Arc<dyn ComponentFactory>> {
+    let is_shadow = crate::daemon_paths_are_shadow(paths);
+    let data_dir_root = paths.root.parent().unwrap_or(paths.root.as_path());
+    let data_dir = SinomoDataDir::new(data_dir_root);
+    let telemetry_host: Option<Arc<dyn sinomo_rollout::RolloutTelemetryHost>> =
+        (!is_shadow && ClusterPaths::new(&data_dir).state.exists()).then(|| {
+            Arc::new(crate::control::DaemonRolloutTelemetryHost {
+                paths: paths.clone(),
+            }) as Arc<dyn sinomo_rollout::RolloutTelemetryHost>
+        });
+    let mut factories: Vec<Arc<dyn ComponentFactory>> = vec![Arc::new(
+        sinomo_rollout::component_factory_with_telemetry(
+            Arc::new(DaemonRolloutServiceHost {
+                paths: paths.clone(),
+            }),
+            telemetry_host,
+            if is_shadow { "shadow-daemon" } else { "daemon" },
+        )
+        .expect("rollout component descriptor must be valid"),
+    )];
+    if observe_module_should_register(paths) {
+        factories.push(Arc::new(
+            sinomo_observe::component_factory()
+                .expect("observe component descriptor must be valid"),
+        ));
+    }
+    if !is_shadow {
+        factories.push(Arc::new(
+            sinomo_build::component_factory().expect("build component descriptor must be valid"),
+        ));
+        factories.extend(supplied_components.iter().cloned());
+        if nfs_module_should_register(paths) && ClusterPaths::new(&data_dir).state.exists() {
+            factories.push(Arc::new(
+                sinomo_dfs_nfs::component_factory()
+                    .expect("NFS component descriptor must be valid"),
+            ));
+        }
+    }
+    factories
 }
 
 #[derive(Clone)]
@@ -2081,6 +2135,12 @@ pub(crate) struct DaemonServiceRegistryHost {
     /// Live service-registry snapshot store; the daemon maintenance loop
     /// publishes its active snapshot's instances into cluster KV.
     service_registry: ServiceRegistrySnapshotStore,
+    component_reconciler: Arc<Mutex<ComponentReconciler>>,
+}
+
+struct DaemonServiceAssembly {
+    base_registry: ServiceRegistry,
+    component_factories: Vec<Arc<dyn ComponentFactory>>,
 }
 
 static DAEMON_SERVICE_REGISTRY_HOSTS: OnceLock<Mutex<HashMap<PathBuf, DaemonServiceRegistryHost>>> =
@@ -2097,6 +2157,7 @@ impl DaemonServiceRegistryHost {
             paths.clone(),
             None,
             observe_module_should_register(paths),
+            Vec::new(),
         )
     }
 
@@ -2109,15 +2170,16 @@ impl DaemonServiceRegistryHost {
     }
 
     fn from_registry_for_paths_on_runtime(
-        registry: ServiceRegistry,
+        assembly: DaemonServiceAssembly,
         paths: &DaemonPaths,
         service_runtime: tokio::runtime::Handle,
     ) -> Result<Self, DaemonError> {
         Self::from_registry_with_internal_modules(
-            registry,
+            assembly.base_registry,
             paths.clone(),
             Some(service_runtime),
             observe_module_should_register(paths),
+            assembly.component_factories,
         )
     }
 
@@ -2126,6 +2188,7 @@ impl DaemonServiceRegistryHost {
         paths: DaemonPaths,
         service_runtime: Option<tokio::runtime::Handle>,
         register_observe_module: bool,
+        component_factories: Vec<Arc<dyn ComponentFactory>>,
     ) -> Result<Self, DaemonError> {
         let data_dir_root =
             daemon_data_dir_path(&paths).map_err(|source| DaemonError::Network {
@@ -2171,11 +2234,33 @@ impl DaemonServiceRegistryHost {
                 &paths, runtime,
             )?;
         }
+        let service_registry = ServiceRegistrySnapshotStore::new(registry.clone());
+        let mut component_context = ComponentContext::new(Arc::clone(&service_data_dir))
+            .with_host_role(if crate::daemon_paths_are_shadow(&paths) {
+                ComponentHostRole::Shadow
+            } else {
+                ComponentHostRole::Main
+            });
+        if let Some(runtime) = service_runtime.as_ref() {
+            component_context = component_context.with_runtime(runtime.clone());
+        }
+        let mut component_reconciler = ComponentReconciler::with_service_registry(
+            component_context,
+            registry,
+            service_registry.clone(),
+        );
+        component_reconciler
+            .reconcile(&component_factories)
+            .map_err(|source| DaemonError::Network {
+                address: "daemon component registry".to_string(),
+                detail: source.to_string(),
+            })?;
         Ok(Self {
             paths,
             service_data_dir,
             service_cluster,
-            service_registry: ServiceRegistrySnapshotStore::new(registry),
+            service_registry,
+            component_reconciler: Arc::new(Mutex::new(component_reconciler)),
         })
     }
 
@@ -2197,13 +2282,13 @@ impl DaemonServiceRegistryHost {
             return Ok(host);
         }
         let registry_paths = paths.clone();
-        let registry = daemon_service_registry_on_blocking_pool(
+        let assembly = daemon_service_registry_on_blocking_pool(
             registry_paths,
             service_runtime.clone(),
             Vec::new(),
         )
         .await?;
-        let host = Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)?;
+        let host = Self::from_registry_for_paths_on_runtime(assembly, &paths, service_runtime)?;
         let mut cache = DAEMON_SERVICE_REGISTRY_HOSTS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -2214,22 +2299,22 @@ impl DaemonServiceRegistryHost {
         Ok(cache.entry(cache_key).or_insert_with(|| host).clone())
     }
 
-    pub(crate) async fn new_on_runtime_with_services(
+    pub(crate) async fn new_on_runtime_with_components(
         paths: DaemonPaths,
         service_runtime: tokio::runtime::Handle,
-        service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+        component_factories: Vec<crate::DaemonComponentFactory>,
     ) -> Result<Self, DaemonError> {
-        if service_hooks.is_empty() {
+        if component_factories.is_empty() {
             return Self::new_on_runtime(paths, service_runtime).await;
         }
         let registry_paths = paths.clone();
-        let registry = daemon_service_registry_on_blocking_pool(
+        let assembly = daemon_service_registry_on_blocking_pool(
             registry_paths,
             service_runtime.clone(),
-            service_hooks,
+            component_factories,
         )
         .await?;
-        Self::from_registry_for_paths_on_runtime(registry, &paths, service_runtime)
+        Self::from_registry_for_paths_on_runtime(assembly, &paths, service_runtime)
     }
 
     pub(crate) fn object_rpc_route_descriptor(&self, route: &str) -> Option<ServiceRoute> {
@@ -2243,15 +2328,34 @@ impl DaemonServiceRegistryHost {
     pub(crate) fn service_registry_snapshot_store(&self) -> ServiceRegistrySnapshotStore {
         self.service_registry.clone()
     }
+
+    pub(crate) fn notify_component_host_start(&self) {
+        if let Ok(reconciler) = self.component_reconciler.lock() {
+            reconciler.notify_host_start();
+        }
+    }
+
+    pub(crate) fn notify_component_host_ready(&self) {
+        if let Ok(reconciler) = self.component_reconciler.lock() {
+            reconciler.notify_host_ready();
+        }
+    }
 }
 
 async fn daemon_service_registry_on_blocking_pool(
     paths: DaemonPaths,
     service_runtime: tokio::runtime::Handle,
-    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
-) -> Result<ServiceRegistry, DaemonError> {
+    component_factories: Vec<crate::DaemonComponentFactory>,
+) -> Result<DaemonServiceAssembly, DaemonError> {
     tokio::task::spawn_blocking(move || {
-        daemon_service_registry(&paths, Some(&service_runtime), &service_hooks)
+        let factories =
+            daemon_component_factories(&paths, Some(&service_runtime), &component_factories);
+        let base_registry =
+            daemon_base_service_registry(&paths, Some(&service_runtime), &factories);
+        DaemonServiceAssembly {
+            base_registry,
+            component_factories: factories,
+        }
     })
     .await
     .map_err(|source| DaemonError::Network {
@@ -2284,15 +2388,12 @@ pub(crate) fn nfs_module_should_register(paths: &DaemonPaths) -> bool {
 
 fn daemon_config_registry(
     paths: &DaemonPaths,
-    service_hooks: &[crate::DaemonServiceRegistryHook],
+    component_factories: &[Arc<dyn ComponentFactory>],
 ) -> ConfigRegistry {
     let mut builder = register_daemon_config_definitions(ConfigRegistry::builder())
         .expect("daemon config definitions must be valid");
-    for hook in service_hooks {
-        builder = hook
-            .register_config_definitions(builder)
-            .expect("daemon config hook definitions must be valid");
-    }
+    builder = sinomo_module::register_component_config_definitions(builder, component_factories)
+        .expect("daemon component config definitions must be valid");
     builder = register_daemon_dynamic_module_config_definitions(paths, builder);
     builder.build()
 }
@@ -2307,7 +2408,6 @@ fn register_daemon_config_definitions(
     for registration in [
         sinomo_dfs::dfs_module_registration(),
         sinomo_dfs_nfs::nfs_module_registration(),
-        sinomo_rollout::rollout_module_registration(),
     ] {
         builder = registration
             .surfaces
@@ -3050,6 +3150,7 @@ fn daemon_service_registry_with_module_snapshot(
         } else if let Some(mut service_route) = registry.route(&descriptor.route) {
             validate_module_service_route_contract(&descriptor, &service_route)?;
             service_route.observability.extend(descriptor.observability);
+            service_route.discovery = descriptor.discovery.clone();
             service_route = service_route
                 .observable("daemon.service_registry", "true")
                 .observable("daemon.service_registry.snapshot_version", "1")
@@ -6178,7 +6279,7 @@ mod tests {
     fn daemon_service_registry_skips_broken_active_native_dylib_state() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-broken-native-dylib-state");
         let module_id =
-            sinomo_module::ModuleId::from_legacy_named("module.dfs.cloud-files").expect("module");
+            sinomo_module::ModuleId::from_legacy_named("module.external-fixture").expect("module");
         let content_hash =
             "blake3:0000000000000000000000000000000000000000000000000000000000000000";
         let state = sinomo_module::NativeDylibModuleLoaderState {
@@ -6186,8 +6287,8 @@ mod tests {
             artifact_id: None,
             content_hash: content_hash.to_string(),
             replaces_content_hash: None,
-            cache_key: "module/dfs/cloud-files".to_string(),
-            library_name: "sinomo_dfs_cloud_files.dll".to_string(),
+            cache_key: "module/external-fixture".to_string(),
+            library_name: "external_fixture.dll".to_string(),
             platform_triple: "x86_64-pc-windows-msvc".to_string(),
             native_abi_version: 1,
             interface_version: sinomo_module::SINOMO_MODULE_V1_INTERFACE_VERSION.to_string(),
@@ -6958,7 +7059,10 @@ mod tests {
         );
 
         let host = DaemonServiceRegistryHost::from_registry_for_paths_on_runtime(
-            registry,
+            DaemonServiceAssembly {
+                base_registry: registry,
+                component_factories: Vec::new(),
+            },
             &paths,
             runtime.handle().clone(),
         )
@@ -7426,17 +7530,26 @@ mod tests {
     }
 
     #[test]
-    fn daemon_service_registry_accepts_application_service_hooks() {
-        fn register_test_stop_service(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
-            builder.register(TestStopService)
-        }
-
+    fn daemon_service_registry_accepts_application_components() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-service-hooks");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
-        let hook = crate::DaemonServiceRegistryHook::new(register_test_stop_service);
-        let registry = daemon_service_registry(&paths, None, &[hook]);
+        let factory: crate::DaemonComponentFactory = Arc::new(
+            sinomo_module::StaticComponentFactory::new(
+                sinomo_module::ComponentDescriptor::new("test.stop", "1.0.0"),
+                |_, scope| {
+                    scope.set_services(
+                        ServiceRegistryBuilder::default()
+                            .register(TestStopService)
+                            .build(),
+                    );
+                    Ok(())
+                },
+            )
+            .expect("test component"),
+        );
+        let registry = daemon_service_registry(&paths, None, &[factory]);
         assert!(registry.owns("/test/stop"));
         assert_eq!(registry.category_for_route("/test/stop"), Some("test-stop"));
 
@@ -7456,36 +7569,45 @@ mod tests {
     }
 
     #[test]
-    fn daemon_config_registry_accepts_application_config_hooks() {
-        let hook = crate::DaemonServiceRegistryHook::new(|builder| builder)
-            .with_config_definitions(|builder| {
-                let definition = sinomo_config::ConfigDefinition::new(
-                    "test.config",
-                    "test",
-                    sinomo_config::ConfigValueType::String {
-                        choices: Vec::new(),
-                    },
-                    "test hook config",
-                    sinomo_config::ConfigClusterMode::ClusterOverrideLocal,
-                )
-                .map_err(|error| error.to_string())?
-                .with_default(&"hooked")
-                .map_err(|error| error.to_string())?;
-                builder
-                    .register(definition)
-                    .map_err(|error| error.to_string())
-            });
+    fn daemon_config_registry_accepts_application_components() {
+        fn register_test_config(
+            builder: sinomo_config::ConfigRegistryBuilder,
+        ) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+            let definition = sinomo_config::ConfigDefinition::new(
+                "test.config",
+                "test",
+                sinomo_config::ConfigValueType::String {
+                    choices: Vec::new(),
+                },
+                "test component config",
+                sinomo_config::ConfigClusterMode::ClusterOverrideLocal,
+            )
+            .map_err(|error| error.to_string())?
+            .with_default(&"hooked")
+            .map_err(|error| error.to_string())?;
+            builder
+                .register(definition)
+                .map_err(|error| error.to_string())
+        }
+        let factory: Arc<dyn ComponentFactory> = Arc::new(
+            sinomo_module::StaticComponentFactory::new(
+                sinomo_module::ComponentDescriptor::new("test.config", "1.0.0"),
+                |_, _| Ok(()),
+            )
+            .expect("test config component")
+            .with_config_definitions(register_test_config),
+        );
 
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-config-hook");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
-        let registry = daemon_config_registry(&paths, &[hook]);
+        let registry = daemon_config_registry(&paths, &[factory]);
         let definition = registry
             .get("test.config")
             .expect("hooked config definition");
 
         assert_eq!(definition.owner, "test");
-        assert_eq!(definition.description, "test hook config");
+        assert_eq!(definition.description, "test component config");
     }
 
     #[test]
@@ -7493,7 +7615,8 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-config-surfaces");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
-        let registry = daemon_config_registry(&paths, &[]);
+        let components = daemon_component_factories(&paths, None, &[]);
+        let registry = daemon_config_registry(&paths, &components);
 
         let rollout = registry
             .get(sinomo_rollout::ROLLOUT_TELEMETRY_GATE_CONFIG_KEY)

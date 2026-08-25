@@ -437,12 +437,6 @@ impl Backend {
         );
         insert_module_summary(
             &mut modules,
-            sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID,
-            "wasix",
-            "WASIX sandbox runtime module",
-        );
-        insert_module_summary(
-            &mut modules,
             sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID,
             "native-dylib",
             "Privileged node administration module",
@@ -832,11 +826,6 @@ fn parse_module_id(module_id: &str) -> Result<sinomo_runtime::module::ModuleId, 
 fn module_label(module_id: &str) -> String {
     match module_id {
         "module.observe" => return "Observability".to_string(),
-        "module.sandbox.wasix" => return "WASIX Sandbox".to_string(),
-        "module.dfs.cloud-files" => return "Cloud Files".to_string(),
-        "module.remote-management" => return "Remote Management".to_string(),
-        "module.network-iroh" => return "Iroh Networking".to_string(),
-        "module.benchmarks" => return "Benchmarks".to_string(),
         "module.dfs" => return "Distributed Filesystem".to_string(),
         "module.network" => return "Networking".to_string(),
         "module.rollout" => return "Rollout".to_string(),
@@ -849,15 +838,11 @@ fn module_label(module_id: &str) -> String {
         .split(|ch| matches!(ch, '.' | '-' | '_'))
         .filter(|part| !part.is_empty())
         .map(|part| {
-            if part.eq_ignore_ascii_case("wasix") {
-                "WASIX".to_string()
-            } else {
-                let mut chars = part.chars();
-                chars
-                    .next()
-                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
-                    .unwrap_or_default()
-            }
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -869,8 +854,11 @@ mod tests {
 
     #[test]
     fn module_labels_hide_opaque_runtime_ids() {
-        assert_eq!(module_label("module.sandbox.wasix"), "WASIX Sandbox");
-        assert_eq!(module_label("module.dfs.cloud-files"), "Cloud Files");
+        assert_eq!(
+            module_label("module.external-executor"),
+            "External Executor"
+        );
+        assert_eq!(module_label("module.host-filesystem"), "Host Filesystem");
         assert_eq!(module_label("module.custom-data_sync"), "Custom Data Sync");
     }
 

@@ -347,6 +347,28 @@ Rust, a native library, a declarative resource, a sandboxed process, or a Wasm
 component. The lifecycle covers identity, compatibility, evaluation,
 activation, observation, replacement, and rollback.
 
+Runtime activation is component-based. Every implementation supplies a
+`ComponentDescriptor` with versioned service offers and requirements and is
+materialized through `ComponentFactory`. A mounted `ComponentScope` owns all
+services, workers, readiness edges, and reverse-order compensations. The
+reconciler keeps components pending until dependencies exist, preserves
+unchanged scopes across atomic service-registry generations, and removes a
+component's routes before unwinding its effects.
+
+External providers are selected by interface offer, never by provider crate or
+hardcoded module ID in the main runtime. WASIX implements the generic sandbox
+executor interface; Cloud Files implements the generic host-filesystem provider
+interface and keeps its private protocol and durable recovery state inside its
+external package. Default external artifacts are enumerated only by verified
+signed distribution profiles, not by scanning a source checkout.
+
+`sinomo-module::ActiveNativeComponent` owns the common native-provider binding:
+it resolves exactly one active component from a `ServiceRequirement`, verifies
+and loads its content-addressed artifact, and invokes typed SOBJ operations.
+Domain-owned clients in `sinomo-sandbox` and `sinomo-dfs` translate their own
+interfaces onto that binding. Parallel per-interface host-loader crates and
+runtime-facade re-exports are forbidden.
+
 Candidate changes move through isolated workspaces, tests and replay,
 machine-readable scorecards, trusted policy, immutable artifact registration,
 shadow or canary execution, and rollback. Candidate code cannot approve itself,

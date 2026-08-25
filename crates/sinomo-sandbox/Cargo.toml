@@ -1,7 +1,7 @@
 [package]
 name = "sinomo-sandbox"
 version.workspace = true
-description = "Sinomo SIFS-backed agent sandbox contracts (types, paths, policy, capabilities)"
+description = "Sinomo sandbox contracts, policy, storage, and external-executor client"
 authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ ring = "r1"
 # Mirrored by the native WASIX execution module: its `wasix-runtime` feature
 # enables this one so capability/policy checks in this crate reflect whether the
 # WASIX backend is actually linked. This marker adds no dependencies of its own;
-# the contracts crate carries no wasm code.
+# the sandbox crate carries no provider implementation or Wasm engine code.
 wasix-runtime = []
 
 [dependencies]
@@ -40,3 +40,4 @@ tracing.workspace = true
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio.workspace = true
+wat = "1.253.0"

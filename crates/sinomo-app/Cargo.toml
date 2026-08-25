@@ -67,5 +67,6 @@ netwatcher.workspace = true
 android-build = "0.1.4"
 
 [dev-dependencies]
+sinomo-testdir = { path = "../sinomo-testdir" }
 # Headless rendering harness for visual verification of the widget tree.
 sui-testing = { package = "sinomo-ui-testing", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }

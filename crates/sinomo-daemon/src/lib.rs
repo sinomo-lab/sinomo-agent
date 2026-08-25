@@ -94,106 +94,9 @@ pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
     }
 }
 
-#[derive(Clone)]
-pub struct DaemonServiceRegistryHook {
-    register: std::sync::Arc<
-        dyn Fn(
-                sinomo_core::service::ServiceRegistryBuilder,
-            ) -> sinomo_core::service::ServiceRegistryBuilder
-            + Send
-            + Sync,
-    >,
-    register_config_definitions: Option<
-        std::sync::Arc<
-            dyn Fn(
-                    sinomo_config::ConfigRegistryBuilder,
-                ) -> Result<sinomo_config::ConfigRegistryBuilder, String>
-                + Send
-                + Sync,
-        >,
-    >,
-    register_observe_metric_exporters: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-    host_ready: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl DaemonServiceRegistryHook {
-    pub fn new(
-        register: impl Fn(
-            sinomo_core::service::ServiceRegistryBuilder,
-        ) -> sinomo_core::service::ServiceRegistryBuilder
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self {
-            register: std::sync::Arc::new(register),
-            register_config_definitions: None,
-            register_observe_metric_exporters: None,
-            host_ready: None,
-        }
-    }
-
-    pub fn with_config_definitions(
-        mut self,
-        register: impl Fn(
-            sinomo_config::ConfigRegistryBuilder,
-        ) -> Result<sinomo_config::ConfigRegistryBuilder, String>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        self.register_config_definitions = Some(std::sync::Arc::new(register));
-        self
-    }
-
-    pub fn with_observe_metric_exporters(
-        mut self,
-        register: impl Fn() + Send + Sync + 'static,
-    ) -> Self {
-        self.register_observe_metric_exporters = Some(std::sync::Arc::new(register));
-        self
-    }
-
-    /// Registers a non-blocking notification fired immediately before the
-    /// daemon begins accepting service RPCs.
-    ///
-    /// Service-owned workers use this edge to leave startup states without a
-    /// timer. The callback must only signal already-created work; it must not
-    /// synchronously call back into the daemon that is about to serve it.
-    pub fn with_host_ready(mut self, notify: impl Fn() + Send + Sync + 'static) -> Self {
-        self.host_ready = Some(std::sync::Arc::new(notify));
-        self
-    }
-
-    pub fn register_config_definitions(
-        &self,
-        builder: sinomo_config::ConfigRegistryBuilder,
-    ) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
-        match &self.register_config_definitions {
-            Some(register) => register(builder),
-            None => Ok(builder),
-        }
-    }
-
-    pub fn register(
-        &self,
-        builder: sinomo_core::service::ServiceRegistryBuilder,
-    ) -> sinomo_core::service::ServiceRegistryBuilder {
-        (self.register)(builder)
-    }
-
-    pub fn register_observe_metric_exporters(&self) {
-        if let Some(register) = &self.register_observe_metric_exporters {
-            register();
-        }
-    }
-
-    pub fn notify_host_ready(&self) {
-        if let Some(notify) = &self.host_ready {
-            notify();
-        }
-    }
-}
+/// Application and built-in modules enter the daemon through the same
+/// backend-neutral component factory contract.
+pub type DaemonComponentFactory = std::sync::Arc<dyn sinomo_module::ComponentFactory>;
 
 pub use api::{DAEMON_API_PROBE_TIMEOUT, DaemonApiClient};
 pub use auth::{
@@ -252,8 +155,8 @@ pub use control::{
     handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
-    run_daemon_control_loop, run_daemon_control_loop_with_services,
-    run_daemon_control_loop_with_services_and_profile,
+    run_daemon_control_loop, run_daemon_control_loop_with_components,
+    run_daemon_control_loop_with_components_and_profile,
 };
 pub use error::DaemonError;
 pub(crate) use observe::{
@@ -367,22 +270,35 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
-    use super::DaemonServiceRegistryHook;
+    use super::DaemonComponentFactory;
 
     #[test]
-    fn service_registry_host_ready_is_an_explicit_one_shot_edge() {
+    fn component_host_ready_is_an_explicit_one_shot_edge() {
         let notifications = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&notifications);
-        let hook = DaemonServiceRegistryHook::new(|builder| builder).with_host_ready(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-        });
+        let factory: DaemonComponentFactory = Arc::new(
+            sinomo_module::StaticComponentFactory::new(
+                sinomo_module::ComponentDescriptor::new("test.ready", "1.0.0"),
+                move |_, scope| {
+                    let observed = Arc::clone(&observed);
+                    scope.on_host_ready(move || {
+                        observed.fetch_add(1, Ordering::SeqCst);
+                    });
+                    Ok(())
+                },
+            )
+            .expect("component factory"),
+        );
 
-        // Building the registry does not imply that its transport accepts
-        // requests yet. The daemon emits the readiness edge at that boundary.
-        let _ = hook.register(sinomo_core::service::ServiceRegistry::builder());
+        let data_dir = Arc::new(sinomo_core::local::SinomoDataDir::new("/tmp/ready-test"));
+        let mut reconciler = sinomo_module::ComponentReconciler::new(
+            sinomo_module::ComponentContext::new(data_dir),
+            sinomo_core::service::ServiceRegistry::default(),
+        );
+        reconciler.reconcile(&[factory]).expect("reconcile");
         assert_eq!(notifications.load(Ordering::SeqCst), 0);
 
-        hook.notify_host_ready();
+        reconciler.notify_host_ready();
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
     }
 }

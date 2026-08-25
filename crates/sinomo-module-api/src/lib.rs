@@ -4,6 +4,10 @@
 //! can depend on it without inheriting any dynamic loader, sandbox, Wasm, or
 //! service implementation dependency.
 
+mod component;
+
+pub use component::*;
+
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::ptr;
@@ -165,6 +169,11 @@ pub struct NativeModuleDescriptor {
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "NativeModuleSurfaces::is_empty")]
     pub surfaces: NativeModuleSurfaces,
+    /// Backend-neutral lifecycle and service dependency contract. Legacy
+    /// descriptors omit it and are adapted from their existing surfaces by the
+    /// host until they are rebuilt.
+    #[serde(default, skip_serializing_if = "ComponentDescriptor::is_empty")]
+    pub component: ComponentDescriptor,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

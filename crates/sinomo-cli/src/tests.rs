@@ -392,6 +392,18 @@ fn with_test_sandbox_host<T>(
 }
 
 #[cfg(feature = "sandbox")]
+fn external_sandbox_executor_is_configured() -> bool {
+    if std::env::var_os("SINOMO_SANDBOX_EXECUTOR_NATIVE_MODULE_PATH").is_some() {
+        true
+    } else {
+        eprintln!(
+            "skipping external sandbox execution: SINOMO_SANDBOX_EXECUTOR_NATIVE_MODULE_PATH is not set"
+        );
+        false
+    }
+}
+
+#[cfg(feature = "sandbox")]
 fn sandbox_doctor_findings_with_stores(
     options: SandboxDoctorOptions,
     store: &sinomo_runtime::sandbox::LocalSandboxInstanceStore,
@@ -3793,6 +3805,9 @@ fn sandbox_reboot_respects_retain_tmp_policy_in_local_store() {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_persists_stdout_and_stderr_logs() {
+    if !external_sandbox_executor_is_configured() {
+        return;
+    }
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-run");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
@@ -3904,6 +3919,9 @@ fn sandbox_run_persists_stdout_and_stderr_logs() {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_returns_error_when_guest_exits_nonzero() {
+    if !external_sandbox_executor_is_configured() {
+        return;
+    }
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-run-nonzero");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(&root);
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
@@ -4016,6 +4034,9 @@ fn sandbox_run_rejects_mounts_outside_default_policy() {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_run_uses_pinned_toolchain_command() {
+    if !external_sandbox_executor_is_configured() {
+        return;
+    }
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-toolchain-run");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
@@ -4156,6 +4177,9 @@ fn sandbox_run_uses_pinned_toolchain_command() {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
+    if !external_sandbox_executor_is_configured() {
+        return;
+    }
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-process-plan");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
@@ -4281,6 +4305,9 @@ fn sandbox_process_plan_runs_pinned_commands_from_json_plan() {
 #[test]
 #[cfg(feature = "sandbox")]
 fn sandbox_shell_rejects_toolchain_without_real_sh() {
+    if !external_sandbox_executor_is_configured() {
+        return;
+    }
     let root = sinomo_testdir::TestDir::new("sinomo-cli-sandbox-shell-missing");
     let store = sinomo_runtime::sandbox::LocalSandboxInstanceStore::new(root.join("runtime"));
     let toolchain_store =
@@ -7226,26 +7253,26 @@ fn install_module_mutation_reconciles_exact_managed_source_under_rollout_admissi
     let root = sinomo_testdir::TestDir::new("sinomo-cli-install-module-admission");
     let rollout_paths = SelfRolloutPaths::new(&root);
     let source_repo = root.join("installed-managed-source");
-    let module_dir = source_repo.join("modules/test/install-policy");
-    std::fs::create_dir_all(&module_dir).expect("module source");
+    std::fs::create_dir_all(&source_repo).expect("module source");
     let excluded_platform = if cfg!(windows) { "unix" } else { "windows" };
-    std::fs::write(
-        module_dir.join("Cargo.toml"),
-        format!(
-            r#"
-[package]
-name = "sinomo-install-policy-test"
-version = "0.1.0"
-
-[package.metadata.sinomo.native-dylib]
-module-id = "module.install.policy-test"
-interface-version = "sinomo-install-policy-test-v1"
-source = "rollout:modules/test/install-policy"
-platforms = ["{excluded_platform}"]
-"#
-        ),
-    )
-    .expect("platform policy");
+    let identity = sinomo_runtime::node::load_or_create_main_node_identity(&root)
+        .expect("profile signing identity");
+    let mut profile = sinomo_runtime::rollout::ModuleDistributionProfile::new("install-test", "1")
+        .with_module(sinomo_runtime::rollout::ModuleDistributionEntry {
+            module_id: "module.install.policy-test".to_string(),
+            interface_version: "sinomo-install-policy-test-v1".to_string(),
+            package: "sinomo-install-policy-test".to_string(),
+            features: Vec::new(),
+            cache_key: "install/policy-test".to_string(),
+            library_name: "sinomo_install_policy_test".to_string(),
+            source: "rollout:modules/test/install-policy".to_string(),
+            platforms: vec![excluded_platform.to_string()],
+            default_enabled: true,
+        });
+    sinomo_runtime::rollout::sign_module_distribution_profile(&mut profile, &identity)
+        .expect("sign module distribution profile");
+    sinomo_runtime::rollout::write_module_distribution_profile(&source_repo, &profile)
+        .expect("write module distribution profile");
 
     let module_id =
         sinomo_runtime::module::ModuleId::from_legacy_named("module.install.policy-test")
@@ -8423,8 +8450,8 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         };
         let error =
             crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(sync_local))
-                .expect_err("Unix Cloud Files flag must be rejected explicitly");
-        assert!(error.to_string().contains("Windows Cloud Files"));
+                .expect_err("Unix external-provider flag must be rejected explicitly");
+        assert!(error.to_string().contains("external Windows provider"));
     }
     #[cfg(windows)]
     {
@@ -8455,7 +8482,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
         };
         assert!(
             crate::validate_dfs_mount_options_for_platform(&DfsMountOptions::Mount(read_only))
-                .expect_err("read-only Cloud Files cannot claim writable sync")
+                .expect_err("read-only external provider cannot claim writable sync")
                 .to_string()
                 .contains("durable writable synchronization")
         );
@@ -12714,7 +12741,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         parse_rollout_schema_for_test(&[
             "module".to_string(),
             "native-dylib".to_string(),
-            "module.remote-management".to_string(),
+            "module.external-management".to_string(),
             "--repo".to_string(),
             "/work/sinomo".to_string(),
             "--target".to_string(),
@@ -12723,7 +12750,7 @@ fn rollout_parser_accepts_apply_status_and_init_source() {
         ])
         .expect("module native-dylib rollout"),
         RolloutCliCommand::ModuleNativeDylib(RolloutModuleNativeDylibOptions {
-            module_selector: "module.remote-management".to_string(),
+            module_selector: "module.external-management".to_string(),
             rollout: RolloutOptions {
                 repo: Some(std::path::PathBuf::from("/work/sinomo")),
                 targets: vec!["192.0.2.11:21353".to_string()],

@@ -10,10 +10,10 @@ evolve during the pre-1.0 period.
 | Change | Primary seam | Representative area |
 |---|---|---|
 | CLI command | `CliCommandHandler`, `CliCommand`, registry composition | `sinomo-cli-registry`, `sinomo-cli` |
-| Object-RPC service | `Service` and `ServiceRoute` through the owner's ring facade | owning domain crate plus daemon service hook |
+| Object-RPC service | `Service` and `ServiceRoute` mounted by `ComponentFactory` | owning domain crate plus component scope |
 | Agent tool | `AgentTool`, `AgentToolRegistry` | `sinomo-agent` |
 | Model provider | `LanguageModelProvider` | `sinomo-lm` and provider wiring |
-| Native module | native-dylib package metadata and `sinomo-module-api` | `modules/network/iroh`, `modules/remote/management` |
+| Native module | generic component descriptor and `sinomo-module-api` | independently built external module fixture and packages |
 | Network transport | `NetworkModule` and registry/ABI | `sinomo-network`, `modules/network/iroh` |
 | DFS backend or service | DFS backend/transport traits and service registration | `sinomo-dfs` |
 | Sandbox backend | `SandboxBackend`, `SandboxBackendFactory` | `sinomo-sandbox`, WASIX module |
@@ -43,8 +43,8 @@ Implement the `Service` trait in the domain that owns the request, importing it
 through the facade appropriate to that crate's trust ring; the trait is defined
 in `sinomo-service`. Declare each `ServiceRoute` with its authentication,
 capability, local-permission, body, timeout, and concurrency metadata. Register
-services through the owning crate, then expose them through a daemon service
-hook.
+services through the owning crate, then mount their registry fragment through a
+`ComponentFactory`.
 
 The daemon provides process lifecycle, authentication context, routing, and
 host adapters. It should not reinterpret the domain state machine. A remote
@@ -93,14 +93,23 @@ A native dynamic module lives under `modules/<family>/<name>`, builds as an
 `[package.metadata.sinomo.native-dylib]` with module identity, interface
 version, cache key, and source.
 
-Use `sinomo-module-api` and the relevant narrow extension API. Native modules
-are leaf artifacts and stay outside default workspace members. Activation is a
+Use the single generic `sinomo-module-api` ABI and declare versioned service
+offers and requirements in `ComponentDescriptor`. Provider-specific protocols
+remain private to the external package; the runtime must not depend on a
+provider API crate. Native modules are leaf artifacts and stay outside default
+builds. Activation is a
 module/rollout decision; loading a library from an arbitrary host path must not
 become a second production activation path.
 
+Host-side consumers resolve providers through
+`sinomo_module::ActiveNativeComponent` and keep their typed client in the
+owning domain crate. Do not introduce a new `<interface>-host` crate, duplicate
+loader-state scanning, or add a domain adapter to the `sinomo-runtime` facade.
+
 Representative packages include Iroh networking, remote management, Windows
-Cloud Files, and WASIX. Cloud Files has an additional cross-owner registration
-and crash-recovery contract; read its
+Cloud Files, and WASIX. The latter two implement the generic sandbox-executor
+and host-filesystem-provider interfaces. Cloud Files owns its registration and
+crash-recovery compensation inside the external package; read its
 [architecture](../cloud-files-architecture.md) and
 [module maintainer guide](../../modules/dfs/cloud-files/README.md) before
 changing its ABI, durable state, lifecycle callbacks, or provider selection.

@@ -142,13 +142,13 @@ descriptors. Memory interface ids include:
 - `sinomo.memory.reranker/v1`;
 - `sinomo.memory.preview-renderer/v1`.
 
-Create a data/ABI-only R1 crate, tentatively
-`sinomo-memory-extension-api`, for the versioned descriptor,
-`IndexedContentRef`, extraction requests, continuations, normalized anchors,
-facts, relations, vector/artifact references, diagnostics, and
-`DerivedFactBatch`. Re-export it through
-`sinomo_runtime::memory_extension_api`; R2 memory code must use the facade.
-The crate owns no scheduler, storage, retrieval, or policy behavior.
+Publish the versioned descriptor and schemas with external memory components.
+Do not create or re-export a provider API crate. `IndexedContentRef`, extraction
+requests, continuations, normalized anchors, facts, relations,
+vector/artifact references, diagnostics, and `DerivedFactBatch` are identified
+by standardized schema IDs and transported through the generic module
+invocation contract. R2 memory owns validation and interpretation; the generic
+module runtime owns no scheduler, storage, retrieval, or policy behavior.
 
 The active identity includes module/export/interface version, artifact id and
 content hash, descriptor hash, and invocation lane; all enter the pipeline

@@ -130,35 +130,19 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         sinomo_runtime::sandbox::SandboxLocalCommandOutcome,
         sinomo_runtime::sandbox::SandboxCommandExecutionError,
     > {
-        #[cfg(test)]
-        {
-            return sinomo_sandbox_wasix_module::LocalStagedSandboxCommandRunner::new()?
-                .run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
-                    store,
-                    toolchain_store,
-                    sandbox_id,
-                    wasm,
-                    argv,
-                    stdin,
-                    timeout_ms,
-                    None,
-                    Vec::new(),
-                    output_sink,
-                );
-        }
-        #[cfg(not(test))]
-        active_wasix_runner()?.run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
-            store,
-            toolchain_store,
-            sandbox_id,
-            wasm,
-            argv,
-            stdin,
-            timeout_ms,
-            None,
-            Vec::new(),
-            output_sink,
-        )
+        active_sandbox_executor_runner()?
+            .run_module_with_stdin_limits_preopens_output_sink_and_toolchain(
+                store,
+                toolchain_store,
+                sandbox_id,
+                wasm,
+                argv,
+                stdin,
+                timeout_ms,
+                None,
+                Vec::new(),
+                output_sink,
+            )
     }
 
     #[cfg(feature = "sandbox")]
@@ -178,24 +162,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         sinomo_runtime::sandbox::SandboxLocalCommandOutcome,
         sinomo_runtime::sandbox::SandboxCommandExecutionError,
     > {
-        #[cfg(test)]
-        {
-            return sinomo_sandbox_wasix_module::LocalStagedSandboxCommandRunner::new()?
-                .run_toolchain_command_with_stdin_policy_and_output_sink(
-                    store,
-                    toolchain_store,
-                    sandbox_id,
-                    command_name,
-                    argv,
-                    stdin,
-                    timeout_ms,
-                    execution_node_id,
-                    policy,
-                    output_sink,
-                );
-        }
-        #[cfg(not(test))]
-        active_wasix_runner()?.run_toolchain_command_with_stdin_policy_and_output_sink(
+        active_sandbox_executor_runner()?.run_toolchain_command_with_stdin_policy_and_output_sink(
             store,
             toolchain_store,
             sandbox_id,
@@ -224,22 +191,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         sinomo_runtime::sandbox::SandboxProcessPlanOutcome,
         sinomo_runtime::sandbox::SandboxCommandExecutionError,
     > {
-        #[cfg(test)]
-        {
-            return sinomo_sandbox_wasix_module::LocalStagedSandboxCommandRunner::new()?
-                .run_toolchain_process_plan_with_policy_and_output_sink(
-                    store,
-                    toolchain_store,
-                    sandbox_id,
-                    plan,
-                    timeout_ms,
-                    execution_node_id,
-                    policy,
-                    output_sink,
-                );
-        }
-        #[cfg(not(test))]
-        active_wasix_runner()?.run_toolchain_process_plan_with_policy_and_output_sink(
+        active_sandbox_executor_runner()?.run_toolchain_process_plan_with_policy_and_output_sink(
             store,
             toolchain_store,
             sandbox_id,
@@ -322,21 +274,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         Vec<sinomo_runtime::sandbox::SandboxToolFidelityResult>,
         sinomo_runtime::sandbox::SandboxToolFidelityError,
     > {
-        #[cfg(test)]
-        {
-            let runner = sinomo_sandbox_wasix_module::LocalStagedSandboxCommandRunner::new()
-                .map_err(sinomo_runtime::sandbox::SandboxCommandExecutionError::from)?;
-            return runner.verify_busybox_toolchain_fidelity(
-                store,
-                toolchain_store,
-                sandbox_id,
-                execution_node_id,
-                policy,
-                cases,
-            );
-        }
-        #[cfg(not(test))]
-        active_wasix_runner()?.verify_busybox_toolchain_fidelity(
+        active_sandbox_executor_runner()?.verify_busybox_toolchain_fidelity(
             store,
             toolchain_store,
             sandbox_id,
@@ -351,17 +289,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         &self,
         bytes: &[u8],
     ) -> Result<(), sinomo_runtime::sandbox::SandboxCliError> {
-        #[cfg(test)]
-        {
-            return sinomo_sandbox_wasix_module::validate_sinomo_module_v1_component_contract(
-                bytes,
-            )
-            .map_err(|source| sinomo_runtime::sandbox::SandboxCliError::Parse {
-                detail: source.to_string(),
-            });
-        }
-        #[cfg(not(test))]
-        active_wasix_runner()?
+        active_sandbox_executor_runner()?
             .validate_sinomo_module_v1_component_contract(bytes)
             .map_err(Into::into)
     }
@@ -373,18 +301,7 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
         fixture: &sinomo_runtime::module::ModuleReplayFixture,
     ) -> Result<sinomo_runtime::module::ModuleReplayReport, sinomo_runtime::sandbox::SandboxCliError>
     {
-        #[cfg(test)]
-        {
-            return sinomo_sandbox_wasix_module::run_sandbox_wasm_module_replay_fixture(
-                data_dir_root,
-                fixture,
-            )
-            .map_err(|source| sinomo_runtime::sandbox::SandboxCliError::Parse {
-                detail: format!("sandbox module replay failed: {source}"),
-            });
-        }
-        #[cfg(not(test))]
-        sinomo_runtime::sandbox_wasix_host::run_sandbox_wasm_module_replay_fixture_with_active_module(
+        sinomo_runtime::sandbox::run_sandbox_wasm_module_replay_fixture_with_active_module(
             data_dir_root,
             fixture,
         )
@@ -394,11 +311,22 @@ impl sinomo_runtime::sandbox::SandboxCliHost for SinomoCliSandboxHost {
     }
 }
 
-#[cfg(all(feature = "sandbox", not(test)))]
-fn active_wasix_runner() -> Result<
-    sinomo_runtime::sandbox_wasix_host::SandboxWasixModuleCommandRunner,
+#[cfg(feature = "sandbox")]
+fn active_sandbox_executor_runner() -> Result<
+    sinomo_runtime::sandbox::SandboxExecutorCommandRunner,
     sinomo_runtime::sandbox::SandboxCommandExecutionError,
 > {
+    #[cfg(test)]
+    if let Some(module_path) = std::env::var_os("SINOMO_SANDBOX_EXECUTOR_NATIVE_MODULE_PATH") {
+        // SAFETY: this opt-in test path is explicitly supplied as a trusted
+        // native artifact by the test operator. Descriptor validation still
+        // requires the generic sandbox-executor interface before invocation.
+        return unsafe {
+            sinomo_runtime::sandbox::SandboxExecutorCommandRunner::from_verified_module_path(
+                module_path,
+            )
+        };
+    }
     let data_dir = SinomoDataDir::from_env_or_home().map_err(|error| {
         sinomo_runtime::sandbox::SandboxCommandExecutionError::Wasi(
             sinomo_runtime::sandbox::SandboxWasiError::Runtime {
@@ -413,16 +341,14 @@ fn active_wasix_runner() -> Result<
             },
         )
     })?;
-    sinomo_runtime::sandbox_wasix_host::SandboxWasixModuleCommandRunner::from_active_module(
-        data_dir.root(),
-    )
-    .map_err(|error| {
-        sinomo_runtime::sandbox::SandboxCommandExecutionError::Wasi(
-            sinomo_runtime::sandbox::SandboxWasiError::Runtime {
-                detail: error.to_string(),
-            },
-        )
-    })
+    sinomo_runtime::sandbox::SandboxExecutorCommandRunner::from_active_module(data_dir.root())
+        .map_err(|error| {
+            sinomo_runtime::sandbox::SandboxCommandExecutionError::Wasi(
+                sinomo_runtime::sandbox::SandboxWasiError::Runtime {
+                    detail: error.to_string(),
+                },
+            )
+        })
 }
 
 fn sandbox_cli_error_from_cli(error: CliError) -> sinomo_runtime::sandbox::SandboxCliError {

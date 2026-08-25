@@ -18,7 +18,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CloudFilesLocalChangeSyncMode, CloudFilesLocalChangeSyncStatus, CloudFilesModuleError,
     CloudFilesPlaceholderIdentity,
 };

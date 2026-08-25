@@ -101,6 +101,29 @@ pub fn register_services_for_data_dir(
     builder.register(BuildService::for_data_dir(data_dir))
 }
 
+/// Built-in component factory for the build service. The component owns its
+/// recovered queue and registry fragment; the daemon supplies only the generic
+/// data-directory context.
+pub fn component_factory()
+-> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor =
+        sinomo_module::component_descriptor_from_registration(&crate::build_module_registration())?;
+    Ok(
+        sinomo_module::StaticComponentFactory::new(descriptor, |context, scope| {
+            let data_dir_root = context.data_dir_root();
+            scope.set_services(
+                register_services_for_data_dir(
+                    sinomo_core::service::ServiceRegistry::builder(),
+                    &data_dir_root,
+                )
+                .build(),
+            );
+            Ok(())
+        })?
+        .with_storage_paths(crate::register_storage_paths),
+    )
+}
+
 impl Service for BuildService {
     fn name(&self) -> &'static str {
         "build"

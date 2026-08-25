@@ -881,22 +881,22 @@ pub fn run_daemon_control_loop(
     label: &str,
     cluster: Option<DaemonClusterStatus>,
 ) -> Result<(), DaemonError> {
-    run_daemon_control_loop_with_services(options, paths, label, cluster, Vec::new())
+    run_daemon_control_loop_with_components(options, paths, label, cluster, Vec::new())
 }
 
-pub fn run_daemon_control_loop_with_services(
+pub fn run_daemon_control_loop_with_components(
     options: crate::DaemonRunOptions,
     paths: DaemonPaths,
     label: &str,
     cluster: Option<DaemonClusterStatus>,
-    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+    component_factories: Vec<crate::DaemonComponentFactory>,
 ) -> Result<(), DaemonError> {
-    run_daemon_control_loop_with_services_and_profile(
+    run_daemon_control_loop_with_components_and_profile(
         options,
         paths,
         label,
         cluster,
-        service_hooks,
+        component_factories,
         crate::DaemonExecutionProfile::Standard,
     )
 }
@@ -904,12 +904,12 @@ pub fn run_daemon_control_loop_with_services(
 /// Runs the daemon with an explicit resource profile. Embedded application
 /// hosts use this entry point so mobile process constraints do not change the
 /// standard standalone daemon defaults.
-pub fn run_daemon_control_loop_with_services_and_profile(
+pub fn run_daemon_control_loop_with_components_and_profile(
     options: crate::DaemonRunOptions,
     paths: DaemonPaths,
     label: &str,
     cluster: Option<DaemonClusterStatus>,
-    service_hooks: Vec<crate::DaemonServiceRegistryHook>,
+    component_factories: Vec<crate::DaemonComponentFactory>,
     execution_profile: crate::DaemonExecutionProfile,
 ) -> Result<(), DaemonError> {
     crate::cluster::deny_shadow_daemon_local_raft_access(&paths)?;
@@ -933,7 +933,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     {
         tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
     }
-    crate::observe::register_observe_metric_exporters(&service_hooks);
+    sinomo_observe::register_builtin_observe_metric_exporters();
     let startup_local_raft_resident_initialized =
         match prune_local_cluster_raft_uncommitted_tail(&paths) {
             Ok(initialized) => initialized,
@@ -1086,14 +1086,14 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     // The service host is built before the maintenance loop so the loop can
     // publish the active service-registry snapshot's instances on its cluster
     // tick.
-    let service_host_ready_hooks = service_hooks.clone();
     let service_host = daemon_runtime.block_on(
-        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_components(
             paths.clone(),
             daemon_runtime_handle.clone(),
-            service_hooks,
+            component_factories,
         ),
     )?;
+    service_host.notify_component_host_start();
 
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
@@ -1170,22 +1170,6 @@ pub fn run_daemon_control_loop_with_services_and_profile(
             )),
         ));
     }
-    let mut lifecycle_modules = vec![sinomo_rollout::SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY];
-    if crate::service_adapter::nfs_module_should_register(&paths) {
-        lifecycle_modules.push(sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY);
-    }
-    runtime_tasks.extend(
-        crate::registry::start_internal_native_rust_module_runtime_tasks(
-            lifecycle_modules,
-            &paths,
-            &daemon_runtime_handle,
-            shutdown_rx.clone(),
-            label,
-            startup_cluster_runtime_enabled,
-        )?
-        .into_iter()
-        .map(crate::registry::NativeRustModuleRuntimeTask::into_parts),
-    );
     runtime_tasks.push((
         "background maintenance",
         daemon_runtime_handle.spawn(run_daemon_background_maintenance_loop(
@@ -1207,9 +1191,7 @@ pub fn run_daemon_control_loop_with_services_and_profile(
     // The listener is already bound and will accept queued connections as
     // soon as the runtime enters the loop below. Notify service-owned workers
     // through an in-process edge so startup never depends on a polling timer.
-    for hook in &service_host_ready_hooks {
-        hook.notify_host_ready();
-    }
+    service_host.notify_component_host_ready();
     daemon_runtime.block_on(run_daemon_control_accept_loop(
         listener,
         paths.clone(),
@@ -1415,10 +1397,6 @@ fn apply_daemon_dfs_maintenance_probe_result(
     *next_probe_at = decision.next_probe_at;
 }
 
-fn daemon_rollout_telemetry_enabled(label: &str, maintain_cluster_runtime: bool) -> bool {
-    label == "daemon" && maintain_cluster_runtime
-}
-
 async fn run_daemon_dfs_storage_environment_runtime_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
@@ -1481,27 +1459,6 @@ async fn run_daemon_dfs_remote_placement_observation_runtime_task(
     }
 }
 
-pub(crate) fn start_daemon_rollout_telemetry_runtime_task(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-    shutdown_rx: tokio::sync::watch::Receiver<bool>,
-    label: &str,
-    maintain_cluster_runtime: bool,
-) -> Result<Option<crate::registry::NativeRustModuleRuntimeTask>, DaemonError> {
-    if !daemon_rollout_telemetry_enabled(label, maintain_cluster_runtime) {
-        return Ok(None);
-    }
-    let data_dir = daemon_data_dir_path(paths)?;
-    let reactor = sinomo_rollout::RolloutTelemetryReactor::new(&data_dir)?;
-    let host = Arc::new(DaemonRolloutTelemetryHost {
-        paths: paths.clone(),
-    });
-    Ok(Some(crate::registry::NativeRustModuleRuntimeTask::new(
-        "rollout telemetry reconciliation",
-        runtime.spawn(reactor.run_until_stopped_async(host, shutdown_rx, label.to_string())),
-    )))
-}
-
 #[cfg(feature = "sandbox")]
 fn daemon_sandbox_lifecycle_maintenance_allowed(
     label: &str,
@@ -1535,6 +1492,7 @@ async fn run_daemon_background_maintenance_loop(
     // source for connectivity. Retain it for exactly the maintenance owner's
     // lifetime; periodic probing remains only an expiry refresh mechanism.
     let _connectivity_topology_subscription = connectivity_topology_subscription;
+    let mut service_registry_versions = service_registry.subscribe_versions();
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(
         idle_stats.clone(),
         startup_local_raft_resident_initialized,
@@ -2062,6 +2020,16 @@ async fn run_daemon_background_maintenance_loop(
                 }
                 if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
                     cluster_network.request_discovery_refresh(now);
+                }
+            }
+            changed = service_registry_versions.changed() => {
+                if changed.is_ok() {
+                    let version = *service_registry_versions.borrow_and_update();
+                    tracing::info!(
+                        version,
+                        "sinomo {label} service registry generation changed; scheduling discovery publication"
+                    );
+                    cluster_network.request_publish_refresh(Instant::now());
                 }
             }
         }
@@ -3823,8 +3791,8 @@ pub(crate) fn handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtim
 }
 
 /// Error returned by sandbox-execution RPC handlers when the daemon was built
-/// without the `sandbox` feature, so the build-heavy native WASIX module
-/// backend is not linked in.
+/// without the `sandbox` feature, so external sandbox executors are not
+/// available.
 #[cfg(not(feature = "sandbox"))]
 fn sandbox_runtime_not_compiled_error() -> DaemonError {
     DaemonError::Parse {
@@ -3852,7 +3820,7 @@ fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
     _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
     Err(DaemonError::Parse {
-        detail: "daemon-hosted dynamic SIFS WASIX process plans were removed; execute through direct-SIFS WASIX or the live DFS/FUSE simple sandbox".to_string(),
+        detail: "daemon-hosted dynamic SIFS sandbox process plans were removed; execute through an external sandbox executor or the live DFS/FUSE simple sandbox".to_string(),
     })
 }
 
@@ -3876,7 +3844,7 @@ fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
     _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
 ) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
     Err(DaemonError::Parse {
-        detail: "daemon-hosted dynamic SIFS WASIX commands were removed; execute through direct-SIFS WASIX or the live DFS/FUSE simple sandbox".to_string(),
+        detail: "daemon-hosted dynamic SIFS sandbox commands were removed; execute through an external sandbox executor or the live DFS/FUSE simple sandbox".to_string(),
     })
 }
 
@@ -4331,8 +4299,8 @@ fn open_daemon_sandbox_dfs_service_with_content_on_runtime(
 }
 
 #[derive(Clone, Debug)]
-struct DaemonRolloutTelemetryHost {
-    paths: DaemonPaths,
+pub(crate) struct DaemonRolloutTelemetryHost {
+    pub(crate) paths: DaemonPaths,
 }
 
 impl sinomo_rollout::RolloutTelemetryHost for DaemonRolloutTelemetryHost {
@@ -6059,12 +6027,26 @@ mod tests {
                         .send(stream_address.clone())
                         .expect("send listener address");
                     let service_host =
-                        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+                        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_components(
                             paths.clone(),
                             service_runtime.clone(),
-                            vec![crate::DaemonServiceRegistryHook::new(|builder| {
-                                builder.register(FailingRegistryService)
-                            })],
+                            vec![Arc::new(
+                                sinomo_module::StaticComponentFactory::new(
+                                    sinomo_module::ComponentDescriptor::new(
+                                        "test.failing-registry",
+                                        "1.0.0",
+                                    ),
+                                    |_, scope| {
+                                        scope.set_services(
+                                            sinomo_core::service::ServiceRegistry::builder()
+                                                .register(FailingRegistryService)
+                                                .build(),
+                                        );
+                                        Ok(())
+                                    },
+                                )
+                                .expect("failing registry test component"),
+                            )],
                         )
                         .await
                         .expect("service host");
@@ -6143,12 +6125,26 @@ mod tests {
                     address_tx
                         .send(stream_address.clone())
                         .expect("send listener address");
-                    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_services(
+                    let service_host = crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_components(
                         paths.clone(),
                         service_runtime.clone(),
-                        vec![crate::DaemonServiceRegistryHook::new(|builder| {
-                            builder.register(PermissionDeniedRegistryService)
-                        })],
+                        vec![Arc::new(
+                            sinomo_module::StaticComponentFactory::new(
+                                sinomo_module::ComponentDescriptor::new(
+                                    "test.permission-denied-registry",
+                                    "1.0.0",
+                                ),
+                                |_, scope| {
+                                    scope.set_services(
+                                        sinomo_core::service::ServiceRegistry::builder()
+                                            .register(PermissionDeniedRegistryService)
+                                            .build(),
+                                    );
+                                    Ok(())
+                                },
+                            )
+                            .expect("permission registry test component"),
+                        )],
                     )
                     .await
                     .expect("service host");
@@ -7631,19 +7627,6 @@ mod tests {
             ),
             Duration::from_secs(2),
             "pending sandbox lifecycle recovery must wake on its own cadence"
-        );
-    }
-
-    #[test]
-    fn rollout_telemetry_requires_startup_cluster_runtime() {
-        assert!(daemon_rollout_telemetry_enabled("daemon", true));
-        assert!(
-            !daemon_rollout_telemetry_enabled("daemon", false),
-            "a daemon that started unclustered must not adopt later cluster state through telemetry"
-        );
-        assert!(
-            !daemon_rollout_telemetry_enabled("shadow-daemon", true),
-            "the shadow supervisor never owns cluster rollout telemetry"
         );
     }
 

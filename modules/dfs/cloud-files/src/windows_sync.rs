@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT, CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE,
     CloudFilesLocalChangeSyncStatus, CloudFilesModuleError, CloudFilesPlaceholderIdentity,
     CloudFilesRetainedLocalEvidenceSummary, CloudFilesSyncAttentionKind,
@@ -264,7 +264,10 @@ impl<C: CloudFilesMountedMutationDaemon> CloudFilesMountedMutationHandoff<C> {
         let store = dfs::MountedSifsMutationOutboxStore::new(data_dir)
             .map_err(|error| error.to_string())?;
         let session = store
-            .open_host_mount_session(dfs::MountedSifsMutationAdapter::CloudFiles, mount_identity)
+            .open_host_mount_session(
+                dfs::MountedSifsMutationAdapter::ExternalProvider,
+                mount_identity,
+            )
             .map_err(|error| error.to_string())?;
         Ok(Self {
             inner: Mutex::new(CloudFilesMountedMutationHandoffInner {
@@ -4433,7 +4436,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use sinomo_dfs_cloud_files_api::CloudFilesLocalChangeSyncMode;
+    use crate::protocol::CloudFilesLocalChangeSyncMode;
 
     use super::*;
     use crate::local_change_queue::{CloudFilesExpectedObjectState, CloudFilesStagedContent};
@@ -5372,7 +5375,7 @@ mod tests {
         assert_eq!(&*events.lock().expect("events"), &["probe"]);
         let session = store
             .open_host_mount_session(
-                dfs::MountedSifsMutationAdapter::CloudFiles,
+                dfs::MountedSifsMutationAdapter::ExternalProvider,
                 "cloud-files:proof-no-session-opened",
             )
             .expect("failed Probe left no live host session");
@@ -6066,7 +6069,7 @@ mod tests {
             .expect("close completed after mutation");
         let replacement = store
             .open_host_mount_session(
-                dfs::MountedSifsMutationAdapter::CloudFiles,
+                dfs::MountedSifsMutationAdapter::ExternalProvider,
                 "cloud-files:replacement-after-clean-close",
             )
             .expect("clean close released session liveness");

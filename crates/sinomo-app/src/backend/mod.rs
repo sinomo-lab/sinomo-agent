@@ -36,8 +36,8 @@ use sinomo_runtime::cluster::{
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
 use sinomo_runtime::core::ClusterNodeRole;
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonExecutionProfile, DaemonServiceRegistryHook, daemon_cluster_status,
-    run_daemon_control_loop_with_services_and_profile,
+    DaemonClusterProcess, DaemonComponentFactory, DaemonExecutionProfile, daemon_cluster_status,
+    run_daemon_control_loop_with_components_and_profile,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterPaths;
@@ -861,10 +861,10 @@ fn start_in_process_daemon(
                 .map(SinomoDataDir::new)
                 .expect("embedded daemon paths must have a data directory parent");
             let hooks = vec![
-                agent_runtime_control_service_hook(control_host),
-                sinomo_cli::sifs_mount_supervisor_service_hook(data_dir, loop_paths.clone()),
+                agent_runtime_control_component_factory(control_host),
+                sinomo_cli::sifs_mount_supervisor_component_factory(data_dir, loop_paths.clone()),
             ];
-            if let Err(error) = run_daemon_control_loop_with_services_and_profile(
+            if let Err(error) = run_daemon_control_loop_with_components_and_profile(
                 options,
                 loop_paths,
                 "daemon",
@@ -933,18 +933,39 @@ fn in_process_daemon_cluster_status(
         })
 }
 
-fn agent_runtime_control_service_hook(
+fn agent_runtime_control_component_factory(
     control_host: sinomo_agent::AgentRuntimeControlRegistry,
-) -> DaemonServiceRegistryHook {
-    DaemonServiceRegistryHook::new(move |builder| {
-        let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> = Arc::new(control_host.clone());
-        sinomo_agent::register_services_with_runtime_control(builder, host)
-    })
-    .with_config_definitions(|builder| {
-        let builder =
-            sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
-        sinomo_evolution::register_config_definitions(builder).map_err(|error| error.to_string())
-    })
+) -> DaemonComponentFactory {
+    Arc::new(
+        sinomo_runtime::module::StaticComponentFactory::new(
+            sinomo_runtime::module::ComponentDescriptor::new(
+                "sinomo-agent-runtime-control",
+                env!("CARGO_PKG_VERSION"),
+            ),
+            move |_, scope| {
+                let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
+                    Arc::new(control_host.clone());
+                scope.set_services(
+                    sinomo_agent::register_services_with_runtime_control(
+                        sinomo_runtime::service::ServiceRegistry::builder(),
+                        host,
+                    )
+                    .build(),
+                );
+                Ok(())
+            },
+        )
+        .expect("agent runtime control component descriptor must be valid")
+        .with_config_definitions(register_agent_runtime_component_config_definitions),
+    )
+}
+
+fn register_agent_runtime_component_config_definitions(
+    builder: sinomo_runtime::config::ConfigRegistryBuilder,
+) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
+    let builder =
+        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    sinomo_evolution::register_config_definitions(builder).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -952,7 +973,6 @@ mod tests {
     use super::*;
     use sinomo_runtime::core::{ClusterBootstrapState, Id};
     use sinomo_runtime::node::NodeRole;
-    use sinomo_runtime::service::ServiceRegistry;
     use time::OffsetDateTime;
 
     #[cfg(not(target_os = "android"))]
@@ -1248,8 +1268,9 @@ mod tests {
 
     #[test]
     fn app_agent_runtime_control_hook_registers_read_and_control_routes() {
-        let hook =
-            agent_runtime_control_service_hook(sinomo_agent::AgentRuntimeControlRegistry::new());
+        let hook = agent_runtime_control_component_factory(
+            sinomo_agent::AgentRuntimeControlRegistry::new(),
+        );
         let config_registry = hook
             .register_config_definitions(sinomo_runtime::config::ConfigRegistry::builder())
             .expect("register app config definitions")
@@ -1278,7 +1299,13 @@ mod tests {
         hook.register_config_definitions(daemon_owned_builder)
             .expect("app hook must compose with daemon-owned config definitions");
 
-        let registry = hook.register(ServiceRegistry::builder()).build();
+        let root = sinomo_testdir::TestDir::new("app-agent-component");
+        let scope = hook
+            .mount(&sinomo_runtime::module::ComponentContext::new(Arc::new(
+                SinomoDataDir::new(&root),
+            )))
+            .expect("mount app agent component");
+        let registry = scope.services();
 
         for route in sinomo_agent::AGENT_OBJECT_RPC_ROUTES
             .iter()

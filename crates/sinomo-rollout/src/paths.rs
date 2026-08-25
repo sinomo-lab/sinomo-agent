@@ -5,19 +5,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const SANDBOX_WASIX_MODULE_PACKAGE: &str = "sinomo-sandbox-wasix-module";
-pub const SANDBOX_WASIX_MODULE_RUNTIME_FEATURE: &str = "sinomo-sandbox-wasix-module/wasix-runtime";
-pub const SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY: &str = "module/sandbox/wasix";
-pub const SANDBOX_WASIX_NATIVE_MODULE_SOURCE: &str = "rollout:modules/sandbox/wasix";
-pub const BENCHMARKS_MODULE_PACKAGE: &str = "sinomo-benchmarks";
-pub const BENCHMARKS_MODULE_ID: &str = "module.benchmarks";
-pub const BENCHMARKS_MODULE_INTERFACE_VERSION: &str = "sinomo.benchmarks.v1";
-pub const BENCHMARKS_NATIVE_MODULE_CACHE_KEY: &str = "module/benchmark/sinomo-benchmarks";
-pub const BENCHMARKS_NATIVE_MODULE_SOURCE: &str = "rollout:modules/benchmark/sinomo-benchmarks";
-pub const DFS_CLOUD_FILES_MODULE_PACKAGE: &str = "sinomo-dfs-cloud-files";
-pub const DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY: &str = "module/dfs/cloud-files";
-pub const DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE: &str = "rollout:modules/dfs/cloud-files";
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutPaths {
     pub root: PathBuf,
@@ -137,74 +124,61 @@ pub fn native_dylib_library_name(stem: &str) -> String {
     }
 }
 
-pub fn sandbox_wasix_native_module_library_name() -> String {
-    native_dylib_library_name("sinomo_sandbox_wasix_module")
-}
-
-pub fn benchmarks_native_module_library_name() -> String {
-    native_dylib_library_name("sinomo_benchmarks")
-}
-
-pub fn dfs_cloud_files_native_module_library_name() -> String {
-    native_dylib_library_name("sinomo_dfs_cloud_files")
-}
-
 pub fn default_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Vec<SelfRolloutNativeDylibModuleBuild> {
-    discover_default_native_dylib_module_builds(build_dir)
-        .unwrap_or_else(|_| legacy_default_native_dylib_module_builds(build_dir))
+    discover_default_native_dylib_module_builds(build_dir).unwrap_or_default()
 }
 
 pub fn discover_default_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    let discovered = discover_native_dylib_module_builds(build_dir)?;
-    if discovered.is_empty() {
-        Ok(legacy_default_native_dylib_module_builds(build_dir))
-    } else {
-        Ok(discovered)
-    }
+    module_builds_from_signed_profile(build_dir, false)
 }
 
 pub fn discover_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    discover_native_dylib_module_builds_with_options(
-        build_dir,
-        NativeDylibModuleDiscoveryOptions::default(),
-    )
+    discover_default_native_dylib_module_builds(build_dir)
 }
 
 pub fn discover_all_native_dylib_module_builds(
     build_dir: &Path,
 ) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    discover_native_dylib_module_builds_with_options(
-        build_dir,
-        NativeDylibModuleDiscoveryOptions {
-            include_non_default: true,
-        },
-    )
+    module_builds_from_signed_profile(build_dir, true)
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct NativeDylibModuleDiscoveryOptions {
-    include_non_default: bool,
-}
-
-fn discover_native_dylib_module_builds_with_options(
+fn module_builds_from_signed_profile(
     build_dir: &Path,
-    options: NativeDylibModuleDiscoveryOptions,
+    include_non_default: bool,
 ) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    let manifests = discover_module_package_manifests(build_dir)?;
-    let mut modules = Vec::new();
-    for manifest in manifests {
-        if let Some(module) =
-            native_dylib_module_build_from_manifest(build_dir, &manifest, options)?
-        {
-            modules.push(module);
+    let Some(profile) = crate::read_module_distribution_profile(build_dir).map_err(|error| {
+        RolloutError::InvalidArtifact {
+            detail: error.to_string(),
         }
-    }
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut modules = profile
+        .modules
+        .into_iter()
+        .filter(|entry| entry.applies_to_current_platform())
+        .filter(|entry| include_non_default || entry.default_enabled)
+        .map(|entry| {
+            let library_name = distribution_library_name(&entry.library_name);
+            SelfRolloutNativeDylibModuleBuild {
+                package: entry.package,
+                features: entry.features,
+                module_id: entry.module_id,
+                interface_version: entry.interface_version,
+                cache_key: entry.cache_key,
+                built_library: build_dir.join("target").join("debug").join(&library_name),
+                library_name,
+                source: entry.source,
+            }
+        })
+        .collect::<Vec<_>>();
     modules.sort_by(|left, right| {
         left.source
             .cmp(&right.source)
@@ -213,48 +187,37 @@ fn discover_native_dylib_module_builds_with_options(
     Ok(modules)
 }
 
+fn distribution_library_name(stem_or_name: &str) -> String {
+    let extension = Path::new(stem_or_name)
+        .extension()
+        .and_then(|extension| extension.to_str());
+    if matches!(extension, Some("dll" | "dylib" | "so")) {
+        stem_or_name.to_string()
+    } else {
+        native_dylib_library_name(stem_or_name)
+    }
+}
+
 pub fn discover_native_dylib_module_platform_policies(
     build_dir: &Path,
 ) -> Result<Vec<NativeDylibModulePlatformPolicy>, RolloutError> {
-    let manifests = discover_module_package_manifests(build_dir)?;
-    let mut policies = Vec::new();
-    for manifest_path in manifests {
-        let manifest = fs::read_to_string(&manifest_path).map_err(|source| RolloutError::Io {
-            path: manifest_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let parsed = toml::from_str::<toml::Value>(&manifest).map_err(|source| {
-            RolloutError::InvalidArtifact {
-                detail: format!("parse {}: {source}", manifest_path.display()),
-            }
-        })?;
-        let Some(native_dylib) = parsed
-            .get("package")
-            .and_then(|package| package.get("metadata"))
-            .and_then(|metadata| metadata.get("sinomo"))
-            .and_then(|sinomo| sinomo.get("native-dylib"))
-        else {
-            continue;
-        };
-        let module_id = metadata_string(native_dylib, "module-id", &manifest_path)?;
-        let relative_package_dir = manifest_path
-            .parent()
-            .and_then(|parent| parent.strip_prefix(build_dir).ok())
-            .ok_or_else(|| RolloutError::InvalidArtifact {
-                detail: format!(
-                    "{} is not under rollout build dir {}",
-                    manifest_path.display(),
-                    build_dir.display()
-                ),
-            })?;
-        let source = metadata_optional_string(native_dylib, "source", &manifest_path)?
-            .unwrap_or_else(|| format!("rollout:{}", path_to_slash_string(relative_package_dir)));
-        policies.push(NativeDylibModulePlatformPolicy {
-            module_id,
-            source,
-            platforms: metadata_string_array(native_dylib, "platforms", &manifest_path)?,
-        });
-    }
+    let Some(profile) = crate::read_module_distribution_profile(build_dir).map_err(|error| {
+        RolloutError::InvalidArtifact {
+            detail: error.to_string(),
+        }
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut policies = profile
+        .modules
+        .into_iter()
+        .map(|entry| NativeDylibModulePlatformPolicy {
+            module_id: entry.module_id,
+            source: entry.source,
+            platforms: entry.platforms,
+        })
+        .collect::<Vec<_>>();
     policies.sort_by(|left, right| left.module_id.cmp(&right.module_id));
     Ok(policies)
 }
@@ -335,287 +298,6 @@ pub fn reconcile_rollout_native_dylib_platforms(
     Ok(NativeDylibPlatformReconciliationReport {
         removed_module_ids: removed_module_ids.into_iter().collect(),
     })
-}
-
-fn legacy_default_native_dylib_module_builds(
-    build_dir: &Path,
-) -> Vec<SelfRolloutNativeDylibModuleBuild> {
-    let library_name = sandbox_wasix_native_module_library_name();
-    let mut modules = vec![SelfRolloutNativeDylibModuleBuild {
-        package: SANDBOX_WASIX_MODULE_PACKAGE.to_string(),
-        features: vec![SANDBOX_WASIX_MODULE_RUNTIME_FEATURE.to_string()],
-        module_id: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
-        interface_version: sinomo_sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION
-            .to_string(),
-        cache_key: SANDBOX_WASIX_NATIVE_MODULE_CACHE_KEY.to_string(),
-        library_name: library_name.clone(),
-        built_library: build_dir.join("target").join("debug").join(library_name),
-        source: SANDBOX_WASIX_NATIVE_MODULE_SOURCE.to_string(),
-    }];
-    if cfg!(windows) {
-        modules.push(dfs_cloud_files_native_dylib_module_build(build_dir));
-    }
-    modules
-}
-
-fn discover_module_package_manifests(build_dir: &Path) -> Result<Vec<PathBuf>, RolloutError> {
-    let modules_dir = build_dir.join("modules");
-    if !modules_dir.exists() {
-        return Ok(Vec::new());
-    }
-    let mut manifests = Vec::new();
-    let mut family_dirs = read_sorted_dirs(&modules_dir)?;
-    family_dirs.sort();
-    for family_dir in family_dirs {
-        let mut module_dirs = read_sorted_dirs(&family_dir)?;
-        module_dirs.sort();
-        for module_dir in module_dirs {
-            let manifest = module_dir.join("Cargo.toml");
-            if manifest.exists() {
-                manifests.push(manifest);
-            }
-        }
-    }
-    Ok(manifests)
-}
-
-fn read_sorted_dirs(path: &Path) -> Result<Vec<PathBuf>, RolloutError> {
-    let entries = fs::read_dir(path).map_err(|source| RolloutError::Io {
-        path: path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let mut dirs = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|source| RolloutError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        let file_type = entry.file_type().map_err(|source| RolloutError::Io {
-            path: entry.path().display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if file_type.is_dir() {
-            dirs.push(entry.path());
-        }
-    }
-    dirs.sort();
-    Ok(dirs)
-}
-
-fn native_dylib_module_build_from_manifest(
-    build_dir: &Path,
-    manifest_path: &Path,
-    options: NativeDylibModuleDiscoveryOptions,
-) -> Result<Option<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    let manifest = fs::read_to_string(manifest_path).map_err(|source| RolloutError::Io {
-        path: manifest_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let parsed = toml::from_str::<toml::Value>(&manifest).map_err(|source| {
-        RolloutError::InvalidArtifact {
-            detail: format!("parse {}: {source}", manifest_path.display()),
-        }
-    })?;
-    let Some(native_dylib) = parsed
-        .get("package")
-        .and_then(|package| package.get("metadata"))
-        .and_then(|metadata| metadata.get("sinomo"))
-        .and_then(|sinomo| sinomo.get("native-dylib"))
-    else {
-        return Ok(None);
-    };
-    if !options.include_non_default && !metadata_bool(native_dylib, "default", true, manifest_path)?
-    {
-        return Ok(None);
-    }
-    if !metadata_platform_matches(native_dylib, manifest_path)? {
-        return Ok(None);
-    }
-
-    let package = parsed
-        .get("package")
-        .and_then(|package| package.get("name"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| RolloutError::InvalidArtifact {
-            detail: format!("{} is missing package.name", manifest_path.display()),
-        })?;
-    let module_id = metadata_string(native_dylib, "module-id", manifest_path)?;
-    let interface_version = metadata_string(native_dylib, "interface-version", manifest_path)?;
-    let relative_package_dir = manifest_path
-        .parent()
-        .and_then(|parent| parent.strip_prefix(build_dir).ok())
-        .ok_or_else(|| RolloutError::InvalidArtifact {
-            detail: format!(
-                "{} is not under rollout build dir {}",
-                manifest_path.display(),
-                build_dir.display()
-            ),
-        })?;
-    let source = metadata_optional_string(native_dylib, "source", manifest_path)?
-        .unwrap_or_else(|| format!("rollout:{}", path_to_slash_string(relative_package_dir)));
-    let cache_key = metadata_optional_string(native_dylib, "cache-key", manifest_path)?
-        .unwrap_or_else(|| path_to_slash_string(relative_package_dir));
-    let library_name = match metadata_optional_string(native_dylib, "library-name", manifest_path)?
-    {
-        Some(library_name) => library_name,
-        None => {
-            let stem = metadata_optional_string(native_dylib, "library-stem", manifest_path)?
-                .unwrap_or_else(|| package.replace('-', "_"));
-            native_dylib_library_name(&stem)
-        }
-    };
-    let features = metadata_string_array(native_dylib, "features", manifest_path)?;
-
-    Ok(Some(SelfRolloutNativeDylibModuleBuild {
-        package: package.to_string(),
-        features,
-        module_id,
-        interface_version,
-        cache_key,
-        library_name: library_name.clone(),
-        built_library: build_dir.join("target").join("debug").join(library_name),
-        source,
-    }))
-}
-
-fn metadata_bool(
-    table: &toml::Value,
-    key: &str,
-    default: bool,
-    manifest_path: &Path,
-) -> Result<bool, RolloutError> {
-    match table.get(key) {
-        None => Ok(default),
-        Some(value) => value
-            .as_bool()
-            .ok_or_else(|| RolloutError::InvalidArtifact {
-                detail: format!(
-                    "{} metadata `{key}` must be a boolean",
-                    manifest_path.display()
-                ),
-            }),
-    }
-}
-
-fn metadata_string(
-    table: &toml::Value,
-    key: &str,
-    manifest_path: &Path,
-) -> Result<String, RolloutError> {
-    metadata_optional_string(table, key, manifest_path)?.ok_or_else(|| {
-        RolloutError::InvalidArtifact {
-            detail: format!(
-                "{} metadata is missing required `{key}`",
-                manifest_path.display()
-            ),
-        }
-    })
-}
-
-fn metadata_optional_string(
-    table: &toml::Value,
-    key: &str,
-    manifest_path: &Path,
-) -> Result<Option<String>, RolloutError> {
-    match table.get(key) {
-        None => Ok(None),
-        Some(value) => value
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| Some(value.trim().to_string()))
-            .ok_or_else(|| RolloutError::InvalidArtifact {
-                detail: format!(
-                    "{} metadata `{key}` must be a non-empty string",
-                    manifest_path.display()
-                ),
-            }),
-    }
-}
-
-fn metadata_string_array(
-    table: &toml::Value,
-    key: &str,
-    manifest_path: &Path,
-) -> Result<Vec<String>, RolloutError> {
-    let Some(value) = table.get(key) else {
-        return Ok(Vec::new());
-    };
-    let array = value
-        .as_array()
-        .ok_or_else(|| RolloutError::InvalidArtifact {
-            detail: format!(
-                "{} metadata `{key}` must be an array",
-                manifest_path.display()
-            ),
-        })?;
-    let mut values = Vec::new();
-    for item in array {
-        let value = item
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| RolloutError::InvalidArtifact {
-                detail: format!(
-                    "{} metadata `{key}` entries must be non-empty strings",
-                    manifest_path.display()
-                ),
-            })?;
-        values.push(value.trim().to_string());
-    }
-    Ok(values)
-}
-
-fn metadata_platform_matches(
-    table: &toml::Value,
-    manifest_path: &Path,
-) -> Result<bool, RolloutError> {
-    let platforms = metadata_string_array(table, "platforms", manifest_path)?;
-    if platforms.is_empty() {
-        return Ok(true);
-    }
-    let current_os = env::consts::OS;
-    Ok(platforms.iter().any(|platform| {
-        platform == current_os
-            || (platform == "windows" && cfg!(windows))
-            || (platform == "unix" && cfg!(unix))
-    }))
-}
-
-fn path_to_slash_string(path: &Path) -> String {
-    path.components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
-pub fn benchmark_native_dylib_module_build(build_dir: &Path) -> SelfRolloutNativeDylibModuleBuild {
-    let library_name = benchmarks_native_module_library_name();
-    SelfRolloutNativeDylibModuleBuild {
-        package: BENCHMARKS_MODULE_PACKAGE.to_string(),
-        features: Vec::new(),
-        module_id: BENCHMARKS_MODULE_ID.to_string(),
-        interface_version: BENCHMARKS_MODULE_INTERFACE_VERSION.to_string(),
-        cache_key: BENCHMARKS_NATIVE_MODULE_CACHE_KEY.to_string(),
-        library_name: library_name.clone(),
-        built_library: build_dir.join("target").join("debug").join(library_name),
-        source: BENCHMARKS_NATIVE_MODULE_SOURCE.to_string(),
-    }
-}
-
-pub fn dfs_cloud_files_native_dylib_module_build(
-    build_dir: &Path,
-) -> SelfRolloutNativeDylibModuleBuild {
-    let library_name = dfs_cloud_files_native_module_library_name();
-    SelfRolloutNativeDylibModuleBuild {
-        package: DFS_CLOUD_FILES_MODULE_PACKAGE.to_string(),
-        features: Vec::new(),
-        module_id: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID.to_string(),
-        interface_version: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
-            .to_string(),
-        cache_key: DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY.to_string(),
-        library_name: library_name.clone(),
-        built_library: build_dir.join("target").join("debug").join(library_name),
-        source: DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE.to_string(),
-    }
 }
 
 pub fn append_native_dylib_module_build_args(
@@ -708,77 +390,66 @@ mod tests {
     }
 
     #[test]
-    fn native_dylib_module_builds_are_discovered_from_module_metadata() {
+    fn native_dylib_module_builds_come_from_signed_distribution_profile() {
         let root = unique_temp("native-dylib-discovery");
-        let module_dir = root.join("modules/remote/management");
-        fs::create_dir_all(&module_dir).expect("module dir");
-        fs::write(
-            module_dir.join("Cargo.toml"),
-            r#"
-[package]
-name = "sinomo-remote-management-module"
-version = "0.1.0"
-
-[package.metadata.sinomo.native-dylib]
-module-id = "module.remote-management"
-interface-version = "sinomo.remote-management.v2"
-cache-key = "module/remote/management"
-source = "rollout:modules/remote/management"
-"#,
-        )
-        .expect("manifest");
+        write_profile(
+            &root,
+            vec![profile_entry(
+                "module.external-fixture",
+                "sinomo.external-fixture.v2",
+                "external-fixture-module",
+                "module/external-fixture",
+                "external_fixture_module",
+                "profile:external-fixture",
+                Vec::new(),
+                true,
+            )],
+        );
 
         let modules = discover_default_native_dylib_module_builds(&root).expect("discover modules");
 
         assert_eq!(modules.len(), 1);
-        assert_eq!(modules[0].package, "sinomo-remote-management-module");
-        assert_eq!(modules[0].module_id, "module.remote-management");
-        assert_eq!(modules[0].interface_version, "sinomo.remote-management.v2");
-        assert_eq!(modules[0].cache_key, "module/remote/management");
-        assert_eq!(modules[0].source, "rollout:modules/remote/management");
+        assert_eq!(modules[0].package, "external-fixture-module");
+        assert_eq!(modules[0].module_id, "module.external-fixture");
+        assert_eq!(modules[0].interface_version, "sinomo.external-fixture.v2");
+        assert_eq!(modules[0].cache_key, "module/external-fixture");
+        assert_eq!(modules[0].source, "profile:external-fixture");
         assert_eq!(
             modules[0].built_library,
             root.join("target")
                 .join("debug")
-                .join(native_dylib_library_name("sinomo_remote_management_module"))
+                .join(native_dylib_library_name("external_fixture_module"))
         );
     }
 
     #[test]
-    fn native_dylib_module_discovery_filters_platforms_and_opt_in_modules() {
+    fn signed_profile_filters_platforms_and_opt_in_modules() {
         let root = unique_temp("native-dylib-discovery-filter");
-        let windows_dir = root.join("modules/dfs/cloud-files");
-        let benchmark_dir = root.join("modules/benchmark/sinomo-benchmarks");
-        fs::create_dir_all(&windows_dir).expect("windows module dir");
-        fs::create_dir_all(&benchmark_dir).expect("benchmark module dir");
-        fs::write(
-            windows_dir.join("Cargo.toml"),
-            r#"
-[package]
-name = "sinomo-dfs-cloud-files"
-version = "0.1.0"
-
-[package.metadata.sinomo.native-dylib]
-module-id = "module.dfs.cloud-files"
-interface-version = "sinomo.dfs.cloud-files.v1"
-platforms = ["windows"]
-"#,
-        )
-        .expect("windows manifest");
-        fs::write(
-            benchmark_dir.join("Cargo.toml"),
-            r#"
-[package]
-name = "sinomo-benchmarks"
-version = "0.1.0"
-
-[package.metadata.sinomo.native-dylib]
-module-id = "module.benchmarks"
-interface-version = "sinomo.benchmarks.v1"
-default = false
-"#,
-        )
-        .expect("benchmark manifest");
+        write_profile(
+            &root,
+            vec![
+                profile_entry(
+                    "module.platform-fixture",
+                    "sinomo.platform-fixture.v1",
+                    "platform-fixture-module",
+                    "module/platform-fixture",
+                    "platform_fixture_module",
+                    "profile:platform-fixture",
+                    vec!["windows".to_string()],
+                    true,
+                ),
+                profile_entry(
+                    "module.opt-in-fixture",
+                    "sinomo.opt-in-fixture.v1",
+                    "opt-in-fixture-module",
+                    "module/opt-in-fixture",
+                    "opt_in_fixture_module",
+                    "profile:opt-in-fixture",
+                    Vec::new(),
+                    false,
+                ),
+            ],
+        );
 
         let modules = discover_default_native_dylib_module_builds(&root).expect("discover modules");
         let all_modules =
@@ -787,27 +458,27 @@ default = false
         assert_eq!(
             modules
                 .iter()
-                .any(|module| module.package == "sinomo-dfs-cloud-files"),
+                .any(|module| module.package == "platform-fixture-module"),
             cfg!(windows)
         );
         assert!(
             modules
                 .iter()
-                .all(|module| module.package != "sinomo-benchmarks")
+                .all(|module| module.package != "opt-in-fixture-module")
         );
         assert!(
             all_modules
                 .iter()
-                .any(|module| module.package == "sinomo-benchmarks")
+                .any(|module| module.package == "opt-in-fixture-module")
         );
     }
 
     #[test]
     fn loader_host_compatibility_uses_exact_platform_and_generic_abi() {
         let state = test_native_dylib_loader_state(
-            "module.network-iroh",
+            "module.external-network",
             "x86_64-windows-windows",
-            "rollout:modules/network/iroh",
+            "profile:external-network",
         );
         assert!(native_dylib_loader_state_is_host_compatible_for(
             &state, "x86_64", "windows", "windows"
@@ -833,28 +504,12 @@ default = false
     #[test]
     fn platform_reconciliation_removes_rollout_state_omitted_on_this_host() {
         let root = unique_temp("native-dylib-platform-reconcile");
-        let module_dir = root
-            .join("source/sinomo")
-            .join("modules/test/opposite-platform");
-        fs::create_dir_all(&module_dir).expect("module dir");
         let excluded_platform = if cfg!(windows) { "unix" } else { "windows" };
-        fs::write(
-            module_dir.join("Cargo.toml"),
-            format!(
-                r#"
-[package]
-name = "sinomo-opposite-platform-module"
-version = "0.1.0"
-
-[package.metadata.sinomo.native-dylib]
-module-id = "module.opposite-platform"
-interface-version = "sinomo.opposite-platform.v1"
-source = "rollout:modules/test/opposite-platform"
-platforms = ["{excluded_platform}"]
-"#
-            ),
-        )
-        .expect("manifest");
+        write_platform_policy(
+            &SelfRolloutPaths::new(&root).source_repo,
+            "module.opposite-platform",
+            excluded_platform,
+        );
         let state = test_native_dylib_loader_state(
             "module.opposite-platform",
             &format!(
@@ -888,16 +543,16 @@ platforms = ["{excluded_platform}"]
     #[test]
     fn platform_reconciliation_preserves_manual_same_id_override() {
         let root = unique_temp("native-dylib-platform-manual-override");
-        write_opposite_platform_policy(&root, "module.network-iroh");
+        write_opposite_platform_policy(&root, "module.external-network");
         let state = test_native_dylib_loader_state(
-            "module.network-iroh",
+            "module.external-network",
             &format!(
                 "{}-{}-{}",
                 env::consts::ARCH,
                 env::consts::OS,
                 env::consts::FAMILY
             ),
-            "manual:operator-installed-iroh",
+            "manual:operator-installed-external-network",
         );
         sinomo_module::write_native_dylib_module_loader_state(&root, &state)
             .expect("write loader state");
@@ -982,75 +637,6 @@ platforms = ["{excluded_platform}"]
         );
     }
 
-    #[test]
-    fn benchmark_native_dylib_module_build_is_opt_in() {
-        let build_dir = Path::new("/tmp/sinomo-source");
-        let default_modules = default_native_dylib_module_builds(build_dir);
-        let benchmark_module = benchmark_native_dylib_module_build(build_dir);
-
-        assert!(
-            default_modules
-                .iter()
-                .all(|module| module.package != BENCHMARKS_MODULE_PACKAGE)
-        );
-        assert_eq!(benchmark_module.package, BENCHMARKS_MODULE_PACKAGE);
-        assert_eq!(benchmark_module.module_id, BENCHMARKS_MODULE_ID);
-        assert_eq!(
-            benchmark_module.interface_version,
-            BENCHMARKS_MODULE_INTERFACE_VERSION
-        );
-        assert_eq!(
-            benchmark_module.cache_key,
-            BENCHMARKS_NATIVE_MODULE_CACHE_KEY
-        );
-        assert_eq!(benchmark_module.source, BENCHMARKS_NATIVE_MODULE_SOURCE);
-        assert_eq!(
-            benchmark_module.built_library,
-            build_dir
-                .join("target")
-                .join("debug")
-                .join(benchmarks_native_module_library_name())
-        );
-    }
-
-    #[test]
-    fn dfs_cloud_files_native_dylib_module_is_default_only_on_windows() {
-        let build_dir = Path::new("/tmp/sinomo-source");
-        let default_modules = default_native_dylib_module_builds(build_dir);
-        let cloud_files_module = dfs_cloud_files_native_dylib_module_build(build_dir);
-
-        assert_eq!(cloud_files_module.package, DFS_CLOUD_FILES_MODULE_PACKAGE);
-        assert_eq!(
-            cloud_files_module.module_id,
-            sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID
-        );
-        assert_eq!(
-            cloud_files_module.interface_version,
-            sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
-        );
-        assert_eq!(
-            cloud_files_module.cache_key,
-            DFS_CLOUD_FILES_NATIVE_MODULE_CACHE_KEY
-        );
-        assert_eq!(
-            cloud_files_module.source,
-            DFS_CLOUD_FILES_NATIVE_MODULE_SOURCE
-        );
-        assert_eq!(
-            cloud_files_module.built_library,
-            build_dir
-                .join("target")
-                .join("debug")
-                .join(dfs_cloud_files_native_module_library_name())
-        );
-        assert_eq!(
-            default_modules
-                .iter()
-                .any(|module| module.package == DFS_CLOUD_FILES_MODULE_PACKAGE),
-            cfg!(windows)
-        );
-    }
-
     fn unique_temp(label: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-rollout-{label}"))
     }
@@ -1062,25 +648,52 @@ platforms = ["{excluded_platform}"]
     }
 
     fn write_platform_policy(source_repo: &Path, module_id: &str, platform: &str) {
-        let module_dir = source_repo.join("modules/test/opposite-platform");
-        fs::create_dir_all(&module_dir).expect("module dir");
-        fs::write(
-            module_dir.join("Cargo.toml"),
-            format!(
-                r#"
-[package]
-name = "sinomo-opposite-platform-module"
-version = "0.1.0"
+        write_profile(
+            source_repo,
+            vec![profile_entry(
+                module_id,
+                "sinomo.opposite-platform.v1",
+                "sinomo-opposite-platform-module",
+                "module/test/opposite-platform",
+                "sinomo_opposite_platform_module",
+                "rollout:modules/test/opposite-platform",
+                vec![platform.to_string()],
+                true,
+            )],
+        );
+    }
 
-[package.metadata.sinomo.native-dylib]
-module-id = "{module_id}"
-interface-version = "sinomo.opposite-platform.v1"
-source = "rollout:modules/test/opposite-platform"
-platforms = ["{platform}"]
-"#
-            ),
-        )
-        .expect("manifest");
+    fn profile_entry(
+        module_id: &str,
+        interface_version: &str,
+        package: &str,
+        cache_key: &str,
+        library_stem: &str,
+        source: &str,
+        platforms: Vec<String>,
+        default_enabled: bool,
+    ) -> crate::ModuleDistributionEntry {
+        crate::ModuleDistributionEntry {
+            module_id: module_id.to_string(),
+            interface_version: interface_version.to_string(),
+            package: package.to_string(),
+            features: Vec::new(),
+            cache_key: cache_key.to_string(),
+            library_name: library_stem.to_string(),
+            source: source.to_string(),
+            platforms,
+            default_enabled,
+        }
+    }
+
+    fn write_profile(root: &Path, entries: Vec<crate::ModuleDistributionEntry>) {
+        let signer_root = root.join(".module-profile-signer");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&signer_root)
+            .expect("profile signer");
+        let mut profile = crate::ModuleDistributionProfile::new("test", "1");
+        profile.modules = entries;
+        crate::sign_module_distribution_profile(&mut profile, &identity).expect("sign profile");
+        crate::write_module_distribution_profile(root, &profile).expect("write profile");
     }
 
     fn test_native_dylib_loader_state(

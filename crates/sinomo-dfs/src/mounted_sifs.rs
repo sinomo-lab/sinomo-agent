@@ -1251,14 +1251,11 @@ mod tests {
             version: sinomo_core::kv::KvVersion(1),
             lease_id: None,
         };
-        let service_record = sinomo_core::service::ServiceInstanceRecord {
-            service: "dfs".to_string(),
-            node_id: active.clone(),
-            registry_version: 1,
-            routes: vec![crate::DFS_STATUS_ROUTE.to_string()],
-            capabilities: vec!["dfs.object.transfer".to_string()],
-            updated_at: time::OffsetDateTime::now_utc(),
-        };
+        let mut service_record =
+            sinomo_core::service::ServiceInstanceRecord::new("dfs", active.clone());
+        service_record.routes = vec![crate::DFS_STATUS_ROUTE.to_string()];
+        service_record.provider_capabilities = vec!["dfs.object.transfer".to_string()];
+        service_record.updated_at = time::OffsetDateTime::now_utc();
         let service_entry = KvEntry {
             key: sinomo_core::service::cluster_service_instance_key("dfs", &active),
             value: sinomo_core::kv::encode_kv_value(&service_record).expect("encode service"),

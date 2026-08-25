@@ -13,7 +13,7 @@ ring = "r1"
 
 [package.metadata.sinomo.native-dylib]
 module-id = "module.sandbox.wasix"
-interface-version = "sinomo.sandbox.wasix.v1"
+interface-version = "1.0.0"
 cache-key = "module/sandbox/wasix"
 source = "rollout:modules/sandbox/wasix"
 features = ["sinomo-sandbox-wasix-module/wasix-runtime"]
@@ -49,7 +49,7 @@ time.workspace = true
 sinomo-core = { path = "../../../crates/sinomo-core" }
 sinomo-dfs = { path = "../../../crates/sinomo-dfs" }
 sinomo-module = { path = "../../../crates/sinomo-module" }
-sinomo-sandbox-wasix-api = { path = "../../../crates/sinomo-sandbox-wasix-api" }
+sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
 wasmtime = { version = "46.0.1", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"], optional = true }
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "time"], optional = true }
 # These patched Wasmer/WASIX crates and the webc type passed into WasiRunner

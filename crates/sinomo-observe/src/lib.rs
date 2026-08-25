@@ -910,6 +910,19 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
     builder.register(ObserveService::new())
 }
 
+pub fn component_factory()
+-> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor =
+        sinomo_module::component_descriptor_from_registration(&observe_module_registration())?;
+    Ok(
+        sinomo_module::StaticComponentFactory::new(descriptor, |_, scope| {
+            scope.set_services(register_services(ServiceRegistryBuilder::default()).build());
+            Ok(())
+        })?
+        .with_storage_paths(register_storage_paths),
+    )
+}
+
 impl Service for ObserveService {
     fn name(&self) -> &'static str {
         "observe"

@@ -8,7 +8,9 @@
 //! layer's [`ClusterDirectory`] for reachability instead of owning its own
 //! routing rules.
 
-use crate::{ClusterAccess, ServiceError, ServiceRegistry};
+use crate::{
+    ClusterAccess, ServiceDiscoveryHealth, ServiceDiscoveryLocality, ServiceError, ServiceRegistry,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use sinomo_kv::ClusterKvTxnCommitResult;
@@ -35,24 +37,69 @@ pub fn cluster_service_prefix(service: &str) -> String {
 /// capabilities it exports, and when the registration was last refreshed.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ServiceInstanceRecord {
-    pub service: String,
+    #[serde(alias = "service")]
+    pub service_id: String,
+    pub interface_id: String,
+    pub interface_version: String,
     pub node_id: NodeId,
     /// Service registry snapshot version that produced this record.
     pub registry_version: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub capabilities: Vec<String>,
+    pub provider_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_requirements: Vec<String>,
+    pub component_id: String,
+    pub component_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub component_generation: u64,
+    #[serde(default)]
+    pub health: ServiceDiscoveryHealth,
+    #[serde(default)]
+    pub locality: ServiceDiscoveryLocality,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
 
 impl ServiceInstanceRecord {
+    pub fn new(service_id: impl Into<String>, node_id: NodeId) -> Self {
+        let service_id = service_id.into();
+        Self {
+            interface_id: format!("sinomo.object-rpc/{service_id}"),
+            interface_version: "legacy".to_string(),
+            component_id: service_id.clone(),
+            component_version: "legacy".to_string(),
+            service_id,
+            node_id,
+            registry_version: 1,
+            routes: Vec::new(),
+            provider_capabilities: Vec::new(),
+            caller_requirements: Vec::new(),
+            artifact_id: None,
+            component_generation: 1,
+            health: ServiceDiscoveryHealth::Ready,
+            locality: ServiceDiscoveryLocality::Cluster,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
     fn stable_eq(&self, other: &Self) -> bool {
-        self.service == other.service
+        self.service_id == other.service_id
+            && self.interface_id == other.interface_id
+            && self.interface_version == other.interface_version
             && self.node_id == other.node_id
             && self.routes == other.routes
-            && self.capabilities == other.capabilities
+            && self.provider_capabilities == other.provider_capabilities
+            && self.caller_requirements == other.caller_requirements
+            && self.component_id == other.component_id
+            && self.component_version == other.component_version
+            && self.artifact_id == other.artifact_id
+            && self.component_generation == other.component_generation
+            && self.health == other.health
+            && self.locality == other.locality
     }
 }
 
@@ -63,26 +110,56 @@ pub fn service_instance_records_from_registry(
     registry_version: u64,
     now: OffsetDateTime,
 ) -> Vec<ServiceInstanceRecord> {
-    let mut by_service: std::collections::BTreeMap<&str, ServiceInstanceRecord> =
+    let mut by_service: std::collections::BTreeMap<String, ServiceInstanceRecord> =
         std::collections::BTreeMap::new();
     for route in registry.route_categories() {
-        let Some(service) = registry.category_for_route(&route.route) else {
-            continue;
-        };
+        let identity = route
+            .discovery
+            .clone()
+            .unwrap_or_else(|| crate::ServiceDiscoveryIdentity {
+                service_id: route.category.clone(),
+                interface_id: format!("sinomo.object-rpc/{}", route.category),
+                interface_version: "legacy".to_string(),
+                provider_capabilities: Vec::new(),
+                caller_requirements: route.required_capabilities.clone(),
+                component_id: registry
+                    .service_name_for_route(&route.route)
+                    .unwrap_or("legacy")
+                    .to_string(),
+                component_version: "legacy".to_string(),
+                artifact_id: None,
+                component_generation: 1,
+                health: ServiceDiscoveryHealth::Ready,
+                locality: ServiceDiscoveryLocality::Cluster,
+            });
         let entry = by_service
-            .entry(service)
+            .entry(identity.service_id.clone())
             .or_insert_with(|| ServiceInstanceRecord {
-                service: service.to_string(),
+                service_id: identity.service_id.clone(),
+                interface_id: identity.interface_id.clone(),
+                interface_version: identity.interface_version.clone(),
                 node_id: node_id.clone(),
                 registry_version,
                 routes: Vec::new(),
-                capabilities: Vec::new(),
+                provider_capabilities: identity.provider_capabilities.clone(),
+                caller_requirements: identity.caller_requirements.clone(),
+                component_id: identity.component_id.clone(),
+                component_version: identity.component_version.clone(),
+                artifact_id: identity.artifact_id.clone(),
+                component_generation: identity.component_generation,
+                health: identity.health,
+                locality: identity.locality,
                 updated_at: now,
             });
         entry.routes.push(route.route.clone());
-        for capability in &route.required_capabilities {
-            if !entry.capabilities.contains(capability) {
-                entry.capabilities.push(capability.clone());
+        for capability in &identity.provider_capabilities {
+            if !entry.provider_capabilities.contains(capability) {
+                entry.provider_capabilities.push(capability.clone());
+            }
+        }
+        for requirement in &identity.caller_requirements {
+            if !entry.caller_requirements.contains(requirement) {
+                entry.caller_requirements.push(requirement.clone());
             }
         }
     }
@@ -90,8 +167,10 @@ pub fn service_instance_records_from_registry(
     for record in &mut records {
         record.routes.sort();
         record.routes.dedup();
-        record.capabilities.sort();
-        record.capabilities.dedup();
+        record.provider_capabilities.sort();
+        record.provider_capabilities.dedup();
+        record.caller_requirements.sort();
+        record.caller_requirements.dedup();
     }
     records
 }
@@ -106,8 +185,8 @@ pub fn service_instances_from_entries(
         records.push(record);
     }
     records.sort_by(|left, right| {
-        left.service
-            .cmp(&right.service)
+        left.service_id
+            .cmp(&right.service_id)
             .then_with(|| left.node_id.cmp(&right.node_id))
     });
     Ok(records)
@@ -126,7 +205,7 @@ pub fn service_instances_providing_capability(
         .into_iter()
         .filter(|instance| {
             instance
-                .capabilities
+                .provider_capabilities
                 .iter()
                 .any(|provided| provided == capability)
         })
@@ -134,7 +213,7 @@ pub fn service_instances_providing_capability(
     providers.sort_by(|left, right| {
         left.node_id
             .cmp(&right.node_id)
-            .then_with(|| left.service.cmp(&right.service))
+            .then_with(|| left.service_id.cmp(&right.service_id))
     });
     providers
 }
@@ -169,7 +248,7 @@ pub async fn publish_local_service_instances(
         .collect();
     let mut ops = Vec::new();
     for record in records {
-        let key = cluster_service_instance_key(&record.service, node_id);
+        let key = cluster_service_instance_key(&record.service_id, node_id);
         let unchanged = existing_by_key
             .remove(&key)
             .and_then(|entry| entry.decode::<ServiceInstanceRecord>().ok())
@@ -358,7 +437,7 @@ mod tests {
             let entries = records
                 .into_iter()
                 .map(|record| {
-                    let key = cluster_service_instance_key(&record.service, &record.node_id);
+                    let key = cluster_service_instance_key(&record.service_id, &record.node_id);
                     let entry = KvEntry {
                         key: key.clone(),
                         value: sinomo_kv::encode_kv_value(&record).expect("instance record"),
@@ -533,25 +612,15 @@ mod tests {
         node_id: &NodeId,
         routes: impl IntoIterator<Item = &'static str>,
     ) -> ServiceInstanceRecord {
-        ServiceInstanceRecord {
-            service: "dfs".to_string(),
-            node_id: node_id.clone(),
-            registry_version: 1,
-            routes: routes.into_iter().map(str::to_string).collect(),
-            capabilities: Vec::new(),
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-        }
+        let mut instance = ServiceInstanceRecord::new("dfs", node_id.clone());
+        instance.routes = routes.into_iter().map(str::to_string).collect();
+        instance
     }
 
     fn instance(service: &str, node_id: &NodeId) -> ServiceInstanceRecord {
-        ServiceInstanceRecord {
-            service: service.to_string(),
-            node_id: node_id.clone(),
-            registry_version: 1,
-            routes: vec![format!("/{service}/status")],
-            capabilities: Vec::new(),
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-        }
+        let mut instance = ServiceInstanceRecord::new(service, node_id.clone());
+        instance.routes = vec![format!("/{service}/status")];
+        instance
     }
 
     #[test]
@@ -560,9 +629,9 @@ mod tests {
         let second = node("node_capability_second");
         let unrelated = node("node_capability_unrelated");
         let mut first_provider = instance("daemon", &first);
-        first_provider.capabilities = vec!["sifs.path.access".to_string()];
+        first_provider.provider_capabilities = vec!["sifs.path.access".to_string()];
         let mut second_provider = instance("dfs", &second);
-        second_provider.capabilities = vec![
+        second_provider.provider_capabilities = vec![
             "dfs.object.transfer".to_string(),
             "sifs.path.access".to_string(),
         ];
@@ -580,9 +649,51 @@ mod tests {
         expected.sort_by(|left, right| {
             left.node_id
                 .cmp(&right.node_id)
-                .then_with(|| left.service.cmp(&right.service))
+                .then_with(|| left.service_id.cmp(&right.service_id))
         });
         assert_eq!(providers, expected);
+    }
+
+    #[test]
+    fn publication_preserves_explicit_interface_provider_authority_and_generation_identity() {
+        let route = crate::ServiceRoute::new("/fixture/echo", "legacy-category")
+            .require_capability("fixture.echo.invoke")
+            .with_discovery_identity(crate::ServiceDiscoveryIdentity {
+                service_id: "external-echo".to_string(),
+                interface_id: "sinomo.fixture.echo".to_string(),
+                interface_version: "1.2.0".to_string(),
+                provider_capabilities: vec!["echo.streaming".to_string()],
+                caller_requirements: vec!["fixture.echo.invoke".to_string()],
+                component_id: "fixture.external.echo".to_string(),
+                component_version: "2.0.0".to_string(),
+                artifact_id: Some("artifact.echo".to_string()),
+                component_generation: 7,
+                health: crate::ServiceDiscoveryHealth::Degraded,
+                locality: crate::ServiceDiscoveryLocality::Cluster,
+            });
+        let registry = ServiceRegistry::builder()
+            .register_dynamic("external-echo", route, |_, _| async {
+                Ok(ServiceDisposition::Continue)
+            })
+            .build();
+        let records = service_instance_records_from_registry(
+            &registry,
+            &node("node_explicit_service_identity"),
+            9,
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.service_id, "external-echo");
+        assert_eq!(record.interface_id, "sinomo.fixture.echo");
+        assert_eq!(record.interface_version, "1.2.0");
+        assert_eq!(record.provider_capabilities, ["echo.streaming"]);
+        assert_eq!(record.caller_requirements, ["fixture.echo.invoke"]);
+        assert_eq!(record.component_id, "fixture.external.echo");
+        assert_eq!(record.artifact_id.as_deref(), Some("artifact.echo"));
+        assert_eq!(record.component_generation, 7);
+        assert_eq!(record.health, crate::ServiceDiscoveryHealth::Degraded);
+        assert_eq!(record.locality, crate::ServiceDiscoveryLocality::Cluster);
     }
 
     #[tokio::test]

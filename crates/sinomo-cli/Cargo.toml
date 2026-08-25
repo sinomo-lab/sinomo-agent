@@ -35,7 +35,6 @@ serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse", optional = true, default-features = false }
-sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
 sinomo-models = { path = "../sinomo-models", optional = true }
@@ -50,9 +49,9 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 libc = "0.2.186"
 notify.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 sinomo-runtime = { path = "../sinomo-runtime", features = ["cluster-test-support"] }
-sinomo-sandbox-wasix-module = { path = "../../modules/sandbox/wasix", features = ["wasix-runtime"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 wat = "1.253.0"

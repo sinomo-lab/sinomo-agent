@@ -1298,29 +1298,9 @@ mod tests {
                 .iter()
                 .any(|item| item.label == "native-rust")
         );
-        assert!(completions.items.iter().any(|item| item.label == "wasix"));
-
-        let options = slash_completions(
-            "/module wasix activate --",
-            "/module wasix activate --".len(),
-        )
-        .expect("wasix activate options");
-
-        assert!(options.items.iter().any(|item| item.label == "--artifact"));
         assert!(
-            options
-                .items
-                .iter()
-                .any(|item| item.label == "--library-name")
-        );
-
-        let wasix_commands =
-            slash_completions("/module wasix ", "/module wasix ".len()).expect("wasix commands");
-        assert!(
-            wasix_commands
-                .items
-                .iter()
-                .any(|item| item.label == "unload")
+            completions.items.iter().all(|item| item.label != "wasix"),
+            "provider-specific module commands must not be built into completion"
         );
 
         let unload_options = slash_completions(

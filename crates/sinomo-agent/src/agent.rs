@@ -15753,6 +15753,7 @@ mod tests {
                 ],
                 ..Default::default()
             },
+            component: Default::default(),
         };
         let registration =
             sinomo_runtime::module::native_dylib_module_registration_from_state_and_descriptor(

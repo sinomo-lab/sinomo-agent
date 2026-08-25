@@ -10,8 +10,6 @@ use sinomo_config::{
     ConfigClusterMode, ConfigDefinition, ConfigSchema, ConfigSchemaField, ConfigSchemaValue,
     ConfigValueType,
 };
-#[cfg(windows)]
-use sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
 
 use crate::SINOMO_DFS_MODULE_OWNER;
 
@@ -21,19 +19,10 @@ pub const SIFS_MOUNT_STATUS_ROUTE: &str = "/dfs/mount/status";
 pub const SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE: &str = "/dfs/mount/recover-cursor-only-state";
 
 /// Module card that owns the host-mount settings on this target. Unix FUSE is
-/// part of the built-in DFS module; Windows delegates the host adapter to the
-/// separately rolled out Cloud Files module.
+/// part of the built-in DFS module; Windows delegates the host adapter through
+/// the generic external host-filesystem provider interface.
 pub fn sifs_mount_settings_module_id() -> String {
-    #[cfg(windows)]
-    {
-        sinomo_core::Id::from_legacy_named(SINOMO_DFS_CLOUD_FILES_MODULE_ID)
-            .expect("valid Cloud Files module id")
-            .to_string()
-    }
-    #[cfg(not(windows))]
-    {
-        crate::dfs_module_id().to_string()
-    }
+    crate::dfs_module_id().to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -69,14 +58,15 @@ impl Default for SifsMountConfig {
 #[serde(rename_all = "kebab-case")]
 pub enum SifsMountPlatform {
     UnixFuse,
-    WindowsCloudFiles,
+    #[serde(alias = "windows-cloud-files")]
+    ExternalProvider,
     Unsupported,
 }
 
 impl SifsMountPlatform {
     pub const fn current() -> Self {
         if cfg!(windows) {
-            Self::WindowsCloudFiles
+            Self::ExternalProvider
         } else if cfg!(target_os = "linux") {
             Self::UnixFuse
         } else {
@@ -256,9 +246,9 @@ pub struct SifsMountStatusResponse {
     pub status: SifsMountRuntimeStatus,
 }
 
-/// Daemon-local control request for the explicit Windows Cloud Files
-/// cursor-only recovery. The main daemon's mount supervisor serializes this
-/// with registration staging, cleanup, and active-provider lifecycle work.
+/// Legacy daemon-local control request for external-provider cursor recovery.
+/// New providers should expose provider-owned recovery operations through
+/// their module interface rather than extend this shared contract.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "action", rename_all = "kebab-case")]
 pub enum SifsMountCursorOnlyRecoveryRequest {
@@ -352,7 +342,7 @@ pub fn sifs_mount_config_definition_for_module(module_id: impl Into<String>) -> 
             ConfigSchemaField::new(
                 "sync_local_changes",
                 "Sync local changes",
-                "Windows Cloud Files only. Durably journal, version-fence, and reconcile host-side changes before reporting them synchronized.",
+                "External Windows provider only. Durably journal, version-fence, and reconcile host-side changes before reporting them synchronized.",
                 ConfigSchemaValue::bool(),
             )
             .with_default_value(Value::Bool(default_sync_local_changes())),
@@ -440,13 +430,13 @@ pub fn sifs_mount_status_config_definition_for_module(
             ConfigSchemaField::new(
                 "provider_registered",
                 "Provider registered",
-                "Whether the Windows Cloud Files sync root is persistently registered.",
+                "Whether the external host-filesystem provider is persistently registered.",
                 ConfigSchemaValue::bool(),
             ),
             ConfigSchemaField::new(
                 "provider_connected",
                 "Provider connected",
-                "Whether Cloud Files callbacks are currently connected.",
+                "Whether external provider callbacks are currently connected.",
                 ConfigSchemaValue::bool(),
             ),
             ConfigSchemaField::new(
@@ -516,7 +506,7 @@ pub fn sifs_mount_status_config_definition_for_module(
             ConfigSchemaField::new(
                 "unregister_pending",
                 "Unregister pending",
-                "Whether a retired Windows Cloud Files registration still requires cleanup.",
+                "Whether a retired external provider registration still requires cleanup.",
                 ConfigSchemaValue::bool(),
             ),
             ConfigSchemaField::new(
@@ -529,21 +519,21 @@ pub fn sifs_mount_status_config_definition_for_module(
             ConfigSchemaField::new(
                 "provider_content_hash",
                 "Provider hash",
-                "Content hash of the active Windows Cloud Files provider.",
+                "Content hash of the active external host-filesystem provider.",
                 ConfigSchemaValue::string(),
             )
             .optional(),
             ConfigSchemaField::new(
                 "provider_interface_version",
                 "Provider interface",
-                "Interface version of the active Windows Cloud Files provider.",
+                "Generic interface version of the active external host-filesystem provider.",
                 ConfigSchemaValue::string(),
             )
             .optional(),
             ConfigSchemaField::new(
                 "placeholders_created",
                 "Placeholders created",
-                "Number of Cloud Files placeholders created while connecting.",
+                "Number of host filesystem entries projected while connecting.",
                 ConfigSchemaValue::u64(None),
             )
             .optional(),

@@ -311,34 +311,76 @@ pub(crate) fn run_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
-    let mut service_hooks = vec![
-        sinomo_runtime::daemon::DaemonServiceRegistryHook::new(sinomo_agent::register_services)
-            .with_config_definitions(|builder| {
-                let builder = sinomo_lm::register_config_definitions(builder)
-                    .map_err(|error| error.to_string())?;
-                register_cli_runtime_config_definitions(builder)
-            })
-            .with_observe_metric_exporters(sinomo_agent::register_observe_metric_exporters),
-        // Serves this node's own microphones and speakers to authorized peers. Registration only
-        // publishes the routes; each request is still checked against node-local device exposure.
-        sinomo_runtime::daemon::DaemonServiceRegistryHook::new(
-            sinomo_audio::service::register_services,
-        ),
-    ];
+    let mut component_factories = vec![cli_agent_component_factory()?, audio_component_factory()?];
     if label == "daemon" {
         let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
             path: paths.root.display().to_string(),
             detail: "main daemon paths have no data directory parent".to_string(),
         })?;
-        service_hooks.push(
-            crate::dfs_mount_supervisor::sifs_mount_supervisor_service_hook(
+        component_factories.push(
+            crate::dfs_mount_supervisor::sifs_mount_supervisor_component_factory(
                 SinomoDataDir::new(data_dir),
                 paths.clone(),
             ),
         );
     }
-    daemon_run_daemon_control_loop_with_services(options, paths, label, cluster, service_hooks)
-        .map_err(Into::into)
+    daemon_run_daemon_control_loop_with_components(
+        options,
+        paths,
+        label,
+        cluster,
+        component_factories,
+    )
+    .map_err(Into::into)
+}
+
+fn register_daemon_component_config_definitions(
+    builder: sinomo_runtime::config::ConfigRegistryBuilder,
+) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
+    let builder =
+        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    register_cli_runtime_config_definitions(builder)
+}
+
+fn cli_agent_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError>
+{
+    let factory = sinomo_runtime::module::StaticComponentFactory::new(
+        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
+        |_, scope| {
+            scope.set_services(
+                sinomo_agent::register_services(
+                    sinomo_runtime::service::ServiceRegistry::builder(),
+                )
+                .build(),
+            );
+            scope.on_host_start(sinomo_agent::register_observe_metric_exporters);
+            Ok(())
+        },
+    )
+    .map_err(|error| CliError::Parse {
+        detail: error.to_string(),
+    })?
+    .with_config_definitions(register_daemon_component_config_definitions);
+    Ok(Arc::new(factory))
+}
+
+fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError> {
+    let factory = sinomo_runtime::module::StaticComponentFactory::new(
+        sinomo_runtime::module::ComponentDescriptor::new("sinomo-audio", env!("CARGO_PKG_VERSION")),
+        |_, scope| {
+            scope.set_services(
+                sinomo_audio::service::register_services(
+                    sinomo_runtime::service::ServiceRegistry::builder(),
+                )
+                .build(),
+            );
+            Ok(())
+        },
+    )
+    .map_err(|error| CliError::Parse {
+        detail: error.to_string(),
+    })?;
+    Ok(Arc::new(factory))
 }
 
 pub(crate) fn start_daemon(options: DaemonRunOptions) -> Result<(), CliError> {

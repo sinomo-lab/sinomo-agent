@@ -9,24 +9,28 @@ use std::thread;
 #[cfg(feature = "wasix-runtime")]
 use std::time::Duration;
 
-use sinomo_sandbox_wasix_api::{
-    NativeModuleBackend, NativeModuleCapabilitiesResponse, NativeModuleDescriptor,
-    NativeModuleErrorResponse, NativeModuleInvocationResponse, NativeModuleRequest,
-    NativeModuleResponse, SINOMO_SANDBOX_WASIX_INTERFACE_VERSION, SINOMO_SANDBOX_WASIX_MODULE_ID,
-    SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION, SINOMO_SANDBOX_WASIX_OPERATION,
-    SINOMO_WASIX_STATUS_INVALID_ARGUMENT, SINOMO_WASIX_STATUS_OK,
-    SINOMO_WASIX_STATUS_RUNTIME_ERROR, SINOMO_WASIX_STATUS_UNSUPPORTED_ABI,
-    SandboxWasixCapabilitiesResponse, SandboxWasixNativeErrorResponse, SandboxWasixNativeRequest,
-    SandboxWasixNativeResponse, SandboxWasixRequestKind, SandboxWasixRunModuleRequest,
-    SandboxWasixRunReplayFixtureRequest, SandboxWasixRunToolchainCommandRequest,
-    SandboxWasixValidateComponentRequest, SinomoWasixByteBuffer, SinomoWasixByteSlice,
-    SinomoWasixHostApiV2, SinomoWasixStatusCode, decode_sobj, encode_sobj,
-};
-
 #[cfg(feature = "wasix-runtime")]
-use sinomo_sandbox_wasix_api::{
-    SandboxWasixRunModuleResponse, SandboxWasixRunReplayFixtureResponse,
-    SandboxWasixValidateComponentResponse, encode_output_chunk,
+use sinomo_module_api::SinomoModuleHostIsCancelledFn;
+use sinomo_module_api::{
+    ComponentDescriptor, NativeModuleBackend, NativeModuleCapabilitiesResponse,
+    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationResponse,
+    NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
+    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
+    decode_sobj, encode_sobj,
+};
+use sinomo_sandbox::{
+    SANDBOX_EXECUTOR_INTERFACE_ID, SANDBOX_EXECUTOR_INTERFACE_VERSION, SANDBOX_EXECUTOR_OPERATION,
+    SandboxExecutorCapabilitiesResponse, SandboxExecutorErrorResponse, SandboxExecutorRequest,
+    SandboxExecutorRequestKind, SandboxExecutorResponse, SandboxExecutorRunModuleRequest,
+    SandboxExecutorRunReplayFixtureRequest, SandboxExecutorRunToolchainCommandRequest,
+    SandboxExecutorValidateComponentRequest,
+};
+#[cfg(feature = "wasix-runtime")]
+use sinomo_sandbox::{
+    SandboxExecutorRunModuleResponse, SandboxExecutorRunReplayFixtureResponse,
+    SandboxExecutorValidateComponentResponse, encode_sandbox_executor_output,
 };
 
 #[cfg(feature = "wasix-runtime")]
@@ -35,9 +39,11 @@ use crate::{
     SandboxWasiAbi, SandboxWasiPreopen, SandboxWasiRunOptions, SandboxWasixCommandOverride,
 };
 
+const SINOMO_SANDBOX_WASIX_MODULE_ID: &str = "module.sandbox.wasix";
+
 #[derive(Clone, Copy)]
 #[cfg_attr(not(feature = "wasix-runtime"), allow(dead_code))]
-struct StoredHostApi(SinomoWasixHostApiV2);
+struct StoredHostApi(SinomoModuleHostApiV2);
 
 unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
@@ -46,35 +52,35 @@ static HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_api_version() -> u32 {
-    SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION
+    SINOMO_NATIVE_MODULE_ABI_VERSION
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_descriptor(
-    out: *mut SinomoWasixByteBuffer,
-) -> SinomoWasixStatusCode {
+    out: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
     write_buffer(out, descriptor_response())
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_init(host: SinomoWasixHostApiV2) -> SinomoWasixStatusCode {
-    if host.abi_version != SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION {
-        return SINOMO_WASIX_STATUS_UNSUPPORTED_ABI;
+pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModuleStatusCode {
+    if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
+        return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = Some(StoredHostApi(host));
-            SINOMO_WASIX_STATUS_OK
+            SINOMO_MODULE_STATUS_OK
         }
-        Err(_) => SINOMO_WASIX_STATUS_RUNTIME_ERROR,
+        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_invoke(
-    request_sobj: SinomoWasixByteSlice,
-    response_sobj: *mut SinomoWasixByteBuffer,
-) -> SinomoWasixStatusCode {
+    request_sobj: SinomoModuleByteSlice,
+    response_sobj: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -86,33 +92,33 @@ pub extern "C" fn sinomo_module_invoke(
                 "panic",
                 "native module panicked while handling invocation",
             )),
-            SINOMO_WASIX_STATUS_RUNTIME_ERROR,
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
         ),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_shutdown() -> SinomoWasixStatusCode {
+pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = None;
-            SINOMO_WASIX_STATUS_OK
+            SINOMO_MODULE_STATUS_OK
         }
-        Err(_) => SINOMO_WASIX_STATUS_RUNTIME_ERROR,
+        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn sinomo_module_free_buffer(buffer: SinomoWasixByteBuffer) {
+pub extern "C" fn sinomo_module_free_buffer(buffer: SinomoModuleByteBuffer) {
     unsafe {
-        drop(SinomoWasixByteBuffer::into_vec(buffer));
+        drop(SinomoModuleByteBuffer::into_vec(buffer));
     }
 }
 
 unsafe fn invoke_unchecked(
-    request_sobj: SinomoWasixByteSlice,
-    response_sobj: *mut SinomoWasixByteBuffer,
-) -> SinomoWasixStatusCode {
+    request_sobj: SinomoModuleByteSlice,
+    response_sobj: *mut SinomoModuleByteBuffer,
+) -> SinomoModuleStatusCode {
     let request_bytes = unsafe { request_sobj.as_slice() };
     let request = match decode_sobj::<NativeModuleRequest>(request_bytes) {
         Ok(request) => request,
@@ -123,7 +129,7 @@ unsafe fn invoke_unchecked(
                     "invalid-request",
                     &format!("decode native module request: {error}"),
                 )),
-                SINOMO_WASIX_STATUS_INVALID_ARGUMENT,
+                SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
             );
         }
     };
@@ -135,13 +141,13 @@ unsafe fn invoke_unchecked(
         }
         NativeModuleRequest::Invoke(request) => invoke_wasix_operation_response(request),
     };
-    write_response(response_sobj, response, SINOMO_WASIX_STATUS_OK)
+    write_response(response_sobj, response, SINOMO_MODULE_STATUS_OK)
 }
 
 fn invoke_wasix_operation_response(
-    request: sinomo_sandbox_wasix_api::NativeModuleInvocationRequest,
+    request: sinomo_module_api::NativeModuleInvocationRequest,
 ) -> NativeModuleResponse {
-    if request.operation != SINOMO_SANDBOX_WASIX_OPERATION {
+    if request.operation != SANDBOX_EXECUTOR_OPERATION {
         return NativeModuleResponse::Error(native_error_response(
             "unsupported-operation",
             &format!(
@@ -150,7 +156,7 @@ fn invoke_wasix_operation_response(
             ),
         ));
     }
-    let wasix_request = match decode_sobj::<SandboxWasixNativeRequest>(&request.payload_sobj) {
+    let wasix_request = match decode_sobj::<SandboxExecutorRequest>(&request.payload_sobj) {
         Ok(request) => request,
         Err(error) => {
             return NativeModuleResponse::Error(native_error_response(
@@ -160,25 +166,24 @@ fn invoke_wasix_operation_response(
         }
     };
     let wasix_response = match wasix_request {
-        SandboxWasixNativeRequest::ProbeCapabilities(_) => {
-            SandboxWasixNativeResponse::Capabilities(SandboxWasixCapabilitiesResponse {
-                descriptor: legacy_wasix_descriptor(),
+        SandboxExecutorRequest::ProbeCapabilities(_) => {
+            SandboxExecutorResponse::Capabilities(SandboxExecutorCapabilitiesResponse {
+                interface_id: SANDBOX_EXECUTOR_INTERFACE_ID.to_string(),
+                interface_version: SANDBOX_EXECUTOR_INTERFACE_VERSION.to_string(),
+                supported_requests: supported_executor_requests(),
+                provider_capabilities: runtime_capabilities(),
             })
         }
-        SandboxWasixNativeRequest::RunModule(request) => run_module_response(request),
-        SandboxWasixNativeRequest::RunToolchainCommand(request) => {
+        SandboxExecutorRequest::RunModule(request) => run_module_response(request),
+        SandboxExecutorRequest::RunToolchainCommand(request) => {
             run_toolchain_command_response(request)
         }
-        SandboxWasixNativeRequest::RunReplayFixture(request) => {
-            run_replay_fixture_response(request)
-        }
-        SandboxWasixNativeRequest::ValidateComponent(request) => {
-            validate_component_response(request)
-        }
+        SandboxExecutorRequest::RunReplayFixture(request) => run_replay_fixture_response(request),
+        SandboxExecutorRequest::ValidateComponent(request) => validate_component_response(request),
     };
     match encode_sobj(&wasix_response) {
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
-            operation: SINOMO_SANDBOX_WASIX_OPERATION.to_string(),
+            operation: SANDBOX_EXECUTOR_OPERATION.to_string(),
             payload_sobj,
             response_body: None,
         }),
@@ -190,7 +195,7 @@ fn invoke_wasix_operation_response(
 }
 
 #[cfg(feature = "wasix-runtime")]
-fn run_module_response(request: SandboxWasixRunModuleRequest) -> SandboxWasixNativeResponse {
+fn run_module_response(request: SandboxExecutorRunModuleRequest) -> SandboxExecutorResponse {
     match run_resolved_module(
         request.target_abi,
         request.wasm,
@@ -198,21 +203,21 @@ fn run_module_response(request: SandboxWasixRunModuleRequest) -> SandboxWasixNat
         request.options,
     ) {
         Ok(outcome) => {
-            SandboxWasixNativeResponse::RunModule(SandboxWasixRunModuleResponse { outcome })
+            SandboxExecutorResponse::RunModule(SandboxExecutorRunModuleResponse { outcome })
         }
-        Err(error) => SandboxWasixNativeResponse::Error(error_response("run-module", &error)),
+        Err(error) => SandboxExecutorResponse::Error(error_response("run-module", &error)),
     }
 }
 
 #[cfg(not(feature = "wasix-runtime"))]
-fn run_module_response(_request: SandboxWasixRunModuleRequest) -> SandboxWasixNativeResponse {
+fn run_module_response(_request: SandboxExecutorRunModuleRequest) -> SandboxExecutorResponse {
     runtime_disabled_response("run-module")
 }
 
 #[cfg(feature = "wasix-runtime")]
 fn run_toolchain_command_response(
-    request: SandboxWasixRunToolchainCommandRequest,
-) -> SandboxWasixNativeResponse {
+    request: SandboxExecutorRunToolchainCommandRequest,
+) -> SandboxExecutorResponse {
     match run_resolved_module(
         request.module.target_abi,
         request.module.wasm,
@@ -220,66 +225,64 @@ fn run_toolchain_command_response(
         request.options,
     ) {
         Ok(outcome) => {
-            SandboxWasixNativeResponse::RunToolchainCommand(SandboxWasixRunModuleResponse {
+            SandboxExecutorResponse::RunToolchainCommand(SandboxExecutorRunModuleResponse {
                 outcome,
             })
         }
-        Err(error) => SandboxWasixNativeResponse::Error(error_response("run-toolchain", &error)),
+        Err(error) => SandboxExecutorResponse::Error(error_response("run-toolchain", &error)),
     }
 }
 
 #[cfg(not(feature = "wasix-runtime"))]
 fn run_toolchain_command_response(
-    _request: SandboxWasixRunToolchainCommandRequest,
-) -> SandboxWasixNativeResponse {
+    _request: SandboxExecutorRunToolchainCommandRequest,
+) -> SandboxExecutorResponse {
     runtime_disabled_response("run-toolchain")
 }
 
 #[cfg(feature = "wasix-runtime")]
 fn run_replay_fixture_response(
-    request: SandboxWasixRunReplayFixtureRequest,
-) -> SandboxWasixNativeResponse {
+    request: SandboxExecutorRunReplayFixtureRequest,
+) -> SandboxExecutorResponse {
     match crate::run_sandbox_wasm_module_replay_fixture(&request.data_dir_root, &request.fixture) {
         Ok(report) => {
-            SandboxWasixNativeResponse::RunReplayFixture(SandboxWasixRunReplayFixtureResponse {
+            SandboxExecutorResponse::RunReplayFixture(SandboxExecutorRunReplayFixtureResponse {
                 report,
             })
         }
-        Err(error) => SandboxWasixNativeResponse::Error(error_response("run-replay", &error)),
+        Err(error) => SandboxExecutorResponse::Error(error_response("run-replay", &error)),
     }
 }
 
 #[cfg(not(feature = "wasix-runtime"))]
 fn run_replay_fixture_response(
-    _request: SandboxWasixRunReplayFixtureRequest,
-) -> SandboxWasixNativeResponse {
+    _request: SandboxExecutorRunReplayFixtureRequest,
+) -> SandboxExecutorResponse {
     runtime_disabled_response("run-replay")
 }
 
 #[cfg(feature = "wasix-runtime")]
 fn validate_component_response(
-    request: SandboxWasixValidateComponentRequest,
-) -> SandboxWasixNativeResponse {
+    request: SandboxExecutorValidateComponentRequest,
+) -> SandboxExecutorResponse {
     match crate::validate_sinomo_module_v1_component_contract(&request.wasm) {
-        Ok(()) => SandboxWasixNativeResponse::ValidateComponent(
-            SandboxWasixValidateComponentResponse::default(),
+        Ok(()) => SandboxExecutorResponse::ValidateComponent(
+            SandboxExecutorValidateComponentResponse::default(),
         ),
-        Err(error) => {
-            SandboxWasixNativeResponse::Error(error_response("validate-component", &error))
-        }
+        Err(error) => SandboxExecutorResponse::Error(error_response("validate-component", &error)),
     }
 }
 
 #[cfg(not(feature = "wasix-runtime"))]
 fn validate_component_response(
-    _request: SandboxWasixValidateComponentRequest,
-) -> SandboxWasixNativeResponse {
+    _request: SandboxExecutorValidateComponentRequest,
+) -> SandboxExecutorResponse {
     runtime_disabled_response("validate-component")
 }
 
 #[cfg(not(feature = "wasix-runtime"))]
-fn runtime_disabled_response(operation: &str) -> SandboxWasixNativeResponse {
-    SandboxWasixNativeResponse::Error(error_response(
+fn runtime_disabled_response(operation: &str) -> SandboxExecutorResponse {
+    SandboxExecutorResponse::Error(error_response(
         operation,
         "WASIX native module was built without the `wasix-runtime` feature",
     ))
@@ -290,7 +293,7 @@ fn run_resolved_module(
     target_abi: SandboxWasiAbi,
     wasm: Vec<u8>,
     command: crate::SandboxCommandRequest,
-    options: sinomo_sandbox_wasix_api::SandboxWasixRunModuleOptions,
+    options: sinomo_sandbox::SandboxExecutorOptions,
 ) -> Result<SandboxLocalCommandOutcome, String> {
     let runner =
         crate::LocalStagedSandboxCommandRunner::new().map_err(|error| error.to_string())?;
@@ -307,7 +310,7 @@ fn run_resolved_module(
 
 #[cfg(feature = "wasix-runtime")]
 fn convert_run_options(
-    options: sinomo_sandbox_wasix_api::SandboxWasixRunModuleOptions,
+    options: sinomo_sandbox::SandboxExecutorOptions,
     cancellation: SandboxCancellation,
 ) -> SandboxWasiRunOptions {
     let default_options = SandboxWasiRunOptions::default();
@@ -349,12 +352,12 @@ fn convert_run_options(
         file_count_limit: options.file_count_limit,
         cancellation,
         output_sink: host_output_sink(),
-        wasix_pinned_child_exec_only: options.wasix_pinned_child_exec_only,
-        wasix_instruction_metering: options.wasix_instruction_metering,
-        wasix_auto_asyncify: options.wasix_auto_asyncify,
-        wasix_fpcast_emu: options.wasix_fpcast_emu,
+        wasix_pinned_child_exec_only: options.pinned_child_exec_only,
+        wasix_instruction_metering: options.instruction_metering,
+        wasix_auto_asyncify: options.auto_asyncify,
+        wasix_fpcast_emu: options.fpcast_emulation,
         wasix_command_overrides: options
-            .wasix_command_overrides
+            .command_overrides
             .into_iter()
             .map(|override_| SandboxWasixCommandOverride {
                 name: override_.name,
@@ -423,10 +426,7 @@ impl Drop for HostCancellationBridge {
 }
 
 #[cfg(feature = "wasix-runtime")]
-fn host_cancellation_callback() -> Option<(
-    sinomo_sandbox_wasix_api::SinomoWasixHostIsCancelledFn,
-    usize,
-)> {
+fn host_cancellation_callback() -> Option<(SinomoModuleHostIsCancelledFn, usize)> {
     let api = HOST_API.lock().ok().and_then(|api| *api)?;
     api.0
         .is_cancelled
@@ -457,19 +457,19 @@ impl SandboxOutputSink for HostOutputSink {
         let Some(output_chunk) = self.api.0.output_chunk else {
             return;
         };
-        let Ok(bytes) = encode_output_chunk(&chunk) else {
+        let Ok(bytes) = encode_sandbox_executor_output(&chunk) else {
             return;
         };
         unsafe {
             let _ = output_chunk(
                 self.api.0.user_data,
-                SinomoWasixByteSlice::from_slice(&bytes),
+                SinomoModuleByteSlice::from_slice(&bytes),
             );
         }
     }
 }
 
-fn descriptor_response() -> Result<Vec<u8>, sinomo_sandbox_wasix_api::SandboxWasixApiError> {
+fn descriptor_response() -> Result<Vec<u8>, sinomo_module_api::NativeModuleApiError> {
     encode_sobj(&descriptor())
 }
 
@@ -478,25 +478,25 @@ fn descriptor() -> NativeModuleDescriptor {
         module_id: SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
         module_version: env!("CARGO_PKG_VERSION").to_string(),
         owner: "sinomo-sandbox-wasix".to_string(),
-        native_abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
+        native_abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
         backend: NativeModuleBackend::NativeDylib,
-        interface_version: SINOMO_SANDBOX_WASIX_INTERFACE_VERSION.to_string(),
+        interface_version: SANDBOX_EXECUTOR_INTERFACE_VERSION.to_string(),
         platform_triple: platform_triple(),
-        supported_operations: vec![SINOMO_SANDBOX_WASIX_OPERATION.to_string()],
+        supported_operations: vec![SANDBOX_EXECUTOR_OPERATION.to_string()],
         capabilities: runtime_capabilities(),
         surfaces: Default::default(),
-    }
-}
-
-fn legacy_wasix_descriptor() -> sinomo_sandbox_wasix_api::SandboxWasixNativeDescriptor {
-    sinomo_sandbox_wasix_api::SandboxWasixNativeDescriptor {
-        module_id: SINOMO_SANDBOX_WASIX_MODULE_ID.to_string(),
-        module_version: env!("CARGO_PKG_VERSION").to_string(),
-        native_abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
-        interface_version: SINOMO_SANDBOX_WASIX_INTERFACE_VERSION.to_string(),
-        platform_triple: platform_triple(),
-        supported_requests: supported_wasix_requests(),
-        capabilities: descriptor().capabilities,
+        component: ComponentDescriptor::new(
+            SINOMO_SANDBOX_WASIX_MODULE_ID,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_offer(
+            ServiceOffer::new(
+                "sandbox-executor",
+                SANDBOX_EXECUTOR_INTERFACE_ID,
+                SANDBOX_EXECUTOR_INTERFACE_VERSION,
+            )
+            .with_provider_capability("sandbox.wasm.execute"),
+        ),
     }
 }
 
@@ -514,14 +514,14 @@ fn runtime_capabilities() -> Vec<String> {
     }
 }
 
-fn supported_wasix_requests() -> Vec<SandboxWasixRequestKind> {
-    let mut requests = vec![SandboxWasixRequestKind::ProbeCapabilities];
+fn supported_executor_requests() -> Vec<SandboxExecutorRequestKind> {
+    let mut requests = vec![SandboxExecutorRequestKind::ProbeCapabilities];
     if cfg!(feature = "wasix-runtime") {
         requests.extend([
-            SandboxWasixRequestKind::RunModule,
-            SandboxWasixRequestKind::RunToolchainCommand,
-            SandboxWasixRequestKind::RunReplayFixture,
-            SandboxWasixRequestKind::ValidateComponent,
+            SandboxExecutorRequestKind::RunModule,
+            SandboxExecutorRequestKind::RunToolchainCommand,
+            SandboxExecutorRequestKind::RunReplayFixture,
+            SandboxExecutorRequestKind::ValidateComponent,
         ]);
     }
     requests
@@ -537,17 +537,17 @@ fn platform_triple() -> String {
 }
 
 fn write_response(
-    out: *mut SinomoWasixByteBuffer,
+    out: *mut SinomoModuleByteBuffer,
     response: NativeModuleResponse,
-    success_status: SinomoWasixStatusCode,
-) -> SinomoWasixStatusCode {
+    success_status: SinomoModuleStatusCode,
+) -> SinomoModuleStatusCode {
     match encode_sobj(&response) {
         Ok(bytes) => {
             if out.is_null() {
-                SINOMO_WASIX_STATUS_INVALID_ARGUMENT
+                SINOMO_MODULE_STATUS_INVALID_ARGUMENT
             } else {
                 unsafe {
-                    *out = SinomoWasixByteBuffer::from_vec(bytes);
+                    *out = SinomoModuleByteBuffer::from_vec(bytes);
                 }
                 success_status
             }
@@ -557,25 +557,25 @@ fn write_response(
 }
 
 fn write_buffer(
-    out: *mut SinomoWasixByteBuffer,
+    out: *mut SinomoModuleByteBuffer,
     bytes: Result<Vec<u8>, impl std::fmt::Display>,
-) -> SinomoWasixStatusCode {
+) -> SinomoModuleStatusCode {
     if out.is_null() {
-        return SINOMO_WASIX_STATUS_INVALID_ARGUMENT;
+        return SINOMO_MODULE_STATUS_INVALID_ARGUMENT;
     }
     match bytes {
         Ok(bytes) => {
             unsafe {
-                *out = SinomoWasixByteBuffer::from_vec(bytes);
+                *out = SinomoModuleByteBuffer::from_vec(bytes);
             }
-            SINOMO_WASIX_STATUS_OK
+            SINOMO_MODULE_STATUS_OK
         }
         Err(error) => {
             let fallback = format!("encode WASIX native response: {error}").into_bytes();
             unsafe {
-                *out = SinomoWasixByteBuffer::from_vec(fallback);
+                *out = SinomoModuleByteBuffer::from_vec(fallback);
             }
-            SINOMO_WASIX_STATUS_RUNTIME_ERROR
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
         }
     }
 }
@@ -583,8 +583,8 @@ fn write_buffer(
 fn error_response(
     code: &str,
     detail: &(impl std::fmt::Display + ?Sized),
-) -> SandboxWasixNativeErrorResponse {
-    SandboxWasixNativeErrorResponse {
+) -> SandboxExecutorErrorResponse {
+    SandboxExecutorErrorResponse {
         code: code.to_string(),
         detail: detail.to_string(),
     }
@@ -632,8 +632,8 @@ mod tests {
 
     fn install_test_host_api(cancelled: &AtomicBool) -> HostApiRestore {
         let mut api = HOST_API.lock().expect("host api lock");
-        let previous = api.replace(StoredHostApi(SinomoWasixHostApiV2 {
-            abi_version: SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION,
+        let previous = api.replace(StoredHostApi(SinomoModuleHostApiV2 {
+            abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
             user_data: cancelled as *const AtomicBool as *mut std::ffi::c_void,
             output_chunk: None,
             log: None,

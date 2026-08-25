@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use fs2::FileExt;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION, CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN,
     CLOUD_FILES_CURSOR_RECOVERY_MARKER_MAX_BYTES, CloudFilesCursorOnlyRecoveryApplied,
     CloudFilesCursorOnlyRecoveryApplyRequest, CloudFilesCursorOnlyRecoveryIdentity,
@@ -29,6 +27,8 @@ use sinomo_dfs_cloud_files_api::{
     CloudFilesUnregisterResponse, SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
     SINOMO_DFS_CLOUD_FILES_MODULE_ID,
 };
+use fs2::FileExt;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sinomo_module_api::{decode_sobj, encode_sobj};
 use sinomo_runtime::api::DaemonDfsPeerTransport;
 use sinomo_runtime::dfs::{
@@ -1867,8 +1867,7 @@ fn validate_cursor_recovery_identity(
     identity: &CloudFilesCursorOnlyRecoveryIdentity,
 ) -> Result<(), CloudFilesModuleError> {
     if identity.schema_version != CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION
-        || identity.provider_name
-            != sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
+        || identity.provider_name != crate::protocol::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
         || identity.provider_version != env!("CARGO_PKG_VERSION")
         || identity.disabled_config_fingerprint.trim().is_empty()
         || identity.provider_provenance_fingerprint.trim().is_empty()
@@ -1994,7 +1993,7 @@ fn cursor_recovery_active_observed_event(
     marker: &CursorRecoveryModuleMarker,
 ) -> Result<CloudFilesModuleEvent, CloudFilesModuleError> {
     Ok(CloudFilesModuleEvent::CursorRecoveryActiveObserved(
-        sinomo_dfs_cloud_files_api::CloudFilesCursorRecoveryActiveObservedRequest {
+        crate::protocol::CloudFilesCursorRecoveryActiveObservedRequest {
             schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
             recovery_id: marker.recovery_id.clone(),
             recovery_token: marker.recovery_token.clone(),
@@ -4109,7 +4108,7 @@ fn mount_sifs_cloud_files_inner(
         }
         if marker.phase == CursorRecoveryModulePhase::Ready || restoring_preserved_ready {
             let ready_observed = CloudFilesModuleEvent::CursorRecoveryReadyObserved(
-                sinomo_dfs_cloud_files_api::CloudFilesCursorRecoveryReadyObservedRequest {
+                crate::protocol::CloudFilesCursorRecoveryReadyObservedRequest {
                     schema_version: CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
                     recovery_id: marker.recovery_id.clone(),
                     recovery_token: marker.recovery_token.clone(),
@@ -6278,8 +6277,8 @@ fn verify_registration_receipt(
     };
     if !matches!(
         receipt.interface_version.as_str(),
-        sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V1
-            | sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
+        crate::protocol::SINOMO_DFS_CLOUD_FILES_INTERFACE_V1
+            | crate::protocol::SINOMO_DFS_CLOUD_FILES_INTERFACE_V2
             | SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION
     ) || receipt.sync_root != request.sync_root
         || receipt.root_path != request.root_path
@@ -7527,8 +7526,7 @@ mod tests {
             sync_root: sync_root.to_path_buf(),
             root_path: "/".to_string(),
             data_dir_root: data_dir.root(),
-            provider_name: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
-                .to_string(),
+            provider_name: crate::protocol::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME.to_string(),
             provider_version: env!("CARGO_PKG_VERSION").to_string(),
             read_only: false,
             allow_other: false,
@@ -8999,12 +8997,11 @@ mod tests {
     #[test]
     fn exact_provider_replacement_adopts_nonempty_root_and_retained_writable_scopes() {
         let mut request = CloudFilesMountRequest::new(PathBuf::from(r"C:\SinomoSIFS"));
-        request.provider_replacement = Some(
-            sinomo_dfs_cloud_files_api::CloudFilesProviderReplacementContext {
+        request.provider_replacement =
+            Some(crate::protocol::CloudFilesProviderReplacementContext {
                 predecessor_content_hash: format!("blake3:{}", "1".repeat(64)),
                 successor_content_hash: format!("blake3:{}", "2".repeat(64)),
-            },
-        );
+            });
         assert!(validate_provider_replacement_context(&request).expect("replacement context"));
 
         verify_fresh_state_owned_boundary_with(
@@ -9210,11 +9207,11 @@ mod tests {
 
         assert_eq!(
             error.code,
-            sinomo_dfs_cloud_files_api::CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE
+            crate::protocol::CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE
         );
         assert_eq!(
             lifecycle.local_change_sync.mode,
-            sinomo_dfs_cloud_files_api::CloudFilesLocalChangeSyncMode::Unsupported
+            crate::protocol::CloudFilesLocalChangeSyncMode::Unsupported
         );
         assert!(!lifecycle.local_change_sync.local_mutations_blocked);
         assert!(!sync_root.exists());

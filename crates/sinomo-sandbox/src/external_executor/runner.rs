@@ -3,36 +3,42 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use sinomo_module::{
-    ModuleId, NativeDylibModuleLoaderState, NativeModuleUnloadReport, native_module_cache_path,
-    read_native_dylib_module_loader_state,
-};
-use sinomo_sandbox::*;
-use sinomo_sandbox_wasix_api::{
-    SINOMO_SANDBOX_WASIX_INTERFACE_VERSION, SINOMO_SANDBOX_WASIX_MODULE_ID,
-    SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION, SandboxWasixCommandOverride, SandboxWasixHostPreopen,
-    SandboxWasixNativeErrorResponse, SandboxWasixNativeRequest, SandboxWasixNativeResponse,
-    SandboxWasixRunModuleOptions, SandboxWasixRunModuleRequest,
-    SandboxWasixRunReplayFixtureRequest, SandboxWasixValidateComponentRequest,
-};
+use sinomo_module::NativeModuleUnloadReport;
 use time::OffsetDateTime;
 
-use crate::{SandboxWasixNativeModule, SandboxWasixNativeModuleError};
+use crate::*;
 
-pub struct SandboxWasixModuleCommandRunner {
-    module: SandboxWasixNativeModule,
+pub struct SandboxExecutorCommandRunner {
+    module: SandboxExecutorClient,
 }
 
-impl SandboxWasixModuleCommandRunner {
+impl SandboxExecutorCommandRunner {
     pub fn from_active_module(
         data_dir_root: impl AsRef<Path>,
     ) -> Result<Self, SandboxCommandExecutionError> {
-        let module = load_active_sandbox_wasix_module(data_dir_root.as_ref())?;
+        let module = SandboxExecutorClient::from_active_component(data_dir_root)
+            .map_err(executor_module_error_to_wasi)?;
         Ok(Self { module })
     }
 
-    pub fn from_module(module: SandboxWasixNativeModule) -> Self {
+    pub fn from_module(module: SandboxExecutorClient) -> Self {
         Self { module }
+    }
+
+    /// Load a provider artifact whose bytes and provenance were already
+    /// verified by the caller. The descriptor is still required to offer the
+    /// generic sandbox-executor interface.
+    ///
+    /// # Safety
+    ///
+    /// Native modules share the host process address space. Callers must only
+    /// pass trusted artifacts that completed policy and provenance checks.
+    pub unsafe fn from_verified_module_path(
+        library_path: impl AsRef<Path>,
+    ) -> Result<Self, SandboxCommandExecutionError> {
+        let module = unsafe { SandboxExecutorClient::load_verified(library_path) }
+            .map_err(executor_module_error_to_wasi)?;
+        Ok(Self { module })
     }
 
     pub fn unload(self) -> NativeModuleUnloadReport {
@@ -44,20 +50,20 @@ impl SandboxWasixModuleCommandRunner {
         wasm: impl AsRef<[u8]>,
     ) -> Result<(), SandboxCommandExecutionError> {
         let request =
-            SandboxWasixNativeRequest::ValidateComponent(SandboxWasixValidateComponentRequest {
+            SandboxExecutorRequest::ValidateComponent(SandboxExecutorValidateComponentRequest {
                 wasm: wasm.as_ref().to_vec(),
             });
         match self
             .module
             .invoke(&request)
-            .map_err(wasix_native_module_error_to_wasi)?
+            .map_err(executor_module_error_to_wasi)?
         {
-            SandboxWasixNativeResponse::ValidateComponent(_) => Ok(()),
-            SandboxWasixNativeResponse::Error(error) => {
-                Err(wasix_native_error_to_wasi(error).into())
-            }
+            SandboxExecutorResponse::ValidateComponent(_) => Ok(()),
+            SandboxExecutorResponse::Error(error) => Err(executor_error_to_wasi(error).into()),
             other => Err(SandboxWasiError::Runtime {
-                detail: format!("WASIX module returned unexpected validation response {other:?}"),
+                detail: format!(
+                    "sandbox executor returned unexpected validation response {other:?}"
+                ),
             }
             .into()),
         }
@@ -74,7 +80,7 @@ impl SandboxWasixModuleCommandRunner {
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
         limits: Option<SandboxResourceLimits>,
-        extra_preopens: Vec<SandboxWasixHostPreopen>,
+        extra_preopens: Vec<SandboxExecutorHostPreopen>,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
         self.run_module_with_stdin_limits_preopens_output_sink_toolchain_and_cancellation(
@@ -103,7 +109,7 @@ impl SandboxWasixModuleCommandRunner {
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
         limits: Option<SandboxResourceLimits>,
-        mut extra_preopens: Vec<SandboxWasixHostPreopen>,
+        mut extra_preopens: Vec<SandboxExecutorHostPreopen>,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
@@ -164,7 +170,7 @@ impl SandboxWasixModuleCommandRunner {
             true,
             true,
             false,
-            wasix_command_overrides_for_toolchain(&toolchain),
+            command_overrides_for_toolchain(&toolchain),
             cancellation_token,
             true,
         )
@@ -422,11 +428,11 @@ impl SandboxWasixModuleCommandRunner {
         let limits = effective_sandbox_command_limits(&manifest.limits, &command.default_limits);
         let timeout_ms = effective_sandbox_timeout_ms(timeout_ms, limits.wall_time_ms);
         let argv = command.effective_argv(argv);
-        let wasix_pinned_child_exec_only = !command
+        let pinned_child_exec_only = !command
             .required_capabilities
             .iter()
             .any(|capability| capability == SANDBOX_WASIX_UNPINNED_CHILD_EXEC_CAPABILITY);
-        let wasix_auto_asyncify = command
+        let auto_asyncify = command
             .required_capabilities
             .iter()
             .any(|capability| capability == SANDBOX_WASIX_ASYNCIFIED_FORK_CAPABILITY);
@@ -447,11 +453,11 @@ impl SandboxWasixModuleCommandRunner {
             command.default_env.clone(),
             cwd_override,
             env_override,
-            wasix_pinned_child_exec_only,
+            pinned_child_exec_only,
             false,
-            wasix_auto_asyncify,
+            auto_asyncify,
             false,
-            wasix_command_overrides_for_toolchain(toolchain),
+            command_overrides_for_toolchain(toolchain),
             cancellation_token,
             complete_outcome,
         )
@@ -468,17 +474,17 @@ impl SandboxWasixModuleCommandRunner {
         stdin: Option<Vec<u8>>,
         timeout_ms: u64,
         limits: Option<SandboxResourceLimits>,
-        extra_preopens: Vec<SandboxWasixHostPreopen>,
+        extra_preopens: Vec<SandboxExecutorHostPreopen>,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         target_abi: SandboxWasiAbi,
         default_env: BTreeMap<String, String>,
         cwd_override: Option<SandboxPath>,
         env_override: BTreeMap<String, String>,
-        wasix_pinned_child_exec_only: bool,
-        wasix_instruction_metering: bool,
-        wasix_auto_asyncify: bool,
-        wasix_fpcast_emu: bool,
-        wasix_command_overrides: Vec<SandboxWasixCommandOverride>,
+        pinned_child_exec_only: bool,
+        instruction_metering: bool,
+        auto_asyncify: bool,
+        fpcast_emulation: bool,
+        command_overrides: Vec<SandboxExecutorCommandOverride>,
         cancellation_token: SandboxCancellationToken,
         complete_outcome: bool,
     ) -> Result<SandboxLocalCommandOutcome, SandboxCommandExecutionError> {
@@ -540,11 +546,11 @@ impl SandboxWasixModuleCommandRunner {
             OffsetDateTime::now_utc(),
         )?;
         let mut options = local_staged_sandbox_wasix_options(&layout, &limits, extra_preopens);
-        options.wasix_pinned_child_exec_only = wasix_pinned_child_exec_only;
-        options.wasix_instruction_metering = wasix_instruction_metering;
-        options.wasix_auto_asyncify = wasix_auto_asyncify;
-        options.wasix_fpcast_emu = wasix_fpcast_emu;
-        options.wasix_command_overrides = wasix_command_overrides;
+        options.pinned_child_exec_only = pinned_child_exec_only;
+        options.instruction_metering = instruction_metering;
+        options.auto_asyncify = auto_asyncify;
+        options.fpcast_emulation = fpcast_emulation;
+        options.command_overrides = command_overrides;
         let execution = if cancellation_token.is_cancelled() {
             Err(SandboxWasiError::Cancelled)
         } else {
@@ -986,11 +992,11 @@ impl SandboxWasixModuleCommandRunner {
         target_abi: SandboxWasiAbi,
         wasm: Vec<u8>,
         command: SandboxCommandRequest,
-        options: SandboxWasixRunModuleOptions,
+        options: SandboxExecutorOptions,
         output_sink: Option<Arc<dyn SandboxOutputSink>>,
         cancellation_token: SandboxCancellationToken,
     ) -> Result<SandboxLocalCommandOutcome, SandboxWasiError> {
-        let request = SandboxWasixNativeRequest::RunModule(SandboxWasixRunModuleRequest {
+        let request = SandboxExecutorRequest::RunModule(SandboxExecutorRunModuleRequest {
             target_abi,
             wasm,
             command,
@@ -1003,12 +1009,12 @@ impl SandboxWasixModuleCommandRunner {
                 output_sink,
                 Some(cancellation_token),
             )
-            .map_err(wasix_native_module_error_to_wasi)?
+            .map_err(executor_module_error_to_wasi)?
         {
-            SandboxWasixNativeResponse::RunModule(response) => Ok(response.outcome),
-            SandboxWasixNativeResponse::Error(error) => Err(wasix_native_error_to_wasi(error)),
+            SandboxExecutorResponse::RunModule(response) => Ok(response.outcome),
+            SandboxExecutorResponse::Error(error) => Err(executor_error_to_wasi(error)),
             other => Err(SandboxWasiError::Runtime {
-                detail: format!("WASIX module returned unexpected response {other:?}"),
+                detail: format!("sandbox executor returned unexpected response {other:?}"),
             }),
         }
     }
@@ -1225,105 +1231,31 @@ pub fn run_sandbox_wasm_module_replay_fixture_with_active_module(
     data_dir_root: impl AsRef<Path>,
     fixture: &sinomo_module::ModuleReplayFixture,
 ) -> Result<sinomo_module::ModuleReplayReport, SandboxCommandExecutionError> {
-    let runner = SandboxWasixModuleCommandRunner::from_active_module(data_dir_root.as_ref())?;
+    let runner = SandboxExecutorCommandRunner::from_active_module(data_dir_root.as_ref())?;
     let response = runner
         .module
-        .invoke(&SandboxWasixNativeRequest::RunReplayFixture(
-            SandboxWasixRunReplayFixtureRequest {
+        .invoke(&SandboxExecutorRequest::RunReplayFixture(
+            SandboxExecutorRunReplayFixtureRequest {
                 data_dir_root: data_dir_root.as_ref().to_path_buf(),
                 fixture: fixture.clone(),
             },
         ))
-        .map_err(wasix_native_module_error_to_wasi)?;
+        .map_err(executor_module_error_to_wasi)?;
     match response {
-        SandboxWasixNativeResponse::RunReplayFixture(response) => Ok(response.report),
-        SandboxWasixNativeResponse::Error(error) => Err(wasix_native_error_to_wasi(error).into()),
+        SandboxExecutorResponse::RunReplayFixture(response) => Ok(response.report),
+        SandboxExecutorResponse::Error(error) => Err(executor_error_to_wasi(error).into()),
         other => Err(SandboxWasiError::Runtime {
-            detail: format!("WASIX module returned unexpected replay response {other:?}"),
+            detail: format!("sandbox executor returned unexpected replay response {other:?}"),
         }
         .into()),
     }
 }
 
-fn load_active_sandbox_wasix_module(
-    data_dir_root: &Path,
-) -> Result<SandboxWasixNativeModule, SandboxCommandExecutionError> {
-    let module_id =
-        ModuleId::from_legacy_named(SINOMO_SANDBOX_WASIX_MODULE_ID).map_err(|source| {
-            SandboxWasiError::Runtime {
-                detail: format!("invalid WASIX module id: {source}"),
-            }
-        })?;
-    let state = read_native_dylib_module_loader_state(data_dir_root, &module_id)
-        .map_err(|source| SandboxWasiError::Runtime {
-            detail: format!("read WASIX native module loader state: {source}"),
-        })?
-        .ok_or_else(|| SandboxWasiError::Runtime {
-            detail: format!(
-                "WASIX native module is not active; install and activate `{SINOMO_SANDBOX_WASIX_MODULE_ID}`"
-            ),
-        })?;
-    validate_active_wasix_state(&state)?;
-    let library_path = native_module_cache_path(
-        data_dir_root,
-        &state.cache_key,
-        &state.content_hash,
-        &state.library_name,
-    );
-    unsafe {
-        SandboxWasixNativeModule::load_from_content_addressed_path(
-            &library_path,
-            &state.content_hash,
-        )
-    }
-    .map_err(wasix_native_module_error_to_wasi)
-    .map_err(SandboxCommandExecutionError::from)
-}
-
-fn validate_active_wasix_state(
-    state: &NativeDylibModuleLoaderState,
-) -> Result<(), SandboxCommandExecutionError> {
-    let expected_module_id =
-        ModuleId::from_legacy_named(SINOMO_SANDBOX_WASIX_MODULE_ID).map_err(|source| {
-            SandboxWasiError::Runtime {
-                detail: format!("invalid WASIX module id: {source}"),
-            }
-        })?;
-    if state.module_id != expected_module_id {
-        return Err(SandboxWasiError::Runtime {
-            detail: format!(
-                "WASIX native module loader state points to {}, expected {}",
-                state.module_id, expected_module_id
-            ),
-        }
-        .into());
-    }
-    if state.native_abi_version != SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION {
-        return Err(SandboxWasiError::Runtime {
-            detail: format!(
-                "WASIX native module ABI mismatch: expected {}, got {}",
-                SINOMO_SANDBOX_WASIX_NATIVE_ABI_VERSION, state.native_abi_version
-            ),
-        }
-        .into());
-    }
-    if state.interface_version != SINOMO_SANDBOX_WASIX_INTERFACE_VERSION {
-        return Err(SandboxWasiError::Runtime {
-            detail: format!(
-                "WASIX native module interface mismatch: expected {}, got {}",
-                SINOMO_SANDBOX_WASIX_INTERFACE_VERSION, state.interface_version
-            ),
-        }
-        .into());
-    }
-    Ok(())
-}
-
 fn local_staged_sandbox_wasix_options(
     layout: &LocalSandboxInstanceLayout,
     limits: &SandboxResourceLimits,
-    extra_preopens: Vec<SandboxWasixHostPreopen>,
-) -> SandboxWasixRunModuleOptions {
+    extra_preopens: Vec<SandboxExecutorHostPreopen>,
+) -> SandboxExecutorOptions {
     let mut preopened_dirs = vec![
         local_staged_sandbox_preopen(&layout.root_dir, "/root", SandboxMountMode::ReadWrite),
         local_staged_sandbox_preopen(&layout.home, "/home", SandboxMountMode::ReadWrite),
@@ -1334,7 +1266,7 @@ fn local_staged_sandbox_wasix_options(
         local_staged_sandbox_preopen(&layout.artifacts, "/artifacts", SandboxMountMode::ReadWrite),
     ];
     preopened_dirs.extend(extra_preopens);
-    SandboxWasixRunModuleOptions {
+    SandboxExecutorOptions {
         preopened_dirs,
         enable_virtual_devices: true,
         zero_device_bytes: SANDBOX_WASI_ZERO_DEVICE_BYTES as u64,
@@ -1343,7 +1275,7 @@ fn local_staged_sandbox_wasix_options(
         output_limit_bytes: limits.max_output_bytes,
         workspace_limit_bytes: limits.max_workspace_bytes,
         file_count_limit: limits.max_file_count,
-        ..SandboxWasixRunModuleOptions::default()
+        ..SandboxExecutorOptions::default()
     }
 }
 
@@ -1351,8 +1283,8 @@ fn local_staged_sandbox_preopen(
     host_path: &Path,
     guest_path: &str,
     mode: SandboxMountMode,
-) -> SandboxWasixHostPreopen {
-    SandboxWasixHostPreopen {
+) -> SandboxExecutorHostPreopen {
+    SandboxExecutorHostPreopen {
         host_path: host_path.to_path_buf(),
         guest_path: SandboxPath::new(guest_path).expect("static sandbox path"),
         mode,
@@ -1393,7 +1325,7 @@ fn stage_toolchain_runtime_to_local(
     layout: &LocalSandboxInstanceLayout,
     artifacts: &[(String, Vec<u8>)],
     commands: &[(String, Vec<u8>)],
-) -> Result<Vec<SandboxWasixHostPreopen>, SandboxCommandExecutionError> {
+) -> Result<Vec<SandboxExecutorHostPreopen>, SandboxCommandExecutionError> {
     let toolchain_root = ensure_local_toolchain_runtime_cache(layout, artifacts, commands)?;
     let mut preopens = Vec::new();
     if toolchain_root.exists() {
@@ -1426,7 +1358,7 @@ fn stage_toolchain_runtime_to_local(
             }
             let name = entry.file_name().to_string_lossy().into_owned();
             validate_toolchain_stage_top_level_name(&name)?;
-            preopens.push(SandboxWasixHostPreopen {
+            preopens.push(SandboxExecutorHostPreopen {
                 host_path: entry.path(),
                 guest_path: SandboxPath::new(format!("/{name}")).map_err(|source| {
                     SandboxFsError::Unavailable {
@@ -1883,9 +1815,9 @@ fn set_staged_toolchain_command_executable(
     Ok(())
 }
 
-fn wasix_command_overrides_for_toolchain(
+fn command_overrides_for_toolchain(
     toolchain: &SandboxToolchainManifest,
-) -> Vec<SandboxWasixCommandOverride> {
+) -> Vec<SandboxExecutorCommandOverride> {
     toolchain
         .commands
         .values()
@@ -1893,7 +1825,7 @@ fn wasix_command_overrides_for_toolchain(
             command.effective_target_abi(toolchain) == SandboxWasiAbi::Wasix
                 && (!command.argv_prefix.is_empty() || command.exec_name.is_some())
         })
-        .map(|command| SandboxWasixCommandOverride {
+        .map(|command| SandboxExecutorCommandOverride {
             name: command.name.clone(),
             argv_prefix: command.argv_prefix.clone(),
             exec_name: command.exec_name.clone(),
@@ -1901,13 +1833,13 @@ fn wasix_command_overrides_for_toolchain(
         .collect()
 }
 
-fn wasix_native_module_error_to_wasi(error: SandboxWasixNativeModuleError) -> SandboxWasiError {
+fn executor_module_error_to_wasi(error: SandboxExecutorClientError) -> SandboxWasiError {
     SandboxWasiError::Runtime {
         detail: error.to_string(),
     }
 }
 
-fn wasix_native_error_to_wasi(error: SandboxWasixNativeErrorResponse) -> SandboxWasiError {
+fn executor_error_to_wasi(error: SandboxExecutorErrorResponse) -> SandboxWasiError {
     if matches!(
         error.code.as_str(),
         "run-module" | "run-toolchain" | "run-replay"

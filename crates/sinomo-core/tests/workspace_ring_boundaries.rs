@@ -9,11 +9,7 @@ const FACADE_MIGRATION_COMPLETE: bool = true;
 
 /// Stable dylib ABI crates may depend directly on `sinomo-object` so native
 /// modules do not have to link the whole R0 graph for the wire codec.
-const ABI_OBJECT_EXEMPT: &[&str] = &[
-    "sinomo-module-api",
-    "sinomo-sandbox-wasix-api",
-    "sinomo-dfs-cloud-files-api",
-];
+const ABI_OBJECT_EXEMPT: &[&str] = &["sinomo-module-api"];
 
 #[derive(Clone, Debug)]
 struct PackageManifest {
@@ -270,24 +266,14 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
         "the base contracts crate should remain in default builds"
     );
     assert!(
-        default_members.contains(&"crates/sinomo-sandbox-wasix-api".to_string()),
-        "the stable WASIX ABI crate should remain in default builds"
-    );
-    assert!(
         default_members.contains(&"crates/sinomo-module-api".to_string()),
         "the generic native module ABI crate should remain in default builds"
     );
     assert!(
-        default_members.contains(&"crates/sinomo-memory-extension-api".to_string()),
-        "the data-only memory extension ABI crate should remain in default builds"
-    );
-    assert!(
-        default_members.contains(&"crates/sinomo-dfs-cloud-files-api".to_string()),
-        "the lightweight Cloud Files module API crate should remain in default builds"
-    );
-    assert!(
-        default_members.contains(&"crates/sinomo-sandbox-wasix-host".to_string()),
-        "the lightweight WASIX host loader should remain in default builds"
+        !default_members.contains(&"crates/sinomo-sandbox-executor-host".to_string())
+            && !default_members
+                .contains(&"crates/sinomo-host-filesystem-provider-host".to_string()),
+        "generic component clients belong to their domain crates, not parallel host packages"
     );
     assert!(
         default_members
@@ -298,6 +284,107 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
     assert!(
         !default_members.contains(&"crates/sinomo-benchmarks".to_string()),
         "the old benchmark crate path must not remain in default-members"
+    );
+}
+
+#[test]
+fn external_component_fixture_is_not_a_core_workspace_dependency() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let workspace_manifest =
+        fs::read_to_string(workspace_root.join("Cargo.toml")).expect("read workspace manifest");
+    assert!(
+        !workspace_manifest.contains("fixtures/external-component"),
+        "the external component fixture must remain outside workspace members and default-members"
+    );
+    assert!(
+        workspace_root
+            .join("fixtures/external-component/Cargo.toml")
+            .exists(),
+        "the independently built external component proof fixture must exist"
+    );
+    for package in read_workspace_packages().values() {
+        let manifest = fs::read_to_string(&package.manifest_path).expect("read package manifest");
+        assert!(
+            !manifest.contains("sinomo-external-component-fixture"),
+            "{} must not compile against the external component fixture",
+            package.name
+        );
+    }
+}
+
+#[test]
+fn provider_specific_api_crates_and_source_tree_module_discovery_are_absent() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let packages = read_workspace_packages();
+    for removed in [
+        "sinomo-dfs-cloud-files-api",
+        "sinomo-sandbox-wasix-api",
+        "sinomo-memory-extension-api",
+        "sinomo-sandbox-wasix-host",
+        "sinomo-host-filesystem-provider-host",
+        "sinomo-sandbox-executor-host",
+    ] {
+        assert!(
+            !packages.contains_key(removed),
+            "provider-specific boundary crate {removed} must not return to the core workspace"
+        );
+    }
+    for provider in [
+        "sinomo-dfs-cloud-files",
+        "sinomo-sandbox-wasix-module",
+        "sinomo-network-iroh-module",
+        "sinomo-remote-management-module",
+        "sinomo-benchmarks",
+    ] {
+        let dependents = packages
+            .values()
+            .filter(|package| {
+                package.name != provider
+                    && package
+                        .dependencies
+                        .iter()
+                        .any(|dependency| dependency == provider)
+            })
+            .map(|package| package.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            dependents.is_empty(),
+            "external provider {provider} must remain a dependency root, found dependents {dependents:?}"
+        );
+    }
+    let runtime = fs::read_to_string(workspace_root.join("crates/sinomo-runtime/src/lib.rs"))
+        .expect("runtime facade");
+    for forbidden in [
+        "dfs_cloud_files_api",
+        "sandbox_wasix_api",
+        "memory_extension_api",
+        "host_filesystem_provider_host",
+        "sandbox_executor_host",
+    ] {
+        assert!(
+            !runtime.contains(forbidden),
+            "runtime facade must not expose provider-specific API `{forbidden}`"
+        );
+    }
+    let rollout_paths =
+        fs::read_to_string(workspace_root.join("crates/sinomo-rollout/src/paths.rs"))
+            .expect("rollout paths");
+    assert!(
+        !rollout_paths.contains("discover_module_package_manifests")
+            && !rollout_paths.contains("package.metadata.sinomo.native-dylib"),
+        "rollout must consume signed module profiles instead of scanning source-tree manifests"
+    );
+    assert!(
+        workspace_root
+            .join("distribution/module-profile.json")
+            .is_file(),
+        "the default external component set must be seeded as signed profile data"
     );
 }
 
@@ -458,8 +545,6 @@ fn parse_sinomo_ring(manifest_text: &str) -> Option<String> {
 const OPTIONAL_PRODUCTION_DEPENDENCY_ALLOWLIST: &[(&str, &str)] = &[
     ("sinomo-cli", "sinomo-dfs-fuse"),
     ("sinomo-cli", "sinomo-models"),
-    ("sinomo-daemon", "sinomo-sandbox-wasix-host"),
-    ("sinomo-runtime", "sinomo-sandbox-wasix-host"),
 ];
 
 fn parse_workspace_dependencies(manifest_text: &str, package_name: &str) -> Vec<String> {

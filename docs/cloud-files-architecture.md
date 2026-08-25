@@ -38,7 +38,7 @@ in reconciliation state but are not synthesized as file-like placeholders.
 ## Layer Ownership
 
 ```text
-SIFS mount supervisor (node-local consent, lease, provider pin, recovery)
+Generic SIFS mount supervisor (node-local consent and process lease)
         |
         | typed SOBJ invocation and lifecycle events
         v
@@ -55,17 +55,19 @@ Explorer and applications <-> Windows Cloud Files native module
 
 | Component | Responsibility |
 |---|---|
-| `sinomo-dfs-cloud-files-api` | Versioned SOBJ request, response, event, placeholder identity, and status contracts. It contains no CFAPI implementation. |
-| SIFS mount supervisor | Reads node-local mount consent, owns the process-wide mount lease, selects and pins the exact provider artifact, supervises the native invocation, and persists host-side unregister and recovery authority. |
-| Native module | Registers and connects the CFAPI provider, validates the physical sync-root identity, serves callbacks, and owns provider-side durable state. |
+| Cloud Files private protocol | Versioned provider implementation records live in `modules/dfs/cloud-files/src/protocol.rs` and are not part of the runtime facade. |
+| Generic host interface | `sinomo.host-filesystem-provider/v1` is the only contract known by the main system. |
+| SIFS mount supervisor | Reads node-local mount consent, owns the process-wide mount lease, and calls the DFS-owned typed client. Provider selection and content-addressed loading use `sinomo-module`'s generic active-component binding. It does not decode Cloud Files state. |
+| Native module | Pins its exact artifact, registers and connects CFAPI, validates physical identity, serves callbacks, and owns registration, unregister, compensation, and recovery state. |
 | Writable worker | Converts NTFS notifications and DFS namespace events into bounded, restart-safe work. |
 | Mounted SIFS service | Resolves the configured SIFS root and performs canonical DFS reads and mutations through the normal routed service path. |
 | Windows/NTFS | Owns ordinary local directory behavior, placeholder state, cached hydrated ranges, and change notifications. |
 
 The native module executes in the daemon process and is trusted native code.
 The module ABI isolates build and rollout, not memory or security. The host
-loads only an immutable, content-addressed provider matching module ID
-`module.dfs.cloud-files` and interface `sinomo.dfs.cloud-files.v3`.
+loads only an immutable, content-addressed component offering
+`sinomo.host-filesystem-provider/v1`. Cloud Files identity and private protocol
+versions are interpreted only inside the external module.
 
 ## Read and Population Paths
 
@@ -219,23 +221,24 @@ even if the current module loader has moved to another artifact. A missing,
 tampered, or identity-mismatched pin blocks recovery; there is no fallback to a
 different provider for an owned registration.
 
-Host-owned mount and recovery files live under the DFS portion of
-`$SINOMO_DATA_DIR`. Provider-owned registration, queue, manifest, and recovery
-state live under
+The generic host owns only its process lease and provider-neutral config/status.
+Provider-owned registration, queue, manifest, compensation, and recovery state
+live under
 `$SINOMO_DATA_DIR/module/runtime/module.dfs.cloud-files/`. Exact filenames and
 schemas stay registered beside their owner. Neither subtree is a user-editable
 configuration surface.
 
 ## Disable, Re-enable, and Cursor Recovery
 
-Disabling a healthy mount is state preserving. Before stopping the provider,
-the supervisor serializes the decision with lifecycle callbacks and persists
-an exact unregister intent. The native module then records
+Disabling or replacing a healthy mount is state preserving. The component scope
+signals cancellation, waits for the active invocation to leave routing, and
+then asks the same interface provider for a state-preserving stop. The native
+module records
 `PreserveAuthorized` before CFAPI unregister effects and
 `PreservedStateOwned` only after the new-cycle state-owned journal is durable.
-The host advances the staged registration and its retained marker only from
-that exact typed successor. Re-enable durably re-arms the host and native
-markers before CFAPI registration or writable worker effects.
+The provider advances its private staged registration only from that exact
+typed successor. Re-enable durably re-arms provider-owned markers before CFAPI
+registration or writable worker effects.
 
 Cursor recovery exists for one narrow legacy state: valid provider-owned
 namespace cursors with no remaining writable queue or other mutable evidence.
@@ -243,33 +246,33 @@ Inspection is read-only. Adoption requires the exact returned token and an
 explicit acknowledgement that authoritative full reconciliation may rebuild
 the namespace state. It is not a generic repair command.
 
-Recovery completion is a cross-owner commit protocol:
+Recovery completion is a provider-owned commit protocol:
 
 | Durable cut | Meaning |
 |---|---|
-| Native `Ready` | Reconciliation is terminal for the authorized cycle; the host has durably observed readiness. |
-| Native `NamespaceFinalized`, host `ActiveObserved` | The exact namespace-finalization proof is bound while ordinary writeback remains parked. |
-| Native `CompletionAuthorized`, host `AuthorityFinalized` | Completion is irreversible; a concurrent disable must finish forward rather than return to cursor-preserving unregister. |
+| Native `Ready` | Reconciliation is terminal for the authorized cycle. |
+| Native `NamespaceFinalized` | The exact namespace-finalization proof is bound while ordinary writeback remains parked. |
+| Native `CompletionAuthorized` | Completion is irreversible; a concurrent disable must finish forward rather than return to cursor-preserving unregister. |
 | Ordinary registration journal and ordinary staged context | Recovery provenance has been normalized while the exact provider remains pinned. |
 | Native marker absent | Native completion authority was cleared only after normalized registration evidence was durable. |
-| Provider bundle absent, then host marker absent | Final host authority was released in replayable order. The ordinary staged provider pin remains restart authority. |
+| Provider recovery bundle absent | Final recovery authority was released in replayable order. The ordinary staged provider pin remains restart authority. |
 
 Every cross-file transition uses a deterministic successor and validates the
 predecessor/successor pair before effects. A crash may leave either the current
 file or its exact temporary successor; replay promotes only a causally valid
 cut. Operators must not delete these files to force progress.
 
-If disabled consent is observed after `AuthorityFinalized`, the host finishes
-normalization and latches cancellation. The native provider checks cancellation
+If disabled consent is observed after `CompletionAuthorized`, the provider
+finishes normalization and latches cancellation. The provider checks cancellation
 before completing and releasing parked population/writeback. A later ordinary
 disable uses `PreserveState` with no stale cursor context.
 
 ## Rollout and Compatibility
 
-The CLI host, typed API, and native provider are one compatibility set. A new
+The generic host interface and native provider are one compatibility set. A new
 rollout may install and select a candidate provider for fresh state, but a
 durable existing registration continues to select the exact content-addressed
-provider that owns it. The supervisor does not unregister owned state merely to
+provider that owns it. The generic supervisor does not unregister owned state merely to
 make loader selection agree with the latest rollout.
 
 Older interface and serialized-state readers exist only where the owning code
@@ -315,15 +318,10 @@ sinomo dfs mount --disable --json
 ```
 
 Do not manually unregister the sync root, replace the projected directory, or
-delete module runtime files while the supervisor owns the mount. Cursor-only
-recovery begins with read-only inspection:
-
-```powershell
-sinomo dfs mount --recover-cursor-only-state --json
-```
-
-Apply only the exact token and acknowledgement printed by that inspection and
-only after preserving the reported evidence.
+delete module runtime files while the provider owns the mount. Provider-specific
+recovery is intentionally absent from the generic mount API. A Cloud Files
+recovery tool must be versioned and shipped with the provider that owns the
+private evidence.
 
 ## Security and Failure Rules
 
@@ -347,13 +345,12 @@ only after preserving the reported evidence.
 ## Verification Boundary
 
 Pure queue, reconciliation, registration, and protocol cuts are exercised by
-Rust tests. Windows GNU cross-compilation proves the module, API, and CLI test
+Rust tests. Windows GNU cross-compilation proves the module, generic host, and CLI test
 targets continue to build:
 
 ```sh
-cargo test -p sinomo-dfs-cloud-files-api
-cargo test -p sinomo-dfs-cloud-files-api \
-  -p sinomo-dfs-cloud-files -p sinomo-cli \
+cargo test -p sinomo-dfs-cloud-files
+cargo test -p sinomo-dfs-cloud-files -p sinomo-cli \
   --target x86_64-pc-windows-gnu --no-run
 ```
 

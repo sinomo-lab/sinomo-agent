@@ -12,14 +12,15 @@ use sinomo_agent::{
 };
 use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig};
 use sinomo_runtime::module_api::{
-    NativeModuleBackend, NativeModuleBodyMode, NativeModuleCapabilitiesResponse,
-    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationRequest,
-    NativeModuleInvocationResponse, NativeModuleObjectRpcRoute, NativeModuleRequest,
-    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer,
-    SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleHostIsCancelledFn,
-    SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    ComponentDescriptor, NativeModuleBackend, NativeModuleBodyMode,
+    NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
+    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleObjectRpcRoute,
+    NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
+    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV2, SinomoModuleHostIsCancelledFn, SinomoModuleStatusCode, decode_sobj,
+    encode_sobj,
 };
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -241,6 +242,15 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
             ],
             ..Default::default()
         },
+        component: ComponentDescriptor::new(SINOMO_BENCHMARKS_MODULE_ID, env!("CARGO_PKG_VERSION"))
+            .with_offer(
+                ServiceOffer::new(
+                    SINOMO_BENCHMARKS_RPC_CATEGORY,
+                    "sinomo.benchmarks/v1",
+                    "1.0.0",
+                )
+                .with_provider_capability(SINOMO_BENCHMARKS_OPERATION),
+            ),
     }
 }
 

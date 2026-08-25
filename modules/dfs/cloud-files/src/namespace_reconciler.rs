@@ -13,11 +13,9 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 
+use crate::protocol::{CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT, SINOMO_DFS_CLOUD_FILES_MODULE_ID};
 use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
-use sinomo_dfs_cloud_files_api::{
-    CLOUD_FILES_SYNC_ATTENTION_SUMMARY_LIMIT, SINOMO_DFS_CLOUD_FILES_MODULE_ID,
-};
 use sinomo_module_api::{decode_sobj, encode_sobj};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::storage::durable_file::{

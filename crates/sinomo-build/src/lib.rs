@@ -21,7 +21,9 @@ pub use executor::*;
 pub use module::*;
 pub use paths::*;
 pub use protocol::*;
-pub use service::{BuildService, register_services, register_services_for_data_dir};
+pub use service::{
+    BuildService, component_factory, register_services, register_services_for_data_dir,
+};
 pub use target::*;
 
 use thiserror::Error;

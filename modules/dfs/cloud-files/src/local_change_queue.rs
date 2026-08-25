@@ -20,7 +20,7 @@ use sinomo_runtime::storage::durable_file::{
     DurableRecordAppendOptions, DurableRecordReadOptions,
 };
 
-use sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
+use crate::protocol::SINOMO_DFS_CLOUD_FILES_MODULE_ID;
 
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;

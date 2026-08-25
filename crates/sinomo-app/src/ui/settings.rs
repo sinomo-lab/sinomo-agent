@@ -52,12 +52,12 @@ use sui::{
 use sinomo_runtime::config::{
     ConfigClient, ConfigKey, ConfigSchema, ConfigSchemaField, ConfigSchemaValue, ConfigWriteTarget,
 };
+#[cfg(test)]
+use sinomo_runtime::dfs::HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION;
 use sinomo_runtime::dfs::{
     SifsMountAttentionKind, SifsMountAttentionNextAction, SifsMountAttentionSummary,
     SifsMountConfig, SifsMountPlatform, SifsMountRuntimePhase, SifsMountWritebackMode,
 };
-#[cfg(test)]
-use sinomo_runtime::dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION;
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::LocalNodePermissions;
 use sinomo_runtime::vfs::VfsHandle;
@@ -83,7 +83,8 @@ use crate::backend::config::{
 };
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
 use crate::backend::mounts::{
-    SifsMountSettingsSnapshot, validate_connected_cloud_files_status_at, validate_sifs_mount_config,
+    SifsMountSettingsSnapshot, validate_connected_host_filesystem_provider_status_at,
+    validate_sifs_mount_config,
 };
 use crate::backend::remote_management::{
     EXTERNAL_INTEGRATIONS_ALLOW_COMMAND, EXTERNAL_INTEGRATIONS_DENY_COMMAND,
@@ -381,7 +382,7 @@ impl From<&SifsMountConfig> for SifsMountForm {
         };
         match SifsMountPlatform::current() {
             SifsMountPlatform::UnixFuse => form.sync_local_changes = false,
-            SifsMountPlatform::WindowsCloudFiles => {
+            SifsMountPlatform::ExternalProvider => {
                 form.allow_other = false;
             }
             SifsMountPlatform::Unsupported => {
@@ -6878,7 +6879,7 @@ fn build_sifs_mount_runtime_status(
                 "Read and write"
             },
         ));
-    if status.platform == SifsMountPlatform::WindowsCloudFiles {
+    if status.platform == SifsMountPlatform::ExternalProvider {
         runtime_rows = runtime_rows
             .with_child(value_row(
                 shared,
@@ -7170,13 +7171,13 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
     let mount_point = text_row(
         reader,
         "sifs-mount-location",
-        if platform == SifsMountPlatform::WindowsCloudFiles {
+        if platform == SifsMountPlatform::ExternalProvider {
             "Sync root"
         } else {
             "Mount location"
         },
         form.mount_point,
-        if platform == SifsMountPlatform::WindowsCloudFiles {
+        if platform == SifsMountPlatform::ExternalProvider {
             r"C:\Users\you\Sinomo"
         } else {
             "~/sinomo"
@@ -7232,7 +7233,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                     "Owner-only by default; allow_other also requires user_allow_other in /etc/fuse.conf",
                 ));
         }
-        SifsMountPlatform::WindowsCloudFiles => {
+        SifsMountPlatform::ExternalProvider => {
             let writeback_enabled = !form.read_only && form.sync_local_changes;
             config_rows = config_rows
                 .with_child(switch_row(
@@ -7252,7 +7253,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
                 .with_child(value_row(
                     shared,
                     reader,
-                    "Cloud Files policy",
+                    "External provider policy",
                     "Writable activation requires explicit durable sync. Local operations are journaled and version-fenced; conflicts fail closed for review.",
                 ));
         }
@@ -7353,7 +7354,7 @@ fn section_sifs_mount_body(shared: &Shared, reader: &ThemeReader) -> impl Widget
 fn sifs_mount_platform_label(platform: SifsMountPlatform) -> &'static str {
     match platform {
         SifsMountPlatform::UnixFuse => "Unix FUSE",
-        SifsMountPlatform::WindowsCloudFiles => "Windows Cloud Files",
+        SifsMountPlatform::ExternalProvider => "External provider",
         SifsMountPlatform::Unsupported => "Unsupported platform",
     }
 }
@@ -7496,7 +7497,7 @@ fn sifs_mount_presentation_at(
         );
     }
     if status.phase == SifsMountRuntimePhase::Connected
-        && let Err(error) = validate_connected_cloud_files_status_at(status, now)
+        && let Err(error) = validate_connected_host_filesystem_provider_status_at(status, now)
     {
         return needs_attention(
             format!("{error}; last observation: {}", status.detail),
@@ -7506,7 +7507,7 @@ fn sifs_mount_presentation_at(
     if status.unregister_pending {
         return needs_attention(
             format!(
-                "A retired Cloud Files registration still requires cleanup; {}",
+                "A retired host-filesystem provider still requires cleanup; {}",
                 status.detail
             ),
             "Keep the daemon running and refresh status. Replacement activation stays blocked until cleanup completes.",
@@ -16242,7 +16243,7 @@ mod tests {
         };
         let status = sinomo_runtime::dfs::SifsMountRuntimeStatus {
             phase: SifsMountRuntimePhase::Connected,
-            platform: SifsMountPlatform::WindowsCloudFiles,
+            platform: SifsMountPlatform::ExternalProvider,
             configured_mount_point: config.mount_point.clone(),
             resolved_mount_point: Some(config.mount_point.clone()),
             root_path: config.root_path.clone(),
@@ -16257,7 +16258,9 @@ mod tests {
             last_worker_heartbeat_at: Some(timestamp.clone()),
             daemon_pid: Some(4242),
             provider_content_hash: Some("abcdef0123456789".to_string()),
-            provider_interface_version: Some(SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string()),
+            provider_interface_version: Some(
+                HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string(),
+            ),
             placeholders_created: Some(3),
             detail: "callbacks connected after a complete worker pass".to_string(),
             updated_at: timestamp,
@@ -16416,7 +16419,7 @@ mod tests {
         assert_eq!(mount.snapshot.status.daemon_pid, Some(4242));
         assert_eq!(
             mount.snapshot.status.provider_interface_version.as_deref(),
-            Some(SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION)
+            Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION)
         );
         assert_eq!(
             section_preview(&shared, SettingsSection::SifsMount),
@@ -16475,7 +16478,7 @@ mod tests {
             kind: SifsMountAttentionKind::UnsupportedObjectKind,
             path: "/teams/design/socket".to_string(),
             reason_code: "unsupported-object-kind".to_string(),
-            reason: "Cloud Files cannot expose a Unix socket as a placeholder".to_string(),
+            reason: "external provider cannot expose a Unix socket".to_string(),
             retained_local_evidence: Some(sinomo_runtime::dfs::SifsMountRetainedLocalEvidence {
                 operation_id: Some("operation-7".to_string()),
                 evidence_id: Some("evidence-9".to_string()),
@@ -17441,7 +17444,7 @@ mod tests {
 
     #[test]
     fn module_id_matching_normalizes_legacy_aliases() {
-        let legacy = "module.sandbox.wasix";
+        let legacy = "module.external-executor";
         let canonical = sinomo_runtime::core::Id::from_legacy_named(legacy)
             .expect("canonical module id")
             .to_string();
@@ -18534,7 +18537,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         let associated_index;
-        let cloud_files_index;
+        let external_provider_index;
         let nfs_config_index;
         let nfs_status_index;
         let unmatched_index;
@@ -18560,10 +18563,10 @@ mod tests {
                 nodes: vec![node_summary],
                 modules: vec![
                     crate::backend::modules::ModuleConfigModuleSummary {
-                        module_id: "module.sandbox.wasix".to_string(),
-                        label: "WASIX Sandbox".to_string(),
-                        backend: "wasix".to_string(),
-                        detail: "WASIX sandbox runtime module".to_string(),
+                        module_id: "module.external-executor".to_string(),
+                        label: "External Executor".to_string(),
+                        backend: "native-dylib".to_string(),
+                        detail: "External sandbox executor".to_string(),
                         desired_enabled: Some(true),
                         effective_enabled: false,
                         effective_source: ModuleRuntimeConfigSource::Node,
@@ -18571,8 +18574,8 @@ mod tests {
                         observed_detail: "Runtime process is active".to_string(),
                     },
                     crate::backend::modules::ModuleConfigModuleSummary {
-                        module_id: "module.dfs.cloud-files".to_string(),
-                        label: "Cloud Files".to_string(),
+                        module_id: "module.external-filesystem".to_string(),
+                        label: "External Filesystem".to_string(),
                         backend: "native-dylib".to_string(),
                         detail: "Windows SIFS filesystem projection".to_string(),
                         desired_enabled: Some(true),
@@ -18603,7 +18606,7 @@ mod tests {
                 r#"{"enabled":true,"endpoint":"https://sandbox.test"}"#,
             );
             associated.module_id = Some(
-                sinomo_runtime::core::Id::from_legacy_named("module.sandbox.wasix")
+                sinomo_runtime::core::Id::from_legacy_named("module.external-executor")
                     .expect("canonical module id")
                     .to_string(),
             );
@@ -18627,22 +18630,22 @@ mod tests {
             ));
             settings.config_items.push(associated);
 
-            cloud_files_index = settings.config_items.len();
+            external_provider_index = settings.config_items.len();
             let definition = sinomo_runtime::dfs::sifs_mount_config_definition_for_module(
-                "module.dfs.cloud-files",
+                "module.external-filesystem",
             );
             let default_value = definition.default_value.expect("mount mapping default");
             let default_json = serde_json::to_string(&default_value).expect("mount mapping JSON");
-            let mut cloud_files = test_config_item(
+            let mut external_provider = test_config_item(
                 sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY,
                 ConfigEditKind::Json,
                 &default_json,
             );
-            cloud_files.owner = definition.owner;
-            cloud_files.module_id = definition.module_id;
-            cloud_files.description = definition.description;
-            cloud_files.schema = definition.schema;
-            settings.config_items.push(cloud_files);
+            external_provider.owner = definition.owner;
+            external_provider.module_id = definition.module_id;
+            external_provider.description = definition.description;
+            external_provider.schema = definition.schema;
+            settings.config_items.push(external_provider);
 
             nfs_config_index = settings.config_items.len();
             let definition = sinomo_runtime::dfs_nfs::nfs_mount_config_definition();
@@ -18725,7 +18728,7 @@ mod tests {
         let window = app.main_window()?;
 
         window
-            .get_by_text("WASIX Sandbox")
+            .get_by_text("External Executor")
             .expect()
             .to_be_visible()?;
         window.get_by_text("Desired").expect().to_be_visible()?;
@@ -18757,22 +18760,27 @@ mod tests {
             .with_name(format!("config-{associated_index}-schema-endpoint"))
             .expect()
             .to_have_value("https://sandbox.test")?;
-        window.get_by_text("Cloud Files").expect().to_be_visible()?;
+        window
+            .get_by_text("External Filesystem")
+            .expect()
+            .to_be_visible()?;
         assert!(
             window
                 .get_by_text("Settings · storage.sifs-mount")
                 .count()?
                 >= 1,
-            "the Cloud Files descriptor must render the shared mount mapping on its module card"
+            "the external provider descriptor must render the shared mount mapping on its module card"
         );
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name(format!("config-{cloud_files_index}-schema-mount_point"))
+            .with_name(format!(
+                "config-{external_provider_index}-schema-mount_point"
+            ))
             .expect()
             .to_be_visible()?;
         window
             .get_by_role(sui::SemanticsRole::TextInput)
-            .with_name(format!("config-{cloud_files_index}-schema-root_path"))
+            .with_name(format!("config-{external_provider_index}-schema-root_path"))
             .expect()
             .to_have_value("/")?;
         window.get_by_text("NFS Mount").expect().to_be_visible()?;

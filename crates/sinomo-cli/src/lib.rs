@@ -126,7 +126,7 @@ use sinomo_runtime::daemon::{
     invite_introducers_from_daemon_status,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
     read_daemon_endpoint_advertisement_config,
-    run_daemon_control_loop_with_services as daemon_run_daemon_control_loop_with_services,
+    run_daemon_control_loop_with_components as daemon_run_daemon_control_loop_with_components,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
@@ -724,11 +724,11 @@ pub(crate) use completion::*;
 ///
 /// Standalone and embedded main daemons register the same application-ring
 /// service so UI-written local consent has identical lifecycle semantics.
-pub fn sifs_mount_supervisor_service_hook(
+pub fn sifs_mount_supervisor_component_factory(
     data_dir: sinomo_runtime::local::SinomoDataDir,
     daemon_paths: sinomo_runtime::daemon::DaemonPaths,
-) -> sinomo_runtime::daemon::DaemonServiceRegistryHook {
-    dfs_mount_supervisor::sifs_mount_supervisor_service_hook(data_dir, daemon_paths)
+) -> sinomo_runtime::daemon::DaemonComponentFactory {
+    dfs_mount_supervisor::sifs_mount_supervisor_component_factory(data_dir, daemon_paths)
 }
 
 thread_local! {
@@ -1502,12 +1502,7 @@ fn default_module_cli_command_config(
             sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
             "operational observation module",
         )
-        .expect("observe module id is valid")
-        .with_wasix(sinomo_runtime::module::ModuleWasixCliConfig {
-            module_id: sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_MODULE_ID,
-            interface_version:
-                sinomo_runtime::sandbox_wasix_api::SINOMO_SANDBOX_WASIX_INTERFACE_VERSION,
-        });
+        .expect("observe module id is valid");
     let module_config = local_data_dir
         .and_then(|data_dir| {
             module_config

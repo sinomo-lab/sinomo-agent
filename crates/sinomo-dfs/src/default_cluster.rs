@@ -2339,28 +2339,28 @@ mod tests {
             .expect("disabled member");
         let now = OffsetDateTime::now_utc();
         let records = [
-            sinomo_core::service::ServiceInstanceRecord {
-                service: "dfs".to_string(),
-                node_id: remote.clone(),
-                registry_version: 1,
-                routes: vec![crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.to_string()],
-                capabilities: vec!["dfs.metadata.replicate".to_string()],
-                updated_at: now,
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("dfs", remote.clone());
+                record.routes = vec![crate::DFS_METADATA_JOURNAL_BATCH_ROUTE.to_string()];
+                record.provider_capabilities = vec!["dfs.metadata.replicate".to_string()];
+                record.updated_at = now;
+                record
             },
-            sinomo_core::service::ServiceInstanceRecord {
-                service: "daemon".to_string(),
-                node_id: disabled,
-                registry_version: 1,
-                routes: vec!["/daemon/status".to_string()],
-                capabilities: vec!["daemon.status.read".to_string()],
-                updated_at: now,
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
+                record.routes = vec!["/daemon/status".to_string()];
+                record.provider_capabilities = vec!["daemon.status.read".to_string()];
+                record.updated_at = now;
+                record
             },
         ];
         let entries = records
             .into_iter()
             .map(|record| sinomo_core::kv::KvEntry {
                 key: sinomo_core::service::cluster_service_instance_key(
-                    &record.service,
+                    &record.service_id,
                     &record.node_id,
                 ),
                 value: sinomo_core::kv::encode_kv_value(&record).expect("encode service"),

@@ -956,13 +956,13 @@ mod tests {
         );
         assert!(
             ids.iter()
-                .any(|candidate| candidate == "cluster.agent.module-native-dylib-active-cancel"),
-            "missing cluster.agent.module-native-dylib-active-cancel"
+                .all(|candidate| candidate != "cluster.agent.module-native-dylib-active-cancel"),
+            "core test registry must not embed an external provider's active-work fixture"
         );
     }
 
     #[test]
-    fn agent_readiness_tags_separate_required_and_fixture_backed_checks() {
+    fn agent_readiness_core_checks_do_not_require_an_external_fixture() {
         let registry = test_registry().expect("registry");
         let metadata = registry.metadata();
         let sandbox = metadata
@@ -979,19 +979,12 @@ mod tests {
 
         let native = metadata
             .iter()
-            .find(|case| case.id == "cluster.agent.module-native-dylib-active-cancel")
-            .expect("native-dylib cancellation case");
-        assert!(
-            native
-                .tags
-                .iter()
-                .any(|tag| tag == "agent-readiness-extended")
-        );
-        assert!(!native.tags.iter().any(|tag| tag == "agent-readiness"));
+            .find(|case| case.id == "cluster.agent.module-native-dylib-cancel-route")
+            .expect("generic native-dylib cancellation route case");
+        assert!(native.tags.iter().any(|tag| tag == "agent-readiness"));
         assert!(native.requirements.iter().any(|requirement| matches!(
             requirement,
-            sinomo_runtime::test::SinomoTestRequirement::RuntimeCapability { capability }
-                if capability.starts_with("module.native-dylib:")
+            sinomo_runtime::test::SinomoTestRequirement::ClusterRuntime
         )));
     }
 }

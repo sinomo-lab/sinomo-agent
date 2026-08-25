@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use sinomo_kv::{
     ClusterKvTxnCommitResult, ClusterKvTxnCompactCommitResult, KvAuthoritativeRead, KvEntry,
     KvError, KvLocalRead, KvTxnRequest,
@@ -474,6 +475,46 @@ pub struct ServiceRouteReadiness {
     pub timeout_ms: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceDiscoveryLocality {
+    #[default]
+    Local,
+    Cluster,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceDiscoveryHealth {
+    Starting,
+    #[default]
+    Ready,
+    Degraded,
+    Unavailable,
+}
+
+/// Provider identity attached to a route and projected into cluster discovery.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ServiceDiscoveryIdentity {
+    pub service_id: String,
+    pub interface_id: String,
+    pub interface_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_requirements: Vec<String>,
+    pub component_id: String,
+    pub component_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub component_generation: u64,
+    #[serde(default)]
+    pub health: ServiceDiscoveryHealth,
+    #[serde(default)]
+    pub locality: ServiceDiscoveryLocality,
+}
+
 impl ServiceRouteReadiness {
     pub fn is_ready(&self) -> bool {
         self.available_concurrency
@@ -501,6 +542,7 @@ pub struct ServiceRoute {
     pub request_body_mode: ServiceBodyMode,
     pub response_body_mode: ServiceBodyMode,
     pub request_value_mode: ServiceRequestValueMode,
+    pub discovery: Option<ServiceDiscoveryIdentity>,
 }
 
 impl ServiceRoute {
@@ -520,6 +562,7 @@ impl ServiceRoute {
             request_body_mode: ServiceBodyMode::None,
             response_body_mode: ServiceBodyMode::None,
             request_value_mode: ServiceRequestValueMode::Incremental,
+            discovery: None,
         }
     }
 
@@ -624,6 +667,11 @@ impl ServiceRoute {
         self.request_value_mode = ServiceRequestValueMode::BufferedCompatibility;
         self
     }
+
+    pub fn with_discovery_identity(mut self, identity: ServiceDiscoveryIdentity) -> Self {
+        self.discovery = Some(identity);
+        self
+    }
 }
 
 type ServiceHandler =
@@ -646,6 +694,7 @@ struct RouteOwner {
     request_body_mode: ServiceBodyMode,
     response_body_mode: ServiceBodyMode,
     request_value_mode: ServiceRequestValueMode,
+    discovery: Option<ServiceDiscoveryIdentity>,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
@@ -770,6 +819,7 @@ impl ServiceRegistry {
                 request_body_mode: owner.request_body_mode,
                 response_body_mode: owner.response_body_mode,
                 request_value_mode: owner.request_value_mode,
+                discovery: owner.discovery.clone(),
             })
             .collect()
     }
@@ -791,6 +841,7 @@ impl ServiceRegistry {
             request_body_mode: owner.request_body_mode,
             response_body_mode: owner.response_body_mode,
             request_value_mode: owner.request_value_mode,
+            discovery: owner.discovery.clone(),
         })
     }
 
@@ -812,6 +863,10 @@ impl ServiceRegistry {
         self.by_route
             .get(route)
             .map(|owner| owner.category.as_str())
+    }
+
+    pub fn service_name_for_route(&self, route: &str) -> Option<&'static str> {
+        self.by_route.get(route).map(|owner| owner.service_name)
     }
 
     /// Whether any registered service owns `route`. Lets a host dispatch registry-owned
@@ -850,6 +905,7 @@ impl ServiceRegistry {
                                 request_body_mode: owner.request_body_mode,
                                 response_body_mode: owner.response_body_mode,
                                 request_value_mode: owner.request_value_mode,
+                                discovery: owner.discovery.clone(),
                             },
                         },
                     )
@@ -926,6 +982,7 @@ pub enum ServiceRegistrySnapshotError {
 pub struct ServiceRegistrySnapshotStore {
     active: Arc<ArcSwap<ServiceRegistrySnapshot>>,
     update_lock: Arc<Mutex<()>>,
+    version_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for ServiceRegistrySnapshotStore {
@@ -946,14 +1003,23 @@ impl Default for ServiceRegistrySnapshotStore {
 impl ServiceRegistrySnapshotStore {
     pub fn new(registry: ServiceRegistry) -> Self {
         let snapshot = Arc::new(ServiceRegistrySnapshot::new(1, registry));
+        let (version_tx, _) = tokio::sync::watch::channel(snapshot.version());
         Self {
             active: Arc::new(ArcSwap::from(snapshot)),
             update_lock: Arc::new(Mutex::new(())),
+            version_tx,
         }
     }
 
     pub fn active_snapshot(&self) -> Arc<ServiceRegistrySnapshot> {
         self.active.load_full()
+    }
+
+    /// Subscribe to exact active-generation changes. Consumers use this edge
+    /// to publish discovery state immediately rather than waiting for a generic
+    /// maintenance cadence.
+    pub fn subscribe_versions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.version_tx.subscribe()
     }
 
     pub fn replace_registry(
@@ -971,6 +1037,7 @@ impl ServiceRegistrySnapshotStore {
             registry,
         ));
         self.active.store(Arc::clone(&snapshot));
+        self.version_tx.send_replace(snapshot.version());
         Ok(snapshot)
     }
 }
@@ -990,6 +1057,54 @@ struct PendingRouteOwner {
 }
 
 impl ServiceRegistryBuilder {
+    /// Merge one immutable registry fragment into this registry generation.
+    ///
+    /// Component scopes build private fragments once at mount time. The host
+    /// can then compose a new generation by cloning their handlers and route
+    /// metadata without reconstructing service-owned state.
+    ///
+    /// # Panics
+    /// Panics if a route in `registry` is already owned by this builder.
+    pub fn merge_registry(mut self, registry: &ServiceRegistry) -> Self {
+        for (route, owner) in &registry.by_route {
+            if let Some(previous) = self.by_route.insert(
+                route.clone(),
+                PendingRouteOwner {
+                    service_name: owner.service_name,
+                    handler: Arc::clone(&owner.handler),
+                    route: ServiceRoute {
+                        route: route.clone(),
+                        category: owner.category.clone(),
+                        summary: owner.summary.clone(),
+                        input_type: owner.input_type.clone(),
+                        output_type: owner.output_type.clone(),
+                        observability: owner.observability.clone(),
+                        auth_scope: owner.auth_scope.clone(),
+                        required_capabilities: owner.required_capabilities.clone(),
+                        required_local_permissions: owner.required_local_permissions.clone(),
+                        concurrency_limit: owner.concurrency_limit,
+                        timeout_ms: owner.timeout_ms,
+                        request_body_mode: owner.request_body_mode,
+                        response_body_mode: owner.response_body_mode,
+                        request_value_mode: owner.request_value_mode,
+                        discovery: owner.discovery.clone(),
+                    },
+                },
+            ) {
+                panic!(
+                    "service route `{route}` is claimed by both `{}` and `{}`",
+                    previous.service_name, owner.service_name
+                );
+            }
+        }
+        for service_name in &registry.service_names {
+            if !self.service_names.contains(service_name) {
+                self.service_names.push(service_name);
+            }
+        }
+        self
+    }
+
     /// Register a service, mapping each of its route/category pairs to it.
     ///
     /// # Panics
@@ -1092,6 +1207,7 @@ impl ServiceRegistryBuilder {
                             request_body_mode: metadata.request_body_mode,
                             response_body_mode: metadata.response_body_mode,
                             request_value_mode: metadata.request_value_mode,
+                            discovery: metadata.discovery,
                             semaphore: metadata
                                 .concurrency_limit
                                 .map(|limit| Arc::new(tokio::sync::Semaphore::new(limit))),
@@ -1888,6 +2004,7 @@ mod tests {
         let store = ServiceRegistrySnapshotStore::new(
             ServiceRegistry::builder().register(EchoService).build(),
         );
+        let mut versions = store.subscribe_versions();
         let old_snapshot = store.active_snapshot();
         assert_eq!(old_snapshot.version(), 1);
         assert_eq!(
@@ -1903,6 +2020,8 @@ mod tests {
             )
             .expect("replace registry");
         assert_eq!(new_snapshot.version(), 2);
+        versions.changed().await.expect("registry generation edge");
+        assert_eq!(*versions.borrow_and_update(), 2);
         assert_eq!(store.active_snapshot().version(), 2);
         assert_eq!(
             store

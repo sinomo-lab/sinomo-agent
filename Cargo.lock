@@ -9556,6 +9556,7 @@ dependencies = [
  "sinomo-evolution",
  "sinomo-lm",
  "sinomo-runtime",
+ "sinomo-testdir",
  "sinomo-ui",
  "sinomo-ui-testing",
  "sinomo-video",
@@ -9644,6 +9645,7 @@ dependencies = [
  "blake3",
  "candle-core",
  "crossterm",
+ "fs2",
  "libc",
  "metrics",
  "notify",
@@ -9654,13 +9656,11 @@ dependencies = [
  "sinomo-agent",
  "sinomo-audio",
  "sinomo-dfs-fuse",
- "sinomo-dfs-nfs",
  "sinomo-lm",
  "sinomo-memory",
  "sinomo-models",
  "sinomo-pytorch",
  "sinomo-runtime",
- "sinomo-sandbox-wasix-module",
  "sinomo-testdir",
  "sinomo-video",
  "time",
@@ -9812,7 +9812,6 @@ dependencies = [
  "serde_json",
  "sinomo-config",
  "sinomo-core",
- "sinomo-dfs-cloud-files-api",
  "sinomo-module",
  "sinomo-testdir",
  "thiserror 2.0.20",
@@ -9830,20 +9829,12 @@ dependencies = [
  "blake3",
  "fs2",
  "serde",
- "sinomo-dfs-cloud-files-api",
  "sinomo-module-api",
  "sinomo-runtime",
  "tokio",
  "ulid",
  "windows",
  "windows-collections",
-]
-
-[[package]]
-name = "sinomo-dfs-cloud-files-api"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -10020,15 +10011,6 @@ dependencies = [
  "sinomo-runtime",
  "thiserror 2.0.20",
  "time",
-]
-
-[[package]]
-name = "sinomo-memory-extension-api"
-version = "0.1.0"
-dependencies = [
- "serde",
- "sinomo-module-api",
- "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -10247,23 +10229,22 @@ dependencies = [
 name = "sinomo-rollout"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "fs2",
  "notify",
+ "ring",
  "serde",
  "serde_bytes",
  "serde_json",
  "sinomo-config",
  "sinomo-core",
- "sinomo-dfs-cloud-files-api",
  "sinomo-module",
  "sinomo-registry",
- "sinomo-sandbox-wasix-api",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
  "tokio",
- "toml 1.1.4+spec-1.1.0",
  "tracing",
 ]
 
@@ -10279,11 +10260,9 @@ dependencies = [
  "sinomo-daemon",
  "sinomo-device",
  "sinomo-dfs",
- "sinomo-dfs-cloud-files-api",
  "sinomo-dfs-nfs",
  "sinomo-eval",
  "sinomo-installer",
- "sinomo-memory-extension-api",
  "sinomo-module",
  "sinomo-module-api",
  "sinomo-observe",
@@ -10293,8 +10272,6 @@ dependencies = [
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-sandbox-simple",
- "sinomo-sandbox-wasix-api",
- "sinomo-sandbox-wasix-host",
  "sinomo-supervision",
  "sinomo-test",
  "sinomo-vfs",
@@ -10323,6 +10300,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "wat",
 ]
 
 [[package]]
@@ -10338,33 +10316,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sinomo-sandbox-wasix-api"
-version = "0.1.0"
-dependencies = [
- "serde",
- "sinomo-module",
- "sinomo-module-api",
- "sinomo-object",
- "sinomo-sandbox",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "sinomo-sandbox-wasix-host"
-version = "0.1.0"
-dependencies = [
- "sinomo-core",
- "sinomo-module",
- "sinomo-module-api",
- "sinomo-sandbox",
- "sinomo-sandbox-wasix-api",
- "sinomo-testdir",
- "thiserror 2.0.20",
- "time",
- "wat",
-]
-
-[[package]]
 name = "sinomo-sandbox-wasix-module"
 version = "0.1.0"
 dependencies = [
@@ -10375,8 +10326,8 @@ dependencies = [
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",
+ "sinomo-module-api",
  "sinomo-sandbox",
- "sinomo-sandbox-wasix-api",
  "sinomo-testdir",
  "tar",
  "thiserror 2.0.20",
@@ -11577,21 +11528,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml"
-version = "1.1.4+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
-dependencies = [
- "indexmap",
- "serde_core",
- "serde_spanned",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "toml_writer",
- "winnow 1.0.4",
-]
-
-[[package]]
 name = "toml_datetime"
 version = "0.7.5+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12480,7 +12416,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
+ "toml",
  "url",
 ]
 
@@ -12545,7 +12481,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 2.0.20",
- "toml 0.9.12+spec-1.1.0",
+ "toml",
  "url",
  "wasmer-config",
  "wasmer-types",
@@ -12649,7 +12585,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-stream",
- "toml 0.9.12+spec-1.1.0",
+ "toml",
  "tracing",
  "url",
  "urlencoding",

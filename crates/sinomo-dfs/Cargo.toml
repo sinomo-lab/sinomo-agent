@@ -32,7 +32,6 @@ sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }
 
 [target.'cfg(windows)'.dependencies]
-sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 windows-sys.workspace = true
 
 [dev-dependencies]

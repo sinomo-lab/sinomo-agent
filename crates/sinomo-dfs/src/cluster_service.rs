@@ -170,28 +170,28 @@ mod tests {
             ),
         ]);
         let records = [
-            sinomo_core::service::ServiceInstanceRecord {
-                service: "dfs".to_string(),
-                node_id: provider.clone(),
-                registry_version: 1,
-                routes: vec![crate::DFS_STATUS_ROUTE.to_string()],
-                capabilities: vec!["dfs.object.transfer".to_string()],
-                updated_at: now,
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("dfs", provider.clone());
+                record.routes = vec![crate::DFS_STATUS_ROUTE.to_string()];
+                record.provider_capabilities = vec!["dfs.object.transfer".to_string()];
+                record.updated_at = now;
+                record
             },
-            sinomo_core::service::ServiceInstanceRecord {
-                service: "daemon".to_string(),
-                node_id: disabled,
-                registry_version: 1,
-                routes: vec!["/daemon/status".to_string()],
-                capabilities: vec!["daemon.status.read".to_string()],
-                updated_at: now,
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
+                record.routes = vec!["/daemon/status".to_string()];
+                record.provider_capabilities = vec!["daemon.status.read".to_string()];
+                record.updated_at = now;
+                record
             },
         ];
         let mut entries = records
             .into_iter()
             .map(|record| KvEntry {
                 key: sinomo_core::service::cluster_service_instance_key(
-                    &record.service,
+                    &record.service_id,
                     &record.node_id,
                 ),
                 value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),
@@ -256,14 +256,10 @@ mod tests {
                 "pk-disabled",
                 now,
             ));
-        let record = sinomo_core::service::ServiceInstanceRecord {
-            service: "daemon".to_string(),
-            node_id: disabled,
-            registry_version: 1,
-            routes: vec!["/daemon/status".to_string()],
-            capabilities: vec!["daemon.status.read".to_string()],
-            updated_at: now,
-        };
+        let mut record = sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
+        record.routes = vec!["/daemon/status".to_string()];
+        record.provider_capabilities = vec!["daemon.status.read".to_string()];
+        record.updated_at = now;
         sinomo_core::kv::write_cluster_kv_snapshot(
             &cluster_paths.kv_paths(),
             &KvSnapshot {
@@ -271,7 +267,7 @@ mod tests {
                 compacted_revision: KvRevision(0),
                 entries: vec![KvEntry {
                     key: sinomo_core::service::cluster_service_instance_key(
-                        &record.service,
+                        &record.service_id,
                         &record.node_id,
                     ),
                     value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),

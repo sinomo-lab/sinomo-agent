@@ -4,17 +4,22 @@
 //! native-module ABI and keeps Windows Cloud Files bindings out of the main
 //! `sinomo` binary on non-Windows platforms.
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
+mod protocol;
+
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(windows)]
-use sinomo_dfs_cloud_files_api::CloudFilesModuleEvent;
+use crate::protocol::CloudFilesModuleEvent;
 #[cfg(any(windows, test))]
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CLOUD_FILES_PLACEHOLDER_IDENTITY_MAX_BYTES, CLOUD_FILES_PLACEHOLDER_IDENTITY_SCHEMA_VERSION,
     CloudFilesPlaceholderIdentity, CloudFilesStaleIdentityReason,
 };
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CloudFilesModuleError, CloudFilesModuleRequest, CloudFilesModuleResponse,
     SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_CAPABILITY,
     SINOMO_DFS_CLOUD_FILES_CURSOR_ONLY_RECOVERY_APPLY_OPERATION,
@@ -27,14 +32,23 @@ use sinomo_dfs_cloud_files_api::{
     SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION,
 };
 use sinomo_module_api::{
-    ModuleSettingsExport, NativeModuleBackend, NativeModuleCapabilitiesResponse,
-    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationRequest,
-    NativeModuleInvocationResponse, NativeModuleRequest, NativeModuleResponse,
-    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
-    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
-    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    ComponentDescriptor, ModuleSettingsExport, NativeModuleBackend,
+    NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
+    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleRequest,
+    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
+    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
+    decode_sobj, encode_sobj,
 };
+use sinomo_runtime::dfs::{
+    HOST_FILESYSTEM_PROVIDER_INTERFACE_ID, HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION,
+    HOST_FILESYSTEM_PROVIDER_OPERATION, HostFilesystemProviderError, HostFilesystemProviderRequest,
+    HostFilesystemProviderResponse, SifsMountPlatform, SifsMountRuntimePhase,
+    SifsMountRuntimeStatus,
+};
+#[cfg(windows)]
+use sinomo_runtime::dfs::{HostFilesystemProviderEvent, SifsMountWritebackMode};
 
 pub mod local_change_queue;
 pub mod namespace_reconciler;
@@ -49,6 +63,8 @@ pub mod windows_sync;
 
 #[cfg(any(windows, test))]
 const CLOUD_FILES_PLACEHOLDER_IDENTITY_MAGIC: &[u8] = b"SCFI\0\x01";
+
+static GENERIC_HOST_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[cfg(any(windows, test))]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -282,6 +298,7 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
         interface_version: SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION.to_string(),
         platform_triple: platform_triple(),
         supported_operations: vec![
+            HOST_FILESYSTEM_PROVIDER_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION.to_string(),
             SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION.to_string(),
@@ -300,6 +317,18 @@ pub fn cloud_files_module_descriptor() -> NativeModuleDescriptor {
             settings: cloud_files_settings_exports(),
             ..Default::default()
         },
+        component: ComponentDescriptor::new(
+            SINOMO_DFS_CLOUD_FILES_MODULE_ID,
+            env!("CARGO_PKG_VERSION"),
+        )
+        .with_offer(
+            ServiceOffer::new(
+                "host-filesystem-provider",
+                HOST_FILESYSTEM_PROVIDER_INTERFACE_ID,
+                HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION,
+            )
+            .with_provider_capability("sifs.host-filesystem.mount"),
+        ),
     }
 }
 
@@ -342,6 +371,9 @@ fn invoke_unchecked(
 }
 
 fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    if request.operation == HOST_FILESYSTEM_PROVIDER_OPERATION {
+        return invoke_host_filesystem_provider(request);
+    }
     if request.operation != SINOMO_DFS_CLOUD_FILES_MOUNT_OPERATION
         && request.operation != SINOMO_DFS_CLOUD_FILES_UNREGISTER_OPERATION
         && request.operation != SINOMO_DFS_CLOUD_FILES_PRESERVE_STATE_UNREGISTER_OPERATION
@@ -421,50 +453,178 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
     }
 }
 
+fn invoke_host_filesystem_provider(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    let provider_request = match decode_sobj::<HostFilesystemProviderRequest>(&request.payload_sobj)
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return NativeModuleResponse::Error(native_error_response(
+                "invalid-host-filesystem-request",
+                &error.to_string(),
+            ));
+        }
+    };
+    GENERIC_HOST_PROTOCOL_ACTIVE.store(true, Ordering::Release);
+    let response = host_filesystem_provider_response(provider_request);
+    GENERIC_HOST_PROTOCOL_ACTIVE.store(false, Ordering::Release);
+    match encode_sobj(&response) {
+        Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
+            operation: HOST_FILESYSTEM_PROVIDER_OPERATION.to_string(),
+            payload_sobj,
+            response_body: None,
+        }),
+        Err(error) => NativeModuleResponse::Error(native_error_response(
+            "encode-host-filesystem-response",
+            &error.to_string(),
+        )),
+    }
+}
+
+fn host_filesystem_provider_response(
+    request: HostFilesystemProviderRequest,
+) -> HostFilesystemProviderResponse {
+    match request {
+        HostFilesystemProviderRequest::Reconcile {
+            data_dir_root,
+            mount_point,
+            config,
+        } => {
+            let request = crate::protocol::CloudFilesMountRequest {
+                sync_root: mount_point,
+                root_path: config.root_path.clone(),
+                data_dir_root: Some(data_dir_root),
+                read_only: config.read_only,
+                sync_local_changes: config.sync_local_changes,
+                provider_name: "Sinomo SIFS".to_string(),
+                provider_version: env!("CARGO_PKG_VERSION").to_string(),
+                prepopulate_depth: 0,
+                connect: true,
+                max_run_seconds: None,
+                cancellation_event_handle: None,
+                cursor_recovery: None,
+                provider_replacement: None,
+            };
+            match mount_sifs_cloud_files(request) {
+                Ok(response) => HostFilesystemProviderResponse::Status(cloud_files_mount_status(
+                    &config, response,
+                )),
+                Err(error) => {
+                    HostFilesystemProviderResponse::Error(host_filesystem_provider_error(error))
+                }
+            }
+        }
+        HostFilesystemProviderRequest::Stop {
+            data_dir_root,
+            mount_point,
+            config,
+            preserve_state,
+        } => {
+            let mut request = crate::protocol::CloudFilesUnregisterRequest::new(mount_point);
+            request.root_path = config.root_path.clone();
+            request.data_dir_root = Some(data_dir_root);
+            let result = if preserve_state {
+                unregister_sifs_cloud_files_preserving_state(request)
+                    .map(|response| response.detail)
+            } else {
+                unregister_sifs_cloud_files(request).map(|response| response.detail)
+            };
+            match result {
+                Ok(detail) => {
+                    let mut status = SifsMountRuntimeStatus::default();
+                    status.phase = SifsMountRuntimePhase::Disabled;
+                    status.platform = SifsMountPlatform::ExternalProvider;
+                    status.configured_mount_point = config.mount_point;
+                    status.root_path = config.root_path;
+                    status.detail = detail;
+                    HostFilesystemProviderResponse::Stopped(status)
+                }
+                Err(error) => {
+                    HostFilesystemProviderResponse::Error(host_filesystem_provider_error(error))
+                }
+            }
+        }
+        HostFilesystemProviderRequest::Status { .. } => {
+            let mut status = SifsMountRuntimeStatus::default();
+            status.platform = SifsMountPlatform::ExternalProvider;
+            status.detail =
+                "provider status is emitted by the active reconciliation invocation".to_string();
+            HostFilesystemProviderResponse::Status(status)
+        }
+    }
+}
+
+fn cloud_files_mount_status(
+    config: &sinomo_runtime::dfs::SifsMountConfig,
+    response: crate::protocol::CloudFilesMountResponse,
+) -> SifsMountRuntimeStatus {
+    let mut status = SifsMountRuntimeStatus::default();
+    status.phase = if response.connected {
+        SifsMountRuntimePhase::Connected
+    } else {
+        SifsMountRuntimePhase::Registered
+    };
+    status.platform = SifsMountPlatform::ExternalProvider;
+    status.configured_mount_point = config.mount_point.clone();
+    status.resolved_mount_point = Some(response.sync_root.display().to_string());
+    status.root_path = response.root_path;
+    status.read_only = config.read_only;
+    status.sync_local_changes = config.sync_local_changes;
+    status.provider_registered = true;
+    status.provider_connected = response.connected;
+    status.placeholders_created = Some(response.placeholders_created);
+    status.provider_interface_version =
+        Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string());
+    status.detail = response.detail;
+    status
+}
+
+fn host_filesystem_provider_error(error: CloudFilesModuleError) -> HostFilesystemProviderError {
+    HostFilesystemProviderError {
+        code: error.code,
+        detail: error.detail,
+        resolution: None,
+    }
+}
+
 #[cfg(windows)]
 fn mount_sifs_cloud_files(
-    request: sinomo_dfs_cloud_files_api::CloudFilesMountRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesMountResponse, CloudFilesModuleError> {
+    request: crate::protocol::CloudFilesMountRequest,
+) -> Result<crate::protocol::CloudFilesMountResponse, CloudFilesModuleError> {
     windows_impl::mount_sifs_cloud_files(request)
 }
 
 #[cfg(windows)]
 fn unregister_sifs_cloud_files(
-    request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesUnregisterResponse, CloudFilesModuleError> {
+    request: crate::protocol::CloudFilesUnregisterRequest,
+) -> Result<crate::protocol::CloudFilesUnregisterResponse, CloudFilesModuleError> {
     windows_impl::unregister_sifs_cloud_files(request)
 }
 
 #[cfg(windows)]
 fn unregister_sifs_cloud_files_preserving_state(
-    request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
-) -> Result<
-    sinomo_dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse,
-    CloudFilesModuleError,
-> {
+    request: crate::protocol::CloudFilesUnregisterRequest,
+) -> Result<crate::protocol::CloudFilesPreserveStateUnregisterResponse, CloudFilesModuleError> {
     windows_impl::unregister_sifs_cloud_files_preserving_state(request)
 }
 
 #[cfg(windows)]
 fn inspect_cursor_only_recovery(
-    request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError>
-{
+    request: crate::protocol::CloudFilesCursorOnlyRecoveryInspectRequest,
+) -> Result<crate::protocol::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError> {
     windows_impl::inspect_cursor_only_recovery(request)
 }
 
 #[cfg(windows)]
 fn apply_cursor_only_recovery(
-    request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError>
-{
+    request: crate::protocol::CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<crate::protocol::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError> {
     windows_impl::apply_cursor_only_recovery(request)
 }
 
 #[cfg(not(windows))]
 fn mount_sifs_cloud_files(
-    request: sinomo_dfs_cloud_files_api::CloudFilesMountRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesMountResponse, CloudFilesModuleError> {
+    request: crate::protocol::CloudFilesMountRequest,
+) -> Result<crate::protocol::CloudFilesMountResponse, CloudFilesModuleError> {
     request.validate_supported_mode()?;
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
@@ -474,8 +634,8 @@ fn mount_sifs_cloud_files(
 
 #[cfg(not(windows))]
 fn unregister_sifs_cloud_files(
-    _request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesUnregisterResponse, CloudFilesModuleError> {
+    _request: crate::protocol::CloudFilesUnregisterRequest,
+) -> Result<crate::protocol::CloudFilesUnregisterResponse, CloudFilesModuleError> {
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files support is only available in Windows builds".to_string(),
@@ -484,11 +644,8 @@ fn unregister_sifs_cloud_files(
 
 #[cfg(not(windows))]
 fn unregister_sifs_cloud_files_preserving_state(
-    _request: sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest,
-) -> Result<
-    sinomo_dfs_cloud_files_api::CloudFilesPreserveStateUnregisterResponse,
-    CloudFilesModuleError,
-> {
+    _request: crate::protocol::CloudFilesUnregisterRequest,
+) -> Result<crate::protocol::CloudFilesPreserveStateUnregisterResponse, CloudFilesModuleError> {
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files support is only available in Windows builds".to_string(),
@@ -497,9 +654,8 @@ fn unregister_sifs_cloud_files_preserving_state(
 
 #[cfg(not(windows))]
 fn inspect_cursor_only_recovery(
-    _request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError>
-{
+    _request: crate::protocol::CloudFilesCursorOnlyRecoveryInspectRequest,
+) -> Result<crate::protocol::CloudFilesCursorOnlyRecoveryInspection, CloudFilesModuleError> {
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files cursor recovery is only available in Windows builds"
@@ -509,9 +665,8 @@ fn inspect_cursor_only_recovery(
 
 #[cfg(not(windows))]
 fn apply_cursor_only_recovery(
-    _request: sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest,
-) -> Result<sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError>
-{
+    _request: crate::protocol::CloudFilesCursorOnlyRecoveryApplyRequest,
+) -> Result<crate::protocol::CloudFilesCursorOnlyRecoveryApplied, CloudFilesModuleError> {
     Err(CloudFilesModuleError {
         code: "unsupported-platform".to_string(),
         detail: "Windows Cloud Files cursor recovery is only available in Windows builds"
@@ -595,7 +750,16 @@ pub(crate) fn host_log(message: &str) {
 
 #[cfg(windows)]
 pub(crate) fn host_emit_event(event: &CloudFilesModuleEvent) {
-    let payload_sobj = match encode_sobj(event) {
+    let payload_sobj = match if GENERIC_HOST_PROTOCOL_ACTIVE.load(Ordering::Acquire) {
+        match event {
+            CloudFilesModuleEvent::MountLifecycle(event) => encode_sobj(
+                &HostFilesystemProviderEvent::Status(cloud_files_lifecycle_status(event)),
+            ),
+            _ => return,
+        }
+    } else {
+        encode_sobj(event)
+    } {
         Ok(payload_sobj) => payload_sobj,
         Err(error) => {
             host_log(&format!(
@@ -625,6 +789,52 @@ pub(crate) fn host_emit_event(event: &CloudFilesModuleEvent) {
             "Cloud Files lifecycle event host output returned status {status}"
         ));
     }
+}
+
+#[cfg(windows)]
+fn cloud_files_lifecycle_status(
+    event: &crate::protocol::CloudFilesMountLifecycleEvent,
+) -> SifsMountRuntimeStatus {
+    use crate::protocol::{CloudFilesLocalChangeSyncMode, CloudFilesMountLifecyclePhase};
+    let mut status = SifsMountRuntimeStatus::default();
+    status.phase = match event.phase {
+        CloudFilesMountLifecyclePhase::Registered => SifsMountRuntimePhase::Registered,
+        CloudFilesMountLifecyclePhase::Connected => SifsMountRuntimePhase::Connected,
+        CloudFilesMountLifecyclePhase::Disconnected
+        | CloudFilesMountLifecyclePhase::Unregistered => SifsMountRuntimePhase::Stopping,
+        CloudFilesMountLifecyclePhase::Failed => SifsMountRuntimePhase::Error,
+    };
+    status.platform = SifsMountPlatform::ExternalProvider;
+    status.configured_mount_point = event.sync_root.display().to_string();
+    status.resolved_mount_point = Some(event.sync_root.display().to_string());
+    status.root_path = event.root_path.clone();
+    status.read_only = false;
+    status.sync_local_changes = true;
+    status.writeback_mode = match event.local_change_sync.mode {
+        CloudFilesLocalChangeSyncMode::Disabled => SifsMountWritebackMode::Disabled,
+        CloudFilesLocalChangeSyncMode::Unsupported => SifsMountWritebackMode::Unsupported,
+        CloudFilesLocalChangeSyncMode::ReadOnlyEnforcementUnavailable => {
+            SifsMountWritebackMode::ReadOnlyEnforcementUnavailable
+        }
+        CloudFilesLocalChangeSyncMode::Starting => SifsMountWritebackMode::Starting,
+        CloudFilesLocalChangeSyncMode::Active => SifsMountWritebackMode::Active,
+        CloudFilesLocalChangeSyncMode::Blocked => SifsMountWritebackMode::Blocked,
+    };
+    status.provider_registered = event.registered;
+    status.provider_connected = event.connected;
+    status.worker_alive = event.worker_alive;
+    status.worker_ready = event.worker_ready;
+    status.worker_health_generation = event.health_generation;
+    status.pending_operations = event.local_change_sync.pending_operations;
+    status.retrying_operations = event.local_change_sync.retrying_operations;
+    status.failed_operations = event.local_change_sync.failed_operations;
+    status.conflict_count = event.local_change_sync.conflict_count;
+    status.placeholders_created = Some(event.placeholders_created);
+    status.provider_interface_version =
+        Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string());
+    status.last_error = event.error.as_ref().map(ToString::to_string);
+    status.detail = event.detail.clone();
+    status
 }
 
 #[cfg(windows)]
@@ -778,22 +988,20 @@ mod tests {
 
     #[test]
     fn operation_payload_cross_pairs_fail_before_platform_dispatch() {
-        let mount = CloudFilesModuleRequest::Mount(
-            sinomo_dfs_cloud_files_api::CloudFilesMountRequest::new("C:\\SinomoSIFS"),
-        );
+        let mount = CloudFilesModuleRequest::Mount(crate::protocol::CloudFilesMountRequest::new(
+            "C:\\SinomoSIFS",
+        ));
         let unregister_request =
-            sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest::new("C:\\SinomoSIFS");
+            crate::protocol::CloudFilesUnregisterRequest::new("C:\\SinomoSIFS");
         let unregister = CloudFilesModuleRequest::Unregister(unregister_request.clone());
         let preserve = CloudFilesModuleRequest::PreserveStateUnregister(unregister_request);
-        let recovery_identity = sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryIdentity {
-            schema_version:
-                sinomo_dfs_cloud_files_api::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
+        let recovery_identity = crate::protocol::CloudFilesCursorOnlyRecoveryIdentity {
+            schema_version: crate::protocol::CLOUD_FILES_CURSOR_ONLY_RECOVERY_SCHEMA_VERSION,
             enabled: false,
             sync_root: "C:\\SinomoSIFS".into(),
             root_path: "/services".to_string(),
             data_dir_root: "C:\\SinomoData".into(),
-            provider_name: sinomo_dfs_cloud_files_api::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME
-                .to_string(),
+            provider_name: crate::protocol::SINOMO_DFS_CLOUD_FILES_PROVIDER_NAME.to_string(),
             provider_version: env!("CARGO_PKG_VERSION").to_string(),
             read_only: false,
             allow_other: false,
@@ -805,12 +1013,12 @@ mod tests {
             provider_provenance_fingerprint: "blake3:provider".to_string(),
         };
         let inspect = CloudFilesModuleRequest::InspectCursorOnlyRecovery(
-            sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryInspectRequest {
+            crate::protocol::CloudFilesCursorOnlyRecoveryInspectRequest {
                 identity: recovery_identity.clone(),
             },
         );
         let apply = CloudFilesModuleRequest::ApplyCursorOnlyRecovery(
-            sinomo_dfs_cloud_files_api::CloudFilesCursorOnlyRecoveryApplyRequest {
+            crate::protocol::CloudFilesCursorOnlyRecoveryApplyRequest {
                 identity: recovery_identity,
                 expected_token: "v1:blake3:token".to_string(),
                 recovery_id: "cursor-recovery-id".to_string(),
@@ -857,8 +1065,8 @@ mod tests {
 
     #[test]
     fn mount_lifecycle_event_round_trips_through_native_payload_encoding() {
-        let event = sinomo_dfs_cloud_files_api::CloudFilesModuleEvent::MountLifecycle(
-            sinomo_dfs_cloud_files_api::CloudFilesMountLifecycleEvent::connected(
+        let event = crate::protocol::CloudFilesModuleEvent::MountLifecycle(
+            crate::protocol::CloudFilesMountLifecycleEvent::connected(
                 "C:\\SinomoSIFS",
                 "/services",
                 23,
@@ -866,7 +1074,7 @@ mod tests {
         );
 
         let encoded = encode_sobj(&event).expect("encode lifecycle event");
-        let decoded = decode_sobj::<sinomo_dfs_cloud_files_api::CloudFilesModuleEvent>(&encoded)
+        let decoded = decode_sobj::<crate::protocol::CloudFilesModuleEvent>(&encoded)
             .expect("decode lifecycle event");
 
         assert_eq!(decoded, event);
@@ -948,8 +1156,7 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn mount_returns_unsupported_on_non_windows() {
-        let mut request =
-            sinomo_dfs_cloud_files_api::CloudFilesMountRequest::new("/tmp/sinomo-sifs");
+        let mut request = crate::protocol::CloudFilesMountRequest::new("/tmp/sinomo-sifs");
         request.read_only = false;
         request.sync_local_changes = true;
         let response = mount_sifs_cloud_files(request);
@@ -963,15 +1170,14 @@ mod tests {
     #[test]
     #[cfg(not(windows))]
     fn best_effort_writable_mount_is_rejected_before_platform_dispatch() {
-        let mut request =
-            sinomo_dfs_cloud_files_api::CloudFilesMountRequest::new("/tmp/sinomo-sifs");
+        let mut request = crate::protocol::CloudFilesMountRequest::new("/tmp/sinomo-sifs");
         request.read_only = false;
 
         assert_eq!(
             mount_sifs_cloud_files(request)
                 .expect_err("writable mode must fail closed")
                 .code,
-            sinomo_dfs_cloud_files_api::CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE
+            crate::protocol::CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE
         );
     }
 
@@ -979,7 +1185,7 @@ mod tests {
     #[cfg(not(windows))]
     fn unregister_returns_unsupported_on_non_windows() {
         let response = unregister_sifs_cloud_files(
-            sinomo_dfs_cloud_files_api::CloudFilesUnregisterRequest::new("/tmp/sinomo-sifs"),
+            crate::protocol::CloudFilesUnregisterRequest::new("/tmp/sinomo-sifs"),
         );
 
         assert_eq!(

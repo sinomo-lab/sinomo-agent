@@ -19,13 +19,13 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use serde::Serialize;
 use sinomo_core::node::LocalNodePermission;
 use sinomo_module_api::{
-    NativeModuleBackend, NativeModuleBodyMode, NativeModuleCapabilitiesResponse,
-    NativeModuleDeclarativeResource, NativeModuleDescriptor, NativeModuleErrorResponse,
-    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleObjectRpcRoute,
-    NativeModuleRequest, NativeModuleResponse, NativeModuleStagedBody, NativeModuleSurfaces,
-    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    ComponentDescriptor, NativeModuleBackend, NativeModuleBodyMode,
+    NativeModuleCapabilitiesResponse, NativeModuleDeclarativeResource, NativeModuleDescriptor,
+    NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
+    NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse, NativeModuleStagedBody,
+    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
     SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
     SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use sinomo_remote_management::*;
@@ -223,6 +223,15 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
             network_transports: Vec::new(),
             interface_exports: Vec::new(),
         },
+        component: ComponentDescriptor::new(REMOTE_MANAGEMENT_MODULE_ID, env!("CARGO_PKG_VERSION"))
+            .with_offer(
+                ServiceOffer::new(
+                    REMOTE_MANAGEMENT_RPC_CATEGORY,
+                    "sinomo.remote-management/v1",
+                    "1.0.0",
+                )
+                .cluster_visible(),
+            ),
     }
 }
 

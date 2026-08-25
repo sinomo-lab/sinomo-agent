@@ -13,7 +13,7 @@ ring = "r1-boundary"
 default = []
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX engine.
-sandbox = ["dep:sinomo-sandbox-wasix-host", "sinomo-daemon/sandbox"]
+sandbox = ["sinomo-daemon/sandbox"]
 native-devices = ["sinomo-device/native-devices"]
 # Forwards the cluster test-support surface to application-crate tests.
 cluster-test-support = ["sinomo-core/cluster-test-support"]
@@ -28,12 +28,10 @@ sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
-sinomo-dfs-cloud-files-api = { path = "../sinomo-dfs-cloud-files-api" }
 sinomo-eval = { path = "../sinomo-eval" }
 sinomo-installer = { path = "../sinomo-installer" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-memory-extension-api = { path = "../sinomo-memory-extension-api" }
 sinomo-observe = { path = "../sinomo-observe" }
 sinomo-policy = { path = "../sinomo-policy" }
 sinomo-registry = { path = "../sinomo-registry" }
@@ -41,8 +39,6 @@ sinomo-remote-management = { path = "../sinomo-remote-management" }
 sinomo-rollout = { path = "../sinomo-rollout" }
 sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple" }
-sinomo-sandbox-wasix-api = { path = "../sinomo-sandbox-wasix-api" }
-sinomo-sandbox-wasix-host = { path = "../sinomo-sandbox-wasix-host", optional = true }
 sinomo-supervision = { path = "../sinomo-supervision" }
 sinomo-test = { path = "../sinomo-test" }
 sinomo-vfs = { path = "../sinomo-vfs" }

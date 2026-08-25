@@ -514,7 +514,7 @@ fn dfs_cli_spec() -> CliCommandSpec {
                     ),
                     CliOptionSpec::flag(
                         "--recover-cursor-only-state",
-                        "inspect or explicitly adopt retained Windows Cloud Files cursor-only state",
+                        "inspect or explicitly adopt retained external-provider cursor state",
                     ),
                     option(
                         "--expected-token",
@@ -530,7 +530,7 @@ fn dfs_cli_spec() -> CliCommandSpec {
                     option("--data-dir", "Sinomo data directory", "path"),
                     CliOptionSpec::flag(
                         "--read-only",
-                        "mount read-only (Unix FUSE; Windows Cloud Files requires durable writable sync)",
+                        "mount read-only (Unix FUSE; external Windows providers may require durable writable sync)",
                     )
                     .with_aliases(["--ro"]),
                     CliOptionSpec::flag("--allow-other", "allow other local users"),
@@ -2714,7 +2714,7 @@ fn print_cursor_only_recovery_response(
             provider_interface_version,
             detail,
         } => {
-            println!("Windows Cloud Files cursor-only recovery inspection:");
+            println!("External provider cursor-only recovery inspection:");
             println!("  recovery token: {recovery_token}");
             println!("  raw state fingerprint: {raw_state_fingerprint}");
             println!("  sync-root file ID: {sync_root_file_id}");
@@ -2730,7 +2730,7 @@ fn print_cursor_only_recovery_response(
             cursor_count_cleared,
             detail,
         } => {
-            println!("Windows Cloud Files cursor-only recovery was authorized:");
+            println!("External provider cursor-only recovery was authorized:");
             println!("  recovery ID: {recovery_id}");
             println!("  recovery token: {recovery_token}");
             println!("  sync-root file ID: {sync_root_file_id}");
@@ -2782,7 +2782,7 @@ fn run_dfs_nfs_server(
             detail: format!("create NFS runtime: {source}"),
         })?;
     runtime.block_on(async move {
-        let server_options = sinomo_dfs_nfs::DfsNfsServerOptions {
+        let server_options = sinomo_runtime::dfs_nfs::DfsNfsServerOptions {
             data_dir: options.data_dir,
             bind: options.bind,
             export_name: options.export_name,
@@ -2790,7 +2790,7 @@ fn run_dfs_nfs_server(
             read_only: options.read_only,
         };
         let read_only = server_options.read_only;
-        let server = sinomo_dfs_nfs::DfsNfsServer::bind(server_options)
+        let server = sinomo_runtime::dfs_nfs::DfsNfsServer::bind(server_options)
             .await
             .map_err(|source| CliError::Parse {
                 detail: source.to_string(),
@@ -3259,7 +3259,7 @@ fn run_dfs_host_mount_command(options: DfsHostMountOptions) -> Result<(), CliErr
     #[cfg(windows)]
     if options.foreground {
         return Err(CliError::Parse {
-            detail: "Windows Cloud Files foreground mounts are unsupported because only the managed supervisor durably pins registration ownership and state-preserving cleanup; use `sinomo dfs mount --background ...` with the main daemon"
+            detail: "external Windows provider foreground mounts are unsupported because only the managed supervisor durably pins ownership and state-preserving cleanup; use `sinomo dfs mount --background ...` with the main daemon"
                 .to_string(),
         });
     }
@@ -3333,7 +3333,7 @@ pub(crate) fn validate_dfs_mount_options_for_platform(
         #[cfg(not(windows))]
         {
             return Err(CliError::Parse {
-                detail: "`--recover-cursor-only-state` is only supported by Windows Cloud Files"
+                detail: "`--recover-cursor-only-state` is only supported by an external Windows provider"
                     .to_string(),
             });
         }
@@ -3349,7 +3349,7 @@ pub(crate) fn validate_dfs_mount_options_for_platform(
     {
         if options.sync_local_changes {
             return Err(CliError::Parse {
-                detail: "`--sync-local-changes` is only supported by Windows Cloud Files; Unix FUSE writes are already sent directly to SIFS".to_string(),
+                detail: "`--sync-local-changes` is only supported by an external Windows provider; Unix FUSE writes are already sent directly to SIFS".to_string(),
             });
         }
     }
@@ -3362,7 +3362,7 @@ pub(crate) fn validate_dfs_mount_options_for_platform(
         }
         if options.read_only || !options.sync_local_changes {
             return Err(CliError::Parse {
-                detail: "Windows Cloud Files requires durable writable synchronization; pass `--sync-local-changes` without `--read-only`"
+                detail: "the external Windows provider requires durable writable synchronization; pass `--sync-local-changes` without `--read-only`"
                     .to_string(),
             });
         }
@@ -3414,7 +3414,8 @@ mod dfs_mount_tests {
                     sync_root_file_id: 42,
                     cursor_count: 2,
                     provider_content_hash: "blake3:provider".to_string(),
-                    provider_interface_version: "sinomo.dfs.cloud-files.v3".to_string(),
+                    provider_interface_version:
+                        sinomo_runtime::dfs::HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string(),
                     detail: "eligible cursor-only state".to_string(),
                 },
                 config_reads: Cell::new(0),
@@ -3744,7 +3745,7 @@ mod dfs_mount_tests {
         };
         let error = super::validate_dfs_mount_options_for_platform(&options)
             .expect_err("cursor recovery must remain Windows-only");
-        assert!(error.to_string().contains("Windows Cloud Files"));
+        assert!(error.to_string().contains("external Windows provider"));
     }
 
     #[cfg(not(windows))]

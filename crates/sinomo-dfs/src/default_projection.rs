@@ -179,7 +179,7 @@ fn reconciliation_input_value(entry: &KvEntry) -> Vec<u8> {
     {
         return sinomo_core::kv::encode_kv_value(&DefaultDfsServiceInstanceProjection {
             node_id: &instance.node_id,
-            capabilities: &instance.capabilities,
+            capabilities: &instance.provider_capabilities,
         })
         .unwrap_or_else(|_| entry.value.clone());
     }

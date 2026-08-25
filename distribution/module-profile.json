@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "profile_id": "sinomo-default",
+  "profile_version": "1",
+  "modules": [
+    {
+      "module_id": "module.network-iroh",
+      "interface_version": "sinomo.network-iroh.v1",
+      "package": "sinomo-network-iroh-module",
+      "cache_key": "module/network/iroh",
+      "library_name": "sinomo_network_iroh_module",
+      "source": "rollout:modules/network/iroh",
+      "platforms": [
+        "unix",
+        "windows"
+      ],
+      "default_enabled": true
+    },
+    {
+      "module_id": "module.remote-management",
+      "interface_version": "sinomo.remote-management.v2",
+      "package": "sinomo-remote-management-module",
+      "cache_key": "module/remote/management",
+      "library_name": "sinomo_remote_management_module",
+      "source": "rollout:modules/remote/management",
+      "default_enabled": true
+    },
+    {
+      "module_id": "module.sandbox.wasix",
+      "interface_version": "1.0.0",
+      "package": "sinomo-sandbox-wasix-module",
+      "features": [
+        "sinomo-sandbox-wasix-module/wasix-runtime"
+      ],
+      "cache_key": "module/sandbox/wasix",
+      "library_name": "sinomo_sandbox_wasix_module",
+      "source": "rollout:modules/sandbox/wasix",
+      "default_enabled": true
+    },
+    {
+      "module_id": "module.dfs.cloud-files",
+      "interface_version": "sinomo.dfs.cloud-files.v3",
+      "package": "sinomo-dfs-cloud-files",
+      "cache_key": "module/dfs/cloud-files",
+      "library_name": "sinomo_dfs_cloud_files",
+      "source": "rollout:modules/dfs/cloud-files",
+      "platforms": [
+        "windows"
+      ],
+      "default_enabled": true
+    },
+    {
+      "module_id": "module.benchmarks",
+      "interface_version": "sinomo.benchmarks.v1",
+      "package": "sinomo-benchmarks",
+      "cache_key": "module/benchmark/sinomo-benchmarks",
+      "library_name": "sinomo_benchmarks",
+      "source": "rollout:modules/benchmark/sinomo-benchmarks",
+      "default_enabled": false
+    }
+  ],
+  "signer_public_key": "IMK-U9iwPZ5euJ5dSzkt84lfJzWpqT3dAXI_immwL3A",
+  "signature": "local-ed25519:Zmt7EVuIUHjPobXlzIevThJCcGpX9IUTdDeJR_p0145xOVfZyHZ5QDljph9himYFbxzJAupV-lryP3eYdHkFDQ"
+}

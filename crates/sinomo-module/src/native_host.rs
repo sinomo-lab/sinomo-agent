@@ -712,6 +712,21 @@ fn validate_descriptor(descriptor: &NativeModuleDescriptor) -> Result<(), Native
             detail: "interface_version is empty".to_string(),
         });
     }
+    if !descriptor.component.is_empty() {
+        descriptor
+            .component
+            .validate()
+            .map_err(|error| NativeModuleHostError::Descriptor {
+                detail: error.to_string(),
+            })?;
+        if descriptor.component.component_id != descriptor.module_id
+            || descriptor.component.component_version != descriptor.module_version
+        {
+            return Err(NativeModuleHostError::Descriptor {
+                detail: "component identity does not match native module identity".to_string(),
+            });
+        }
+    }
     Ok(())
 }
 

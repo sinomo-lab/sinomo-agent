@@ -2827,28 +2827,29 @@ mod cluster_build_service_tests {
 
     #[test]
     fn legacy_named_module_selector_matches_canonical_module_id() {
-        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.network-iroh")
-            .expect("module id");
+        let module_id =
+            sinomo_runtime::module::ModuleId::from_legacy_named("module.external-network")
+                .expect("module id");
         let output = BuildOutputRequest::native_dylib_module(
             module_id.to_string(),
-            "sinomo-network-iroh-module",
-            "sinomo_network_iroh_module",
+            "external-network-module",
+            "external_network_module",
             NativeDylibArtifactMetadata::new(
                 module_id,
                 "v1",
-                "module/network/iroh",
-                "libsinomo_network_iroh_module.so",
-                "rollout:modules/network/iroh",
+                "module/external-network",
+                "libexternal_network_module.so",
+                "profile:external-network",
             ),
         );
 
         assert!(cluster_build_output_matches_selector(
             &output,
-            "module.network-iroh"
+            "module.external-network"
         ));
         assert!(cluster_build_output_matches_selector(
             &output,
-            "sinomo-network-iroh-module"
+            "external-network-module"
         ));
     }
 

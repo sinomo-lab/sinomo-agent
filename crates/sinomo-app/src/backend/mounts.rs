@@ -170,9 +170,9 @@ fn validate_sifs_mount_status(
             | sinomo_runtime::dfs::SifsMountRuntimePhase::Connected,
         ) => return Err("Unix FUSE reported a Windows-only lifecycle phase".to_string()),
         (
-            SifsMountPlatform::WindowsCloudFiles,
+            SifsMountPlatform::ExternalProvider,
             sinomo_runtime::dfs::SifsMountRuntimePhase::Mounted,
-        ) => return Err("Windows Cloud Files reported a Unix-only lifecycle phase".to_string()),
+        ) => return Err("external provider reported a Unix-only lifecycle phase".to_string()),
         (
             SifsMountPlatform::Unsupported,
             sinomo_runtime::dfs::SifsMountRuntimePhase::Registered
@@ -195,22 +195,25 @@ fn validate_sifs_mount_status(
         );
     }
     if status.phase == sinomo_runtime::dfs::SifsMountRuntimePhase::Connected {
-        validate_connected_cloud_files_status(status)?;
+        validate_connected_host_filesystem_provider_status(status)?;
     }
     Ok(())
 }
 
-fn validate_connected_cloud_files_status(status: &SifsMountRuntimeStatus) -> Result<(), String> {
-    validate_connected_cloud_files_status_at(status, OffsetDateTime::now_utc())
+fn validate_connected_host_filesystem_provider_status(
+    status: &SifsMountRuntimeStatus,
+) -> Result<(), String> {
+    validate_connected_host_filesystem_provider_status_at(status, OffsetDateTime::now_utc())
 }
 
-pub(crate) fn validate_connected_cloud_files_status_at(
+pub(crate) fn validate_connected_host_filesystem_provider_status_at(
     status: &SifsMountRuntimeStatus,
     now: OffsetDateTime,
 ) -> Result<(), String> {
     if !status.provider_registered || !status.provider_connected {
         return Err(
-            "Cloud Files reported connected without a registered, connected provider".to_string(),
+            "host-filesystem provider reported connected without a registered, connected provider"
+                .to_string(),
         );
     }
     if !status.worker_alive
@@ -222,7 +225,7 @@ pub(crate) fn validate_connected_cloud_files_status_at(
             .is_none_or(|observed| observed.trim().is_empty())
     {
         return Err(
-            "Cloud Files reported connected without a live, ready writeback worker heartbeat"
+            "host-filesystem provider reported connected without a live, ready writeback worker heartbeat"
                 .to_string(),
         );
     }
@@ -230,18 +233,18 @@ pub(crate) fn validate_connected_cloud_files_status_at(
         .last_worker_heartbeat_at
         .as_deref()
         .and_then(|observed| OffsetDateTime::parse(observed, &Rfc3339).ok())
-        .ok_or_else(|| "Cloud Files worker heartbeat is not valid RFC3339".to_string())?;
+        .ok_or_else(|| "host-filesystem provider heartbeat is not valid RFC3339".to_string())?;
     let heartbeat_age = now - heartbeat;
     if heartbeat_age > Duration::seconds(5) || heartbeat_age < -Duration::seconds(1) {
         return Err(format!(
-            "Cloud Files worker heartbeat is outside the live freshness window ({heartbeat_age})"
+            "host-filesystem provider heartbeat is outside the live freshness window ({heartbeat_age})"
         ));
     }
     if status.writeback_mode != sinomo_runtime::dfs::SifsMountWritebackMode::Active {
-        return Err("Cloud Files writeback is not active".to_string());
+        return Err("host-filesystem provider writeback is not active".to_string());
     }
     if status.unregister_pending {
-        return Err("a retired Cloud Files registration still requires cleanup".to_string());
+        return Err("a retired host-filesystem provider still requires cleanup".to_string());
     }
     Ok(())
 }
@@ -305,17 +308,18 @@ pub fn validate_sifs_mount_config(
         SifsMountPlatform::UnixFuse => {
             if config.sync_local_changes {
                 return Err(
-                    "sync local changes is only available for Windows Cloud Files".to_string(),
+                    "sync local changes is only available for the external Windows provider"
+                        .to_string(),
                 );
             }
         }
-        SifsMountPlatform::WindowsCloudFiles => {
+        SifsMountPlatform::ExternalProvider => {
             if config.allow_other {
                 return Err("allow other users is only available for Unix FUSE".to_string());
             }
             if config.enabled && (config.read_only || !config.sync_local_changes) {
                 return Err(
-                    "Windows Cloud Files requires explicit durable writable synchronization"
+                    "the external Windows provider requires explicit durable writable synchronization"
                         .to_string(),
                 );
             }
@@ -436,13 +440,13 @@ mod tests {
         assert!(
             validate_sifs_mount_config(&config, SifsMountPlatform::UnixFuse)
                 .expect_err("Unix must reject the Windows-only option")
-                .contains("Windows Cloud Files")
+                .contains("external Windows provider")
         );
 
         config.sync_local_changes = false;
         config.allow_other = true;
         assert!(
-            validate_sifs_mount_config(&config, SifsMountPlatform::WindowsCloudFiles)
+            validate_sifs_mount_config(&config, SifsMountPlatform::ExternalProvider)
                 .expect_err("Windows must reject the FUSE-only option")
                 .contains("Unix FUSE")
         );
@@ -452,7 +456,7 @@ mod tests {
         config.read_only = false;
         config.sync_local_changes = false;
         assert!(
-            validate_sifs_mount_config(&config, SifsMountPlatform::WindowsCloudFiles)
+            validate_sifs_mount_config(&config, SifsMountPlatform::ExternalProvider)
                 .expect_err("Windows writeback must be explicitly enabled")
                 .contains("durable writable synchronization")
         );
@@ -460,14 +464,14 @@ mod tests {
         config.read_only = true;
         config.sync_local_changes = true;
         assert!(
-            validate_sifs_mount_config(&config, SifsMountPlatform::WindowsCloudFiles)
+            validate_sifs_mount_config(&config, SifsMountPlatform::ExternalProvider)
                 .expect_err("Windows cannot combine read-only and writeback modes")
                 .contains("durable writable synchronization")
         );
 
         config.read_only = false;
         assert_eq!(
-            validate_sifs_mount_config(&config, SifsMountPlatform::WindowsCloudFiles),
+            validate_sifs_mount_config(&config, SifsMountPlatform::ExternalProvider),
             Ok(()),
             "Windows writable sync is accepted only as an explicit pair"
         );
@@ -566,7 +570,7 @@ mod tests {
         );
 
         status.phase = match SifsMountPlatform::current() {
-            SifsMountPlatform::WindowsCloudFiles => {
+            SifsMountPlatform::ExternalProvider => {
                 config.read_only = false;
                 config.sync_local_changes = true;
                 status.read_only = false;
@@ -605,7 +609,7 @@ mod tests {
     fn connected_cloud_status_requires_a_fresh_worker_progress_heartbeat() {
         let mut status = SifsMountRuntimeStatus {
             phase: sinomo_runtime::dfs::SifsMountRuntimePhase::Connected,
-            platform: SifsMountPlatform::WindowsCloudFiles,
+            platform: SifsMountPlatform::ExternalProvider,
             provider_registered: true,
             provider_connected: true,
             worker_alive: true,
@@ -620,7 +624,7 @@ mod tests {
                 .expect("stale heartbeat"),
         );
         assert!(
-            validate_connected_cloud_files_status(&status)
+            validate_connected_host_filesystem_provider_status(&status)
                 .expect_err("stale progress must not be shown as connected")
                 .contains("freshness window")
         );
@@ -630,6 +634,9 @@ mod tests {
                 .format(&Rfc3339)
                 .expect("fresh heartbeat"),
         );
-        assert_eq!(validate_connected_cloud_files_status(&status), Ok(()));
+        assert_eq!(
+            validate_connected_host_filesystem_provider_status(&status),
+            Ok(())
+        );
     }
 }

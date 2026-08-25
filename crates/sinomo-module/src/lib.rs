@@ -1,16 +1,20 @@
 //! Module registry, routing, loader state, and native module host glue.
 
+mod active_component;
 mod cli;
+mod component;
 mod native_cancellation;
 mod native_host;
 mod native_staging;
 mod network_runtime;
 mod service;
 
+pub use active_component::*;
 pub use cli::{
     ModuleCliCommandConfig, ModuleCliCommandHandler, ModuleNativeRustToggleTarget,
-    ModuleWasixCliConfig, module_cli_command_handler,
+    module_cli_command_handler,
 };
+pub use component::*;
 pub use native_cancellation::*;
 pub use native_host::*;
 pub use native_staging::*;
@@ -30,9 +34,9 @@ use sinomo_core::{
     LatencyClass, ModuleCapabilities, ModuleKind, ModuleLoaderState, PrivacyClass, RoutingMetadata,
     RoutingScope, Salience, Source, TrustRing,
 };
+pub use sinomo_module_api::NativeModuleDescriptor;
 use sinomo_module_api::{
-    NativeModuleBodyMode, NativeModuleDeclarativeResource, NativeModuleDescriptor,
-    NativeModuleObjectRpcRoute,
+    NativeModuleBodyMode, NativeModuleDeclarativeResource, NativeModuleObjectRpcRoute,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -514,10 +518,15 @@ impl DeclarativeModulePackageManifest {
             self.target_ring,
         );
         manifest.capabilities = self.capabilities;
+        let component = sinomo_module_api::ComponentDescriptor::new(
+            manifest.module_id.as_str(),
+            manifest.version.clone(),
+        );
         Ok(ModuleRegistration {
             manifest,
             backend: ModuleBackendRegistration::Declarative { payload_ref },
             surfaces: self.surfaces,
+            component,
         })
     }
 }
@@ -968,6 +977,11 @@ pub struct ModuleRegistration {
     pub backend: ModuleBackendRegistration,
     #[serde(default, skip_serializing_if = "ModuleSurfaces::is_empty")]
     pub surfaces: ModuleSurfaces,
+    #[serde(
+        default,
+        skip_serializing_if = "sinomo_module_api::ComponentDescriptor::is_empty"
+    )]
+    pub component: sinomo_module_api::ComponentDescriptor,
 }
 
 impl ModuleRegistration {
@@ -985,6 +999,9 @@ impl ModuleRegistration {
         registration_key: impl Into<String>,
     ) -> Self {
         let owner = owner.into();
+        let version = version.into();
+        let component =
+            sinomo_module_api::ComponentDescriptor::new(module_id.as_str(), version.clone());
         Self {
             manifest: sinomo_core::ModuleManifest::native_rust(
                 module_id,
@@ -997,6 +1014,7 @@ impl ModuleRegistration {
                 registration: NativeRustBackendRegistration::new(registration_key, crate_name),
             },
             surfaces: ModuleSurfaces::default(),
+            component,
         }
     }
 
@@ -1007,6 +1025,20 @@ impl ModuleRegistration {
 
     pub fn validate_surfaces(&self) -> Result<(), ModuleSurfaceError> {
         self.surfaces.validate()?;
+        if !self.component.is_empty() {
+            self.component.validate().map_err(|error| {
+                ModuleSurfaceError::InvalidComponentDescriptor {
+                    detail: error.to_string(),
+                }
+            })?;
+            if self.component.component_id != self.module_id().as_str()
+                || self.component.component_version != self.manifest.version
+            {
+                return Err(ModuleSurfaceError::InvalidComponentDescriptor {
+                    detail: "component identity does not match module manifest".to_string(),
+                });
+            }
+        }
         let expected_module_id = self.module_id().as_str();
         for definition in self.surfaces.config_definitions()? {
             let Some(module_id) = definition.module_id.as_deref() else {
@@ -2193,6 +2225,8 @@ pub enum ModuleRegistryError {
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum ModuleSurfaceError {
+    #[error("invalid component descriptor: {detail}")]
+    InvalidComponentDescriptor { detail: String },
     #[error("module object RPC route `{route}` is invalid: {detail}")]
     InvalidObjectRpcRoute { route: String, detail: String },
     #[error("module object RPC route `{route}` operation `{operation}` is invalid: {detail}")]
@@ -3339,6 +3373,14 @@ pub fn native_dylib_module_registration_from_state_and_descriptor(
     } else {
         descriptor.owner.clone()
     };
+    let component = if descriptor.component.is_empty() {
+        sinomo_module_api::ComponentDescriptor::new(
+            module_id.as_str(),
+            descriptor.module_version.clone(),
+        )
+    } else {
+        descriptor.component.clone()
+    };
     let mut registration = ModuleRegistration {
         manifest: sinomo_core::ModuleManifest::native_dylib(
             module_id,
@@ -3358,6 +3400,7 @@ pub fn native_dylib_module_registration_from_state_and_descriptor(
             interface_version: state.interface_version.clone(),
         },
         surfaces: native_descriptor_surfaces_to_module_surfaces(descriptor)?,
+        component,
     };
     registration.manifest.capabilities = registration.surfaces.capabilities.clone();
     Ok(registration)
@@ -5817,6 +5860,10 @@ mod tests {
                 payload_ref: "config://modules/module/agent/prompt_pack/payload".to_string(),
             },
             surfaces: ModuleSurfaces::default(),
+            component: sinomo_module_api::ComponentDescriptor::new(
+                first_module_id.as_str(),
+                "0.1.0",
+            ),
         };
         let second = ModuleRegistration {
             manifest: ModuleManifest::native_dylib(
@@ -5835,6 +5882,10 @@ mod tests {
                 interface_version: "sinomo.sandbox.wasix.v1".to_string(),
             },
             surfaces: ModuleSurfaces::default(),
+            component: sinomo_module_api::ComponentDescriptor::new(
+                second_module_id.as_str(),
+                "0.1.0",
+            ),
         };
 
         let duplicate = ModuleRegistry::builder()
@@ -6188,6 +6239,7 @@ mod tests {
                 network_transports: vec!["iroh".to_string()],
                 interface_exports: vec![interface_export.clone()],
             },
+            component: sinomo_module_api::ComponentDescriptor::default(),
         };
 
         let registration =
@@ -6302,6 +6354,7 @@ mod tests {
             supported_operations: vec!["legacy.probe".to_string()],
             capabilities: vec!["wasix".to_string()],
             surfaces: Default::default(),
+            component: sinomo_module_api::ComponentDescriptor::default(),
         };
 
         let registration =

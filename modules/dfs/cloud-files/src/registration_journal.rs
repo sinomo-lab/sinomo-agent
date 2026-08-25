@@ -2,12 +2,12 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-use sinomo_dfs_cloud_files_api::{
+use crate::protocol::{
     CloudFilesModuleError, CloudFilesMountRequest, CloudFilesRegistrationReceipt,
     CloudFilesUnregisterRequest, SINOMO_DFS_CLOUD_FILES_INTERFACE_V2,
     SINOMO_DFS_CLOUD_FILES_INTERFACE_VERSION,
 };
+use serde::{Deserialize, Serialize};
 use sinomo_module_api::{decode_sobj, encode_sobj};
 
 pub(crate) const REGISTRATION_IDENTITY_MAX_BYTES: usize = 64 * 1024;

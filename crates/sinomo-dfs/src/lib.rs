@@ -21,6 +21,8 @@ mod direct_read;
 mod discovery;
 mod distributed;
 mod error;
+mod host_filesystem_provider;
+mod host_filesystem_provider_client;
 mod identity;
 mod intent;
 mod local_service;
@@ -312,6 +314,8 @@ pub(crate) use error::{
     dfs_replica_not_desired_reason, distributed_write_rejection_current_primary,
     namespace_rejection_current_primary, routed_write_rejection_error,
 };
+pub use host_filesystem_provider::*;
+pub use host_filesystem_provider_client::*;
 pub use identity::{
     DEFAULT_DFS_NODE_ID, SIFS_FILE_SYSTEM_ID, fallback_dfs_node_id, sifs_file_system_id,
 };
