@@ -36,8 +36,9 @@ pub fn cluster_service_prefix(service: &str) -> String {
 /// One node's registration of one service: which routes it serves, which
 /// capabilities it exports, and when the registration was last refreshed.
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(from = "ServiceInstanceRecordWire")]
 pub struct ServiceInstanceRecord {
-    #[serde(alias = "service")]
+    #[serde(rename = "service", alias = "service_id")]
     pub service_id: String,
     pub interface_id: String,
     pub interface_version: String,
@@ -62,6 +63,120 @@ pub struct ServiceInstanceRecord {
     pub locality: ServiceDiscoveryLocality,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Deserialize)]
+struct ServiceInstanceRecordWire {
+    #[serde(alias = "service")]
+    service_id: String,
+    #[serde(default)]
+    interface_id: String,
+    #[serde(default)]
+    interface_version: String,
+    node_id: NodeId,
+    registry_version: u64,
+    #[serde(default)]
+    routes: Vec<String>,
+    #[serde(default)]
+    provider_capabilities: Vec<String>,
+    #[serde(default)]
+    caller_requirements: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    component_id: String,
+    #[serde(default)]
+    component_version: String,
+    #[serde(default)]
+    artifact_id: Option<String>,
+    #[serde(default)]
+    component_generation: u64,
+    #[serde(default)]
+    health: ServiceDiscoveryHealth,
+    #[serde(default = "legacy_service_instance_locality")]
+    locality: ServiceDiscoveryLocality,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+fn legacy_service_instance_locality() -> ServiceDiscoveryLocality {
+    ServiceDiscoveryLocality::Cluster
+}
+
+#[derive(Deserialize)]
+struct RollingCompatibleServiceInstanceMarker {
+    service: String,
+}
+
+fn service_instance_record_has_rolling_compatible_wire(value: &[u8]) -> bool {
+    sinomo_kv::decode_kv_value::<RollingCompatibleServiceInstanceMarker>(value)
+        .is_ok_and(|record| !record.service.is_empty())
+}
+
+impl From<ServiceInstanceRecordWire> for ServiceInstanceRecord {
+    fn from(wire: ServiceInstanceRecordWire) -> Self {
+        let ServiceInstanceRecordWire {
+            service_id,
+            interface_id,
+            interface_version,
+            node_id,
+            registry_version,
+            routes,
+            mut provider_capabilities,
+            mut caller_requirements,
+            capabilities,
+            component_id,
+            component_version,
+            artifact_id,
+            component_generation,
+            health,
+            locality,
+            updated_at,
+        } = wire;
+        // Pre-component discovery used one `capabilities` list for both target
+        // selection and route authorization requirements. Preserve both views
+        // while old nodes remain in the cluster. Provider capabilities are
+        // routing metadata only; the destination still authorizes the caller.
+        provider_capabilities.extend(capabilities.iter().cloned());
+        provider_capabilities.sort();
+        provider_capabilities.dedup();
+        caller_requirements.extend(capabilities);
+        caller_requirements.sort();
+        caller_requirements.dedup();
+        Self {
+            interface_id: if interface_id.is_empty() {
+                format!("sinomo.object-rpc/{service_id}")
+            } else {
+                interface_id
+            },
+            interface_version: if interface_version.is_empty() {
+                "legacy".to_string()
+            } else {
+                interface_version
+            },
+            component_id: if component_id.is_empty() {
+                service_id.clone()
+            } else {
+                component_id
+            },
+            component_version: if component_version.is_empty() {
+                "legacy".to_string()
+            } else {
+                component_version
+            },
+            service_id,
+            node_id,
+            registry_version,
+            routes,
+            provider_capabilities,
+            caller_requirements,
+            artifact_id,
+            component_generation: component_generation.max(1),
+            health,
+            locality,
+            updated_at,
+        }
+    }
 }
 
 impl ServiceInstanceRecord {
@@ -249,10 +364,12 @@ pub async fn publish_local_service_instances(
     let mut ops = Vec::new();
     for record in records {
         let key = cluster_service_instance_key(&record.service_id, node_id);
-        let unchanged = existing_by_key
-            .remove(&key)
-            .and_then(|entry| entry.decode::<ServiceInstanceRecord>().ok())
-            .is_some_and(|stored| stored.stable_eq(&record));
+        let unchanged = existing_by_key.remove(&key).is_some_and(|entry| {
+            service_instance_record_has_rolling_compatible_wire(&entry.value)
+                && entry
+                    .decode::<ServiceInstanceRecord>()
+                    .is_ok_and(|stored| stored.stable_eq(&record))
+        });
         if unchanged {
             continue;
         }
@@ -621,6 +738,68 @@ mod tests {
         let mut instance = ServiceInstanceRecord::new(service, node_id.clone());
         instance.routes = vec![format!("/{service}/status")];
         instance
+    }
+
+    #[test]
+    fn legacy_instance_records_decode_into_component_discovery_identity() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct LegacyServiceInstanceRecord {
+            service: String,
+            node_id: NodeId,
+            registry_version: u64,
+            #[serde(default)]
+            routes: Vec<String>,
+            #[serde(default)]
+            capabilities: Vec<String>,
+            #[serde(with = "time::serde::rfc3339")]
+            updated_at: OffsetDateTime,
+        }
+
+        let node_id = node("legacy-service-instance-node");
+        let legacy = LegacyServiceInstanceRecord {
+            service: "dfs".to_string(),
+            node_id: node_id.clone(),
+            registry_version: 7,
+            routes: vec!["/dfs/status".to_string()],
+            capabilities: vec!["cluster.dfs.read".to_string()],
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let encoded = sinomo_kv::encode_kv_value(&legacy).expect("encode legacy record");
+        let decoded: ServiceInstanceRecord =
+            sinomo_kv::decode_kv_value(&encoded).expect("decode legacy record");
+
+        assert_eq!(decoded.service_id, "dfs");
+        assert_eq!(decoded.interface_id, "sinomo.object-rpc/dfs");
+        assert_eq!(decoded.interface_version, "legacy");
+        assert_eq!(decoded.node_id, node_id);
+        assert_eq!(decoded.registry_version, 7);
+        assert_eq!(decoded.routes, ["/dfs/status"]);
+        assert_eq!(decoded.provider_capabilities, ["cluster.dfs.read"]);
+        assert_eq!(decoded.caller_requirements, ["cluster.dfs.read"]);
+        assert_eq!(decoded.component_id, "dfs");
+        assert_eq!(decoded.component_version, "legacy");
+        assert_eq!(decoded.component_generation, 1);
+        assert_eq!(decoded.health, crate::ServiceDiscoveryHealth::Ready);
+        assert_eq!(decoded.locality, crate::ServiceDiscoveryLocality::Cluster);
+
+        let current = ServiceInstanceRecord::new("dfs", node("current-service-instance-node"));
+        let encoded = sinomo_kv::encode_kv_value(&current).expect("encode current record");
+        let decoded: LegacyServiceInstanceRecord =
+            sinomo_kv::decode_kv_value(&encoded).expect("decode current record with legacy schema");
+        assert_eq!(decoded.service, "dfs");
+        assert!(service_instance_record_has_rolling_compatible_wire(
+            &encoded
+        ));
+
+        #[derive(serde::Serialize)]
+        struct ServiceIdOnlyMarker<'a> {
+            service_id: &'a str,
+        }
+        let noncanonical = sinomo_kv::encode_kv_value(&ServiceIdOnlyMarker { service_id: "dfs" })
+            .expect("encode service-id-only marker");
+        assert!(!service_instance_record_has_rolling_compatible_wire(
+            &noncanonical
+        ));
     }
 
     #[test]
