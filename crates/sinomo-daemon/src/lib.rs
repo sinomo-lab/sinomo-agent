@@ -226,6 +226,7 @@ pub fn register_storage_paths(
     for relative_path in [
         "daemon/daemon.lock",
         "daemon/data-owner.lock",
+        "daemon/sifs-mount.lock",
         "shadow-daemon/daemon.lock",
     ] {
         layout.register_binary("sinomo-daemon", StorageRing::R1, relative_path)?;

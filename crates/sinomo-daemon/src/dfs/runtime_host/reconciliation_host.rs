@@ -196,6 +196,11 @@ impl DaemonDefaultDfsReconciliationReactor {
         else {
             return Ok(DaemonDefaultDfsReconciliationStep::IdentityChanged);
         };
+        let publish_metadata = publish_cluster_control
+            || daemon_default_dfs_reconciliation_local_owns_metadata_primary(
+                expected_node_id,
+                &work.inputs,
+            );
 
         let mut deferred_recovery_error = None;
         if work.recover_prior_process_permit {
@@ -232,6 +237,7 @@ impl DaemonDefaultDfsReconciliationReactor {
                 paths,
                 options,
                 publish_cluster_control,
+                publish_metadata,
                 runtime.clone(),
                 foreground_preemptible,
             )
@@ -466,6 +472,7 @@ pub(crate) async fn ensure_default_distributed_dfs_async_on_runtime(
         paths,
         options,
         publish_cluster_control,
+        publish_cluster_control,
         runtime,
         false,
     )
@@ -489,6 +496,7 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     publish_cluster_control: bool,
+    publish_metadata: bool,
     runtime: tokio::runtime::Handle,
     foreground_preemptible: bool,
 ) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
@@ -497,7 +505,7 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     let data_dir = daemon_data_dir(paths)?;
     let lifecycle_data_dir = SinomoDataDir::new(data_dir);
     let lifecycle_cluster_paths = ClusterPaths::new(&lifecycle_data_dir);
-    let metadata_authority_preflight = if publish_cluster_control {
+    let metadata_authority_preflight = if publish_metadata {
         let Some(peer_snapshot) = read_daemon_dfs_message_peer_snapshot(&lifecycle_cluster_paths)?
         else {
             return Err(DaemonError::ClusterOrphan);
@@ -510,9 +518,9 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
         .await?;
         Some((peer_snapshot, preflight))
     } else {
-        // Learners and shadow/non-authoritative callers neither consume nor
-        // publish shard topology. They must not hydrate a metadata backend or
-        // enter Raft merely to determine that this branch has no authority.
+        // A node which owns no authoritative metadata shard must not hydrate a
+        // backend or enter Raft merely to determine that it has no journal to
+        // publish.
         None
     };
     let lifecycle_gate = daemon_default_dfs_lifecycle_gate(data_dir)?;
@@ -614,14 +622,13 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
             // outer waiter. Retain the publisher edge from inside the same
             // cancellation-independent closure and before releasing mutation
             // admission; the spawned lane will wait for this guard normally.
-            let publish_result = if publish_cluster_control {
+            let publish_result = if publish_metadata {
                 schedule_daemon_dfs_metadata_publish_on_runtime(&task_paths, &task_runtime, None)
                     .map(|_| ())
             } else {
-                // A non-voter cannot own an authoritative metadata shard, so
-                // it cannot have a journal eligible for cluster publication.
-                // Starting discovery here would perform an authoritative KV
-                // read for work this process is forbidden to execute.
+                // This node owns no authoritative metadata shard. Starting
+                // discovery would perform an authoritative KV read for work it
+                // cannot publish.
                 Ok(())
             };
             match (lifecycle_result, publish_result) {

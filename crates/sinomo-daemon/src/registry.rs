@@ -186,6 +186,17 @@ mod tests {
     }
 
     #[test]
+    fn daemon_mount_lease_is_registered() {
+        let layout = sinomo_data_dir_layout().expect("data-dir layout");
+        let report = layout
+            .verify_relative_paths(["daemon/sifs-mount.lock"])
+            .expect("verify mount lease path");
+
+        assert!(report.is_complete(), "{:#?}", report.unregistered);
+        assert_eq!(report.covered.len(), 1);
+    }
+
+    #[test]
     fn module_route_local_permissions_propagate_to_network_descriptor() {
         let descriptor = sinomo_module::ModuleObjectRpcRoute::new(
             "/remote/status",

@@ -1267,9 +1267,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .collect::<Vec<_>>();
                 return Err(DfsError::Network {
                     message: format!(
-                        "metadata shard {} did not reach a POSIX sync certificate before {}ms: {}/{} acknowledgements through sequence {}; missing={missing_node_ids:?}; recovery-set intersection={recovery_intersection}",
-                        target.shard_id.0,
+                        "timed out after {}ms before metadata shard {} reached a POSIX sync certificate: {}/{} acknowledgements through sequence {}; missing={missing_node_ids:?}; recovery-set intersection={recovery_intersection}",
                         timeout.as_millis(),
+                        target.shard_id.0,
                         progress.acknowledged_node_ids.len(),
                         required_node_ids.len(),
                         target.journal_sequence

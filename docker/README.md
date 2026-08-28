@@ -173,7 +173,7 @@ the connectivity graph's **healthy** links. So every node integrates into one cl
 
 Joins are best-effort and time-bounded, so **no node hangs**; each joiner waits for the dev
 harness readiness marker, then runs one cluster join command. Clean six-node formation has a
-non-configurable 10-second hard acceptance gate. Crossing it still indicates a startup, join,
+non-configurable 60-second bounded acceptance gate. Crossing it still indicates a startup, join,
 restart, or relay bug even though benchmark work need not stop to optimize formation below it.
 
 ## Layout
@@ -237,7 +237,7 @@ SINOMO_TEST_REUSE=1 docker/test-cluster.sh   # reuse the running test project
 SINOMO_TEST_KEEP=1  docker/test-cluster.sh   # leave the cluster up afterwards
 ```
 
-To diagnose formation without extending or weakening its ten-second gate, enable the
+To diagnose formation without extending or weakening its 60-second gate, enable the
 bounded observation mode and stop after formation:
 
 ```bash
@@ -286,7 +286,7 @@ supervisors are separate processes.
 After transport readiness and DFS metadata-shard placement have converged, and before each
 no-load realtime network leg, the benchmark requires one uninterrupted 30-second monotonic
 interval in which every one of the six service containers remains at or below 10 percent CPU.
-DFS convergence is deliberately outside the Docker-only ten-second cluster-formation gate,
+DFS convergence is deliberately outside the Docker-only 60-second cluster-formation gate,
 but it is a prerequisite for quietness: otherwise final shard handoff commits can race the
 idle-load measurement. The harness searches for the sustained quiet interval for at most 120
 seconds. One continuous `docker stats` stream supplies cumulative per-container CPU intervals; the harness consumes

@@ -750,6 +750,7 @@ pub use default_reconciliation::{
     DefaultDfsReconciliationProjection, DefaultDfsReconciliationRuntime,
     DefaultDfsReconciliationState, DefaultDfsReconciliationWork,
     completed_promoted_primary_handoff_matches, default_dfs_locally_owned_pending_handoff,
+    default_dfs_reconciliation_local_owns_metadata_primary,
     notify_default_dfs_reconciliation_replica_progress,
 };
 #[cfg(any(test, feature = "test-support"))]

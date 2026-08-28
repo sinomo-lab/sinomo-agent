@@ -6508,8 +6508,11 @@ fn is_retryable_rename_error(error: &str) -> bool {
 fn is_retryable_dfs_probe_error(error: &str) -> bool {
     error.contains("metadata shard config incomplete")
         || error.contains("authority redirects")
+        || error.contains("DFS metadata authority advanced after async preflight")
         || error.contains("write did not commit yet")
         || (error.contains("DFS error: network error") && error.contains("timed out"))
+        || (error.contains("DFS error: network delivery PossiblyApplied")
+            && (error.contains("timed out") || error.contains("network retries exhausted")))
         || (error.contains("metadata serialization error")
             && (error.contains("invalid magic") || error.contains("unexpected end of input")))
 }
@@ -6574,6 +6577,23 @@ mod tests {
             Some("/users/cluster-tests/runs/run-1/remote-shard-write")
         );
         assert!(remote_shard_write_probe_prefix("unknown", "run-1").is_none());
+    }
+
+    #[test]
+    fn rename_retries_ambiguous_delivery_and_sync_timeout_failures() {
+        let error = "DFS error: network delivery PossiblyApplied: network retries exhausted \
+            during reconcile DFS message response after 2 attempts (PossiblyApplied): \
+            initial response was ambiguous: network timeout";
+
+        assert!(is_retryable_rename_error(error));
+        assert!(is_retryable_rename_error(
+            "DFS error: network error: timed out after 45000ms before metadata shard services \
+             reached a POSIX sync certificate"
+        ));
+        assert!(is_retryable_rename_error(
+            "DFS error: network error: DFS metadata authority advanced after async preflight of \
+             generation 2"
+        ));
     }
 
     #[test]

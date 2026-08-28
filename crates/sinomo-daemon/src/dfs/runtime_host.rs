@@ -95,6 +95,7 @@ use sinomo_dfs::{
     DefaultDfsParkedHandoff as DaemonDefaultDfsParkedHandoff,
     DefaultDfsReconciliationWork as DaemonDefaultDfsReconciliationWork,
     default_dfs_locally_owned_pending_handoff as daemon_default_dfs_locally_owned_pending_handoff,
+    default_dfs_reconciliation_local_owns_metadata_primary as daemon_default_dfs_reconciliation_local_owns_metadata_primary,
 };
 #[cfg(test)]
 use sinomo_dfs::{

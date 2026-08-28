@@ -19,6 +19,7 @@ static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
 > = OnceLock::new();
 
 const DAEMON_DFS_METERING_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN: time::Duration = time::Duration::seconds(30);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DAEMON_DFS_METERING_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -213,16 +214,11 @@ fn prepare_daemon_dfs_storage_environment_refresh(
     );
     let publish_required =
         with_placement_environment(&data_dir, &state.local_node_id, |environment| {
-            environment
-                .last_published_local_advertisement
-                .as_ref()
-                .is_none_or(|current| {
-                    !daemon_advertisement_semantics_equal(current, &desired)
-                        || current.expires_at.is_none_or(|expires_at| {
-                            expires_at
-                                <= time::OffsetDateTime::now_utc() + time::Duration::seconds(60)
-                        })
-                })
+            daemon_advertisement_publish_required(
+                environment.last_published_local_advertisement.as_ref(),
+                &desired,
+                time::OffsetDateTime::now_utc(),
+            )
         });
     Ok(Some(PreparedDaemonDfsStorageEnvironmentRefresh {
         data_dir,
@@ -438,6 +434,19 @@ fn daemon_advertisement_semantics_equal(
         && left.storage_freshness == right.storage_freshness
         && left.content_location_count == right.content_location_count
         && left.network_metering == right.network_metering
+}
+
+fn daemon_advertisement_publish_required(
+    current: Option<&sinomo_dfs::DfsNodeAdvertisement>,
+    desired: &sinomo_dfs::DfsNodeAdvertisement,
+    now: time::OffsetDateTime,
+) -> bool {
+    current.is_none_or(|current| {
+        !daemon_advertisement_semantics_equal(current, desired)
+            || current.expires_at.is_none_or(|expires_at| {
+                expires_at <= now + DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN
+            })
+    })
 }
 
 fn aggregate_path_metering(
@@ -697,6 +706,26 @@ mod tests {
         assert!(daemon_advertisement_semantics_equal(&left, &right));
         right.storage_health = sinomo_dfs::DfsHealthState::Degraded;
         assert!(!daemon_advertisement_semantics_equal(&left, &right));
+    }
+
+    #[test]
+    fn unchanged_advertisement_renews_only_in_final_lease_third() {
+        let node_id = NodeId::from_legacy_named("placement-advertisement-lease").expect("node");
+        let now = time::OffsetDateTime::now_utc();
+        let mut current = sinomo_dfs::DfsNodeAdvertisement::content(node_id);
+        current.expires_at = Some(now + time::Duration::seconds(90));
+        let desired = current.clone();
+
+        assert!(!daemon_advertisement_publish_required(
+            Some(&current),
+            &desired,
+            now + time::Duration::seconds(59),
+        ));
+        assert!(daemon_advertisement_publish_required(
+            Some(&current),
+            &desired,
+            now + time::Duration::seconds(60),
+        ));
     }
 
     #[test]

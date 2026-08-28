@@ -664,7 +664,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         .map(drop)
     }
 
-    fn route_namespace_operation_with_request_id_and_result(
+    pub(crate) fn route_namespace_operation_with_request_id_and_result(
         &mut self,
         operation_id: String,
         primary_node_id: NodeId,

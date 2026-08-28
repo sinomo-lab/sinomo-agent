@@ -576,16 +576,7 @@ fn namespace_operation_requires_fresh_authority(operation: &DfsNamespaceOperatio
             | DfsNamespaceOperation::FileSync { .. }
             | DfsNamespaceOperation::DirectorySync { .. }
             | DfsNamespaceOperation::AdvisoryLockMigrationPrepare { .. }
-            | DfsNamespaceOperation::FinalizeObjectFamilyAdoption { .. }
             | DfsNamespaceOperation::VerifyObjectFamilyAdoption { .. }
-            | DfsNamespaceOperation::AdoptObjectAtPath {
-                pin_transfer_id: Some(_),
-                ..
-            }
-            | DfsNamespaceOperation::AdoptObjectAtPath {
-                advisory_lock_state: Some(_),
-                ..
-            }
     )
 }
 
@@ -3999,9 +3990,10 @@ mod admission_tests {
     }
 
     #[test]
-    fn pin_aware_adoption_bypasses_durable_admission_that_cannot_preserve_typed_receipts() {
+    fn pin_aware_adoption_uses_durable_admission_for_typed_receipt_replay() {
+        let object = adoption_object();
         let operation = DfsNamespaceOperation::AdoptObjectAtPath {
-            object: adoption_object(),
+            object: object.clone(),
             source_path: "/users/pinned.txt".to_string(),
             pin_transfer_id: Some("pin-transfer".to_string()),
             versions: Vec::new(),
@@ -4015,14 +4007,64 @@ mod admission_tests {
             advisory_lock_state: None,
         };
 
-        assert!(namespace_operation_requires_fresh_authority(&operation));
-        assert!(!namespace_operation_uses_durable_request_admission(
+        assert!(!namespace_operation_requires_fresh_authority(&operation));
+        assert!(namespace_operation_uses_durable_request_admission(
             &operation
         ));
         assert!(!namespace_operation_can_fuse_durable_request_admission(
             &operation
         ));
         assert!(namespace_operation_response_retry_safe(&operation));
+
+        let requester = NodeId::from_legacy_named("node_adoption_source").expect("node");
+        let request_id = "xsj_adoption_phase";
+        let command = DfsNamespaceCommand {
+            request_id: request_id.to_string(),
+            file_system_id: object.file_system_id.clone(),
+            requesting_node_id: requester.clone(),
+            include_metadata_journal_batches: false,
+            metadata_journal_after_sequences: Vec::new(),
+            authority_shards: Vec::new(),
+            operation,
+        };
+        let digest = namespace_command_digest(&command).expect("command digest");
+        let typed_result = DfsPosixCoordinationResult::ObjectFamilyAdoption {
+            object_id: object.object_id.clone(),
+            target_version: object.version.clone(),
+            pin_transfer_id: "pin-transfer".to_string(),
+            pin_transfer_active: false,
+            version_pin_set_fingerprint: "blake3:pins".to_string(),
+            advisory_lock_state_fingerprint: None,
+            durable_through_sequence: 42,
+        };
+        let receipt = DfsNamespaceRequestReceipt {
+            file_system_id: object.file_system_id,
+            requester_node_id: requester.clone(),
+            request_id: request_id.to_string(),
+            operation_id: namespace_request_operation_id(&requester, request_id),
+            authority_shard_id: DfsMetadataShardId::new("services"),
+            command_digest: digest.clone(),
+            result: DfsNamespaceResult::Applied,
+            posix_coordination_result: Some(typed_result.clone()),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            retained_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let reconciliation = classify_stable_namespace_operation(
+            request_id,
+            &command.file_system_id,
+            &requester,
+            &digest,
+            &command,
+            Some(&DfsNamespaceRequestAdmissionSnapshot {
+                receipt: Some(receipt),
+                ..DfsNamespaceRequestAdmissionSnapshot::default()
+            }),
+            false,
+        );
+        let DfsStableNamespaceOperationReconciliation::Applied { receipt } = reconciliation else {
+            panic!("exact adoption receipt must replay as applied");
+        };
+        assert_eq!(receipt.posix_coordination_result, Some(typed_result));
     }
 
     #[test]
@@ -4037,7 +4079,10 @@ mod admission_tests {
 
         assert_eq!(operation.routing_path(), Some("/services/pinned.txt"));
         assert_eq!(operation.involved_paths(), vec!["/services/pinned.txt"]);
-        assert!(namespace_operation_requires_fresh_authority(&operation));
+        assert!(!namespace_operation_requires_fresh_authority(&operation));
+        assert!(namespace_operation_uses_durable_request_admission(
+            &operation
+        ));
         assert!(namespace_operation_response_retry_safe(&operation));
     }
 }

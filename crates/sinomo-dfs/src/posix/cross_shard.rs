@@ -334,6 +334,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// from the source shard. Idempotent against resumes.
     fn run_cross_shard_dir_start(
         &mut self,
+        job: &DfsNamespaceJobRecord,
         source_object_id: &DfsObjectId,
         source_root: &str,
         target_root: &str,
@@ -364,6 +365,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 source_root,
                 None,
                 Some(&current),
+                Some(job),
             )?;
             return self.complete_cross_shard_move_locally(&moved, source_root, false);
         }
@@ -377,7 +379,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         moved.changed_at_unix_nanos =
             now_unix_nanos().max(current.changed_at_unix_nanos.saturating_add(1));
         moved.version = next_version(&current.version);
-        self.adopt_moved_object_on_destination_primary(&moved, source_root, Some(&current), None)?;
+        self.adopt_moved_object_on_destination_primary(
+            &moved,
+            source_root,
+            Some(&current),
+            None,
+            Some(job),
+        )?;
         self.complete_cross_shard_move_locally(&moved, source_root, false)
     }
 
@@ -424,6 +432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &object_path,
                     None,
                     Some(&current),
+                    Some(job),
                 )?;
                 if let Some(backend) = self.metadata_backend.as_mut() {
                     backend.evict_object_record_for_foreign_shard_move(&current, &object_path)?;
@@ -447,6 +456,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &object_path,
                 Some(&current),
                 None,
+                Some(job),
             )?;
             if let Some(backend) = self.metadata_backend.as_mut() {
                 backend.evict_object_record_for_foreign_shard_move(&moved, &object_path)?;
@@ -537,10 +547,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// state: a saga that parked (transport failure) may resume after
     /// pre-existing writes settled, so the snapshot recorded at job creation
     /// cannot be trusted. Idempotent against already-applied adoptions.
+    #[cfg(test)]
     pub(crate) fn run_cross_shard_adopt(
         &mut self,
         frame_object: &DfsObjectMetadata,
         old_path: &str,
+    ) -> Result<()> {
+        self.run_cross_shard_adopt_for_job(frame_object, old_path, None)
+    }
+
+    fn run_cross_shard_adopt_for_job(
+        &mut self,
+        frame_object: &DfsObjectMetadata,
+        old_path: &str,
+        job: Option<&DfsNamespaceJobRecord>,
     ) -> Result<()> {
         let old_path = normalize_posix_path(old_path)?;
         let target_path = normalize_posix_path(&frame_object.path)?;
@@ -573,6 +593,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &old_path,
                 None,
                 Some(frame_object),
+                job,
             );
         }
         if current_path != old_path {
@@ -590,7 +611,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // version here would assign a different ULID on every retry, breaking
         // both destination idempotency and the pin-transfer receipt identity.
         moved.version = frame_object.version.clone();
-        self.adopt_moved_object_on_destination_primary(&moved, &old_path, Some(&current), None)
+        self.adopt_moved_object_on_destination_primary(&moved, &old_path, Some(&current), None, job)
     }
 
     /// Routes the adoption of a moved record to the destination path's
@@ -602,6 +623,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_path: &str,
         expected_source: Option<&DfsObjectMetadata>,
         finalized_proof_object: Option<&DfsObjectMetadata>,
+        job: Option<&DfsNamespaceJobRecord>,
     ) -> Result<()> {
         let source_family = match self.metadata_backend.as_mut() {
             Some(backend) => {
@@ -638,6 +660,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return self.verify_cross_shard_adoption_finalized(
                 finalized_proof_object.unwrap_or(moved),
                 source_path,
+                job,
             );
         }
         let mut transfer_identity_object = moved.clone();
@@ -676,6 +699,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &transfer_identity_object,
                 source_path,
                 finalize_transfer_id,
+                job,
             );
         }
         let (
@@ -737,7 +761,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 ),
                             })
                         })?;
-                    self.route_namespace_operation(
+                    self.route_cross_shard_job_phase(
+                        job,
+                        &format!(
+                            "prepare-advisory-lock-migration\0{}\0{source_path}",
+                            moved.object_id
+                        ),
                         primary.clone(),
                         DfsNamespaceOperation::AdvisoryLockMigrationPrepare {
                             path: moved.path.clone(),
@@ -747,7 +776,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         },
                     )?;
                 }
-                let result = self.route_namespace_operation_with_result(
+                let result = self.route_cross_shard_job_phase_with_result(
+                    job,
+                    &format!("adopt-object-family\0{}\0{source_path}", moved.object_id),
                     primary,
                     DfsNamespaceOperation::AdoptObjectAtPath {
                         object: moved.clone(),
@@ -813,6 +844,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 &transfer_identity_object,
                 source_path,
                 &pin_transfer_id,
+                job,
             )?;
         }
         Ok(())
@@ -822,6 +854,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         moved: &DfsObjectMetadata,
         source_path: &str,
+        job: Option<&DfsNamespaceJobRecord>,
     ) -> Result<()> {
         let pin_transfer_id = crate::protocol::cross_shard_pin_transfer_id(moved, source_path)
             .map_err(DfsPosixError::from)?;
@@ -831,7 +864,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pin_transfer_id: pin_transfer_id.clone(),
         };
         let result = match self.routed_namespace_primary_for_path(&moved.path)? {
-            Some(primary) => self.route_namespace_operation_with_result(primary, operation)?,
+            Some(primary) => self.route_cross_shard_job_phase_with_result(
+                job,
+                &format!(
+                    "verify-object-family-adoption\0{}\0{source_path}",
+                    moved.object_id
+                ),
+                primary,
+                operation,
+            )?,
             None => self.execute_posix_coordination_operation_local(&operation)?,
         };
         match result {
@@ -860,9 +901,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transfer_object: &DfsObjectMetadata,
         source_path: &str,
         pin_transfer_id: &str,
+        job: Option<&DfsNamespaceJobRecord>,
     ) -> Result<()> {
         match self.routed_namespace_primary_for_path(&transfer_object.path)? {
-            Some(primary) => self.route_namespace_operation(
+            Some(primary) => self.route_cross_shard_job_phase(
+                job,
+                &format!(
+                    "finalize-object-family-adoption\0{}\0{source_path}",
+                    transfer_object.object_id
+                ),
                 primary,
                 DfsNamespaceOperation::FinalizeObjectFamilyAdoption {
                     path: transfer_object.path.clone(),
@@ -1030,6 +1077,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.drive_cross_shard_namespace_job(job)
     }
 
+    fn cross_shard_job_phase_operation_id(job: &DfsNamespaceJobRecord, phase: &str) -> String {
+        let identity = format!("{}\0{}", job.job_id, phase);
+        let digest = blake3::hash(identity.as_bytes()).to_hex();
+        let order_token = job.origin.as_ref().and_then(|origin| {
+            crate::intent::stable_operation_order_token(&origin.operation_id)
+                .or_else(|| crate::intent::stable_operation_order_token(&origin.request_id))
+        });
+        match order_token {
+            Some(order_token) => format!("xsj_{}_{}", &digest.as_str()[..24], order_token),
+            None => format!("xsj_{}", &digest.as_str()[..32]),
+        }
+    }
+
     fn hardlink_alias_job_phase_operation_id(job: &DfsNamespaceJobRecord, phase: &str) -> String {
         let identity = format!("{}\0{}", job.job_id, phase);
         let digest = blake3::hash(identity.as_bytes()).to_hex();
@@ -1040,6 +1100,34 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         match order_token {
             Some(order_token) => format!("hlj_{}_{}", &digest.as_str()[..24], order_token),
             None => format!("hlj_{}", &digest.as_str()[..32]),
+        }
+    }
+
+    fn route_cross_shard_job_phase(
+        &mut self,
+        job: Option<&DfsNamespaceJobRecord>,
+        phase: &str,
+        primary: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<()> {
+        self.route_cross_shard_job_phase_with_result(job, phase, primary, operation)
+            .map(drop)
+    }
+
+    fn route_cross_shard_job_phase_with_result(
+        &mut self,
+        job: Option<&DfsNamespaceJobRecord>,
+        phase: &str,
+        primary: NodeId,
+        operation: DfsNamespaceOperation,
+    ) -> Result<Option<DfsPosixCoordinationResult>> {
+        match job {
+            Some(job) => self.route_namespace_operation_with_request_id_and_result(
+                Self::cross_shard_job_phase_operation_id(job, phase),
+                primary,
+                operation,
+            ),
+            None => self.route_namespace_operation_with_result(primary, operation),
         }
     }
 
@@ -1561,7 +1649,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     destination_primary_node_id,
                 } => {
                     let _ = destination_primary_node_id;
-                    self.run_cross_shard_adopt(&moved_object, &old_path)
+                    self.run_cross_shard_adopt_for_job(&moved_object, &old_path, Some(&job))
                 }
                 DfsNamespaceJobFrame::CrossShardComplete {
                     moved_object,
@@ -1571,7 +1659,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     source_object_id,
                     source_root,
                     target_root,
-                } => self.run_cross_shard_dir_start(&source_object_id, &source_root, &target_root),
+                } => self.run_cross_shard_dir_start(
+                    &job,
+                    &source_object_id,
+                    &source_root,
+                    &target_root,
+                ),
                 DfsNamespaceJobFrame::CrossShardDirScan {
                     source_path,
                     target_path,
@@ -2481,5 +2574,46 @@ mod version_pin_reconciliation_tests {
         assert_eq!(first.size_bytes, object.content_size_bytes);
         assert_eq!(first.locations, object.current_locations);
         assert_eq!(first.created_at.unix_timestamp_nanos(), 42);
+    }
+
+    #[test]
+    fn cross_shard_job_phase_ids_are_stable_and_object_scoped() {
+        let job = DfsNamespaceJobRecord {
+            job_id: "rename-job".to_string(),
+            file_system_id: DfsFileSystemId::from_legacy_named("sifs").expect("filesystem"),
+            origin: None,
+            kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
+            status: DfsNamespaceJobStatus::Running,
+            root_path: "/users/source".to_string(),
+            target_path: Some("/services/target".to_string()),
+            pending_frames: Vec::new(),
+            processed_object_count: 0,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+            completed_at: None,
+            failure_reason: None,
+        };
+        type Service = NetworkedDfsService<sinomo_core::network::InProcessTransport>;
+
+        let first = Service::cross_shard_job_phase_operation_id(
+            &job,
+            "adopt-object-family\0object-a\0/users/source/a",
+        );
+        let retry = Service::cross_shard_job_phase_operation_id(
+            &job,
+            "adopt-object-family\0object-a\0/users/source/a",
+        );
+        let sibling = Service::cross_shard_job_phase_operation_id(
+            &job,
+            "adopt-object-family\0object-b\0/users/source/b",
+        );
+
+        assert_eq!(retry, first);
+        assert_ne!(sibling, first);
+        assert!(first.starts_with("xsj_"));
+        assert!(
+            first.len() <= 256,
+            "phase id must fit the namespace request bound"
+        );
     }
 }

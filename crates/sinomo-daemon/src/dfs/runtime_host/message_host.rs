@@ -692,6 +692,7 @@ pub(crate) fn open_daemon_dfs_resident_metadata_backend_from_authority_projectio
         local_node_id,
     )?
     .into_resident();
+    backend.initialize_bounded_status_snapshots()?;
     if authority_generation.generation() != expected_generation {
         return Err(sinomo_dfs::DfsError::Network {
             message: format!(

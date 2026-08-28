@@ -267,17 +267,17 @@ struct DfsBrowserBackendSlot {
 static DFS_BROWSER_BACKENDS: OnceLock<Mutex<HashMap<PathBuf, Arc<DfsBrowserBackendSlot>>>> =
     OnceLock::new();
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 static DFS_BROWSER_BACKEND_OPEN_COUNTS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 fn record_dfs_browser_backend_open(data_dir: &SinomoDataDir) {
     let counts = DFS_BROWSER_BACKEND_OPEN_COUNTS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut counts = counts.lock().expect("DFS browser open-count lock");
     *counts.entry(data_dir.root()).or_default() += 1;
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub fn dfs_browser_backend_open_count(data_dir: &SinomoDataDir) -> usize {
     DFS_BROWSER_BACKEND_OPEN_COUNTS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -305,7 +305,7 @@ impl DfsBrowserBackend {
         runtime: &tokio::runtime::Handle,
         host: Arc<dyn DfsBrowserServiceHost>,
     ) -> Result<Self, ServiceError> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(feature = "test-support")]
         record_dfs_browser_backend_open(&data_dir);
         let cluster_paths = ClusterPaths::new(&data_dir);
         let control_plane = host.control_plane_client(&cluster_paths, runtime);
@@ -2521,7 +2521,7 @@ pub fn enrich_daemon_dfs_browser_placement_connectivity_from_snapshot(
     );
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(feature = "test-support")]
 pub fn merge_daemon_dfs_browser_placement_impact(
     aggregate: &mut crate::DfsPlacementImpact,
     page: &crate::DfsPlacementImpact,

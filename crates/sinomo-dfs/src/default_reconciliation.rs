@@ -203,6 +203,34 @@ pub fn default_dfs_locally_owned_pending_handoff(
         })
 }
 
+/// Return whether the committed default-DFS projection assigns at least one
+/// authoritative metadata shard to this node.
+///
+/// Cluster-KV voter authority and DFS metadata authority are independent. A
+/// learner may therefore need to publish a journal produced by default
+/// reconciliation even though it must not publish cluster-control state.
+/// Malformed or mismatched inputs never grant local metadata authority.
+pub fn default_dfs_reconciliation_local_owns_metadata_primary(
+    local_node_id: &NodeId,
+    inputs: &[(String, Vec<u8>)],
+) -> bool {
+    let file_system_id = crate::sifs_file_system_id();
+    ["root", "services", "users"].into_iter().any(|shard_id| {
+        let key = crate::metadata_shard_key(&file_system_id, shard_id);
+        inputs
+            .iter()
+            .find(|(input_key, _)| input_key == &key)
+            .and_then(|(_, value)| {
+                sinomo_core::kv::decode_kv_value::<DfsMetadataShardConfig>(value).ok()
+            })
+            .is_some_and(|shard| {
+                shard.file_system_id == file_system_id
+                    && shard.shard_id == shard_id
+                    && shard.primary_node_id == *local_node_id
+            })
+    })
+}
+
 pub fn completed_promoted_primary_handoff_matches(
     local_node_id: &NodeId,
     active: &DfsMetadataShardConfig,
@@ -662,6 +690,48 @@ mod tests {
             inputs,
             placement_authority_permit: None,
         }
+    }
+
+    #[test]
+    fn learner_metadata_primary_is_independent_of_cluster_kv_voter_role() {
+        let local = NodeId::from_legacy_named("default-dfs-learner-primary").expect("local node");
+        let other = NodeId::from_legacy_named("default-dfs-kv-voter").expect("other node");
+        let file_system_id = crate::sifs_file_system_id();
+        let shard = |shard_id: &str, primary_node_id: NodeId| DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: shard_id.to_string(),
+            primary_node_id,
+            replica_node_ids: Vec::new(),
+            epoch: 1,
+            assignment: match shard_id {
+                "root" => crate::DfsMetadataShardAssignment::Root,
+                "services" => crate::DfsMetadataShardAssignment::PathPrefix {
+                    prefix: "/services".to_string(),
+                },
+                _ => unreachable!("test shard assignment"),
+            },
+            namespace_prepare_codec: Default::default(),
+            default_policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+        };
+        let inputs = vec![
+            (
+                crate::metadata_shard_key(&file_system_id, "root"),
+                sinomo_core::kv::encode_kv_value(&shard("root", other)).expect("encode root shard"),
+            ),
+            (
+                crate::metadata_shard_key(&file_system_id, "services"),
+                sinomo_core::kv::encode_kv_value(&shard("services", local.clone()))
+                    .expect("encode services shard"),
+            ),
+        ];
+
+        assert!(default_dfs_reconciliation_local_owns_metadata_primary(
+            &local, &inputs
+        ));
+        assert!(!default_dfs_reconciliation_local_owns_metadata_primary(
+            &NodeId::from_legacy_named("default-dfs-replica-only").expect("replica node"),
+            &inputs,
+        ));
     }
 
     #[test]

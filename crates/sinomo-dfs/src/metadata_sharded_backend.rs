@@ -1250,10 +1250,73 @@ impl ResidentLocalMetadataShardSlot {
         self.async_available.notify_waiters();
     }
 
+    /// Populate the last completed operator projection for a deferred replica
+    /// without turning the replica into a permanently resident backend.
+    ///
+    /// This is a startup-only operation in normal daemon use. The state wait
+    /// keeps the helper correct if a future caller races it with a scoped
+    /// checkout: an already-open shard retains its resident authority instance,
+    /// while an unopened shard is inspected once and returned to `Unopened`.
+    fn initialize_deferred_bounded_status_snapshot(&self) -> Result<()> {
+        let mut state = self.state.lock().map_err(|error| {
+            MetadataBackendError::Serde(format!(
+                "resident metadata shard {} state lock failed: {error}",
+                self.config.shard_id
+            ))
+        })?;
+        loop {
+            match &*state {
+                ResidentLocalMetadataShardState::Unopened => {
+                    *state = ResidentLocalMetadataShardState::Opening;
+                    break;
+                }
+                ResidentLocalMetadataShardState::Available(_) => return Ok(()),
+                ResidentLocalMetadataShardState::Opening
+                | ResidentLocalMetadataShardState::CheckedOut => {
+                    state = self.available.wait(state).map_err(|error| {
+                        MetadataBackendError::Serde(format!(
+                            "resident metadata shard {} availability wait failed: {error}",
+                            self.config.shard_id
+                        ))
+                    })?;
+                }
+            }
+        }
+        drop(state);
+
+        let opened = self.open_backend();
+        match opened {
+            Ok(backend) => {
+                let snapshot =
+                    initialize_resident_metadata_shard_status_snapshot(&self.config, &backend);
+                self.operator_status
+                    .write()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .snapshot = Some(snapshot);
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                debug_assert!(matches!(*state, ResidentLocalMetadataShardState::Opening));
+                *state = ResidentLocalMetadataShardState::Unopened;
+                self.available.notify_all();
+                self.async_available.notify_waiters();
+                drop(state);
+                drop(backend);
+                Ok(())
+            }
+            Err(error) => {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                *state = ResidentLocalMetadataShardState::Unopened;
+                self.available.notify_all();
+                self.async_available.notify_waiters();
+                Err(error)
+            }
+        }
+    }
+
     /// Return a bounded operator projection without waiting for ownership of
     /// the shard backend. A checked-out shard deliberately serves the last
-    /// completed generation; an unopened shard has no truthful generation to
-    /// serve and is reported as unavailable instead of being hydrated here.
+    /// completed generation. An unopened shard serves a startup-inspected
+    /// projection when present; otherwise it is reported as unavailable instead
+    /// of being hydrated by an operator read.
     fn bounded_status_snapshot(&self) -> Result<ResidentLocalMetadataShardStatusSnapshot> {
         let state = match self.state.try_lock() {
             Ok(state) => state,
@@ -1269,11 +1332,15 @@ impl ResidentLocalMetadataShardSlot {
             ResidentLocalMetadataShardState::Available(_) => self.last_status_snapshot(),
             ResidentLocalMetadataShardState::Opening
             | ResidentLocalMetadataShardState::CheckedOut => self.last_status_snapshot(),
-            ResidentLocalMetadataShardState::Unopened => {
-                Err(MetadataBackendError::StatusUnhydrated {
-                    shard_id: DfsMetadataShardId::new(self.config.shard_id.clone()),
-                })
-            }
+            ResidentLocalMetadataShardState::Unopened => match self.last_status_snapshot() {
+                Ok(snapshot) => Ok(snapshot),
+                Err(MetadataBackendError::StatusUnavailable { .. }) => {
+                    Err(MetadataBackendError::StatusUnhydrated {
+                        shard_id: DfsMetadataShardId::new(self.config.shard_id.clone()),
+                    })
+                }
+                Err(error) => Err(error),
+            },
         }
     }
 
@@ -1566,6 +1633,21 @@ pub struct ResidentLocalShardedMetadataBackend {
 impl ResidentLocalShardedMetadataBackend {
     pub fn shard_ids(&self) -> Vec<DfsMetadataShardId> {
         self.inner.shards.keys().cloned().collect()
+    }
+
+    /// Initialize every shard's compact operator projection during daemon
+    /// startup, before the resident generation is published.
+    ///
+    /// Bounded status reads deliberately never open deferred replica shards.
+    /// A restarted daemon must therefore own this one-time inspection so it can
+    /// prove cluster-wide lock and job invariants even when a quiet non-primary
+    /// shard receives no new replication after restart. Inspection leaves the
+    /// replica deferred, preserving lazy repair and idle-runtime behavior.
+    pub fn initialize_bounded_status_snapshots(&self) -> Result<()> {
+        for slot in self.inner.shards.values() {
+            slot.initialize_deferred_bounded_status_snapshot()?;
+        }
+        Ok(())
     }
 
     pub fn shard_config(&self, shard_id: &DfsMetadataShardId) -> Result<DfsMetadataShardConfig> {
@@ -3946,6 +4028,71 @@ mod lazy_replica_slot_tests {
             0,
             "zero-proof status must not hydrate a missing shard summary"
         );
+    }
+
+    #[test]
+    fn explicit_startup_status_initialization_proves_zero_across_deferred_replicas() {
+        let root = sinomo_testdir::TestDir::new("dfs-bounded-status-startup-initialization");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("bounded-status-startup-local");
+        let root_shard = configs(&local_node_id)[0].clone();
+        drop(
+            LocalShardedMetadataBackend::new(&metadata_root, vec![root_shard])
+                .expect("open predecessor topology"),
+        );
+        let resident = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            configs(&local_node_id),
+            &local_node_id,
+        )
+        .expect("open successor topology with deferred replicas")
+        .into_resident();
+
+        resident
+            .initialize_bounded_status_snapshots()
+            .expect("initialize startup status projections");
+        for slot in resident.inner.shards.values().filter(|slot| {
+            slot.config.primary_node_id != local_node_id
+                && slot.config.replica_node_ids.contains(&local_node_id)
+        }) {
+            assert!(matches!(
+                *slot.state.lock().expect("deferred slot state"),
+                ResidentLocalMetadataShardState::Unopened
+            ));
+            assert!(
+                slot.operator_status
+                    .read()
+                    .expect("deferred slot operator status")
+                    .snapshot
+                    .is_some(),
+                "startup inspection must retain only the bounded projection"
+            );
+        }
+        let snapshot = resident
+            .bounded_status_snapshot()
+            .expect("complete bounded startup status");
+
+        assert!(!snapshot.bounded_omissions.iter().any(|omission| matches!(
+            omission,
+            DfsOperatorStatusOmission::NonPrimaryResidentMetadataNotHydrated { .. }
+        )));
+        let historical = snapshot
+            .bounded_omissions
+            .iter()
+            .find(|omission| {
+                matches!(
+                    omission,
+                    DfsOperatorStatusOmission::HistoricalRoutingTopology { .. }
+                )
+            })
+            .expect("historical routing omission remains visible");
+        assert!(
+            !historical
+                .omitted_metrics()
+                .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount),
+            "startup initialization must preserve the exact zero-lock proof"
+        );
+        assert_eq!(snapshot.summary.cross_shard_namespace_lock_count, 0);
     }
 
     #[test]
