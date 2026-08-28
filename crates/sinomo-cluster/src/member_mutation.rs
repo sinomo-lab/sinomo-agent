@@ -1197,7 +1197,7 @@ fn reconcile_cluster_raft_config_change_with_host(
                 || change
                     .catch_up_proof
                     .as_ref()
-                    .map_or(true, |proof| !proof.proves_required_index())
+                    .is_none_or(|proof| !proof.proves_required_index())
             {
                 let failed = finish_reconciled_cluster_raft_config_change(
                     paths,
@@ -1318,9 +1318,8 @@ pub fn reconcile_cluster_raft_config_changes_bounded_with_host(
     max_change_count: usize,
     host: &mut (impl ClusterMemberMutationHost + ?Sized),
 ) -> Result<ClusterRaftConfigReconciliationReport, NetworkError> {
-    let max_change_count = max_change_count
-        .max(1)
-        .min(MAX_CLUSTER_RAFT_CONFIG_RECONCILIATIONS_PER_PASS);
+    let max_change_count =
+        max_change_count.clamp(1, MAX_CLUSTER_RAFT_CONFIG_RECONCILIATIONS_PER_PASS);
     let authoritative = host.authoritative_cluster_kv_snapshot(paths, state)?;
     let mut authority = authoritative.authority;
     let mut store = InProcessKvStore::restore(authoritative.value).map_err(kv_err)?;

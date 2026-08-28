@@ -385,15 +385,11 @@ impl AgentToolKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentOutputFormat {
+    #[default]
     JsonDecision,
     Text,
-}
-
-impl Default for AgentOutputFormat {
-    fn default() -> Self {
-        Self::JsonDecision
-    }
 }
 
 impl AgentOutputFormat {

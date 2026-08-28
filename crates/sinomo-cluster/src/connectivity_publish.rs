@@ -227,7 +227,7 @@ where
         };
         let snapshot = latest
             .as_ref()
-            .or_else(|| local_snapshot.as_deref())
+            .or(local_snapshot.as_deref())
             .expect("connectivity sync always has a snapshot");
         let success = cluster_connectivity_full_sync_batch_ops_from_snapshot(
             snapshot,

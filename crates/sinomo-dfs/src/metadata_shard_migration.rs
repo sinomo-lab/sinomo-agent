@@ -126,7 +126,7 @@ pub(crate) fn collect_object_metadata_family<B: DfsMetadataBackend + ?Sized>(
         }
     }
     if let Some(limit) = version_history_limit {
-        versions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+        versions.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         let retained_versions = versions
             .iter()
             .take(limit)

@@ -36,10 +36,9 @@ pub fn component_descriptor_from_registration(
         platform_triple: _,
         interface_version: _,
     } = &registration.backend
+        && descriptor.artifact_id.is_none()
     {
-        if descriptor.artifact_id.is_none() {
-            descriptor = descriptor.with_artifact(artifact_id.as_str(), 1);
-        }
+        descriptor = descriptor.with_artifact(artifact_id.as_str(), 1);
     }
 
     for export in &registration.surfaces.interface_exports {

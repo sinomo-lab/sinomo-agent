@@ -351,20 +351,14 @@ pub(crate) mod prelude {
     pub(crate) use serde::{Deserialize, Serialize};
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) use sinomo_base::ClusterCertificate;
-    #[cfg(test)]
-    pub(crate) use sinomo_base::EventEnvelope;
+
     pub(crate) use sinomo_base::{
         CapabilityName, ClusterBootstrapState, ClusterEndpointPrivacy, ClusterEndpointRecord,
         ClusterEndpointSource, ClusterInvitationChannel, ClusterJoinInvite, ClusterMemberRecord,
         ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRole,
         ClusterNodeStatusRecord, ClusterTransportKind, TrustDomain,
     };
-    #[cfg(test)]
-    pub(crate) use sinomo_base::{LatencyClass, RoutingScope};
-    #[cfg(test)]
-    pub(crate) use sinomo_events::EventStore;
-    #[cfg(test)]
-    pub(crate) use sinomo_events::{EventSequence, SessionId, StoredEvent};
+
     #[allow(unused_imports)]
     pub(crate) use sinomo_kv::{
         ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, InProcessKvStore, KvCommand,
@@ -376,13 +370,9 @@ pub(crate) mod prelude {
     pub(crate) use sinomo_network::ClusterEndpointId;
     pub(crate) use sinomo_node::ClusterId;
     pub(crate) use sinomo_node::ClusterInviteId;
-    #[cfg(test)]
-    pub(crate) use sinomo_node::main_daemon_capabilities;
-    #[cfg(test)]
-    pub(crate) use sinomo_node::{NodeAvailability, NodeHealth, NodeProfile};
+
     pub(crate) use sinomo_node::{NodeId, shadow_daemon_node_id};
-    #[cfg(test)]
-    pub(crate) use std::collections::HashSet;
+
     pub(crate) use std::collections::{BTreeMap, BTreeSet};
     pub(crate) use std::net::SocketAddr;
     pub(crate) use std::time::Duration;

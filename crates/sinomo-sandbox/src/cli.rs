@@ -3494,7 +3494,7 @@ pub fn sandbox_fetch(options: SandboxFetchOptions) -> Result<(), CliError> {
                 .to_string(),
         });
     };
-    let transport = DaemonMediatedSandboxHttpTransport { address: address };
+    let transport = DaemonMediatedSandboxHttpTransport { address };
     let mut event_store =
         sinomo_core::events::JsonlEventStore::new(data_dir.root().join("events/event-log.jsonl"));
     let _ = sandbox_fetch_with_store_transport_and_event_store(
@@ -4210,8 +4210,8 @@ fn sandbox_policy_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     }
     #[cfg(test)]
     {
-        return sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
-            .map_err(SandboxCliError::Kv);
+        sinomo_core::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+            .map_err(SandboxCliError::Kv)
     }
     #[cfg(not(test))]
     {
@@ -4628,8 +4628,10 @@ pub fn sandbox_toolchain_verify_busybox_with_stores(
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = options.allow_unsigned;
+    let policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: options.allow_unsigned,
+        ..crate::SandboxPolicy::default()
+    };
     match current_sandbox_cli_host().verify_busybox_toolchain_fidelity(
         store,
         toolchain_store,
@@ -4780,8 +4782,10 @@ fn sandbox_toolchain_verify_coding_workflow_with_stores(
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = options.allow_unsigned;
+    let policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: options.allow_unsigned,
+        ..crate::SandboxPolicy::default()
+    };
     let mut results = Vec::new();
     for case in CODING_WORKFLOW_BUSYBOX_CASES {
         let outcome = current_sandbox_cli_host().run_wasix_toolchain_command(
@@ -5156,8 +5160,10 @@ fn sandbox_toolchain_verify_command_cases_with_stores(
     let node_id = NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
         detail: format!("invalid sandbox CLI node id: {source}"),
     })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = allow_unsigned;
+    let mut policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: allow_unsigned,
+        ..crate::SandboxPolicy::default()
+    };
     for capability in allowed_capabilities {
         policy
             .allowed_command_capabilities
@@ -5169,10 +5175,7 @@ fn sandbox_toolchain_verify_command_cases_with_stores(
             let (_manifest, layout) = store.load(sandbox_id)?;
             let mut sandbox_fs = crate::LocalSandboxFileSystem::new(layout);
             for (path, contents) in case.setup_files {
-                sandbox_fs.write(
-                    &crate::SandboxPath::new((*path).to_string())?,
-                    contents.as_bytes(),
-                )?;
+                sandbox_fs.write(&crate::SandboxPath::new(*path)?, contents.as_bytes())?;
             }
         }
         let outcome = current_sandbox_cli_host().run_wasix_toolchain_command(
@@ -5233,7 +5236,7 @@ fn sandbox_toolchain_verify_command_cases_with_daemon_address(
             daemon_sandbox_write_file_to_address(
                 daemon_address,
                 sandbox_id,
-                crate::SandboxPath::new((*path).to_string())?,
+                crate::SandboxPath::new(*path)?,
                 contents.as_bytes().to_vec(),
             )?;
         }
@@ -5712,13 +5715,13 @@ pub fn sandbox_module_replay_run_with_data_dir(
             detail: source.to_string(),
         })?;
     let report = current_sandbox_cli_host().run_module_replay_fixture(data_dir_root, &fixture)?;
-    if let Some(parent) = options.report_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
-                path: parent.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        }
+    if let Some(parent) = options.report_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|source| CliError::Io {
+            path: parent.display().to_string(),
+            detail: source.to_string(),
+        })?;
     }
     let report_json = serde_json::to_vec_pretty(&report).map_err(|source| CliError::Json {
         path: options.report_path.display().to_string(),
@@ -6539,8 +6542,10 @@ fn sandbox_process_plan_wasix_with_stores(
         NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
             detail: format!("invalid sandbox CLI node id: {source}"),
         })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = true;
+    let policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: true,
+        ..crate::SandboxPolicy::default()
+    };
     let outcome = current_sandbox_cli_host().run_wasix_process_plan(
         store,
         toolchain_store,
@@ -6564,8 +6569,10 @@ fn sandbox_process_plan_simple_native_with_stores(
         NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
             detail: format!("invalid sandbox CLI node id: {source}"),
         })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = true;
+    let policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: true,
+        ..crate::SandboxPolicy::default()
+    };
     let outcome = current_sandbox_cli_host().run_simple_native_process_plan(
         store,
         toolchain_store,
@@ -6789,8 +6796,10 @@ fn sandbox_run_simple_native_with_stores_and_stdin(
         NodeId::from_legacy_named("sandbox_cli").map_err(|source| CliError::Parse {
             detail: format!("invalid sandbox CLI node id: {source}"),
         })?;
-    let mut policy = crate::SandboxPolicy::default();
-    policy.allow_unsigned_toolchains = true;
+    let policy = crate::SandboxPolicy {
+        allow_unsigned_toolchains: true,
+        ..crate::SandboxPolicy::default()
+    };
     let request = crate::SandboxRunToolchainRequest {
         sandbox_id: options.sandbox_id.clone(),
         command_name: command_name.clone(),
@@ -6853,8 +6862,10 @@ fn sandbox_run_wasix_with_stores_and_stdin(
             print_sandbox_command_outcome(&outcome, false)
         }
         SandboxRunTarget::ToolchainCommand(command_name) => {
-            let mut policy = crate::SandboxPolicy::default();
-            policy.allow_unsigned_toolchains = options.allow_unsigned;
+            let mut policy = crate::SandboxPolicy {
+                allow_unsigned_toolchains: options.allow_unsigned,
+                ..crate::SandboxPolicy::default()
+            };
             for capability in &options.allowed_capabilities {
                 policy
                     .allowed_command_capabilities
@@ -7981,7 +7992,7 @@ fn parse_sandbox_checkpoint_id(value: &str) -> Result<crate::SandboxCheckpointId
 }
 
 fn parse_sandbox_path(value: &str) -> Result<crate::SandboxPath, CliError> {
-    crate::SandboxPath::new(value.to_string()).map_err(CliError::from)
+    crate::SandboxPath::new(value).map_err(CliError::from)
 }
 
 fn parse_sandbox_env_assignment(value: &str) -> Result<(String, String), CliError> {

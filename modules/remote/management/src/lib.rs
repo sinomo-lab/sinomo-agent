@@ -1315,7 +1315,7 @@ fn ensure_request_head_matches_staged_body(
                 .expected_blake3
                 .strip_prefix("blake3:")
                 .unwrap_or(&request.expected_blake3)
-                .eq_ignore_ascii_case(&blake3::hash(&[]).to_hex().to_string()) =>
+                .eq_ignore_ascii_case(blake3::hash(&[]).to_hex().as_ref()) =>
         {
             Ok(())
         }

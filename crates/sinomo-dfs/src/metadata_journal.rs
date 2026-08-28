@@ -558,9 +558,7 @@ fn cached_journal_segment_decoded_entries(
     let mut cache = journal_segment_index_cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(cached_index) = cache.entries.get(path).map(|cached| &cached.index) else {
-        return None;
-    };
+    let cached_index = cache.entries.get(path).map(|cached| &cached.index)?;
     if !cached_index.matches_cached_snapshot(index)
         || !expected
             .iter()
@@ -993,7 +991,7 @@ fn segmented_journal_paths_descending(root: &Path) -> Result<Vec<(u64, PathBuf)>
         };
         paths.push((segment_id, path));
     }
-    paths.sort_by(|left, right| right.0.cmp(&left.0));
+    paths.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     Ok(paths)
 }
 

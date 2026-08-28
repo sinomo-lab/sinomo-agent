@@ -1126,7 +1126,7 @@ pub fn fixed_layout_record_bytes<T: FixedLayoutRecord>(records: &[T]) -> Result<
 pub fn fixed_layout_records_from_bytes<T: FixedLayoutRecord>(bytes: &[u8]) -> Result<&[T]> {
     ensure_fixed_layout_supported::<T>()?;
     let record_size = std::mem::size_of::<T>();
-    if bytes.len() % record_size != 0 {
+    if !bytes.len().is_multiple_of(record_size) {
         return Err(Error::ArrayByteLengthMismatch);
     }
     let alignment = std::mem::align_of::<T>();
@@ -1875,12 +1875,11 @@ impl<'a> Reader<'a> {
             self.limits.max_bytes_value_bytes,
         )?;
         let byte_len = usize::try_from(byte_len_u64).map_err(|_| Error::LengthTooLarge)?;
-        if let ElementType::Builtin(type_id) = element_type {
-            if let Some(size) = type_id.fixed_size() {
-                if size != element_size {
-                    return Err(Error::ArrayByteLengthMismatch);
-                }
-            }
+        if let ElementType::Builtin(type_id) = element_type
+            && let Some(size) = type_id.fixed_size()
+            && size != element_size
+        {
+            return Err(Error::ArrayByteLengthMismatch);
         }
         let data = self.take(byte_len)?;
         Ok(ArrayView {
@@ -2185,12 +2184,11 @@ fn skip_array_inner(reader: &mut Reader<'_>) -> Result<ElementType> {
         reader.limits.max_bytes_value_bytes,
     )?;
     let byte_len = usize::try_from(byte_len_u64).map_err(|_| Error::LengthTooLarge)?;
-    if let ElementType::Builtin(type_id) = &element_type {
-        if let Some(size) = type_id.fixed_size() {
-            if size != element_size {
-                return Err(Error::ArrayByteLengthMismatch);
-            }
-        }
+    if let ElementType::Builtin(type_id) = &element_type
+        && let Some(size) = type_id.fixed_size()
+        && size != element_size
+    {
+        return Err(Error::ArrayByteLengthMismatch);
     }
     reader.take(byte_len)?;
     Ok(element_type)
@@ -2451,12 +2449,11 @@ fn validate_array_data(
     if expected != actual {
         return Err(Error::ArrayByteLengthMismatch);
     }
-    if let ElementType::Builtin(type_id) = element_type {
-        if let Some(size) = type_id.fixed_size() {
-            if size != element_size {
-                return Err(Error::ArrayByteLengthMismatch);
-            }
-        }
+    if let ElementType::Builtin(type_id) = element_type
+        && let Some(size) = type_id.fixed_size()
+        && size != element_size
+    {
+        return Err(Error::ArrayByteLengthMismatch);
     }
     Ok(())
 }

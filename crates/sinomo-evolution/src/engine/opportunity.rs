@@ -163,10 +163,9 @@ fn opportunity_objective(
         .payload
         .get("objective")
         .and_then(|value| value.as_str())
+        && !objective.trim().is_empty()
     {
-        if !objective.trim().is_empty() {
-            return objective.trim().to_string();
-        }
+        return objective.trim().to_string();
     }
     let target = event
         .payload

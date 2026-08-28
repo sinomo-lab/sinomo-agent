@@ -1235,6 +1235,7 @@ impl LocalContentStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .map_err(|source| ContentStoreError::Io {
                 path: lock_path.clone(),
@@ -1835,10 +1836,8 @@ impl LocalContentStore {
                     .map(String::as_str)
                     .filter(|hash| *hash != empty_hash),
             )?;
-            for (((object_id, version, bytes), hash), existing) in versions
-                .iter()
-                .zip(&hashes)
-                .zip(existing_manifests.into_iter())
+            for (((object_id, version, bytes), hash), existing) in
+                versions.iter().zip(&hashes).zip(existing_manifests)
             {
                 if hash == empty_hash {
                     manifests.push(existing.unwrap_or_else(|| ContentManifest {
@@ -1859,7 +1858,7 @@ impl LocalContentStore {
                     continue;
                 }
 
-                let blob_path = self.blob_path(&hash)?;
+                let blob_path = self.blob_path(hash)?;
                 let manifest = ContentManifest {
                     object_id: (*object_id).to_owned(),
                     version: (*version).to_owned(),
@@ -2377,7 +2376,7 @@ impl LocalContentStore {
 
     pub fn manifest_content_available(&self, manifest: &ContentManifest) -> Result<bool> {
         if manifest.extents.is_empty() {
-            return Ok(self.has_blob(&manifest.content_hash)?);
+            return self.has_blob(&manifest.content_hash);
         }
         let extents = self.logical_extents_for_manifest(manifest)?;
         self.extents_readable(&extents)
@@ -3345,7 +3344,7 @@ impl LocalContentStore {
                 Err(error) => Err(error),
             };
         }
-        let extents = self.logical_extents_for_manifest(&manifest)?;
+        let extents = self.logical_extents_for_manifest(manifest)?;
         self.extents_readable(&extents)
     }
 
@@ -5228,9 +5227,9 @@ impl LocalContentStore {
                     extent.content_hash
                 ),
             })?;
-        if !self
+        if self
             .readable_blob_size(&extent.content_hash)?
-            .is_some_and(|size_bytes| required_end <= size_bytes)
+            .is_none_or(|size_bytes| required_end > size_bytes)
         {
             return Err(ContentStoreError::InvalidContentLayout {
                 message: "manifest references missing or truncated content extents".to_string(),

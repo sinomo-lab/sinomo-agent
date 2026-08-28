@@ -823,7 +823,7 @@ mod tests {
         DfsRenewableLeaseAnchor,
     ) {
         let root = sinomo_testdir::TestDir::new(&format!("sinomo-dfs-{name}"));
-        let node_id = NodeId::from_legacy_named(&format!("node_{name}").replace('-', "_"))
+        let node_id = NodeId::from_legacy_named(format!("node_{name}").replace('-', "_"))
             .expect("lease test node id");
         let mut first = open_service(&root, node_id.clone(), "content-a");
         first

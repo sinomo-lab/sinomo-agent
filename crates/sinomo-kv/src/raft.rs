@@ -641,10 +641,9 @@ impl ResidentRaftNodeSlot {
         let started = Instant::now();
         while state.checked_out
             || state.read_loading
-            || !state
+            || state
                 .checkout_waiters
-                .front()
-                .is_some_and(|waiter| waiter.ticket == ticket)
+                .front().is_none_or(|waiter| waiter.ticket != ticket)
         {
             if state.read_loading && !state.read_load_preempt_requested {
                 state.read_load_preempt_requested = true;
@@ -3753,8 +3752,8 @@ pub fn validate_cluster_kv_raft_config_transition(
             ),
         });
     }
-    if let Some(added_voter) = added_voters.first() {
-        if !current
+    if let Some(added_voter) = added_voters.first()
+        && !current
             .learners
             .iter()
             .chain(current.non_voting.iter())
@@ -3766,7 +3765,6 @@ pub fn validate_cluster_kv_raft_config_transition(
                 ),
             });
         }
-    }
     Ok(())
 }
 
@@ -5170,9 +5168,7 @@ where
                             &detail,
                             true,
                         );
-                        if let Err(reconciliation_error) = reconciliation {
-                            return Err(reconciliation_error);
-                        }
+                        reconciliation?;
                         let failure = cluster_kv_authority_failure(
                             state,
                             KvAuthorityFailureReason::Timeout,
@@ -5221,9 +5217,7 @@ where
                         true,
                     );
                     drop(commit_sequence_lock.take());
-                    if let Err(reconciliation_error) = reconciliation {
-                        return Err(reconciliation_error);
-                    }
+                    reconciliation?;
                     return Err(error);
                 }
             }
@@ -5254,9 +5248,7 @@ where
                             || transport_may_have_applied,
                     );
                     drop(commit_sequence_lock.take());
-                    if let Err(reconciliation_error) = reconciliation {
-                        return Err(reconciliation_error);
-                    }
+                    reconciliation?;
                     return Err(error);
                 }
             }
@@ -5453,9 +5445,7 @@ where
             Some(state.local_node_id.clone()),
         );
         drop(commit_sequence_lock.take());
-        if let Err(error) = reconciliation {
-            return Err(error);
-        }
+        reconciliation?;
         for (target, status, latency_ms) in deferred_replication_statuses {
             let _ = host.record_target_replication_status(state, &target, status, latency_ms);
         }
@@ -5769,9 +5759,7 @@ where
                             true,
                         )
                         .await;
-                        if let Err(reconciliation_error) = reconciliation {
-                            return Err(reconciliation_error);
-                        }
+                        reconciliation?;
                         let failure = cluster_kv_authority_failure(
                             state,
                             KvAuthorityFailureReason::Timeout,
@@ -5834,9 +5822,7 @@ where
                     )
                     .await;
                     drop(commit_sequence_lock.take());
-                    if let Err(reconciliation_error) = reconciliation {
-                        return Err(reconciliation_error);
-                    }
+                    reconciliation?;
                     return Err(error);
                 }
             }
@@ -5867,9 +5853,7 @@ where
                     )
                     .await;
                     drop(commit_sequence_lock.take());
-                    if let Err(reconciliation_error) = reconciliation {
-                        return Err(reconciliation_error);
-                    }
+                    reconciliation?;
                     return Err(error);
                 }
             }
@@ -6145,9 +6129,7 @@ where
             Some(state.local_node_id.clone()),
         );
         drop(commit_sequence_lock.take());
-        if let Err(error) = reconciliation {
-            return Err(error);
-        }
+        reconciliation?;
         for (target, status, latency_ms) in deferred_replication_statuses {
             let _ = host
                 .record_target_replication_status_async(state, &target, status, latency_ms)
@@ -7609,9 +7591,8 @@ impl ClusterKvRaftStore {
         // authority leases linearized before this observation and may drain;
         // the raised floor immediately rejects every later authority action.
         // The supervised durable closer owns any blocking wait.
-        if !state
-            .known_durable
-            .is_some_and(|durable| durable.term >= term)
+        if state
+            .known_durable.is_none_or(|durable| durable.term < term)
         {
             state.floor = Some(state.floor.unwrap_or_default().max(term));
         }
@@ -11309,8 +11290,8 @@ impl DurableRaftKvNode {
             None => None,
         };
 
-        if preparation.response.success {
-            if let Err(error) = append_wal_entries(&self.paths.wal, &preparation.appended_entries) {
+        if preparation.response.success
+            && let Err(error) = append_wal_entries(&self.paths.wal, &preparation.appended_entries) {
                 self.restore_after_append_entries_persist_failure(
                     None,
                     hard_state_before,
@@ -11320,7 +11301,6 @@ impl DurableRaftKvNode {
                 );
                 return Err(error);
             }
-        }
         if let Some((commit_index, _)) = &entries_to_apply {
             self.node.hard_state.commit_index = *commit_index;
         }

@@ -336,21 +336,18 @@ pub fn component_factory()
 -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor =
         sinomo_module::component_descriptor_from_registration(&nfs_module_registration())?;
-    Ok(sinomo_module::StaticComponentFactory::new(
-        descriptor,
-        |context, scope| {
-            let runtime = context.runtime().ok_or_else(|| {
-                sinomo_module::ComponentError::RuntimeUnavailable {
+    sinomo_module::StaticComponentFactory::new(descriptor, |context, scope| {
+        let runtime =
+            context
+                .runtime()
+                .ok_or_else(|| sinomo_module::ComponentError::RuntimeUnavailable {
                     component_id: SINOMO_DFS_NFS_MODULE_LEGACY_ID.to_string(),
-                }
-            })?;
-            let data_dir = SinomoDataDir::new(context.data_dir_root());
-            let task =
-                crate::spawn_nfs_mount_supervisor(data_dir, runtime, scope.shutdown_receiver());
-            scope.own_task("NFS mount supervisor", task);
-            Ok(())
-        },
-    )?)
+                })?;
+        let data_dir = SinomoDataDir::new(context.data_dir_root());
+        let task = crate::spawn_nfs_mount_supervisor(data_dir, runtime, scope.shutdown_receiver());
+        scope.own_task("NFS mount supervisor", task);
+        Ok(())
+    })
 }
 
 pub fn nfs_module_enabled(data_dir: &SinomoDataDir) -> Result<bool, String> {

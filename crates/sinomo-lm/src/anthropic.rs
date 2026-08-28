@@ -492,7 +492,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
     }
 
     let items = (!reasoning.trim().is_empty())
-        .then(|| LanguageModelResponseItem::ReasoningSummary { summary: reasoning })
+        .then_some(LanguageModelResponseItem::ReasoningSummary { summary: reasoning })
         .into_iter()
         .collect();
     Ok(LanguageModelResponse {

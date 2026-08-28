@@ -3343,7 +3343,7 @@ impl MountedSifsControlPlaneKvClient {
             payload.category,
             payload.body,
         ));
-        let response = self.call_local_kv_rpc(call, &route, 1024 * 1024)?;
+        let response = self.call_local_kv_rpc(call, route, 1024 * 1024)?;
         let read = sinomo_core::kv::decode_cluster_kv_authoritative_entry_rpc_body(&response.body)?;
         self.ensure_authoritative_revision(read.authority.revision, Some(minimum_revision), key)?;
         if read.value.as_ref().is_some_and(|entry| entry.key != key) {
@@ -3458,7 +3458,7 @@ impl MountedSifsControlPlaneKvClient {
         ));
         let response = self.call_local_kv_rpc(
             call,
-            &route,
+            route,
             sinomo_core::kv::CLUSTER_KV_RANGE_PREFIX_MAX_PAYLOAD_BYTES.saturating_add(1024 * 1024),
         )?;
         let read =

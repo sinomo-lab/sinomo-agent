@@ -425,7 +425,7 @@ pub fn authorize_authenticated_daemon_command(
                     | DaemonSignerAuthority::Member
             )
         }
-        route if route == "/benchmarks/cancel-probe" => {
+        "/benchmarks/cancel-probe" => {
             matches!(
                 authenticated.signer,
                 DaemonSignerAuthority::Local
@@ -630,10 +630,10 @@ fn authorize_daemon_signer(
     {
         return Ok(authority.clone());
     }
-    if !require_exact_member_identity {
-        if let Some(authority) = verifier.members_by_key.get(&envelope_public_key) {
-            return Ok(authority.clone());
-        }
+    if !require_exact_member_identity
+        && let Some(authority) = verifier.members_by_key.get(&envelope_public_key)
+    {
+        return Ok(authority.clone());
     }
 
     if request.route == sinomo_core::network::CLUSTER_JOIN_REGISTER_ROUTE {

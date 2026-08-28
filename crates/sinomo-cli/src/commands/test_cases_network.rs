@@ -871,9 +871,8 @@ fn run_network_ping_with_defaults(
             .checked_add(warmup_job_count)
             .and_then(|jobs| jobs.checked_mul(payload_bytes))
             .unwrap_or(usize::MAX);
-        let maximum_live_payload_bytes = concurrency
-            .checked_mul(payload_bytes.max(response_payload_bytes))
-            .unwrap_or(usize::MAX);
+        let maximum_live_payload_bytes =
+            concurrency.saturating_mul(payload_bytes.max(response_payload_bytes));
         if prepared_payload_bytes > MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES
             || maximum_live_payload_bytes > MAX_PREPARED_EMBEDDED_PAYLOAD_BYTES
         {
@@ -1660,9 +1659,7 @@ fn run_network_endpoint_error_fallback(ctx: &mut SinomoTestContext) -> SinomoTes
         original_connectivity.clone(),
         "restore connectivity after endpoint fallback probe",
     );
-    if let Err(error) = restore_result {
-        return Err(error);
-    }
+    restore_result?;
     let probe_outcome = probe_result?;
     if !matches!(
         probe_outcome.status,
@@ -2033,7 +2030,7 @@ fn endpoint_error_fallback_seed_records(
             record.failure_reason = None;
             record.observed_at = now;
             record.expires_at =
-                now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS as i64);
+                now + time::Duration::seconds(network::CLUSTER_CONNECTIVITY_TTL_SECONDS);
         }
     }
     for endpoint in &target.endpoints {
@@ -3010,7 +3007,7 @@ fn network_ping_runtime_worker_threads(concurrency: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4);
-    available.clamp(2, concurrency.max(2).min(16))
+    available.clamp(2, concurrency.clamp(2, 16))
 }
 
 fn percentile_value(sorted: &[u64], percentile: usize) -> u64 {
@@ -3194,6 +3191,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn network_ping_job_parameters_have_explicit_allocation_bounds() {
         assert!(
             require_at_most(
@@ -3355,7 +3353,7 @@ mod tests {
 
         let findings = network_hygiene_findings(
             &state,
-            &[record],
+            std::slice::from_ref(&record),
             &[],
             &[],
             NetworkHygieneOptions::unscoped(false),
@@ -3398,9 +3396,9 @@ mod tests {
 
         let findings = network_hygiene_findings(
             &state,
-            &[record.clone()],
+            std::slice::from_ref(&record),
             &[],
-            &[record],
+            std::slice::from_ref(&record),
             NetworkHygieneOptions::unscoped(true),
         );
 
@@ -3852,9 +3850,9 @@ mod tests {
 
         let unscoped_findings = network_hygiene_findings(
             &state,
-            &[record.clone()],
+            std::slice::from_ref(&record),
             &[],
-            &[record.clone()],
+            std::slice::from_ref(&record),
             NetworkHygieneOptions::unscoped(true),
         );
         assert!(
@@ -3866,9 +3864,9 @@ mod tests {
 
         let scoped_findings = network_hygiene_findings(
             &state,
-            &[record.clone()],
+            std::slice::from_ref(&record),
             &[],
-            &[record],
+            std::slice::from_ref(&record),
             NetworkHygieneOptions::for_targets(true, [selected]),
         );
 

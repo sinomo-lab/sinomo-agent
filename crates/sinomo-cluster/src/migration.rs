@@ -78,12 +78,12 @@ pub fn plan_cluster_migration_with_host(
     paths.ensure()?;
     let authoritative = host.authoritative_cluster_kv_snapshot(paths, source)?;
     apply_authoritative_migration_members(source, &authoritative.value)?;
-    if cluster_state_needs_join_registration(&source) {
+    if cluster_state_needs_join_registration(source) {
         return Err(migration_error(
             "local cluster state is an incomplete legacy join; run `sinomo cluster join <invite>` again for a fresh one-shot attempt or `sinomo cluster leave` to discard it",
         ));
     }
-    if mode == ClusterMigrationMode::SingleNode && !cluster_is_settled_solo(&source) {
+    if mode == ClusterMigrationMode::SingleNode && !cluster_is_settled_solo(source) {
         return Err(migration_error(
             "single-node migration requires a settled source cluster with no remote peers; use `--mode cluster-merge` to plan a cluster merge",
         ));
@@ -115,7 +115,7 @@ pub fn plan_cluster_migration_with_host(
         .iter()
         .filter(|member| {
             !matches!(member.state, ClusterMemberState::Removed)
-                && !cluster_member_is_local_process(&source, member)
+                && !cluster_member_is_local_process(source, member)
         })
         .count();
     let migration = ClusterMigrationRecord {

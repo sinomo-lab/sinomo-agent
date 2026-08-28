@@ -872,7 +872,7 @@ where
             self.missing.len(),
         )?;
         if let Some(last) = self.missing.last()
-            && expected % 64 != 0
+            && !expected.is_multiple_of(64)
             && *last >> (expected % 64) != 0
         {
             return Err(DfsNamespacePrepareCodecError::NonCanonicalSparseRows {

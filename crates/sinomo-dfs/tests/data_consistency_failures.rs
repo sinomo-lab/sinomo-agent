@@ -75,7 +75,13 @@ fn coordinator_stays_awaiting_receipts_until_metadata_commit_applies() {
         DfsWriteIntentState::Committed,
         "coordinator should commit only after metadata apply"
     );
-    assert_consistent_committed_object(owner_dfs, &object_id, &version_2, bytes, &[owner.clone()]);
+    assert_consistent_committed_object(
+        owner_dfs,
+        &object_id,
+        &version_2,
+        bytes,
+        std::slice::from_ref(&owner),
+    );
 
     cleanup(&root);
 }
@@ -228,7 +234,13 @@ fn restart_hydration_restores_backend_visible_version_without_fake_receipts() {
     )
     .expect("hydrate");
 
-    assert_consistent_committed_object(&recovered, &object_id, &version_2, bytes, &[owner.clone()]);
+    assert_consistent_committed_object(
+        &recovered,
+        &object_id,
+        &version_2,
+        bytes,
+        std::slice::from_ref(&owner),
+    );
     let backend_receipts = recovered
         .metadata_backend()
         .expect("backend")
@@ -339,7 +351,7 @@ fn stale_base_version_write_is_rejected_without_metadata_advance() {
     let version_3 = version("version_3");
     let root = temp_root("stale_base");
 
-    let mut fixture = ClusterFixture::new(&root, &[owner.clone()]);
+    let mut fixture = ClusterFixture::new(&root, std::slice::from_ref(&owner));
     fixture.seed_replicated_object(
         &owner,
         object_id.clone(),
@@ -393,7 +405,7 @@ fn stale_base_version_write_is_rejected_without_metadata_advance() {
         &object_id,
         &version_2,
         b"current write",
-        &[owner.clone()],
+        std::slice::from_ref(&owner),
     );
 
     cleanup(&root);

@@ -2859,7 +2859,7 @@ pub fn join_channel_endpoint_for_accepted_state(
         member.state.is_authorized()
             && (member.display_name == host
                 || member.endpoints.iter().any(|candidate| {
-                    cluster_endpoint_address_host(&candidate.address).as_deref() == Some(host)
+                    cluster_endpoint_address_host(&candidate.address) == Some(host)
                 }))
     });
     let node_id = member

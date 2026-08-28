@@ -787,7 +787,7 @@ mod tests {
 
     fn endpoint(node_id: &NodeId, priority: u16, latency: Option<u32>) -> ClusterEndpointRecord {
         ClusterEndpointRecord {
-            endpoint_id: sinomo_base::Id::from_legacy_named(&format!("ep_{node_id}_{priority}"))
+            endpoint_id: sinomo_base::Id::from_legacy_named(format!("ep_{node_id}_{priority}"))
                 .expect("endpoint id"),
             node_id: node_id.clone(),
             transport: sinomo_base::ClusterTransportKind::LanTcp,

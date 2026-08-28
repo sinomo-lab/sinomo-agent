@@ -614,10 +614,10 @@ fn submit_tui_input<H: TuiAgentRuntimeControl>(
         let mut render_error = None;
         let mut emit = |output: InteractionOutput| {
             state.apply_output(output);
-            if render_error.is_none() {
-                if let Err(error) = terminal.draw(state) {
-                    render_error = Some(error);
-                }
+            if render_error.is_none()
+                && let Err(error) = terminal.draw(state)
+            {
+                render_error = Some(error);
             }
         };
         let outputs = runtime.ingest_user_input_with_item_id_and_context_attachments_streaming(
@@ -1102,7 +1102,7 @@ impl TuiSessionStore {
                 sessions.push(record);
             }
         }
-        sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
         Ok(sessions)
     }
 }
@@ -5067,10 +5067,7 @@ fn tui_message_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(display_prefix, selected_style.unwrap_or(style)),
-                Span::styled(
-                    text.to_string(),
-                    selected_style.unwrap_or_else(Style::default),
-                ),
+                Span::styled(text.to_string(), selected_style.unwrap_or_default()),
             ]));
             transcript_line_index += 1;
         }
@@ -6212,8 +6209,8 @@ mod tui_tests {
             .map(TuiSettingsEntry::key)
             .collect::<Vec<_>>();
 
-        assert!(keys.iter().any(|key| *key == "rollout.telemetry.gates"));
-        assert!(keys.iter().any(|key| *key == "lm.providers"));
+        assert!(keys.contains(&"rollout.telemetry.gates"));
+        assert!(keys.contains(&"lm.providers"));
         assert!(
             !keys.iter().any(|key| key.starts_with("lm.credentials.")),
             "provider credentials are account data in lm.providers, not catalog entries"
@@ -8939,27 +8936,25 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         if agent_definition_has_coding_authority(&definition)
             && candidate.workspace_binding.is_none()
             && workspaces.is_none()
+            && let Some(workspace_root) = self.workspace_root.as_ref()
         {
-            if let Some(workspace_root) = self.workspace_root.as_ref() {
-                let metadata =
-                    std::fs::metadata(workspace_root).map_err(|source| CliError::Io {
-                        path: workspace_root.display().to_string(),
-                        detail: format!("workspace directory is unavailable: {source}"),
-                    })?;
-                if !metadata.is_dir() {
-                    return Err(CliError::Parse {
-                        detail: format!(
-                            "workspace path is not a directory: {}",
-                            workspace_root.display()
-                        ),
-                    });
-                }
-                candidate.workspace_binding = Some(
-                    coding_agent_workspace_binding(data_dir, workspace_root)?
-                        .binding()
-                        .clone(),
-                );
+            let metadata = std::fs::metadata(workspace_root).map_err(|source| CliError::Io {
+                path: workspace_root.display().to_string(),
+                detail: format!("workspace directory is unavailable: {source}"),
+            })?;
+            if !metadata.is_dir() {
+                return Err(CliError::Parse {
+                    detail: format!(
+                        "workspace path is not a directory: {}",
+                        workspace_root.display()
+                    ),
+                });
             }
+            candidate.workspace_binding = Some(
+                coding_agent_workspace_binding(data_dir, workspace_root)?
+                    .binding()
+                    .clone(),
+            );
         }
 
         let store = FileAgentSessionStore::for_data_dir(data_dir);
@@ -9978,14 +9973,10 @@ where
             .unwrap_or_default();
         let mut context_attachments = match event.payload.get("context_attachments") {
             Some(value) => {
-                let attachments =
-                    serde_json::from_value::<Vec<sinomo_agent::AgentContextAttachment>>(
-                        value.clone(),
-                    )
+                serde_json::from_value::<Vec<sinomo_agent::AgentContextAttachment>>(value.clone())
                     .map_err(|source| CliError::Parse {
-                        detail: format!("parse context attachments failed: {source}"),
-                    })?;
-                attachments
+                    detail: format!("parse context attachments failed: {source}"),
+                })?
             }
             None => Vec::new(),
         };

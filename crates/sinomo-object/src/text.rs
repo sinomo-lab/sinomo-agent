@@ -606,10 +606,10 @@ impl<'a> Parser<'a> {
             Some(try_box(self.parse_value()?, "text optional inner value")?)
         };
         self.expect_char(')')?;
-        if let Some(value) = value.as_deref() {
-            if !value_matches_element_type(value, &element_type) {
-                return Err(self.error("optional value does not match declared element type"));
-            }
+        if let Some(value) = value.as_deref()
+            && !value_matches_element_type(value, &element_type)
+        {
+            return Err(self.error("optional value does not match declared element type"));
         }
         Ok(OptionalValue {
             element_type,

@@ -31,6 +31,10 @@ pub use crate::stream_serde::from_chunk_iter_with_options;
 pub trait SobjOutput {
     fn len(&self) -> usize;
 
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     fn append(&mut self, bytes: &[u8], context: &'static str) -> Result<()>;
 
     fn patch(&mut self, offset: usize, bytes: &[u8]) -> Result<()>;

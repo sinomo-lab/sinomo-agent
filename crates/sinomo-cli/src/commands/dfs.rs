@@ -1820,15 +1820,15 @@ fn run_dfs_metadata_shard_transfer_primary(
             ),
         })?;
 
-    if let Some(expected_epoch) = options.expected_epoch {
-        if previous.epoch != expected_epoch {
-            return Err(CliError::ClusterReadOnly {
-                detail: format!(
-                    "DFS metadata shard {} epoch is {}, expected {}",
-                    options.shard_id, previous.epoch, expected_epoch
-                ),
-            });
-        }
+    if let Some(expected_epoch) = options.expected_epoch
+        && previous.epoch != expected_epoch
+    {
+        return Err(CliError::ClusterReadOnly {
+            detail: format!(
+                "DFS metadata shard {} epoch is {}, expected {}",
+                options.shard_id, previous.epoch, expected_epoch
+            ),
+        });
     }
 
     if previous.primary_node_id == options.new_primary_node_id {
@@ -3119,7 +3119,7 @@ fn parse_linux_mountinfo_for_path(contents: &str, path: &Path) -> Option<LinuxMo
         let fields = line.split_whitespace().collect::<Vec<_>>();
         let separator = fields.iter().position(|field| *field == "-")?;
         if separator + 2 >= fields.len()
-            || decode_linux_mountinfo_path(*fields.get(4)?)?.as_path() != path
+            || decode_linux_mountinfo_path(fields.get(4)?)?.as_path() != path
         {
             return None;
         }

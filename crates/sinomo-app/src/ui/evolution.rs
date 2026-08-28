@@ -1027,7 +1027,7 @@ impl EvolutionStarterObjective {
 
 fn parse_scope_paths(value: &str) -> Vec<String> {
     value
-        .split(|ch: char| ch == ',' || ch == '\n' || ch == ';')
+        .split([',', '\n', ';'])
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
@@ -2502,7 +2502,7 @@ fn starter_action_rects(bounds: Rect) -> [Rect; STARTER_ACTION_COUNT] {
             x += width + STARTER_ACTION_GAP;
         }
     } else {
-        let width = bounds.width().min(220.0).max(0.0);
+        let width = bounds.width().clamp(0.0, 220.0);
         let x = bounds.x() + (bounds.width() - width).max(0.0) / 2.0;
         for (index, _) in EvolutionStarterObjective::ALL.iter().enumerate() {
             rects[index] = Rect::new(

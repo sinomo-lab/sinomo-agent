@@ -5,7 +5,7 @@ use sinomo_base::Id;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 
-fn serialize_network_bytes<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_network_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {

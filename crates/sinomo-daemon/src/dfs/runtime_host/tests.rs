@@ -1897,7 +1897,7 @@ fn metadata_publish_planning_does_not_hold_admission_while_shard_is_borrowed() {
         default_policy: DfsObjectPolicy::ReplicatedEventual,
     };
     let resident = sinomo_dfs::LocalShardedMetadataBackend::new(
-        &root.path().join("metadata"),
+        root.path().join("metadata"),
         vec![shard_config],
     )
     .expect("resident metadata backend")
@@ -3033,6 +3033,7 @@ fn daemon_dfs_blocking_task_retains_admission_after_rpc_cancellation() {
 }
 
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
     let explicit_recovery = daemon_dfs_explicit_disaster_recovery_tick_options(true, true);
     assert_eq!(
@@ -3056,7 +3057,7 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
         explicit_recovery.lifecycle.tombstone_compaction_max_records,
         DAEMON_DFS_TOMBSTONE_COMPACTION_MAX_RECORDS
     );
-    let lifecycle = explicit_recovery.lifecycle.clone();
+    let lifecycle = explicit_recovery.lifecycle;
     assert!(lifecycle.collect_metadata_history);
     assert_eq!(
         lifecycle.metadata_history_gc_min_age,
@@ -3377,11 +3378,13 @@ fn daemon_dfs_content_gc_projection_requires_complete_catalog_coverage() {
     default_dfs_content_root_catalog_store(&content_root)
         .install_test_catalog_at(complete_catalog.clone(), generated_at_unix_nanos)
         .expect("install complete catalog");
-    let mut lifecycle = DfsMaintenanceRunOptions::default();
-    lifecycle.content_version_gc_min_age = Duration::ZERO;
-    lifecycle.content_version_gc_keep_latest_versions = 1;
-    lifecycle.content_orphan_gc_min_age = Duration::ZERO;
-    lifecycle.content_root_catalog_max_age = Duration::from_secs(60);
+    let lifecycle = DfsMaintenanceRunOptions {
+        content_version_gc_min_age: Duration::ZERO,
+        content_version_gc_keep_latest_versions: 1,
+        content_orphan_gc_min_age: Duration::ZERO,
+        content_root_catalog_max_age: Duration::from_secs(60),
+        ..DfsMaintenanceRunOptions::default()
+    };
     let complete = daemon_dfs_content_gc_projection(
         &data_dir,
         &cluster_paths,

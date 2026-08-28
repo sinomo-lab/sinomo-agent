@@ -1268,11 +1268,10 @@ pub fn cluster_kv_watch_events(paths: &ClusterKvPaths) -> Result<Vec<KvEvent>, K
 #[cfg(any(test, feature = "test-support"))]
 fn cluster_kv_watch_events_arc(paths: &ClusterKvPaths) -> Result<Arc<Vec<KvEvent>>, KvError> {
     let cache_marks = cluster_kv_watch_event_cache_marks(paths);
-    if let Some((checkpoint_mark, log_mark)) = cache_marks {
-        if let Some(events) = cached_cluster_kv_watch_events_arc(paths, checkpoint_mark, log_mark) {
+    if let Some((checkpoint_mark, log_mark)) = cache_marks
+        && let Some(events) = cached_cluster_kv_watch_events_arc(paths, checkpoint_mark, log_mark) {
             return Ok(events);
         }
-    }
     let read = crate::read_cluster_kv_watch_events_with_observer(paths, |read| {
         observe_cluster_kv_watch_event_log_read(paths, read)
     });

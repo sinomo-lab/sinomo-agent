@@ -969,14 +969,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }
             }
             DfsNamespaceOperation::Rename { from, to }
-            | DfsNamespaceOperation::ConditionalRename { from, to, .. } => {
+            | DfsNamespaceOperation::ConditionalRename { from, to, .. }
                 if self.resume_or_replay_hardlink_alias_mutation_for_active_request(
                     &sifs_file_system_id(),
                     from,
                     to,
-                )? {
-                    return Ok(());
-                }
+                )? =>
+            {
+                return Ok(());
             }
             _ => {}
         }
@@ -998,15 +998,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNamespaceOperation::Hardlink {
                 existing_path,
                 link_path,
-            } => {
-                if self.resume_running_cross_shard_namespace_job_for_paths(
-                    &sifs_file_system_id(),
-                    existing_path,
-                    link_path,
-                    &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
-                )? {
-                    return Ok(());
-                }
+            } if self.resume_running_cross_shard_namespace_job_for_paths(
+                &sifs_file_system_id(),
+                existing_path,
+                link_path,
+                &[DfsNamespaceJobKind::HardlinkAcrossShardPrimaries],
+            )? =>
+            {
+                return Ok(());
             }
             _ => {}
         }

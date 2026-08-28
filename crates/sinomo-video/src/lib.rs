@@ -339,19 +339,16 @@ fn convert_nv12_to_rgba(sample: &NativeVideoSample) -> Result<Vec<u8>, NativeVid
     for y in 0..sample.height as usize {
         let y_row = &y_data[y * y_stride..(y + 1) * y_stride];
         let uv_row = &uv_data[(y / 2) * uv_stride..(y / 2 + 1) * uv_stride];
-        for x in 0..sample.width as usize {
+        for (x, &luma) in y_row.iter().enumerate().take(sample.width as usize) {
             let uv_offset = (x / 2) * 2;
-            let [red, green, blue] = yuv_to_rgb(y_row[x], uv_row[uv_offset], uv_row[uv_offset + 1]);
+            let [red, green, blue] = yuv_to_rgb(luma, uv_row[uv_offset], uv_row[uv_offset + 1]);
             rgba.extend_from_slice(&[red, green, blue, 255]);
         }
     }
     Ok(rgba)
 }
 
-fn sample_plane_data<'a>(
-    sample: &'a NativeVideoSample,
-    index: usize,
-) -> Result<&'a [u8], NativeVideoError> {
+fn sample_plane_data(sample: &NativeVideoSample, index: usize) -> Result<&[u8], NativeVideoError> {
     sample
         .plane_data(index)
         .ok_or_else(|| NativeVideoError::InvalidSample {

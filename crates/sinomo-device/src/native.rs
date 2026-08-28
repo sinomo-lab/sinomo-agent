@@ -46,6 +46,7 @@ const MICROPHONE_CAPTURE_QUEUE_CAPACITY: usize = 4;
 #[cfg(feature = "native-devices")]
 const CAMERA_WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 #[cfg(any(feature = "native-devices", test))]
+#[cfg(feature = "native-devices")]
 const MAX_CONSECUTIVE_CAMERA_SAMPLE_FAILURES: u8 = 3;
 #[cfg(feature = "native-devices")]
 const SPEAKER_QUEUE_MAX_LATENCY_MS: u64 = 1_000;
@@ -256,15 +257,9 @@ pub struct NativeRawAudioChunk {
     pub audio: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct NativeSpeakerPlaybackConfig {
     pub device: Option<String>,
-}
-
-impl Default for NativeSpeakerPlaybackConfig {
-    fn default() -> Self {
-        Self { device: None }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -954,7 +949,7 @@ fn native_video_duration_ns(frame_rate_hz: u32) -> u64 {
     1_000_000_000_u64 / u64::from(frame_rate_hz.max(1))
 }
 
-#[cfg(any(feature = "native-devices", test))]
+#[cfg(feature = "native-devices")]
 fn camera_sample_failure_is_terminal(failures: &mut u8) -> bool {
     *failures = failures.saturating_add(1);
     *failures >= MAX_CONSECUTIVE_CAMERA_SAMPLE_FAILURES

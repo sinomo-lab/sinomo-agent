@@ -64,6 +64,7 @@ pub fn try_acquire_sandbox_local_execution_lease(
     let path = locks_root.join(format!("{}.lock", sandbox_id.as_str()));
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&path)
@@ -570,21 +571,21 @@ pub fn recover_sandbox_local_execution_journal_with_lease(
             write_sandbox_local_execution_journal(store, lease, &journal)?;
             return Err(error);
         }
-        if let Some(command_record) = journal.pending_command_record.as_ref() {
-            if let Err(error) = record_local_command_history(
+        if let Some(command_record) = journal.pending_command_record.as_ref()
+            && let Err(error) = record_local_command_history(
                 store,
                 &journal.sandbox_id,
                 &command_record.command_id,
                 command_record.completed_at.unwrap_or(journal.updated_at),
-            ) {
-                journal.record_cleanup_failure(
-                    SandboxLocalExecutionCleanupStage::CommandHistory,
-                    error.to_string(),
-                    now,
-                );
-                write_sandbox_local_execution_journal(store, lease, &journal)?;
-                return Err(error);
-            }
+            )
+        {
+            journal.record_cleanup_failure(
+                SandboxLocalExecutionCleanupStage::CommandHistory,
+                error.to_string(),
+                now,
+            );
+            write_sandbox_local_execution_journal(store, lease, &journal)?;
+            return Err(error);
         }
         journal.mark_audit_completed(now);
         write_sandbox_local_execution_journal(store, lease, &journal)?;
@@ -770,8 +771,8 @@ fn spawn_bounded_external_reader<R: Read + Send + 'static>(
 #[cfg(target_os = "linux")]
 fn linux_process_start_time_ticks(process_id: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
-    let fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
-    fields.skip(19).next()?.parse().ok()
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_whitespace();
+    fields.nth(19)?.parse().ok()
 }
 
 #[cfg(target_os = "linux")]

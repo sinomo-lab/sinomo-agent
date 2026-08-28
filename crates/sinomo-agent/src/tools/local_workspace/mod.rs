@@ -1588,8 +1588,10 @@ fn sandbox_store_failure(
 }
 
 fn agent_sandbox_policy(manifest: &SandboxInstanceManifest) -> SandboxPolicy {
-    let mut policy = SandboxPolicy::default();
-    policy.allow_read_write_sifs_mounts = true;
+    let mut policy = SandboxPolicy {
+        allow_read_write_sifs_mounts: true,
+        ..SandboxPolicy::default()
+    };
     if !policy
         .allowed_mount_prefixes
         .iter()
@@ -2408,13 +2410,13 @@ fn path_is_in_workspace_grants(
 }
 
 fn display_workspace_path(config: &LocalWorkspaceAgentConfig, path: &Path) -> String {
-    if let Ok(root) = canonical_workspace_root(config) {
-        if let Ok(relative) = path.strip_prefix(root) {
-            if relative.as_os_str().is_empty() {
-                return ".".to_string();
-            }
-            return relative.display().to_string();
+    if let Ok(root) = canonical_workspace_root(config)
+        && let Ok(relative) = path.strip_prefix(root)
+    {
+        if relative.as_os_str().is_empty() {
+            return ".".to_string();
         }
+        return relative.display().to_string();
     }
     path.display().to_string()
 }
@@ -3114,7 +3116,7 @@ mod tests {
 
         assert_eq!(
             config_a.agent_home_sifs_path.as_deref(),
-            Some(agent_home_sifs_path_for_id(&agent_id).as_str())
+            Some(agent_home_sifs_path_for_id(agent_id).as_str())
         );
         assert_eq!(
             agent_home_live_host_path(&config_a),

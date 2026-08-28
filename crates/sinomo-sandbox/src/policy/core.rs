@@ -686,17 +686,9 @@ fn command_declares_child_process_capability(command: &SandboxToolchainCommand) 
     })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct SandboxClusterPolicyConfig {
     pub policy: SandboxPolicy,
-}
-
-impl Default for SandboxClusterPolicyConfig {
-    fn default() -> Self {
-        Self {
-            policy: SandboxPolicy::default(),
-        }
-    }
 }
 
 pub fn sandbox_policy_config_schema() -> sinomo_config::ConfigSchema {

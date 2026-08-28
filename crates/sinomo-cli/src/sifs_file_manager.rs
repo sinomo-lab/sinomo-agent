@@ -567,9 +567,9 @@ impl SifsFileManagerBackend {
         let now = Instant::now();
         if operation_deadline.is_some() {
             let needs_refresh = match self.peer_targets_refreshed_at.try_lock() {
-                Ok(refreshed_at) => !refreshed_at
+                Ok(refreshed_at) => refreshed_at
                     .as_ref()
-                    .is_some_and(|last| now.duration_since(*last) < SIFS_PEER_TARGET_REFRESH_TTL),
+                    .is_none_or(|last| now.duration_since(*last) >= SIFS_PEER_TARGET_REFRESH_TTL),
                 Err(_) => false,
             };
             if !needs_refresh {
@@ -606,10 +606,10 @@ impl SifsFileManagerBackend {
         if !cluster_paths.state.exists() {
             return false;
         }
-        if let Some(deadline) = operation_deadline {
-            if sifs_operation_remaining(Some(deadline), "refreshing SIFS peer targets").is_err() {
-                return false;
-            }
+        if let Some(deadline) = operation_deadline
+            && sifs_operation_remaining(Some(deadline), "refreshing SIFS peer targets").is_err()
+        {
+            return false;
         }
         // Peer discovery is an observational hot path. The daemon already
         // projects committed membership into the durable bootstrap state; a
@@ -1780,13 +1780,13 @@ impl SifsFileManagerBackend {
             .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
             .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))?
             .ok_or_else(|| format!("no SIFS metadata shard controls {path}"))?;
-        if let Some(expected_epoch) = expected_epoch {
-            if previous.epoch != expected_epoch {
-                return Err(format!(
-                    "SIFS metadata shard {} epoch is {}, expected {}",
-                    previous.shard_id, previous.epoch, expected_epoch
-                ));
-            }
+        if let Some(expected_epoch) = expected_epoch
+            && previous.epoch != expected_epoch
+        {
+            return Err(format!(
+                "SIFS metadata shard {} epoch is {}, expected {}",
+                previous.shard_id, previous.epoch, expected_epoch
+            ));
         }
         if previous.primary_node_id == local_node_id {
             return Ok(SifsMetadataPrimaryTransferReport {
@@ -3802,14 +3802,13 @@ impl SifsControlPlaneKvClient {
             .snapshot
             .lock()
             .map_err(|_| self.kv_error("SIFS snapshot cache lock is poisoned"))?;
-        if let Some(snapshot) = snapshot {
-            if cache
+        if let Some(snapshot) = snapshot
+            && cache
                 .snapshot
                 .as_ref()
                 .is_none_or(|cached| cached.revision <= snapshot.revision)
-            {
-                cache.snapshot = Some(snapshot);
-            }
+        {
+            cache.snapshot = Some(snapshot);
         }
         cache.loaded = true;
         Ok(())
@@ -4578,7 +4577,7 @@ fn choose_sifs_remote_replica_candidate(
     routable_node_ids: &BTreeSet<NodeId>,
 ) -> Option<NodeId> {
     content_node_ids
-        .sort_by_key(|node_id| sifs_replica_candidate_rank(&graph, local_node_id, node_id));
+        .sort_by_key(|node_id| sifs_replica_candidate_rank(graph, local_node_id, node_id));
     content_node_ids.into_iter().find(|node_id| {
         node_id != local_node_id
             && routable_node_ids.contains(node_id)
@@ -7937,7 +7936,6 @@ mod tests {
                 .compare_and_put_placement_update(&base, &desired, &job)
                 .expect("activity Apply")
         );
-        drop(store);
         sinomo_runtime::kv::write_cluster_kv_snapshot(
             &cluster_paths.kv_paths(),
             &kv.try_snapshot().expect("activity KV snapshot"),

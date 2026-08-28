@@ -592,7 +592,7 @@ mod tests {
             request_id: txn_response.request_id.clone(),
             command_digest: txn_response.command_digest,
             txn_response: txn_response.txn_response.clone(),
-            authority: txn_response.authority.clone(),
+            authority: txn_response.authority,
             replayed_committed_request: txn_response.replayed_committed_request,
         })
         .expect("encode pre-submitted-digest response");
@@ -610,7 +610,7 @@ mod tests {
                 request_id: txn_response.request_id.clone(),
                 command_digest: txn_response.command_digest,
                 txn_response: txn_response.txn_response.clone(),
-                authority: txn_response.authority.clone(),
+                authority: txn_response.authority,
                 replayed_committed_request: txn_response.replayed_committed_request,
             },
             "old nodes must ignore the added response field during a rolling upgrade"
@@ -859,7 +859,7 @@ mod tests {
                     voter_acks: 1,
                     required_quorum: 2,
                 },
-                ..authoritative.authority.clone()
+                ..authoritative.authority
             },
         };
         let invalid_body =
@@ -9823,7 +9823,7 @@ mod tests {
                     term: 1,
                     commit_index: 7,
                     revision: KvRevision(1),
-                    basis: basis.clone(),
+                    basis,
                 },
                 replayed_committed_request,
             };

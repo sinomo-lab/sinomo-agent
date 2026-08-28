@@ -985,7 +985,7 @@ fn scheduled_iteration_prepares_dry_run_agent_handoff_from_approved_campaign() {
 
     assert_eq!(plan.campaign_id, campaign.campaign_id);
     assert_eq!(plan.task.task_id, task_id);
-    assert_eq!(plan.evolution_request.dry_run, true);
+    assert!(plan.evolution_request.dry_run);
     assert!(plan.evolution_request.objective.contains("Campaign"));
     assert!(
         plan.evolution_request

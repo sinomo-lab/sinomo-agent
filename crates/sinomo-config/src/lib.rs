@@ -1301,11 +1301,11 @@ fn write_config(
             let _ = cluster.ok_or_else(|| ConfigError::ClusterUnavailable {
                 key: definition.key.to_string(),
             })?;
-            return Err(ConfigError::WriteTargetUnavailable {
+            Err(ConfigError::WriteTargetUnavailable {
                 key: definition.key.to_string(),
                 target,
                 detail: "cluster config writes require the async config service path".to_string(),
-            });
+            })
         }
         ConfigWriteTarget::Auto => unreachable!("auto target resolved above"),
     }

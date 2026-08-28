@@ -2570,10 +2570,10 @@ impl LocalShardedMetadataBackend {
     }
 
     fn shard_id_for_object(&self, object_id: &DfsObjectId) -> Result<Option<DfsMetadataShardId>> {
-        if let Some(index) = self.read_object_shard_index(object_id)? {
-            if self.object_shard_index_is_corroborated(object_id, &index)? {
-                return Ok(Some(index.shard_id));
-            }
+        if let Some(index) = self.read_object_shard_index(object_id)?
+            && self.object_shard_index_is_corroborated(object_id, &index)?
+        {
+            return Ok(Some(index.shard_id));
         }
         // The object-to-shard record is a rebuildable accelerator. A replica
         // may have no record or may retain the source shard after ingesting a
@@ -4447,15 +4447,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         let object = self
             .shard_backend(&shard_id)?
             .get_object_by_path(file_system_id, path)?;
-        if let Some(object) = object {
-            if self.object_is_visible_from_shard(&object, &shard_id)? {
-                return Ok(Some(object));
-            }
-            // A non-authoritative physical row on the currently selected
-            // shard does not suppress a live fallback. In particular, a
-            // source-eviction marker may become path-selected after a later
-            // topology change, but it remains storage-only evidence.
+        if let Some(object) = object
+            && self.object_is_visible_from_shard(&object, &shard_id)?
+        {
+            return Ok(Some(object));
         }
+        // A non-authoritative physical row on the currently selected
+        // shard does not suppress a live fallback. In particular, a
+        // source-eviction marker may become path-selected after a later
+        // topology change, but it remains storage-only evidence.
         for fallback_shard_id in
             self.fallback_shard_ids_for_path(file_system_id, path, &shard_id)?
         {

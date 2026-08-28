@@ -254,9 +254,11 @@ pub fn observe_metrics_interval_delta(
     let same_process = previous.process_started_at.is_none()
         || current.process_started_at.is_none()
         || previous.process_started_at == current.process_started_at;
-    let previous_metrics = same_process
-        .then_some(previous.metrics.as_slice())
-        .unwrap_or_default();
+    let previous_metrics = if same_process {
+        previous.metrics.as_slice()
+    } else {
+        Default::default()
+    };
     let mut delta = current.clone();
     delta.metrics = observe_metric_records_interval_delta(previous_metrics, &current.metrics);
     delta
@@ -596,7 +598,7 @@ fn init_observe_runtime_inner(
         .map_err(|source| ObserveError::Runtime {
             detail: format!("failed to initialize observe tracing subscriber: {source}"),
         })
-        .or_else(|_| Ok(()))
+        .or(Ok(()))
 }
 
 pub fn update_observe_control(
@@ -758,25 +760,25 @@ pub fn update_observe_control(
     if let Some(restore_filter) = restore_filter {
         runtime.install_filter_state(restore_filter)?;
     }
-    if let Some((capture_id, expires_at)) = capture_expiry {
-        if let Err(error) = runtime.schedule_capture_expiry(capture_id.clone(), expires_at) {
-            let restore_filter = runtime
-                .capture
-                .lock()
-                .ok()
-                .and_then(|mut capture| {
-                    (capture
-                        .as_ref()
-                        .is_some_and(|capture| capture.id == capture_id))
-                    .then(|| capture.take())
-                    .flatten()
-                })
-                .and_then(|capture| capture.restore_filter);
-            if let Some(restore_filter) = restore_filter {
-                runtime.install_filter_state(restore_filter)?;
-            }
-            return Err(error);
+    if let Some((capture_id, expires_at)) = capture_expiry
+        && let Err(error) = runtime.schedule_capture_expiry(capture_id.clone(), expires_at)
+    {
+        let restore_filter = runtime
+            .capture
+            .lock()
+            .ok()
+            .and_then(|mut capture| {
+                (capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.id == capture_id))
+                .then(|| capture.take())
+                .flatten()
+            })
+            .and_then(|capture| capture.restore_filter);
+        if let Some(restore_filter) = restore_filter {
+            runtime.install_filter_state(restore_filter)?;
         }
+        return Err(error);
     }
     Ok(runtime.control_snapshot(true, cleared_trace_count))
 }

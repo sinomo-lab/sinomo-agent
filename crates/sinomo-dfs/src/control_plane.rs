@@ -1886,10 +1886,10 @@ impl<'a> DfsControlPlaneStore<'a> {
         let record = entry.decode::<DfsPlacementAuthorityPermitRecord>()?;
         if record.holder_cluster_id.as_deref() != Some(current_process.cluster_id.as_str())
             || record.holder_node_id.as_ref() != Some(local_node_id)
-            || !record
+            || record
                 .holder_session_id
                 .as_deref()
-                .is_some_and(|session_id| session_id != current_process.process_session_id)
+                .is_none_or(|session_id| session_id == current_process.process_session_id)
         {
             return Ok(false);
         }
@@ -2092,9 +2092,11 @@ impl<'a> DfsControlPlaneStore<'a> {
             // Do not scan terminal history to migrate it on an operator read;
             // seed bounded state as jobs are next created or advanced and keep
             // the compatibility gap explicit on every page.
-            let mut index = DfsPlacementReconciliationActivityIndex::default();
-            index.partial = true;
-            index.history_truncated = true;
+            let index = DfsPlacementReconciliationActivityIndex {
+                partial: true,
+                history_truncated: true,
+                ..DfsPlacementReconciliationActivityIndex::default()
+            };
             return Ok((None, index));
         };
         let index = entry.decode::<DfsPlacementReconciliationActivityIndex>()?;
@@ -6382,7 +6384,6 @@ mod tests {
                 },
             )
             .expect("inject stale queue ids");
-        drop(store);
         let mut kv = RejectPlacementHistoryRangeKv { inner: kv };
         let mut store = DfsControlPlaneStore::new(&mut kv);
         assert_eq!(
@@ -6486,7 +6487,6 @@ mod tests {
             .placement_reconciliation(&file_system_id, &job.job_id)
             .expect("durable job read")
             .expect("durable job");
-        drop(store);
 
         // Model an older v1 daemon: it knows the full job and active queue but
         // not the compact activity record introduced by this change.
@@ -6585,8 +6585,10 @@ mod tests {
         let file_system_id = file_system_id();
         let owner = node("placement-activity-cap-owner");
         let mut kv = InProcessKvStore::new();
-        let mut index = DfsPlacementReconciliationActivityIndex::default();
-        index.history_truncated = true;
+        let mut index = DfsPlacementReconciliationActivityIndex {
+            history_truncated: true,
+            ..DfsPlacementReconciliationActivityIndex::default()
+        };
 
         for offset in 0..MAX_RECENT_PLACEMENT_RECONCILIATION_ACTIVITIES {
             let mut job = placement_authority_test_job(
@@ -7289,7 +7291,6 @@ mod tests {
             .expect("permit");
         let permit_record = permit.record.clone();
 
-        drop(store);
         client.remaining_delete_failures = 1;
         let mut store = DfsControlPlaneStore::new(&mut client);
         assert!(matches!(
@@ -7304,7 +7305,6 @@ mod tests {
         // Model the maintenance tick's ephemeral store and service being
         // destroyed after release exhaustion. The process-wide exact handle
         // remains recoverable by a new store instance.
-        drop(store);
         drop(permit);
         let mut store = DfsControlPlaneStore::new(&mut client);
         let mut republished = accepted.clone();
@@ -7357,7 +7357,6 @@ mod tests {
             .placement_reconciliation(&base.file_system_id, &job.job_id)
             .expect("job read")
             .expect("durable job");
-        drop(store);
 
         client.apply_acquisition_then_fail = true;
         let mut store = DfsControlPlaneStore::new(&mut client);
@@ -7370,7 +7369,6 @@ mod tests {
             ),
             Err(KvError::Io { detail, .. }) if detail.contains("ambiguous permit acquisition")
         ));
-        drop(store);
         let permit_record = client
             .inner
             .get(&placement_authority_permit_key(&base.file_system_id))
@@ -7591,7 +7589,6 @@ mod tests {
                 )
                 .expect("stale recovery compare")
         );
-        drop(store);
         assert_eq!(
             client
                 .authoritative
@@ -7941,7 +7938,6 @@ mod tests {
                 .expect("replacement compare"),
             DfsPlacementAuthorityRecoveryOutcome::Changed
         );
-        drop(store);
         assert_eq!(
             client
                 .authoritative

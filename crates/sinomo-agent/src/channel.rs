@@ -1070,13 +1070,13 @@ impl AgentChannelStore for FileAgentChannelStore {
             let Ok(channel_id) = entry.name.parse::<SessionId>() else {
                 continue;
             };
-            if let Some(channel) = self.load_channel(&channel_id)? {
-                if !channel.is_deleted() {
-                    channels.push(channel);
-                }
+            if let Some(channel) = self.load_channel(&channel_id)?
+                && !channel.is_deleted()
+            {
+                channels.push(channel);
             }
         }
-        channels.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.updated_at));
         Ok(channels)
     }
 

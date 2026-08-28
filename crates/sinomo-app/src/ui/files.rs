@@ -1716,14 +1716,13 @@ impl FilesState {
         if let Some(error) = self.error.as_deref().filter(|text| !text.is_empty()) {
             return Some(format!("SIFS unavailable: {error}"));
         }
-        if self.source == FilesSourceKind::Sifs {
-            if let Some(error) = self
+        if self.source == FilesSourceKind::Sifs
+            && let Some(error) = self
                 .details_error
                 .as_deref()
                 .filter(|text| !text.is_empty())
-            {
-                return Some(format!("SIFS metadata unavailable: {error}"));
-            }
+        {
+            return Some(format!("SIFS metadata unavailable: {error}"));
         }
         self.tasks
             .iter()
@@ -1762,12 +1761,16 @@ impl FilesState {
                     .as_ref()
                     .is_none_or(|address| address == origin)
             }) || (placement_activity_origin.is_none() && self.daemon_address == daemon_address);
-        let placement_activity = preserve_placement_activity
-            .then(|| self.placement_activity.clone())
-            .unwrap_or_default();
-        let placement_activity_head_job_ids = preserve_placement_activity
-            .then(|| self.placement_activity_head_job_ids.clone())
-            .unwrap_or_default();
+        let placement_activity = if preserve_placement_activity {
+            self.placement_activity.clone()
+        } else {
+            Default::default()
+        };
+        let placement_activity_head_job_ids = if preserve_placement_activity {
+            self.placement_activity_head_job_ids.clone()
+        } else {
+            Default::default()
+        };
         let placement_activity_next_cursor = preserve_placement_activity
             .then(|| self.placement_activity_next_cursor.clone())
             .flatten();
@@ -7863,11 +7866,7 @@ fn local_crumbs(path: &str) -> Vec<(String, String)> {
             }
             std::path::Component::RootDir => {
                 saw_root = true;
-                if acc.as_os_str().is_empty() {
-                    acc.push(std::path::MAIN_SEPARATOR.to_string());
-                } else {
-                    acc.push(std::path::MAIN_SEPARATOR.to_string());
-                }
+                acc.push(std::path::MAIN_SEPARATOR.to_string());
                 if out.is_empty() {
                     out.push(("Local".to_string(), acc.to_string_lossy().into_owned()));
                 }
@@ -7949,12 +7948,7 @@ fn normalize_jump_path(
             if path.is_absolute() {
                 normalize_local_path(trimmed)
             } else {
-                normalize_local_path(
-                    &Path::new(current_path)
-                        .join(path)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
+                normalize_local_path(&Path::new(current_path).join(path).to_string_lossy())
             }
         }
     }
@@ -8422,7 +8416,7 @@ fn report_plan_scan_progress(
     let Some(progress) = progress else {
         return;
     };
-    if scanned == 0 || scanned % PLAN_SCAN_REPORT_STEP != 0 {
+    if scanned == 0 || !scanned.is_multiple_of(PLAN_SCAN_REPORT_STEP) {
         return;
     }
     let steps = (scanned / PLAN_SCAN_REPORT_STEP).min(8) as f32;
@@ -14528,28 +14522,29 @@ fn selection_context_actions(files: &FilesState) -> Vec<FileContextAction> {
         }
         actions.push(FileContextAction::RefreshPlacement);
         actions.push(FileContextAction::HistoryIssues);
-        if !metadata_needs_connection && !files.details_loading {
-            if let Some(details) = details {
-                if sifs_needs_replica_repair(details) {
-                    actions.push(FileContextAction::RepairReplicas);
-                }
-                if sifs_can_make_metadata_primary(details) {
-                    actions.push(FileContextAction::MakeMetadataPrimary);
-                }
-                if sifs_has_local_pin(details, "metadata") {
-                    actions.push(FileContextAction::UnpinMetadata);
-                } else {
-                    actions.push(FileContextAction::PinMetadata);
-                }
-                if !entry.is_dir && !entry.is_link {
-                    if sifs_has_local_pin(details, "content") {
-                        actions.push(FileContextAction::UnpinContent);
-                    } else {
-                        actions.push(FileContextAction::PinContent);
-                    }
-                }
-                actions.push(FileContextAction::CopyIdentifiers);
+        if !metadata_needs_connection
+            && !files.details_loading
+            && let Some(details) = details
+        {
+            if sifs_needs_replica_repair(details) {
+                actions.push(FileContextAction::RepairReplicas);
             }
+            if sifs_can_make_metadata_primary(details) {
+                actions.push(FileContextAction::MakeMetadataPrimary);
+            }
+            if sifs_has_local_pin(details, "metadata") {
+                actions.push(FileContextAction::UnpinMetadata);
+            } else {
+                actions.push(FileContextAction::PinMetadata);
+            }
+            if !entry.is_dir && !entry.is_link {
+                if sifs_has_local_pin(details, "content") {
+                    actions.push(FileContextAction::UnpinContent);
+                } else {
+                    actions.push(FileContextAction::PinContent);
+                }
+            }
+            actions.push(FileContextAction::CopyIdentifiers);
         }
     }
     actions.push(FileContextAction::Delete);
@@ -16812,11 +16807,10 @@ fn placement_reconciliation_rows(
     job: &SifsPlacementReconciliationJob,
 ) -> Vec<(&'static str, String)> {
     let (completed, total) = job.progress_fraction();
-    let percent = if total == 0 {
-        0
-    } else {
-        completed.saturating_mul(100) / total
-    };
+    let percent = completed
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0);
     let mut rows = vec![
         ("Reconciliation", format!("{:?} · {percent}%", job.state)),
         (
@@ -17944,17 +17938,9 @@ fn placement_preview_status(shared: &Shared, reader: &ThemeReader) -> StatusBadg
             if files.placement_applying || files.placement_loading {
                 SemanticTone::Info
             } else if files.placement_preview_is_current()
-                && files
-                    .placement_preview
-                    .as_ref()
-                    .is_some_and(|preview| !preview.supports_safe_apply())
-            {
-                SemanticTone::Danger
-            } else if files.placement_preview_is_current()
-                && files
-                    .placement_preview
-                    .as_ref()
-                    .is_some_and(|preview| !preview.is_satisfiable())
+                && files.placement_preview.as_ref().is_some_and(|preview| {
+                    !preview.supports_safe_apply() || !preview.is_satisfiable()
+                })
             {
                 SemanticTone::Danger
             } else if files.placement_reconciliation_in_flight() {
@@ -18461,7 +18447,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
     let mut body = Stack::vertical()
         .spacing(10.0)
         .alignment(Alignment::Stretch)
-        .with_child(sui::Label::new(description).theme(dialog_theme.clone()));
+        .with_child(sui::Label::new(description).theme(dialog_theme));
     if let Some(chooser) = destination_chooser_controls(shared, reader, prompt.kind, source) {
         body = body.with_child(
             Surface::panel(chooser)
@@ -18475,7 +18461,7 @@ fn files_action_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         body = body.with_child(input);
     }
     if let Some(error) = prompt.error {
-        body = body.with_child(sui::Label::new(error).theme(dialog_theme.clone()));
+        body = body.with_child(sui::Label::new(error).theme(dialog_theme));
     }
     if prompt.kind == FileActionPromptKind::Placement {
         let files = shared.files();
@@ -18620,7 +18606,7 @@ fn files_document_sheet(shared: &Shared, reader: &ThemeReader) -> Option<WidgetP
     text_style.line_height = theme.text.sm.line_height;
     let editor_shared = shared.clone();
     let mut editor = TextSurface::new(format!("files-document:{}", document.path))
-        .theme(theme.clone())
+        .theme(theme)
         .text_style(text_style)
         .padding(Insets::all(12.0))
         .min_width(0.0)

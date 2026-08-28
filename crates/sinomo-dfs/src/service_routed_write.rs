@@ -961,7 +961,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 }),
                 None => Ok(None),
             };
-            match authority_validation.and_then(|()| manifest).and_then(|manifest| {
+            match authority_validation.and(manifest).and_then(|manifest| {
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
                 self
                 .ensure_routed_write_object_metadata(

@@ -387,6 +387,7 @@ struct ObservationActivity {
     warning: bool,
 }
 
+#[derive(Default)]
 struct ClusterObservationState {
     generation: u64,
     in_flight: bool,
@@ -403,22 +404,6 @@ struct ClusterObservationState {
     metrics: MetricStore,
     activity: VecDeque<ObservationActivity>,
     revision: u64,
-}
-
-impl Default for ClusterObservationState {
-    fn default() -> Self {
-        Self {
-            generation: 0,
-            in_flight: false,
-            sample_rx: None,
-            previous: BTreeMap::new(),
-            targets: BTreeMap::new(),
-            history: VecDeque::new(),
-            metrics: MetricStore::default(),
-            activity: VecDeque::new(),
-            revision: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5759,7 +5744,7 @@ mod tests {
                             Sparkline::new(
                                 DashboardMetric::RpcRate,
                                 vec![None, Some(1.0), Some(3.0), Some(2.0)],
-                                theme.clone(),
+                                theme,
                                 theme.palette.accent,
                             ),
                         )),

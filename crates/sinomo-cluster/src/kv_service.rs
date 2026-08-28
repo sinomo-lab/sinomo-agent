@@ -315,12 +315,7 @@ pub fn fence_remote_cluster_kv_txn_request_with_entries(
         ));
     }
 
-    let compare_count = request
-        .txn
-        .compares
-        .len()
-        .checked_add(4)
-        .unwrap_or(usize::MAX);
+    let compare_count = request.txn.compares.len().saturating_add(4);
     if compare_count > MAX_KV_TXN_COMPARES {
         return Err(KvError::TxnLimit {
             compares: compare_count,

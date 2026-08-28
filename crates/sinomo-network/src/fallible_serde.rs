@@ -4,16 +4,14 @@ use serde::ser;
 use std::marker::PhantomData;
 
 fn requested_bytes<T>(items: usize) -> usize {
-    items
-        .checked_mul(std::mem::size_of::<T>().max(1))
-        .unwrap_or(usize::MAX)
+    items.saturating_mul(std::mem::size_of::<T>().max(1))
 }
 
 fn try_reserve_vec<T, E>(vec: &mut Vec<T>, additional: usize, operation: &str) -> Result<(), E>
 where
     E: de::Error,
 {
-    let requested_items = vec.len().checked_add(additional).unwrap_or(usize::MAX);
+    let requested_items = vec.len().saturating_add(additional);
     let requested_bytes = requested_bytes::<T>(requested_items);
     vec.try_reserve(additional).map_err(|_| {
         E::custom(network_fallible_vec_resource_exhausted(
@@ -23,7 +21,7 @@ where
     })
 }
 
-pub fn serialize_bytes<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+pub fn serialize_bytes<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: ser::Serializer,
 {

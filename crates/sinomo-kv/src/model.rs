@@ -47,9 +47,7 @@ fn parse_kv_fallible_vec_resource_exhaustion(detail: &str) -> Option<(String, us
 }
 
 fn kv_fallible_vec_requested_bytes<T>(items: usize) -> usize {
-    items
-        .checked_mul(std::mem::size_of::<T>().max(1))
-        .unwrap_or(usize::MAX)
+    items.saturating_mul(std::mem::size_of::<T>().max(1))
 }
 
 fn kv_fallible_vec_resource_exhausted(context: &str, requested_bytes: usize) -> String {
@@ -62,7 +60,7 @@ fn try_reserve_kv_vec<T, E>(vec: &mut Vec<T>, additional: usize, context: &str) 
 where
     E: serde::de::Error,
 {
-    let requested_items = vec.len().checked_add(additional).unwrap_or(usize::MAX);
+    let requested_items = vec.len().saturating_add(additional);
     let requested_bytes = kv_fallible_vec_requested_bytes::<T>(requested_items);
     vec.try_reserve(additional)
         .map_err(|_| E::custom(kv_fallible_vec_resource_exhausted(context, requested_bytes)))
@@ -73,7 +71,7 @@ pub(crate) fn try_reserve_kv_items<T>(
     additional: usize,
     operation: &str,
 ) -> Result<(), KvError> {
-    let requested_items = vec.len().checked_add(additional).unwrap_or(usize::MAX);
+    let requested_items = vec.len().saturating_add(additional);
     let requested_bytes = kv_fallible_vec_requested_bytes::<T>(requested_items);
     vec.try_reserve(additional)
         .map_err(|_| KvError::ResourceExhausted {

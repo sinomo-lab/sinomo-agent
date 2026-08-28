@@ -2137,10 +2137,10 @@ mod tests {
         backend
             .put_receipt(&DfsReplicaReceiptRecord {
                 receipt: sinomo_core::DfsWriteReceipt {
-                    file_system_id: file_system.file_system_id.clone().into(),
-                    object_id: object_id.clone().into(),
-                    committed_version: version.clone().into(),
-                    owner_node_id: local.clone().into(),
+                    file_system_id: file_system.file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    committed_version: version.clone(),
+                    owner_node_id: local.clone(),
                     event_id: sinomo_core::Id::generate(),
                 },
                 replica_node_id: local,

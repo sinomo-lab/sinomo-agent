@@ -19,7 +19,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -202,10 +202,12 @@ pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
 }
 
 fn read_codex_chatgpt_tokens(
-    credentials_path: &PathBuf,
+    credentials_path: &Path,
 ) -> Result<Option<CodexChatGptTokens>, LanguageModelError> {
-    let Some(value) =
-        read_provider_credentials_json_value(CODEX_PROVIDER_ID, &Some(credentials_path.clone()))?
+    let Some(value) = read_provider_credentials_json_value(
+        CODEX_PROVIDER_ID,
+        &Some(credentials_path.to_path_buf()),
+    )?
     else {
         return Ok(None);
     };

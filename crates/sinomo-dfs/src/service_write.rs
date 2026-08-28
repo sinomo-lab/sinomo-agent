@@ -51,25 +51,6 @@ fn planned_initial_receipt_nodes(
         .collect()
 }
 
-#[cfg(test)]
-mod initial_receipt_tests {
-    use super::*;
-
-    #[test]
-    fn snapshot_replanning_drops_non_replica_receipts() {
-        let requester = NodeId::from_legacy_named("receipt-requester").expect("requester");
-        let replica = NodeId::from_legacy_named("receipt-replica").expect("replica");
-
-        assert_eq!(
-            planned_initial_receipt_nodes(
-                [requester, replica.clone()],
-                std::slice::from_ref(&replica),
-            ),
-            vec![replica]
-        );
-    }
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn snapshot_replication_plan(
         &self,
@@ -570,26 +551,26 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidate_nodes, policy.clone())?;
         let object = self.current_object_for_write(&request.object_id)?;
-        if let Some(shard) = self.select_metadata_shard_for_object(&object)? {
-            if shard.primary_node_id != self.node_id {
-                return self
-                    .route_distributed_manifest_write_to_metadata_primary_with_operation_id_and_mode(
-                        request,
-                        expected_base_version,
-                        content_hash,
-                        content_size_bytes,
-                        plan.desired_replica_nodes,
-                        policy,
-                        object,
-                        shard,
-                        touch_parent_on_create,
-                        exclusive_create,
-                        foreground_replica_repair,
-                        detach_request,
-                        replay_response_journal,
-                        operation_id,
-                    );
-            }
+        if let Some(shard) = self.select_metadata_shard_for_object(&object)?
+            && shard.primary_node_id != self.node_id
+        {
+            return self
+                .route_distributed_manifest_write_to_metadata_primary_with_operation_id_and_mode(
+                    request,
+                    expected_base_version,
+                    content_hash,
+                    content_size_bytes,
+                    plan.desired_replica_nodes,
+                    policy,
+                    object,
+                    shard,
+                    touch_parent_on_create,
+                    exclusive_create,
+                    foreground_replica_repair,
+                    detach_request,
+                    replay_response_journal,
+                    operation_id,
+                );
         }
         match operation_id {
             Some(operation_id) => self
@@ -875,10 +856,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .with_foreground_replica_repair(foreground_replica_repair),
         );
 
-        let receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         let updated_intent = self.persist_receipts_and_apply_ready_intent(
             &intent,
             &object,
@@ -1027,10 +1009,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .with_foreground_replica_repair(foreground_replica_repair),
         );
 
-        let receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         let updated_intent = self.persist_receipts_and_apply_ready_intent(
             &intent,
             &object,
@@ -1522,10 +1505,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .with_foreground_replica_repair(foreground_replica_repair),
         );
 
-        let receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         let updated_intent = self.persist_receipts_and_apply_ready_intent(
             &intent,
             &object,
@@ -1646,10 +1630,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let content_hash = blob.content_hash.clone();
         let content_size_bytes = blob.size_bytes;
-        let initial_receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let initial_receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         self.write_distributed_eventual_from_manifest_with_initial_receipts(
             request,
             expected_base_version,
@@ -1681,10 +1666,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         let content_hash = blob.content_hash.clone();
         let content_size_bytes = blob.size_bytes;
-        let initial_receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let initial_receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         self.write_distributed_eventual_from_manifest_with_initial_receipts(
             request,
             expected_base_version,
@@ -1714,10 +1700,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         exclusive_create: bool,
         foreground_replica_repair: bool,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let initial_receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let initial_receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         self.write_distributed_eventual_from_manifest_with_initial_receipts(
             request,
             expected_base_version,
@@ -1748,10 +1735,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         foreground_replica_repair: bool,
         operation_id: String,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
-        let initial_receipt_node_ids = desired_replica_nodes
-            .contains(&self.node_id)
-            .then(|| vec![self.node_id.clone()])
-            .unwrap_or_default();
+        let initial_receipt_node_ids = if desired_replica_nodes.contains(&self.node_id) {
+            vec![self.node_id.clone()]
+        } else {
+            Default::default()
+        };
         self.write_distributed_eventual_from_manifest_with_initial_receipts(
             request,
             expected_base_version,
@@ -2913,5 +2901,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             shard,
             command,
         ))
+    }
+}
+
+#[cfg(test)]
+mod initial_receipt_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_replanning_drops_non_replica_receipts() {
+        let requester = NodeId::from_legacy_named("receipt-requester").expect("requester");
+        let replica = NodeId::from_legacy_named("receipt-replica").expect("replica");
+
+        assert_eq!(
+            planned_initial_receipt_nodes(
+                [requester, replica.clone()],
+                std::slice::from_ref(&replica),
+            ),
+            vec![replica]
+        );
     }
 }

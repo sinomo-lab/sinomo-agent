@@ -16,23 +16,12 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::backend::Backend;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct SifsMountSettingsSnapshot {
     pub config: SifsMountConfig,
     pub status: SifsMountRuntimeStatus,
     pub config_error: Option<String>,
     pub status_error: Option<String>,
-}
-
-impl Default for SifsMountSettingsSnapshot {
-    fn default() -> Self {
-        Self {
-            config: SifsMountConfig::default(),
-            status: SifsMountRuntimeStatus::default(),
-            config_error: None,
-            status_error: None,
-        }
-    }
 }
 
 impl Backend {
@@ -418,8 +407,10 @@ mod tests {
 
     #[test]
     fn mount_validation_rejects_unsafe_or_ambiguous_paths() {
-        let mut config = SifsMountConfig::default();
-        config.mount_point = "relative/mount".to_string();
+        let mut config = SifsMountConfig {
+            mount_point: "relative/mount".to_string(),
+            ..SifsMountConfig::default()
+        };
         assert_eq!(
             validate_sifs_mount_config(&config, SifsMountPlatform::UnixFuse),
             Err("mount location must be absolute or begin with ~/".to_string())
@@ -435,8 +426,10 @@ mod tests {
 
     #[test]
     fn mount_validation_is_platform_specific_and_fail_closed() {
-        let mut config = SifsMountConfig::default();
-        config.sync_local_changes = true;
+        let mut config = SifsMountConfig {
+            sync_local_changes: true,
+            ..SifsMountConfig::default()
+        };
         assert!(
             validate_sifs_mount_config(&config, SifsMountPlatform::UnixFuse)
                 .expect_err("Unix must reject the Windows-only option")
@@ -486,8 +479,10 @@ mod tests {
 
     #[test]
     fn mount_target_validation_rejects_internal_and_system_locations() {
-        let mut config = SifsMountConfig::default();
-        config.mount_point = "/srv/sinomo-state/mount".to_string();
+        let mut config = SifsMountConfig {
+            mount_point: "/srv/sinomo-state/mount".to_string(),
+            ..SifsMountConfig::default()
+        };
         assert_eq!(
             validate_sifs_mount_target(&config, Path::new("/srv/sinomo-state")),
             Err("mount location cannot overlap the Sinomo data directory".to_string())
@@ -536,12 +531,14 @@ mod tests {
     #[test]
     fn enabled_mount_never_treats_a_persisted_status_as_live() {
         let backend = Backend::local_fallback();
-        let mut config = SifsMountConfig::default();
-        config.enabled = true;
-        config.mount_point = if cfg!(windows) {
-            r"C:\SinomoSettingsLivenessMount".to_string()
-        } else {
-            "/tmp/sinomo-settings-liveness-mount".to_string()
+        let config = SifsMountConfig {
+            enabled: true,
+            mount_point: if cfg!(windows) {
+                r"C:\SinomoSettingsLivenessMount".to_string()
+            } else {
+                "/tmp/sinomo-settings-liveness-mount".to_string()
+            },
+            ..SifsMountConfig::default()
         };
         backend
             .set_local_sifs_mount_config(&config)
@@ -560,8 +557,10 @@ mod tests {
 
     #[test]
     fn enabled_mount_status_requires_a_fresh_matching_supervisor_observation() {
-        let mut config = SifsMountConfig::default();
-        config.enabled = true;
+        let mut config = SifsMountConfig {
+            enabled: true,
+            ..SifsMountConfig::default()
+        };
         let mut status = SifsMountRuntimeStatus::default();
         assert!(
             validate_sifs_mount_status(&config, &status, ConfigValueSource::Default)

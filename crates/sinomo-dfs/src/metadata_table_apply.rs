@@ -126,6 +126,7 @@ fn metadata_table_checkpoint_coordination_file(path: &Path) -> Result<fs::File> 
     }
     fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(path)
@@ -1276,16 +1277,12 @@ fn claim_metadata_table_checkpoint_worker_request(
     root: &Path,
     request: MetadataTableCheckpointWorkerRequest,
 ) -> Option<MetadataTableCheckpointWorkerRequest> {
-    let Some(registry) = METADATA_TABLE_CHECKPOINT_WORKERS.get() else {
-        return None;
-    };
+    let registry = METADATA_TABLE_CHECKPOINT_WORKERS.get()?;
     let mut workers = registry
         .workers
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(worker) = workers.get_mut(root) else {
-        return None;
-    };
+    let worker = workers.get_mut(root)?;
     if worker.physical_checkpoint_required {
         if request.trigger != MetadataTableCheckpointTrigger::Physical {
             return None;

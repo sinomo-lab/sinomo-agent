@@ -71,7 +71,7 @@ impl AgentTaskActivityProjection {
             // reasons, host paths, or model-session handles. Never copy it to
             // the roaming/searchable record; derive a stable label instead.
             progress_summary: Some(activity_status_label(&snapshot.status).to_string()),
-            updated_at: snapshot.updated_at.clone(),
+            updated_at: snapshot.updated_at,
         })
     }
 

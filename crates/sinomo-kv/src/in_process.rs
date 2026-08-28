@@ -925,9 +925,7 @@ impl InProcessKvStore {
         self.validate_ops(&ops)?;
         let mut responses = Vec::new();
         let requested_bytes = ops
-            .len()
-            .checked_mul(std::mem::size_of::<KvOpResponse>().max(1))
-            .unwrap_or(usize::MAX);
+            .len().saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
         responses
             .try_reserve(ops.len())
             .map_err(|_| KvError::ResourceExhausted {
@@ -990,9 +988,7 @@ impl InProcessKvStore {
 
         let mut responses = Vec::new();
         let requested_bytes = ops
-            .len()
-            .checked_mul(std::mem::size_of::<KvOpResponse>().max(1))
-            .unwrap_or(usize::MAX);
+            .len().saturating_mul(std::mem::size_of::<KvOpResponse>().max(1));
         responses
             .try_reserve(ops.len())
             .map_err(|_| KvError::ResourceExhausted {
@@ -1547,9 +1543,9 @@ impl InProcessKvStore {
                     }
                     let old_state = self.simulated_key_state(
                         key,
-                        &touched_keys,
-                        &deleted_prefixes,
-                        &revoked_leases,
+                        touched_keys,
+                        deleted_prefixes,
+                        revoked_leases,
                     );
                     if old_state.lease_id != Some(*lease_id) {
                         let lease_keys =
@@ -1600,9 +1596,9 @@ impl InProcessKvStore {
                 } => {
                     let old_state = self.simulated_key_state(
                         key,
-                        &touched_keys,
-                        &deleted_prefixes,
-                        &revoked_leases,
+                        touched_keys,
+                        deleted_prefixes,
+                        revoked_leases,
                     );
                     let changed = !(old_state.present
                         && old_state.lease_id.is_none()
@@ -1634,9 +1630,9 @@ impl InProcessKvStore {
                 KvOp::Delete { key } => {
                     let old_state = self.simulated_key_state(
                         key,
-                        &touched_keys,
-                        &deleted_prefixes,
-                        &revoked_leases,
+                        touched_keys,
+                        deleted_prefixes,
+                        revoked_leases,
                     );
                     if old_state.present {
                         record_kv_mutation_events(&mut mutation_events, 1)?;
@@ -1656,9 +1652,9 @@ impl InProcessKvStore {
                 KvOp::DeletePrefix { prefix } => {
                     let deleted = self.simulated_delete_prefix(
                         prefix,
-                        &touched_keys,
-                        &deleted_prefixes,
-                        &revoked_leases,
+                        touched_keys,
+                        deleted_prefixes,
+                        revoked_leases,
                         MAX_DELETE_PREFIX_KEYS,
                     )?;
                     record_kv_mutation_events(&mut mutation_events, deleted.total)?;

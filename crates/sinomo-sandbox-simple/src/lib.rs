@@ -224,7 +224,7 @@ impl SandboxSimpleNativeCommandRunner {
             request,
             output_sink,
             &cancellation_token,
-            &local_execution_lease,
+            local_execution_lease,
         )
     }
 
@@ -562,11 +562,7 @@ impl SandboxSimpleNativeCommandRunner {
             },
         };
 
-        let execution_error = if let Some(error) = terminal_error {
-            Some(SandboxCommandExecutionError::Wasi(error))
-        } else {
-            None
-        };
+        let execution_error = terminal_error.map(SandboxCommandExecutionError::Wasi);
 
         let completed_at = OffsetDateTime::now_utc();
         let status = match execution_error.as_ref() {

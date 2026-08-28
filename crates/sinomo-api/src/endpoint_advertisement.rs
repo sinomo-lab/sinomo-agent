@@ -481,7 +481,7 @@ pub fn current_daemon_cluster_options(
         return None;
     }
     Some((
-        main_options.unwrap_or_else(DaemonRunOptions::default),
+        main_options.unwrap_or_default(),
         shadow_options.unwrap_or_else(DaemonRunOptions::shadow_default),
     ))
 }

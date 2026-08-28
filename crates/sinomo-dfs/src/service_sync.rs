@@ -159,7 +159,7 @@ pub struct DfsMetadataQuorumSyncCertificate {
 
 /// Majority size for one primary plus `replica_count` configured replicas.
 pub const fn dfs_metadata_replica_quorum_size(replica_count: usize) -> usize {
-    (replica_count + 1) / 2 + 1
+    replica_count.div_ceil(2) + 1
 }
 
 pub(crate) fn rebind_completed_metadata_shard_membership_handoff(
@@ -2362,12 +2362,10 @@ fn record_metadata_sync_prefix_probe_events(
                 request_id,
                 source_node_id,
                 ..
-            } => {
-                if pending_prefix_probes.remove(&request_id).is_some()
-                    || pending_catchup_batches.remove(&request_id).is_some()
-                {
-                    rejected_node_ids.insert(source_node_id);
-                }
+            } if (pending_prefix_probes.remove(&request_id).is_some()
+                || pending_catchup_batches.remove(&request_id).is_some()) =>
+            {
+                rejected_node_ids.insert(source_node_id);
             }
             _ => {}
         }
@@ -3885,7 +3883,7 @@ mod tests {
 
     #[test]
     fn primary_handoff_routes_quorum_probes_concurrently_around_one_offline_member() {
-        let mut candidates = vec![
+        let mut candidates = [
             node("node_sync_handoff_fanout_a"),
             node("node_sync_handoff_fanout_b"),
             node("node_sync_handoff_fanout_c"),
@@ -4012,7 +4010,7 @@ mod tests {
 
     #[test]
     fn primary_handoff_probes_ready_quorum_before_offline_replica_catchup() {
-        let mut candidates = vec![
+        let mut candidates = [
             node("node_sync_handoff_ready_quorum_a"),
             node("node_sync_handoff_ready_quorum_b"),
             node("node_sync_handoff_ready_quorum_c"),
@@ -4698,7 +4696,7 @@ mod tests {
             fixture
                 .service
                 .reconcile_pending_metadata_shard_membership_handoffs(
-                    &[middle.clone()],
+                    std::slice::from_ref(&middle),
                     Duration::from_secs(1),
                 )
                 .expect("advance surviving marker and activate second handoff"),
@@ -5067,13 +5065,12 @@ mod tests {
                 .is_none(),
             "mounted in-memory metadata should still reflect its pre-rebind hydration"
         );
-        assert_eq!(
+        assert!(
             mounted
                 .metadata_backend()
                 .expect("mounted backend")
                 .metadata_shard_authoritative_writes_frozen(&shard_id)
                 .expect("mounted frozen state"),
-            true,
             "an activated marker still fences a long-lived instance until exact rebind"
         );
 
@@ -5130,13 +5127,12 @@ mod tests {
             Some(&caught_up_after_mount_open),
             "rebind must first refresh a prefix that was behind the completion marker"
         );
-        assert_eq!(
-            mounted
+        assert!(
+            !mounted
                 .metadata_backend()
                 .expect("mounted backend")
                 .metadata_shard_authoritative_writes_frozen(&shard_id)
                 .expect("mounted rebound state"),
-            false,
             "the convergence gate must observe the rebound current-primary lane as writable"
         );
         let after_rebind = directory_object("/after-mounted-rebind", local.clone());

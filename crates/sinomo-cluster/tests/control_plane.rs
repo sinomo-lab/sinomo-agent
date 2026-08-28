@@ -5234,6 +5234,9 @@ fn default_lan_ip_discovery_cache_reuses_recent_result() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+// The cache under test is process-global, so the cross-test mutex must cover
+// both async cache calls. This current-thread test never reacquires it.
+#[allow(clippy::await_holding_lock)]
 async fn async_default_lan_ip_discovery_cache_reuses_recent_result() {
     let _guard = PUBLIC_ENDPOINT_CACHE_TEST_MUTEX
         .lock()
@@ -12446,7 +12449,7 @@ fn simultaneous_reachable_candidates_with_third_voter_unavailable_stabilize_one_
         .clone();
     assert_eq!(hard_state_a.current_term, hard_state_b.current_term);
     assert!(
-        hard_state_a.current_term >= 1 + sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
+        hard_state_a.current_term > sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP
             && hard_state_a.current_term
                 <= 1 + 2 * sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP,
         "two reachable simultaneous candidates should converge in at most two bounded rounds"
@@ -20115,7 +20118,8 @@ fn cluster_member_publish_treats_mdns_and_observed_sources_as_stable() {
     write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
 
     assert!(
-        cluster_member_publish_matches_kv(&paths, &[desired.clone()]).expect("matches kv"),
+        cluster_member_publish_matches_kv(&paths, std::slice::from_ref(&desired))
+            .expect("matches kv"),
         "member publish should treat mDNS and observed LAN endpoint sources as the same stable route"
     );
     let txn = cluster_member_publish_txn_from_snapshot(&snapshot, &[desired])
@@ -20194,7 +20198,8 @@ fn cluster_member_publish_ignores_stable_endpoint_order() {
     write_cluster_kv_snapshot(&paths, &snapshot).expect("seed snapshot");
 
     assert!(
-        cluster_member_publish_matches_kv(&paths, &[desired.clone()]).expect("matches kv"),
+        cluster_member_publish_matches_kv(&paths, std::slice::from_ref(&desired))
+            .expect("matches kv"),
         "member publish should treat endpoint list order as stable"
     );
     let txn = cluster_member_publish_txn_from_snapshot(&snapshot, &[desired])
@@ -21142,7 +21147,7 @@ fn unchecked_cluster_state_sync_skips_stable_raft_appends() {
 
     let mut bumped = state;
     bumped.updated_at = now + time::Duration::seconds(120);
-    bumped.kv_revision = bumped.kv_revision + 5;
+    bumped.kv_revision += 5;
     sync_cluster_state_to_local_raft_unchecked(&paths, &bumped).expect("stable unchecked sync");
     assert_eq!(
         wal_len_after_first,
@@ -30567,10 +30572,10 @@ fn install_localhost_kv_snapshot(address: &str, snapshot: KvSnapshot) {
 fn wait_for_localhost_kv_entry(address: &str, key: &str, expected: &[u8]) -> KvEntry {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if let Some(entry) = get_localhost_kv_entry(address, key) {
-            if entry.value == expected {
-                return entry;
-            }
+        if let Some(entry) = get_localhost_kv_entry(address, key)
+            && entry.value == expected
+        {
+            return entry;
         }
         assert!(
             Instant::now() < deadline,

@@ -730,7 +730,7 @@ mod tests {
             .append(true)
             .open(path)
             .expect("raw event log append");
-        file.write_all(&bytes).expect("raw event bytes");
+        file.write_all(bytes).expect("raw event bytes");
         file.flush().expect("raw event flush");
     }
 

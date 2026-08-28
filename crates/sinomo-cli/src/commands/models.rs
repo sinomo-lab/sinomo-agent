@@ -621,41 +621,41 @@ fn parse_vendor_option(value: &str) -> Result<(String, String), CliParseError> {
 fn parse_model_runtime_set_matches(
     matches: &CliCommandMatches,
 ) -> Result<ModelRuntimeSetOptions, CliParseError> {
-    let mut options = ModelRuntimeSetOptions::default();
-    options.native_models_cache_dir = trimmed_match_value(matches, "--native-models-cache-dir");
-    options.minicpm_v46_model_dir = trimmed_match_value(matches, "--minicpm-v46-model-dir");
-    options.minicpm_v46_max_input_tokens = matches
-        .value("--minicpm-v46-max-input-tokens")
-        .map(|value| {
-            value.parse().map_err(|source| CliParseError::Parse {
-                detail: format!("invalid --minicpm-v46-max-input-tokens `{value}`: {source}"),
+    Ok(ModelRuntimeSetOptions {
+        native_models_cache_dir: trimmed_match_value(matches, "--native-models-cache-dir"),
+        minicpm_v46_model_dir: trimmed_match_value(matches, "--minicpm-v46-model-dir"),
+        minicpm_v46_max_input_tokens: matches
+            .value("--minicpm-v46-max-input-tokens")
+            .map(|value| {
+                value.parse().map_err(|source| CliParseError::Parse {
+                    detail: format!("invalid --minicpm-v46-max-input-tokens `{value}`: {source}"),
+                })
             })
-        })
-        .transpose()?;
-    options.minicpm_v46_max_output_tokens = matches
-        .value("--minicpm-v46-max-output-tokens")
-        .map(|value| {
-            value.parse().map_err(|source| CliParseError::Parse {
-                detail: format!("invalid --minicpm-v46-max-output-tokens `{value}`: {source}"),
+            .transpose()?,
+        minicpm_v46_max_output_tokens: matches
+            .value("--minicpm-v46-max-output-tokens")
+            .map(|value| {
+                value.parse().map_err(|source| CliParseError::Parse {
+                    detail: format!("invalid --minicpm-v46-max-output-tokens `{value}`: {source}"),
+                })
             })
-        })
-        .transpose()?;
-    options.pytorch_endpoint = trimmed_match_value(matches, "--pytorch-endpoint");
-    options.pytorch_python = trimmed_match_value(matches, "--pytorch-python");
-    options.pytorch_device = matches.value("--pytorch-device").map(str::to_string);
-    options.pytorch_timeout_seconds = matches
-        .value("--pytorch-timeout-seconds")
-        .map(|value| {
-            value.parse().map_err(|source| CliParseError::Parse {
-                detail: format!("invalid --pytorch-timeout-seconds `{value}`: {source}"),
+            .transpose()?,
+        pytorch_endpoint: trimmed_match_value(matches, "--pytorch-endpoint"),
+        pytorch_python: trimmed_match_value(matches, "--pytorch-python"),
+        pytorch_device: matches.value("--pytorch-device").map(str::to_string),
+        pytorch_timeout_seconds: matches
+            .value("--pytorch-timeout-seconds")
+            .map(|value| {
+                value.parse().map_err(|source| CliParseError::Parse {
+                    detail: format!("invalid --pytorch-timeout-seconds `{value}`: {source}"),
+                })
             })
-        })
-        .transpose()?;
-    options.pytorch_mock = matches
-        .value("--pytorch-mock")
-        .map(parse_bool_flag_value)
-        .transpose()?;
-    Ok(options)
+            .transpose()?,
+        pytorch_mock: matches
+            .value("--pytorch-mock")
+            .map(parse_bool_flag_value)
+            .transpose()?,
+    })
 }
 
 fn parse_bool_flag_value(value: &str) -> Result<bool, CliParseError> {
@@ -1240,10 +1240,10 @@ pub(crate) fn model_config_cluster_snapshot_read(
     }
     #[cfg(test)]
     {
-        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+        sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .map(ModelConfigClusterSnapshot::Unverified)
             .map_err(sinomo_runtime::network::NetworkError::directory)
-            .map_err(Into::into);
+            .map_err(Into::into)
     }
     #[cfg(not(test))]
     {
@@ -1535,7 +1535,7 @@ pub(crate) fn usage(options: UsageOptions) -> Result<(), CliError> {
                     path: "<usage>".to_string(),
                     detail: source.to_string(),
                 })?
-                .unwrap_or_else(|| serde_json::json!(null))
+                .unwrap_or(serde_json::Value::Null)
         } else {
             serde_json::to_value(&snapshots).map_err(|source| CliError::Json {
                 path: "<usage>".to_string(),

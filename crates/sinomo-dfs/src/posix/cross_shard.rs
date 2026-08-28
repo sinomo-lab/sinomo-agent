@@ -641,13 +641,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             );
         }
         let mut transfer_identity_object = moved.clone();
-        if let Some(source_family) = source_family.as_ref() {
-            if matches!(
+        if let Some(source_family) = source_family.as_ref()
+            && matches!(
                 source_family.source_object.tombstone_provenance,
                 Some(crate::DfsTombstoneProvenance::SourceEviction { .. })
-            ) {
-                transfer_identity_object.version = source_family.source_object.version.clone();
-            }
+            )
+        {
+            transfer_identity_object.version = source_family.source_object.version.clone();
         }
         let pin_transfer_id =
             crate::protocol::cross_shard_pin_transfer_id(&transfer_identity_object, source_path)
@@ -2420,7 +2420,7 @@ mod version_pin_reconciliation_tests {
     fn exact_pin_reconciliation_installs_the_first_copy() {
         let desired = pin("version_one", "checkpoint", OffsetDateTime::UNIX_EPOCH);
         let (puts, removals) =
-            plan_cross_shard_version_pin_reconciliation(&[], &[desired.clone()], true)
+            plan_cross_shard_version_pin_reconciliation(&[], std::slice::from_ref(&desired), true)
                 .expect("reconciliation");
         assert_eq!(puts, vec![desired]);
         assert!(removals.is_empty());
@@ -2430,7 +2430,7 @@ mod version_pin_reconciliation_tests {
     fn exact_pin_reconciliation_removes_a_pin_unpinned_after_the_first_copy() {
         let copied = pin("version_one", "checkpoint", OffsetDateTime::UNIX_EPOCH);
         let (puts, removals) =
-            plan_cross_shard_version_pin_reconciliation(&[copied.clone()], &[], true)
+            plan_cross_shard_version_pin_reconciliation(std::slice::from_ref(&copied), &[], true)
                 .expect("reconciliation");
         assert!(puts.is_empty());
         assert_eq!(removals, vec![copied]);
@@ -2454,8 +2454,8 @@ mod version_pin_reconciliation_tests {
             OffsetDateTime::UNIX_EPOCH + time::Duration::SECOND,
         );
         let (puts, removals) = plan_cross_shard_version_pin_reconciliation(
-            &[existing.clone()],
-            &[desired.clone()],
+            std::slice::from_ref(&existing),
+            std::slice::from_ref(&desired),
             true,
         )
         .expect("reconciliation");

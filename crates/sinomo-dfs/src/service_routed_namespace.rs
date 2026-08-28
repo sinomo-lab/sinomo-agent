@@ -1371,9 +1371,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut shard_snapshots = BTreeMap::<DfsFileSystemId, Vec<DfsMetadataShardConfig>>::new();
         let mut cursor = self.pending_namespace_request_recovery_cursor.take();
         let scan_started_after_cursor = cursor.is_some();
-        let scan_page_entry_limit = max_requests
-            .max(1)
-            .min(DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT);
+        let scan_page_entry_limit =
+            max_requests.clamp(1, DFS_NAMESPACE_REQUEST_RECOVERY_BATCH_LIMIT);
         let mut scanned_pages = 0usize;
         'scan: while scanned_pages < DFS_NAMESPACE_REQUEST_RECOVERY_SCAN_PAGE_LIMIT {
             let page = self
@@ -3005,7 +3004,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 response.posix_coordination_result.clone(),
                 response.synced_path_object.clone(),
                 response.synced_path_objects.clone(),
-                response.metadata_journal_has_more.unwrap_or_else(|| {
+                response.metadata_journal_has_more.unwrap_or({
                     response.metadata_journal_batches.len()
                         >= DFS_ROUTED_NAMESPACE_RESPONSE_JOURNAL_BATCH_LIMIT
                 }),
@@ -3126,10 +3125,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .iter()
             .filter(|shard| &shard.primary_node_id == attempted_primary)
             .collect::<Vec<_>>();
-        if !expected_dispatch_authorities
-            .iter()
-            .any(|expected| *expected == dispatch_authority_shard)
-        {
+        if !expected_dispatch_authorities.contains(&dispatch_authority_shard) {
             return Err(DfsError::Distributed {
                 message: format!(
                     "routing shard {} is missing from the immutable affected-shard authority snapshot",

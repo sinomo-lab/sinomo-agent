@@ -155,9 +155,8 @@ pub(crate) fn limit_cluster_kv_watch_drain_events(
         limited.push(event.clone());
         if payload_bytes >= max_payload_bytes {
             let current_revision = event.revision;
-            if !events
-                .peek()
-                .is_some_and(|candidate| candidate.revision == current_revision)
+            if events
+                .peek().is_none_or(|candidate| candidate.revision != current_revision)
             {
                 break;
             }
@@ -570,6 +569,7 @@ pub fn lock_cluster_kv_watch_allocator(paths: &ClusterKvPaths) -> Result<File, K
     })?;
     let file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&paths.watches_lock)

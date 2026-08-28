@@ -1063,12 +1063,17 @@ impl DfsDefaultClusterAsyncBootstrapHost for DfsControlPlaneDefaultClusterAsyncB
             #[cfg(test)]
             record_default_materialization_run(&data_root);
             let mut active_primary_shard_ids = BTreeSet::new();
-            active_primary_shard_ids.extend(shards.iter().zip(&completion_evidence).filter_map(
-                |(active, (pending, _))| {
-                    (active.primary_node_id == self.local_node_id && pending.is_none())
-                        .then(|| DfsMetadataShardId::new(active.shard_id.clone()))
-                },
-            ));
+            active_primary_shard_ids.extend(
+                shards
+                    .iter()
+                    .zip(&completion_evidence)
+                    .filter(|&(active, (pending, _))| {
+                        active.primary_node_id == self.local_node_id && pending.is_none()
+                    })
+                    .map(|(active, (_pending, _))| {
+                        DfsMetadataShardId::new(active.shard_id.clone())
+                    }),
+            );
             if active_primary_shard_ids.is_empty() {
                 record_default_materialization(data_root, signature, false);
                 return Ok(());
@@ -1262,12 +1267,12 @@ fn metadata_shard_local_replica_failover_ready_from_local_backend(
     }
     let authority_floor = backend.metadata_authority_ack_floor(&shard_id)?;
     let prefix_floor = backend.metadata_prefix_ack_floor(&shard_id)?;
-    if !authority_floor
+    if authority_floor
         .as_ref()
-        .is_some_and(|floor| floor.journal_sequence >= watermark.journal_sequence)
-        && !prefix_floor
+        .is_none_or(|floor| floor.journal_sequence < watermark.journal_sequence)
+        && prefix_floor
             .as_ref()
-            .is_some_and(|floor| floor.journal_sequence >= watermark.journal_sequence)
+            .is_none_or(|floor| floor.journal_sequence < watermark.journal_sequence)
     {
         return Ok(false);
     }
@@ -1308,7 +1313,7 @@ fn metadata_shard_head_watermark_certifies_failover_candidate(
         && acknowledged_node_ids
             .iter()
             .all(|node_id| configured_node_ids.contains(node_id))
-        && acknowledged_node_ids.len() >= configured_node_ids.len() / 2 + 1
+        && acknowledged_node_ids.len() > configured_node_ids.len() / 2
 }
 
 fn metadata_shard_node_routing_unavailable(

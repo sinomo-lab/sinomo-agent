@@ -104,29 +104,21 @@ pub struct DaemonDfsBrowserHealthSummary {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DaemonDfsBrowserSortKey {
+    #[default]
     Name,
     Kind,
     Size,
 }
 
-impl Default for DaemonDfsBrowserSortKey {
-    fn default() -> Self {
-        Self::Name
-    }
-}
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum DaemonDfsBrowserSortDirection {
+    #[default]
     Ascending,
     Descending,
-}
-
-impl Default for DaemonDfsBrowserSortDirection {
-    fn default() -> Self {
-        Self::Ascending
-    }
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]

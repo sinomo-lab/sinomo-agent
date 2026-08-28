@@ -624,24 +624,24 @@ where
             request,
             self.options,
         );
-        if let Err(error) = &result {
-            if clear_verified_stale_cluster_raft_leader(
+        if let Err(error) = &result
+            && clear_verified_stale_cluster_raft_leader(
                 self.paths,
                 state,
                 leader_fence.as_ref(),
                 error,
-            )? && let Some(forward_options) =
+            )?
+            && let Some(forward_options) =
                 cluster_kv_forward_options_before_deadline(self.options.forward_options, deadline)
-            {
-                let mut retry_options = self.options;
-                retry_options.forward_options = forward_options;
-                return self.host.forward_cluster_kv_txn_to_state_authority(
-                    self.paths,
-                    state,
-                    request,
-                    retry_options,
-                );
-            }
+        {
+            let mut retry_options = self.options;
+            retry_options.forward_options = forward_options;
+            return self.host.forward_cluster_kv_txn_to_state_authority(
+                self.paths,
+                state,
+                request,
+                retry_options,
+            );
         }
         result
     }
@@ -3165,8 +3165,8 @@ where
                 runtime, paths, state, request, options, host,
             )
             .await;
-            if let Err(error) = &result {
-                if clear_verified_stale_cluster_raft_leader_async(
+            if let Err(error) = &result
+                && clear_verified_stale_cluster_raft_leader_async(
                     runtime,
                     paths,
                     state,
@@ -3175,14 +3175,13 @@ where
                     operation_deadline,
                 )
                 .await?
-                    && let Some(options) =
-                        cluster_kv_forward_options_before_deadline(options, operation_deadline)
-                {
-                    return forward_cluster_kv_txn_to_state_authority_async_with_host(
-                        runtime, paths, state, request, options, host,
-                    )
-                    .await;
-                }
+                && let Some(options) =
+                    cluster_kv_forward_options_before_deadline(options, operation_deadline)
+            {
+                return forward_cluster_kv_txn_to_state_authority_async_with_host(
+                    runtime, paths, state, request, options, host,
+                )
+                .await;
             }
             result
         })
@@ -3215,8 +3214,8 @@ where
                 runtime, paths, state, request, options, host,
             )
             .await;
-            if let Err(error) = &result {
-                if clear_verified_stale_cluster_raft_leader_async(
+            if let Err(error) = &result
+                && clear_verified_stale_cluster_raft_leader_async(
                     runtime,
                     paths,
                     state,
@@ -3225,14 +3224,13 @@ where
                     operation_deadline,
                 )
                 .await?
-                    && let Some(options) =
-                        cluster_kv_forward_options_before_deadline(options, operation_deadline)
-                {
-                    return forward_cluster_kv_txn_compact_to_state_authority_async_with_host(
-                        runtime, paths, state, request, options, host,
-                    )
-                    .await;
-                }
+                && let Some(options) =
+                    cluster_kv_forward_options_before_deadline(options, operation_deadline)
+            {
+                return forward_cluster_kv_txn_compact_to_state_authority_async_with_host(
+                    runtime, paths, state, request, options, host,
+                )
+                .await;
             }
             result
         })
@@ -3845,7 +3843,7 @@ where
     if !elect_cluster_raft_leader_async_with_host(
         runtime,
         paths,
-        &mut consensus_state,
+        &consensus_state,
         election_options,
         host,
     )
@@ -4237,7 +4235,7 @@ where
     if !elect_cluster_raft_leader_async_with_host(
         runtime,
         paths,
-        &mut consensus_state,
+        &consensus_state,
         election_options,
         host,
     )
@@ -4557,7 +4555,7 @@ where
     if !elect_cluster_raft_leader_async_with_host(
         runtime,
         paths,
-        &mut consensus_state,
+        &consensus_state,
         election_options,
         host,
     )
@@ -4907,7 +4905,7 @@ where
     if !elect_cluster_raft_leader_async_with_host(
         runtime,
         paths,
-        &mut consensus_state,
+        &consensus_state,
         election_options,
         host,
     )
@@ -6029,7 +6027,6 @@ mod tests {
             .voters
             .retain(|node_id| node_id != &removed_caller_voter);
         let resident_revision = commit_config(&mut config);
-        drop(commit_config);
         let resident_last_index = node.last_log_index();
         drop(node);
 

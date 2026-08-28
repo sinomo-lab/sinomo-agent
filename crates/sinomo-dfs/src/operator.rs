@@ -982,23 +982,23 @@ impl<'a> DfsOperatorInspector<'a> {
             )));
         }
 
-        if let Some(object_id) = cursor.object_id.as_ref() {
-            if let Some(object) = self.backend.get_object(object_id)? {
-                let item_limit = limit.saturating_sub(output.len());
-                if item_limit > 0 {
-                    let has_remaining =
-                        extend(self, &object, cursor.item_key.as_ref(), item_limit, output)?;
-                    if output.len() >= limit {
-                        return Ok(OperatorResumeState::Filled(
-                            next_operator_inspection_cursor(
-                                self.backend,
-                                &object,
-                                has_remaining,
-                                cursor.object_cursor.is_some(),
-                                output.last().map(key_for_item),
-                            )?,
-                        ));
-                    }
+        if let Some(object_id) = cursor.object_id.as_ref()
+            && let Some(object) = self.backend.get_object(object_id)?
+        {
+            let item_limit = limit.saturating_sub(output.len());
+            if item_limit > 0 {
+                let has_remaining =
+                    extend(self, &object, cursor.item_key.as_ref(), item_limit, output)?;
+                if output.len() >= limit {
+                    return Ok(OperatorResumeState::Filled(
+                        next_operator_inspection_cursor(
+                            self.backend,
+                            &object,
+                            has_remaining,
+                            cursor.object_cursor.is_some(),
+                            output.last().map(key_for_item),
+                        )?,
+                    ));
                 }
             }
         }

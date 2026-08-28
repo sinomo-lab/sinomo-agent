@@ -284,11 +284,11 @@ pub(crate) fn publish_local_members_via_voter_with_host(
         {
             Ok(response) if response.accepted => {
                 let mut imported_newer_snapshot = false;
-                if let Some(snapshot) = response.kv_snapshot {
-                    if imported_snapshot_advances_local_kv(paths, &snapshot) {
-                        write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
-                        imported_newer_snapshot = true;
-                    }
+                if let Some(snapshot) = response.kv_snapshot
+                    && imported_snapshot_advances_local_kv(paths, &snapshot)
+                {
+                    write_imported_cluster_kv_snapshot_if_changed(paths, &snapshot)?;
+                    imported_newer_snapshot = true;
                 }
                 if !options.force_kv_snapshot_sync || imported_newer_snapshot {
                     return Ok(());

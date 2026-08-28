@@ -270,6 +270,31 @@ pub(crate) fn write_intent_status_requires_hydrate_restore(status: &DfsWriteInte
     )
 }
 
+pub(crate) fn distributed_error_is_stale_or_concurrent_write(error: &DfsDistributedError) -> bool {
+    matches!(
+        error,
+        DfsDistributedError::BaseVersionConflict { .. }
+            | DfsDistributedError::DuplicateIntent { .. }
+            | DfsDistributedError::PendingIntentConflict { .. }
+    )
+}
+
+impl From<DfsConflictRecord> for DfsConflictReadView {
+    fn from(conflict: DfsConflictRecord) -> Self {
+        Self {
+            conflict_id: conflict.conflict_id,
+            base_version: conflict.base_version,
+            local_version: conflict.local_version,
+            remote_version: conflict.remote_version,
+            detected_by_node_id: conflict.detected_by_node_id,
+            reason: conflict.reason,
+            local_content_hash: conflict.local_content_hash,
+            remote_content_hash: conflict.remote_content_hash,
+            status: conflict.status,
+        }
+    }
+}
+
 #[cfg(test)]
 mod stable_operation_tests {
     use super::*;
@@ -456,30 +481,5 @@ mod stable_operation_tests {
             stable_write_target_version(&requester, &first, "create-1"),
             stable_write_target_version(&requester, &first, "create-2")
         );
-    }
-}
-
-pub(crate) fn distributed_error_is_stale_or_concurrent_write(error: &DfsDistributedError) -> bool {
-    matches!(
-        error,
-        DfsDistributedError::BaseVersionConflict { .. }
-            | DfsDistributedError::DuplicateIntent { .. }
-            | DfsDistributedError::PendingIntentConflict { .. }
-    )
-}
-
-impl From<DfsConflictRecord> for DfsConflictReadView {
-    fn from(conflict: DfsConflictRecord) -> Self {
-        Self {
-            conflict_id: conflict.conflict_id,
-            base_version: conflict.base_version,
-            local_version: conflict.local_version,
-            remote_version: conflict.remote_version,
-            detected_by_node_id: conflict.detected_by_node_id,
-            reason: conflict.reason,
-            local_content_hash: conflict.local_content_hash,
-            remote_content_hash: conflict.remote_content_hash,
-            status: conflict.status,
-        }
     }
 }

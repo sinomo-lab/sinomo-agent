@@ -857,7 +857,7 @@ pub(crate) fn require_cluster_runtime_quorum_with_paths_and_daemon(
     paths: &ClusterPaths,
     daemon: Option<&DaemonStatus>,
 ) -> Result<(), CliError> {
-    let state = read_cluster_state(&paths).map_err(|error| match error {
+    let state = read_cluster_state(paths).map_err(|error| match error {
         CliError::ClusterOrphan => CliError::ClusterReadOnly {
             detail: "local node has no cluster state; cluster-dependent operations are paused"
                 .to_string(),
@@ -3611,7 +3611,10 @@ mod tests {
             code: "node-offline".to_string(),
             detail: "offline member is tolerated by quorum".to_string(),
         };
-        assert_eq!(cluster_doctor_summary_label(&[info.clone()]), "ok");
+        assert_eq!(
+            cluster_doctor_summary_label(std::slice::from_ref(&info)),
+            "ok"
+        );
 
         let warning = ClusterDoctorFinding {
             severity: "warning".to_string(),

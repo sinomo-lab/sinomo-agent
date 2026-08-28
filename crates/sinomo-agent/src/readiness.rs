@@ -101,6 +101,9 @@ impl AgentReadinessReport {
     }
 }
 
+// Keeping each probe on its own line makes this long diagnostic catalog easier
+// to audit and extend than one very large `vec!` initializer.
+#[allow(clippy::vec_init_then_push)]
 pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> AgentReadinessReport {
     let workspace_root = workspace_root.into();
     let mut checks = Vec::new();
@@ -5918,7 +5921,7 @@ fn check_agent_runtime_resume_missing_metadata() -> AgentReadinessCheck {
     let data_dir = Arc::new(SinomoDataDir::new(&data_root));
     let session_id =
         SessionId::from_legacy_named("sess_agent_readiness_resume_missing").expect("session");
-    let result = (|| -> Result<AgentSessionResumeResponse, String> {
+    let result = {
         let service_registry = crate::register_runtime_control_services(
             ServiceRegistry::builder(),
             Arc::new(AgentRuntimeControlRegistry::new()),
@@ -5932,7 +5935,7 @@ fn check_agent_runtime_resume_missing_metadata() -> AgentReadinessCheck {
                 session_id: session_id.clone(),
             },
         )
-    })();
+    };
 
     match result {
         Ok(response)

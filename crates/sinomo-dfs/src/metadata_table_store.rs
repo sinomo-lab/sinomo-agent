@@ -736,16 +736,13 @@ pub(crate) fn current_metadata_table_log_replay(root: &Path) -> Result<MetadataT
         }
     };
     let mut replay = MetadataTableReplay::default();
-    loop {
-        let Some(record) = durable_file::read_length_prefixed_record(
-            &mut file,
-            &path,
-            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
-        )
-        .map_err(metadata_durable_file_error)?
-        else {
-            break;
-        };
+    while let Some(record) = durable_file::read_length_prefixed_record(
+        &mut file,
+        &path,
+        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+    )
+    .map_err(metadata_durable_file_error)?
+    {
         let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&record.bytes) {
             Ok(batch) => batch,
             Err(_) if record.record_end >= record.file_len => {
@@ -854,16 +851,13 @@ fn replay_metadata_table_batches(
     let mut prefix_proof = None;
     let mut journal_reference_replay_cost_bytes = 0u64;
     let mut unpriced_namespace_prepare_references = 0u64;
-    loop {
-        let Some(record) = durable_file::read_length_prefixed_record(
-            file,
-            path,
-            durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
-        )
-        .map_err(metadata_durable_file_error)?
-        else {
-            break;
-        };
+    while let Some(record) = durable_file::read_length_prefixed_record(
+        file,
+        path,
+        durable_file::DurableRecordReadOptions::new(durable_file::DurableLengthEndian::Little),
+    )
+    .map_err(metadata_durable_file_error)?
+    {
         let batch: DfsMetadataTableBatch = match sinomo_object_serde::from_bytes(&record.bytes) {
             Ok(batch) => batch,
             Err(_) if record.record_end >= record.file_len => {
@@ -1221,10 +1215,10 @@ fn remove_metadata_table_snapshot_stages_older_than(
                 path: entry.path(),
                 source,
             })?;
-        if !metadata
+        if metadata
             .modified()
             .ok()
-            .is_some_and(|modified| modified <= stale_before)
+            .is_none_or(|modified| modified > stale_before)
         {
             continue;
         }

@@ -15,6 +15,9 @@ pub(crate) enum NativePickerKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+// Non-desktop builds retain the cross-platform result contract even though
+// their local picker backend can only return `Failed`.
+#[cfg_attr(not(feature = "desktop"), allow(dead_code))]
 pub(crate) enum NativePickerOutcome {
     Selected(Vec<PathBuf>),
     Cancelled,

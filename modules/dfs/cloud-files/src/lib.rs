@@ -530,12 +530,14 @@ fn host_filesystem_provider_response(
             };
             match result {
                 Ok(detail) => {
-                    let mut status = SifsMountRuntimeStatus::default();
-                    status.phase = SifsMountRuntimePhase::Disabled;
-                    status.platform = SifsMountPlatform::ExternalProvider;
-                    status.configured_mount_point = config.mount_point;
-                    status.root_path = config.root_path;
-                    status.detail = detail;
+                    let status = SifsMountRuntimeStatus {
+                        phase: SifsMountRuntimePhase::Disabled,
+                        platform: SifsMountPlatform::ExternalProvider,
+                        configured_mount_point: config.mount_point,
+                        root_path: config.root_path,
+                        detail,
+                        ..SifsMountRuntimeStatus::default()
+                    };
                     HostFilesystemProviderResponse::Stopped(status)
                 }
                 Err(error) => {
@@ -544,10 +546,12 @@ fn host_filesystem_provider_response(
             }
         }
         HostFilesystemProviderRequest::Status { .. } => {
-            let mut status = SifsMountRuntimeStatus::default();
-            status.platform = SifsMountPlatform::ExternalProvider;
-            status.detail =
-                "provider status is emitted by the active reconciliation invocation".to_string();
+            let status = SifsMountRuntimeStatus {
+                platform: SifsMountPlatform::ExternalProvider,
+                detail: "provider status is emitted by the active reconciliation invocation"
+                    .to_string(),
+                ..SifsMountRuntimeStatus::default()
+            };
             HostFilesystemProviderResponse::Status(status)
         }
     }
@@ -557,25 +561,25 @@ fn cloud_files_mount_status(
     config: &sinomo_runtime::dfs::SifsMountConfig,
     response: crate::protocol::CloudFilesMountResponse,
 ) -> SifsMountRuntimeStatus {
-    let mut status = SifsMountRuntimeStatus::default();
-    status.phase = if response.connected {
-        SifsMountRuntimePhase::Connected
-    } else {
-        SifsMountRuntimePhase::Registered
-    };
-    status.platform = SifsMountPlatform::ExternalProvider;
-    status.configured_mount_point = config.mount_point.clone();
-    status.resolved_mount_point = Some(response.sync_root.display().to_string());
-    status.root_path = response.root_path;
-    status.read_only = config.read_only;
-    status.sync_local_changes = config.sync_local_changes;
-    status.provider_registered = true;
-    status.provider_connected = response.connected;
-    status.placeholders_created = Some(response.placeholders_created);
-    status.provider_interface_version =
-        Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string());
-    status.detail = response.detail;
-    status
+    SifsMountRuntimeStatus {
+        phase: if response.connected {
+            SifsMountRuntimePhase::Connected
+        } else {
+            SifsMountRuntimePhase::Registered
+        },
+        platform: SifsMountPlatform::ExternalProvider,
+        configured_mount_point: config.mount_point.clone(),
+        resolved_mount_point: Some(response.sync_root.display().to_string()),
+        root_path: response.root_path,
+        read_only: config.read_only,
+        sync_local_changes: config.sync_local_changes,
+        provider_registered: true,
+        provider_connected: response.connected,
+        placeholders_created: Some(response.placeholders_created),
+        provider_interface_version: Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string()),
+        detail: response.detail,
+        ..SifsMountRuntimeStatus::default()
+    }
 }
 
 fn host_filesystem_provider_error(error: CloudFilesModuleError) -> HostFilesystemProviderError {

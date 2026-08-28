@@ -3377,10 +3377,8 @@ impl Filesystem for SifsFuseFileSystem {
         let commit_succeeded = commit_result.is_ok();
         let close_result = self.close_advisory_locks_for_release(fh, lock_owner);
         let result = commit_result.and(close_result);
-        if commit_succeeded {
-            if let Ok(mut state) = self.lock_state() {
-                state.handles.remove(&fh);
-            }
+        if commit_succeeded && let Ok(mut state) = self.lock_state() {
+            state.handles.remove(&fh);
         }
         match result {
             Ok(()) => reply.ok(),

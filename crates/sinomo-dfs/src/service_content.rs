@@ -19,17 +19,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Ok((manifest, reader)) = self
             .content
             .open_object_version_stream(pending.object_id.as_str(), pending.version.as_str())
+            && manifest.content_hash == pending.content_hash
+            && (pending.size_bytes == 0 || manifest.size_bytes == pending.size_bytes)
         {
-            if manifest.content_hash == pending.content_hash
-                && (pending.size_bytes == 0 || manifest.size_bytes == pending.size_bytes)
-            {
-                return Ok(reader);
-            }
-            // Concurrent serialized writers can transiently share an
-            // object/version identity while retaining distinct immutable
-            // blobs. The manifest names only the latest contender; fall back
-            // to the pending intent's exact content hash below.
+            return Ok(reader);
         }
+        // Concurrent serialized writers can transiently share an
+        // object/version identity while retaining distinct immutable
+        // blobs. The manifest names only the latest contender; fall back
+        // to the pending intent's exact content hash below.
 
         let reader = self.content.open_blob_stream(&pending.content_hash)?;
         if pending.size_bytes != 0 && reader.size_bytes() != pending.size_bytes {

@@ -5207,7 +5207,7 @@ fn optional_trimmed_string(value: &str) -> Option<String> {
 
 fn parse_agent_list(value: &str) -> Vec<String> {
     value
-        .split(|ch| ch == '\n' || ch == ',')
+        .split(['\n', ','])
         .map(str::trim)
         .filter(|item| !item.is_empty())
         .map(str::to_string)
@@ -11915,7 +11915,7 @@ where
         .theme_when(clone_reader(reader))
         .on_change(move |value| {
             let mut settings = s.settings_mut();
-            on_change(&mut *settings, value);
+            on_change(&mut settings, value);
         });
     FormRow::new(label, input)
         .inline()
@@ -11943,7 +11943,7 @@ where
             .theme_when(clone_reader(reader))
             .on_change(move |value| {
                 let mut settings = s.settings_mut();
-                on_change(&mut *settings, value);
+                on_change(&mut settings, value);
             }),
     );
     FormRow::new(label, area)
@@ -13523,48 +13523,49 @@ fn config_row(shared: &Shared, reader: &ThemeReader, index: usize) -> impl Widge
     let bool_value = item.bool_value;
     let display_key = key.trim_start_matches('/').to_string();
 
-    if let Some(on) = bool_value {
-        if edit_kind == ConfigEditKind::Bool && !item.read_only {
-            let on_toggle = {
-                let s = shared.clone();
-                let key = key.clone();
-                move |next: bool| {
-                    queue_settings_operation(
-                        &s,
-                        SettingsOperationScope::ConfigField(config_field_key(&key)),
-                        SettingsOperation::SetConfigBool {
-                            key: key.clone(),
-                            value: next,
-                        },
-                    );
-                }
-            };
-            let mut details = Stack::vertical()
-                .spacing(5.0)
-                .alignment(Alignment::Stretch)
-                .with_child(
-                    Switch::new("Applies immediately")
-                        .on(on)
-                        .theme_when(clone_reader(reader))
-                        .on_toggle(on_toggle),
-                )
-                .with_child(muted_label_with_token(
-                    shared,
-                    config_metadata_line(&item),
-                    shared.theme().text.xs,
-                ));
-            if !item.description.trim().is_empty() {
-                details = details.with_child(muted_meta_label(
-                    shared,
-                    short_one_line(&item.description, 128),
-                ));
+    if let Some(on) = bool_value
+        && edit_kind == ConfigEditKind::Bool
+        && !item.read_only
+    {
+        let on_toggle = {
+            let s = shared.clone();
+            let key = key.clone();
+            move |next: bool| {
+                queue_settings_operation(
+                    &s,
+                    SettingsOperationScope::ConfigField(config_field_key(&key)),
+                    SettingsOperation::SetConfigBool {
+                        key: key.clone(),
+                        value: next,
+                    },
+                );
             }
-            return PodHost::new(WidgetPod::new(
-                FormRow::new(display_key, details)
-                    .stacked()
-                    .theme_when(clone_reader(reader)),
+        };
+        let mut details = Stack::vertical()
+            .spacing(5.0)
+            .alignment(Alignment::Stretch)
+            .with_child(
+                Switch::new("Applies immediately")
+                    .on(on)
+                    .theme_when(clone_reader(reader))
+                    .on_toggle(on_toggle),
+            )
+            .with_child(muted_label_with_token(
+                shared,
+                config_metadata_line(&item),
+                shared.theme().text.xs,
+            ));
+        if !item.description.trim().is_empty() {
+            details = details.with_child(muted_meta_label(
+                shared,
+                short_one_line(&item.description, 128),
             ));
         }
+        return PodHost::new(WidgetPod::new(
+            FormRow::new(display_key, details)
+                .stacked()
+                .theme_when(clone_reader(reader)),
+        ));
     }
 
     let expanded = shared.settings().advanced_detail_expanded(&key);
@@ -14933,29 +14934,29 @@ fn config_json_summary(item: &ConfigItem) -> String {
             short_one_line(&item.edit_value, 96)
         };
     };
-    if item.key.trim_matches('/') == "lm.providers" {
-        if let Some(accounts) = value.get("accounts").and_then(Value::as_array) {
-            let enabled = accounts
-                .iter()
-                .filter(|account| {
-                    account
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                })
-                .count();
-            let suffix = if contains_sensitive_json_field(&value) {
-                " · sensitive fields redacted"
-            } else {
-                ""
-            };
-            return format!(
-                "Provider config · {} accounts · {} enabled{}",
-                accounts.len(),
-                enabled,
-                suffix
-            );
-        }
+    if item.key.trim_matches('/') == "lm.providers"
+        && let Some(accounts) = value.get("accounts").and_then(Value::as_array)
+    {
+        let enabled = accounts
+            .iter()
+            .filter(|account| {
+                account
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .count();
+        let suffix = if contains_sensitive_json_field(&value) {
+            " · sensitive fields redacted"
+        } else {
+            ""
+        };
+        return format!(
+            "Provider config · {} accounts · {} enabled{}",
+            accounts.len(),
+            enabled,
+            suffix
+        );
     }
     let mut summary = match &value {
         Value::Null => "Unset".to_string(),
@@ -16084,10 +16085,7 @@ fn validate_external_http_url(url: &str) -> Result<&str, String> {
     if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
         return Err("only http and https URLs can be opened".to_string());
     }
-    let authority = location
-        .split(|character| matches!(character, '/' | '?' | '#'))
-        .next()
-        .unwrap_or_default();
+    let authority = location.split(['/', '?', '#']).next().unwrap_or_default();
     if authority.is_empty() {
         return Err("URL is missing a host".to_string());
     }
@@ -19398,7 +19396,7 @@ mod tests {
             Some(false)
         );
         assert!(
-            !sinomo_runtime::dfs::dfs_module_enabled(&backend.data_dir.root())
+            !sinomo_runtime::dfs::dfs_module_enabled(backend.data_dir.root())
                 .expect("read DFS module state")
         );
         assert!(

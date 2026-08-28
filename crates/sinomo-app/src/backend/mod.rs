@@ -984,6 +984,15 @@ fn register_agent_runtime_component_config_definitions(
     sinomo_evolution::register_config_definitions(builder).map_err(|error| error.to_string())
 }
 
+fn short_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.len() <= 10 {
+        trimmed.to_string()
+    } else {
+        format!("{}…", &trimmed[..10])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,14 +1342,5 @@ mod tests {
                 Some(sinomo_agent::AGENT_RPC_CATEGORY)
             );
         }
-    }
-}
-
-fn short_id(id: &str) -> String {
-    let trimmed = id.trim();
-    if trimmed.len() <= 10 {
-        trimmed.to_string()
-    } else {
-        format!("{}…", &trimmed[..10])
     }
 }

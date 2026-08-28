@@ -1108,9 +1108,8 @@ fn inspect_authorized_cursor_recovery_cut(
     let audit_is_expected = audit_bytes == plan.expected_audit;
     let rewrite_present = rewrite.is_some();
     let cut_is_valid = if rewrite_present {
-        (state_is_original && audit_is_original)
-            || (state_is_expected && audit_is_original)
-            || (state_is_expected && audit_is_expected)
+        (state_is_expected || state_is_original) && audit_is_original
+            || state_is_expected && audit_is_expected
     } else {
         state_is_original && audit_is_original
     };
@@ -4364,7 +4363,7 @@ impl CloudFilesNamespaceReconciler {
             self.usable = false;
             return Err(error);
         }
-        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterIntent) {
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::Intent) {
             self.usable = false;
             return Err(reconcile_error(
                 "injected-cursor-recovery-page-crash",
@@ -4378,7 +4377,7 @@ impl CloudFilesNamespaceReconciler {
             self.usable = false;
             return Err(error);
         }
-        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterManifest) {
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::Manifest) {
             self.usable = false;
             return Err(reconcile_error(
                 "injected-cursor-recovery-page-crash",
@@ -4394,7 +4393,7 @@ impl CloudFilesNamespaceReconciler {
             self.usable = false;
             return Err(storage_error("persist cursor recovery page state")(source));
         }
-        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::AfterState) {
+        if cursor_recovery_page_crash_is_armed(CursorRecoveryPageCrashCut::State) {
             self.usable = false;
             return Err(reconcile_error(
                 "injected-cursor-recovery-page-crash",
@@ -4424,9 +4423,9 @@ std::thread_local! {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CursorRecoveryPageCrashCut {
-    AfterIntent = 1,
-    AfterManifest = 2,
-    AfterState = 3,
+    Intent = 1,
+    Manifest = 2,
+    State = 3,
 }
 
 #[cfg(test)]
@@ -4449,9 +4448,9 @@ fn cursor_recovery_page_crash_is_armed(cut: CursorRecoveryPageCrashCut) -> bool 
 #[cfg(not(test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CursorRecoveryPageCrashCut {
-    AfterIntent,
-    AfterManifest,
-    AfterState,
+    Intent,
+    Manifest,
+    State,
 }
 
 #[cfg(not(test))]
@@ -7721,19 +7720,19 @@ mod tests {
         for (name, cut, manifest_committed, state_committed) in [
             (
                 "recovery-page-before-before",
-                CursorRecoveryPageCrashCut::AfterIntent,
+                CursorRecoveryPageCrashCut::Intent,
                 false,
                 false,
             ),
             (
                 "recovery-page-before-after",
-                CursorRecoveryPageCrashCut::AfterManifest,
+                CursorRecoveryPageCrashCut::Manifest,
                 true,
                 false,
             ),
             (
                 "recovery-page-after-after",
-                CursorRecoveryPageCrashCut::AfterState,
+                CursorRecoveryPageCrashCut::State,
                 true,
                 true,
             ),
@@ -7788,7 +7787,7 @@ mod tests {
         let forged_path = "/services/forged-link";
         inject_unsupported_recovery_page_cut(
             &forged,
-            CursorRecoveryPageCrashCut::AfterManifest,
+            CursorRecoveryPageCrashCut::Manifest,
             forged_path,
         );
         let intent_path = forged.scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);
@@ -7829,7 +7828,7 @@ mod tests {
         let multiple = cursor_recovery_fixture("recovery-page-multiple");
         inject_unsupported_recovery_page_cut(
             &multiple,
-            CursorRecoveryPageCrashCut::AfterIntent,
+            CursorRecoveryPageCrashCut::Intent,
             "/services/multiple-link",
         );
         let final_path = multiple.scope.join(CURSOR_RECOVERY_PAGE_INTENT_FILE);

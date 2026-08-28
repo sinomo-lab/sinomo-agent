@@ -134,11 +134,12 @@ fn r1_crates_cross_the_r0_boundary_through_sinomo_core() {
                     {
                         continue;
                     }
-                    assert!(
-                        !FACADE_MIGRATION_COMPLETE,
-                        "{} (r1) must depend on sinomo-core instead of directly on {} (r0)",
-                        package.name, dependency_manifest.name
-                    );
+                    if FACADE_MIGRATION_COMPLETE {
+                        panic!(
+                            "{} (r1) must depend on sinomo-core instead of directly on {} (r0)",
+                            package.name, dependency_manifest.name
+                        );
+                    }
                 }
                 "r1-boundary" => {
                     // Native-dylib module packages under modules/ are leaf
@@ -661,10 +662,11 @@ fn parse_feature_value(manifest_text: &str, key: &str) -> Option<String> {
         if in_features && trimmed.starts_with('[') {
             return None;
         }
-        if in_features && let Some((actual_key, raw_value)) = trimmed.split_once('=') {
-            if actual_key.trim() == key {
-                return Some(raw_value.trim().to_string());
-            }
+        if in_features
+            && let Some((actual_key, raw_value)) = trimmed.split_once('=')
+            && actual_key.trim() == key
+        {
+            return Some(raw_value.trim().to_string());
         }
     }
     None

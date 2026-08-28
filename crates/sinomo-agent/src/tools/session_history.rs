@@ -705,13 +705,15 @@ mod tests {
             SessionHistorySearchPage::complete(vec![one_match()]),
         )));
         let principal = SessionHistorySearchPrincipal::new(" main-agent ").expect("principal");
-        let mut limits = SessionHistorySearchLimits::default();
-        limits.max_result_limit = 3;
-        limits.max_scanned_activities = 11;
-        limits.max_scanned_items = 22;
-        limits.max_scanned_bytes = 33;
-        limits.max_title_bytes = 44;
-        limits.max_author_bytes = 55;
+        let limits = SessionHistorySearchLimits {
+            max_result_limit: 3,
+            max_scanned_activities: 11,
+            max_scanned_items: 22,
+            max_scanned_bytes: 33,
+            max_title_bytes: 44,
+            max_author_bytes: 55,
+            ..SessionHistorySearchLimits::default()
+        };
         let tool = SessionHistorySearchTool::new(principal, backend.clone()).with_limits(limits);
 
         let result = execute(
@@ -743,9 +745,11 @@ mod tests {
     fn invalid_query_and_cursor_are_rejected_before_backend_execution() {
         let backend = Arc::new(RecordingBackend::default());
         let principal = SessionHistorySearchPrincipal::new("main-agent").expect("principal");
-        let mut limits = SessionHistorySearchLimits::default();
-        limits.max_query_bytes = 4;
-        limits.max_cursor_bytes = 3;
+        let limits = SessionHistorySearchLimits {
+            max_query_bytes: 4,
+            max_cursor_bytes: 3,
+            ..SessionHistorySearchLimits::default()
+        };
         let tool = SessionHistorySearchTool::new(principal, backend.clone()).with_limits(limits);
 
         let empty = execute(&tool, serde_json::json!({ "query": "   " }));

@@ -685,11 +685,12 @@ pub use renewable_lease::{
     DfsRenewableLeaseAnchor, DfsRenewableLeaseConfig, DfsRenewableLeaseError,
     DfsRenewableLeaseStatus,
 };
+#[cfg(test)]
+pub(crate) use repair::repair_rejection_indicates_stale_replica_base;
 pub(crate) use repair::{
     repair_attempt_record_indicates_lost_authority,
     repair_attempt_record_indicates_transient_route_failure,
     repair_error_indicates_transient_route_failure, repair_rejection_indicates_lost_authority,
-    repair_rejection_indicates_stale_replica_base,
 };
 pub use repair_queue_store::{
     DfsRepairQueueBoundedStatus, DfsRepairQueueCompactionOptions, DfsRepairQueueCompactionReport,

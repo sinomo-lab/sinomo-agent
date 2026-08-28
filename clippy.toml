@@ -1,0 +1,8 @@
+# Sinomo's typed wire envelopes and host adapters intentionally carry richer
+# variants/signatures than Clippy's general-purpose defaults. Keep these
+# thresholds high enough to flag real outliers without requiring per-function
+# suppressions throughout the workspace.
+too-many-arguments-threshold = 20
+type-complexity-threshold = 1000
+enum-variant-size-threshold = 4096
+large-error-threshold = 4096

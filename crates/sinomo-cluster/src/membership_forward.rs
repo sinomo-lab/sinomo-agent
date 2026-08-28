@@ -154,7 +154,7 @@ pub async fn forward_cluster_membership_rpc_to_state_authority_async_with_host(
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
+    host: &mut impl ClusterObjectRpcAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let result = forward_cluster_membership_rpc_to_state_authority_async_with_call_factory(
         runtime,
@@ -177,7 +177,7 @@ pub(crate) async fn forward_cluster_membership_value_to_state_authority_async_wi
     request_head: &ObjectRpcRequest,
     request_value: &Q,
     failure_detail: &str,
-    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
+    host: &mut impl ClusterObjectRpcAsyncHost,
 ) -> Result<R, NetworkError>
 where
     Q: Serialize + Sync + ?Sized,
@@ -212,7 +212,7 @@ async fn forward_cluster_membership_rpc_to_state_authority_async_with_call_facto
     state: &ClusterBootstrapState,
     request: &ObjectRpcRequest,
     failure_detail: &str,
-    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
+    host: &mut impl ClusterObjectRpcAsyncHost,
     timeout: Duration,
     mut make_call: F,
 ) -> Result<ObjectRpcResult, NetworkError>
@@ -452,7 +452,7 @@ pub async fn forward_cluster_join_challenge_rpc_to_state_authority_async_with_ho
     runtime: &tokio::runtime::Handle,
     paths: &ClusterPaths,
     request: &ObjectRpcRequest,
-    host: &mut (impl ClusterObjectRpcAsyncHost + Send),
+    host: &mut impl ClusterObjectRpcAsyncHost,
 ) -> Result<ObjectRpcResponse, NetworkError> {
     let state_paths = paths.clone();
     let state = runtime

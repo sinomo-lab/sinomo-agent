@@ -4,15 +4,11 @@ pub const BUSYBOX_WASI_CONFIG_FRAGMENT: &str =
     include_str!("../toolchains/busybox/busybox-wasi.fragment");
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SandboxTempPolicy {
+    #[default]
     ClearOnSessionStart,
     RetainAcrossSessions,
-}
-
-impl Default for SandboxTempPolicy {
-    fn default() -> Self {
-        Self::ClearOnSessionStart
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -31,15 +27,11 @@ pub struct SandboxMount {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SandboxInstancePortability {
     Portable,
+    #[default]
     NonPortable,
-}
-
-impl Default for SandboxInstancePortability {
-    fn default() -> Self {
-        Self::NonPortable
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -52,16 +44,12 @@ pub struct SandboxRuntimeBinding {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum SandboxInstanceLifecycleStatus {
+    #[default]
     Created,
     Running,
     Stopped,
-}
-
-impl Default for SandboxInstanceLifecycleStatus {
-    fn default() -> Self {
-        Self::Created
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -146,16 +134,16 @@ impl SandboxResourceLimits {
 fn host_memory_limit_mb() -> u64 {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
-            if let Some(kb) = meminfo.lines().find_map(|line| {
+        if let Ok(meminfo) = fs::read_to_string("/proc/meminfo")
+            && let Some(kb) = meminfo.lines().find_map(|line| {
                 let mut fields = line.split_whitespace();
                 match (fields.next(), fields.next()) {
                     (Some("MemTotal:"), Some(value)) => value.parse::<u64>().ok(),
                     _ => None,
                 }
-            }) {
-                return kb.saturating_add(1023) / 1024;
-            }
+            })
+        {
+            return kb.saturating_add(1023) / 1024;
         }
     }
     u64::MAX / (1024 * 1024)

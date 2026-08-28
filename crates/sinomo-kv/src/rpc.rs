@@ -102,7 +102,7 @@ impl From<&ClusterKvTxnCommitResult> for ClusterKvTxnRpcResponse {
             submitted_command_digest: Some(response.command_digest),
             command_digest: response.command_digest,
             txn_response: response.txn_response.clone(),
-            authority: response.authority.clone(),
+            authority: response.authority,
             replayed_committed_request: response.replayed_committed_request,
         }
     }

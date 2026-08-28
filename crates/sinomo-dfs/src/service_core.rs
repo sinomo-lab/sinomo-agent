@@ -234,7 +234,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         Ok(())
     }
 
-    pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + Send + 'static) -> Self {
+    pub fn with_control_plane(mut self, kv: impl DfsControlPlaneKvClient + 'static) -> Self {
         self.control_plane = Some(Box::new(kv));
         self
     }
@@ -295,7 +295,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn with_metadata_backend(
         mut self,
-        backend: impl DfsMetadataBackend + Send + 'static,
+        backend: impl DfsMetadataBackend + 'static,
     ) -> Result<Self, DfsError> {
         self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
         self.hydrate_from_metadata_backend()?;
@@ -304,7 +304,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn with_metadata_backend_lazy(
         mut self,
-        backend: impl DfsMetadataBackend + Send + 'static,
+        backend: impl DfsMetadataBackend + 'static,
     ) -> Result<Self, DfsError> {
         self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
         self.hydrate_file_systems_from_metadata_backend()?;
@@ -314,7 +314,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     #[cfg(test)]
     pub(crate) fn set_metadata_backend_unhydrated(
         &mut self,
-        backend: impl DfsMetadataBackend + Send + 'static,
+        backend: impl DfsMetadataBackend + 'static,
     ) {
         self.metadata_backend = Some(DfsMetadataBackendOwner::Owned(Box::new(backend)));
     }
@@ -783,11 +783,10 @@ mod projection_release_tests {
             ),
         );
         assert!(!service.can_release_hydrated_metadata_projection());
-        assert_eq!(
-            service
+        assert!(
+            !service
                 .release_hydrated_metadata_projection_if_quiescent()
-                .expect("blocked release"),
-            false
+                .expect("blocked release")
         );
         service.pending_writes.clear();
 

@@ -390,7 +390,7 @@ mod tests {
         let left = ClusterIdentityRecord::from(&state);
         let mut right = left.clone();
         right.kv_revision += 1;
-        right.updated_at = right.updated_at + time::Duration::minutes(1);
+        right.updated_at += time::Duration::minutes(1);
 
         assert!(cluster_identity_record_stable_eq(&left, &right));
 
@@ -418,7 +418,7 @@ mod tests {
         member.allowed_capabilities = member.capabilities.clone();
         let left = ClusterCapabilityPolicyRecord::from(&member);
         let mut right = left.clone();
-        right.updated_at = right.updated_at + time::Duration::minutes(1);
+        right.updated_at += time::Duration::minutes(1);
 
         assert!(cluster_capability_policy_stable_eq(&left, &right));
 
@@ -518,7 +518,7 @@ mod tests {
         };
         let mut right = left.clone();
         right.pid = Some(200);
-        right.observed_at = right.observed_at + time::Duration::minutes(1);
+        right.observed_at += time::Duration::minutes(1);
 
         assert!(cluster_node_status_stable_eq(&left, &right));
 
@@ -546,7 +546,7 @@ mod tests {
             updated_at: timestamp,
         };
         let mut right = left.clone();
-        right.updated_at = right.updated_at + time::Duration::minutes(1);
+        right.updated_at += time::Duration::minutes(1);
 
         assert!(cluster_invitation_state_stable_eq(&left, &right));
 

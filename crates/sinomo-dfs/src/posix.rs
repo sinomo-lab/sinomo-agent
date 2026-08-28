@@ -2326,7 +2326,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     object,
                     target_version,
                     expected_base_version,
-                    bytes: *bytes,
+                    bytes,
                     metadata_shard,
                     parent_touch,
                     link_count_hint,
@@ -3107,7 +3107,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 let attrs = create_attrs.unwrap_or_else(DfsPosixCreateAttrs::file_default);
                 let attrs = self.posix_create_attrs_for_object_authority(&object, attrs, false)?;
                 apply_posix_create_attrs(&mut object, attrs);
-                if let Some(operation_id) = operation_id.as_deref() {
+                if let Some(operation_id) = operation_id {
                     object.object_id = stable_create_object_id(&self.node_id, &path, operation_id);
                 }
                 self.add_transient_object_metadata(object.clone())?;

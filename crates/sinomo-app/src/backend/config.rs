@@ -1608,7 +1608,7 @@ fn optional_trimmed(value: &str) -> Option<String> {
 }
 
 fn write_provider_config(client: &dyn ConfigClient, config: &ModelConfig) -> Result<(), String> {
-    let value = serde_json::to_value(&config).map_err(|e| e.to_string())?;
+    let value = serde_json::to_value(config).map_err(|e| e.to_string())?;
     client
         .set(LM_PROVIDER_CONFIG_KEY, value, ConfigWriteTarget::Auto)
         .map(|_| ())

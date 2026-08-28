@@ -1001,16 +1001,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 "metadata snapshot ingest requires a committed control-plane shard view"
                     .to_string(),
             )
-        } else if command.file_system_id.is_none() || command.authority_epoch.is_none() {
-            Err(
-                "metadata snapshot install is missing exact filesystem and authority epoch identity"
-                    .to_string(),
-            )
-        } else {
-            let file_system_id = command
-                .file_system_id
-                .as_ref()
-                .expect("snapshot filesystem identity checked above");
+        } else if let (Some(file_system_id), Some(_)) =
+            (command.file_system_id.as_ref(), command.authority_epoch)
+        {
             let control_plane = self
                 .control_plane
                 .as_mut()
@@ -1044,6 +1037,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // configured replicas.
                 Some(shard) => Ok(shard),
             }
+        } else {
+            Err(
+                "metadata snapshot install is missing exact filesystem and authority epoch identity"
+                    .to_string(),
+            )
         };
         let (permit, rejection) = match authority_shard {
             Ok(shard) => {
@@ -1434,7 +1432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .expect("metadata backend checked above");
             if let Some(replication) = command.durable_replication.as_ref() {
                 backend.persist_journal_frames_with_replica_permit_report(
-                    &permit,
+                    permit,
                     &command.batch,
                     &replication.journal_frames,
                 )
@@ -1448,7 +1446,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .as_ref()
                     .expect("durable authority probe checked above");
                 backend.persist_authority_journal_frames_with_replica_permit_report(
-                    &permit,
+                    permit,
                     &command.batch,
                     &probe.journal_frames,
                     probe
@@ -1457,10 +1455,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .expect("durable authority prefix validated above"),
                 )
             } else if command.authority_probe.is_some() {
-                backend.apply_journal_batch_with_replica_permit_report(&permit, &command.batch)
+                backend.apply_journal_batch_with_replica_permit_report(permit, &command.batch)
             } else {
                 backend
-                    .apply_journal_batch_with_replica_permit(&permit, &command.batch)
+                    .apply_journal_batch_with_replica_permit(permit, &command.batch)
                     .map(DfsMetadataReplicaApplyReport::without_authority_proofs)
             }
         };

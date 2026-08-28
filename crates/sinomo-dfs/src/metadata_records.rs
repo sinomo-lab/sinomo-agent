@@ -3529,7 +3529,7 @@ pub(crate) fn metadata_journal_batch_file_system_id(
     batch
         .entries
         .iter()
-        .find_map(|entry| match &entry.mutation {
+        .map(|entry| match &entry.mutation {
             DfsMetadataMutation::PutFileSystem { file_system_id, .. }
             | DfsMetadataMutation::PutObject { file_system_id, .. }
             | DfsMetadataMutation::PutVersion { file_system_id, .. }
@@ -3562,9 +3562,10 @@ pub(crate) fn metadata_journal_batch_file_system_id(
             | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
             | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
             | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
-                Some(file_system_id.clone())
+                file_system_id.clone()
             }
         })
+        .next()
 }
 
 pub(crate) fn read_conflicts_reason(conflicts: Vec<DfsConflictReadView>) -> String {

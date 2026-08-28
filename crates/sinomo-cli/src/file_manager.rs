@@ -397,7 +397,7 @@ impl FileManagerState {
                 return preview;
             }
         }
-        if read.bytes.iter().any(|byte| *byte == 0) {
+        if read.bytes.contains(&0) {
             return FileManagerPreview::new(
                 format!("Binary {}", entry.name),
                 vec![format!(
@@ -458,13 +458,8 @@ impl FileManagerBackend for LocalFileManagerBackend {
         } else {
             PathBuf::from(path)
         };
-        let metadata = fs::metadata(&path)
-            .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
-        let normalized = if metadata.is_dir() {
-            path.canonicalize().unwrap_or(path)
-        } else {
-            path.canonicalize().unwrap_or(path)
-        };
+        fs::metadata(&path).map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+        let normalized = path.canonicalize().unwrap_or(path);
         Ok(normalized.to_string_lossy().into_owned())
     }
 

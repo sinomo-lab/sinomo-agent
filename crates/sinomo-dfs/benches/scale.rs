@@ -1834,10 +1834,7 @@ fn run_network_blob(args: &Args) -> BenchResult<()> {
         .into());
     }
 
-    for (replica_node, finalize_sender) in replica_nodes
-        .iter()
-        .zip(replica_finalize_senders.into_iter())
-    {
+    for (replica_node, finalize_sender) in replica_nodes.iter().zip(replica_finalize_senders) {
         finalize_sender.send(()).map_err(|_| {
             format!("replica {replica_node} stopped before its finalize barrier was released")
         })?;

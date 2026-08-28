@@ -479,9 +479,9 @@ fn sample_os_network_metering() -> sinomo_dfs::DfsNetworkMetering {
             "device",
             "show",
         ]);
-        return command_stdout_bounded(command, DAEMON_DFS_METERING_QUERY_TIMEOUT)
+        command_stdout_bounded(command, DAEMON_DFS_METERING_QUERY_TIMEOUT)
             .map(|output| parse_network_manager_metering(&output))
-            .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown);
+            .unwrap_or(sinomo_dfs::DfsNetworkMetering::Unknown)
     }
     #[cfg(target_os = "windows")]
     {

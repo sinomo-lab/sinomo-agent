@@ -1437,10 +1437,9 @@ pub(crate) fn mark_cluster_identity_restart_after_response(
     if stop
         && sinomo_core::cluster::cluster_control_route_requires_runtime_restart(route)
         && let Some(paths) = paths
+        && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
     {
-        if let Err(error) = crate::rollout::request_supervised_main_restart(paths) {
-            tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
-        }
+        tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
     }
 }
 
@@ -5266,7 +5265,6 @@ mod tests {
                 .compare_and_put_placement_update(&first_config, &second_config, &second_job)
                 .expect("second activity Apply")
         );
-        drop(store);
         sinomo_core::kv::write_cluster_kv_snapshot(
             &cluster_paths.kv_paths(),
             &kv.try_snapshot().expect("activity KV snapshot"),
@@ -7785,8 +7783,7 @@ mod tests {
         assert!(
             dfs_status
                 .observability
-                .get("module.registry.snapshot_version")
-                .is_some()
+                .contains_key("module.registry.snapshot_version")
         );
         assert_eq!(
             dfs_status
@@ -9020,15 +9017,12 @@ mod tests {
             .iter()
             .copied()
             .chain(CLUSTER_RAFT_RPC_ROUTES.iter().copied())
-            .chain(
-                [
-                    CLUSTER_JOIN_CHALLENGE_ROUTE,
-                    CLUSTER_JOIN_REGISTER_ROUTE,
-                    CLUSTER_INVITE_PUBLISH_ROUTE,
-                    CLUSTER_MEMBER_PUBLISH_ROUTE,
-                ]
-                .into_iter(),
-            )
+            .chain([
+                CLUSTER_JOIN_CHALLENGE_ROUTE,
+                CLUSTER_JOIN_REGISTER_ROUTE,
+                CLUSTER_INVITE_PUBLISH_ROUTE,
+                CLUSTER_MEMBER_PUBLISH_ROUTE,
+            ])
             .chain(
                 sinomo_core::cluster::CLUSTER_CONTROL_RPC_ROUTES
                     .iter()

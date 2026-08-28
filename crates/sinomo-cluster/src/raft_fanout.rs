@@ -712,9 +712,11 @@ mod tests {
             member.node_public_key = format!("pk-{name}");
             member.role = role;
             member.state = member_state;
-            member.capabilities = main_daemon
-                .then(|| vec![main_capability.clone()])
-                .unwrap_or_default();
+            member.capabilities = if main_daemon {
+                vec![main_capability.clone()]
+            } else {
+                Default::default()
+            };
             state.members.push(member);
             node_id
         };

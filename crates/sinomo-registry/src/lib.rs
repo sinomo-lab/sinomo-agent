@@ -832,7 +832,7 @@ pub fn read_release_material_from_path(
     path: impl AsRef<Path>,
 ) -> Result<Option<VerifiedReleaseMaterialRecord>, RegistryError> {
     let path = path.as_ref();
-    match fs::read_to_string(&path) {
+    match fs::read_to_string(path) {
         Ok(content) => serde_json::from_str(&content).map(Some).map_err(|source| {
             RegistryError::VerifiedRolloutMaterialStoreParse {
                 path: path.display().to_string(),

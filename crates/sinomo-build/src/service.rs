@@ -1154,7 +1154,7 @@ fn build_executor_for_targets(
     rustc_program: &Path,
     configured_targets: Option<std::borrow::Cow<'_, str>>,
 ) -> Result<CargoBuildExecutor, String> {
-    let toolchain = crate::inspect_cargo_toolchain(&rustc_program, cargo_program)
+    let toolchain = crate::inspect_cargo_toolchain(rustc_program, cargo_program)
         .map_err(|error| format!("inspect build toolchain: {error}"))?;
     let mut triples = vec![toolchain.host_target.clone()];
     if let Some(configured) = configured_targets {
@@ -1168,7 +1168,7 @@ fn build_executor_for_targets(
     let capabilities = triples
         .into_iter()
         .map(|triple| {
-            let target = crate::inspect_rust_target(&rustc_program, &triple)
+            let target = crate::inspect_rust_target(rustc_program, &triple)
                 .map_err(|error| format!("inspect configured build target {triple}: {error}"))?;
             Ok(BuildTargetCapability {
                 target,

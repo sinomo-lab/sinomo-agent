@@ -347,7 +347,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         &cluster_paths,
         &cluster_state,
         runtime,
-        Some(&metadata_authority_preflight),
+        Some(metadata_authority_preflight),
     )
     .map_err(DaemonError::from)?;
     let DaemonDfsMaintenanceServiceLane {

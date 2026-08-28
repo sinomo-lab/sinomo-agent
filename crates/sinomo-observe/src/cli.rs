@@ -1860,22 +1860,30 @@ fn validate_cluster_trace_collection(
         .iter()
         .map(|error| format!("{}: {}", error.target_node_id, error.error))
         .collect::<Vec<_>>();
-    issues.extend(response.targets.iter().filter_map(|target| {
-        target.response.truncated.then(|| {
-            format!(
-                "{}: trace buffer incomplete (dropped_records={})",
-                target.target_node_id, target.response.dropped_records
-            )
-        })
-    }));
-    issues.extend(response.targets.iter().filter_map(|target| {
-        (target.response.capture_active != Some(true)).then(|| {
-            format!(
-                "{}: requested capture is no longer active",
-                target.target_node_id
-            )
-        })
-    }));
+    issues.extend(
+        response
+            .targets
+            .iter()
+            .filter(|&target| target.response.truncated)
+            .map(|target| {
+                format!(
+                    "{}: trace buffer incomplete (dropped_records={})",
+                    target.target_node_id, target.response.dropped_records
+                )
+            }),
+    );
+    issues.extend(
+        response
+            .targets
+            .iter()
+            .filter(|&target| target.response.capture_active != Some(true))
+            .map(|target| {
+                format!(
+                    "{}: requested capture is no longer active",
+                    target.target_node_id
+                )
+            }),
+    );
     if issues.is_empty() {
         Ok(())
     } else {
@@ -1962,7 +1970,7 @@ fn observe_control(
             context,
             response,
             options.json,
-            |context, response, json| print_observe_control_response(context, response, json),
+            print_observe_control_response,
         );
     }
     let response = if rpc.is_some() {

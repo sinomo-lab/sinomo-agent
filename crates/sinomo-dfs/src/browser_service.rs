@@ -991,13 +991,13 @@ impl DfsBrowserBackend {
             .ok_or_else(|| {
                 ServiceError::Service(format!("no SIFS metadata shard controls {path}"))
             })?;
-        if let Some(expected_epoch) = request.expected_epoch {
-            if previous.epoch != expected_epoch {
-                return Err(ServiceError::Service(format!(
-                    "SIFS metadata shard {} epoch is {}, expected {}",
-                    previous.shard_id, previous.epoch, expected_epoch
-                )));
-            }
+        if let Some(expected_epoch) = request.expected_epoch
+            && previous.epoch != expected_epoch
+        {
+            return Err(ServiceError::Service(format!(
+                "SIFS metadata shard {} epoch is {}, expected {}",
+                previous.shard_id, previous.epoch, expected_epoch
+            )));
         }
         if previous.primary_node_id == local_node_id {
             return Ok(crate::DaemonDfsBrowserTransferMetadataPrimaryResponse {

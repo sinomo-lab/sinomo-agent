@@ -489,7 +489,10 @@ pub struct MiniCpmV46VisionAttention {
 
 impl MiniCpmV46VisionAttention {
     pub fn new(config: &MiniCpmV46VisionConfig, vb: VarBuilder) -> Result<Self> {
-        if config.hidden_size % config.num_attention_heads != 0 {
+        if !config
+            .hidden_size
+            .is_multiple_of(config.num_attention_heads)
+        {
             return Err(MiniCpmV46Error::InvalidInput {
                 detail: format!(
                     "vision hidden_size {} must be divisible by num_attention_heads {}",
@@ -739,6 +742,12 @@ impl MiniCpmV46NativeVisionTower {
         })
     }
 
+    /// Constructs the vision encoder from memory-mapped safetensor files.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the mapped files are not modified or
+    /// replaced for as long as tensors backed by those mappings are alive.
     pub unsafe fn from_mmaped_safetensors(
         config: &MiniCpmV46Config,
         safetensors: &[impl AsRef<Path>],
@@ -820,6 +829,12 @@ impl MiniCpmV46VisionTower {
         Ok(Self { model })
     }
 
+    /// Constructs the vision tower from memory-mapped safetensor files.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the mapped files are not modified or
+    /// replaced for as long as tensors backed by those mappings are alive.
     pub unsafe fn from_mmaped_safetensors(
         config: &MiniCpmV46Config,
         safetensors: &[impl AsRef<Path>],
@@ -955,7 +970,7 @@ pub fn merge_2x2_windows(
     width: usize,
     embed_dim: usize,
 ) -> Result<Tensor> {
-    if height % 2 != 0 || width % 2 != 0 {
+    if !height.is_multiple_of(2) || !width.is_multiple_of(2) {
         return Err(MiniCpmV46Error::InvalidInput {
             detail: format!("patch grid ({height}, {width}) must be divisible by 2x2 windows"),
         });
@@ -1056,10 +1071,10 @@ pub fn inspect_safetensors_header(path: impl AsRef<Path>) -> Result<SafetensorSu
             .filter(|value| !value.is_empty())
             .unwrap_or("<root>");
         *likely_prefixes.entry(prefix.to_string()).or_insert(0) += 1;
-        if let Some(offsets) = value.get("data_offsets").and_then(|item| item.as_array()) {
-            if let Some(end) = offsets.get(1).and_then(|item| item.as_u64()) {
-                declared_data_bytes = declared_data_bytes.max(end);
-            }
+        if let Some(offsets) = value.get("data_offsets").and_then(|item| item.as_array())
+            && let Some(end) = offsets.get(1).and_then(|item| item.as_u64())
+        {
+            declared_data_bytes = declared_data_bytes.max(end);
         }
     }
     let required_bytes = 8u64 + header_len as u64 + declared_data_bytes;
@@ -1500,7 +1515,7 @@ impl Qwen3_5GatedDeltaNet {
         if self.num_v_heads == self.num_k_heads {
             return Ok(tensor);
         }
-        if self.num_v_heads % self.num_k_heads != 0 {
+        if !self.num_v_heads.is_multiple_of(self.num_k_heads) {
             return Err(MiniCpmV46Error::InvalidInput {
                 detail: format!(
                     "linear_num_value_heads {} must be divisible by linear_num_key_heads {}",
@@ -1764,7 +1779,7 @@ fn repeat_kv_heads(tensor: Tensor, target_heads: usize) -> Result<Tensor> {
     if key_heads == target_heads {
         return Ok(tensor);
     }
-    if target_heads % key_heads != 0 {
+    if !target_heads.is_multiple_of(key_heads) {
         return Err(MiniCpmV46Error::InvalidInput {
             detail: format!(
                 "target heads {target_heads} must be divisible by key heads {key_heads}"
@@ -2183,6 +2198,12 @@ impl MiniCpmV46ForConditionalGeneration {
         })
     }
 
+    /// Constructs the model from memory-mapped safetensor files.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the mapped files are not modified or
+    /// replaced for as long as tensors backed by those mappings are alive.
     pub unsafe fn from_mmaped_safetensors(
         config: &MiniCpmV46Config,
         safetensors: &[impl AsRef<Path>],
@@ -2656,7 +2677,7 @@ mod tests {
         let expected = [
             [-0.085_968_14, -0.142_135_11, 0.235_781_13],
             [-0.031_701_777, -0.035_503_246, 0.098_784_655],
-            [-0.001_479_941_4, 0.059_467_185, 0.047_398_798],
+            [-0.001_479_941_4, 0.059_467_185, 0.047_398_8],
         ];
         for row in 0..3 {
             for col in 0..3 {

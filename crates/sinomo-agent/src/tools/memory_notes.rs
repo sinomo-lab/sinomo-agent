@@ -408,9 +408,7 @@ impl AgentTool for MemorySearchTool {
             );
         };
         let query = query.trim().to_string();
-        if query.as_bytes().len() > MAX_MEMORY_NOTE_QUERY_BYTES
-            || query.chars().any(char::is_control)
-        {
+        if query.len() > MAX_MEMORY_NOTE_QUERY_BYTES || query.chars().any(char::is_control) {
             return AgentToolResult::failed(
                 format!(
                     "memory_search query exceeds the {MAX_MEMORY_NOTE_QUERY_BYTES}-byte limit or contains control characters"
@@ -732,8 +730,8 @@ impl AgentTool for MemoryWriteTool {
                 serde_json::json!({ "error": "missing_markdown" }),
             );
         };
-        if markdown.as_bytes().len() > self.config.max_write_bytes
-            || markdown.as_bytes().len() > MAX_MEMORY_NOTE_WRITE_BYTES
+        if markdown.len() > self.config.max_write_bytes
+            || markdown.len() > MAX_MEMORY_NOTE_WRITE_BYTES
         {
             return AgentToolResult::failed(
                 format!(
@@ -742,7 +740,7 @@ impl AgentTool for MemoryWriteTool {
                 ),
                 serde_json::json!({
                     "error": "note_too_large",
-                    "bytes": markdown.as_bytes().len(),
+                    "bytes": markdown.len(),
                     "max_bytes": self.config.max_write_bytes.min(MAX_MEMORY_NOTE_WRITE_BYTES),
                 }),
             );
@@ -1010,7 +1008,7 @@ fn validate_memory_note_path(path: &str) -> Result<(), MemoryNotePathError> {
             "path must not have leading or trailing whitespace",
         ));
     }
-    if path.as_bytes().len() > MAX_MEMORY_NOTE_PATH_BYTES {
+    if path.len() > MAX_MEMORY_NOTE_PATH_BYTES {
         return Err(MemoryNotePathError::new(format!(
             "path exceeds the {MAX_MEMORY_NOTE_PATH_BYTES}-byte limit"
         )));
@@ -1040,7 +1038,7 @@ fn validate_memory_note_path(path: &str) -> Result<(), MemoryNotePathError> {
                 "path must not contain dot or parent segments",
             ));
         }
-        if segment.as_bytes().len() > MAX_MEMORY_NOTE_PATH_SEGMENT_BYTES {
+        if segment.len() > MAX_MEMORY_NOTE_PATH_SEGMENT_BYTES {
             return Err(MemoryNotePathError::new(format!(
                 "path segment exceeds the {MAX_MEMORY_NOTE_PATH_SEGMENT_BYTES}-byte limit"
             )));
@@ -1064,7 +1062,7 @@ fn validate_memory_note_version(version: &str) -> Result<(), MemoryNoteVersionEr
             "memory note version must not be empty",
         ));
     }
-    if version.as_bytes().len() > MAX_MEMORY_NOTE_VERSION_BYTES {
+    if version.len() > MAX_MEMORY_NOTE_VERSION_BYTES {
         return Err(MemoryNoteVersionError::new(format!(
             "memory note version exceeds the {MAX_MEMORY_NOTE_VERSION_BYTES}-byte limit"
         )));

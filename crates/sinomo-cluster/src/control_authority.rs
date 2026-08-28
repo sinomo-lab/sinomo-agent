@@ -87,12 +87,7 @@ impl RemoteClusterControlAuthorityFence {
             });
         }
         let guard_count = self.entries.len().saturating_mul(2);
-        let compare_count = request
-            .txn
-            .compares
-            .len()
-            .checked_add(guard_count)
-            .unwrap_or(usize::MAX);
+        let compare_count = request.txn.compares.len().saturating_add(guard_count);
         if compare_count > MAX_KV_TXN_COMPARES {
             let error = KvError::TxnLimit {
                 compares: compare_count,

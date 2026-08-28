@@ -879,10 +879,7 @@ fn promote_fifo_waiters(
     context: DfsAdvisoryLockTransitionContext,
 ) {
     state.waiters.sort_by_key(|waiter| waiter.queue_sequence);
-    loop {
-        let Some(waiter) = state.waiters.first().cloned() else {
-            break;
-        };
+    while let Some(waiter) = state.waiters.first().cloned() {
         if waiter.authority_epoch != state.authority_epoch
             || first_grant_conflict(state, &waiter.session_id, waiter.mode).is_some()
         {

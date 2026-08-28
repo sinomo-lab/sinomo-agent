@@ -482,11 +482,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 Some(&response.replica_node_id),
                                 false,
                             );
-                        } else if repair_rejection_indicates_stale_replica_base(reason) {
-                            self.record_repair_retry_scheduled(
-                                &response.intent_id,
-                                &response.replica_node_id,
-                            );
                         } else {
                             self.record_repair_retry_scheduled(
                                 &response.intent_id,
@@ -700,8 +695,8 @@ where
                 break;
             }
             let mut fanout_jobs = vec![(job.clone(), request_id)];
-            if remaining > 1 {
-                if let Some(companion) = repair_jobs
+            if remaining > 1
+                && let Some(companion) = repair_jobs
                     .iter()
                     .find(|candidate| {
                         candidate.intent_id == job.intent_id
@@ -722,30 +717,25 @@ where
                             )
                     })
                     .cloned()
-                    && self.prepare_repair_target(
-                        &companion.intent_id,
-                        &companion.missing_replica_node_id,
-                    )
-                {
-                    let companion_pending = self
-                        .pending_writes
-                        .get(&companion.intent_id)
+                && self
+                    .prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
+            {
+                let companion_pending = self
+                    .pending_writes
+                    .get(&companion.intent_id)
+                    .cloned()
+                    .expect("same-intent pending repair validated");
+                if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
+                    let companion_request_id = companion_pending
+                        .repair_inflight_request_ids
+                        .get(&companion.missing_replica_node_id)
                         .cloned()
-                        .expect("same-intent pending repair validated");
-                    if self
-                        .pending_repair_targets_current_content(&companion, &companion_pending)?
-                    {
-                        let companion_request_id = companion_pending
-                            .repair_inflight_request_ids
-                            .get(&companion.missing_replica_node_id)
-                            .cloned()
-                            .unwrap_or_else(|| self.next_request_id());
-                        consumed_repair_targets.insert((
-                            companion.intent_id.clone(),
-                            companion.missing_replica_node_id.clone(),
-                        ));
-                        fanout_jobs.push((companion, companion_request_id));
-                    }
+                        .unwrap_or_else(|| self.next_request_id());
+                    consumed_repair_targets.insert((
+                        companion.intent_id.clone(),
+                        companion.missing_replica_node_id.clone(),
+                    ));
+                    fanout_jobs.push((companion, companion_request_id));
                 }
             }
             let reserved = budget.reserve(fanout_jobs.len());
@@ -810,10 +800,7 @@ where
             if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
                 continue;
             }
-            loop {
-                let Some(pending) = self.pending_writes.get(&intent_id).cloned() else {
-                    break;
-                };
+            while let Some(pending) = self.pending_writes.get(&intent_id).cloned() {
                 let durable_nodes = self
                     .coordinator
                     .receipts_for_intent(&intent_id)
@@ -1249,8 +1236,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 break;
             }
             let mut fanout_jobs = vec![(job.clone(), request_id)];
-            if remaining > 1 {
-                if let Some(companion) = repair_jobs
+            if remaining > 1
+                && let Some(companion) = repair_jobs
                     .iter()
                     .find(|candidate| {
                         candidate.intent_id == job.intent_id
@@ -1270,30 +1257,25 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             )
                     })
                     .cloned()
-                    && self.prepare_repair_target(
-                        &companion.intent_id,
-                        &companion.missing_replica_node_id,
-                    )
-                {
-                    let companion_pending = self
-                        .pending_writes
-                        .get(&companion.intent_id)
+                && self
+                    .prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
+            {
+                let companion_pending = self
+                    .pending_writes
+                    .get(&companion.intent_id)
+                    .cloned()
+                    .expect("same-intent pending repair validated");
+                if self.pending_repair_targets_current_content(&companion, &companion_pending)? {
+                    let companion_request_id = companion_pending
+                        .repair_inflight_request_ids
+                        .get(&companion.missing_replica_node_id)
                         .cloned()
-                        .expect("same-intent pending repair validated");
-                    if self
-                        .pending_repair_targets_current_content(&companion, &companion_pending)?
-                    {
-                        let companion_request_id = companion_pending
-                            .repair_inflight_request_ids
-                            .get(&companion.missing_replica_node_id)
-                            .cloned()
-                            .unwrap_or_else(|| self.next_request_id());
-                        consumed_repair_targets.insert((
-                            companion.intent_id.clone(),
-                            companion.missing_replica_node_id.clone(),
-                        ));
-                        fanout_jobs.push((companion, companion_request_id));
-                    }
+                        .unwrap_or_else(|| self.next_request_id());
+                    consumed_repair_targets.insert((
+                        companion.intent_id.clone(),
+                        companion.missing_replica_node_id.clone(),
+                    ));
+                    fanout_jobs.push((companion, companion_request_id));
                 }
             }
             let reserved = budget.reserve(fanout_jobs.len());
@@ -1621,13 +1603,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<BTreeSet<_>>();
-        if let Some(intent) = self.coordinator.intent(intent_id) {
-            if intent.requesting_node_id != self.node_id {
-                // A requester whose pre-staged blob was excluded by snapshot
-                // replanning is a transfer source, not a durable replica.
-                // Content-hash verification still gates every fetch response.
-                sources.insert(intent.requesting_node_id.clone());
-            }
+        if let Some(intent) = self.coordinator.intent(intent_id)
+            && intent.requesting_node_id != self.node_id
+        {
+            // A requester whose pre-staged blob was excluded by snapshot
+            // replanning is a transfer source, not a durable replica.
+            // Content-hash verification still gates every fetch response.
+            sources.insert(intent.requesting_node_id.clone());
         }
         self.ranked_transfer_sources(sources)
     }
@@ -1820,14 +1802,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let mut restored_record = record.clone();
             let now = dfs_now_unix_nanos();
-            if restored_record.next_retry_unix_nanos == u64::MAX
-                && !repair_attempt_record_indicates_lost_authority(&restored_record)
-            {
-                restored_record.in_flight = false;
-                restored_record.next_retry_unix_nanos = now;
-                restored_record.transfer_request_id = None;
-            } else if repair_attempt_record_indicates_transient_route_failure(&restored_record)
-                && restored_record.next_retry_unix_nanos > now
+            if (restored_record.next_retry_unix_nanos == u64::MAX
+                && !repair_attempt_record_indicates_lost_authority(&restored_record))
+                || (repair_attempt_record_indicates_transient_route_failure(&restored_record)
+                    && restored_record.next_retry_unix_nanos > now)
             {
                 restored_record.in_flight = false;
                 restored_record.next_retry_unix_nanos = now;

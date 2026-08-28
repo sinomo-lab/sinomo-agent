@@ -209,6 +209,29 @@ impl<'a> DfsControlPlaneStore<'a> {
     }
 }
 
+impl<'a> DfsControlPlaneStore<'a> {
+    fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        self.kv.get(key)
+    }
+
+    fn kv_put(
+        &mut self,
+        key: String,
+        value: Vec<u8>,
+    ) -> Result<sinomo_core::kv::KvRevision, KvError> {
+        self.kv.put(key, value)
+    }
+
+    fn kv_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        // The DFS control-plane trait intentionally exposes only the operations
+        // needed by production daemon clients. Until daemon range support is
+        // passed through here, cluster views can still be built by direct lookup
+        // through advertised membership records. In-process tests use the
+        // default empty range plus explicit gets.
+        self.kv.range_prefix(prefix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,28 +273,5 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_content
         );
-    }
-}
-
-impl<'a> DfsControlPlaneStore<'a> {
-    fn kv_get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
-        self.kv.get(key)
-    }
-
-    fn kv_put(
-        &mut self,
-        key: String,
-        value: Vec<u8>,
-    ) -> Result<sinomo_core::kv::KvRevision, KvError> {
-        self.kv.put(key, value)
-    }
-
-    fn kv_range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
-        // The DFS control-plane trait intentionally exposes only the operations
-        // needed by production daemon clients. Until daemon range support is
-        // passed through here, cluster views can still be built by direct lookup
-        // through advertised membership records. In-process tests use the
-        // default empty range plus explicit gets.
-        self.kv.range_prefix(prefix)
     }
 }

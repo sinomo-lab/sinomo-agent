@@ -8451,12 +8451,6 @@ fn maintenance_tick_runs_lifecycle_and_metadata_journal_publish() {
 
 #[tokio::test]
 async fn async_maintenance_yields_between_completed_synchronous_phases() {
-    struct NoopWake;
-
-    impl std::task::Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     let root = temp_root("async-maintenance-yields-between-completed-phases");
     let local = NodeId::from_legacy_named("node_async_maintenance_yield").expect("local");
     let content = LocalContentStore::new(root.join("content")).expect("content");
@@ -8495,8 +8489,7 @@ async fn async_maintenance_yields_between_completed_synchronous_phases() {
             },
         ),
     );
-    let waker = std::task::Waker::from(Arc::new(NoopWake));
-    let mut context = std::task::Context::from_waker(&waker);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
 
     for phase in 0..7 {
         assert!(
@@ -11319,7 +11312,7 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
         &local,
         vec![shard.clone()],
         &mut host,
-        &[suppression.clone()],
+        std::slice::from_ref(&suppression),
         DfsMetadataJournalReplicationOptions::default(),
     )
     .expect("prepare suppressed publish");
@@ -23852,7 +23845,7 @@ fn hydrate_from_metadata_backend_ignores_unexpected_replica_receipts() {
     .expect("unexpected replica receipt should not break hydration");
 
     assert!(
-        recovered_owner.pending_writes.get(&intent_id).is_none(),
+        !recovered_owner.pending_writes.contains_key(&intent_id),
         "fully repaired committed write should not be restored as pending"
     );
     assert!(recovered_owner.coordinator().repair_jobs().is_empty());
@@ -23978,7 +23971,7 @@ fn hydrate_from_metadata_backend_applies_commit_ready_receipts_pending_intent() 
         BTreeSet::from([owner, replica])
     );
     assert!(
-        recovered_owner.pending_writes.get(&intent_id).is_none(),
+        !recovered_owner.pending_writes.contains_key(&intent_id),
         "fully receipted commit-ready intent should be cleaned after visible commit recovery"
     );
     assert!(recovered_owner.coordinator().repair_jobs().is_empty());
@@ -24165,7 +24158,7 @@ fn hydrate_from_metadata_backend_reuses_older_compacted_tombstone_path() {
         BTreeSet::from([owner, requester, replica])
     );
     assert!(
-        recovered_owner.pending_writes.get(&intent_id).is_none(),
+        !recovered_owner.pending_writes.contains_key(&intent_id),
         "fully receipted new-object intent should be cleaned after recovery"
     );
     assert_eq!(
@@ -24190,14 +24183,14 @@ fn recovered_new_object_parent_metadata(
         "raw-write"
     };
     let root = temp_root(&format!("hydrate-new-object-{case}"));
-    let owner = NodeId::from_legacy_named(&format!("node_hydrate_{case}_primary")).expect("node");
+    let owner = NodeId::from_legacy_named(format!("node_hydrate_{case}_primary")).expect("node");
     let requester =
-        NodeId::from_legacy_named(&format!("node_hydrate_{case}_requester")).expect("node");
-    let replica = NodeId::from_legacy_named(&format!("node_hydrate_{case}_replica")).expect("node");
+        NodeId::from_legacy_named(format!("node_hydrate_{case}_requester")).expect("node");
+    let replica = NodeId::from_legacy_named(format!("node_hydrate_{case}_replica")).expect("node");
     let object_id =
-        DfsObjectId::from_legacy_named(&format!("obj_hydrate_{case}_child")).expect("object");
+        DfsObjectId::from_legacy_named(format!("obj_hydrate_{case}_child")).expect("object");
     let parent_object_id =
-        DfsObjectId::from_legacy_named(&format!("obj_hydrate_{case}_parent")).expect("object");
+        DfsObjectId::from_legacy_named(format!("obj_hydrate_{case}_parent")).expect("object");
     let version_1 = DfsVersion::from_legacy_named("version_1").expect("version");
     let version_2 = DfsVersion::from_legacy_named("version_2").expect("version");
     let parent_version = DfsVersion::from_legacy_named("version_parent_1").expect("version");
@@ -24984,7 +24977,7 @@ fn hydrate_from_metadata_backend_does_not_mix_duplicate_intent_ids() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([owner, replica])
     );
-    assert!(recovered_owner.pending_writes.get(&intent_id).is_none());
+    assert!(!recovered_owner.pending_writes.contains_key(&intent_id));
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -26991,10 +26984,10 @@ fn assert_malformed_remote_range_rejected(
     expected_reason: &str,
 ) {
     let root = temp_root(name);
-    let reader = NodeId::from_legacy_named(&format!("{name}_reader")).expect("reader node");
-    let source = NodeId::from_legacy_named(&format!("{name}_source")).expect("source node");
-    let object_id = DfsObjectId::from_legacy_named(&format!("{name}_object")).expect("object");
-    let version = DfsVersion::from_legacy_named(&format!("{name}_version")).expect("version");
+    let reader = NodeId::from_legacy_named(format!("{name}_reader")).expect("reader node");
+    let source = NodeId::from_legacy_named(format!("{name}_source")).expect("source node");
+    let object_id = DfsObjectId::from_legacy_named(format!("{name}_object")).expect("object");
+    let version = DfsVersion::from_legacy_named(format!("{name}_version")).expect("version");
     let bytes = b"authoritative ranged response bytes".to_vec();
     let content_hash = content_hash(&bytes);
     let offset = 3_u64;
@@ -36435,11 +36428,11 @@ fn sifs_posix_cluster(name: &str) -> SifsPosixCluster {
     let root = temp_root(name);
     let node_prefix = name.replace('-', "_");
     let primary_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_primary")).expect("primary node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_primary")).expect("primary node");
     let writer_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_writer")).expect("writer node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_writer")).expect("writer node");
     let observer_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_observer")).expect("observer node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_observer")).expect("observer node");
 
     let network = InProcessNetwork::new();
     let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -37325,9 +37318,7 @@ fn sifs_cluster_posix_contract_concurrent_write_at_truncate_races() {
         b"whole-file".as_slice(),
     ];
     assert!(
-        valid
-            .iter()
-            .any(|candidate| *candidate == final_bytes.as_slice()),
+        valid.contains(&final_bytes.as_slice()),
         "final bytes must match a serialized write_at/truncate/overwrite order: {final_bytes:?}"
     );
 
@@ -42026,11 +42017,11 @@ fn sifs_two_primary_cluster(name: &str) -> SifsTwoPrimaryCluster {
     let root = temp_root(name);
     let node_prefix = name.replace('-', "_");
     let users_primary_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_users")).expect("users primary");
-    let services_primary_node = NodeId::from_legacy_named(&format!("node_{node_prefix}_services"))
+        NodeId::from_legacy_named(format!("node_{node_prefix}_users")).expect("users primary");
+    let services_primary_node = NodeId::from_legacy_named(format!("node_{node_prefix}_services"))
         .expect("services primary");
     let replica_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_replica")).expect("replica");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_replica")).expect("replica");
 
     let network = InProcessNetwork::new();
     let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
@@ -45381,16 +45372,18 @@ fn sifs_stale_cross_shard_runner_without_source_cannot_bypass_active_pin_transfe
     };
     let transfer_id =
         crate::protocol::cross_shard_pin_transfer_id(&target, source_path).expect("transfer id");
-    let pin_fingerprint =
-        crate::protocol::cross_shard_version_pin_set_fingerprint(&target, &[pin.clone()])
-            .expect("pin fingerprint");
+    let pin_fingerprint = crate::protocol::cross_shard_version_pin_set_fingerprint(
+        &target,
+        std::slice::from_ref(&pin),
+    )
+    .expect("pin fingerprint");
     assert!(
         dfs.adopt_object_at_path_local(
             &target,
             source_path,
             Some(&transfer_id),
             &[],
-            &[pin.clone()],
+            std::slice::from_ref(&pin),
             Some(&pin_fingerprint),
             &[],
             &[],
@@ -48043,11 +48036,11 @@ fn sifs_outsider_cluster(name: &str) -> SifsPosixCluster {
     let root = temp_root(name);
     let node_prefix = name.replace('-', "_");
     let primary_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_primary")).expect("primary node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_primary")).expect("primary node");
     let writer_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_writer")).expect("writer node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_writer")).expect("writer node");
     let observer_node =
-        NodeId::from_legacy_named(&format!("node_{node_prefix}_outsider")).expect("outsider node");
+        NodeId::from_legacy_named(format!("node_{node_prefix}_outsider")).expect("outsider node");
 
     let network = InProcessNetwork::new();
     let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());

@@ -1597,13 +1597,13 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             distinct_primary_node_ids.len()
         )));
     }
-    if let Some(expected) = expected_namespace_prepare_codec {
-        if let Some(mismatch) = namespace_prepare_codec_mismatch_detail(&layouts, expected) {
-            return Ok(SinomoTestOutcome::failed(format!(
-                "live SIFS metadata-shard layout expected namespace prepare codec {} on every lane, but observed {mismatch}",
-                namespace_prepare_codec_label(expected),
-            )));
-        }
+    if let Some(expected) = expected_namespace_prepare_codec
+        && let Some(mismatch) = namespace_prepare_codec_mismatch_detail(&layouts, expected)
+    {
+        return Ok(SinomoTestOutcome::failed(format!(
+            "live SIFS metadata-shard layout expected namespace prepare codec {} on every lane, but observed {mismatch}",
+            namespace_prepare_codec_label(expected),
+        )));
     }
 
     Ok(SinomoTestOutcome::passed(format!(
@@ -1968,13 +1968,8 @@ fn run_service_advertisements(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let bad = metadata
         .iter()
         .chain(content.iter())
-        .filter_map(|advertisement| {
-            advertisement
-                .node_id
-                .as_str()
-                .is_empty()
-                .then(|| format!("{} has empty node id", advertisement.node_id))
-        })
+        .filter(|&advertisement| advertisement.node_id.as_str().is_empty())
+        .map(|advertisement| format!("{} has empty node id", advertisement.node_id))
         .collect::<Vec<_>>();
 
     ctx.record("metadata_count", metadata.len());
@@ -2491,7 +2486,7 @@ fn run_concurrent_file_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         writer_b.clone(),
         deadline,
     );
-    let results = vec![
+    let results = [
         thread_a
             .join()
             .map_err(|_| SinomoTestError::failed("writer-a thread panicked"))?,
@@ -2657,7 +2652,7 @@ fn run_concurrent_dir_race(ctx: &mut SinomoTestContext) -> SinomoTestResult {
             started.elapsed().as_millis() as u64,
         )
     });
-    let results = vec![
+    let results = [
         create_thread
             .join()
             .map_err(|_| SinomoTestError::failed("child-create thread panicked"))?,

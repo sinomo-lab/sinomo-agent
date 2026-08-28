@@ -120,23 +120,20 @@ pub fn test_expire_dfs_runtime_peer_discovery_cache(
     if let Ok(mut cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE
         .get_or_init(|| Mutex::new(BTreeMap::new()))
         .lock()
+        && let Some(entry) = cache.get_mut(&cluster_paths.root)
+        && let Some(validated_at) =
+            Instant::now().checked_sub(validation_lease.saturating_add(Duration::from_millis(1)))
     {
-        if let Some(entry) = cache.get_mut(&cluster_paths.root) {
-            if let Some(validated_at) = Instant::now()
-                .checked_sub(validation_lease.saturating_add(Duration::from_millis(1)))
-            {
-                entry.validated_at = validated_at;
-            }
-        }
+        entry.validated_at = validated_at;
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_clear_dfs_runtime_peer_discovery_cache(cluster_paths: &ClusterPaths) {
-    if let Some(cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE.get() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.remove(&cluster_paths.root);
-        }
+    if let Some(cache) = DFS_RUNTIME_PEER_DISCOVERY_CACHE.get()
+        && let Ok(mut cache) = cache.lock()
+    {
+        cache.remove(&cluster_paths.root);
     }
 }
 

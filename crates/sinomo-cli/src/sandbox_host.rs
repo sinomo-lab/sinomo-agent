@@ -1,7 +1,9 @@
 use super::*;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
-use std::{path::Path, sync::Arc, time::Duration};
+#[cfg(feature = "sandbox")]
+use std::path::Path;
+use std::{sync::Arc, time::Duration};
 
 #[derive(Debug, Default)]
 pub(crate) struct SinomoCliSandboxHost;

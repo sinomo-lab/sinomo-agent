@@ -391,17 +391,7 @@ impl LocalDfsRepairQueueStore {
         if !state.loaded {
             return Ok(DfsRepairQueueBoundedStatus::NotHydrated);
         }
-        let records = state
-            .records
-            .values()
-            .take(max_records)
-            .map(|record| {
-                #[cfg(test)]
-                BOUNDED_STATUS_RECORD_CLONES
-                    .set(BOUNDED_STATUS_RECORD_CLONES.get().saturating_add(1));
-                record.clone()
-            })
-            .collect();
+        let records = state.records.values().take(max_records).cloned().collect();
         Ok(DfsRepairQueueBoundedStatus::Hydrated(
             DfsRepairQueueStatusView {
                 head_sequence: state.head_sequence,

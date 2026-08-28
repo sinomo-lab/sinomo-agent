@@ -901,7 +901,7 @@ impl MemoryAccessContext {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct QueryFeatureTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<MemoryRetrievalPlanId>,
@@ -1034,18 +1034,17 @@ impl MemoryRetrievalPlan {
                 "one or more effective limits exceed the hard retrieval bounds",
             ));
         }
-        if let MemoryRetrievalOperator::LexicalExact { terms } = &self.operators[0] {
-            if terms.is_empty()
+        if let MemoryRetrievalOperator::LexicalExact { terms } = &self.operators[0]
+            && (terms.is_empty()
                 || terms.len() > MAX_MEMORY_RETRIEVAL_TERMS
-                || canonical_plan_terms(terms.clone()) != *terms
-            {
-                return Err(IndexedMemoryContractError::new(
-                    "memory retrieval plan",
-                    format!(
-                        "lexical terms must be non-empty, unique, sorted, and bounded to {MAX_MEMORY_RETRIEVAL_TERMS} terms of {MAX_MEMORY_RETRIEVAL_TERM_CHARS} characters"
-                    ),
-                ));
-            }
+                || canonical_plan_terms(terms.clone()) != *terms)
+        {
+            return Err(IndexedMemoryContractError::new(
+                "memory retrieval plan",
+                format!(
+                    "lexical terms must be non-empty, unique, sorted, and bounded to {MAX_MEMORY_RETRIEVAL_TERMS} terms of {MAX_MEMORY_RETRIEVAL_TERM_CHARS} characters"
+                ),
+            ));
         }
         let expected = Self::canonical_id(
             self.schema_version,
@@ -1137,16 +1136,16 @@ pub struct MemoryQueryContinuation {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum EvidenceCoverage {
+    #[default]
     Complete,
-    Approximate { reason: String },
-    BudgetTruncated { reason: String },
-}
-
-impl Default for EvidenceCoverage {
-    fn default() -> Self {
-        Self::Complete
-    }
+    Approximate {
+        reason: String,
+    },
+    BudgetTruncated {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1176,19 +1175,6 @@ pub struct MemoryEvidenceBundle {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation: Option<MemoryQueryContinuation>,
     pub trace: QueryFeatureTrace,
-}
-
-impl Default for QueryFeatureTrace {
-    fn default() -> Self {
-        Self {
-            plan_id: None,
-            terms: Vec::new(),
-            routed_partitions: 0,
-            searched_partitions: 0,
-            stale_partitions: 0,
-            trace_persisted: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]

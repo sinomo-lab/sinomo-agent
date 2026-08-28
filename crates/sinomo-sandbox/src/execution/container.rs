@@ -409,26 +409,26 @@ impl SandboxContainerCommandRunner {
             )?;
             return Err(error.into());
         }
-        if let Some(stdin) = &request.stdin {
-            if stdin.len() as u64 > manifest.limits.max_input_bytes {
-                let error = SandboxWasiError::InputLimitExceeded {
-                    limit: manifest.limits.max_input_bytes.min(usize::MAX as u64) as usize,
-                };
-                self.persist_failed_command(
-                    store,
-                    manifest,
-                    layout,
-                    &command_id,
-                    &request,
-                    started_at,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    sandbox_command_record_status_for_wasi_error(&error),
-                    error.to_string(),
-                )?;
-                return Err(error.into());
-            }
+        if let Some(stdin) = &request.stdin
+            && stdin.len() as u64 > manifest.limits.max_input_bytes
+        {
+            let error = SandboxWasiError::InputLimitExceeded {
+                limit: manifest.limits.max_input_bytes.min(usize::MAX as u64) as usize,
+            };
+            self.persist_failed_command(
+                store,
+                manifest,
+                layout,
+                &command_id,
+                &request,
+                started_at,
+                None,
+                Vec::new(),
+                Vec::new(),
+                sandbox_command_record_status_for_wasi_error(&error),
+                error.to_string(),
+            )?;
+            return Err(error.into());
         }
 
         let sandbox_fs = LocalSandboxFileSystem::new(layout.clone());

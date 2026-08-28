@@ -1754,7 +1754,9 @@ fn resource_for_estimate<'a>(
 }
 
 fn reserve_floor_units(total_units: u64, reserve_floor_percent: u8) -> u64 {
-    (total_units.saturating_mul(reserve_floor_percent as u64) + 99) / 100
+    total_units
+        .saturating_mul(reserve_floor_percent as u64)
+        .div_ceil(100)
 }
 
 pub fn prepare_scheduled_iteration(
@@ -4328,26 +4330,25 @@ impl<P: LanguageModelProvider> MutationModel for LanguageModelMutationBridge<P> 
             .as_ref()
             .and_then(|output| output.patch.clone())
             .or_else(|| extract_patch_from_text(&response.content));
-        if !direct_edit {
-            if let Some(patch) = parsed_patch
+        if !direct_edit
+            && let Some(patch) = parsed_patch
                 .as_ref()
                 .filter(|patch| !patch.trim().is_empty())
-            {
-                let result = self.tool_registry.execute(
-                    workspace,
-                    EvolutionToolCall {
-                        tool: "apply_patch".to_string(),
-                        input: serde_json::json!({ "patch": patch }),
-                    },
-                );
-                if result.status != ToolCallStatus::Succeeded {
-                    return Err(MutationModelError::ToolExecution {
-                        tool: result.tool,
-                        detail: result.evidence.summary,
-                    });
-                }
-                all_tool_results.push(result);
+        {
+            let result = self.tool_registry.execute(
+                workspace,
+                EvolutionToolCall {
+                    tool: "apply_patch".to_string(),
+                    input: serde_json::json!({ "patch": patch }),
+                },
+            );
+            if result.status != ToolCallStatus::Succeeded {
+                return Err(MutationModelError::ToolExecution {
+                    tool: result.tool,
+                    detail: result.evidence.summary,
+                });
             }
+            all_tool_results.push(result);
         }
         let summary = structured_output
             .as_ref()

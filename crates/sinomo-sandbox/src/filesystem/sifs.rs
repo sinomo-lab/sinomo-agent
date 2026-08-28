@@ -591,7 +591,7 @@ impl<T: DfsMessageTransport> SifsSandboxFileSystem<T> {
     ) -> Result<SandboxPath, SandboxFsError> {
         let target = target
             .to_str()
-            .ok_or_else(|| SandboxFsError::Path(SandboxPathError::NulByte))?;
+            .ok_or(SandboxFsError::Path(SandboxPathError::NulByte))?;
         if target.starts_with('/') {
             return SandboxPath::new(target).map_err(Into::into);
         }

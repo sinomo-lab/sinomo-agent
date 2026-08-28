@@ -475,7 +475,7 @@ fn placement_policy_from_rule(
 ) -> Result<DfsPlacementPolicy, DfsDistributedError> {
     let desired_replicas = rule
         .desired_replicas
-        .unwrap_or_else(|| legacy_desired_replicas.max(1).min(2));
+        .unwrap_or_else(|| legacy_desired_replicas.clamp(1, 2));
     let min_commit_replicas = rule.min_commit_replicas.unwrap_or_else(|| {
         if rule.policy == DfsObjectPolicy::ReplicatedConfirmed {
             desired_replicas
@@ -531,7 +531,7 @@ fn legacy_placement_policy(
     ) {
         1
     } else {
-        desired_replicas.max(1).min(2)
+        desired_replicas.clamp(1, 2)
     };
     let min_commit_replicas = if policy == DfsObjectPolicy::ReplicatedConfirmed {
         desired_replicas
@@ -1849,9 +1849,7 @@ pub(crate) fn placement_reconciliation_activity_page_from_summaries(
             .cmp(&left.created_at_unix_nanos)
             .then_with(|| right.job_id.cmp(&left.job_id))
     });
-    let limit = limit
-        .max(1)
-        .min(MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE);
+    let limit = limit.clamp(1, MAX_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE);
     let has_more = activities.len() > limit;
     activities.truncate(limit);
     let next_cursor = has_more
@@ -1884,10 +1882,10 @@ pub fn publish_dfs_content_advertisement_if_needed(
     }
     desired.accepts_metadata = false;
     let mut store = DfsControlPlaneStore::new(control_plane);
-    if let Some(current) = store.content_service(local_node_id)? {
-        if dfs_content_advertisement_is_current(&current, &desired) {
-            return Ok(false);
-        }
+    if let Some(current) = store.content_service(local_node_id)?
+        && dfs_content_advertisement_is_current(&current, &desired)
+    {
+        return Ok(false);
     }
     store.advertise_content_service(&desired)?;
     Ok(true)
@@ -5934,7 +5932,7 @@ mod tests {
         newest.created_at_unix_nanos = 2;
         newest.state = DfsPlacementReconciliationState::Completed;
 
-        let jobs = vec![oldest, newest, tied];
+        let jobs = [oldest, newest, tied];
         let first = placement_reconciliation_activity_page(jobs.iter(), &[], None, None, 2);
         assert_eq!(
             first

@@ -19,6 +19,8 @@ use sinomo_core::node::{ClusterId, NodeId};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::fs;
+#[cfg(test)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(test)]
@@ -119,9 +121,9 @@ static IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST: LazyLock<Mutex<HashMap<Path
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
-fn record_iroh_secret_key_create_new_attempt_for_test(path: &PathBuf) {
+fn record_iroh_secret_key_create_new_attempt_for_test(path: &Path) {
     if let Ok(mut attempts) = IROH_SECRET_KEY_CREATE_NEW_ATTEMPTS_FOR_TEST.lock() {
-        *attempts.entry(path.clone()).or_default() += 1;
+        *attempts.entry(path.to_path_buf()).or_default() += 1;
     }
 }
 
@@ -164,6 +166,7 @@ fn lock_iroh_secret_key_with_wait(
     }
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -1325,6 +1328,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn iroh_daemon_proxy_admission_limit_releases_permits() {
         assert!(IROH_DAEMON_PROXY_MAX_CONNECTIONS >= 2);
         assert!(IROH_DAEMON_PROXY_MAX_COMMAND_STREAMS >= IROH_DAEMON_PROXY_MAX_CONNECTIONS);
@@ -1482,6 +1486,7 @@ mod tests {
             move || {
                 let file = std::fs::OpenOptions::new()
                     .create(true)
+                    .truncate(false)
                     .read(true)
                     .write(true)
                     .open(&key_lock_path)

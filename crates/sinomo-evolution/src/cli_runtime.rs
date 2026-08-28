@@ -28,7 +28,7 @@ use sinomo_runtime::cli_registry::{
 use sinomo_runtime::core::{EvaluationOutcome, EventEnvelope};
 use sinomo_runtime::eval::{ExecutingEvalHarness, LocalCommandRunner};
 use sinomo_runtime::events::{EventStore, JsonlEventStore, ReplayDirection, ReplayQuery};
-use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvSnapshot, KvTxn, KvTxnRequest};
+use sinomo_runtime::kv::{InProcessKvStore, KvEntry, KvSnapshot, KvTxn};
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths};
 use sinomo_runtime::node::NodeId;
@@ -787,9 +787,9 @@ fn registry_trust_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, C
     }
     #[cfg(test)]
     {
-        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+        sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .map_err(network::NetworkError::directory)
-            .map_err(Into::into);
+            .map_err(Into::into)
     }
     #[cfg(not(test))]
     {
@@ -831,8 +831,10 @@ fn commit_registry_trust_cluster_txn(
             detail: "clustered trusted signer registry writes require the local daemon".to_string(),
         });
     };
-    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(&KvTxnRequest::generated(txn))
-        .map_err(network::NetworkError::directory)?;
+    let payload = sinomo_runtime::kv::cluster_kv_txn_rpc_payload(
+        &sinomo_runtime::kv::KvTxnRequest::generated(txn),
+    )
+    .map_err(network::NetworkError::directory)?;
     let request =
         network::ObjectRpcRequest::from_encoded_body(payload.route, payload.category, payload.body);
     let response = sinomo_runtime::daemon::send_daemon_rpc(
@@ -934,9 +936,9 @@ fn model_config_cluster_snapshot(paths: &ClusterPaths) -> Result<KvSnapshot, Cli
     }
     #[cfg(test)]
     {
-        return sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
+        sinomo_runtime::kv::read_cluster_kv_cached_snapshot(&paths.kv_paths())
             .map_err(network::NetworkError::directory)
-            .map_err(Into::into);
+            .map_err(Into::into)
     }
     #[cfg(not(test))]
     {
@@ -1319,7 +1321,7 @@ fn execute_campaign_iteration_plan(
     mut plan: ScheduledIterationPlan,
     overrides: IterationExecutionOverrides,
 ) -> Result<(EvolutionReport, StageEvaluationUpdate, CampaignBundlePaths), CliError> {
-    let (model_config, _) = load_model_config_for_node(&data_dir)?;
+    let (model_config, _) = load_model_config_for_node(data_dir)?;
     let evolution_model_config = config.map(|config| sinomo_lm::ModelConfig {
         default_provider: config.default_provider.clone(),
         default_account: None,
@@ -1335,7 +1337,7 @@ fn execute_campaign_iteration_plan(
         default_model.configured_model,
     )?;
     let repo = resolve_evolution_repo(
-        &data_dir,
+        data_dir,
         overrides
             .repo
             .clone()
@@ -1369,7 +1371,7 @@ fn execute_campaign_iteration_plan(
     if let Some(sifs_root) = configured_sifs_artifact_root(config) {
         mirror_evolution_report_bundle_to_sifs(data_dir, &mut report, &sifs_root)?;
     }
-    write_report_record(&paths, &report)?;
+    write_report_record(paths, &report)?;
     let resource_usage =
         candidate_resource_usage_estimates_for_report(&campaign, &plan.task.task_id, &report)?;
 
@@ -1382,7 +1384,7 @@ fn execute_campaign_iteration_plan(
         root_cause_summary: None,
         what_was_learned: Vec::new(),
     });
-    let bundle = write_campaign_iteration_evaluation(&paths, &plan, &update)?;
+    let bundle = write_campaign_iteration_evaluation(paths, &plan, &update)?;
     Ok((report, update, bundle))
 }
 

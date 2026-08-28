@@ -379,7 +379,7 @@ static CLUSTER_PUBLICATION_CACHE: LazyLock<sinomo_core::cluster::ClusterPublicat
 
 thread_local! {
     static COMMAND_CONNECTIVITY_SYNC_IN_FLIGHT: std::cell::Cell<bool> =
-        std::cell::Cell::new(false);
+        const { std::cell::Cell::new(false) };
 }
 
 #[derive(Clone, Debug)]
@@ -2807,18 +2807,7 @@ impl ClusterNetworkMaintenance {
             // Default DFS is derived control-plane state owned by its
             // committed-snapshot reactor. A generic network publication tick
             // must never poll or republish DFS state.
-            if cluster_is_solo {
-                // no-op: nothing to publish to absent peers
-            } else if sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
-                self.idle_stats.incr_kv_publish_member();
-                pending_work
-                    .member_publishes
-                    .push(ClusterMemberPublishPendingWork {
-                        paths: cluster_paths.clone(),
-                        state: state.clone(),
-                        force_kv_snapshot_sync: false,
-                    });
-            } else if !sinomo_core::kv::cluster_kv_raft_local_is_voter(&state) {
+            if !cluster_is_solo {
                 self.idle_stats.incr_kv_publish_member();
                 pending_work
                     .member_publishes
@@ -4250,7 +4239,8 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
         let timeout = connectivity_import_timeout_for_endpoint(&endpoint, timeouts);
         handles.push(tokio::spawn(async move {
             let _permit = permit;
-            let result = fetch_peer_connectivity_records_from_endpoint_async(
+
+            fetch_peer_connectivity_records_from_endpoint_async(
                 paths,
                 state,
                 endpoint,
@@ -4258,8 +4248,7 @@ async fn import_peer_connectivity_records_from_reachable_endpoints_async(
                 timeout,
                 PeerConnectivityFetchScope::EndpointSource,
             )
-            .await;
-            result
+            .await
         }));
     }
 
@@ -5146,7 +5135,7 @@ async fn probe_member_direct_daemon_status_async(
     {
         let status = match fetch_daemon_status_from_endpoint_direct_async(
             state,
-            &endpoint,
+            endpoint,
             CLUSTER_HEALTH_DIRECT_STATUS_TIMEOUT,
         )
         .await
@@ -9928,8 +9917,8 @@ mod tests {
         paths.ensure().expect("cluster paths");
         let now = OffsetDateTime::now_utc();
         let cluster_id =
-            ClusterId::from_legacy_named(&format!("cluster_{name}")).expect("cluster id");
-        let node_id = NodeId::from_legacy_named(&format!("node_{name}")).expect("node id");
+            ClusterId::from_legacy_named(format!("cluster_{name}")).expect("cluster id");
+        let node_id = NodeId::from_legacy_named(format!("node_{name}")).expect("node id");
         let mut state = ClusterBootstrapState::initialized_locally(
             cluster_id, name, node_id, "local", "pk-local", now,
         );

@@ -27,9 +27,7 @@ pub fn encode_cluster_kv_watch_event_log_batch(
 ) -> Result<EncodedClusterKvWatchEventLogBatch, KvError> {
     let mut records = Vec::new();
     let requested_bytes = events
-        .len()
-        .checked_mul(std::mem::size_of::<Vec<u8>>().max(1))
-        .unwrap_or(usize::MAX);
+        .len().saturating_mul(std::mem::size_of::<Vec<u8>>().max(1));
     records
         .try_reserve(events.len())
         .map_err(|_| KvError::ResourceExhausted {

@@ -3,7 +3,6 @@ use crate::internal::*;
 /// Perform an explicitly requested one-shot workspace copy for import, export,
 /// or migration. This is not the SIFS synchronization path and command
 /// execution must never call it; live DFS/VFS mounts provide synchronization.
-
 pub fn sync_sandbox_workspace_roots<S, D>(
     source: &mut S,
     destination: &mut D,
@@ -156,15 +155,15 @@ where
         checkpoint()?;
     }
     let actual_hash = format!("blake3:{}", blake3::hash(&source_content).to_hex());
-    if let Some(expected_hash) = metadata.content_hash.as_deref() {
-        if actual_hash != expected_hash {
-            return Err(SandboxFsError::Unavailable {
+    if let Some(expected_hash) = metadata.content_hash.as_deref()
+        && actual_hash != expected_hash
+    {
+        return Err(SandboxFsError::Unavailable {
                 reason: format!(
                     "assembled ranged read hash mismatch while synchronizing {path}: expected {expected_hash}, got {actual_hash}"
                 ),
             }
             .into());
-        }
     }
     // Destination ranged reads are not authoritative: a stale or adversarial
     // replica could forge matching ranges and suppress copy-back. Only a

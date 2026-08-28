@@ -24,43 +24,6 @@ fn active_replica_stage_conflicts(
         && (active_version != incoming_version || active_content_hash != incoming_content_hash)
 }
 
-#[cfg(test)]
-mod active_stage_tests {
-    use super::*;
-
-    fn version(value: &str) -> DfsVersion {
-        DfsVersion::from_legacy_named(value).expect("version")
-    }
-
-    #[test]
-    fn newer_replica_stage_supersedes_older_active_stage() {
-        assert!(!active_replica_stage_conflicts(
-            "intent-old",
-            &version("version-1"),
-            "hash-old",
-            "intent-new",
-            &version("version-2"),
-            "hash-new",
-        ));
-        assert!(active_replica_stage_conflicts(
-            "intent-new",
-            &version("version-2"),
-            "hash-new",
-            "intent-old",
-            &version("version-1"),
-            "hash-old",
-        ));
-        assert!(active_replica_stage_conflicts(
-            "intent-a",
-            &version("version-2"),
-            "hash-a",
-            "intent-b",
-            &version("version-2"),
-            "hash-b",
-        ));
-    }
-}
-
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub(crate) fn ensure_command_base_matches_current(
         &self,
@@ -136,28 +99,28 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         content_hash: &str,
     ) -> Result<(), DfsError> {
-        if let Some(stage) = self.active_replica_stages.get(object_id) {
-            if active_replica_stage_conflicts(
+        if let Some(stage) = self.active_replica_stages.get(object_id)
+            && active_replica_stage_conflicts(
                 &stage.intent_id,
                 &stage.version,
                 &stage.content_hash,
                 intent_id,
                 version,
                 content_hash,
-            ) {
-                return Err(DfsError::Distributed {
-                    message: format!(
-                        "conflicting active DFS {operation} for {object_id}: local stage {} from {} targets {} ({}) while remote intent {intent_id} from {} targets {} ({})",
-                        stage.intent_id,
-                        stage.requester_node_id,
-                        stage.version,
-                        stage.content_hash,
-                        requester_node_id,
-                        version,
-                        content_hash
-                    ),
-                });
-            }
+            )
+        {
+            return Err(DfsError::Distributed {
+                message: format!(
+                    "conflicting active DFS {operation} for {object_id}: local stage {} from {} targets {} ({}) while remote intent {intent_id} from {} targets {} ({})",
+                    stage.intent_id,
+                    stage.requester_node_id,
+                    stage.version,
+                    stage.content_hash,
+                    requester_node_id,
+                    version,
+                    content_hash
+                ),
+            });
         }
         for (pending_intent_id, pending) in &self.pending_writes {
             if pending.object_id != *object_id {
@@ -233,5 +196,42 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod active_stage_tests {
+    use super::*;
+
+    fn version(value: &str) -> DfsVersion {
+        DfsVersion::from_legacy_named(value).expect("version")
+    }
+
+    #[test]
+    fn newer_replica_stage_supersedes_older_active_stage() {
+        assert!(!active_replica_stage_conflicts(
+            "intent-old",
+            &version("version-1"),
+            "hash-old",
+            "intent-new",
+            &version("version-2"),
+            "hash-new",
+        ));
+        assert!(active_replica_stage_conflicts(
+            "intent-new",
+            &version("version-2"),
+            "hash-new",
+            "intent-old",
+            &version("version-1"),
+            "hash-old",
+        ));
+        assert!(active_replica_stage_conflicts(
+            "intent-a",
+            &version("version-2"),
+            "hash-a",
+            "intent-b",
+            &version("version-2"),
+            "hash-b",
+        ));
     }
 }

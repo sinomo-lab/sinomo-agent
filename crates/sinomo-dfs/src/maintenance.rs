@@ -172,30 +172,30 @@ pub fn dfs_maintenance_report_reached_limit(report: &DfsMaintenanceTickReport) -
 /// Bounded resident-daemon maintenance policy. Inventory-wide lifecycle work
 /// remains disabled and is enabled only by explicit recovery options.
 pub fn dfs_resident_routine_maintenance_tick_options() -> DfsMaintenanceTickOptions {
-    let mut options = DfsMaintenanceTickOptions::default();
-    options.repair_max_jobs = DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK;
-    options.lifecycle.repair_metadata = false;
-    options.lifecycle.cleanup_stale_staging = false;
-    options.lifecycle.compact_tombstones = false;
-    options.lifecycle.tombstone_compaction_min_age = DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE;
-    options.lifecycle.tombstone_compaction_max_records =
-        DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS;
-    options.lifecycle.collect_metadata_history = false;
-    options.lifecycle.metadata_history_gc_min_age = DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE;
-    options.lifecycle.metadata_history_gc_keep_latest_versions =
-        DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS;
-    options.lifecycle.metadata_history_gc_max_records =
-        DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS;
-    options.lifecycle.collect_content_versions = false;
-    options.lifecycle.collect_orphan_content = false;
-    options.lifecycle.reconcile_content_reservations = false;
-    options
-        .lifecycle
-        .content_reservation_reconciliation_max_records =
-        DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS;
-    options.publish_metadata = false;
-    options.metadata_replication = dfs_resident_metadata_replication_options();
-    options
+    DfsMaintenanceTickOptions {
+        repair_max_jobs: DFS_RESIDENT_REPAIR_MAX_JOBS_PER_TICK,
+        lifecycle: DfsMaintenanceRunOptions {
+            repair_metadata: false,
+            cleanup_stale_staging: false,
+            compact_tombstones: false,
+            tombstone_compaction_min_age: DFS_RESIDENT_TOMBSTONE_COMPACTION_MIN_AGE,
+            tombstone_compaction_max_records: DFS_RESIDENT_TOMBSTONE_COMPACTION_MAX_RECORDS,
+            collect_metadata_history: false,
+            metadata_history_gc_min_age: DFS_RESIDENT_METADATA_HISTORY_GC_MIN_AGE,
+            metadata_history_gc_keep_latest_versions:
+                DFS_RESIDENT_METADATA_HISTORY_GC_KEEP_LATEST_VERSIONS,
+            metadata_history_gc_max_records: DFS_RESIDENT_METADATA_HISTORY_GC_MAX_RECORDS,
+            collect_content_versions: false,
+            collect_orphan_content: false,
+            reconcile_content_reservations: false,
+            content_reservation_reconciliation_max_records:
+                DFS_RESIDENT_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS,
+            ..DfsMaintenanceRunOptions::default()
+        },
+        publish_metadata: false,
+        metadata_replication: dfs_resident_metadata_replication_options(),
+        ..DfsMaintenanceTickOptions::default()
+    }
 }
 
 pub fn dfs_explicit_disaster_recovery_tick_options(
@@ -575,7 +575,7 @@ pub(crate) fn run_cluster_dfs_maintenance_tick_with_message_sender(
         .map(|topology| topology.metadata_shards(&file_system.file_system_id))
         .transpose()?
         .unwrap_or_default();
-    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)?;
+    let peer_node_ids = discovered_cluster_dfs_peer_node_ids(cluster_paths, &state)?;
     let mut service = open_cluster_dfs_service_with_message_sender(
         data_dir,
         cluster_paths,
@@ -2771,228 +2771,6 @@ pub fn run_dfs_maintenance_tick_with_host<T: DfsMessageTransport>(
     })
 }
 
-#[cfg(test)]
-mod causal_time_tests {
-    use super::*;
-    use crate::{
-        DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalog,
-        DfsContentRootCatalogCoverage, DfsContentRootCatalogFragment,
-        DfsContentRootCatalogShardIdentity, DfsMetadataShardAssignment,
-        LocalDfsContentRootCatalogStore,
-        dfs_content_root_catalog_topology_digest_with_file_systems,
-    };
-    use sinomo_core::DfsObjectPolicy;
-
-    fn repair_attempt_for_connectivity_test(
-        target: NodeId,
-        attempts: u32,
-    ) -> DfsRepairAttemptRecord {
-        DfsRepairAttemptRecord {
-            intent_id: "intent-reactive-connectivity".to_string(),
-            object_id: DfsObjectId::from_legacy_named("object-reactive-connectivity")
-                .expect("object id"),
-            version: DfsVersion::from_legacy_named("version-reactive-connectivity")
-                .expect("version"),
-            content_hash: "blake3:reactive-connectivity".to_string(),
-            missing_replica_node_id: target,
-            attempts,
-            in_flight: false,
-            last_attempt_unix_nanos: 0,
-            next_retry_unix_nanos: dfs_now_unix_nanos(),
-            transfer_request_id: None,
-            last_error: None,
-        }
-    }
-
-    #[test]
-    fn connectivity_projection_cannot_defer_the_first_bounded_repair_attempt() {
-        let target = NodeId::from_legacy_named("node-reactive-connectivity").expect("target node");
-        let exclusions = DfsMaintenanceExecutionExclusions::new([target.clone()]);
-        let unattempted = repair_attempt_for_connectivity_test(target.clone(), 0);
-        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&unattempted));
-
-        assert!(
-            !effective.contains(&target),
-            "cached reachability alone must not park newly committed repair work"
-        );
-
-        let attempted = repair_attempt_for_connectivity_test(target.clone(), 1);
-        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&attempted));
-        assert!(
-            effective.contains(&target),
-            "a target with an actual failed attempt may remain connectivity-parked"
-        );
-
-        let mut records = vec![attempted];
-        mark_connectivity_blocked_dfs_repair_attempt_records(&mut records, &exclusions);
-        assert_eq!(records[0].next_retry_unix_nanos, u64::MAX);
-        assert!(!records[0].in_flight);
-        assert_eq!(records[0].transfer_request_id, None);
-        assert_eq!(
-            records[0].last_error.as_deref(),
-            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY),
-            "a deferred record must carry its concrete blocker"
-        );
-    }
-
-    #[test]
-    fn sync_repair_budget_excludes_durably_parked_records() {
-        let runnable_target =
-            NodeId::from_legacy_named("node-sync-budget-runnable").expect("runnable target");
-        let parked_target =
-            NodeId::from_legacy_named("node-sync-budget-parked").expect("parked target");
-        let now = dfs_now_unix_nanos();
-        let mut runnable = repair_attempt_for_connectivity_test(runnable_target, 1);
-        runnable.next_retry_unix_nanos = now;
-        let mut parked = repair_attempt_for_connectivity_test(parked_target, 1);
-        parked.next_retry_unix_nanos = u64::MAX;
-        parked.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
-        let queue_before = [runnable.clone(), parked];
-        let eligible_count = queue_before
-            .iter()
-            .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
-            .count();
-
-        assert_eq!(eligible_count, 1);
-        assert!(
-            !dfs_repair_maintenance_budget_exhausted(
-                2,
-                eligible_count,
-                1,
-                std::slice::from_ref(&runnable),
-                now,
-            ),
-            "parked work cannot make a partially used sync budget look exhausted"
-        );
-        assert!(
-            dfs_repair_maintenance_budget_exhausted(
-                1,
-                eligible_count,
-                1,
-                std::slice::from_ref(&runnable),
-                now,
-            ),
-            "the same queue must report exhaustion when its executable work fills the budget"
-        );
-    }
-
-    #[test]
-    fn default_catalog_page_budget_preserves_the_bounded_root_capacity() {
-        assert_eq!(DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD, 4096);
-        let root_capacity = DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD
-            * DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
-        assert!(root_capacity >= DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD);
-        assert!(
-            root_capacity - DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD
-                < DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES
-        );
-        assert!(
-            crate::DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES
-                > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
-            "the request target may grow without silently reducing the safety page budget"
-        );
-    }
-
-    #[test]
-    fn content_gc_uses_local_install_time_for_durable_content_observations() {
-        let file_system_id =
-            DfsFileSystemId::from_legacy_named("causal-time-fs").expect("filesystem");
-        let primary_node_id =
-            NodeId::from_legacy_named("causal-time-primary").expect("primary node");
-        let shard = DfsMetadataShardConfig {
-            file_system_id: file_system_id.clone(),
-            shard_id: "causal-time-shard".to_string(),
-            primary_node_id: primary_node_id.clone(),
-            replica_node_ids: Vec::new(),
-            epoch: 4,
-            assignment: DfsMetadataShardAssignment::Root,
-            namespace_prepare_codec: Default::default(),
-            default_policy: DfsObjectPolicy::ReplicatedConfirmed,
-        };
-        let file_system = DfsFileSystemConfig {
-            file_system_id,
-            display_name: "Causal time filesystem".to_string(),
-            owner_node_id: primary_node_id,
-            subtree_policies: Vec::new(),
-        };
-        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
-            std::slice::from_ref(&file_system),
-            std::slice::from_ref(&shard),
-        )
-        .expect("topology digest");
-        let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
-        let generated_at_unix_nanos = 10;
-        let installed_at_unix_nanos = 100;
-        let state_fingerprint = format!(
-            "dfs-metadata-prefix-v2:blake3:{}",
-            blake3::hash(b"causal-time-state").to_hex()
-        );
-        let catalog = DfsContentRootCatalog::from_fragments(
-            topology_digest.clone(),
-            vec![identity.clone()],
-            generated_at_unix_nanos,
-            vec![DfsContentRootCatalogFragment {
-                identity,
-                topology_digest,
-                generated_at_unix_nanos,
-                coverage: DfsContentRootCatalogCoverage::Complete {
-                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
-                    journal_sequence: 1,
-                    state_fingerprint,
-                },
-                entries: Vec::new(),
-            }],
-        )
-        .expect("catalog");
-        let root = sinomo_testdir::TestDir::new("dfs-content-root-catalog-causal-time");
-        let validation = LocalDfsContentRootCatalogStore::new(&root)
-            .install_test_catalog_at(catalog, installed_at_unix_nanos)
-            .expect("install catalog")
-            .validate_for_collection_with_head_watermark_policy(
-                std::slice::from_ref(&file_system),
-                std::slice::from_ref(&shard),
-                &[],
-                &[],
-                false,
-                installed_at_unix_nanos + 1,
-                Duration::from_nanos(100),
-            )
-            .expect("validate catalog");
-        let content_gc_options = DfsMaintenanceRunOptions {
-            collect_content_versions: true,
-            reconcile_content_reservations: true,
-            ..DfsMaintenanceRunOptions::default()
-        };
-        assert!(validation.is_collection_authorized());
-        assert_eq!(
-            validation.catalog_generated_at_unix_nanos(),
-            Some(generated_at_unix_nanos)
-        );
-        assert_eq!(
-            validation.catalog_installed_at_unix_nanos(),
-            Some(installed_at_unix_nanos)
-        );
-
-        let options = dfs_content_gc_lifecycle_options(content_gc_options, validation);
-        assert_eq!(
-            options
-                .version_gc
-                .expect("version GC")
-                .catalog_generated_at_unix_nanos,
-            Some(installed_at_unix_nanos),
-            "manifest first-absence observations use the causally ordered local installation time"
-        );
-        assert_eq!(
-            options
-                .content_reservation_reconciliation
-                .expect("reservation reconciliation")
-                .catalog_generated_at_unix_nanos,
-            installed_at_unix_nanos,
-            "reservation release uses the causally ordered local installation time"
-        );
-    }
-}
-
 pub async fn run_dfs_maintenance_tick_with_async_host<T>(
     service: &mut NetworkedDfsService<T>,
     maintenance_host: &mut dyn DfsMaintenanceHost,
@@ -3209,4 +2987,227 @@ where
         repair_budget_exhausted,
         metadata_replication,
     })
+}
+
+#[cfg(test)]
+mod causal_time_tests {
+    use super::*;
+    use crate::{
+        DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION, DfsContentRootCatalog,
+        DfsContentRootCatalogCoverage, DfsContentRootCatalogFragment,
+        DfsContentRootCatalogShardIdentity, DfsMetadataShardAssignment,
+        LocalDfsContentRootCatalogStore,
+        dfs_content_root_catalog_topology_digest_with_file_systems,
+    };
+    use sinomo_core::DfsObjectPolicy;
+
+    fn repair_attempt_for_connectivity_test(
+        target: NodeId,
+        attempts: u32,
+    ) -> DfsRepairAttemptRecord {
+        DfsRepairAttemptRecord {
+            intent_id: "intent-reactive-connectivity".to_string(),
+            object_id: DfsObjectId::from_legacy_named("object-reactive-connectivity")
+                .expect("object id"),
+            version: DfsVersion::from_legacy_named("version-reactive-connectivity")
+                .expect("version"),
+            content_hash: "blake3:reactive-connectivity".to_string(),
+            missing_replica_node_id: target,
+            attempts,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: dfs_now_unix_nanos(),
+            transfer_request_id: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn connectivity_projection_cannot_defer_the_first_bounded_repair_attempt() {
+        let target = NodeId::from_legacy_named("node-reactive-connectivity").expect("target node");
+        let exclusions = DfsMaintenanceExecutionExclusions::new([target.clone()]);
+        let unattempted = repair_attempt_for_connectivity_test(target.clone(), 0);
+        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&unattempted));
+
+        assert!(
+            !effective.contains(&target),
+            "cached reachability alone must not park newly committed repair work"
+        );
+
+        let attempted = repair_attempt_for_connectivity_test(target.clone(), 1);
+        let effective = exclusions.allowing_unattempted_repairs(std::slice::from_ref(&attempted));
+        assert!(
+            effective.contains(&target),
+            "a target with an actual failed attempt may remain connectivity-parked"
+        );
+
+        let mut records = vec![attempted];
+        mark_connectivity_blocked_dfs_repair_attempt_records(&mut records, &exclusions);
+        assert_eq!(records[0].next_retry_unix_nanos, u64::MAX);
+        assert!(!records[0].in_flight);
+        assert_eq!(records[0].transfer_request_id, None);
+        assert_eq!(
+            records[0].last_error.as_deref(),
+            Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY),
+            "a deferred record must carry its concrete blocker"
+        );
+    }
+
+    #[test]
+    fn sync_repair_budget_excludes_durably_parked_records() {
+        let runnable_target =
+            NodeId::from_legacy_named("node-sync-budget-runnable").expect("runnable target");
+        let parked_target =
+            NodeId::from_legacy_named("node-sync-budget-parked").expect("parked target");
+        let now = dfs_now_unix_nanos();
+        let mut runnable = repair_attempt_for_connectivity_test(runnable_target, 1);
+        runnable.next_retry_unix_nanos = now;
+        let mut parked = repair_attempt_for_connectivity_test(parked_target, 1);
+        parked.next_retry_unix_nanos = u64::MAX;
+        parked.last_error = Some(DFS_REPAIR_EXECUTION_BLOCKED_BY_CONNECTIVITY.to_string());
+        let queue_before = [runnable.clone(), parked];
+        let eligible_count = queue_before
+            .iter()
+            .filter(|record| dfs_repair_attempt_is_eligible_without_execution_projection(record))
+            .count();
+
+        assert_eq!(eligible_count, 1);
+        assert!(
+            !dfs_repair_maintenance_budget_exhausted(
+                2,
+                eligible_count,
+                1,
+                std::slice::from_ref(&runnable),
+                now,
+            ),
+            "parked work cannot make a partially used sync budget look exhausted"
+        );
+        assert!(
+            dfs_repair_maintenance_budget_exhausted(
+                1,
+                eligible_count,
+                1,
+                std::slice::from_ref(&runnable),
+                now,
+            ),
+            "the same queue must report exhaustion when its executable work fills the budget"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn default_catalog_page_budget_preserves_the_bounded_root_capacity() {
+        assert_eq!(DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD, 4096);
+        let root_capacity = DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_PAGES_PER_SHARD
+            * DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES;
+        assert!(root_capacity >= DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD);
+        assert!(
+            root_capacity - DEFAULT_DFS_CONTENT_ROOT_CATALOG_MAX_ROOTS_PER_SHARD
+                < DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES
+        );
+        assert!(
+            crate::DEFAULT_DFS_CONTENT_ROOT_CATALOG_PAGE_ENTRIES
+                > DFS_CONTENT_ROOT_CATALOG_MAX_PAGE_ENTRIES,
+            "the request target may grow without silently reducing the safety page budget"
+        );
+    }
+
+    #[test]
+    fn content_gc_uses_local_install_time_for_durable_content_observations() {
+        let file_system_id =
+            DfsFileSystemId::from_legacy_named("causal-time-fs").expect("filesystem");
+        let primary_node_id =
+            NodeId::from_legacy_named("causal-time-primary").expect("primary node");
+        let shard = DfsMetadataShardConfig {
+            file_system_id: file_system_id.clone(),
+            shard_id: "causal-time-shard".to_string(),
+            primary_node_id: primary_node_id.clone(),
+            replica_node_ids: Vec::new(),
+            epoch: 4,
+            assignment: DfsMetadataShardAssignment::Root,
+            namespace_prepare_codec: Default::default(),
+            default_policy: DfsObjectPolicy::ReplicatedConfirmed,
+        };
+        let file_system = DfsFileSystemConfig {
+            file_system_id,
+            display_name: "Causal time filesystem".to_string(),
+            owner_node_id: primary_node_id,
+            subtree_policies: Vec::new(),
+        };
+        let topology_digest = dfs_content_root_catalog_topology_digest_with_file_systems(
+            std::slice::from_ref(&file_system),
+            std::slice::from_ref(&shard),
+        )
+        .expect("topology digest");
+        let identity = DfsContentRootCatalogShardIdentity::from_config(&shard);
+        let generated_at_unix_nanos = 10;
+        let installed_at_unix_nanos = 100;
+        let state_fingerprint = format!(
+            "dfs-metadata-prefix-v2:blake3:{}",
+            blake3::hash(b"causal-time-state").to_hex()
+        );
+        let catalog = DfsContentRootCatalog::from_fragments(
+            topology_digest.clone(),
+            vec![identity.clone()],
+            generated_at_unix_nanos,
+            vec![DfsContentRootCatalogFragment {
+                identity,
+                topology_digest,
+                generated_at_unix_nanos,
+                coverage: DfsContentRootCatalogCoverage::Complete {
+                    prefix_proof_version: DFS_CONTENT_ROOT_CATALOG_PREFIX_PROOF_VERSION,
+                    journal_sequence: 1,
+                    state_fingerprint,
+                },
+                entries: Vec::new(),
+            }],
+        )
+        .expect("catalog");
+        let root = sinomo_testdir::TestDir::new("dfs-content-root-catalog-causal-time");
+        let validation = LocalDfsContentRootCatalogStore::new(&root)
+            .install_test_catalog_at(catalog, installed_at_unix_nanos)
+            .expect("install catalog")
+            .validate_for_collection_with_head_watermark_policy(
+                std::slice::from_ref(&file_system),
+                std::slice::from_ref(&shard),
+                &[],
+                &[],
+                false,
+                installed_at_unix_nanos + 1,
+                Duration::from_nanos(100),
+            )
+            .expect("validate catalog");
+        let content_gc_options = DfsMaintenanceRunOptions {
+            collect_content_versions: true,
+            reconcile_content_reservations: true,
+            ..DfsMaintenanceRunOptions::default()
+        };
+        assert!(validation.is_collection_authorized());
+        assert_eq!(
+            validation.catalog_generated_at_unix_nanos(),
+            Some(generated_at_unix_nanos)
+        );
+        assert_eq!(
+            validation.catalog_installed_at_unix_nanos(),
+            Some(installed_at_unix_nanos)
+        );
+
+        let options = dfs_content_gc_lifecycle_options(content_gc_options, validation);
+        assert_eq!(
+            options
+                .version_gc
+                .expect("version GC")
+                .catalog_generated_at_unix_nanos,
+            Some(installed_at_unix_nanos),
+            "manifest first-absence observations use the causally ordered local installation time"
+        );
+        assert_eq!(
+            options
+                .content_reservation_reconciliation
+                .expect("reservation reconciliation")
+                .catalog_generated_at_unix_nanos,
+            installed_at_unix_nanos,
+            "reservation release uses the causally ordered local installation time"
+        );
+    }
 }

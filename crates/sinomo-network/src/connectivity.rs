@@ -599,7 +599,7 @@ pub fn try_select_cluster_connectivity_probe_batch(
             previous,
         });
     }
-    probe_entries.sort_by(|left, right| cluster_connectivity_probe_entry_cmp(left, right));
+    probe_entries.sort_by(cluster_connectivity_probe_entry_cmp);
     let due_count = probe_entries.len();
     let probe_count = due_count.min(cluster_connectivity_probe_max_endpoints_per_tick_for_role(
         local_node_role,

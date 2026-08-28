@@ -1083,7 +1083,7 @@ async fn run_raw_voice_input_loop(
             1,
         );
         store
-            .append_audio_segment(&session_id, segment, &bytes)
+            .append_audio_segment(session_id, segment, &bytes)
             .map_err(agent_session_store_error)?;
         let mut chunk = sinomo_lm::RealtimeAudioInputChunk::new(bytes);
         chunk.force_listen = options.force_listen;
@@ -1162,27 +1162,26 @@ async fn run_native_voice_loop(
     let mut video_conversion_failures = 0_u8;
     while Instant::now() < deadline {
         let mut progressed = false;
-        if let Some(microphone) = &microphone {
-            if let Some(chunk) = microphone
+        if let Some(microphone) = &microphone
+            && let Some(chunk) = microphone
                 .recv_chunk(Duration::from_millis(5))
                 .map_err(native_audio_error)?
-            {
-                send_voice_audio_chunk(
-                    session,
-                    state,
-                    store,
-                    session_id,
-                    provider_id,
-                    model,
-                    config,
-                    options,
-                    input_sequence,
-                    chunk.audio,
-                )
-                .await?;
-                input_sequence = input_sequence.saturating_add(1);
-                progressed = true;
-            }
+        {
+            send_voice_audio_chunk(
+                session,
+                state,
+                store,
+                session_id,
+                provider_id,
+                model,
+                config,
+                options,
+                input_sequence,
+                chunk.audio,
+            )
+            .await?;
+            input_sequence = input_sequence.saturating_add(1);
+            progressed = true;
         }
         if let Some(camera) = &camera {
             if let Some(sample) = camera
@@ -1436,8 +1435,8 @@ async fn send_voice_video_frames(
             .await
             .map_err(realtime_audio_error)?;
         sequence = sequence.saturating_add(1);
-        if options.pace {
-            if receive_voice_events_for(
+        if options.pace
+            && receive_voice_events_for(
                 session,
                 state,
                 store,
@@ -1452,9 +1451,8 @@ async fn send_voice_video_frames(
                 false,
             )
             .await?
-            {
-                break;
-            }
+        {
+            break;
         }
     }
     Ok(sequence)

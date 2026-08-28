@@ -617,11 +617,7 @@ pub fn plan_background_scheduling_tick(
         });
     }
 
-    for campaign in request
-        .campaigns
-        .into_iter()
-        .chain(opportunity_campaigns.into_iter())
-    {
+    for campaign in request.campaigns.into_iter().chain(opportunity_campaigns) {
         let campaign_context_evidence_refs = background_campaign_context_evidence_refs(&campaign);
         let previous_status = campaign.status.clone();
         if is_terminal_campaign_status(&campaign.status) {

@@ -382,10 +382,7 @@ pub fn invite_channels_for_join_registration(
         .iter()
         .any(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
     {
-        channels = channels
-            .into_iter()
-            .filter(|channel| is_remote_join_registration_endpoint(&channel.endpoint))
-            .collect();
+        channels.retain(|channel| is_remote_join_registration_endpoint(&channel.endpoint));
     }
     channels.sort_by_key(|channel| {
         (
@@ -452,21 +449,19 @@ fn invite_direct_endpoint_fallback_rank(endpoint: &ClusterEndpointRecord) -> u8 
 pub fn compact_default_invite_introducers(introducers: &mut Vec<ClusterEndpointRecord>) {
     let remote_lan = introducers
         .iter()
-        .filter(|endpoint| {
+        .find(|endpoint| {
             is_remote_usable_invite_endpoint(endpoint)
                 && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
                 && invite_direct_endpoint_fallback_rank(endpoint) == 0
         })
-        .next()
         .cloned();
     let remote_public = introducers
         .iter()
-        .filter(|endpoint| {
+        .find(|endpoint| {
             is_remote_usable_invite_endpoint(endpoint)
                 && !matches!(endpoint.transport, ClusterTransportKind::Iroh)
                 && invite_direct_endpoint_fallback_rank(endpoint) == 1
         })
-        .next()
         .cloned()
         .or_else(|| {
             introducers
@@ -646,7 +641,7 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Ne
         detail: format!("invalid invite_id: {source}"),
     })?;
     let cluster_id = ClusterId::deserialize_migrating_legacy(
-        &optional_invite_param(&params, "cluster_id")?
+        optional_invite_param(&params, "cluster_id")?
             .unwrap_or_else(|| PENDING_INVITE_CLUSTER_ID.to_string()),
     )
     .map_err(|source| NetworkError::Serialization {
@@ -663,7 +658,7 @@ fn decode_cluster_join_invite_uri(payload: &str) -> Result<ClusterJoinInvite, Ne
         .transpose()?
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let trust_domain = TrustDomain::new(
-        &optional_invite_param(&params, "trust_domain")?
+        optional_invite_param(&params, "trust_domain")?
             .unwrap_or_else(|| "trust.local".to_string()),
     )
     .map_err(|source| NetworkError::Serialization {

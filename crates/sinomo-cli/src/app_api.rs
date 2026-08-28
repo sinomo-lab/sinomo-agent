@@ -315,7 +315,7 @@ impl AgentChannelHistoryMetadata {
         Self {
             channel_id: channel.channel_id.clone(),
             title: channel.title.clone(),
-            channel_kind: channel.channel_kind.clone(),
+            channel_kind: channel.channel_kind,
             updated_at: channel.updated_at,
             deleted_at: channel.deleted_at,
             participants: channel
@@ -1298,7 +1298,7 @@ impl SifsAgentChannelStore {
             .into_iter()
             .filter(|summary| !summary.is_deleted())
             .collect::<Vec<_>>();
-        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
         summaries
     }
 
@@ -2806,7 +2806,7 @@ impl SifsAgentChannelStore {
                 summaries.push(AgentChannelSummary::from_channel(&channel));
             }
         }
-        summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
         Ok(summaries)
     }
 
@@ -2879,13 +2879,13 @@ impl AgentChannelStore for SifsAgentChannelStore {
     fn list_channels(&self) -> Result<Vec<AgentChannel>, AgentChannelStoreError> {
         let mut channels = Vec::new();
         for channel_id in self.channel_ids_from_sifs()? {
-            if let Some(channel) = self.load_channel(&channel_id)? {
-                if !channel.is_deleted() {
-                    channels.push(channel);
-                }
+            if let Some(channel) = self.load_channel(&channel_id)?
+                && !channel.is_deleted()
+            {
+                channels.push(channel);
             }
         }
-        channels.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        channels.sort_by_key(|channel| std::cmp::Reverse(channel.updated_at));
         Ok(channels)
     }
 
@@ -4344,11 +4344,11 @@ impl AgentChat {
             .map_err(|error| CliError::Parse {
                 detail: format!("configure resumed chat tool runtime failed: {error}"),
             })?;
-        if !loaded_existing_channel || self.channel != channel_before_resume {
-            if let Err(error) = self.save_channel() {
-                self.resume_sync_warnings
-                    .push(format!("save reconciled chat channel failed: {error}"));
-            }
+        if (!loaded_existing_channel || self.channel != channel_before_resume)
+            && let Err(error) = self.save_channel()
+        {
+            self.resume_sync_warnings
+                .push(format!("save reconciled chat channel failed: {error}"));
         }
         if let Some(projected_session) = self.runtime.handler().agent_session_snapshot()?
             && let Some(projected_agent_key) = projected_session
@@ -4461,12 +4461,12 @@ impl AgentChat {
         if let Some(node_id) = selection.sandbox_node_id.as_deref() {
             parse_chat_tool_runtime_node_id(node_id)?;
         }
-        if let Some(root) = selection.workspace_root.as_ref() {
-            if root.as_os_str().is_empty() {
-                return Err(CliError::Parse {
-                    detail: "workspace directory cannot be empty".to_string(),
-                });
-            }
+        if let Some(root) = selection.workspace_root.as_ref()
+            && root.as_os_str().is_empty()
+        {
+            return Err(CliError::Parse {
+                detail: "workspace directory cannot be empty".to_string(),
+            });
         }
 
         let session_id = self.runtime.session().session_id.clone();
@@ -6759,7 +6759,7 @@ fn json_text_value_start(json: &str) -> Option<usize> {
 
 fn is_escaped_quote(text: &str, quote_index: usize) -> bool {
     let mut slash_count = 0;
-    for byte in text[..quote_index].as_bytes().iter().rev() {
+    for byte in text.as_bytes()[..quote_index].iter().rev() {
         if *byte == b'\\' {
             slash_count += 1;
         } else {
@@ -6946,10 +6946,10 @@ fn truncate_chars(value: String, max_chars: usize) -> String {
 /// Separate inline `<sinomo_progress>…</sinomo_progress>` status markers from
 /// visible answer text.
 fn split_chunk(chunk: &str) -> Vec<ChatStreamEvent> {
-    if let Some(rest) = chunk.strip_prefix("<sinomo_progress>") {
-        if let Some(progress) = rest.strip_suffix("</sinomo_progress>") {
-            return vec![ChatStreamEvent::Notice(progress.to_string())];
-        }
+    if let Some(rest) = chunk.strip_prefix("<sinomo_progress>")
+        && let Some(progress) = rest.strip_suffix("</sinomo_progress>")
+    {
+        return vec![ChatStreamEvent::Notice(progress.to_string())];
     }
     vec![ChatStreamEvent::Token(chunk.to_string())]
 }
@@ -11826,9 +11826,11 @@ mod tests {
             content: "private pre-compaction constraint".to_string(),
             event_id: None,
         });
-        let mut working_state = sinomo_agent::AgentWorkingState::default();
-        working_state.active_objective = Some("finish roaming verification".to_string());
-        working_state.files_modified = vec!["src/roaming.rs".to_string()];
+        let working_state = sinomo_agent::AgentWorkingState {
+            active_objective: Some("finish roaming verification".to_string()),
+            files_modified: vec!["src/roaming.rs".to_string()],
+            ..sinomo_agent::AgentWorkingState::default()
+        };
         seeded.projection = Some(sinomo_agent::AgentSessionProjection {
             projection_id: TaskId::generate(),
             previous_projection_id: None,

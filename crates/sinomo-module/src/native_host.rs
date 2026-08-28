@@ -366,6 +366,13 @@ impl NativeModule {
         })
     }
 
+    /// Loads a descriptor after verifying the library's content hash.
+    ///
+    /// # Safety
+    ///
+    /// The caller must trust the verified native library to honor Sinomo's
+    /// module ABI. Loading a native library executes platform loader behavior
+    /// and its exported functions may run arbitrary native code.
     pub unsafe fn descriptor_from_content_addressed_path(
         library_path: impl AsRef<Path>,
         expected_content_hash: &str,
@@ -375,6 +382,14 @@ impl NativeModule {
         unsafe { Self::descriptor_from_verified_path(library_path) }
     }
 
+    /// Loads a descriptor from a path whose contents were already verified.
+    ///
+    /// # Safety
+    ///
+    /// The caller must establish both the library's trust and its immutability
+    /// for the duration of this call. The library must honor Sinomo's module
+    /// ABI; loading it and calling its exports may execute arbitrary native
+    /// code.
     pub unsafe fn descriptor_from_verified_path(
         library_path: impl AsRef<Path>,
     ) -> Result<NativeModuleDescriptor, NativeModuleHostError> {
@@ -744,6 +759,45 @@ unsafe fn copy_and_free_buffer(
     bytes
 }
 
+fn verify_native_module_hash(
+    library_path: &Path,
+    expected_content_hash: &str,
+) -> Result<(), NativeModuleHostError> {
+    let bytes = fs::read(library_path).map_err(|source| NativeModuleHostError::Io {
+        path: library_path.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let actual = native_module_content_hash(&bytes);
+    if actual != expected_content_hash {
+        return Err(NativeModuleHostError::HashMismatch {
+            path: library_path.display().to_string(),
+            expected: expected_content_hash.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+pub fn native_module_content_hash(bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(bytes).to_hex())
+}
+
+pub fn native_module_cache_path(
+    data_dir_root: impl AsRef<Path>,
+    module_path_key: &str,
+    content_hash: &str,
+    library_name: &str,
+) -> PathBuf {
+    data_dir_root
+        .as_ref()
+        .join("module")
+        .join("cache")
+        .join("native-dylib")
+        .join(module_path_key)
+        .join(content_hash.replace(':', "_"))
+        .join(library_name)
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
@@ -858,43 +912,4 @@ mod lifecycle_tests {
             .expect("second lifecycle acquired after release");
         waiter.join().expect("join lifecycle waiter");
     }
-}
-
-fn verify_native_module_hash(
-    library_path: &Path,
-    expected_content_hash: &str,
-) -> Result<(), NativeModuleHostError> {
-    let bytes = fs::read(library_path).map_err(|source| NativeModuleHostError::Io {
-        path: library_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let actual = native_module_content_hash(&bytes);
-    if actual != expected_content_hash {
-        return Err(NativeModuleHostError::HashMismatch {
-            path: library_path.display().to_string(),
-            expected: expected_content_hash.to_string(),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-pub fn native_module_content_hash(bytes: &[u8]) -> String {
-    format!("blake3:{}", blake3::hash(bytes).to_hex())
-}
-
-pub fn native_module_cache_path(
-    data_dir_root: impl AsRef<Path>,
-    module_path_key: &str,
-    content_hash: &str,
-    library_name: &str,
-) -> PathBuf {
-    data_dir_root
-        .as_ref()
-        .join("module")
-        .join("cache")
-        .join("native-dylib")
-        .join(module_path_key)
-        .join(content_hash.replace(':', "_"))
-        .join(library_name)
 }

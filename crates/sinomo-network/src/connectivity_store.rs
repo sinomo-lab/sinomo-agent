@@ -1238,9 +1238,9 @@ fn earliest_cluster_connectivity_expiry(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn record_local_cluster_connectivity_prune_pass_for_test(path: &PathBuf) {
+fn record_local_cluster_connectivity_prune_pass_for_test(path: &Path) {
     if let Ok(mut passes) = LOCAL_CLUSTER_CONNECTIVITY_PRUNE_PASSES_FOR_TEST.lock() {
-        *passes.entry(path.clone()).or_default() += 1;
+        *passes.entry(path.to_path_buf()).or_default() += 1;
     }
 }
 
@@ -1249,9 +1249,9 @@ fn prune_expired_local_cluster_connectivity_cache_entry(
     entry: &mut LocalClusterConnectivityRecordCacheEntry,
     now: OffsetDateTime,
 ) {
-    if !entry
+    if entry
         .earliest_expires_at
-        .is_some_and(|expires_at| expires_at <= now)
+        .is_none_or(|expires_at| expires_at > now)
     {
         return;
     }
@@ -2697,7 +2697,7 @@ mod tests {
             let mut record = template.clone();
             record.endpoint_id = ClusterEndpointId::derived(
                 "sinomo.test.connectivity.aggregate-limit.existing",
-                &index.to_le_bytes(),
+                index.to_le_bytes(),
             );
             record.address = format!("target:{index}");
             existing.push(record);
@@ -2713,7 +2713,7 @@ mod tests {
             record.source_node_id = source_b.clone();
             record.endpoint_id = ClusterEndpointId::derived(
                 "sinomo.test.connectivity.aggregate-limit.incoming",
-                &index.to_le_bytes(),
+                index.to_le_bytes(),
             );
             record.address = format!("incoming:{index}");
             incoming.push(record);

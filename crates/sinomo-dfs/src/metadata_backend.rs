@@ -3656,13 +3656,13 @@ impl LocalSobjMetadataBackend {
             content_root_catalog_snapshot_builds: Arc::new(AtomicUsize::new(0)),
         };
         let lock = backend.metadata_write_lock()?;
-        if let Some(freeze) = backend.membership_handoff_write_freeze()? {
-            if !permit.admits_write_freeze(&freeze) {
-                return Err(MetadataBackendError::MembershipHandoffFrozen {
-                    shard_id: backend.shard_id.clone(),
-                    handoff_id: freeze.handoff_id,
-                });
-            }
+        if let Some(freeze) = backend.membership_handoff_write_freeze()?
+            && !permit.admits_write_freeze(&freeze)
+        {
+            return Err(MetadataBackendError::MembershipHandoffFrozen {
+                shard_id: backend.shard_id.clone(),
+                handoff_id: freeze.handoff_id,
+            });
         }
         let archived_existing = backend.replace_with_replicated_snapshot_unlocked(
             source_shard_id,
@@ -4912,9 +4912,7 @@ impl LocalSobjMetadataBackend {
                 for op in ops {
                     if defer_compact_marker {
                         if !post_append_ops.is_empty() {
-                            return Err(MetadataBackendError::Serde(format!(
-                                "metadata journal batch cannot defer more than one compact namespace commit"
-                            )));
+                            return Err(MetadataBackendError::Serde("metadata journal batch cannot defer more than one compact namespace commit".to_string()));
                         }
                         table_ops.push(op.clone());
                         post_append_ops.push(op);
@@ -6450,13 +6448,13 @@ impl LocalSobjMetadataBackend {
             )));
         }
         let lock = self.metadata_write_lock()?;
-        if let Some(freeze) = self.membership_handoff_write_freeze()? {
-            if !permit.admits_write_freeze(&freeze) {
-                return Err(MetadataBackendError::MembershipHandoffFrozen {
-                    shard_id: self.shard_id.clone(),
-                    handoff_id: freeze.handoff_id,
-                });
-            }
+        if let Some(freeze) = self.membership_handoff_write_freeze()?
+            && !permit.admits_write_freeze(&freeze)
+        {
+            return Err(MetadataBackendError::MembershipHandoffFrozen {
+                shard_id: self.shard_id.clone(),
+                handoff_id: freeze.handoff_id,
+            });
         }
         self.refresh_after_metadata_write_lock()?;
         Ok(lock)
@@ -10121,9 +10119,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
             // before slicing or encoding the page.
             let cache_lock = self.metadata_write_lock()?;
             if let Some(freeze) = self.membership_handoff_write_freeze()?
-                && !freeze
+                && freeze
                     .activated_epoch
-                    .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch))
+                    .is_none_or(|epoch| self.instance_authority_epoch != Some(epoch))
             {
                 return Ok(DfsContentRootCatalogPage::incomplete_for_request(
                     request,
@@ -10158,9 +10156,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let lock = self.metadata_write_lock()?;
         self.refresh_after_metadata_write_lock()?;
         if let Some(freeze) = self.membership_handoff_write_freeze()?
-            && !freeze
+            && freeze
                 .activated_epoch
-                .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch))
+                .is_none_or(|epoch| self.instance_authority_epoch != Some(epoch))
         {
             return Ok(DfsContentRootCatalogPage::incomplete_for_request(
                 request,
@@ -10825,9 +10823,9 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
         let Some(freeze) = self.membership_handoff_write_freeze()? else {
             return Ok(false);
         };
-        Ok(!freeze
+        Ok(freeze
             .activated_epoch
-            .is_some_and(|epoch| self.instance_authority_epoch == Some(epoch)))
+            .is_none_or(|epoch| self.instance_authority_epoch != Some(epoch)))
     }
 
     fn freeze_metadata_shard_for_membership_handoff(
@@ -14210,11 +14208,10 @@ mod tests {
         assert_eq!(installed.status, DfsNamespacePrepareStatus::Prepared);
         assert_eq!(installed.transaction.objects.len(), OBJECT_COUNT);
         assert!(
-            replica
+            !replica
                 .tables
                 .objects
-                .get(&prepare.transaction.objects[0].object_id)
-                .is_none(),
+                .contains_key(&prepare.transaction.objects[0].object_id),
             "prepared objects must remain hidden"
         );
         assert_eq!(replica.materialized_through_sequence, prepare_sequence);
@@ -14230,11 +14227,10 @@ mod tests {
         assert_eq!(reopened.status, DfsNamespacePrepareStatus::Prepared);
         assert_eq!(reopened.transaction.objects.len(), OBJECT_COUNT);
         assert!(
-            replica
+            !replica
                 .tables
                 .objects
-                .get(&prepare.transaction.objects[0].object_id)
-                .is_none(),
+                .contains_key(&prepare.transaction.objects[0].object_id),
             "table reference replay must preserve hidden prepare semantics"
         );
         cleanup(&root);
@@ -25977,7 +25973,7 @@ mod tests {
                         object_id: committed.object_id.clone(),
                         committed_version: committed.version.clone(),
                         owner_node_id: owner.clone(),
-                        event_id: EventId::from_legacy_named(&format!("evt_{node_id}"))
+                        event_id: EventId::from_legacy_named(format!("evt_{node_id}"))
                             .expect("event"),
                     },
                     replica_node_id: node_id.clone(),
@@ -26726,7 +26722,7 @@ mod tests {
                     object_id: file.object_id.clone(),
                     committed_version: intent.target_version.clone(),
                     owner_node_id: node("node_owner"),
-                    event_id: EventId::from_legacy_named(&format!("evt_batch_{replica}"))
+                    event_id: EventId::from_legacy_named(format!("evt_batch_{replica}"))
                         .expect("event"),
                 },
                 replica_node_id: node(replica),
@@ -29072,7 +29068,7 @@ mod tests {
                     .with_now_unix_nanos(u64::MAX),
             )
             .expect("sweep history and publish post-GC checkpoint");
-        assert_eq!(gc_report.removed_version_count, historical_count as u64);
+        assert_eq!(gc_report.removed_version_count, historical_count);
         let gap_batch = source
             .journal_batch_since_limited(initial.next_after_sequence, 16, usize::MAX)
             .expect("read retained post-checkpoint suffix")
@@ -29389,11 +29385,10 @@ mod tests {
             .expect("evict compact transaction receipt");
         assert_eq!(evicted.removed_namespace_transaction_receipt_count, 1);
         assert!(
-            backend
+            !backend
                 .tables
                 .namespace_transaction_receipts
-                .get(&transaction.transaction_id)
-                .is_none()
+                .contains_key(&transaction.transaction_id)
         );
         assert!(
             backend
@@ -29501,11 +29496,10 @@ mod tests {
             .expect("evict compact prepare receipt");
         assert_eq!(evicted.removed_namespace_prepare_receipt_count, 1);
         assert!(
-            backend
+            !backend
                 .tables
                 .namespace_prepare_receipts
-                .get(&prepare.operation_id)
-                .is_none()
+                .contains_key(&prepare.operation_id)
         );
         assert!(
             backend
@@ -29687,11 +29681,10 @@ mod tests {
                 .is_none()
         );
         assert!(
-            reopened
+            !reopened
                 .tables
                 .namespace_prepare_receipts
-                .get(&prepare.operation_id)
-                .is_none(),
+                .contains_key(&prepare.operation_id),
             "the compact prepare receipt must be bounded"
         );
         assert!(

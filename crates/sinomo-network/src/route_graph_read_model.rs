@@ -107,10 +107,10 @@ impl ClusterRouteGraphLiveEndpointIndex {
     }
 
     fn record_targets_live_endpoint(&self, record: &ClusterConnectivityRecord) -> bool {
-        if let Some(endpoint_ids) = self.endpoint_ids_by_node.get(&record.target_node_id) {
-            if endpoint_ids.contains(&record.endpoint_id) {
-                return true;
-            }
+        if let Some(endpoint_ids) = self.endpoint_ids_by_node.get(&record.target_node_id)
+            && endpoint_ids.contains(&record.endpoint_id)
+        {
+            return true;
         }
         if let Some(endpoint_routes) = self.endpoint_routes_by_node.get(&record.target_node_id) {
             return endpoint_routes.iter().any(|(transport, address)| {

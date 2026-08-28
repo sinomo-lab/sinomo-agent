@@ -685,8 +685,7 @@ impl DfsNodeDetachedSendOutbox {
         let mut retained = std::mem::take(&mut self.terminal_commit_promotions)
             .into_iter()
             .collect::<Vec<_>>();
-        retained
-            .sort_unstable_by(|left, right| right.1.enqueue_sequence.cmp(&left.1.enqueue_sequence));
+        retained.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1.enqueue_sequence));
         retained.truncate(DFS_TERMINAL_COMMIT_PROMOTION_RETAIN_ENTRIES);
         self.terminal_commit_promotions.extend(retained);
     }

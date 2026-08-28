@@ -384,6 +384,7 @@ impl SifsMountLease {
         }
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -447,6 +448,7 @@ impl ActiveMount {
         }
         #[cfg(not(any(all(target_os = "linux", feature = "dfs-fuse"), windows)))]
         {
+            let _ = (data_dir, config, mount_point);
             return Ok(Self::Unsupported);
         }
         #[allow(unreachable_code)]
@@ -458,6 +460,8 @@ impl ActiveMount {
         daemon_pid: u32,
         restart_count: u64,
     ) -> Result<SifsMountRuntimeStatus, String> {
+        #[cfg(not(any(all(target_os = "linux", feature = "dfs-fuse"), windows)))]
+        let _ = (daemon_pid, restart_count);
         match self {
             #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
             Self::Fuse {
@@ -635,10 +639,10 @@ impl sinomo_runtime::dfs::HostFilesystemStatusSink for ExternalStatusSink {
 }
 
 fn stop_active(active: &mut Option<ActiveMount>) {
-    if let Some(mut mount) = active.take() {
-        if let Err(error) = mount.stop() {
-            tracing::warn!("stop SIFS host mount: {error}");
-        }
+    if let Some(mut mount) = active.take()
+        && let Err(error) = mount.stop()
+    {
+        tracing::warn!("stop SIFS host mount: {error}");
     }
 }
 
@@ -669,19 +673,20 @@ fn starting_status(
     daemon_pid: u32,
     restart_count: u64,
 ) -> SifsMountRuntimeStatus {
-    let mut status = SifsMountRuntimeStatus::default();
-    status.phase = SifsMountRuntimePhase::Starting;
-    status.platform = SifsMountPlatform::current();
-    status.configured_mount_point = config.mount_point.clone();
-    status.resolved_mount_point = Some(mount_point.display().to_string());
-    status.root_path = config.root_path.clone();
-    status.read_only = config.read_only;
-    status.sync_local_changes = config.sync_local_changes;
-    status.daemon_pid = Some(daemon_pid);
-    status.restart_count = restart_count;
-    status.detail = "starting SIFS host filesystem provider".to_string();
-    status.updated_at = now();
-    status
+    SifsMountRuntimeStatus {
+        phase: SifsMountRuntimePhase::Starting,
+        platform: SifsMountPlatform::current(),
+        configured_mount_point: config.mount_point.clone(),
+        resolved_mount_point: Some(mount_point.display().to_string()),
+        root_path: config.root_path.clone(),
+        read_only: config.read_only,
+        sync_local_changes: config.sync_local_changes,
+        daemon_pid: Some(daemon_pid),
+        restart_count,
+        detail: "starting SIFS host filesystem provider".to_string(),
+        updated_at: now(),
+        ..SifsMountRuntimeStatus::default()
+    }
 }
 
 fn disabled_status(
@@ -689,18 +694,19 @@ fn disabled_status(
     daemon_pid: u32,
     restart_count: u64,
 ) -> SifsMountRuntimeStatus {
-    let mut status = SifsMountRuntimeStatus::default();
-    status.phase = SifsMountRuntimePhase::Disabled;
-    status.platform = SifsMountPlatform::current();
-    status.configured_mount_point = config.mount_point.clone();
-    status.root_path = config.root_path.clone();
-    status.read_only = config.read_only;
-    status.sync_local_changes = config.sync_local_changes;
-    status.daemon_pid = Some(daemon_pid);
-    status.restart_count = restart_count;
-    status.detail = "SIFS host mount is disabled".to_string();
-    status.updated_at = now();
-    status
+    SifsMountRuntimeStatus {
+        phase: SifsMountRuntimePhase::Disabled,
+        platform: SifsMountPlatform::current(),
+        configured_mount_point: config.mount_point.clone(),
+        root_path: config.root_path.clone(),
+        read_only: config.read_only,
+        sync_local_changes: config.sync_local_changes,
+        daemon_pid: Some(daemon_pid),
+        restart_count,
+        detail: "SIFS host mount is disabled".to_string(),
+        updated_at: now(),
+        ..SifsMountRuntimeStatus::default()
+    }
 }
 
 fn error_status(
@@ -709,18 +715,19 @@ fn error_status(
     error: impl Into<String>,
 ) -> SifsMountRuntimeStatus {
     let error = error.into();
-    let mut status = SifsMountRuntimeStatus::default();
-    status.phase = SifsMountRuntimePhase::Error;
-    status.platform = SifsMountPlatform::current();
-    status.configured_mount_point = config.mount_point.clone();
-    status.resolved_mount_point = mount_point.map(|path| path.display().to_string());
-    status.root_path = config.root_path.clone();
-    status.read_only = config.read_only;
-    status.sync_local_changes = config.sync_local_changes;
-    status.last_error = Some(error.clone());
-    status.detail = error;
-    status.updated_at = now();
-    status
+    SifsMountRuntimeStatus {
+        phase: SifsMountRuntimePhase::Error,
+        platform: SifsMountPlatform::current(),
+        configured_mount_point: config.mount_point.clone(),
+        resolved_mount_point: mount_point.map(|path| path.display().to_string()),
+        root_path: config.root_path.clone(),
+        read_only: config.read_only,
+        sync_local_changes: config.sync_local_changes,
+        last_error: Some(error.clone()),
+        detail: error,
+        updated_at: now(),
+        ..SifsMountRuntimeStatus::default()
+    }
 }
 
 fn publish(

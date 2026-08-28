@@ -358,19 +358,10 @@ impl VfsAppendOptions {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct VfsRemoveOptions {
     pub directory: bool,
     pub missing_ok: bool,
-}
-
-impl Default for VfsRemoveOptions {
-    fn default() -> Self {
-        Self {
-            directory: false,
-            missing_ok: false,
-        }
-    }
 }
 
 impl VfsRemoveOptions {

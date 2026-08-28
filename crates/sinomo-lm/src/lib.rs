@@ -751,7 +751,7 @@ pub trait LanguageModelUsageProvider {
     fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError>;
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq, Default)]
 pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_provider: Option<String>,
@@ -761,17 +761,6 @@ pub struct ModelConfig {
     pub default_model: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accounts: Vec<ProviderAccountConfig>,
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            default_provider: None,
-            default_account: None,
-            default_model: None,
-            accounts: Vec::new(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -2576,8 +2565,10 @@ pub fn provider_available_model_ids_for_account_in_data_dir(
 ) -> Result<Vec<String>, LanguageModelError> {
     let mut models = match provider {
         CODEX_PROVIDER_ID => {
-            let mut config = OpenAiResponsesCodexConfig::default();
-            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            let mut config = OpenAiResponsesCodexConfig {
+                credentials_path: Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID)),
+                ..OpenAiResponsesCodexConfig::default()
+            };
             if let Some(account) = account {
                 if let Some(base_url) = account.api_base_url.as_deref() {
                     config.api_base_url = base_url.to_string();
@@ -2589,15 +2580,21 @@ pub fn provider_available_model_ids_for_account_in_data_dir(
             OpenAiResponsesCodexClient::new(config).list_models()?
         }
         ClaudeProvider::PROVIDER_ID => {
-            let mut config = ClaudeConfig::default();
-            config.credentials_path =
-                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            let config = ClaudeConfig {
+                credentials_path: Some(
+                    data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID),
+                ),
+                ..ClaudeConfig::default()
+            };
             ClaudeProvider::new(config).list_models()?
         }
         GitHubCopilotProvider::PROVIDER_ID => {
-            let mut config = GitHubCopilotConfig::default();
-            config.token_store_path =
-                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            let mut config = GitHubCopilotConfig {
+                token_store_path: Some(
+                    data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID),
+                ),
+                ..GitHubCopilotConfig::default()
+            };
             if let Some(account) = account {
                 if let Some(base_url) = account.api_base_url.as_deref() {
                     config.api_base_url = base_url.to_string();
@@ -2737,20 +2734,28 @@ pub fn provider_usage_in_data_dir(
 ) -> Result<LanguageModelProviderUsage, LanguageModelError> {
     match provider {
         CODEX_PROVIDER_ID => {
-            let mut config = OpenAiResponsesCodexConfig::default();
-            config.credentials_path = Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID));
+            let config = OpenAiResponsesCodexConfig {
+                credentials_path: Some(data_dir.provider_credentials_file(CODEX_PROVIDER_ID)),
+                ..OpenAiResponsesCodexConfig::default()
+            };
             OpenAiResponsesCodexClient::new(config).usage()
         }
         ClaudeProvider::PROVIDER_ID => {
-            let mut config = ClaudeConfig::default();
-            config.credentials_path =
-                Some(data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID));
+            let config = ClaudeConfig {
+                credentials_path: Some(
+                    data_dir.provider_credentials_file(ClaudeProvider::PROVIDER_ID),
+                ),
+                ..ClaudeConfig::default()
+            };
             ClaudeProvider::new(config).usage()
         }
         GitHubCopilotProvider::PROVIDER_ID => {
-            let mut config = GitHubCopilotConfig::default();
-            config.token_store_path =
-                Some(data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID));
+            let config = GitHubCopilotConfig {
+                token_store_path: Some(
+                    data_dir.provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID),
+                ),
+                ..GitHubCopilotConfig::default()
+            };
             GitHubCopilotProvider::new(config).usage()
         }
         _ => provider_usage(provider),

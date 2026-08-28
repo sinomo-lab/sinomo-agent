@@ -1602,7 +1602,7 @@ mod tests {
         let channel_message = channel.append_user_message(
             "app-user",
             "User",
-            &format!("channel nonmatch {}", "c".repeat(512)),
+            format!("channel nonmatch {}", "c".repeat(512)),
             sinomo_agent::AgentChannelSource::app(),
         );
         sinomo_agent::AgentChannelStore::save_channel(&channel_store, &channel)
@@ -1797,13 +1797,13 @@ mod tests {
         let first = channel.append_user_message(
             "app-user",
             "User",
-            &format!("first nonmatch {}", "a".repeat(256)),
+            format!("first nonmatch {}", "a".repeat(256)),
             sinomo_agent::AgentChannelSource::app(),
         );
         let second = channel.append_user_message(
             "app-user",
             "User",
-            &format!("fresh-budget-needle {}", "b".repeat(4096)),
+            format!("fresh-budget-needle {}", "b".repeat(4096)),
             sinomo_agent::AgentChannelSource::app(),
         );
         sinomo_agent::AgentChannelStore::save_channel(&channel_store, &channel)
@@ -1887,7 +1887,7 @@ mod tests {
         let second = channel.append_user_message(
             "app-user",
             "User",
-            &format!("partial-tail-needle {}", "b".repeat(8_192)),
+            format!("partial-tail-needle {}", "b".repeat(8_192)),
             sinomo_agent::AgentChannelSource::app(),
         );
         sinomo_agent::AgentChannelStore::save_channel(&channel_store, &channel)

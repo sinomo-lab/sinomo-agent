@@ -1503,15 +1503,15 @@ fn default_module_cli_command_config(
             "operational observation module",
         )
         .expect("observe module id is valid");
-    let module_config = local_data_dir
+
+    local_data_dir
         .and_then(|data_dir| {
             module_config
                 .clone()
                 .with_installed_native_dylib_modules_from_data_dir(&data_dir.root())
                 .ok()
         })
-        .unwrap_or(module_config);
-    module_config
+        .unwrap_or(module_config)
 }
 
 pub fn default_cli_command_registry() -> CliCommandRegistry {
@@ -5909,7 +5909,7 @@ fn agent_decision_json(decision: &sinomo_agent::AgentLoopDecision) -> Result<Str
 /// the routing layer's provider seam (the daemon does the same at startup).
 pub(crate) fn ensure_cluster_directory_installed() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| sinomo_runtime::cluster::install_kv_cluster_directory());
+    INSTALL.call_once(sinomo_runtime::cluster::install_kv_cluster_directory);
 }
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
@@ -5951,10 +5951,8 @@ fn run_parsed_cli_invocation(invocation: CliInvocation) -> Result<(), CliError> 
     let command_is_help = command.as_ref().is_some_and(cli_command_is_help);
     let supports_degraded_local_mode = command
         .as_ref()
-        .map_or(true, cli_command_supports_degraded_local_mode);
-    let needs_daemon_probe = command
-        .as_ref()
-        .map_or(true, cli_command_needs_daemon_probe);
+        .is_none_or(cli_command_supports_degraded_local_mode);
+    let needs_daemon_probe = command.as_ref().is_none_or(cli_command_needs_daemon_probe);
     let daemon = if invocation.options.force_local || command_is_help || !needs_daemon_probe {
         None
     } else {

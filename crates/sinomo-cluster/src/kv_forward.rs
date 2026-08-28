@@ -2014,7 +2014,7 @@ fn try_materialize_forwarded_cluster_kv_txn_response(
             command_digest: response.command_digest,
             snapshot,
             txn_response: response.txn_response.clone(),
-            authority: response.authority.clone(),
+            authority: response.authority,
             replayed_committed_request: response.replayed_committed_request,
         }));
     }
@@ -2466,7 +2466,7 @@ mod tests {
             };
             let request_error = validate_forwarded_request_outcome_read(
                 ClusterKvRequestOutcomeRead {
-                    authority: authority.clone(),
+                    authority,
                     outcome: KvRequestOutcome::Unknown {
                         detail: "not retained".to_string(),
                     },
@@ -2478,7 +2478,7 @@ mod tests {
             .to_string();
             let point_error = validate_forwarded_authoritative_entry_read(
                 KvAuthoritativeRead {
-                    authority: authority.clone(),
+                    authority,
                     value: None,
                 },
                 &state,
@@ -2488,7 +2488,7 @@ mod tests {
             .to_string();
             let exact_error = validate_forwarded_authoritative_entries_read(
                 KvAuthoritativeRead {
-                    authority: authority.clone(),
+                    authority,
                     value: vec![None],
                 },
                 &state,
@@ -3161,7 +3161,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let mut point_host = FencedForwardDispatchHost::default();
+        let mut point_host = FencedForwardDispatchHost;
         let point = runtime.block_on(
             forward_cluster_kv_authoritative_entry_to_state_authority_async_with_host(
                 runtime.handle(),
@@ -3193,7 +3193,7 @@ mod tests {
             false,
         )
         .expect("restore healthy route after deliberate point failure");
-        let mut exact_host = FencedForwardDispatchHost::default();
+        let mut exact_host = FencedForwardDispatchHost;
         let exact = runtime.block_on(
             forward_cluster_kv_authoritative_entries_to_state_authority_async_with_host(
                 runtime.handle(),

@@ -113,7 +113,7 @@ fn cluster_raft_campaign_jitter_for_voters(
     // next. Same-node calls for one generation remain coalesced by the
     // election-round lock below.
     let election_generation = durable_term / sinomo_kv::CLUSTER_KV_RAFT_LEADER_ELECTION_TERM_BUMP;
-    let scheduled_rank = if election_generation % 2 == 0 {
+    let scheduled_rank = if election_generation.is_multiple_of(2) {
         voter_rank
     } else {
         voter_count.saturating_sub(1).saturating_sub(voter_rank)
@@ -151,6 +151,7 @@ fn lock_cluster_raft_election_round_before(
     let lock_path = lock_root.join("election-round.lock");
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

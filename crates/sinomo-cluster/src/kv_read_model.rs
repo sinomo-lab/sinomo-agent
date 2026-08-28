@@ -357,7 +357,7 @@ pub fn read_cluster_members_from_snapshot(
     {
         members.push(entry.decode().map_err(kv_err)?);
     }
-    let policies = read_cluster_capability_policies_from_snapshot(&snapshot)?;
+    let policies = read_cluster_capability_policies_from_snapshot(snapshot)?;
     for member in &mut members {
         member
             .endpoints
@@ -366,7 +366,7 @@ pub fn read_cluster_members_from_snapshot(
             member.capabilities = policy.capabilities.clone();
             member.allowed_capabilities = policy.allowed_capabilities.clone();
         }
-        for endpoint in read_cluster_member_endpoints_from_snapshot(&snapshot, &member.node_id)? {
+        for endpoint in read_cluster_member_endpoints_from_snapshot(snapshot, &member.node_id)? {
             upsert_member_endpoint(member, endpoint);
         }
         cleanup_member_endpoint_duplicates(member);
@@ -1041,6 +1041,10 @@ mod tests {
     }
 
     #[tokio::test]
+    // This guard serializes mutation of the process-global module registry for
+    // the entire async test; releasing it at an await would reintroduce races
+    // with the synchronous registry tests in this module.
+    #[allow(clippy::await_holding_lock)]
     async fn module_registry_generation_invalidates_a_prepared_directory_cache() {
         let _registry_guard = TEST_NETWORK_MODULE_REGISTRY_LOCK
             .lock()

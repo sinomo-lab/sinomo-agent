@@ -859,12 +859,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             content_hash,
             source_node_id,
         );
-        if let Some(object) = self.metadata.objects.get_mut(object_id) {
-            if object.version == *version && object.content_hash == *content_hash {
-                object
-                    .current_locations
-                    .retain(|node_id| node_id != source_node_id);
-            }
+        if let Some(object) = self.metadata.objects.get_mut(object_id)
+            && object.version == *version
+            && object.content_hash == *content_hash
+        {
+            object
+                .current_locations
+                .retain(|node_id| node_id != source_node_id);
         }
         let backend_object = if let Some(backend) = self.metadata_backend.as_ref()
             && let Some(object) = backend.get_object(object_id)?

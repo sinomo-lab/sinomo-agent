@@ -124,176 +124,6 @@ pub(crate) fn open_cluster_dfs_service_with_message_sender(
     service.with_boxed_metadata_backend(metadata)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sinomo_core::kv::{KvEntry, KvRevision, KvSnapshot, KvVersion};
-    use time::OffsetDateTime;
-
-    #[test]
-    fn discovered_peers_exclude_authorized_members_without_dfs_service() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-discovered-peer-filter");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data root");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let now = OffsetDateTime::now_utc();
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_discovered_peer_filter")
-                .expect("cluster id");
-        let local = NodeId::from_legacy_named("node_dfs_discovered_peer_local").expect("local");
-        let provider =
-            NodeId::from_legacy_named("node_dfs_discovered_peer_provider").expect("provider");
-        let disabled =
-            NodeId::from_legacy_named("node_dfs_discovered_peer_disabled").expect("disabled");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "DFS provider discovery",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        state.members.extend([
-            sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id.clone(),
-                provider.clone(),
-                "provider",
-                "pk-provider",
-                now,
-            ),
-            sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id,
-                disabled.clone(),
-                "disabled",
-                "pk-disabled",
-                now,
-            ),
-        ]);
-        let records = [
-            {
-                let mut record =
-                    sinomo_core::service::ServiceInstanceRecord::new("dfs", provider.clone());
-                record.routes = vec![crate::DFS_STATUS_ROUTE.to_string()];
-                record.provider_capabilities = vec!["dfs.object.transfer".to_string()];
-                record.updated_at = now;
-                record
-            },
-            {
-                let mut record =
-                    sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
-                record.routes = vec!["/daemon/status".to_string()];
-                record.provider_capabilities = vec!["daemon.status.read".to_string()];
-                record.updated_at = now;
-                record
-            },
-        ];
-        let mut entries = records
-            .into_iter()
-            .map(|record| KvEntry {
-                key: sinomo_core::service::cluster_service_instance_key(
-                    &record.service_id,
-                    &record.node_id,
-                ),
-                value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),
-                create_revision: KvRevision(1),
-                modify_revision: KvRevision(1),
-                version: KvVersion(1),
-                lease_id: None,
-            })
-            .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.key.cmp(&right.key));
-        sinomo_core::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &KvSnapshot {
-                revision: KvRevision(1),
-                compacted_revision: KvRevision(0),
-                entries,
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            },
-        )
-        .expect("write service catalog");
-
-        let peers = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
-            .expect("discover DFS peers");
-        let providers = discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
-            .expect("discover DFS providers");
-
-        assert!(peers.contains(&local));
-        assert!(peers.contains(&provider));
-        assert_eq!(peers.len(), 2);
-        assert_eq!(providers, vec![provider]);
-    }
-
-    #[test]
-    fn populated_catalog_with_no_dfs_capability_has_no_providers() {
-        let root = sinomo_testdir::TestDir::new("sinomo-dfs-no-discovered-provider");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data root");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        let now = OffsetDateTime::now_utc();
-        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_no_provider")
-            .expect("cluster id");
-        let local = NodeId::from_legacy_named("node_dfs_no_provider_local").expect("local");
-        let disabled =
-            NodeId::from_legacy_named("node_dfs_no_provider_disabled").expect("disabled");
-        let mut state = ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "DFS provider discovery",
-            local.clone(),
-            "local",
-            "pk-local",
-            now,
-        );
-        state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_voter(
-                cluster_id,
-                disabled.clone(),
-                "disabled",
-                "pk-disabled",
-                now,
-            ));
-        let mut record = sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
-        record.routes = vec!["/daemon/status".to_string()];
-        record.provider_capabilities = vec!["daemon.status.read".to_string()];
-        record.updated_at = now;
-        sinomo_core::kv::write_cluster_kv_snapshot(
-            &cluster_paths.kv_paths(),
-            &KvSnapshot {
-                revision: KvRevision(1),
-                compacted_revision: KvRevision(0),
-                entries: vec![KvEntry {
-                    key: sinomo_core::service::cluster_service_instance_key(
-                        &record.service_id,
-                        &record.node_id,
-                    ),
-                    value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),
-                    create_revision: KvRevision(1),
-                    modify_revision: KvRevision(1),
-                    version: KvVersion(1),
-                    lease_id: None,
-                }],
-                leases: Vec::new(),
-                events: Vec::new(),
-                committed_requests: Vec::new(),
-                expired_requests: Vec::new(),
-            },
-        )
-        .expect("write service catalog");
-
-        let providers = discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
-            .expect("discover DFS providers");
-        let peers = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
-            .expect("discover DFS peers");
-
-        assert!(providers.is_empty());
-        assert_eq!(peers, vec![local]);
-    }
-}
-
 pub(crate) fn open_cluster_dfs_service_with_message_sender_lazy(
     data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
@@ -524,4 +354,174 @@ fn open_service_metadata_backend(
     )
     .map(|backend| Box::new(backend) as Box<dyn DfsMetadataBackend>)
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_core::kv::{KvEntry, KvRevision, KvSnapshot, KvVersion};
+    use time::OffsetDateTime;
+
+    #[test]
+    fn discovered_peers_exclude_authorized_members_without_dfs_service() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-discovered-peer-filter");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data root");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_discovered_peer_filter")
+                .expect("cluster id");
+        let local = NodeId::from_legacy_named("node_dfs_discovered_peer_local").expect("local");
+        let provider =
+            NodeId::from_legacy_named("node_dfs_discovered_peer_provider").expect("provider");
+        let disabled =
+            NodeId::from_legacy_named("node_dfs_discovered_peer_disabled").expect("disabled");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "DFS provider discovery",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state.members.extend([
+            sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id.clone(),
+                provider.clone(),
+                "provider",
+                "pk-provider",
+                now,
+            ),
+            sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id,
+                disabled.clone(),
+                "disabled",
+                "pk-disabled",
+                now,
+            ),
+        ]);
+        let records = [
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("dfs", provider.clone());
+                record.routes = vec![crate::DFS_STATUS_ROUTE.to_string()];
+                record.provider_capabilities = vec!["dfs.object.transfer".to_string()];
+                record.updated_at = now;
+                record
+            },
+            {
+                let mut record =
+                    sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
+                record.routes = vec!["/daemon/status".to_string()];
+                record.provider_capabilities = vec!["daemon.status.read".to_string()];
+                record.updated_at = now;
+                record
+            },
+        ];
+        let mut entries = records
+            .into_iter()
+            .map(|record| KvEntry {
+                key: sinomo_core::service::cluster_service_instance_key(
+                    &record.service_id,
+                    &record.node_id,
+                ),
+                value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),
+                create_revision: KvRevision(1),
+                modify_revision: KvRevision(1),
+                version: KvVersion(1),
+                lease_id: None,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        sinomo_core::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &KvSnapshot {
+                revision: KvRevision(1),
+                compacted_revision: KvRevision(0),
+                entries,
+                leases: Vec::new(),
+                events: Vec::new(),
+                committed_requests: Vec::new(),
+                expired_requests: Vec::new(),
+            },
+        )
+        .expect("write service catalog");
+
+        let peers = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+            .expect("discover DFS peers");
+        let providers = discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
+            .expect("discover DFS providers");
+
+        assert!(peers.contains(&local));
+        assert!(peers.contains(&provider));
+        assert_eq!(peers.len(), 2);
+        assert_eq!(providers, vec![provider]);
+    }
+
+    #[test]
+    fn populated_catalog_with_no_dfs_capability_has_no_providers() {
+        let root = sinomo_testdir::TestDir::new("sinomo-dfs-no-discovered-provider");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data root");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_no_provider")
+            .expect("cluster id");
+        let local = NodeId::from_legacy_named("node_dfs_no_provider_local").expect("local");
+        let disabled =
+            NodeId::from_legacy_named("node_dfs_no_provider_disabled").expect("disabled");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "DFS provider discovery",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        state
+            .members
+            .push(sinomo_core::ClusterMemberRecord::local_voter(
+                cluster_id,
+                disabled.clone(),
+                "disabled",
+                "pk-disabled",
+                now,
+            ));
+        let mut record = sinomo_core::service::ServiceInstanceRecord::new("daemon", disabled);
+        record.routes = vec!["/daemon/status".to_string()];
+        record.provider_capabilities = vec!["daemon.status.read".to_string()];
+        record.updated_at = now;
+        sinomo_core::kv::write_cluster_kv_snapshot(
+            &cluster_paths.kv_paths(),
+            &KvSnapshot {
+                revision: KvRevision(1),
+                compacted_revision: KvRevision(0),
+                entries: vec![KvEntry {
+                    key: sinomo_core::service::cluster_service_instance_key(
+                        &record.service_id,
+                        &record.node_id,
+                    ),
+                    value: sinomo_core::kv::encode_kv_value(&record).expect("encode record"),
+                    create_revision: KvRevision(1),
+                    modify_revision: KvRevision(1),
+                    version: KvVersion(1),
+                    lease_id: None,
+                }],
+                leases: Vec::new(),
+                events: Vec::new(),
+                committed_requests: Vec::new(),
+                expired_requests: Vec::new(),
+            },
+        )
+        .expect("write service catalog");
+
+        let providers = discovered_cluster_dfs_provider_node_ids(&cluster_paths, &state)
+            .expect("discover DFS providers");
+        let peers = discovered_cluster_dfs_peer_node_ids(&cluster_paths, &state)
+            .expect("discover DFS peers");
+
+        assert!(providers.is_empty());
+        assert_eq!(peers, vec![local]);
+    }
 }

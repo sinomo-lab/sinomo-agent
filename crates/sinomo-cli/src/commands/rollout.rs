@@ -380,19 +380,15 @@ fn rollout_cli_spec() -> CliCommandSpec {
 fn rollout_options_from_matches(
     matches: &CliCommandMatches,
 ) -> Result<RolloutOptions, CliParseError> {
-    let mut options = RolloutOptions::default();
-    options.repo = matches.value("--repo").map(PathBuf::from);
-    options.binary = matches.value("--binary").map(PathBuf::from);
-    options.remote_repo = matches.value("--remote-repo").map(PathBuf::from);
-    options.targets = matches
+    let defaults = RolloutOptions::default();
+    let targets = matches
         .values("--target")
         .map(|value| non_empty_address(value).map_err(semantic_parse_error))
         .collect::<Result<Vec<_>, _>>()?;
-    if let Some(host) = matches.value("--host") {
-        options.host = host.to_string();
-        options.host_explicit = true;
-    }
-    options.port = matches
+    let (host, host_explicit) = matches
+        .value("--host")
+        .map_or((defaults.host, false), |host| (host.to_string(), true));
+    let port = matches
         .value("--port")
         .map(|value| {
             value.parse::<u16>().map_err(|source| CliParseError::Parse {
@@ -400,8 +396,8 @@ fn rollout_options_from_matches(
             })
         })
         .transpose()?
-        .unwrap_or(options.port);
-    options.shadow_port = matches
+        .unwrap_or(defaults.port);
+    let shadow_port = matches
         .value("--shadow-port")
         .map(|value| {
             value.parse::<u16>().map_err(|source| CliParseError::Parse {
@@ -409,12 +405,21 @@ fn rollout_options_from_matches(
             })
         })
         .transpose()?
-        .unwrap_or(options.shadow_port);
-    options.skip_local = matches.contains("--skip-local");
-    options.remote_build = matches.contains("--remote-build");
-    options.skip_native_modules = matches.contains("--skip-native-modules");
-    options.force_source_overwrite = matches.contains("--force-source");
-    Ok(options)
+        .unwrap_or(defaults.shadow_port);
+    Ok(RolloutOptions {
+        repo: matches.value("--repo").map(PathBuf::from),
+        binary: matches.value("--binary").map(PathBuf::from),
+        remote_repo: matches.value("--remote-repo").map(PathBuf::from),
+        targets,
+        host,
+        host_explicit,
+        port,
+        shadow_port,
+        skip_local: matches.contains("--skip-local"),
+        remote_build: matches.contains("--remote-build"),
+        skip_native_modules: matches.contains("--skip-native-modules"),
+        force_source_overwrite: matches.contains("--force-source"),
+    })
 }
 
 fn parse_rollout_matches(matches: &CliCommandMatches) -> Result<RolloutCliCommand, CliParseError> {
@@ -4577,13 +4582,12 @@ where
         };
         if pending_error_started_at
             .is_some_and(|started_at| started_at.elapsed() >= pending_error_grace)
+            && let Some(error) = pending_error
         {
-            if let Some(error) = pending_error {
-                if emit_progress && drew_progress {
-                    println!();
-                }
-                return Err(error);
+            if emit_progress && drew_progress {
+                println!();
             }
+            return Err(error);
         }
     }
 }
@@ -7381,12 +7385,8 @@ fn send_rollout_object_rpc_with_options(
 ) -> Result<network::ObjectRpcResponse, CliError> {
     match resolve_rollout_node_dispatch(target)? {
         RolloutNodeDispatch::LocalMain(status) => {
-            return sinomo_runtime::daemon::send_daemon_rpc_with_options(
-                &status.address,
-                request,
-                options,
-            )
-            .map_err(Into::into);
+            sinomo_runtime::daemon::send_daemon_rpc_with_options(&status.address, request, options)
+                .map_err(Into::into)
         }
         RolloutNodeDispatch::Routed(node_id) => {
             let options = options

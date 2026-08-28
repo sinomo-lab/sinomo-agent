@@ -580,7 +580,8 @@ mod tests {
             .lock()
             .expect("frames")
             .pop()
-            .expect("a response frame")
+            .expect("a response frame");
+        let response = response
             .into_materialized_value_response(usize::MAX)
             .await
             .expect("materialize diagnostics response");

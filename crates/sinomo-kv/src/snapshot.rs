@@ -1017,7 +1017,7 @@ impl KvSnapshot {
         self.entries.dedup_by(|left, right| left.key == right.key);
         self.entries.reverse();
         self.leases
-            .sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+            .sort_by_key(|left| left.lease_id);
         self.leases.reverse();
         self.committed_requests
             .sort_by(|left, right| left.request_id.cmp(&right.request_id));
@@ -1464,6 +1464,7 @@ impl KvMaterializedCache {
         }
         let lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

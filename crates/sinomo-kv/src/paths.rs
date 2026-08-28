@@ -127,6 +127,7 @@ pub fn lock_cluster_kv_commit_sequence(
     let _turn = admission.acquire(&lock_path, deadline)?;
     let lock = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

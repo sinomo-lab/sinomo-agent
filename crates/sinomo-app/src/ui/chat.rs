@@ -850,22 +850,14 @@ impl StableRealtimeChatProjection {
     }
 
     fn observe(&mut self, event: &sinomo_lm::RealtimeAudioEvent) -> Option<&'static str> {
-        if self.writer.is_none() {
-            return None;
-        }
-        let Some(turn) = self.text.observe(event) else {
-            return None;
-        };
+        self.writer.as_ref()?;
+        let turn = self.text.observe(event)?;
         self.persist(turn)
     }
 
     fn flush_partial(&mut self) -> Option<&'static str> {
-        if self.writer.is_none() {
-            return None;
-        }
-        let Some(turn) = self.text.flush(true) else {
-            return None;
-        };
+        self.writer.as_ref()?;
+        let turn = self.text.flush(true)?;
         self.persist(turn)
     }
 
@@ -2921,59 +2913,57 @@ impl ChatState {
 
     pub fn pump_session_list(&mut self) -> bool {
         let mut changed = false;
-        loop {
-            let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
-                Some(Ok(result)) => result,
-                Some(Err(TryRecvError::Empty)) => {
-                    if changed {
-                        return true;
-                    }
-                    if self.session_list_loading
-                        && !self.session_list_slow_notice_shown
-                        && self
-                            .session_list_started_at
-                            .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
-                    {
-                        let detail = format!(
-                            "SIFS conversation history is still loading after {} seconds",
-                            SESSION_LIST_UI_TIMEOUT.as_secs()
-                        );
-                        self.session_list_slow_notice_shown = true;
-                        self.replace_activity("chat list", detail, ActivityTone::Running);
-                        return true;
-                    }
-                    return false;
-                }
-                None => return changed,
-                Some(Err(TryRecvError::Disconnected)) => {
-                    self.session_list_rx = None;
-                    self.session_list_loading = false;
-                    self.session_list_started_at = None;
-                    self.session_list_slow_notice_shown = false;
-                    self.session_list_details_open = false;
-                    self.notice = Some("chat list failed: worker stopped".to_string());
-                    self.replace_activity(
-                        "chat list",
-                        "worker stopped before loading chats from SIFS".to_string(),
-                        ActivityTone::Warn,
-                    );
-                    if std::mem::take(&mut self.session_list_refresh_queued) {
-                        self.start_session_list_load(self.ui_waker.clone());
-                    }
+        let result = match self.session_list_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(result)) => result,
+            Some(Err(TryRecvError::Empty)) => {
+                if changed {
                     return true;
                 }
-            };
-            changed |= self.apply_session_list_result(result);
-            self.session_list_rx = None;
-            self.session_list_loading = false;
-            self.session_list_started_at = None;
-            self.session_list_slow_notice_shown = false;
-            self.session_list_details_open = false;
-            if std::mem::take(&mut self.session_list_refresh_queued) {
-                self.start_session_list_load(self.ui_waker.clone());
+                if self.session_list_loading
+                    && !self.session_list_slow_notice_shown
+                    && self
+                        .session_list_started_at
+                        .is_some_and(|started| started.elapsed() >= SESSION_LIST_UI_TIMEOUT)
+                {
+                    let detail = format!(
+                        "SIFS conversation history is still loading after {} seconds",
+                        SESSION_LIST_UI_TIMEOUT.as_secs()
+                    );
+                    self.session_list_slow_notice_shown = true;
+                    self.replace_activity("chat list", detail, ActivityTone::Running);
+                    return true;
+                }
+                return false;
             }
-            return changed;
+            None => return changed,
+            Some(Err(TryRecvError::Disconnected)) => {
+                self.session_list_rx = None;
+                self.session_list_loading = false;
+                self.session_list_started_at = None;
+                self.session_list_slow_notice_shown = false;
+                self.session_list_details_open = false;
+                self.notice = Some("chat list failed: worker stopped".to_string());
+                self.replace_activity(
+                    "chat list",
+                    "worker stopped before loading chats from SIFS".to_string(),
+                    ActivityTone::Warn,
+                );
+                if std::mem::take(&mut self.session_list_refresh_queued) {
+                    self.start_session_list_load(self.ui_waker.clone());
+                }
+                return true;
+            }
+        };
+        changed |= self.apply_session_list_result(result);
+        self.session_list_rx = None;
+        self.session_list_loading = false;
+        self.session_list_started_at = None;
+        self.session_list_slow_notice_shown = false;
+        self.session_list_details_open = false;
+        if std::mem::take(&mut self.session_list_refresh_queued) {
+            self.start_session_list_load(self.ui_waker.clone());
         }
+        changed
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
@@ -4854,9 +4844,9 @@ impl ChatState {
     fn maybe_show_slow_transcript_load(&mut self) -> bool {
         if self.transcript_load_slow_notice_shown
             || self.transcript_load_mode != Some(TranscriptLoadMode::Initial)
-            || !self
+            || self
                 .transcript_load_started_at
-                .is_some_and(|started| started.elapsed() >= TRANSCRIPT_LOAD_UI_TIMEOUT)
+                .is_none_or(|started| started.elapsed() < TRANSCRIPT_LOAD_UI_TIMEOUT)
         {
             return false;
         }
@@ -5191,7 +5181,7 @@ impl ChatState {
         {
             let _ = (provider, model, start_config, setup_shutdown);
             self.media_call_runtime = None;
-            return (true, "native media disabled in tests".to_string());
+            (true, "native media disabled in tests".to_string())
         }
         #[cfg(not(test))]
         {
@@ -5335,12 +5325,11 @@ impl ChatState {
                 .media_call
                 .output_audio_chunks
                 .saturating_add(snapshots.output_audio_chunks);
-            if let Some(level) = snapshots.microphone_level {
-                if self.media_call.mic_enabled
-                    && matches!(self.media_setup.microphone_access, MediaAccessState::Ready)
-                {
-                    self.media_call.microphone_level = level.clamp(0.0, 1.0);
-                }
+            if let Some(level) = snapshots.microphone_level
+                && self.media_call.mic_enabled
+                && matches!(self.media_setup.microphone_access, MediaAccessState::Ready)
+            {
+                self.media_call.microphone_level = level.clamp(0.0, 1.0);
             }
             if let Some(notice) = snapshots.notice {
                 self.media_call.notice = Some(notice);
@@ -6438,14 +6427,9 @@ impl ChatState {
             self.apply_attachment_picker_result(result);
             changed = true;
         }
-        loop {
-            match self.attachment_validation_rx.try_recv() {
-                Ok(result) => {
-                    self.apply_attachment_validation_result(result);
-                    changed = true;
-                }
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            }
+        while let Ok(result) = self.attachment_validation_rx.try_recv() {
+            self.apply_attachment_validation_result(result);
+            changed = true;
         }
         changed
     }
@@ -8122,7 +8106,7 @@ fn open_agent_channel_store(
         Some(daemon) => daemon
             .open_browser()
             .map(SifsAgentChannelStore::from_browser)
-            .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail)),
+            .map_err(std::io::Error::other),
         None => open_local_agent_channel_store(data_dir),
     }
 }
@@ -8213,8 +8197,7 @@ fn update_channel_membership_in_store(
 fn open_local_agent_channel_store(
     data_dir: &SinomoDataDir,
 ) -> std::io::Result<SifsAgentChannelStore> {
-    SifsAgentChannelStore::open(data_dir)
-        .map_err(|detail| std::io::Error::new(std::io::ErrorKind::Other, detail))
+    SifsAgentChannelStore::open(data_dir).map_err(std::io::Error::other)
 }
 
 fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
@@ -8227,7 +8210,7 @@ fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
 }
 
 fn channel_store_io_error(error: sinomo_agent::AgentChannelStoreError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
+    std::io::Error::other(error.to_string())
 }
 
 fn set_channel_participant_tool_runtime(
@@ -9520,25 +9503,25 @@ fn handle_chat_media_realtime_event(
         }
         sinomo_lm::RealtimeAudioEvent::OutputAudioDelta { audio, .. } => {
             if !audio.is_empty() {
-                if let Some(speaker) = speaker {
-                    if let Err(error) = speaker.write(&audio) {
-                        let detail = format!("speaker playback failed: {error}");
-                        let _ = send_chat_media_call_event(
-                            event_tx,
-                            waker,
-                            ChatMediaCallWorkerEvent::DeviceAccess(
-                                MediaAccessKind::Speaker,
-                                chat_media_access_failure(detail.clone()),
-                            ),
-                        );
-                        publish_chat_media_notice(snapshots, waker, detail.clone());
-                        report_stable_realtime_projection_notice(
-                            stable_projection.observe(&event),
-                            event_tx,
-                            waker,
-                        );
-                        return Err(detail);
-                    }
+                if let Some(speaker) = speaker
+                    && let Err(error) = speaker.write(audio)
+                {
+                    let detail = format!("speaker playback failed: {error}");
+                    let _ = send_chat_media_call_event(
+                        event_tx,
+                        waker,
+                        ChatMediaCallWorkerEvent::DeviceAccess(
+                            MediaAccessKind::Speaker,
+                            chat_media_access_failure(detail.clone()),
+                        ),
+                    );
+                    publish_chat_media_notice(snapshots, waker, detail.clone());
+                    report_stable_realtime_projection_notice(
+                        stable_projection.observe(&event),
+                        event_tx,
+                        waker,
+                    );
+                    return Err(detail);
                 }
                 publish_chat_media_snapshot(snapshots, waker, |snapshots| {
                     snapshots.output_audio_chunks = snapshots.output_audio_chunks.saturating_add(1);
@@ -14197,7 +14180,7 @@ impl TranscriptView {
             .map(|action| Self::quick_action_width(*action))
             .collect::<Vec<_>>();
         let row_w = widths.iter().sum::<f32>() + gap * actions.len().saturating_sub(1) as f32;
-        let max_w = (area.width() - PAD * 4.0).max(0.0).min(560.0);
+        let max_w = (area.width() - PAD * 4.0).clamp(0.0, 560.0);
 
         if row_w <= max_w {
             let mut x = area.x() + (area.width() - row_w) * 0.5;
@@ -14205,7 +14188,7 @@ impl TranscriptView {
             let upper = (area.max_y() - PAD - button_h).max(lower);
             let y = (cy + EMPTY_ACTION_OFFSET_Y).clamp(lower, upper);
             return actions
-                .into_iter()
+                .iter()
                 .zip(widths)
                 .map(|(action, width)| {
                     let rect = Rect::new(x, y, width, button_h);
@@ -14315,7 +14298,7 @@ impl TranscriptView {
     fn recovery_card_rect(area: Rect) -> Rect {
         let cx = area.x() + area.width() / 2.0;
         let cy = area.y() + area.height() / 2.0;
-        let card_w = (area.width() - 56.0).max(220.0).min(560.0);
+        let card_w = (area.width() - 56.0).clamp(220.0, 560.0);
         let card_h = 188.0_f32.min((area.height() - 48.0).max(156.0));
         Rect::new(cx - card_w / 2.0, cy - card_h / 2.0, card_w, card_h)
     }
@@ -16326,7 +16309,7 @@ impl Widget for TranscriptView {
             };
             if let Some((title, hint, context)) = standard_copy {
                 let (cx, cy) = Self::empty_state_center(ctx.bounds());
-                let text_width = (ctx.bounds().width() - PAD * 4.0).max(120.0).min(560.0);
+                let text_width = (ctx.bounds().width() - PAD * 4.0).clamp(120.0, 560.0);
                 let mut text_nodes = vec![(title, cy + 2.0, 22.0_f32), (hint, cy + 26.0, 18.0)];
                 if let Some(context) = context {
                     text_nodes.push((context, cy + 44.0, 18.0));
@@ -19530,7 +19513,7 @@ mod tests {
             .iter()
             .find_map(|node| {
                 (node.role == SemanticsRole::Text)
-                    .then(|| node.name.as_deref())
+                    .then_some(node.name.as_deref())
                     .flatten()
                     .filter(|name| name.starts_with("Messages 401-800 of 1024"))
             })

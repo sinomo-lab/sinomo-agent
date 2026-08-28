@@ -356,7 +356,7 @@ impl Backend {
         if !observations.keys().any(|module_id| {
             module_ids_match(module_id, sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID)
         }) {
-            match sinomo_runtime::dfs::dfs_module_enabled(&self.data_dir.root()) {
+            match sinomo_runtime::dfs::dfs_module_enabled(self.data_dir.root()) {
                 Ok(enabled) => {
                     observations.insert(
                         sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID.to_string(),
@@ -521,10 +521,10 @@ impl Backend {
                     remove_matching_observation(&mut observations, &module.module_id)
                 };
                 let (state, detail) = observation.unwrap_or_else(|| {
-                    if module.backend == "native-dylib" {
-                        if let Some(error) = native_dylib_observation_error.as_ref() {
-                            return (ModuleObservedState::Unavailable, error.clone());
-                        }
+                    if module.backend == "native-dylib"
+                        && let Some(error) = native_dylib_observation_error.as_ref()
+                    {
+                        return (ModuleObservedState::Unavailable, error.clone());
                     }
                     (
                         ModuleObservedState::NotReported,
@@ -801,11 +801,11 @@ fn insert_native_dylib_module_summary(
         .keys()
         .find(|existing| module_ids_match(existing, module_id))
         .cloned();
-    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching)) {
-        if module.backend != "native-dylib" {
-            module.backend = "native-dylib".to_string();
-            module.detail = detail;
-        }
+    if let Some(module) = matching.and_then(|matching| modules.get_mut(&matching))
+        && module.backend != "native-dylib"
+    {
+        module.backend = "native-dylib".to_string();
+        module.detail = detail;
     }
 }
 
@@ -835,7 +835,7 @@ fn module_label(module_id: &str) -> String {
     module_id
         .strip_prefix("module.")
         .unwrap_or(module_id)
-        .split(|ch| matches!(ch, '.' | '-' | '_'))
+        .split(['.', '-', '_'])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mut chars = part.chars();
@@ -913,7 +913,7 @@ mod tests {
             .expect("disable DFS from module settings");
 
         assert!(
-            !sinomo_runtime::dfs::dfs_module_enabled(&backend.data_dir.root())
+            !sinomo_runtime::dfs::dfs_module_enabled(backend.data_dir.root())
                 .expect("read DFS native Rust state")
         );
         let snapshot = backend.module_config_snapshot(Some(&node_id));

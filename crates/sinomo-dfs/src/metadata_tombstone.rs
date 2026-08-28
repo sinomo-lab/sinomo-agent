@@ -109,7 +109,7 @@ pub(crate) fn plan_tombstone_compaction(
         .filter(|object| object.kind == DfsObjectKind::Tombstone)
     {
         report.scanned_tombstone_count = report.scanned_tombstone_count.saturating_add(1);
-        let age_nanos = now.saturating_sub(object_timestamp_for_retention(&object));
+        let age_nanos = now.saturating_sub(object_timestamp_for_retention(object));
         if age_nanos < options.min_tombstone_age_nanos {
             report.retained_young_tombstone_count =
                 report.retained_young_tombstone_count.saturating_add(1);
@@ -144,7 +144,7 @@ pub(crate) fn plan_tombstone_compaction(
             continue;
         }
 
-        let path_record = path_record_for_object(&object);
+        let path_record = path_record_for_object(object);
         let dentry_key = dentry_key(&path_record);
         if tables.dentries.contains_key(&dentry_key) && removed_dentries.insert(dentry_key.clone())
         {

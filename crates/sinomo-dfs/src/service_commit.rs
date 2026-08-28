@@ -811,7 +811,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.modified_at_unix_nanos = write_time_unix_nanos;
             object.changed_at_unix_nanos = write_time_unix_nanos;
         }
-        if !already_current && !(transient_create && object.last_modified_by_event_id.is_some()) {
+        if !(already_current || transient_create && object.last_modified_by_event_id.is_some()) {
             object.last_modified_by_event_id = Some(EventId::generate());
         }
         if !object.current_locations.contains(&self.node_id) {
@@ -862,10 +862,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !required_replica_node_ids.contains(&receipt.replica_node_id) {
                     continue;
                 }
-                if let Some(expected_hash) = object.content_hash.as_deref() {
-                    if receipt.content_hash.as_deref() != Some(expected_hash) {
-                        continue;
-                    }
+                if let Some(expected_hash) = object.content_hash.as_deref()
+                    && receipt.content_hash.as_deref() != Some(expected_hash)
+                {
+                    continue;
                 }
                 confirmed_locations.insert(receipt.replica_node_id);
             }
@@ -927,13 +927,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if &object.version != version {
             return Ok(false);
         }
-        if let Some(expected_hash) = object.content_hash.as_deref() {
-            if expected_hash != content_hash {
-                return Err(DfsError::ContentHashMismatch {
-                    expected: expected_hash.to_string(),
-                    actual: content_hash.to_string(),
-                });
-            }
+        if let Some(expected_hash) = object.content_hash.as_deref()
+            && expected_hash != content_hash
+        {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: content_hash.to_string(),
+            });
         }
         if object.current_locations.contains(replica_node_id) {
             return Ok(false);
@@ -1290,7 +1290,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 .as_ref()
                 .expect("metadata backend checked above")
                 .get_object_by_path(&committed_object.file_system_id, &committed_object.path)?;
-            if !create_visible_path_is_available(&intent, durable_path_object.as_ref()) {
+            if !create_visible_path_is_available(intent, durable_path_object.as_ref()) {
                 let occupant = durable_path_object
                     .as_ref()
                     .map(|object| format!("{} {:?}", object.object_id, object.kind))

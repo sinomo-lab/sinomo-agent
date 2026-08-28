@@ -102,16 +102,16 @@ impl ModuleLoader {
             });
         }
 
-        if request.policy_decision.action == PolicyAction::Allow {
-            if let Some(reason) = artifact_trust_material_failure(&request.artifact) {
-                return Ok(LoadDecision {
-                    node_id: self.node_id.clone(),
-                    module_id: request.artifact.module_id,
-                    artifact_id: request.artifact.artifact_id,
-                    action: LoaderAction::Reject,
-                    reason,
-                });
-            }
+        if request.policy_decision.action == PolicyAction::Allow
+            && let Some(reason) = artifact_trust_material_failure(&request.artifact)
+        {
+            return Ok(LoadDecision {
+                node_id: self.node_id.clone(),
+                module_id: request.artifact.module_id,
+                artifact_id: request.artifact.artifact_id,
+                action: LoaderAction::Reject,
+                reason,
+            });
         }
 
         let action = match request.policy_decision.action {

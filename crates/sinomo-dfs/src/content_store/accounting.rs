@@ -273,6 +273,7 @@ impl LocalContentStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&path)
             .map_err(|source| ContentStoreError::Io {
                 path: path.clone(),

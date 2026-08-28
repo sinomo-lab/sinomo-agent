@@ -360,7 +360,7 @@ pub struct DfsPosixFileSyncEvidence {
 
 impl DfsWriteOptions {
     pub fn replicated_eventual(replica_candidates: Vec<NodeId>) -> Self {
-        let desired = replica_candidates.len().max(1).min(2);
+        let desired = replica_candidates.len().clamp(1, 2);
         Self {
             policy: DfsReplicationPolicy::new(1, desired).expect("valid default policy"),
             replica_candidates,

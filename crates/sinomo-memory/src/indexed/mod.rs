@@ -1249,6 +1249,7 @@ impl IndexedFileMemoryStore {
         manifest.validate(&manifest_path)?;
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -1323,6 +1324,7 @@ impl IndexedFileMemoryStore {
         let lock_path = self.root.join("indexed.write.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

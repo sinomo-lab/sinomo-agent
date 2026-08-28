@@ -62,7 +62,7 @@ pub enum AgentRole {
     Evolution,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct AgentContextBudget {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_bytes: Option<usize>,
@@ -70,16 +70,6 @@ pub struct AgentContextBudget {
     pub compaction_threshold_ratio: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_tail_items: Option<usize>,
-}
-
-impl Default for AgentContextBudget {
-    fn default() -> Self {
-        Self {
-            max_context_bytes: None,
-            compaction_threshold_ratio: None,
-            retained_tail_items: None,
-        }
-    }
 }
 
 impl AgentContextBudget {
@@ -1051,37 +1041,31 @@ pub enum AgentItem {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum AgentVerificationState {
+    #[default]
     NotRun,
     Passed,
     Failed,
     Blocked,
 }
 
-impl Default for AgentVerificationState {
-    fn default() -> Self {
-        Self::NotRun
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CodingPatchStatus {
+    #[default]
     NotStarted,
     Applied,
     Failed,
     Blocked,
 }
 
-impl Default for CodingPatchStatus {
-    fn default() -> Self {
-        Self::NotStarted
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CodingValidationStatus {
+    #[default]
     NotRun,
     Passed,
     FailedPatchRelevant,
@@ -1089,12 +1073,6 @@ pub enum CodingValidationStatus {
     FailedCommandSetup,
     TimedOut,
     Inconclusive,
-}
-
-impl Default for CodingValidationStatus {
-    fn default() -> Self {
-        Self::NotRun
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1124,18 +1102,14 @@ pub enum CodingCommandFailureKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CodingStopDecision {
+    #[default]
     Continue,
     FinishWithPatch,
     FinishBlocked,
     RequestUserInput,
     Abort,
-}
-
-impl Default for CodingStopDecision {
-    fn default() -> Self {
-        Self::Continue
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -3543,17 +3517,9 @@ impl Default for AgentCompactionBuildOptions {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct AgentCompactor {
     pub retained_tail_count: Option<usize>,
-}
-
-impl Default for AgentCompactor {
-    fn default() -> Self {
-        Self {
-            retained_tail_count: None,
-        }
-    }
 }
 
 impl AgentCompactor {
@@ -4997,17 +4963,13 @@ pub struct AgentRunModelTokenUsage {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentModelDecisionSource {
+    #[default]
     StrictJsonDecision,
     TextFallback,
     NativeToolCalls,
     VendorFallbackToolCalls,
-}
-
-impl Default for AgentModelDecisionSource {
-    fn default() -> Self {
-        Self::StrictJsonDecision
-    }
 }
 
 impl AgentRunModelMetrics {
@@ -5830,19 +5792,17 @@ impl AgentSessionControlPlane {
                         started.elapsed() >= std::time::Duration::from_millis(timeout_ms)
                     })
                     .unwrap_or(false);
-                if timed_out {
-                    if let Some(timeout_ms) = timeout_ms {
-                        events.push(agent_session_event(
-                            &op_id,
-                            &self.session.session_id,
-                            AgentEventPayload::TurnTimedOut {
-                                sequence,
-                                active_op_id: op_id.clone(),
-                                timeout_ms,
-                                reason: "turn exceeded configured timeout".to_string(),
-                            },
-                        ));
-                    }
+                if timed_out && let Some(timeout_ms) = timeout_ms {
+                    events.push(agent_session_event(
+                        &op_id,
+                        &self.session.session_id,
+                        AgentEventPayload::TurnTimedOut {
+                            sequence,
+                            active_op_id: op_id.clone(),
+                            timeout_ms,
+                            reason: "turn exceeded configured timeout".to_string(),
+                        },
+                    ));
                 }
                 let status = if timed_out {
                     AgentTaskLifecycleStatus::TimedOut
@@ -11739,9 +11699,7 @@ fn verification_command_from_tool_outcome(outcome: &AgentToolOutcome) -> String 
 }
 
 fn verification_command_from_tool_output(output: &serde_json::Value) -> Option<String> {
-    let Some(program) = output.get("program").and_then(serde_json::Value::as_str) else {
-        return None;
-    };
+    let program = output.get("program").and_then(serde_json::Value::as_str)?;
     let args = output
         .get("args")
         .and_then(serde_json::Value::as_array)
@@ -13184,7 +13142,7 @@ mod tests {
                 .and_then(serde_json::Value::as_u64),
             Some(1)
         );
-        assert_eq!(
+        assert!(
             orchestration
                 .get("visible_toolsets")
                 .and_then(serde_json::Value::as_array)
@@ -13192,8 +13150,7 @@ mod tests {
                     toolsets
                         .iter()
                         .any(|toolset| toolset.as_str() == Some("interactive"))
-                }),
-            true
+                })
         );
         assert_eq!(
             orchestration

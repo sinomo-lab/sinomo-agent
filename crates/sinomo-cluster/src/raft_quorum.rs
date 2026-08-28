@@ -4732,17 +4732,16 @@ impl ReadIndexClaimantFloor {
         let mut confirmed_members =
             read_index_member_floors(&fence.confirmed_state, &self.configuration);
         let mut claimant_members = self.members.clone();
-        if let Some(unresolved_local_node_id) = fence.unresolved_local_node_id.as_ref() {
-            if unresolved_local_node_id != &self.local_node_id
+        if let Some(unresolved_local_node_id) = fence.unresolved_local_node_id.as_ref()
+            && (unresolved_local_node_id != &self.local_node_id
                 || claimant_members
                     .remove(unresolved_local_node_id)
                     .is_none_or(|members| members.len() != 1)
                 || confirmed_members
                     .remove(unresolved_local_node_id)
-                    .is_none_or(|members| members.len() != 1)
-            {
-                return Ok(Some("member_identity"));
-            }
+                    .is_none_or(|members| members.len() != 1))
+        {
+            return Ok(Some("member_identity"));
         }
         if confirmed_members != claimant_members {
             return Ok(Some("member_identity"));
@@ -5799,15 +5798,14 @@ fn prepare_cluster_raft_read_index_from_projection(
         committed_config.as_ref(),
         unresolved_local_node_id.as_ref(),
     )?;
-    if let Some(config) = committed_config.as_ref() {
-        if ReadIndexConfigurationFloor::from_config(config)
+    if let Some(config) = committed_config.as_ref()
+        && ReadIndexConfigurationFloor::from_config(config)
             != ReadIndexConfigurationFloor::from_state(&probe_state)
-        {
-            return Err(NetworkError::ClusterReadOnly {
-                detail: "committed Raft membership partition changed during ReadIndex preparation"
-                    .to_string(),
-            });
-        }
+    {
+        return Err(NetworkError::ClusterReadOnly {
+            detail: "committed Raft membership partition changed during ReadIndex preparation"
+                .to_string(),
+        });
     }
     probe_state.term = probe_state.term.max(read_state.current_term);
     probe_state.kv_revision = probe_state.kv_revision.max(read_state.revision.0);
@@ -5882,8 +5880,8 @@ fn prepare_cluster_raft_read_index(
     record_read_index_resident_preparation(&paths.root);
     let local_node_id = probe_state.local_node_id.clone();
     let wal_paths = paths.kv_paths().raft_wal_paths(&local_node_id);
-    if admission_mode == ClusterRaftReadIndexAdmissionMode::WaitForLocal {
-        if let Some(projected) = sinomo_kv::with_cluster_kv_resident_read_projection(
+    if admission_mode == ClusterRaftReadIndexAdmissionMode::WaitForLocal
+        && let Some(projected) = sinomo_kv::with_cluster_kv_resident_read_projection(
             &wal_paths,
             &local_node_id,
             |storage| {
@@ -5896,9 +5894,9 @@ fn prepare_cluster_raft_read_index(
                     read_state,
                 )
             },
-        ) {
-            return projected.map_err(kv_err)?.value;
-        }
+        )
+    {
+        return projected.map_err(kv_err)?.value;
     }
     let mut storage = match admission_mode {
         ClusterRaftReadIndexAdmissionMode::WaitForLocal => {

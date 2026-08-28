@@ -1299,27 +1299,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .as_ref()
             .is_some_and(|shard| &shard.primary_node_id == requester_node_id)
             || requester_has_supplied_metadata_authority;
-        if let Some(backend) = self.metadata_backend.as_ref() {
-            if let Some(intent) = backend.get_intent(object_id, intent_id)? {
-                let requester_has_intent_authority = &intent.coordinator_node_id
-                    == requester_node_id
-                    || (requester_is_metadata_primary && object_metadata.is_some());
-                if !requester_has_intent_authority {
-                    return Err(DfsError::UnauthorizedReplicaCommand {
-                        source_node_id: requester_node_id.clone(),
-                        reason: format!(
-                            "source is not coordinator for DFS write intent {intent_id}"
-                        ),
-                    });
-                }
-                if !intent.desired_replica_node_ids.contains(&self.node_id) {
-                    return Err(DfsError::UnauthorizedReplicaCommand {
-                        source_node_id: requester_node_id.clone(),
-                        reason: dfs_replica_not_desired_reason(intent_id),
-                    });
-                }
-                return Ok(());
+        if let Some(backend) = self.metadata_backend.as_ref()
+            && let Some(intent) = backend.get_intent(object_id, intent_id)?
+        {
+            let requester_has_intent_authority = &intent.coordinator_node_id == requester_node_id
+                || (requester_is_metadata_primary && object_metadata.is_some());
+            if !requester_has_intent_authority {
+                return Err(DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: requester_node_id.clone(),
+                    reason: format!("source is not coordinator for DFS write intent {intent_id}"),
+                });
             }
+            if !intent.desired_replica_node_ids.contains(&self.node_id) {
+                return Err(DfsError::UnauthorizedReplicaCommand {
+                    source_node_id: requester_node_id.clone(),
+                    reason: dfs_replica_not_desired_reason(intent_id),
+                });
+            }
+            return Ok(());
         }
         if requester_is_metadata_primary && object_metadata.is_some() {
             return Ok(());
@@ -1369,13 +1366,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(intent) = backend.get_intent(object_id, intent_id)? else {
             return Ok(());
         };
-        if let Some(expected_hash) = intent.content_hash.as_deref() {
-            if expected_hash != content_hash {
-                return Err(DfsError::ContentHashMismatch {
-                    expected: expected_hash.to_string(),
-                    actual: content_hash.to_string(),
-                });
-            }
+        if let Some(expected_hash) = intent.content_hash.as_deref()
+            && expected_hash != content_hash
+        {
+            return Err(DfsError::ContentHashMismatch {
+                expected: expected_hash.to_string(),
+                actual: content_hash.to_string(),
+            });
         }
         Ok(())
     }
@@ -1426,18 +1423,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        if !intent.desired_replica_node_ids.contains(&self.node_id) {
-            if self
+        if !intent.desired_replica_node_ids.contains(&self.node_id)
+            && self
                 .backend_receipt_for_replica(object_id, &intent.target_version, &self.node_id)?
                 .is_none()
-            {
-                return Err(DfsError::UnauthorizedReplicaCommand {
-                    source_node_id: requester_node_id.clone(),
-                    reason: format!(
-                        "local node is not an expected or durable replica for DFS intent {intent_id}"
-                    ),
-                });
-            }
+        {
+            return Err(DfsError::UnauthorizedReplicaCommand {
+                source_node_id: requester_node_id.clone(),
+                reason: format!(
+                    "local node is not an expected or durable replica for DFS intent {intent_id}"
+                ),
+            });
         }
         Ok(())
     }
@@ -1852,7 +1848,7 @@ pub(crate) fn verify_persisted_metadata_authority_operation(
             normalized_receipt_nodes.sort();
             normalized_receipt_nodes.dedup();
             if normalized_receipt_nodes != *receipt_node_ids
-                || normalized_receipt_nodes.len() < intent.policy.min_commit_replicas as usize
+                || normalized_receipt_nodes.len() < intent.policy.min_commit_replicas
                 || normalized_receipt_nodes
                     .iter()
                     .any(|node_id| !intent.desired_replica_node_ids.contains(node_id))

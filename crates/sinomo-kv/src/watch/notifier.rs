@@ -66,10 +66,10 @@ pub(crate) fn evict_cluster_kv_watch_notifier_entry_if_needed(
     }
 }
 
-pub(crate) fn ensure_cluster_kv_watch_notifier_entry<'a>(
-    guard: &'a mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
+pub(crate) fn ensure_cluster_kv_watch_notifier_entry(
+    guard: &mut HashMap<PathBuf, ClusterKvWatchNotifierEntry>,
     key: PathBuf,
-) -> &'a mut ClusterKvWatchNotifierEntry {
+) -> &mut ClusterKvWatchNotifierEntry {
     evict_cluster_kv_watch_notifier_entry_if_needed(guard, &key);
     guard.entry(key).or_default()
 }
@@ -391,9 +391,9 @@ pub fn record_cluster_kv_watch_notifier_waiter_key_for_test(path: PathBuf) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn record_cluster_kv_watch_unchanged_wakeup_for_test(path: &PathBuf) {
+pub(crate) fn record_cluster_kv_watch_unchanged_wakeup_for_test(path: &Path) {
     if let Ok(mut wakeups) = CLUSTER_KV_WATCH_UNCHANGED_WAKEUPS_FOR_TEST.lock() {
-        *wakeups.entry(path.clone()).or_default() += 1;
+        *wakeups.entry(path.to_path_buf()).or_default() += 1;
     }
 }
 

@@ -463,30 +463,6 @@ pub(crate) mod prelude {
     pub(crate) use time::OffsetDateTime;
 }
 
-#[cfg(test)]
-mod storage_contract_tests {
-    use super::register_storage_paths;
-    use sinomo_storage::StorageLayout;
-
-    #[test]
-    fn network_storage_contract_covers_runtime_locks_and_dynamic_iroh_records() {
-        let mut layout = StorageLayout::new();
-        register_storage_paths(&mut layout).expect("register network storage paths");
-
-        for path in [
-            "cluster/connectivity-local.sobj.lock",
-            "cluster/iroh/node.endpoint.sobj",
-            "cluster/iroh/node.secret.sobj",
-            "cluster/iroh/node.secret.lock",
-        ] {
-            assert!(
-                layout.owner_for(path).is_some(),
-                "storage contract should cover {path}"
-            );
-        }
-    }
-}
-
 // test-support re-exports (crate internals for sibling integration tests)
 #[cfg(any(test, feature = "test-support"))]
 pub use connectivity_store::local_cluster_connectivity_content_generation;
@@ -591,3 +567,27 @@ pub use roaming::WebRtcSignalingEnvelope;
 pub use roaming::configure_daemon_control_stream_idle_timeout;
 #[cfg(any(test, feature = "test-support"))]
 pub use route_graph_read_model::cluster_route_graph_cache_mark;
+
+#[cfg(test)]
+mod storage_contract_tests {
+    use super::register_storage_paths;
+    use sinomo_storage::StorageLayout;
+
+    #[test]
+    fn network_storage_contract_covers_runtime_locks_and_dynamic_iroh_records() {
+        let mut layout = StorageLayout::new();
+        register_storage_paths(&mut layout).expect("register network storage paths");
+
+        for path in [
+            "cluster/connectivity-local.sobj.lock",
+            "cluster/iroh/node.endpoint.sobj",
+            "cluster/iroh/node.secret.sobj",
+            "cluster/iroh/node.secret.lock",
+        ] {
+            assert!(
+                layout.owner_for(path).is_some(),
+                "storage contract should cover {path}"
+            );
+        }
+    }
+}

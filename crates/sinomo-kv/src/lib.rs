@@ -13,4 +13,8 @@
 //! and local read/watch route dispatch live here; the cluster network wraps them
 //! in its generic object-RPC envelope when transmitting between peers.
 
+// Test-support hooks are exported for integration crates and are not all used
+// by this crate's own unit-test target.
+#![cfg_attr(test, allow(dead_code))]
+
 include!("root.rs");

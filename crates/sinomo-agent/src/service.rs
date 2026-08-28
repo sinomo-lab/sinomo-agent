@@ -139,16 +139,12 @@ pub struct AgentSessionResumeResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AgentSessionReattachState {
     LiveRuntimeAttached,
     PersistedMetadataOnly,
+    #[default]
     Missing,
-}
-
-impl Default for AgentSessionReattachState {
-    fn default() -> Self {
-        Self::Missing
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

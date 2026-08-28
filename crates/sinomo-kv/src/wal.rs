@@ -1022,7 +1022,7 @@ pub(crate) fn decode_object_file<T: for<'de> Deserialize<'de>>(
     path: &Path,
     bytes: &[u8],
 ) -> Result<T, KvError> {
-    sinomo_object_serde::from_bytes(&bytes).map_err(|source| match kv_object_error(source) {
+    sinomo_object_serde::from_bytes(bytes).map_err(|source| match kv_object_error(source) {
         KvError::Serialization { detail } => KvError::Serialization {
             detail: format!("{}: {detail}", path.display()),
         },
@@ -1108,6 +1108,7 @@ pub(crate) fn kv_durable_file_error(error: durable_file::DurableFileError) -> Kv
 pub(crate) fn open_node_lock(paths: &KvWalPaths) -> Result<File, KvError> {
     OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&paths.lock)

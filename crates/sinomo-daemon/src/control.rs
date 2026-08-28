@@ -1850,18 +1850,16 @@ async fn run_daemon_background_maintenance_loop(
             startup_cluster_maintenance_attempted,
         ) && dfs_maintenance_task.is_none()
             && dfs_triggered_maintenance_due
-        {
-            if daemon_dfs_maintenance_should_launch(
+            && daemon_dfs_maintenance_should_launch(
                 dfs_triggered_maintenance_due,
                 dfs_triggered_maintenance_requested,
-            ) {
-                let dfs_paths = paths.clone();
-                let dfs_runtime = runtime.clone();
-                dfs_maintenance_task =
-                    Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
-                dfs_triggered_maintenance_requested = false;
-                dfs_immediate_continuation_requested = false;
-            }
+            )
+        {
+            let dfs_paths = paths.clone();
+            let dfs_runtime = runtime.clone();
+            dfs_maintenance_task = Some(spawn_daemon_dfs_maintenance_task(dfs_paths, dfs_runtime));
+            dfs_triggered_maintenance_requested = false;
+            dfs_immediate_continuation_requested = false;
         }
 
         if daemon_shutdown_requested(&shutdown_rx) {

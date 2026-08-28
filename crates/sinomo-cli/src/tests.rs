@@ -937,7 +937,7 @@ fn cluster_health_daemon_rpc_timeout_covers_health_probe_budget() {
 #[test]
 fn registered_top_level_commands_are_parseable() {
     for command in super::cli_command_registry().metadata() {
-        parse_cli_command(&[command.name.clone()]).unwrap_or_else(|error| {
+        parse_cli_command(std::slice::from_ref(&command.name)).unwrap_or_else(|error| {
             panic!(
                 "registered command `{}` did not parse: {error}",
                 command.name
@@ -4446,7 +4446,7 @@ fn sandbox_module_artifact_register_writes_registry_and_copies_bytes() {
     let artifact_id = sinomo_runtime::module::ArtifactId::from_legacy_named("artifact_cli_module")
         .expect("artifact");
     let sandbox_id = sinomo_runtime::sandbox::SandboxId::generate();
-    let cwd = sinomo_runtime::sandbox::SandboxPath::new("/work".to_string()).expect("cwd");
+    let cwd = sinomo_runtime::sandbox::SandboxPath::new("/work").expect("cwd");
     let mut env = BTreeMap::new();
     env.insert("RUST_LOG".to_string(), "debug".to_string());
     let limits = sinomo_runtime::sandbox::SandboxResourceLimits {
@@ -5978,8 +5978,9 @@ fn agent_run_compaction_evidence_requires_the_persisted_projection() {
     persisted.raw_transcript = transcript;
     persisted.projection = Some(summary.projection.clone());
 
-    let evidence = super::agent_run_compaction_evidence(&op_id, &[event.clone()], &persisted)
-        .expect("matching persisted projection");
+    let evidence =
+        super::agent_run_compaction_evidence(&op_id, std::slice::from_ref(&event), &persisted)
+            .expect("matching persisted projection");
 
     assert_eq!(evidence["op"], op_id.to_string());
     assert_eq!(evidence["compaction_id"], summary.compaction_id.to_string());

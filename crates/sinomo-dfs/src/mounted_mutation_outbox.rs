@@ -1595,14 +1595,13 @@ impl MountedSifsMutationOutboxStore {
         if operation_scan_complete
             && !status.marker_limit_exceeded
             && status.malformed_marker_count == 0
-        {
-            if !self.prune_unreferenced_sessions(
+            && !self.prune_unreferenced_sessions(
                 &referenced_sessions,
                 budget,
                 &mut session_phase_remaining,
-            )? {
-                status.directory_scan_limit_exceeded = true;
-            }
+            )?
+        {
+            status.directory_scan_limit_exceeded = true;
         }
         // Retirement and unpublished-operation staging are cleanup-only
         // namespaces. They run last on their own quota so a wide cleanup tree
@@ -2960,17 +2959,17 @@ fn marker_recovery_kind(
 }
 
 fn is_terminal_phase(phase: &MountedSifsMutationOutboxPhase) -> bool {
-    match phase {
+    matches!(
+        phase,
         MountedSifsMutationOutboxPhase::ProvenNoWrite { .. }
-        | MountedSifsMutationOutboxPhase::AbortedUnstarted
-        | MountedSifsMutationOutboxPhase::Terminal { .. }
-        | MountedSifsMutationOutboxPhase::DaemonAccepted {
-            requires_full_recovery: false,
-            error_observation: None,
-            ..
-        } => true,
-        _ => false,
-    }
+            | MountedSifsMutationOutboxPhase::AbortedUnstarted
+            | MountedSifsMutationOutboxPhase::Terminal { .. }
+            | MountedSifsMutationOutboxPhase::DaemonAccepted {
+                requires_full_recovery: false,
+                error_observation: None,
+                ..
+            }
+    )
 }
 
 fn captured_work_for_phase(

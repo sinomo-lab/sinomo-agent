@@ -1052,7 +1052,7 @@ fn networked_dfs_fetches_lost_stage_blob_from_durable_replica_before_commit() {
 #[test]
 fn networked_dfs_stage_fetch_rotates_after_durable_source_misses_blob() {
     let owner = NodeId::from_legacy_named("node_stage_rotate_owner").expect("node");
-    let mut stage_sources = vec![
+    let mut stage_sources = [
         NodeId::from_legacy_named("node_stage_rotate_a_missing").expect("node"),
         NodeId::from_legacy_named("node_stage_rotate_b_found").expect("node"),
     ];
@@ -1896,7 +1896,7 @@ fn networked_dfs_fetches_repair_blob_from_alternate_replica_after_restart() {
 #[test]
 fn networked_dfs_repair_fetch_rotates_after_durable_source_misses_blob() {
     let owner = NodeId::from_legacy_named("node_repair_rotate_owner").expect("node");
-    let mut repair_sources = vec![
+    let mut repair_sources = [
         NodeId::from_legacy_named("node_repair_rotate_a_missing").expect("node"),
         NodeId::from_legacy_named("node_repair_rotate_b_found").expect("node"),
     ];
@@ -10805,7 +10805,7 @@ fn networked_dfs_confirmed_read_uses_backend_current_metadata() {
                     object_id: object_id.clone(),
                     committed_version: version_2.clone(),
                     owner_node_id: owner.clone(),
-                    event_id: EventId::from_legacy_named(&format!("evt_{node_id}")).expect("event"),
+                    event_id: EventId::from_legacy_named(format!("evt_{node_id}")).expect("event"),
                 },
                 replica_node_id: node_id.clone(),
                 content_hash: Some(hash.clone()),

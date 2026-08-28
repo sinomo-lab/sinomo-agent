@@ -3661,7 +3661,7 @@ mod tests {
     #[test]
     fn small_sobj_source_leaves_unused_transport_tail_uninitialized() {
         let source =
-            ObjectRpcBodySource::sobj_value(&"small typed value").expect("encode SOBJ source");
+            ObjectRpcBodySource::sobj_value("small typed value").expect("encode SOBJ source");
         let ObjectRpcBodySourceKind::AdoptableSobj(source) = &source.kind else {
             panic!("typed SOBJ source was not adoptable");
         };

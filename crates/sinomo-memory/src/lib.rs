@@ -2821,6 +2821,8 @@ impl MemoryLogEntry {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+// Variant names intentionally mirror the durable append-log operation schema.
+#[allow(clippy::enum_variant_names)]
 enum MemoryLogOperation {
     PutRecord {
         record: MemoryRecord,

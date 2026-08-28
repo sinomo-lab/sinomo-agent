@@ -2104,16 +2104,17 @@ mod tests {
         )
         .await
         .expect("accept pooled carrier");
-        let pool = lock_routed_stream_pool();
-        let accepted_key = pool
-            .keys()
-            .find(|key| key.scope == scope)
-            .expect("accepted carrier pool key");
-        assert_eq!(
-            accepted_key.destination_process_affinity,
-            crate::DestinationProcessAffinity::Any
-        );
-        drop(pool);
+        {
+            let pool = lock_routed_stream_pool();
+            let accepted_key = pool
+                .keys()
+                .find(|key| key.scope == scope)
+                .expect("accepted carrier pool key");
+            assert_eq!(
+                accepted_key.destination_process_affinity,
+                crate::DestinationProcessAffinity::Any
+            );
+        }
         drop(acceptor);
         drop(client_carrier);
         assert_eq!(retire_pooled_routed_streams(&scope).await, 1);

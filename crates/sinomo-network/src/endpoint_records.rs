@@ -50,9 +50,11 @@ pub fn apply_cluster_endpoint_advertisement(
 }
 
 pub fn cleanup_cluster_endpoint_duplicates(state: &mut ClusterBootstrapState) -> bool {
-    state.members.iter_mut().fold(false, |changed, member| {
-        cleanup_member_endpoint_duplicates(member) || changed
-    })
+    let mut changed = false;
+    for member in &mut state.members {
+        changed |= cleanup_member_endpoint_duplicates(member);
+    }
+    changed
 }
 
 pub fn cleanup_member_endpoint_duplicates(member: &mut ClusterMemberRecord) -> bool {

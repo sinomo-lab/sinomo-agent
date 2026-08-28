@@ -150,18 +150,19 @@ async fn observe_metrics_for_target(
     .map_err(|error| error.to_string())?
     .with_trace_context_if_missing();
     let client = DaemonApiClient::at_address(address).with_timeout(OBSERVE_DASHBOARD_RPC_TIMEOUT);
-    let response = if target.is_none() || target.as_ref() == local_node_id.as_ref() {
-        client.call_request_async(&request).await
-    } else {
-        client
-            .object_rpc_to_target_with_deadline_async(
-                target.as_ref().expect("remote target checked above"),
-                &request,
-                OBSERVE_DASHBOARD_RPC_TIMEOUT,
-                Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
-                true,
-            )
-            .await
+    let response = match target.as_ref() {
+        Some(target_node_id) if Some(target_node_id) != local_node_id.as_ref() => {
+            client
+                .object_rpc_to_target_with_deadline_async(
+                    target_node_id,
+                    &request,
+                    OBSERVE_DASHBOARD_RPC_TIMEOUT,
+                    Some(OBSERVE_DASHBOARD_RPC_TIMEOUT),
+                    true,
+                )
+                .await
+        }
+        _ => client.call_request_async(&request).await,
     }
     .map_err(|error| error.to_string())?;
     response.decode_body().map_err(|error| error.to_string())

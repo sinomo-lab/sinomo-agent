@@ -3970,7 +3970,7 @@ fn collect_declarative_module_zip_package(
 }
 
 fn normalize_declarative_zip_package_prefix(
-    files: &mut Vec<(PathBuf, Vec<u8>)>,
+    files: &mut [(PathBuf, Vec<u8>)],
 ) -> Result<(), DeclarativeModuleInstallError> {
     if declarative_module_package_manifest_file_index(files).is_some() {
         return Ok(());
@@ -4840,17 +4840,17 @@ fn run_local_command_artifact(
             ));
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(source) = stdin.write_all(invocation.input.as_bytes()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            cleanup_output_capture(&stdout_path);
-            cleanup_output_capture(&stderr_path);
-            return Err(format!(
-                "failed to write stdin for artifact {}: {source}",
-                artifact.artifact_id
-            ));
-        }
+    if let Some(mut stdin) = child.stdin.take()
+        && let Err(source) = stdin.write_all(invocation.input.as_bytes())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        cleanup_output_capture(&stdout_path);
+        cleanup_output_capture(&stderr_path);
+        return Err(format!(
+            "failed to write stdin for artifact {}: {source}",
+            artifact.artifact_id
+        ));
     }
     let timeout = Duration::from_millis(
         artifact

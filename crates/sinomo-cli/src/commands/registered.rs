@@ -23,7 +23,7 @@ pub(crate) fn help_cli_command_handler() -> DeclarativeCommandHandler<TopLevelHe
             Ok(())
         },
     )
-    .as_help_command()
+    .with_help_command()
 }
 
 fn help_cli_spec() -> CliCommandSpec {
@@ -104,7 +104,7 @@ impl<T> DeclarativeCommandHandler<T> {
         self
     }
 
-    pub(crate) const fn as_help_command(mut self) -> Self {
+    pub(crate) const fn with_help_command(mut self) -> Self {
         self.always_help = true;
         self
     }

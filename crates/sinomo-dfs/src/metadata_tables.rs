@@ -644,22 +644,30 @@ impl DfsMetadataTables {
             Self::adjust_status_map_count(
                 &mut self.status_index.object_count_by_file_system,
                 &file_system_id,
-                before_matches
-                    .then_some(before.object_count)
-                    .unwrap_or_default(),
-                after_matches
-                    .then_some(after.object_count)
-                    .unwrap_or_default(),
+                if before_matches {
+                    before.object_count
+                } else {
+                    Default::default()
+                },
+                if after_matches {
+                    after.object_count
+                } else {
+                    Default::default()
+                },
             );
             Self::adjust_status_map_count(
                 &mut self.status_index.pending_repair_count_by_file_system,
                 &file_system_id,
-                before_matches
-                    .then_some(before.pending_repair_count)
-                    .unwrap_or_default(),
-                after_matches
-                    .then_some(after.pending_repair_count)
-                    .unwrap_or_default(),
+                if before_matches {
+                    before.pending_repair_count
+                } else {
+                    Default::default()
+                },
+                if after_matches {
+                    after.pending_repair_count
+                } else {
+                    Default::default()
+                },
             );
         }
         debug_assert!(self.status_index.pending_write_count >= before.pending_write_count);

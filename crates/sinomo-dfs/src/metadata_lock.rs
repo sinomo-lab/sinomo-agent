@@ -57,6 +57,7 @@ fn metadata_write_lock_after_path_guard(
     };
     let file = fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)

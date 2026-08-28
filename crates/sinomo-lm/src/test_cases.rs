@@ -117,8 +117,13 @@ fn live_native_tool_smoke(ctx: &mut SinomoTestContext, provider: &str) -> Sinomo
         &first_request,
     )
     .map_err(|source| SinomoTestError::failed(source.to_string()))?;
-    let tool_output =
-        collect_language_model_tool_calls(provider, &model, &first_response, &[], &[tool.clone()]);
+    let tool_output = collect_language_model_tool_calls(
+        provider,
+        &model,
+        &first_response,
+        &[],
+        std::slice::from_ref(&tool),
+    );
     let call = tool_output.tool_calls.first().cloned().ok_or_else(|| {
         SinomoTestError::failed(format!(
             "model did not return a native tool call; response text: {}",

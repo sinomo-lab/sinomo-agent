@@ -706,6 +706,7 @@ impl JsonlEventStore {
         let lock_path = self.lock_path();
         let lock = fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)

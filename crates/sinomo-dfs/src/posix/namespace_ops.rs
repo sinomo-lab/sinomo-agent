@@ -740,81 +740,81 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut moved_children = Vec::new();
         let mut local_hardlink_target_updates = Vec::new();
 
-        if let Some(mut destination) = self.lookup_sifs_path(&to)? {
-            if destination.kind != DfsObjectKind::Tombstone {
-                let source_target = self.resolve_hardlink_target(&source)?;
-                let destination_target = self.resolve_hardlink_target(&destination)?;
-                if source_target.object_id == destination_target.object_id {
-                    return self.posix_stat(&to);
+        if let Some(mut destination) = self.lookup_sifs_path(&to)?
+            && destination.kind != DfsObjectKind::Tombstone
+        {
+            let source_target = self.resolve_hardlink_target(&source)?;
+            let destination_target = self.resolve_hardlink_target(&destination)?;
+            if source_target.object_id == destination_target.object_id {
+                return self.posix_stat(&to);
+            }
+            match (&source.kind, &destination.kind) {
+                (DfsObjectKind::Directory, DfsObjectKind::Directory) => {
+                    if self.sifs_dir_has_children(&to)? {
+                        return Err(DfsPosixError::DirectoryNotEmpty { path: to });
+                    }
                 }
-                match (&source.kind, &destination.kind) {
-                    (DfsObjectKind::Directory, DfsObjectKind::Directory) => {
-                        if self.sifs_dir_has_children(&to)? {
-                            return Err(DfsPosixError::DirectoryNotEmpty { path: to });
-                        }
-                    }
-                    (DfsObjectKind::Directory, _) => {
-                        return Err(DfsPosixError::NotDirectory { path: to });
-                    }
-                    (_, DfsObjectKind::Directory) => {
-                        return Err(DfsPosixError::IsDirectory { path: to });
-                    }
-                    _ => {}
+                (DfsObjectKind::Directory, _) => {
+                    return Err(DfsPosixError::NotDirectory { path: to });
                 }
-                let destination_target_changed_at = now_unix_nanos();
-                if destination.kind == DfsObjectKind::Hardlink {
-                    if self.hardlink_alias_target_requires_cross_shard_coordination(
-                        &destination.path,
-                        &destination_target.path,
-                    )? {
-                        return Err(DfsPosixError::InvalidPath {
-                            path: format!(
-                                "replacing hardlink destination {to} whose canonical target {} is on another metadata shard requires a multi-target alias job",
-                                destination_target.path
-                            ),
-                        });
-                    }
-                    let mut updated_target = destination_target.clone();
-                    updated_target.changed_at_unix_nanos = destination_target_changed_at
-                        .max(updated_target.changed_at_unix_nanos.saturating_add(1));
-                    updated_target.version = next_version(&updated_target.version);
-                    local_hardlink_target_updates.push(updated_target);
+                (_, DfsObjectKind::Directory) => {
+                    return Err(DfsPosixError::IsDirectory { path: to });
                 }
-                if !matches!(
-                    destination.kind,
-                    DfsObjectKind::Hardlink | DfsObjectKind::Directory
-                ) && self.link_count_for_object(&destination_target)? > 1
+                _ => {}
+            }
+            let destination_target_changed_at = now_unix_nanos();
+            if destination.kind == DfsObjectKind::Hardlink {
+                if self.hardlink_alias_target_requires_cross_shard_coordination(
+                    &destination.path,
+                    &destination_target.path,
+                )? {
+                    return Err(DfsPosixError::InvalidPath {
+                        path: format!(
+                            "replacing hardlink destination {to} whose canonical target {} is on another metadata shard requires a multi-target alias job",
+                            destination_target.path
+                        ),
+                    });
+                }
+                let mut updated_target = destination_target.clone();
+                updated_target.changed_at_unix_nanos = destination_target_changed_at
+                    .max(updated_target.changed_at_unix_nanos.saturating_add(1));
+                updated_target.version = next_version(&updated_target.version);
+                local_hardlink_target_updates.push(updated_target);
+            }
+            if !matches!(
+                destination.kind,
+                DfsObjectKind::Hardlink | DfsObjectKind::Directory
+            ) && self.link_count_for_object(&destination_target)? > 1
+            {
+                let alias = self
+                    .first_hardlink_to_object(&destination.object_id)?
+                    .ok_or_else(|| DfsPosixError::NotFound { path: to.clone() })?;
+                // Demoting the replaced destination onto its alias would
+                // write into the alias's shard; that shard's primary must
+                // be this node, or the promotion would fork its journal.
+                let alias_path = normalize_posix_path(&alias.path)?;
+                if self
+                    .routed_namespace_primary_for_path(&alias_path)?
+                    .is_some()
                 {
-                    let alias = self
-                        .first_hardlink_to_object(&destination.object_id)?
-                        .ok_or_else(|| DfsPosixError::NotFound { path: to.clone() })?;
-                    // Demoting the replaced destination onto its alias would
-                    // write into the alias's shard; that shard's primary must
-                    // be this node, or the promotion would fork its journal.
-                    let alias_path = normalize_posix_path(&alias.path)?;
-                    if self
-                        .routed_namespace_primary_for_path(&alias_path)?
-                        .is_some()
-                    {
-                        return Err(DfsPosixError::InvalidPath {
-                            path: format!(
-                                "{to} has a hardlink alias at {alias_path} owned by another metadata shard primary"
-                            ),
-                        });
-                    }
-                    let alias_tombstone = self.tombstone_path_object_at(
-                        alias.clone(),
-                        hidden_alias_tombstone_path(&alias.object_id),
-                    );
-
-                    destination.path = alias.path.clone();
-                    destination.changed_at_unix_nanos = destination_target_changed_at;
-                    destination.version = next_version(&destination.version);
-                    moved_children.push(alias_tombstone);
-                    moved_children.push(destination);
-                } else {
-                    moved_children.push(self.tombstone_path_object(destination));
+                    return Err(DfsPosixError::InvalidPath {
+                        path: format!(
+                            "{to} has a hardlink alias at {alias_path} owned by another metadata shard primary"
+                        ),
+                    });
                 }
+                let alias_tombstone = self.tombstone_path_object_at(
+                    alias.clone(),
+                    hidden_alias_tombstone_path(&alias.object_id),
+                );
+
+                destination.path = alias.path.clone();
+                destination.changed_at_unix_nanos = destination_target_changed_at;
+                destination.version = next_version(&destination.version);
+                moved_children.push(alias_tombstone);
+                moved_children.push(destination);
+            } else {
+                moved_children.push(self.tombstone_path_object(destination));
             }
         }
 

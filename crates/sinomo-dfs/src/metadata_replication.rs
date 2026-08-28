@@ -431,9 +431,9 @@ pub async fn publish_cluster_dfs_metadata_journal_async_with_execution_exclusion
             outcomes: Vec::new(),
         });
     };
-    let mut transport =
+    let transport =
         AsyncDfsMetadataNodeTransport::new(plan.peer_node_ids.clone(), sender, snapshot_sender);
-    execute_prepared_dfs_metadata_journal_publish_async(plan, &mut transport, options).await
+    execute_prepared_dfs_metadata_journal_publish_async(plan, &transport, options).await
 }
 
 pub fn publish_cluster_dfs_metadata_journal_with_peer_transport(
@@ -715,12 +715,12 @@ pub async fn execute_prepared_cluster_dfs_metadata_publish_with_async_peer_trans
     peer_transport: Arc<dyn AsyncDfsPeerTransport>,
     options: DfsMetadataJournalReplicationOptions,
 ) -> Result<DfsMetadataJournalReplicationReport, DfsError> {
-    let mut transport = AsyncDfsMetadataNodeTransport::new(
+    let transport = AsyncDfsMetadataNodeTransport::new(
         plan.peer_node_ids.clone(),
         async_dfs_metadata_journal_batch_sender_from_peer_transport(Arc::clone(&peer_transport)),
         async_dfs_metadata_snapshot_install_sender_from_peer_transport(peer_transport),
     );
-    execute_prepared_dfs_metadata_journal_publish_async(plan, &mut transport, options).await
+    execute_prepared_dfs_metadata_journal_publish_async(plan, &transport, options).await
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3563,7 +3563,7 @@ mod metadata_publish_membership_tests {
             assert!(
                 lease
                     .resident_metadata_cursor_status_projection(
-                        &[old_target_node_id.clone()],
+                        std::slice::from_ref(&old_target_node_id),
                         &shard_id,
                     )
                     .is_none(),
@@ -5003,8 +5003,8 @@ fn execute_prepared_dfs_metadata_journal_publish(
                         for (target_index, target) in target_lane {
                             let mut target_outcomes = Vec::new();
                             let result = execute_prepared_dfs_metadata_journal_target_publish(
-                                &data_dir,
-                                &local_node_id,
+                                data_dir,
+                                local_node_id,
                                 target,
                                 lane_transport.as_mut(),
                                 options,
@@ -5080,8 +5080,8 @@ async fn execute_prepared_dfs_metadata_journal_publish_async(
                 for (target_index, target) in target_lane {
                     let mut target_outcomes = Vec::new();
                     let result = execute_prepared_dfs_metadata_journal_target_publish_async(
-                        &data_dir,
-                        &local_node_id,
+                        data_dir,
+                        local_node_id,
                         target,
                         resident_cursor_status_observer,
                         transport,
@@ -5308,15 +5308,13 @@ fn execute_prepared_dfs_metadata_journal_target_publish(
         }
     }
 
-    if completed_plan {
-        if let Some(after_sequence) = backlog_after_sequence {
-            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
-                target_node_id,
-                shard_id,
-                after_sequence,
-                max_batches: options.max_batches_per_target,
-            });
-        }
+    if completed_plan && let Some(after_sequence) = backlog_after_sequence {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+            target_node_id,
+            shard_id,
+            after_sequence,
+            max_batches: options.max_batches_per_target,
+        });
     }
     Ok(())
 }
@@ -5652,7 +5650,7 @@ mod concurrent_target_publish_tests {
                     })
                 })
             };
-            let mut transport = AsyncDfsMetadataNodeTransport::new(
+            let transport = AsyncDfsMetadataNodeTransport::new(
                 vec![offline_node_id.clone(), healthy_node_id.clone()],
                 sender,
                 snapshot_sender(),
@@ -5682,7 +5680,7 @@ mod concurrent_target_publish_tests {
             let publish = tokio::spawn(async move {
                 execute_prepared_dfs_metadata_journal_publish_async(
                     plan,
-                    &mut transport,
+                    &transport,
                     DfsMetadataJournalReplicationOptions {
                         attempt_timeout: Duration::from_secs(5),
                         target_timeout: Duration::from_secs(5),
@@ -5765,7 +5763,7 @@ mod concurrent_target_publish_tests {
                     })
                 })
             };
-            let mut transport = AsyncDfsMetadataNodeTransport::new(
+            let transport = AsyncDfsMetadataNodeTransport::new(
                 vec![target_node_id.clone()],
                 sender,
                 snapshot_sender(),
@@ -5790,7 +5788,7 @@ mod concurrent_target_publish_tests {
             let publish = tokio::spawn(async move {
                 execute_prepared_dfs_metadata_journal_publish_async(
                     plan,
-                    &mut transport,
+                    &transport,
                     DfsMetadataJournalReplicationOptions::default(),
                 )
                 .await
@@ -6006,15 +6004,13 @@ async fn execute_prepared_dfs_metadata_journal_target_publish_async(
         }
     }
 
-    if completed_plan {
-        if let Some(after_sequence) = backlog_after_sequence {
-            outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
-                target_node_id,
-                shard_id,
-                after_sequence,
-                max_batches: options.max_batches_per_target,
-            });
-        }
+    if completed_plan && let Some(after_sequence) = backlog_after_sequence {
+        outcomes.push(DfsMetadataJournalReplicationOutcome::BacklogRemaining {
+            target_node_id,
+            shard_id,
+            after_sequence,
+            max_batches: options.max_batches_per_target,
+        });
     }
     Ok(())
 }

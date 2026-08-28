@@ -50,19 +50,14 @@ impl EvolutionDashboard {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub enum EvolutionPhase {
+    #[default]
     Active,
     AwaitingDecision,
     Passed,
     Failed,
     Recovered,
-}
-
-impl Default for EvolutionPhase {
-    fn default() -> Self {
-        Self::Active
-    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -222,7 +217,7 @@ pub fn load_evolution_dashboard(data_dir: &SinomoDataDir) -> EvolutionDashboard 
             };
         }
     };
-    records.sort_by(|a, b| b.bundle.created_at.cmp(&a.bundle.created_at));
+    records.sort_by_key(|record| std::cmp::Reverse(record.bundle.created_at));
     let jobs: Vec<_> = records.into_iter().map(summarize_record).collect();
     EvolutionDashboard {
         source,

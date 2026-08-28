@@ -458,9 +458,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match frame {
                 DfsNamespaceJobFrame::ScanDirectory { path, cursor } => {
-                    let page_size = (max_steps - steps)
-                        .max(1)
-                        .min(POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE);
+                    let page_size =
+                        (max_steps - steps).clamp(1, POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE);
                     let page =
                         self.child_objects_for_sifs_dir_page(&path, cursor.as_ref(), page_size)?;
                     let mut child_dirs = Vec::new();
@@ -761,9 +760,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     target_path,
                     cursor,
                 } => {
-                    let page_size = (max_steps - steps)
-                        .max(1)
-                        .min(POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE);
+                    let page_size =
+                        (max_steps - steps).clamp(1, POSIX_RECURSIVE_CLEAR_JOB_PAGE_SIZE);
                     let page = self.child_objects_for_sifs_dir_page(
                         &source_path,
                         cursor.as_ref(),

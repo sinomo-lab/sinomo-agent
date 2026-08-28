@@ -374,9 +374,9 @@ pub struct LanConnectionPlanner;
 
 #[cfg(any(test, feature = "test-support"))]
 impl LanConnectionPlanner {
-    pub fn select_direct_candidate<'a>(
-        candidates: &'a [PeerEndpointCandidate],
-    ) -> Option<&'a PeerEndpointCandidate> {
+    pub fn select_direct_candidate(
+        candidates: &[PeerEndpointCandidate],
+    ) -> Option<&PeerEndpointCandidate> {
         candidates
             .iter()
             .filter(|candidate| {

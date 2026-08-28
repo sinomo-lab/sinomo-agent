@@ -783,7 +783,7 @@ fn list_modules_from_root(
     for state in native_dylib_states {
         count += 1;
         let cache_path = native_module_cache_path(
-            &root,
+            root,
             &state.cache_key,
             &state.content_hash,
             &state.library_name,

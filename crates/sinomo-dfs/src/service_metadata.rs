@@ -383,7 +383,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .collect::<Vec<_>>();
                 let existing_pairs = backend.get_object_version_pairs(&lookup_keys)?;
                 for ((object, version), (existing_object, existing_version)) in
-                    records.iter().zip(existing_pairs.into_iter())
+                    records.iter().zip(existing_pairs)
                 {
                     if existing_object.as_ref() != Some(object) {
                         transaction_objects.push(object.clone());
@@ -1301,7 +1301,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let trace_version_count = transaction.versions.len();
         let mut trace_ensure_fs_ms = 0;
         let mut trace_expectations_ms = 0;
-        let trace_backend_apply_ms;
+
         let mut trace_memory_coordinator_ms = 0;
         let mut trace_memory_tombstone_ms = 0;
         let mut trace_memory_add_ms = 0;
@@ -1697,7 +1697,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 journal_operation_id.as_deref(),
             )?;
         }
-        trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
+        let trace_backend_apply_ms = backend_apply_started.elapsed().as_millis();
         let (tombstones, live_objects): (Vec<_>, Vec<_>) = transaction
             .objects
             .into_iter()

@@ -1153,80 +1153,6 @@ fn complete_daemonless_outcome(
     finish_daemonless_journal(store, lease, journal)
 }
 
-#[cfg(test)]
-mod cancellation_tests {
-    use super::*;
-
-    #[test]
-    fn cancellation_remains_structured_for_local_execution() {
-        let outcome: Result<(), SandboxCommandExecutionError> =
-            Err(SandboxWasiError::Cancelled.into());
-        assert!(execution_was_cancelled(&outcome));
-    }
-
-    #[test]
-    fn process_plan_preserves_cancelled_cleanup_failure_for_caller_recovery() {
-        let token = SandboxCancellationToken::new();
-        token.cancel();
-        let result: Result<(), SandboxCommandExecutionError> =
-            Err(SandboxWasiError::CancelledCleanupFailed {
-                detail: "durable local audit cleanup remains pending".to_string(),
-            }
-            .into());
-
-        let error = complete_process_outcome(&token, result)
-            .expect_err("process plan cancellation remains structured");
-        assert!(matches!(
-            error,
-            SandboxCommandExecutionError::Wasi(SandboxWasiError::CancelledCleanupFailed {
-                detail
-            }) if detail == "durable local audit cleanup remains pending"
-        ));
-    }
-
-    #[test]
-    fn two_step_process_keeps_rpc_cancellation_active_until_plan_finalization() {
-        let token = SandboxCancellationToken::new();
-
-        assert_eq!(
-            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(1))
-                .expect("first nested step"),
-            1
-        );
-        assert!(!token.is_cancelled());
-        assert!(!token.is_completing_or_completed());
-        assert_eq!(
-            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(2))
-                .expect("second nested step"),
-            2
-        );
-        assert_eq!(
-            complete_process_outcome(&token, Ok::<_, SandboxCommandExecutionError>(vec![1, 2]),)
-                .expect("complete process plan"),
-            vec![1, 2]
-        );
-        assert!(token.is_completing_or_completed());
-        assert!(!token.cancel(), "late cancellation must not win");
-    }
-
-    #[test]
-    fn non_cancel_native_error_enters_finalization_before_audit() {
-        let token = SandboxCancellationToken::new();
-        let error = transition_after_native_return::<()>(
-            &token,
-            true,
-            Err(SandboxWasiError::Runtime {
-                detail: "guest failed".to_string(),
-            }),
-        )
-        .expect_err("native error");
-
-        assert!(matches!(error, SandboxWasiError::Runtime { .. }));
-        assert!(token.is_completing_or_completed());
-        assert!(!token.cancel(), "error audit finalization owns the token");
-    }
-}
-
 pub fn run_sandbox_wasm_module_replay_fixture_with_active_module(
     data_dir_root: impl AsRef<Path>,
     fixture: &sinomo_module::ModuleReplayFixture,
@@ -1849,5 +1775,79 @@ fn executor_error_to_wasi(error: SandboxExecutorErrorResponse) -> SandboxWasiErr
     }
     SandboxWasiError::Runtime {
         detail: format!("{}: {}", error.code, error.detail),
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_remains_structured_for_local_execution() {
+        let outcome: Result<(), SandboxCommandExecutionError> =
+            Err(SandboxWasiError::Cancelled.into());
+        assert!(execution_was_cancelled(&outcome));
+    }
+
+    #[test]
+    fn process_plan_preserves_cancelled_cleanup_failure_for_caller_recovery() {
+        let token = SandboxCancellationToken::new();
+        token.cancel();
+        let result: Result<(), SandboxCommandExecutionError> =
+            Err(SandboxWasiError::CancelledCleanupFailed {
+                detail: "durable local audit cleanup remains pending".to_string(),
+            }
+            .into());
+
+        let error = complete_process_outcome(&token, result)
+            .expect_err("process plan cancellation remains structured");
+        assert!(matches!(
+            error,
+            SandboxCommandExecutionError::Wasi(SandboxWasiError::CancelledCleanupFailed {
+                detail
+            }) if detail == "durable local audit cleanup remains pending"
+        ));
+    }
+
+    #[test]
+    fn two_step_process_keeps_rpc_cancellation_active_until_plan_finalization() {
+        let token = SandboxCancellationToken::new();
+
+        assert_eq!(
+            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(1))
+                .expect("first nested step"),
+            1
+        );
+        assert!(!token.is_cancelled());
+        assert!(!token.is_completing_or_completed());
+        assert_eq!(
+            transition_after_native_return(&token, false, Ok::<_, SandboxWasiError>(2))
+                .expect("second nested step"),
+            2
+        );
+        assert_eq!(
+            complete_process_outcome(&token, Ok::<_, SandboxCommandExecutionError>(vec![1, 2]),)
+                .expect("complete process plan"),
+            vec![1, 2]
+        );
+        assert!(token.is_completing_or_completed());
+        assert!(!token.cancel(), "late cancellation must not win");
+    }
+
+    #[test]
+    fn non_cancel_native_error_enters_finalization_before_audit() {
+        let token = SandboxCancellationToken::new();
+        let error = transition_after_native_return::<()>(
+            &token,
+            true,
+            Err(SandboxWasiError::Runtime {
+                detail: "guest failed".to_string(),
+            }),
+        )
+        .expect_err("native error");
+
+        assert!(matches!(error, SandboxWasiError::Runtime { .. }));
+        assert!(token.is_completing_or_completed());
+        assert!(!token.cancel(), "error audit finalization owns the token");
     }
 }

@@ -1462,7 +1462,7 @@ mod tests {
         writer
             .write_with_options(
                 "catalog/entry.json",
-                b"{\"id\":1}".to_vec(),
+                b"{\"id\":1}",
                 VfsWriteOptions::service_artifact(),
             )
             .expect("write through writer handle");

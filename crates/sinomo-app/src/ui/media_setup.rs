@@ -1900,8 +1900,10 @@ mod tests {
     #[test]
     fn latest_levels_and_surface_revisions_replace_previous_snapshots() {
         let mut state = temp_state("latest");
-        let mut snapshots = MediaSetupSnapshots::default();
-        snapshots.microphone_level = Some(0.25);
+        let mut snapshots = MediaSetupSnapshots {
+            microphone_level: Some(0.25),
+            ..MediaSetupSnapshots::default()
+        };
         snapshots.microphone_level = Some(0.75);
         let first = state
             .camera_surface

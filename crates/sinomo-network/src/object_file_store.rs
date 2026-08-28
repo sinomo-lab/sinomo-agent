@@ -3,6 +3,8 @@ use crate::object::SinomoObjectCodec;
 use serde::Serialize;
 use sinomo_storage::durable_file;
 use std::fs;
+use std::path::Path;
+#[cfg(any(test, feature = "test-support"))]
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -27,7 +29,7 @@ pub(crate) const MAX_OBJECT_FILE_READ_BYTES: u64 = durable_file::DEFAULT_OBJECT_
 static LAST_WRITTEN_OBJECT_FILES: LazyLock<durable_file::ObjectFileWriteMarkCache> =
     LazyLock::new(|| durable_file::ObjectFileWriteMarkCache::new(FILE_CACHE_CAPACITY));
 
-pub fn read_object_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, NetworkError> {
+pub fn read_object_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, NetworkError> {
     let bytes = read_object_file_bytes(path)?;
     if let Some(observer) = io_observer() {
         observer.on_disk_read(bytes.len() as u64);
@@ -36,7 +38,7 @@ pub fn read_object_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Resul
 }
 
 pub fn read_optional_object_file<T: serde::de::DeserializeOwned>(
-    path: &PathBuf,
+    path: &Path,
 ) -> Result<Option<T>, NetworkError> {
     let Some(bytes) = read_optional_object_file_bytes(path)? else {
         return Ok(None);
@@ -47,17 +49,17 @@ pub fn read_optional_object_file<T: serde::de::DeserializeOwned>(
     SinomoObjectCodec::default().decode(&bytes).map(Some)
 }
 
-fn read_optional_object_file_bytes(path: &PathBuf) -> Result<Option<Vec<u8>>, NetworkError> {
+fn read_optional_object_file_bytes(path: &Path) -> Result<Option<Vec<u8>>, NetworkError> {
     durable_file::read_optional_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
         .map_err(network_durable_file_error)
 }
 
-fn read_object_file_bytes(path: &PathBuf) -> Result<Vec<u8>, NetworkError> {
+fn read_object_file_bytes(path: &Path) -> Result<Vec<u8>, NetworkError> {
     durable_file::read_object_file_bytes(path, MAX_OBJECT_FILE_READ_BYTES)
         .map_err(network_durable_file_error)
 }
 
-pub fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
+pub fn remove_optional_file(path: &Path) -> Result<bool, NetworkError> {
     match fs::remove_file(path) {
         Ok(()) => Ok(true),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -68,13 +70,13 @@ pub fn remove_optional_file(path: &PathBuf) -> Result<bool, NetworkError> {
     }
 }
 
-pub fn write_object_file<T: Serialize>(path: &PathBuf, value: &T) -> Result<(), NetworkError> {
+pub fn write_object_file<T: Serialize>(path: &Path, value: &T) -> Result<(), NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
     write_encoded_object_file(path, &desired)
 }
 
 pub fn write_object_file_with_semantic_skip<T, F>(
-    path: &PathBuf,
+    path: &Path,
     value: &T,
     stable_eq: F,
 ) -> Result<(), NetworkError>
@@ -95,7 +97,7 @@ where
     write_encoded_object_file(path, &desired)
 }
 
-fn write_encoded_object_file(path: &PathBuf, desired: &[u8]) -> Result<(), NetworkError> {
+fn write_encoded_object_file(path: &Path, desired: &[u8]) -> Result<(), NetworkError> {
     let result = durable_file::write_object_file_bytes_if_changed(
         path,
         desired,
@@ -125,7 +127,7 @@ pub(crate) fn record_object_file_semantic_skip() {
 
 #[cfg(any(test, feature = "test-support"))]
 pub fn write_object_file_compare_read_bytes_for_test<T: Serialize>(
-    path: &PathBuf,
+    path: &Path,
     value: &T,
 ) -> Result<Option<u64>, NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
@@ -149,7 +151,7 @@ pub fn write_object_file_compare_read_bytes_for_test<T: Serialize>(
 // Unconditional since stage C: dylib network modules reuse this helper
 // through the sinomo-core facade.
 pub fn write_object_file_create_new_serialized<T: Serialize>(
-    path: &PathBuf,
+    path: &Path,
     value: &T,
 ) -> Result<bool, NetworkError> {
     let desired = SinomoObjectCodec::default().encode(value)?;
@@ -158,7 +160,7 @@ pub fn write_object_file_create_new_serialized<T: Serialize>(
         &desired,
         &LAST_WRITTEN_OBJECT_FILES,
         durable_file::DurableObjectFileOptions::new("sobj", "create-new-tmp"),
-        |temp_path, path| create_new_link_or_unsupported_for_test(temp_path, &path.to_path_buf()),
+        create_new_link_or_unsupported_for_test,
     )
     .map_err(network_durable_file_error)?;
     if let Some(observer) = io_observer() {
@@ -176,7 +178,7 @@ pub fn write_object_file_create_new_serialized<T: Serialize>(
 // failure branch stays test-gated.
 fn create_new_link_or_unsupported_for_test(
     temp_path: &std::path::Path,
-    path: &PathBuf,
+    path: &Path,
 ) -> std::io::Result<()> {
     #[cfg(any(test, feature = "test-support"))]
     if write_object_file_create_new_forces_unsupported_link_for_test(path) {
@@ -211,12 +213,12 @@ pub fn object_file_write_mark_cache_capacity_for_test() -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn object_file_write_mark_cache_contains_for_test(path: &PathBuf) -> bool {
+pub fn object_file_write_mark_cache_contains_for_test(path: &Path) -> bool {
     LAST_WRITTEN_OBJECT_FILES.contains(path)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn record_object_file_write_mark_for_test(path: &PathBuf) {
+pub fn record_object_file_write_mark_for_test(path: &Path) {
     LAST_WRITTEN_OBJECT_FILES.record_mark(
         path,
         blake3::hash(b"stable"),
@@ -227,7 +229,7 @@ pub fn record_object_file_write_mark_for_test(path: &PathBuf) {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn refresh_object_file_write_mark_for_test(path: &PathBuf) -> bool {
+pub fn refresh_object_file_write_mark_for_test(path: &Path) -> bool {
     LAST_WRITTEN_OBJECT_FILES.refresh(path)
 }
 
@@ -241,21 +243,21 @@ static CREATE_NEW_OBJECT_FILE_FORCE_UNSUPPORTED_LINK_FOR_TEST: LazyLock<Mutex<Ha
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn force_write_object_file_create_new_unsupported_link_for_test(path: &PathBuf) {
+pub fn force_write_object_file_create_new_unsupported_link_for_test(path: &Path) {
     if let Ok(mut paths) = CREATE_NEW_OBJECT_FILE_FORCE_UNSUPPORTED_LINK_FOR_TEST.lock() {
-        paths.insert(path.clone());
+        paths.insert(path.to_path_buf());
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn clear_write_object_file_create_new_unsupported_link_for_test(path: &PathBuf) {
+pub fn clear_write_object_file_create_new_unsupported_link_for_test(path: &Path) {
     if let Ok(mut paths) = CREATE_NEW_OBJECT_FILE_FORCE_UNSUPPORTED_LINK_FOR_TEST.lock() {
         paths.remove(path);
     }
 }
 
 #[cfg(any(test, feature = "test-support"))]
-fn write_object_file_create_new_forces_unsupported_link_for_test(path: &PathBuf) -> bool {
+fn write_object_file_create_new_forces_unsupported_link_for_test(path: &Path) -> bool {
     CREATE_NEW_OBJECT_FILE_FORCE_UNSUPPORTED_LINK_FOR_TEST
         .lock()
         .ok()
