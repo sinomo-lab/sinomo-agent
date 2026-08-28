@@ -38,7 +38,9 @@ pub use endpoint_advertisement::{
     read_daemon_endpoint_advertisement_config,
 };
 pub use error::DaemonApiError;
-pub use event_service::{DaemonEventHub, DaemonEventService, register_daemon_event_service};
+pub use event_service::{
+    DaemonEventHub, DaemonEventMirror, DaemonEventService, register_daemon_event_service,
+};
 pub use idle_stats::IdleStatsSnapshot;
 pub use paths::{DaemonPaths, daemon_paths_from_data_dir, shadow_daemon_paths_from_data_dir};
 pub use replay_protection::{ReplayNonceCachePoisoned, ScopedReplayNonceCache};

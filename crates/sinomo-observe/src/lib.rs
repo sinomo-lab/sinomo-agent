@@ -26,6 +26,12 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use sinomo_observe_contract::{
+    OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    OBSERVE_METRIC_EXPORTER_MAX_RECORDS, OBSERVE_METRIC_EXPORTER_OPERATION,
+    ObserveMetricExportRequest, ObserveMetricExportResponse,
+};
+
 pub use builtin_metrics::register_builtin_observe_metric_exporters;
 pub use cli::{
     ObserveCliCommandHandler, observe_cli_command_handler,
@@ -820,6 +826,7 @@ pub fn observe_module_capabilities() -> sinomo_core::ModuleCapabilities {
         imports: vec![
             observe_capability("storage.local.read"),
             observe_capability("storage.local.write"),
+            observe_capability(OBSERVE_METRIC_EXPORTER_OPERATION),
         ],
         exports: vec![
             observe_capability("observe.events.read"),
@@ -897,12 +904,32 @@ pub fn register_storage_paths(
     Ok(())
 }
 
+const OBSERVE_COMPONENT_EXPORTER_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const OBSERVE_COMPONENT_EXPORTER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+const OBSERVE_COMPONENT_PROVENANCE_LABELS: &[&str] = &[
+    "component_id",
+    "component_version",
+    "component_service_id",
+    "component_generation",
+    "component_artifact_id",
+];
+
 #[derive(Default)]
-pub struct ObserveService;
+pub struct ObserveService {
+    component_services: Option<sinomo_module::ComponentServiceClient>,
+}
 
 impl ObserveService {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_component_services(
+        component_services: sinomo_module::ComponentServiceClient,
+    ) -> Self {
+        Self {
+            component_services: Some(component_services),
+        }
     }
 }
 
@@ -913,13 +940,122 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
 pub fn component_factory()
 -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor =
-        sinomo_module::component_descriptor_from_registration(&observe_module_registration())?;
+        sinomo_module::component_descriptor_from_registration(&observe_module_registration())?
+            .require(observe_metric_exporter_requirement())
+            .subscribe_event(sinomo_module::ComponentEventSubscription::new(
+                "*", "*", "*",
+            ));
     Ok(
-        sinomo_module::StaticComponentFactory::new(descriptor, |_, scope| {
-            scope.set_services(register_services(ServiceRegistryBuilder::default()).build());
+        sinomo_module::StaticComponentFactory::new(descriptor, |context, scope| {
+            let component_services = context.service_client(scope.descriptor())?;
+            scope.set_services(
+                ServiceRegistryBuilder::default()
+                    .register(ObserveService::with_component_services(component_services))
+                    .build(),
+            );
+            if let Some(runtime) = context.runtime() {
+                let subscription = sinomo_module::ComponentEventSubscription::new("*", "*", "*");
+                let mut events = context
+                    .event_client(scope.descriptor())?
+                    .subscribe(&subscription)
+                    .map_err(|error| {
+                        sinomo_module::ComponentError::component(
+                            SINOMO_OBSERVE_MODULE_LEGACY_ID,
+                            error,
+                        )
+                    })?;
+                let data_dir = context.data_dir_root();
+                let mut shutdown = scope.shutdown_receiver();
+                scope.own_task(
+                    "observe component event recorder",
+                    runtime.spawn(async move {
+                        loop {
+                            tokio::select! {
+                                event = events.recv() => match event {
+                                    Ok(event) => {
+                                        let data_dir = data_dir.clone();
+                                        let record = event.as_ref().clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            append_component_event_record(&data_dir, &record)
+                                        }).await {
+                                            Ok(Ok(())) => {}
+                                            Ok(Err(error)) => tracing::warn!(%error, "observe component event append failed"),
+                                            Err(error) => tracing::warn!(%error, "observe component event append task failed"),
+                                        }
+                                    }
+                                    Err(sinomo_module::ComponentEventReceiveError::Lagged { skipped }) => {
+                                        tracing::warn!(skipped, "observe component event recorder lagged");
+                                    }
+                                    Err(sinomo_module::ComponentEventReceiveError::Closed) => break,
+                                },
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }),
+                );
+            }
             Ok(())
         })?
         .with_storage_paths(register_storage_paths),
+    )
+}
+
+fn append_component_event_record(
+    data_dir: &Path,
+    event: &sinomo_module::ComponentEvent,
+) -> Result<(), ObserveError> {
+    let payload = event.envelope.payload.as_object();
+    let severity = match payload
+        .and_then(|payload| payload.get("severity"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("trace") => OperationalSeverity::Trace,
+        Some("debug") => OperationalSeverity::Debug,
+        Some("warn") => OperationalSeverity::Warn,
+        Some("error") => OperationalSeverity::Error,
+        _ => OperationalSeverity::Info,
+    };
+    let component = payload
+        .and_then(|payload| payload.get("component"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(event.publisher.component_id.as_str());
+    let message = payload
+        .and_then(|payload| payload.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| event.envelope.kind.as_str());
+    let operation_id = payload
+        .and_then(|payload| payload.get("operation_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    if event.envelope.kind.as_str() == "daemon.log.recorded" {
+        let fields = payload
+            .and_then(|payload| payload.get("fields"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        append_operational_log(
+            data_dir,
+            severity,
+            component,
+            message,
+            operation_id.as_deref(),
+            fields,
+        )?;
+        return Ok(());
+    }
+    append_jsonl_record(
+        &operational_events_path(data_dir),
+        &OperationalEventRecord {
+            appended_at: OffsetDateTime::now_utc(),
+            severity,
+            component: component.to_string(),
+            message: message.to_string(),
+            operation_id,
+            event: event.envelope.clone(),
+        },
     )
 }
 
@@ -945,6 +1081,7 @@ impl Service for ObserveService {
         mut ctx: ServiceContext,
         request: sinomo_core::network::ObjectRpcRequest,
     ) -> ServiceFuture<'_> {
+        let component_services = self.component_services.clone();
         Box::pin(async move {
             match request.route.as_str() {
                 OBSERVE_EVENTS_ROUTE => {
@@ -961,10 +1098,17 @@ impl Service for ObserveService {
                 }
                 OBSERVE_METRICS_ROUTE => {
                     let request: ObserveMetricsRequest = ctx.decode_request_body(&request).await?;
-                    ctx.respond_value(
-                        OBSERVE_METRICS_ROUTE,
-                        read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request),
-                    )?;
+                    let mut response =
+                        read_observe_metrics_for_data_dir(ctx.data_dir.as_ref(), &request);
+                    if let Some(component_services) = component_services {
+                        collect_component_metric_exporters(
+                            &component_services,
+                            &request,
+                            &mut response,
+                        )
+                        .await;
+                    }
+                    ctx.respond_value(OBSERVE_METRICS_ROUTE, response)?;
                 }
                 OBSERVE_TRACES_ROUTE => {
                     let request: ObserveTracesRequest = ctx.decode_request_body(&request).await?;
@@ -1001,6 +1145,323 @@ impl Service for ObserveService {
     }
 }
 
+fn observe_metric_exporter_requirement() -> sinomo_module::ServiceRequirement {
+    sinomo_module::ServiceRequirement::new(
+        OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
+        OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    )
+    .with_operation(OBSERVE_METRIC_EXPORTER_OPERATION)
+    .with_caller_capability(OBSERVE_METRIC_EXPORTER_OPERATION)
+    .optional()
+}
+
+async fn collect_component_metric_exporters(
+    component_services: &sinomo_module::ComponentServiceClient,
+    request: &ObserveMetricsRequest,
+    response: &mut ObserveMetricsResponse,
+) {
+    let exporter_request = ObserveMetricExportRequest {
+        name_prefix: request.name_prefix.clone(),
+        limit: if request.limit == 0 {
+            OBSERVE_METRIC_EXPORTER_MAX_RECORDS
+        } else {
+            request.limit.min(OBSERVE_METRIC_EXPORTER_MAX_RECORDS)
+        },
+    };
+    let calls = match component_services
+        .call_local_all::<_, ObserveMetricExportResponse>(
+            &observe_metric_exporter_requirement(),
+            OBSERVE_METRIC_EXPORTER_OPERATION,
+            &exporter_request,
+            OBSERVE_COMPONENT_EXPORTER_DEADLINE,
+            OBSERVE_COMPONENT_EXPORTER_MAX_RESPONSE_BYTES,
+        )
+        .await
+    {
+        Ok(calls) => calls,
+        Err(error) => {
+            response.partial = true;
+            tracing::warn!(
+                target: "sinomo.observe.exporter",
+                error = %error,
+                "component metric exporter resolution failed"
+            );
+            return;
+        }
+    };
+
+    let mut descriptors = response
+        .descriptors
+        .drain(..)
+        .map(|descriptor| (descriptor.name.clone(), descriptor))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for call in calls {
+        match call {
+            Ok(call) => {
+                let exporter_name = component_metric_exporter_name(&call.provider);
+                match merge_component_metric_export(
+                    request,
+                    &call.provider,
+                    call.value,
+                    &mut descriptors,
+                    &mut response.metrics,
+                ) {
+                    Ok(()) => response.exporters.push(ObserveMetricExporterStatus {
+                        name: exporter_name,
+                        observed_at: OffsetDateTime::now_utc(),
+                        duration_us: call.duration_us,
+                        cached: false,
+                        success: true,
+                        error_code: None,
+                    }),
+                    Err(detail) => {
+                        response.partial = true;
+                        response.exporters.push(ObserveMetricExporterStatus {
+                            name: exporter_name.clone(),
+                            observed_at: OffsetDateTime::now_utc(),
+                            duration_us: call.duration_us,
+                            cached: false,
+                            success: false,
+                            error_code: Some("invalid-export".to_string()),
+                        });
+                        tracing::warn!(
+                            target: "sinomo.observe.exporter",
+                            exporter = %exporter_name,
+                            error = %detail,
+                            "component metric exporter returned an invalid batch"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                response.partial = true;
+                response.exporters.push(ObserveMetricExporterStatus {
+                    name: component_metric_exporter_name(&error.provider),
+                    observed_at: OffsetDateTime::now_utc(),
+                    duration_us: error.duration_us,
+                    cached: false,
+                    success: false,
+                    error_code: Some("component-call".to_string()),
+                });
+                tracing::warn!(
+                    target: "sinomo.observe.exporter",
+                    component_id = %error.provider.component_id,
+                    route = %error.route,
+                    error = %error.detail,
+                    "component metric exporter call failed"
+                );
+            }
+        }
+    }
+
+    response.metrics.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.labels.cmp(&right.labels))
+    });
+    if request.limit > 0 && response.metrics.len() > request.limit {
+        response.metrics.truncate(request.limit);
+    }
+    let returned_names = response
+        .metrics
+        .iter()
+        .map(|record| record.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    response.descriptors = descriptors
+        .into_values()
+        .filter(|descriptor| returned_names.contains(descriptor.name.as_str()))
+        .collect();
+}
+
+fn component_metric_exporter_name(
+    provider: &sinomo_core::service::ServiceDiscoveryIdentity,
+) -> String {
+    format!(
+        "component:{}/{}",
+        provider.component_id, provider.service_id
+    )
+}
+
+fn merge_component_metric_export(
+    request: &ObserveMetricsRequest,
+    provider: &sinomo_core::service::ServiceDiscoveryIdentity,
+    mut export: ObserveMetricExportResponse,
+    descriptors: &mut std::collections::BTreeMap<String, ObserveMetricDescriptor>,
+    metrics: &mut Vec<ObserveMetricRecord>,
+) -> Result<(), String> {
+    if export.metrics.len() > OBSERVE_METRIC_EXPORTER_MAX_RECORDS {
+        return Err(format!(
+            "returned {} records; maximum is {OBSERVE_METRIC_EXPORTER_MAX_RECORDS}",
+            export.metrics.len()
+        ));
+    }
+    let mut batch_descriptors = std::collections::BTreeMap::new();
+    for mut descriptor in export.descriptors.drain(..) {
+        validate_component_metric_name(&descriptor.name)?;
+        if descriptor.help.len() > 4_096 {
+            return Err(format!(
+                "metric `{}` help exceeds 4096 bytes",
+                descriptor.name
+            ));
+        }
+        for label in OBSERVE_COMPONENT_PROVENANCE_LABELS {
+            if !descriptor
+                .semantics
+                .labels
+                .iter()
+                .any(|existing| existing == label)
+            {
+                descriptor.semantics.labels.push((*label).to_string());
+            }
+        }
+        descriptor.semantics.labels.sort();
+        descriptor.semantics.labels.dedup();
+        if !descriptor
+            .semantics
+            .aggregation
+            .is_compatible_with(descriptor.kind)
+        {
+            descriptor.semantics.aggregation = ObserveMetricAggregation::None;
+        }
+        if let Some(existing) = descriptors
+            .get(&descriptor.name)
+            .or_else(|| batch_descriptors.get(&descriptor.name))
+            && (existing.kind != descriptor.kind || existing.unit != descriptor.unit)
+        {
+            return Err(format!(
+                "metric `{}` conflicts with an existing descriptor",
+                descriptor.name
+            ));
+        }
+        batch_descriptors.insert(descriptor.name.clone(), descriptor);
+    }
+
+    let mut accepted = Vec::new();
+    let mut accepted_series = std::collections::BTreeSet::new();
+    for mut record in export.metrics {
+        validate_component_metric_record(&record)?;
+        if request
+            .name_prefix
+            .as_ref()
+            .is_some_and(|prefix| !record.name.starts_with(prefix))
+        {
+            continue;
+        }
+        if let Some(descriptor) = batch_descriptors
+            .get(&record.name)
+            .or_else(|| descriptors.get(&record.name))
+            && descriptor.kind != record.kind
+        {
+            return Err(format!(
+                "metric `{}` kind disagrees with its descriptor",
+                record.name
+            ));
+        }
+        record
+            .labels
+            .insert("component_id".to_string(), provider.component_id.clone());
+        record.labels.insert(
+            "component_version".to_string(),
+            provider.component_version.clone(),
+        );
+        record.labels.insert(
+            "component_service_id".to_string(),
+            provider.service_id.clone(),
+        );
+        record.labels.insert(
+            "component_generation".to_string(),
+            provider.component_generation.to_string(),
+        );
+        if let Some(artifact_id) = &provider.artifact_id {
+            record
+                .labels
+                .insert("component_artifact_id".to_string(), artifact_id.clone());
+        }
+        if !accepted_series.insert((record.name.clone(), record.labels.clone())) {
+            return Err(format!(
+                "metric `{}` repeats a label-identical series",
+                record.name
+            ));
+        }
+        accepted.push(record);
+    }
+    descriptors.extend(batch_descriptors);
+    metrics.extend(accepted);
+    Ok(())
+}
+
+fn validate_component_metric_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 256
+        || name != name.trim()
+        || !name.contains('.')
+        || !name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-' | ':' | '/')
+        })
+    {
+        return Err(format!("invalid dotted metric name `{name}`"));
+    }
+    Ok(())
+}
+
+fn validate_component_metric_record(record: &ObserveMetricRecord) -> Result<(), String> {
+    validate_component_metric_name(&record.name)?;
+    if record.labels.len() > 32
+        || record
+            .labels
+            .iter()
+            .any(|(key, value)| key.is_empty() || key.len() > 128 || value.len() > 1_024)
+    {
+        return Err(format!(
+            "metric `{}` has invalid or excessive labels",
+            record.name
+        ));
+    }
+    let finite = |value: Option<f64>| value.is_none_or(f64::is_finite);
+    if !finite(record.value)
+        || !finite(record.sum)
+        || !finite(record.min)
+        || !finite(record.max)
+        || record.buckets.len() > 128
+        || record
+            .buckets
+            .iter()
+            .any(|bucket| !bucket.upper_bound.is_finite())
+        || record.buckets.windows(2).any(|buckets| {
+            buckets[0].upper_bound >= buckets[1].upper_bound || buckets[0].count > buckets[1].count
+        })
+    {
+        return Err(format!(
+            "metric `{}` has an invalid numeric value",
+            record.name
+        ));
+    }
+    match record.kind {
+        ObserveMetricKind::Counter | ObserveMetricKind::Gauge if record.value.is_none() => {
+            Err(format!("metric `{}` has no scalar value", record.name))
+        }
+        ObserveMetricKind::Counter if record.value.is_some_and(|value| value < 0.0) => {
+            Err(format!("counter metric `{}` is negative", record.name))
+        }
+        ObserveMetricKind::Counter | ObserveMetricKind::Gauge
+            if record.count.is_some()
+                || record.sum.is_some()
+                || record.min.is_some()
+                || record.max.is_some()
+                || !record.buckets.is_empty() =>
+        {
+            Err(format!(
+                "scalar metric `{}` contains histogram fields",
+                record.name
+            ))
+        }
+        ObserveMetricKind::Histogram if record.count.is_none() || record.sum.is_none() => Err(
+            format!("histogram metric `{}` has no count or sum", record.name),
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn observe_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = observe_module_surfaces()
         .object_rpc_route_descriptor(route)
@@ -1025,7 +1486,300 @@ fn service_error(error: ObserveError) -> ServiceError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_core::service::ServiceRegistry;
+    use std::sync::{Arc, Mutex};
+
+    use sinomo_core::network::{
+        ObjectRpcIncomingBody, ObjectRpcOutgoingResponse, ObjectRpcRequest,
+    };
+    use sinomo_core::service::{
+        ResponseSink, ServiceContext, ServiceDiscoveryHealth, ServiceDiscoveryIdentity,
+        ServiceDiscoveryLocality, ServiceRegistry, ServiceSigner,
+    };
+
+    struct FixtureMetricExporterService;
+
+    impl Service for FixtureMetricExporterService {
+        fn name(&self) -> &'static str {
+            "fixture-metric-exporter"
+        }
+
+        fn routes(&self) -> &'static [&'static str] {
+            &["/fixture/metrics/export"]
+        }
+
+        fn route_categories(&self) -> Vec<ServiceRoute> {
+            vec![ServiceRoute::from_route_metadata(
+                "/fixture/metrics/export",
+                sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_CATEGORY,
+                "component",
+                [OBSERVE_METRIC_EXPORTER_OPERATION],
+            )]
+        }
+
+        fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+            Box::pin(async move {
+                let _: ObserveMetricExportRequest = ctx.decode_request_body(&request).await?;
+                ctx.respond_value(
+                    request.route,
+                    ObserveMetricExportResponse {
+                        descriptors: vec![ObserveMetricDescriptor::new(
+                            "fixture.jobs.completed",
+                            ObserveMetricKind::Counter,
+                            Some(ObserveMetricUnit::Count),
+                            "Completed fixture jobs.",
+                        )],
+                        metrics: vec![ObserveMetricRecord::counter(
+                            "fixture.jobs.completed",
+                            std::collections::BTreeMap::new(),
+                            9,
+                        )],
+                    },
+                )?;
+                Ok(ServiceDisposition::Continue)
+            })
+        }
+    }
+
+    struct TestResponseSink {
+        response: Arc<Mutex<Option<ObjectRpcOutgoingResponse>>>,
+    }
+
+    impl ResponseSink for TestResponseSink {
+        fn send(self: Box<Self>, response: ObjectRpcOutgoingResponse) -> Result<(), ServiceError> {
+            *self
+                .response
+                .lock()
+                .map_err(|_| ServiceError::Service("test response lock poisoned".to_string()))? =
+                Some(response);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_pulls_external_component_metrics_through_the_live_registry() {
+        let provider_descriptor =
+            sinomo_module::ComponentDescriptor::new("fixture.metrics.provider", "1.0.0")
+                .with_offer(
+                    sinomo_module::ServiceOffer::new(
+                        "fixture-metrics",
+                        OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
+                        OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+                    )
+                    .with_operation(
+                        sinomo_module::ServiceOperationOffer::new(
+                            OBSERVE_METRIC_EXPORTER_OPERATION,
+                        )
+                        .at_route("/fixture/metrics/export")
+                        .require_caller_capability(OBSERVE_METRIC_EXPORTER_OPERATION),
+                    ),
+                );
+        let provider: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
+            sinomo_module::StaticComponentFactory::new(provider_descriptor, |_, scope| {
+                scope.set_services(
+                    ServiceRegistry::builder()
+                        .register(FixtureMetricExporterService)
+                        .build(),
+                );
+                Ok(())
+            })
+            .expect("provider factory"),
+        );
+        let observe: Arc<dyn sinomo_module::ComponentFactory> =
+            Arc::new(component_factory().expect("observe factory"));
+        let data_dir = Arc::new(sinomo_core::local::SinomoDataDir::new(
+            sinomo_testdir::TestDir::new("observe-component-exporter").path(),
+        ));
+        let mut reconciler = sinomo_module::ComponentReconciler::new(
+            sinomo_module::ComponentContext::new(Arc::clone(&data_dir)),
+            ServiceRegistry::default(),
+        );
+        reconciler
+            .reconcile(&[provider, observe])
+            .expect("reconcile observe and exporter");
+
+        let response = Arc::new(Mutex::new(None));
+        let context = ServiceContext::new(
+            data_dir,
+            None,
+            ServiceSigner::Local,
+            ObjectRpcIncomingBody::empty(),
+            Box::new(TestResponseSink {
+                response: Arc::clone(&response),
+            }),
+        );
+        let request = ObjectRpcRequest::encode_body(
+            OBSERVE_METRICS_ROUTE,
+            OBSERVE_RPC_CATEGORY,
+            &ObserveMetricsRequest::default(),
+        )
+        .expect("metrics request");
+        reconciler
+            .service_registry()
+            .active_snapshot()
+            .registry_arc()
+            .dispatch(context, request)
+            .await
+            .expect("dispatch observe metrics");
+        let outgoing = response
+            .lock()
+            .expect("response lock")
+            .take()
+            .expect("observe response");
+        let response: ObserveMetricsResponse = outgoing
+            .into_materialized_value_response(OBSERVE_COMPONENT_EXPORTER_MAX_RESPONSE_BYTES)
+            .await
+            .expect("materialize response")
+            .decode_body()
+            .expect("decode response");
+        let metric = response
+            .metrics
+            .iter()
+            .find(|metric| metric.name == "fixture.jobs.completed")
+            .expect("external metric");
+        assert_eq!(metric.value, Some(9.0));
+        assert_eq!(metric.labels["component_id"], "fixture.metrics.provider");
+        assert!(response.exporters.iter().any(|exporter| {
+            exporter.name == "component:fixture.metrics.provider/fixture-metrics"
+                && exporter.success
+        }));
+    }
+
+    #[test]
+    fn observe_component_declares_optional_pull_exporter_dependency() {
+        let factory = component_factory().expect("observe component factory");
+        let descriptor = sinomo_module::ComponentFactory::descriptor(&factory);
+        assert!(descriptor.requirements.iter().any(|requirement| {
+            requirement.optional
+                && requirement.interface_id == OBSERVE_METRIC_EXPORTER_INTERFACE_ID
+                && requirement.interface_version == OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION
+                && requirement
+                    .operations
+                    .iter()
+                    .any(|operation| operation == OBSERVE_METRIC_EXPORTER_OPERATION)
+                && requirement
+                    .caller_capabilities
+                    .iter()
+                    .any(|capability| capability == OBSERVE_METRIC_EXPORTER_OPERATION)
+        }));
+    }
+
+    #[test]
+    fn component_metric_exports_receive_trusted_provider_labels() {
+        let provider = ServiceDiscoveryIdentity {
+            service_id: "fixture-metrics".to_string(),
+            interface_id: OBSERVE_METRIC_EXPORTER_INTERFACE_ID.to_string(),
+            interface_version: OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION.to_string(),
+            provider_capabilities: vec![OBSERVE_METRIC_EXPORTER_OPERATION.to_string()],
+            caller_requirements: vec![OBSERVE_METRIC_EXPORTER_OPERATION.to_string()],
+            component_id: "fixture.metrics".to_string(),
+            component_version: "2.0.0".to_string(),
+            artifact_id: Some("fixture-artifact".to_string()),
+            component_generation: 7,
+            health: ServiceDiscoveryHealth::Ready,
+            locality: ServiceDiscoveryLocality::Local,
+        };
+        let mut descriptors = std::collections::BTreeMap::new();
+        let mut metrics = Vec::new();
+        merge_component_metric_export(
+            &ObserveMetricsRequest::default(),
+            &provider,
+            ObserveMetricExportResponse {
+                descriptors: vec![ObserveMetricDescriptor::new(
+                    "fixture.jobs.completed",
+                    ObserveMetricKind::Counter,
+                    Some(ObserveMetricUnit::Count),
+                    "Completed fixture jobs.",
+                )],
+                metrics: vec![ObserveMetricRecord::counter(
+                    "fixture.jobs.completed",
+                    std::collections::BTreeMap::from([(
+                        "component_id".to_string(),
+                        "spoofed".to_string(),
+                    )]),
+                    3,
+                )],
+            },
+            &mut descriptors,
+            &mut metrics,
+        )
+        .expect("merge component metric export");
+
+        assert_eq!(metrics[0].labels["component_id"], "fixture.metrics");
+        assert_eq!(metrics[0].labels["component_generation"], "7");
+        assert!(
+            descriptors["fixture.jobs.completed"]
+                .semantics
+                .labels
+                .contains(&"component_id".to_string())
+        );
+    }
+
+    #[test]
+    fn component_events_feed_operational_event_and_log_views() {
+        let root = sinomo_testdir::TestDir::new("observe-component-events");
+        let component_event = |kind: &str, message: &str| sinomo_module::ComponentEvent {
+            publisher: sinomo_module::ComponentEventPublisher {
+                component_id: "fixture.component".to_string(),
+                component_version: "1.0.0".to_string(),
+                artifact_id: None,
+                artifact_generation: 0,
+            },
+            schema_id: "sinomo.operational-event".to_string(),
+            schema_version: "1.0.0".to_string(),
+            envelope: EventEnvelope::new(
+                Id::generate(),
+                OffsetDateTime::now_utc(),
+                Id::from_legacy_named("fixture-node").expect("node"),
+                Source::new("component/fixture.component").expect("source"),
+                EventKind::new(kind).expect("kind"),
+                Salience::new(0.5).expect("salience"),
+                Confidence::new(1.0).expect("confidence"),
+                RoutingMetadata::new(
+                    RoutingScope::Local,
+                    LatencyClass::Background,
+                    PrivacyClass::Private,
+                ),
+            )
+            .with_payload(serde_json::json!({
+                "severity": "warn",
+                "component": "fixture.component",
+                "message": message,
+                "fields": {"attempt": 2},
+            })),
+        };
+
+        append_component_event_record(
+            root.path(),
+            &component_event("fixture.operation.failed", "operation failed"),
+        )
+        .expect("append component event");
+        append_component_event_record(
+            root.path(),
+            &component_event("daemon.log.recorded", "log message"),
+        )
+        .expect("append component log");
+
+        let events = read_operational_events(
+            root.path(),
+            &OperationalEventQuery {
+                limit: 10,
+                ..OperationalEventQuery::default()
+            },
+        )
+        .expect("read events");
+        let logs = read_operational_logs(
+            root.path(),
+            &OperationalLogQuery {
+                limit: 10,
+                ..OperationalLogQuery::default()
+            },
+        )
+        .expect("read logs");
+        assert_eq!(events[0].message, "operation failed");
+        assert_eq!(events[0].severity, OperationalSeverity::Warn);
+        assert_eq!(logs[0].message, "log message");
+        assert_eq!(logs[0].fields["attempt"], 2);
+    }
 
     #[test]
     fn cpu_profile_artifacts_are_registered_in_the_storage_contract() {

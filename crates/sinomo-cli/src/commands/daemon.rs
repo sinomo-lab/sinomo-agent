@@ -311,27 +311,39 @@ pub(crate) fn run_daemon_with_paths(
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
+    let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let data_dir = SinomoDataDir::new(data_dir);
+    let profile = if label == "daemon" {
+        sinomo_product_profile::ProductComponentProfile::main(cluster.is_some())
+    } else {
+        sinomo_product_profile::ProductComponentProfile::shadow(cluster.is_some())
+    };
+    let base_catalog =
+        sinomo_product_profile::base_component_catalog(&data_dir, profile).map_err(|error| {
+            CliError::Parse {
+                detail: format!("build daemon product component profile: {error}"),
+            }
+        })?;
     let mut component_factories = vec![cli_agent_component_factory()?, audio_component_factory()?];
     if label == "daemon" {
-        let data_dir = paths.root.parent().ok_or_else(|| CliError::Io {
-            path: paths.root.display().to_string(),
-            detail: "main daemon paths have no data directory parent".to_string(),
-        })?;
         component_factories.push(
             crate::dfs_mount_supervisor::sifs_mount_supervisor_component_factory(
-                SinomoDataDir::new(data_dir),
+                data_dir,
                 paths.clone(),
             ),
         );
     }
-    daemon_run_daemon_control_loop_with_components(
-        options,
-        paths,
-        label,
-        cluster,
-        component_factories,
-    )
-    .map_err(Into::into)
+    let component_catalog =
+        sinomo_product_profile::with_components(&base_catalog, component_factories).map_err(
+            |error| CliError::Parse {
+                detail: format!("extend daemon product component profile: {error}"),
+            },
+        )?;
+    daemon_run_daemon_control_loop_with_catalog(options, paths, label, cluster, component_catalog)
+        .map_err(Into::into)
 }
 
 fn register_daemon_component_config_definitions(

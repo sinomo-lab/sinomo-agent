@@ -1,25 +1,35 @@
 //! Module registry, routing, loader state, and native module host glue.
 
 mod active_component;
+mod catalog;
 mod cli;
 mod component;
+mod event_bus;
 mod native_cancellation;
 mod native_host;
+mod native_service;
 mod native_staging;
 mod network_runtime;
 mod service;
+mod service_catalog_component;
+mod service_client;
 
 pub use active_component::*;
+pub use catalog::*;
 pub use cli::{
     ModuleCliCommandConfig, ModuleCliCommandHandler, ModuleNativeRustToggleTarget,
     module_cli_command_handler,
 };
 pub use component::*;
+pub use event_bus::*;
 pub use native_cancellation::*;
 pub use native_host::*;
+pub use native_service::*;
 pub use native_staging::*;
 pub use network_runtime::*;
 pub use service::*;
+pub use service_catalog_component::*;
+pub use service_client::*;
 
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1900,6 +1910,9 @@ impl ModuleObjectRpcRoute {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModuleRouteAuth {
+    /// Only calls dispatched by the component host are accepted. Daemon
+    /// authentication deliberately has no signer that satisfies this scope.
+    Component,
     LocalCommand,
     LocalOrClusterMember,
     ClusterMember,
@@ -1909,6 +1922,7 @@ pub enum ModuleRouteAuth {
 impl ModuleRouteAuth {
     pub fn as_scope(self) -> &'static str {
         match self {
+            Self::Component => "component",
             Self::LocalCommand => "local-command",
             Self::LocalOrClusterMember => "local-or-cluster-member",
             Self::ClusterMember => "cluster-member",
@@ -3569,6 +3583,7 @@ fn native_descriptor_route_auth(
     route: &str,
 ) -> Result<ModuleRouteAuth, NativeDylibModuleInstallError> {
     match auth {
+        "component" => Ok(ModuleRouteAuth::Component),
         "local-command" => Ok(ModuleRouteAuth::LocalCommand),
         "local-or-cluster-member" => Ok(ModuleRouteAuth::LocalOrClusterMember),
         "cluster-member" => Ok(ModuleRouteAuth::ClusterMember),

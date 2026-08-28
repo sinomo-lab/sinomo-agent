@@ -97,6 +97,7 @@ mod tests {
         assert!(DaemonSignerAuthority::Member.authorizes_route_scope("cluster-member"));
         assert!(!DaemonSignerAuthority::Member.authorizes_route_scope("admin"));
         assert!(DaemonSignerAuthority::Voter.authorizes_route_scope("admin"));
+        assert!(!DaemonSignerAuthority::Local.authorizes_route_scope("component"));
         assert!(!DaemonSignerAuthority::Local.authorizes_route_scope("unknown-scope"));
     }
 

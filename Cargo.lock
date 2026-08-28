@@ -9555,6 +9555,7 @@ dependencies = [
  "sinomo-cli",
  "sinomo-evolution",
  "sinomo-lm",
+ "sinomo-product-profile",
  "sinomo-runtime",
  "sinomo-testdir",
  "sinomo-ui",
@@ -9659,6 +9660,7 @@ dependencies = [
  "sinomo-lm",
  "sinomo-memory",
  "sinomo-models",
+ "sinomo-product-profile",
  "sinomo-pytorch",
  "sinomo-runtime",
  "sinomo-testdir",
@@ -9760,7 +9762,6 @@ dependencies = [
  "sinomo-module-api",
  "sinomo-observe",
  "sinomo-registry",
- "sinomo-remote-management",
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-testdir",
@@ -10044,6 +10045,7 @@ dependencies = [
  "sinomo-config",
  "sinomo-core",
  "sinomo-module-api",
+ "sinomo-observe-contract",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
@@ -10149,6 +10151,7 @@ dependencies = [
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",
+ "sinomo-observe-contract",
  "sinomo-testdir",
  "sysinfo",
  "thiserror 2.0.20",
@@ -10159,12 +10162,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-observe-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "sinomo-policy"
 version = "0.1.0"
 dependencies = [
  "serde",
  "sinomo-core",
  "sinomo-module",
+]
+
+[[package]]
+name = "sinomo-product-profile"
+version = "0.1.0"
+dependencies = [
+ "sinomo-runtime",
 ]
 
 [[package]]

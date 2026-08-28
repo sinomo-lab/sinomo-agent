@@ -7,8 +7,9 @@ use std::sync::Arc;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::service::{ServiceRegistry, ServiceRegistrySnapshotStore};
 pub use sinomo_module_api::{
-    ComponentDescriptor, ServiceLocality, ServiceOffer, ServiceRequirement,
-    ServiceRequirementLocality,
+    ComponentDescriptor, ComponentEventDurability, ComponentEventLocality,
+    ComponentEventPublication, ComponentEventSubscription, ServiceLocality, ServiceOffer,
+    ServiceOperationOffer, ServiceRequirement, ServiceRequirementLocality,
 };
 use thiserror::Error;
 
@@ -55,12 +56,13 @@ pub fn component_descriptor_from_registration(
             export.interface_version.clone(),
         );
         for operation in &export.operations {
-            offer = offer.with_provider_capability(operation.logical_operation.clone());
+            let mut operation_offer = ServiceOperationOffer::new(&operation.logical_operation);
             if let sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc { route, .. } =
                 &operation.target
             {
-                offer = offer.with_route(route.clone());
+                operation_offer = operation_offer.at_route(route);
             }
+            offer = offer.with_operation(operation_offer);
         }
         descriptor.offers.push(offer);
     }
@@ -77,14 +79,21 @@ pub fn component_descriptor_from_registration(
                 )
                 .cluster_visible()
             });
-        if !offer.provider_capabilities.contains(&route.operation) {
-            offer.provider_capabilities.push(route.operation.clone());
-        }
-        if !offer.caller_capabilities.contains(&route.operation) {
-            offer.caller_capabilities.push(route.operation.clone());
-        }
-        if !offer.routes.contains(&route.route) {
-            offer.routes.push(route.route.clone());
+        if !offer
+            .operations
+            .iter()
+            .any(|operation| operation.operation == route.operation)
+        {
+            let operation = ServiceOperationOffer::new(&route.operation)
+                .at_route(&route.route)
+                .require_caller_capability(&route.operation);
+            if !offer.provider_capabilities.contains(&route.operation) {
+                offer.provider_capabilities.push(route.operation.clone());
+            }
+            if !offer.routes.contains(&route.route) {
+                offer.routes.push(route.route.clone());
+            }
+            offer.operations.push(operation);
         }
     }
     descriptor.offers.extend(object_rpc_offers.into_values());
@@ -101,6 +110,8 @@ pub struct ComponentContext {
     data_dir: Arc<SinomoDataDir>,
     runtime: Option<tokio::runtime::Handle>,
     host_role: ComponentHostRole,
+    service_registry: Option<ServiceRegistrySnapshotStore>,
+    event_bus: Option<crate::ComponentEventBus>,
 }
 
 impl ComponentContext {
@@ -109,6 +120,8 @@ impl ComponentContext {
             data_dir,
             runtime: None,
             host_role: ComponentHostRole::Main,
+            service_registry: None,
+            event_bus: None,
         }
     }
 
@@ -120,6 +133,59 @@ impl ComponentContext {
     pub fn with_host_role(mut self, host_role: ComponentHostRole) -> Self {
         self.host_role = host_role;
         self
+    }
+
+    fn with_service_registry(mut self, service_registry: ServiceRegistrySnapshotStore) -> Self {
+        self.service_registry = Some(service_registry);
+        self
+    }
+
+    pub fn with_event_bus(mut self, event_bus: crate::ComponentEventBus) -> Self {
+        self.event_bus = Some(event_bus);
+        self
+    }
+
+    pub fn service_client(
+        &self,
+        caller: &ComponentDescriptor,
+    ) -> Result<crate::ComponentServiceClient, ComponentError> {
+        let service_registry =
+            self.service_registry
+                .clone()
+                .ok_or_else(|| ComponentError::Component {
+                    component_id: caller.component_id.clone(),
+                    detail: "component service registry is unavailable".to_string(),
+                })?;
+        Ok(crate::ComponentServiceClient::new(
+            caller.clone(),
+            Arc::clone(&self.data_dir),
+            service_registry,
+        ))
+    }
+
+    pub fn service_registry_snapshot_store(
+        &self,
+    ) -> Result<ServiceRegistrySnapshotStore, ComponentError> {
+        self.service_registry
+            .clone()
+            .ok_or_else(|| ComponentError::Component {
+                component_id: "component-host".to_string(),
+                detail: "component service registry is unavailable".to_string(),
+            })
+    }
+
+    pub fn event_client(
+        &self,
+        caller: &ComponentDescriptor,
+    ) -> Result<crate::ComponentEventClient, ComponentError> {
+        let event_bus = self
+            .event_bus
+            .clone()
+            .ok_or_else(|| ComponentError::Component {
+                component_id: caller.component_id.clone(),
+                detail: "component event bus is unavailable".to_string(),
+            })?;
+        Ok(crate::ComponentEventClient::new(caller.clone(), event_bus))
     }
 
     pub fn data_dir(&self) -> &SinomoDataDir {
@@ -383,15 +449,21 @@ pub struct ComponentReconciler {
     context: ComponentContext,
     base_registry: ServiceRegistry,
     service_registry: ServiceRegistrySnapshotStore,
+    event_bus: crate::ComponentEventBus,
     external_offers: Vec<ServiceOffer>,
     active: BTreeMap<String, ComponentScope>,
 }
 
 impl ComponentReconciler {
     pub fn new(context: ComponentContext, base_registry: ServiceRegistry) -> Self {
+        let service_registry = ServiceRegistrySnapshotStore::new(base_registry.clone());
+        let event_bus = context.event_bus.clone().unwrap_or_default();
         Self {
-            context,
-            service_registry: ServiceRegistrySnapshotStore::new(base_registry.clone()),
+            context: context
+                .with_service_registry(service_registry.clone())
+                .with_event_bus(event_bus.clone()),
+            service_registry,
+            event_bus,
             base_registry,
             external_offers: Vec::new(),
             active: BTreeMap::new(),
@@ -403,10 +475,14 @@ impl ComponentReconciler {
         base_registry: ServiceRegistry,
         service_registry: ServiceRegistrySnapshotStore,
     ) -> Self {
+        let event_bus = context.event_bus.clone().unwrap_or_default();
         Self {
-            context,
+            context: context
+                .with_service_registry(service_registry.clone())
+                .with_event_bus(event_bus.clone()),
             base_registry,
             service_registry,
+            event_bus,
             external_offers: Vec::new(),
             active: BTreeMap::new(),
         }
@@ -414,6 +490,10 @@ impl ComponentReconciler {
 
     pub fn service_registry(&self) -> &ServiceRegistrySnapshotStore {
         &self.service_registry
+    }
+
+    pub fn event_bus(&self) -> &crate::ComponentEventBus {
+        &self.event_bus
     }
 
     pub fn set_external_offers(&mut self, offers: Vec<ServiceOffer>) {
@@ -544,12 +624,26 @@ pub fn service_route_with_component_identity(
         offer.routes.iter().any(|offered| offered == &route.route)
             || offer.service_id == route.category
     });
-    let provider_capabilities = offer
-        .map(|offer| offer.provider_capabilities.clone())
+    let operation_offer = offer.and_then(|offer| {
+        offer
+            .operations
+            .iter()
+            .find(|operation| operation.route.as_deref() == Some(route.route.as_str()))
+    });
+    let provider_capabilities = operation_offer
+        .map(|operation| vec![operation.operation.clone()])
+        .or_else(|| offer.map(|offer| offer.provider_capabilities.clone()))
         .unwrap_or_default();
     let mut caller_requirements = offer
         .map(|offer| offer.caller_capabilities.clone())
         .unwrap_or_default();
+    if let Some(operation) = operation_offer {
+        for capability in &operation.caller_capabilities {
+            if !caller_requirements.contains(capability) {
+                caller_requirements.push(capability.clone());
+            }
+        }
+    }
     for capability in &route.required_capabilities {
         if !caller_requirements.contains(capability) {
             caller_requirements.push(capability.clone());

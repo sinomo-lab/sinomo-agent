@@ -1,6 +1,6 @@
 //! Hosted daemon event subscriptions and the in-process publication hub.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use sinomo_core::network::{
     ObjectFrameIoOptions, ObjectRpcBodySource, ObjectRpcRequest, ObjectRpcResponse,
@@ -27,15 +27,40 @@ const DAEMON_EVENT_BUFFER_CAPACITY: usize = 1_024;
 const DAEMON_EVENT_STREAM_BODY_BUFFER_BYTES: usize = 64 * 1_024;
 const DAEMON_EVENT_MAX_FILTERS: usize = 64;
 
-#[derive(Clone, Debug)]
+pub trait DaemonEventMirror: Send + Sync {
+    fn publish(&self, event: EventEnvelope);
+}
+
+#[derive(Clone)]
 pub struct DaemonEventHub {
     sender: broadcast::Sender<EventEnvelope>,
+    mirror: Arc<RwLock<Option<Arc<dyn DaemonEventMirror>>>>,
+}
+
+impl std::fmt::Debug for DaemonEventHub {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonEventHub")
+            .field("receivers", &self.sender.receiver_count())
+            .field(
+                "mirrored",
+                &self
+                    .mirror
+                    .read()
+                    .map(|mirror| mirror.is_some())
+                    .unwrap_or(false),
+            )
+            .finish()
+    }
 }
 
 impl DaemonEventHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(DAEMON_EVENT_BUFFER_CAPACITY);
-        Self { sender }
+        Self {
+            sender,
+            mirror: Arc::new(RwLock::new(None)),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
@@ -45,7 +70,18 @@ impl DaemonEventHub {
     pub fn publish(&self, event: EventEnvelope) {
         // No receivers is a normal state. The durable DFS namespace remains
         // the source of truth and subscribers load a snapshot after Ready.
-        let _ = self.sender.send(event);
+        let _ = self.sender.send(event.clone());
+        if let Ok(mirror) = self.mirror.read()
+            && let Some(mirror) = mirror.as_ref()
+        {
+            mirror.publish(event);
+        }
+    }
+
+    pub fn set_mirror(&self, mirror: Arc<dyn DaemonEventMirror>) {
+        if let Ok(mut installed) = self.mirror.write() {
+            *installed = Some(mirror);
+        }
     }
 
     pub fn publish_dfs_namespace_change(
@@ -284,6 +320,15 @@ async fn write_stream_item(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingMirror(AtomicUsize);
+
+    impl DaemonEventMirror for CountingMirror {
+        fn publish(&self, _event: EventEnvelope) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn namespace_event(path: &str) -> EventEnvelope {
         EventEnvelope::new(
@@ -320,7 +365,10 @@ mod tests {
     #[tokio::test]
     async fn hub_reports_lag_instead_of_silently_dropping_events() {
         let (sender, _) = broadcast::channel(1);
-        let hub = DaemonEventHub { sender };
+        let hub = DaemonEventHub {
+            sender,
+            mirror: Arc::new(RwLock::new(None)),
+        };
         let mut receiver = hub.subscribe();
         hub.publish(namespace_event("/first"));
         hub.publish(namespace_event("/second"));
@@ -328,6 +376,15 @@ mod tests {
             receiver.recv().await,
             Err(broadcast::error::RecvError::Lagged(1))
         ));
+    }
+
+    #[test]
+    fn compatibility_hub_mirrors_into_the_component_event_path() {
+        let hub = DaemonEventHub::new();
+        let mirror = Arc::new(CountingMirror(AtomicUsize::new(0)));
+        hub.set_mirror(mirror.clone());
+        hub.publish(namespace_event("/services/example"));
+        assert_eq!(mirror.0.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

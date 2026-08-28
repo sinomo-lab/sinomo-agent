@@ -90,6 +90,43 @@ pub fn register_services_with_data_plane_host(
         .register(DfsDataPlaneService::new(host))
 }
 
+pub fn component_factory_with_hosts(
+    data_plane_host: Option<Arc<dyn DfsDataPlaneHost>>,
+    browser_host: Option<Arc<dyn crate::DfsBrowserServiceHost>>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor =
+        sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?;
+    Ok(
+        sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
+            let mut builder = ServiceRegistryBuilder::default();
+            builder = match data_plane_host.as_ref() {
+                Some(host) => register_services_with_data_plane_host(builder, Arc::clone(host)),
+                None => register_services(builder),
+            };
+            if let Some(host) = browser_host.as_ref() {
+                builder = crate::register_dfs_browser_services(
+                    builder,
+                    context.runtime().cloned(),
+                    Arc::clone(host),
+                );
+            }
+            scope.set_services(builder.build());
+            Ok(())
+        })?
+        .with_config_definitions(register_component_config_definitions)
+        .with_storage_paths(crate::register_storage_paths),
+    )
+}
+
+fn register_component_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    crate::dfs_module_registration()
+        .surfaces
+        .register_config_definitions(builder)
+        .map_err(|error| error.to_string())
+}
+
 fn dfs_service_route(route: &'static str) -> ServiceRoute {
     let descriptor = dfs_module_surfaces()
         .object_rpc_route_descriptor(route)

@@ -37,7 +37,7 @@ use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalCon
 use sinomo_runtime::core::ClusterNodeRole;
 use sinomo_runtime::daemon::{
     DaemonClusterProcess, DaemonComponentFactory, DaemonExecutionProfile, daemon_cluster_status,
-    run_daemon_control_loop_with_components_and_profile,
+    run_daemon_control_loop_with_catalog_and_profile,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterPaths;
@@ -860,18 +860,34 @@ fn start_in_process_daemon(
                 .parent()
                 .map(SinomoDataDir::new)
                 .expect("embedded daemon paths must have a data directory parent");
-            let hooks = vec![
-                agent_runtime_control_component_factory(control_host),
-                sinomo_cli::sifs_mount_supervisor_component_factory(data_dir, loop_paths.clone()),
-            ];
-            if let Err(error) = run_daemon_control_loop_with_components_and_profile(
-                options,
-                loop_paths,
-                "daemon",
-                cluster,
-                hooks,
-                execution_profile,
-            ) {
+            let result = (|| {
+                let base_catalog = sinomo_product_profile::base_component_catalog(
+                    &data_dir,
+                    sinomo_product_profile::ProductComponentProfile::embedded(cluster.is_some()),
+                )
+                .map_err(|error| format!("build embedded product component profile: {error}"))?;
+                let hooks = vec![
+                    agent_runtime_control_component_factory(control_host),
+                    sinomo_cli::sifs_mount_supervisor_component_factory(
+                        data_dir,
+                        loop_paths.clone(),
+                    ),
+                ];
+                let component_catalog =
+                    sinomo_product_profile::with_components(&base_catalog, hooks).map_err(
+                        |error| format!("extend embedded product component profile: {error}"),
+                    )?;
+                run_daemon_control_loop_with_catalog_and_profile(
+                    options,
+                    loop_paths,
+                    "daemon",
+                    cluster,
+                    component_catalog,
+                    execution_profile,
+                )
+                .map_err(|error| error.to_string())
+            })();
+            if let Err(error) = result {
                 let detail = error.to_string();
                 tracing::warn!(%error, "in-process daemon exited");
                 let _ = exit_tx.send(detail);

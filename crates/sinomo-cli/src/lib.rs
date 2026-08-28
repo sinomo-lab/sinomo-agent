@@ -126,7 +126,7 @@ use sinomo_runtime::daemon::{
     invite_introducers_from_daemon_status,
     prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
     read_daemon_endpoint_advertisement_config,
-    run_daemon_control_loop_with_components as daemon_run_daemon_control_loop_with_components,
+    run_daemon_control_loop_with_catalog as daemon_run_daemon_control_loop_with_catalog,
     run_shadow_daemon_supervision_loop as daemon_run_shadow_daemon_supervision_loop,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,

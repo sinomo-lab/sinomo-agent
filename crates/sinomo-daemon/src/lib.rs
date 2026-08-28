@@ -97,6 +97,8 @@ pub(crate) fn cluster_join_trace(args: std::fmt::Arguments<'_>) {
 /// Application and built-in modules enter the daemon through the same
 /// backend-neutral component factory contract.
 pub type DaemonComponentFactory = std::sync::Arc<dyn sinomo_module::ComponentFactory>;
+/// Complete component/module composition supplied to one daemon host.
+pub type DaemonComponentCatalog = sinomo_module::ComponentCatalog;
 
 pub use api::{DAEMON_API_PROBE_TIMEOUT, DaemonApiClient};
 pub use auth::{
@@ -155,7 +157,8 @@ pub use control::{
     handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
-    run_daemon_control_loop, run_daemon_control_loop_with_components,
+    run_daemon_control_loop, run_daemon_control_loop_with_catalog,
+    run_daemon_control_loop_with_catalog_and_profile, run_daemon_control_loop_with_components,
     run_daemon_control_loop_with_components_and_profile,
 };
 pub use error::DaemonError;

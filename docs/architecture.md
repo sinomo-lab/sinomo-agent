@@ -355,12 +355,63 @@ reconciler keeps components pending until dependencies exist, preserves
 unchanged scopes across atomic service-registry generations, and removes a
 component's routes before unwinding its effects.
 
+`ComponentCatalog` is the single composition input for factories, module
+registrations, config definitions, and storage contributions. A host must not
+maintain separate per-surface built-in lists. The shared product profile builds
+the common catalog used by standalone CLI and embedded app hosts; each may add
+process-specific component overlays before handing the catalog to the daemon.
+The daemon supplies only host infrastructure components and adapters.
+
 External providers are selected by interface offer, never by provider crate or
 hardcoded module ID in the main runtime. WASIX implements the generic sandbox
 executor interface; Cloud Files implements the generic host-filesystem provider
 interface and keeps its private protocol and durable recovery state inside its
 external package. Default external artifacts are enumerated only by verified
 signed distribution profiles, not by scanning a source checkout.
+
+Inter-component commands and queries resolve through the live service registry
+by service interface and version. `ServiceRequirement` declares the caller
+capabilities and exact operations a component may exercise; each `ServiceOffer`
+maps operations to concrete routes and their authority. The component service
+client intersects those declarations with live route policy before dispatch.
+Providers may expose a `component`-scope route which is callable only through
+this host path and is denied to every daemon signer. Local fan-out preserves
+provider failures independently so aggregators can return useful partial data.
+Cluster calls remain ordinary discovered object RPC and require an explicit
+host transport; local resolution never silently implies remote delivery.
+
+Inter-component facts use declared, typed event publications and subscriptions,
+not middleware-style callback chains. The host overwrites publisher provenance,
+uses bounded best-effort delivery with explicit lag, and ties receivers to the
+owning component scope. Local transient delivery is built in. Durable append
+and cluster forwarding require explicit host adapters and fail closed when no
+adapter exists; the event API does not promise global order, waterfall mutation,
+or bail semantics across nodes.
+
+Observation extensions use the same service rule. Independently built modules
+depend only on `sinomo-observe-contract` and expose the versioned
+`sinomo.observe.metric-exporter` pull interface. `sinomo-observe` calls every
+matching local provider, validates bounded batches, injects trusted component
+identity labels, and returns partial-success status. External modules never link
+the recorder, exporter registry, or any process-global `sinomo-observe` state.
+
+Native-dylib route materialization belongs to `sinomo-module`. It owns request
+staging, cancellation, content-addressed loading, permission callbacks, ABI
+invocation, response validation, and route metadata. The daemon contributes a
+narrow request-authority preparer for host-owned fields; it does not implement
+the native invocation engine.
+
+Service-catalog publication is a lifecycle-owned component which observes the
+live registry generation and independently retries cluster-KV reconciliation.
+Generic daemon connectivity maintenance has no service-registry field or
+publication branch. Component events use host-installed durable storage and an
+authenticated cluster ingress route; the original event id and publisher
+metadata survive retries, and the receiving node verifies the signed origin.
+
+Sandbox and DFS control services are component-owned. DFS bulk data, metadata
+authority, and placement-sensitive operations retain their typed host and peer
+transport contracts; generic component events are never substituted for these
+correctness- or throughput-critical paths.
 
 `sinomo-module::ActiveNativeComponent` owns the common native-provider binding:
 it resolves exactly one active component from a `ServiceRequirement`, verifies

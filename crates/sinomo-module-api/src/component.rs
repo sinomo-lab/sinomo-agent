@@ -26,6 +26,126 @@ pub enum ServiceRequirementLocality {
     Any,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentEventLocality {
+    #[default]
+    Local,
+    Cluster,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComponentEventDurability {
+    #[default]
+    Transient,
+    Durable,
+}
+
+/// One typed fact a component is authorized to publish.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ComponentEventPublication {
+    pub kind: String,
+    pub schema_id: String,
+    pub schema_version: String,
+    #[serde(default)]
+    pub locality: ComponentEventLocality,
+    #[serde(default)]
+    pub durability: ComponentEventDurability,
+}
+
+impl ComponentEventPublication {
+    pub fn new(
+        kind: impl Into<String>,
+        schema_id: impl Into<String>,
+        schema_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            schema_id: schema_id.into(),
+            schema_version: schema_version.into(),
+            locality: ComponentEventLocality::Local,
+            durability: ComponentEventDurability::Transient,
+        }
+    }
+
+    pub fn cluster_visible(mut self) -> Self {
+        self.locality = ComponentEventLocality::Cluster;
+        self
+    }
+
+    pub fn durable(mut self) -> Self {
+        self.durability = ComponentEventDurability::Durable;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), ComponentContractError> {
+        validate_dotted_event_name(&self.kind, "event publication kind")?;
+        validate_component_token(&self.schema_id, "event publication schema id")?;
+        validate_component_token(&self.schema_version, "event publication schema version")
+    }
+}
+
+/// One typed fact stream a component is authorized to consume. A trailing
+/// `.*` matches a dotted namespace; every other pattern is exact.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ComponentEventSubscription {
+    pub kind_pattern: String,
+    pub schema_id: String,
+    pub schema_version: String,
+    #[serde(default)]
+    pub locality: ComponentEventLocality,
+}
+
+impl ComponentEventSubscription {
+    pub fn new(
+        kind_pattern: impl Into<String>,
+        schema_id: impl Into<String>,
+        schema_version: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind_pattern: kind_pattern.into(),
+            schema_id: schema_id.into(),
+            schema_version: schema_version.into(),
+            locality: ComponentEventLocality::Local,
+        }
+    }
+
+    pub fn from_cluster(mut self) -> Self {
+        self.locality = ComponentEventLocality::Cluster;
+        self
+    }
+
+    pub fn matches_kind(&self, kind: &str) -> bool {
+        if self.kind_pattern == "*" {
+            return true;
+        }
+        self.kind_pattern
+            .strip_suffix(".*")
+            .map_or(self.kind_pattern == kind, |prefix| {
+                kind.strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('.'))
+            })
+    }
+
+    pub fn validate(&self) -> Result<(), ComponentContractError> {
+        if self.kind_pattern == "*" {
+            validate_component_token(&self.schema_id, "event subscription schema id")?;
+            return validate_component_token(
+                &self.schema_version,
+                "event subscription schema version",
+            );
+        }
+        let kind = self
+            .kind_pattern
+            .strip_suffix(".*")
+            .unwrap_or(self.kind_pattern.as_str());
+        validate_dotted_event_name(kind, "event subscription kind pattern")?;
+        validate_component_token(&self.schema_id, "event subscription schema id")?;
+        validate_component_token(&self.schema_version, "event subscription schema version")
+    }
+}
+
 /// One versioned service interface provided by a component.
 ///
 /// Provider capabilities describe what the implementation can do. Caller
@@ -45,6 +165,39 @@ pub struct ServiceOffer {
     pub caller_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<String>,
+    /// Exact operation-to-route and operation-to-authority mappings. The
+    /// flattened fields above remain rolling-compatible catalog summaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<ServiceOperationOffer>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ServiceOperationOffer {
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_capabilities: Vec<String>,
+}
+
+impl ServiceOperationOffer {
+    pub fn new(operation: impl Into<String>) -> Self {
+        Self {
+            operation: operation.into(),
+            route: None,
+            caller_capabilities: Vec::new(),
+        }
+    }
+
+    pub fn at_route(mut self, route: impl Into<String>) -> Self {
+        self.route = Some(route.into());
+        self
+    }
+
+    pub fn require_caller_capability(mut self, capability: impl Into<String>) -> Self {
+        self.caller_capabilities.push(capability.into());
+        self
+    }
 }
 
 impl ServiceOffer {
@@ -61,6 +214,7 @@ impl ServiceOffer {
             provider_capabilities: Vec::new(),
             caller_capabilities: Vec::new(),
             routes: Vec::new(),
+            operations: Vec::new(),
         }
     }
 
@@ -81,6 +235,19 @@ impl ServiceOffer {
 
     pub fn with_route(mut self, route: impl Into<String>) -> Self {
         self.routes.push(route.into());
+        self
+    }
+
+    pub fn with_operation(mut self, operation: ServiceOperationOffer) -> Self {
+        if !self.provider_capabilities.contains(&operation.operation) {
+            self.provider_capabilities.push(operation.operation.clone());
+        }
+        if let Some(route) = &operation.route
+            && !self.routes.contains(route)
+        {
+            self.routes.push(route.clone());
+        }
+        self.operations.push(operation);
         self
     }
 
@@ -118,6 +285,30 @@ impl ServiceOffer {
                 });
             }
         }
+        let mut operations = BTreeSet::new();
+        for operation in &self.operations {
+            validate_component_token(&operation.operation, "service operation")?;
+            validate_unique_tokens(
+                &operation.caller_capabilities,
+                "operation caller capability",
+                &self.service_id,
+            )?;
+            if let Some(route) = &operation.route
+                && !self.routes.contains(route)
+            {
+                return Err(ComponentContractError::InvalidRoute {
+                    service_id: self.service_id.clone(),
+                    route: route.clone(),
+                });
+            }
+            if !operations.insert(operation.operation.as_str()) {
+                return Err(ComponentContractError::DuplicateToken {
+                    service_id: self.service_id.clone(),
+                    kind: "service operation",
+                    value: operation.operation.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -134,6 +325,16 @@ pub struct ServiceRequirement {
     pub interface_version: String,
     #[serde(default)]
     pub locality: ServiceRequirementLocality,
+    /// Capabilities the component is authorized to exercise on a matching
+    /// provider. Providers remain authoritative: every capability they require
+    /// must be declared here before the host dispatches an in-process call.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caller_capabilities: Vec<String>,
+    /// Operations this component intends to invoke. Empty preserves legacy
+    /// dependency-only requirements, but the component service client always
+    /// requires the concrete operation to be listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
     #[serde(default)]
     pub optional: bool,
 }
@@ -145,6 +346,8 @@ impl ServiceRequirement {
             interface_id: interface_id.into(),
             interface_version: interface_version.into(),
             locality: ServiceRequirementLocality::Local,
+            caller_capabilities: Vec::new(),
+            operations: Vec::new(),
             optional: false,
         }
     }
@@ -169,6 +372,16 @@ impl ServiceRequirement {
         self
     }
 
+    pub fn with_caller_capability(mut self, capability: impl Into<String>) -> Self {
+        self.caller_capabilities.push(capability.into());
+        self
+    }
+
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operations.push(operation.into());
+        self
+    }
+
     pub fn is_satisfied_by(&self, offer: &ServiceOffer) -> bool {
         self.interface_id == offer.interface_id
             && (self.interface_version == "*" || self.interface_version == offer.interface_version)
@@ -181,6 +394,25 @@ impl ServiceRequirement {
                 ServiceRequirementLocality::Cluster => offer.locality == ServiceLocality::Cluster,
                 ServiceRequirementLocality::Any => true,
             }
+            && offer
+                .caller_capabilities
+                .iter()
+                .all(|capability| self.caller_capabilities.contains(capability))
+            && self.operations.iter().all(|required| {
+                offer
+                    .operations
+                    .iter()
+                    .find(|operation| operation.operation == *required)
+                    .map_or_else(
+                        || offer.provider_capabilities.contains(required),
+                        |operation| {
+                            operation
+                                .caller_capabilities
+                                .iter()
+                                .all(|capability| self.caller_capabilities.contains(capability))
+                        },
+                    )
+            })
     }
 
     pub fn validate(&self) -> Result<(), ComponentContractError> {
@@ -194,6 +426,20 @@ impl ServiceRequirement {
                 "required service interface version",
             )?;
         }
+        validate_unique_tokens(
+            &self.caller_capabilities,
+            "caller capability",
+            self.service_id
+                .as_deref()
+                .unwrap_or(self.interface_id.as_str()),
+        )?;
+        validate_unique_tokens(
+            &self.operations,
+            "required operation",
+            self.service_id
+                .as_deref()
+                .unwrap_or(self.interface_id.as_str()),
+        )?;
         Ok(())
     }
 }
@@ -211,6 +457,10 @@ pub struct ComponentDescriptor {
     pub offers: Vec<ServiceOffer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requirements: Vec<ServiceRequirement>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_publications: Vec<ComponentEventPublication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_subscriptions: Vec<ComponentEventSubscription>,
 }
 
 impl ComponentDescriptor {
@@ -242,6 +492,16 @@ impl ComponentDescriptor {
         self
     }
 
+    pub fn publish_event(mut self, publication: ComponentEventPublication) -> Self {
+        self.event_publications.push(publication);
+        self
+    }
+
+    pub fn subscribe_event(mut self, subscription: ComponentEventSubscription) -> Self {
+        self.event_subscriptions.push(subscription);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.component_id.is_empty()
             && self.component_version.is_empty()
@@ -249,6 +509,8 @@ impl ComponentDescriptor {
             && self.artifact_generation == 0
             && self.offers.is_empty()
             && self.requirements.is_empty()
+            && self.event_publications.is_empty()
+            && self.event_subscriptions.is_empty()
     }
 
     pub fn validate(&self) -> Result<(), ComponentContractError> {
@@ -282,6 +544,36 @@ impl ComponentDescriptor {
         for requirement in &self.requirements {
             requirement.validate()?;
         }
+        let mut publications = BTreeSet::new();
+        for publication in &self.event_publications {
+            publication.validate()?;
+            if !publications.insert((
+                publication.kind.as_str(),
+                publication.schema_id.as_str(),
+                publication.schema_version.as_str(),
+            )) {
+                return Err(ComponentContractError::DuplicateEventContract {
+                    component_id: self.component_id.clone(),
+                    direction: "publication",
+                    kind: publication.kind.clone(),
+                });
+            }
+        }
+        let mut subscriptions = BTreeSet::new();
+        for subscription in &self.event_subscriptions {
+            subscription.validate()?;
+            if !subscriptions.insert((
+                subscription.kind_pattern.as_str(),
+                subscription.schema_id.as_str(),
+                subscription.schema_version.as_str(),
+            )) {
+                return Err(ComponentContractError::DuplicateEventContract {
+                    component_id: self.component_id.clone(),
+                    direction: "subscription",
+                    kind: subscription.kind_pattern.clone(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -311,6 +603,22 @@ pub enum ComponentContractError {
     },
     #[error("component `{component_id}` declares an artifact generation without an artifact id")]
     GenerationWithoutArtifact { component_id: String },
+    #[error("component `{component_id}` repeats event {direction} contract `{kind}`")]
+    DuplicateEventContract {
+        component_id: String,
+        direction: &'static str,
+        kind: String,
+    },
+}
+
+fn validate_dotted_event_name(value: &str, context: &str) -> Result<(), ComponentContractError> {
+    validate_component_token(value, context)?;
+    if value.split('.').count() < 2 || value.split('.').any(str::is_empty) {
+        return Err(ComponentContractError::InvalidText(format!(
+            "{context} must contain at least two non-empty dot-separated segments"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_component_token(value: &str, context: &str) -> Result<(), ComponentContractError> {
@@ -387,6 +695,58 @@ mod tests {
         assert_eq!(
             descriptor.offers[0].caller_capabilities,
             ["fixture.echo.invoke"]
+        );
+    }
+
+    #[test]
+    fn caller_authority_and_event_contracts_are_explicit() {
+        let offer = ServiceOffer::new("echo", "sinomo.fixture.echo", "1.0.0")
+            .require_caller_capability("fixture.echo.invoke");
+        assert!(!ServiceRequirement::new("sinomo.fixture.echo", "1.0.0").is_satisfied_by(&offer));
+        assert!(
+            ServiceRequirement::new("sinomo.fixture.echo", "1.0.0")
+                .with_caller_capability("fixture.echo.invoke")
+                .is_satisfied_by(&offer)
+        );
+
+        let descriptor = ComponentDescriptor::new("fixture.events", "1.0.0")
+            .publish_event(ComponentEventPublication::new(
+                "fixture.job.completed",
+                "sinomo.fixture.job",
+                "1.0.0",
+            ))
+            .subscribe_event(ComponentEventSubscription::new(
+                "fixture.job.*",
+                "sinomo.fixture.job",
+                "1.0.0",
+            ));
+        descriptor.validate().expect("event contracts");
+        assert!(descriptor.event_subscriptions[0].matches_kind("fixture.job.completed"));
+        assert!(!descriptor.event_subscriptions[0].matches_kind("fixture.jobs.completed"));
+    }
+
+    #[test]
+    fn operation_authority_is_scoped_to_its_route() {
+        let offer = ServiceOffer::new("jobs", "sinomo.fixture.jobs", "1.0.0")
+            .with_operation(
+                ServiceOperationOffer::new("fixture.jobs.read")
+                    .at_route("/fixture/jobs/read")
+                    .require_caller_capability("fixture.jobs.reader"),
+            )
+            .with_operation(
+                ServiceOperationOffer::new("fixture.jobs.delete")
+                    .at_route("/fixture/jobs/delete")
+                    .require_caller_capability("fixture.jobs.admin"),
+            );
+        let reader = ServiceRequirement::new("sinomo.fixture.jobs", "1.0.0")
+            .with_operation("fixture.jobs.read")
+            .with_caller_capability("fixture.jobs.reader");
+        assert!(reader.is_satisfied_by(&offer));
+        assert!(
+            !ServiceRequirement::new("sinomo.fixture.jobs", "1.0.0")
+                .with_operation("fixture.jobs.delete")
+                .with_caller_capability("fixture.jobs.reader")
+                .is_satisfied_by(&offer)
         );
     }
 }

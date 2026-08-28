@@ -19,7 +19,6 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
     sinomo_registry::register_storage_paths(&mut layout)?;
     sinomo_core::node::register_storage_paths(&mut layout)?;
     register_internal_module_storage_paths(&mut layout)?;
-    sinomo_sandbox::register_storage_paths(&mut layout)?;
     sinomo_core::local::register_storage_paths(&mut layout)?;
     sinomo_core::events::register_storage_paths(&mut layout)?;
     Ok(layout)
@@ -63,15 +62,26 @@ pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryErro
 }
 
 pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
-    let registry = sinomo_module::ModuleRegistry::builder()
-        .register(sinomo_build::build_module_registration())?
-        .register(sinomo_dfs::dfs_module_registration())?
-        .register(sinomo_dfs_nfs::nfs_module_registration())?
-        .register(network_module_registration())?
-        .register(sinomo_rollout::rollout_module_registration())?
-        .register(sinomo_observe::observe_module_registration())?
-        .try_build()?;
-    Ok(registry)
+    internal_component_catalog()
+        .map(|catalog| catalog.modules().clone())
+        .map_err(|error| match error {
+            sinomo_module::ComponentCatalogError::ModuleRegistry(error) => error,
+            other => ModuleRegistryError::InvalidRegistrationOrder {
+                detail: other.to_string(),
+            },
+        })
+}
+
+pub fn internal_component_catalog()
+-> Result<sinomo_module::ComponentCatalog, sinomo_module::ComponentCatalogError> {
+    sinomo_module::ComponentCatalog::builder()
+        .register_module(sinomo_build::build_module_registration())?
+        .register_module(sinomo_dfs::dfs_module_registration())?
+        .register_module(sinomo_dfs_nfs::nfs_module_registration())?
+        .register_module(network_module_registration())?
+        .register_module(sinomo_rollout::rollout_module_registration())?
+        .register_module(sinomo_observe::observe_module_registration())?
+        .build()
 }
 
 /// Compose settings from every built-in module registration without requiring
@@ -114,11 +124,36 @@ pub use sinomo_module::{
 pub fn register_internal_module_storage_paths(
     layout: &mut sinomo_core::storage::StorageLayout,
 ) -> Result<(), sinomo_core::storage::StorageContractError> {
-    sinomo_build::register_storage_paths(layout)?;
-    sinomo_dfs::register_storage_paths(layout)?;
-    sinomo_rollout::register_storage_paths(layout)?;
-    sinomo_observe::register_storage_paths(layout)?;
-    Ok(())
+    internal_storage_component_catalog().register_storage_paths(layout)
+}
+
+fn internal_storage_component_catalog() -> sinomo_module::ComponentCatalog {
+    use std::sync::Arc;
+
+    sinomo_module::ComponentCatalog::builder()
+        .register_factory(Arc::new(
+            sinomo_build::component_factory().expect("build component descriptor"),
+        ))
+        .expect("register build storage component")
+        .register_factory(Arc::new(
+            sinomo_dfs::component_factory_with_hosts(None, None).expect("DFS component descriptor"),
+        ))
+        .expect("register DFS storage component")
+        .register_factory(Arc::new(
+            sinomo_observe::component_factory().expect("observe component descriptor"),
+        ))
+        .expect("register observe storage component")
+        .register_factory(Arc::new(
+            sinomo_sandbox::component_factory_with_backend(Arc::new(
+                sinomo_sandbox::LocalSandboxBackendFactory,
+            ))
+            .expect("sandbox component descriptor"),
+        ))
+        .expect("register sandbox storage component")
+        .register_storage_contributor("sinomo-rollout", sinomo_rollout::register_storage_paths)
+        .expect("register rollout storage contributor")
+        .build()
+        .expect("internal storage component catalog")
 }
 
 pub use sinomo_module::{

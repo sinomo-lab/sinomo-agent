@@ -39,6 +39,7 @@ sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
 sinomo-models = { path = "../sinomo-models", optional = true }
 sinomo-pytorch = { path = "../sinomo-pytorch" }
+sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-video = { path = "../sinomo-video" }
 time.workspace = true
 tracing.workspace = true

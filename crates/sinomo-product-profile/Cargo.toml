@@ -1,0 +1,14 @@
+[package]
+name = "sinomo-product-profile"
+version.workspace = true
+description = "Shared Sinomo product component composition profiles"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r2"
+
+[dependencies]
+sinomo-runtime = { path = "../sinomo-runtime" }

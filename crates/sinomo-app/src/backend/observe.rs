@@ -143,7 +143,7 @@ async fn observe_metrics_for_target(
         OBSERVE_METRICS_ROUTE,
         OBSERVE_RPC_CATEGORY,
         &ObserveMetricsRequest {
-            name_prefix: Some("sinomo.".to_string()),
+            name_prefix: None,
             limit: OBSERVE_DASHBOARD_MAX_METRICS_PER_TARGET,
         },
     )

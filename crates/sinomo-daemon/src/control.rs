@@ -891,12 +891,31 @@ pub fn run_daemon_control_loop_with_components(
     cluster: Option<DaemonClusterStatus>,
     component_factories: Vec<crate::DaemonComponentFactory>,
 ) -> Result<(), DaemonError> {
-    run_daemon_control_loop_with_components_and_profile(
+    let component_catalog =
+        crate::service_adapter::component_catalog_from_factories(component_factories)?;
+    run_daemon_control_loop_with_catalog_and_profile(
         options,
         paths,
         label,
         cluster,
-        component_factories,
+        component_catalog,
+        crate::DaemonExecutionProfile::Standard,
+    )
+}
+
+pub fn run_daemon_control_loop_with_catalog(
+    options: crate::DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+    cluster: Option<DaemonClusterStatus>,
+    component_catalog: crate::DaemonComponentCatalog,
+) -> Result<(), DaemonError> {
+    run_daemon_control_loop_with_catalog_and_profile(
+        options,
+        paths,
+        label,
+        cluster,
+        component_catalog,
         crate::DaemonExecutionProfile::Standard,
     )
 }
@@ -910,6 +929,26 @@ pub fn run_daemon_control_loop_with_components_and_profile(
     label: &str,
     cluster: Option<DaemonClusterStatus>,
     component_factories: Vec<crate::DaemonComponentFactory>,
+    execution_profile: crate::DaemonExecutionProfile,
+) -> Result<(), DaemonError> {
+    let component_catalog =
+        crate::service_adapter::component_catalog_from_factories(component_factories)?;
+    run_daemon_control_loop_with_catalog_and_profile(
+        options,
+        paths,
+        label,
+        cluster,
+        component_catalog,
+        execution_profile,
+    )
+}
+
+pub fn run_daemon_control_loop_with_catalog_and_profile(
+    options: crate::DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+    cluster: Option<DaemonClusterStatus>,
+    component_catalog: crate::DaemonComponentCatalog,
     execution_profile: crate::DaemonExecutionProfile,
 ) -> Result<(), DaemonError> {
     crate::cluster::deny_shadow_daemon_local_raft_access(&paths)?;
@@ -1083,14 +1122,13 @@ pub fn run_daemon_control_loop_with_components_and_profile(
     crate::install_process_idle_stats(idle_stats.clone());
     crate::register_io_observer(idle_stats.clone());
 
-    // The service host is built before the maintenance loop so the loop can
-    // publish the active service-registry snapshot's instances on its cluster
-    // tick.
+    // The service host owns a lifecycle-scoped catalog publisher component;
+    // generic cluster maintenance no longer carries service discovery state.
     let service_host = daemon_runtime.block_on(
-        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_components(
+        crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_catalog(
             paths.clone(),
             daemon_runtime_handle.clone(),
-            component_factories,
+            component_catalog,
         ),
     )?;
     service_host.notify_component_host_start();
@@ -1099,7 +1137,6 @@ pub fn run_daemon_control_loop_with_components_and_profile(
     let maintenance_options = options.clone();
     let maintenance_label = label.to_string();
     let maintenance_idle_stats = idle_stats.clone();
-    let maintenance_service_registry = service_host.service_registry_snapshot_store();
     let maintenance_runtime = daemon_runtime_handle.clone();
     let maintenance_startup_cluster = cluster.clone();
     // The main daemon owns DFS data. Shadow processes still observe committed
@@ -1177,7 +1214,6 @@ pub fn run_daemon_control_loop_with_components_and_profile(
             maintenance_options,
             maintenance_label,
             maintenance_idle_stats,
-            maintenance_service_registry,
             maintenance_runtime,
             maintenance_startup_cluster,
             startup_local_raft_resident_initialized,
@@ -1479,7 +1515,6 @@ async fn run_daemon_background_maintenance_loop(
     options: crate::DaemonRunOptions,
     label: String,
     idle_stats: Arc<crate::IdleStatsAtomics>,
-    service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     runtime: tokio::runtime::Handle,
     startup_cluster: Option<DaemonClusterStatus>,
     startup_local_raft_resident_initialized: bool,
@@ -1492,13 +1527,11 @@ async fn run_daemon_background_maintenance_loop(
     // source for connectivity. Retain it for exactly the maintenance owner's
     // lifetime; periodic probing remains only an expiry refresh mechanism.
     let _connectivity_topology_subscription = connectivity_topology_subscription;
-    let mut service_registry_versions = service_registry.subscribe_versions();
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(
         idle_stats.clone(),
         startup_local_raft_resident_initialized,
     )
-    .await
-    .with_service_registry(service_registry);
+    .await;
     let desired_rollout_task = if maintain_cluster_runtime && daemon_paths_are_shadow(&paths) {
         match cluster_paths_from_daemon_paths(&paths).and_then(|cluster_paths| {
             DaemonDesiredRolloutReactor::new(&cluster_paths).map(|reactor| (cluster_paths, reactor))
@@ -2020,16 +2053,6 @@ async fn run_daemon_background_maintenance_loop(
                 }
                 if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
                     cluster_network.request_discovery_refresh(now);
-                }
-            }
-            changed = service_registry_versions.changed() => {
-                if changed.is_ok() {
-                    let version = *service_registry_versions.borrow_and_update();
-                    tracing::info!(
-                        version,
-                        "sinomo {label} service registry generation changed; scheduling discovery publication"
-                    );
-                    cluster_network.request_publish_refresh(Instant::now());
                 }
             }
         }

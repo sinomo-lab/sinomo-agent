@@ -606,6 +606,10 @@ pub struct NativeModuleInvocationRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "kebab-case")]
+// This is a serialized ABI envelope, not a long-lived in-memory sum type.
+// Boxing the descriptor variant would add an allocation to every capability
+// probe without changing the stable SOBJ representation.
+#[allow(clippy::large_enum_variant)]
 pub enum NativeModuleResponse {
     Capabilities(NativeModuleCapabilitiesResponse),
     Invocation(NativeModuleInvocationResponse),

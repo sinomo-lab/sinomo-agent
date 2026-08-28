@@ -123,6 +123,7 @@ pub const DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF: Duration =
 /// publication, and a flat long backoff freezes the loser past the formation
 /// window (relay routes need connectivity records, which need relayed
 /// publishes — only fast retry breaks the cycle once the bridge publishes).
+#[cfg(test)]
 pub const DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF: Duration =
     sinomo_core::cluster::CLUSTER_NETWORK_MAINTENANCE_FAILURE_INITIAL_BACKOFF;
 #[cfg(test)]
@@ -165,8 +166,6 @@ const CLUSTER_NETWORK_PENDING_NODE_STATUS_TIMEOUT: Duration =
 // maintenance generation so six simultaneous replacements do not double the
 // quorum-commit load on the join critical path.
 const CLUSTER_NETWORK_INITIAL_PRESENCE_METADATA_FOLLOWUP_DELAY: Duration = Duration::from_secs(5);
-const CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT: Duration =
-    CLUSTER_NETWORK_PENDING_CONTROL_PLANE_TIMEOUT;
 // A stale node-status publication can itself depend on the route that this
 // maintenance generation must repair. Bound that publication early enough to
 // leave one complete direct probe plus local projection overhead; otherwise a
@@ -303,7 +302,6 @@ pub(crate) struct ClusterNetworkMaintenancePendingWork {
     member_publishes: Vec<ClusterMemberPublishPendingWork>,
     node_status_refreshes: Vec<ClusterNodeStatusPendingRefresh>,
     low_priority_node_status_refreshes: Vec<ClusterNodeStatusPendingRefresh>,
-    service_instance_publish: Option<ClusterServiceInstancePendingPublish>,
 }
 
 impl ClusterNetworkMaintenancePendingWork {
@@ -316,15 +314,7 @@ impl ClusterNetworkMaintenancePendingWork {
             && self.member_publishes.is_empty()
             && self.node_status_refreshes.is_empty()
             && self.low_priority_node_status_refreshes.is_empty()
-            && self.service_instance_publish.is_none()
     }
-}
-
-#[derive(Clone, Debug)]
-struct ClusterServiceInstancePendingPublish {
-    daemon_paths: DaemonPaths,
-    local_node_id: NodeId,
-    snapshot: Arc<sinomo_core::service::ServiceRegistrySnapshot>,
 }
 
 struct ClusterMemberPublishPendingWork {
@@ -2350,11 +2340,6 @@ pub(crate) struct ClusterNetworkMaintenance {
     /// cancellation never discards it.
     retained_connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     pub idle_stats: Arc<IdleStatsAtomics>,
-    /// Active service-registry snapshots to publish as cluster service
-    /// instances on the publish tick; `None` when the host has no registry
-    /// (tests, minimal loops).
-    pub service_registry: Option<sinomo_core::service::ServiceRegistrySnapshotStore>,
-    retained_service_instance_publish: Option<ClusterServiceInstancePendingPublish>,
 }
 
 impl std::ops::Deref for ClusterNetworkMaintenance {
@@ -2500,20 +2485,8 @@ impl ClusterNetworkMaintenance {
             solo_cluster_idle: false,
             tick: 0,
             idle_stats,
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
         }
-    }
-
-    /// Attaches the daemon's live service-registry snapshot store so publish
-    /// ticks also publish service-instance records into cluster KV.
-    pub fn with_service_registry(
-        mut self,
-        service_registry: sinomo_core::service::ServiceRegistrySnapshotStore,
-    ) -> Self {
-        self.service_registry = Some(service_registry);
-        self
     }
 
     async fn retry_main_local_raft_resident_initialization(
@@ -2859,21 +2832,6 @@ impl ClusterNetworkMaintenance {
                 pending_work.connectivity_publish =
                     Some(self.plan_connectivity_publish(&cluster_paths, &state)?);
             }
-            if self.service_registry.is_some() {
-                pending_work.service_instance_publish =
-                    self.retained_service_instance_publish.take().or_else(|| {
-                        let snapshot = self
-                            .service_registry
-                            .as_ref()
-                            .expect("checked service registry")
-                            .active_snapshot();
-                        Some(ClusterServiceInstancePendingPublish {
-                            daemon_paths: paths.clone(),
-                            local_node_id: state.local_node_id.clone(),
-                            snapshot,
-                        })
-                    });
-            }
             if !cluster_is_solo {
                 pending_work
                     .node_status_refreshes
@@ -3196,10 +3154,8 @@ impl ClusterNetworkMaintenance {
             member_publishes,
             node_status_refreshes,
             low_priority_node_status_refreshes,
-            service_instance_publish,
         } = pending;
         let mut publish_succeeded = true;
-        let mut publish_followup_needed = false;
         let mut presence_metadata_followup_needed = false;
         let mut probe_succeeded = true;
         // A main daemon's presence is part of join realization, not optional
@@ -3286,37 +3242,6 @@ impl ClusterNetworkMaintenance {
             .await
                 == Some(true);
         }
-        if let Some(publish) = service_instance_publish {
-            let service_succeeded = cluster_network_pending_step_with_deadline(
-                "service instance publish",
-                CLUSTER_NETWORK_PENDING_SERVICE_PUBLISH_TIMEOUT,
-                deadline,
-                self.run_pending_service_instance_publish_async(publish.clone(), runtime.clone()),
-            )
-            .await
-                == Some(true);
-            if service_succeeded {
-                if let Some(current) = self
-                    .service_registry
-                    .as_ref()
-                    .map(|store| store.active_snapshot())
-                    && current.version() > publish.snapshot.version()
-                {
-                    self.retained_service_instance_publish =
-                        Some(ClusterServiceInstancePendingPublish {
-                            daemon_paths: publish.daemon_paths,
-                            local_node_id: publish.local_node_id,
-                            snapshot: current,
-                        });
-                    publish_followup_needed = true;
-                }
-            } else {
-                // Retain the exact registry generation. Full-set reconciliation
-                // is idempotent, so an uncertain response can safely replay it.
-                self.retained_service_instance_publish = Some(publish);
-                publish_succeeded = false;
-            }
-        }
         for refresh in low_priority_node_status_refreshes {
             let outcome = cluster_network_pending_step_with_deadline(
                 "low-priority node status refresh",
@@ -3340,11 +3265,6 @@ impl ClusterNetworkMaintenance {
                     self.defer_publish_retry(
                         Instant::now(),
                         CLUSTER_NETWORK_INITIAL_PRESENCE_METADATA_FOLLOWUP_DELAY,
-                    );
-                } else if publish_followup_needed {
-                    self.defer_publish_retry(
-                        Instant::now(),
-                        DAEMON_CLUSTER_PUBLISH_FAILURE_INITIAL_BACKOFF,
                     );
                 }
             } else {
@@ -3565,38 +3485,6 @@ impl ClusterNetworkMaintenance {
                 false
             }
         }
-    }
-
-    async fn run_pending_service_instance_publish_async(
-        &mut self,
-        pending: ClusterServiceInstancePendingPublish,
-        runtime: tokio::runtime::Handle,
-    ) -> bool {
-        let Some(data_dir) = pending.daemon_paths.root.parent() else {
-            tracing::warn!(
-                "sinomo daemon service instance publish failed: daemon paths have no data directory parent"
-            );
-            return false;
-        };
-        let data_dir = SinomoDataDir::new(data_dir);
-        let cluster_access = crate::service_adapter::DaemonClusterAccess::new(
-            pending.daemon_paths.clone(),
-            &data_dir,
-            Some(&runtime),
-        );
-        if let Err(error) = sinomo_core::service::publish_local_service_instances(
-            &cluster_access,
-            pending.snapshot.registry(),
-            &pending.local_node_id,
-            pending.snapshot.version(),
-            OffsetDateTime::now_utc(),
-        )
-        .await
-        {
-            tracing::warn!("sinomo daemon service instance publish failed: {error}");
-            return false;
-        }
-        true
     }
 
     fn record_publish_failure(&mut self) {
@@ -9469,8 +9357,6 @@ mod tests {
             last_probe: now,
             active_due_claims: ClusterNetworkMaintenanceDueClaims::default(),
             idle_stats: Arc::new(IdleStatsAtomics::new()),
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
         }
@@ -12208,43 +12094,6 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_service_publish_retains_the_exact_registry_generation() {
-        let runtime = daemon_cluster_test_runtime();
-        let now = Instant::now();
-        let store = sinomo_core::service::ServiceRegistrySnapshotStore::default();
-        let snapshot = store.active_snapshot();
-        let mut maintenance =
-            cluster_network_scheduler_maintenance_for_test(now).with_service_registry(store);
-        let pending = ClusterNetworkMaintenancePendingWork {
-            publish_claimed: true,
-            service_instance_publish: Some(ClusterServiceInstancePendingPublish {
-                daemon_paths: DaemonPaths::with_root(
-                    unique_cluster_test_root("sinomo-daemon-retained-service-generation")
-                        .join("daemon"),
-                ),
-                local_node_id: NodeId::from_legacy_named("retained_service_node").expect("node id"),
-                snapshot: Arc::clone(&snapshot),
-            }),
-            ..Default::default()
-        };
-        let expired = now.checked_sub(Duration::from_millis(1)).unwrap_or(now);
-
-        runtime.block_on(maintenance.run_pending_work_until_async(
-            pending,
-            runtime.handle().clone(),
-            expired,
-        ));
-
-        let retained = maintenance
-            .retained_service_instance_publish
-            .as_ref()
-            .expect("timed-out exact generation must remain owned");
-        assert!(Arc::ptr_eq(&retained.snapshot, &snapshot));
-        assert_eq!(retained.snapshot.version(), snapshot.version());
-        assert_eq!(maintenance.publish_failure_streak, 1);
-    }
-
-    #[test]
     fn successful_publish_generation_does_not_clear_other_class_failures() {
         let runtime = daemon_cluster_test_runtime();
         let now = Instant::now();
@@ -12681,8 +12530,6 @@ mod tests {
             .checked_add(DAEMON_CLUSTER_PUBLISH_FAILURE_BACKOFF)
             .expect("retry deadline");
         let maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -12735,8 +12582,6 @@ mod tests {
     fn cluster_network_maintenance_next_due_skips_discovery_without_socket() {
         let now = Instant::now();
         let maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -12783,8 +12628,6 @@ mod tests {
     fn cluster_network_maintenance_next_due_uses_role_publish_cadence() {
         let now = Instant::now();
         let maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -12834,8 +12677,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -12895,8 +12736,6 @@ mod tests {
     fn cluster_network_maintenance_next_due_reports_overdue_immediately() {
         let now = Instant::now();
         let maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -12939,8 +12778,6 @@ mod tests {
     fn cluster_network_maintenance_next_due_accelerates_until_connectivity_converges() {
         let now = Instant::now();
         let maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13016,8 +12853,6 @@ mod tests {
         let now = Instant::now();
         let retry_at = now.checked_add(Duration::from_secs(30)).expect("retry");
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13110,8 +12945,6 @@ mod tests {
 
         let now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13447,8 +13280,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13511,8 +13342,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13671,8 +13500,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -13904,8 +13731,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14108,8 +13933,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14410,8 +14233,6 @@ mod tests {
 
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14585,8 +14406,6 @@ mod tests {
 
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14653,8 +14472,6 @@ mod tests {
         let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14786,8 +14603,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -14947,8 +14762,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -15129,8 +14942,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -15236,8 +15047,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -15307,8 +15116,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -16732,8 +16539,6 @@ mod tests {
         );
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -16924,8 +16729,6 @@ mod tests {
         );
 
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -17044,8 +16847,6 @@ mod tests {
         let maintenance_now = Instant::now();
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -17870,8 +17671,6 @@ mod tests {
         let idle_stats = Arc::new(IdleStatsAtomics::new());
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,
@@ -18004,8 +17803,6 @@ mod tests {
         let key = cluster_connectivity_probe_key(&local_node, &endpoint);
         let maintenance_now = Instant::now();
         let mut maintenance = cluster_network_maintenance! {
-            service_registry: None,
-            retained_service_instance_publish: None,
             retained_connectivity_publish: None,
             connectivity_input_generation: 0,
             discovery: None,

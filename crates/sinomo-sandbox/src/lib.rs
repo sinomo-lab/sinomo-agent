@@ -55,8 +55,8 @@ pub use runtime::{
     sandbox_runtime_supports_mvp_virtual_devices,
 };
 pub use service::{
-    LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService, register_services,
-    register_services_with_factory,
+    LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService,
+    component_factory_with_backend, register_services, register_services_with_factory,
 };
 pub use storage::register_storage_paths;
 pub use store::*;

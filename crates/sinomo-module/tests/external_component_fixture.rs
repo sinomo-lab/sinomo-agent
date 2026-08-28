@@ -12,6 +12,10 @@ use sinomo_module::{
     write_native_dylib_module_loader_state,
 };
 use sinomo_module_api::ServiceRequirement;
+use sinomo_observe_contract::{
+    OBSERVE_METRIC_EXPORTER_INTERFACE_ID, OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    OBSERVE_METRIC_EXPORTER_OPERATION, ObserveMetricExportRequest, ObserveMetricExportResponse,
+};
 
 #[test]
 fn independently_built_component_loads_and_reconciles_without_a_core_dependency() {
@@ -40,7 +44,28 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
         .component
         .validate()
         .expect("external component descriptor");
-    assert_eq!(descriptor.component.offers.len(), 1);
+    assert_eq!(descriptor.component.offers.len(), 2);
+    assert!(
+        descriptor
+            .surfaces
+            .object_rpc_routes
+            .iter()
+            .any(|route| route.auth == "component")
+    );
+    let metric_response = component
+        .invoke_sobj::<_, ObserveMetricExportResponse>(
+            OBSERVE_METRIC_EXPORTER_OPERATION,
+            &ObserveMetricExportRequest::default(),
+            None,
+        )
+        .expect("invoke external metric exporter");
+    let ActiveNativeComponentResponse::Value(metric_response) = metric_response else {
+        panic!("external metric exporter returned {metric_response:?}");
+    };
+    assert_eq!(
+        metric_response.metrics[0].name,
+        "fixture.external.echo.invocations"
+    );
     assert!(component.unload().shutdown_ok);
 
     let data_root = sinomo_testdir::TestDir::new("external-component-active-binding");
@@ -82,6 +107,18 @@ fn independently_built_component_loads_and_reconciles_without_a_core_dependency(
         panic!("external fixture returned {response:?}");
     };
     assert_eq!(response, [1, 2, 3, 4]);
+    assert!(component.unload().shutdown_ok);
+
+    let metric_requirement = ServiceRequirement::new(
+        OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
+        OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    )
+    .from_service("external-fixture-metrics")
+    .with_operation(OBSERVE_METRIC_EXPORTER_OPERATION)
+    .with_caller_capability(OBSERVE_METRIC_EXPORTER_OPERATION);
+    let component = unsafe { ActiveNativeComponent::resolve(&data_root, &metric_requirement) }
+        .expect("resolve external metric exporter by interface");
+    assert_eq!(component.descriptor().module_id, "fixture.external.echo");
     assert!(component.unload().shutdown_ok);
 
     let factory: Arc<dyn ComponentFactory> = Arc::new(

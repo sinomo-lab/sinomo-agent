@@ -31,4 +31,5 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 
 [dev-dependencies]
+sinomo-observe-contract = { path = "../sinomo-observe-contract" }
 sinomo-testdir = { path = "../sinomo-testdir" }

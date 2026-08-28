@@ -153,6 +153,32 @@ pub fn register_services_with_factory(
     builder.register(SandboxService::new(factory))
 }
 
+pub fn component_factory_with_backend(
+    backend: Arc<dyn SandboxBackendFactory>,
+) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    Ok(sinomo_module::StaticComponentFactory::new(
+        sinomo_module::ComponentDescriptor::new("sinomo-sandbox", env!("CARGO_PKG_VERSION")),
+        move |_, scope| {
+            scope.set_services(
+                register_services_with_factory(
+                    ServiceRegistryBuilder::default(),
+                    Arc::clone(&backend),
+                )
+                .build(),
+            );
+            Ok(())
+        },
+    )?
+    .with_config_definitions(register_component_config_definitions)
+    .with_storage_paths(crate::register_storage_paths))
+}
+
+fn register_component_config_definitions(
+    builder: sinomo_config::ConfigRegistryBuilder,
+) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
+    crate::register_config_definitions(builder).map_err(|error| error.to_string())
+}
+
 enum SandboxBackendServiceRequest {
     Create(crate::SandboxCreateInstanceRequest),
     Status(crate::SandboxStatusRequest),

@@ -767,8 +767,8 @@ pub use metadata_authority_projection::{
 
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDataPlaneService, DfsInboundAttachment, DfsService, register_data_plane_services,
-    register_services, register_services_with_data_plane_host,
+    DfsDataPlaneService, DfsInboundAttachment, DfsService, component_factory_with_hosts,
+    register_data_plane_services, register_services, register_services_with_data_plane_host,
 };
 pub(crate) use service_state::{
     ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,
