@@ -3393,7 +3393,21 @@ pub fn native_dylib_module_registration_from_state_and_descriptor(
             descriptor.module_version.clone(),
         )
     } else {
-        descriptor.component.clone()
+        let mut component = descriptor.component.clone();
+        let component_module_id = parse_native_dylib_module_id(&component.component_id)?;
+        if component_module_id != module_id {
+            return Err(NativeDylibModuleInstallError::Descriptor {
+                detail: format!(
+                    "native dylib component id `{}` does not identify descriptor module `{}`",
+                    component.component_id, descriptor.module_id
+                ),
+            });
+        }
+        // Native ABI descriptors retain legacy, human-readable module names so
+        // independently built providers do not need to link Sinomo's Id
+        // implementation. The host owns canonicalization at the ABI boundary.
+        component.component_id = module_id.as_str().to_string();
+        component
     };
     let mut registration = ModuleRegistration {
         manifest: sinomo_core::ModuleManifest::native_dylib(
@@ -6254,7 +6268,10 @@ mod tests {
                 network_transports: vec!["iroh".to_string()],
                 interface_exports: vec![interface_export.clone()],
             },
-            component: sinomo_module_api::ComponentDescriptor::default(),
+            component: sinomo_module_api::ComponentDescriptor::new(
+                "module.dynamic-native",
+                "0.1.0",
+            ),
         };
 
         let registration =
@@ -6262,6 +6279,7 @@ mod tests {
                 .expect("native dylib descriptor registration");
 
         assert_eq!(registration.module_id(), &module_id);
+        assert_eq!(registration.component.component_id, module_id.as_str());
         assert_eq!(registration.manifest.owner, "dynamic-native");
         assert_eq!(registration.manifest.kind, ModuleKind::NativeDylib);
         assert_eq!(
@@ -6340,6 +6358,16 @@ mod tests {
         let error = native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
             .expect_err("native descriptor must not declare another module's setting");
         assert!(error.to_string().contains("cannot declare setting"));
+
+        descriptor.surfaces.settings.clear();
+        descriptor.component.component_id = "module.foreign".to_string();
+        let error = native_dylib_module_registration_from_state_and_descriptor(&state, &descriptor)
+            .expect_err("native component identity must match its module");
+        assert!(
+            error
+                .to_string()
+                .contains("does not identify descriptor module")
+        );
     }
 
     #[test]
