@@ -420,6 +420,7 @@ pub struct AppSignals {
     pub evolution_objective_revision: Signal<u64>,
     pub evolution_scope_revision: Signal<u64>,
     pub files_structure: Signal<FilesStructureKey>,
+    pub files_thumbnail_revision: Signal<u64>,
     pub settings_structure: Signal<SettingsStructureKey>,
     pub chat_structure: Signal<ChatStructureKey>,
 }
@@ -478,6 +479,14 @@ impl AppSignals {
                     state.text_scale,
                     state.ready.as_ref().map(|ready| &ready.files),
                 ),
+            ),
+            files_thumbnail_revision: Signal::named(
+                "files thumbnail repaint",
+                state
+                    .ready
+                    .as_ref()
+                    .map(|ready| ready.files.thumbnail_revision())
+                    .unwrap_or_default(),
             ),
             settings_structure: Signal::named("settings structure", SettingsStructureKey::empty()),
             chat_structure: Signal::named(
@@ -856,14 +865,24 @@ impl Shared {
     }
 
     pub fn publish_files_signals(&self) {
-        let structure = {
+        let (structure, thumbnail_revision) = {
             let state = self.state.borrow();
-            FilesStructureKey::new(
-                state.theme_mode,
-                state.text_scale,
-                state.ready.as_ref().map(|ready| &ready.files),
+            (
+                FilesStructureKey::new(
+                    state.theme_mode,
+                    state.text_scale,
+                    state.ready.as_ref().map(|ready| &ready.files),
+                ),
+                state
+                    .ready
+                    .as_ref()
+                    .map(|ready| ready.files.thumbnail_revision())
+                    .unwrap_or_default(),
             )
         };
+        self.signals
+            .files_thumbnail_revision
+            .set(thumbnail_revision);
         if self.signals.files_structure.set(structure) {
             self.publish_health_signals();
         }

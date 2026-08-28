@@ -9545,6 +9545,7 @@ version = "0.1.0"
 dependencies = [
  "android-build",
  "blake3",
+ "image",
  "jni 0.22.4",
  "netwatcher",
  "rfd",
