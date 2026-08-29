@@ -186,6 +186,19 @@ impl DaemonDefaultDfsReconciliationReactor {
         let Some(work) = self.pending_work() else {
             return Ok(DaemonDefaultDfsReconciliationStep::Idle);
         };
+        tracing::trace!(
+            target: "sinomo.dfs.reconciliation",
+            reconcile_defaults = work.reconcile_defaults,
+            recover_prior_process_permit = work.recover_prior_process_permit,
+            refresh_before_recovery = work.refresh_before_recovery,
+            local_generation = work.local_generation,
+            input_count = work.inputs.len(),
+            permit_modify_revision = work
+                .placement_authority_permit
+                .as_ref()
+                .map(|permit| permit.modify_revision.0),
+            "default DFS reconciliation generation started"
+        );
         let Some(publish_cluster_control) = daemon_default_dfs_reconciliation_local_is_voter(
             paths,
             expected_cluster_id,
@@ -268,6 +281,11 @@ impl DaemonDefaultDfsReconciliationReactor {
                     self.complete_default_reconciliation_after_control_plane_observation(
                         &work,
                         expected_node_id,
+                    );
+                    tracing::trace!(
+                        target: "sinomo.dfs.reconciliation",
+                        local_generation = work.local_generation,
+                        "default DFS reconciliation generation completed"
                     );
                 }
                 DaemonDefaultDfsLifecycleOutcome::Parked(handoff) => {

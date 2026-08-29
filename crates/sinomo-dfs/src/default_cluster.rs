@@ -174,11 +174,18 @@ fn record_default_materialization(
             // visible, closing that false-to-true handoff without a polling
             // timer. Subsequent waiting passes remain subscribed and do not
             // self-wake.
-            retries.insert(data_root);
+            retries.insert(data_root.clone());
         } else {
             retries.remove(&data_root);
         }
     }
+    tracing::trace!(
+        target: "sinomo.dfs.reconciliation",
+        awaiting_replica_progress,
+        establish_replica_subscription,
+        data_root = %data_root.display(),
+        "recorded default DFS materialization generation"
+    );
 }
 
 fn request_default_materialization_immediate_retry(data_root: PathBuf) {
