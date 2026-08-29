@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use sysinfo::{Disks, Networks, System};
+use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System};
+
+const DURABLE_INVENTORY_METRIC_CACHE_TTL: Duration = Duration::from_secs(2 * 60);
 
 /// Register Sinomo's built-in metric descriptors and snapshot exporters.
 ///
@@ -19,13 +21,13 @@ pub fn register_builtin_observe_metric_exporters() {
     crate::register_observe_metric_exporter_with_policy(
         "sinomo-dfs",
         ["sinomo.dfs."],
-        Some(Duration::from_secs(5)),
+        Some(DURABLE_INVENTORY_METRIC_CACHE_TTL),
         dfs_observe_metrics,
     );
     crate::register_observe_metric_exporter_with_policy(
         "sinomo-kv",
         ["sinomo.kv."],
-        Some(Duration::from_secs(5)),
+        Some(DURABLE_INVENTORY_METRIC_CACHE_TTL),
         kv_observe_metrics,
     );
     crate::register_observe_metric_exporter_with_policy(
@@ -591,7 +593,20 @@ fn initialize_node_resource_sampling() {
 }
 
 fn node_resource_system() -> &'static Mutex<System> {
-    NODE_RESOURCE_SYSTEM.get_or_init(|| Mutex::new(System::new_all()))
+    NODE_RESOURCE_SYSTEM.get_or_init(|| Mutex::new(System::new()))
+}
+
+fn refresh_node_resource_system(system: &mut System) {
+    system.refresh_cpu_usage();
+    system.refresh_memory();
+    let Ok(pid) = sysinfo::get_current_pid() else {
+        return;
+    };
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_memory().without_tasks(),
+    );
 }
 
 fn node_network_totals() -> (u64, u64) {
@@ -617,7 +632,10 @@ fn node_resource_observe_metrics(
         .map_err(|_| crate::ObserveError::Runtime {
             detail: "node resource sampler lock is poisoned".to_string(),
         })?;
-    system.refresh_all();
+    // Host gauges need global CPU/memory and this daemon's RSS, not a complete
+    // process inventory. `refresh_all` walks every `/proc/<pid>/task/<tid>` on
+    // Linux and made one dashboard pull issue tens of thousands of reads.
+    refresh_node_resource_system(&mut system);
     let load = System::load_average();
     let disks = Disks::new_with_refreshed_list();
     let data_disk = disks
@@ -1050,6 +1068,23 @@ mod tests {
                 .filter(|record| record.name == "sinomo.node.load.average")
                 .count(),
             3
+        );
+    }
+
+    #[test]
+    fn node_resource_refresh_keeps_only_the_current_process() {
+        if !sysinfo::IS_SUPPORTED_SYSTEM {
+            return;
+        }
+        let mut system = System::new();
+        refresh_node_resource_system(&mut system);
+        let pid = sysinfo::get_current_pid().expect("current pid");
+
+        assert!(system.process(pid).is_some());
+        assert_eq!(
+            system.processes().len(),
+            1,
+            "node metrics must not inventory unrelated processes or their tasks"
         );
     }
 
