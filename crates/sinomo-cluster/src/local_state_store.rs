@@ -440,6 +440,25 @@ pub fn read_cluster_state_cached(
     read_cluster_state_cached_shared(paths).map(|state| state.as_ref().clone())
 }
 
+/// Async wrapper for the reactively invalidated merged-state cache.
+///
+/// Scheduled consumers use this instead of rebuilding the full materialized KV
+/// projection as a liveness check. Authority-bearing operations still perform
+/// their own typed ReadIndex/quorum validation at the mutation boundary.
+pub async fn read_cluster_state_cached_async(
+    runtime: &tokio::runtime::Handle,
+    paths: &ClusterPaths,
+) -> Result<ClusterBootstrapState, NetworkError> {
+    let paths = paths.clone();
+    runtime
+        .spawn_blocking(move || read_cluster_state_cached(&paths))
+        .await
+        .map_err(|source| NetworkError::Io {
+            operation: "read cached cluster state".to_string(),
+            detail: format!("cached cluster state read task failed: {source}"),
+        })?
+}
+
 pub(crate) fn invalidate_cluster_state_cache(paths: &ClusterPaths) {
     if let Ok(mut cache) = CLUSTER_STATES.lock() {
         cache.remove(&paths.root);

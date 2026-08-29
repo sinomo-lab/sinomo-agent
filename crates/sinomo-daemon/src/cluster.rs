@@ -2705,8 +2705,13 @@ impl ClusterNetworkMaintenance {
 
         self.idle_stats.incr_ticks_with_work();
         self.idle_stats.incr_disk_reads_cluster_state();
+        // Committed KV writers invalidate the merged state cache reactively.
+        // Scheduled maintenance consumes that projection; rebuilding the full
+        // materialized snapshot on every publish/probe deadline turns an idle
+        // timer into an O(KV) filesystem scan. Concrete publications and probes
+        // retain their typed quorum and freshness checks below.
         let mut state = if publish_due || probe_due || connectivity_publish_retry_due {
-            sinomo_core::cluster::read_cluster_state_async(&runtime, &cluster_paths).await
+            sinomo_core::cluster::read_cluster_state_cached_async(&runtime, &cluster_paths).await
         } else {
             sinomo_core::cluster::read_cluster_state_without_kv_async(&runtime, &cluster_paths)
                 .await
