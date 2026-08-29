@@ -16,9 +16,8 @@ use sinomo_runtime::observe::{ObserveError, ObserveMetricRecord};
 use sinomo_runtime::vfs::{VfsHandle, VfsObjectKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use thiserror::Error;
 
 mod agent;
@@ -146,12 +145,79 @@ pub fn register_observe_metric_exporters() {
             )),
         );
     }
-    sinomo_runtime::observe::register_observe_metric_exporter_with_policy(
+    sinomo_runtime::observe::register_observe_metric_exporter_with_generation(
         "sinomo-agent",
         ["sinomo.agent."],
-        Some(Duration::from_secs(15)),
+        agent_observe_metric_generation,
         agent_observe_metrics,
     );
+}
+
+struct AgentObserveMetricWatcher {
+    generation: Arc<AtomicU64>,
+    _watcher: notify::RecommendedWatcher,
+}
+
+static AGENT_OBSERVE_METRIC_WATCHERS: OnceLock<
+    Mutex<BTreeMap<PathBuf, AgentObserveMetricWatcher>>,
+> = OnceLock::new();
+
+fn agent_observe_metric_generation(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<u64, ObserveError> {
+    use notify::Watcher;
+
+    let paths = AgentStoragePaths::from_data_dir(data_dir);
+    let watch_root = paths.root;
+    let mut watchers = AGENT_OBSERVE_METRIC_WATCHERS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .map_err(|_| ObserveError::Runtime {
+            detail: "agent observe metric watcher registry is poisoned".to_string(),
+        })?;
+    if let Some(watcher) = watchers.get(&watch_root) {
+        return Ok(watcher.generation.load(Ordering::Acquire));
+    }
+    std::fs::create_dir_all(&watch_root).map_err(|source| ObserveError::Runtime {
+        detail: format!(
+            "agent observe metric watcher could not create {}: {source}",
+            watch_root.display()
+        ),
+    })?;
+    let generation = Arc::new(AtomicU64::new(1));
+    let callback_generation = Arc::clone(&generation);
+    let mut watcher = notify::recommended_watcher(
+        move |event: Result<notify::Event, notify::Error>| match event {
+            Ok(event) if !matches!(event.kind, notify::EventKind::Access(_)) => {
+                callback_generation.fetch_add(1, Ordering::AcqRel);
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "sinomo.agent.observe",
+                "agent metric invalidation watcher failed: {error}"
+            ),
+        },
+    )
+    .map_err(|source| ObserveError::Runtime {
+        detail: format!("agent observe metric watcher could not initialize: {source}"),
+    })?;
+    watcher
+        .watch(&watch_root, notify::RecursiveMode::Recursive)
+        .map_err(|source| ObserveError::Runtime {
+            detail: format!(
+                "agent observe metric watcher could not watch {}: {source}",
+                watch_root.display()
+            ),
+        })?;
+    let current = generation.load(Ordering::Acquire);
+    watchers.insert(
+        watch_root,
+        AgentObserveMetricWatcher {
+            generation,
+            _watcher: watcher,
+        },
+    );
+    Ok(current)
 }
 
 fn agent_observe_metrics(
@@ -2858,6 +2924,29 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn agent_metric_generation_advances_from_filesystem_events() {
+        let root = sinomo_testdir::TestDir::new("agent-observe-generation");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
+        let initial = agent_observe_metric_generation(&data_dir).expect("install watcher");
+        let paths = AgentStoragePaths::from_data_dir(&data_dir);
+        std::fs::write(paths.root.join("observe-change"), b"changed")
+            .expect("write watched change");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let current = agent_observe_metric_generation(&data_dir).expect("read generation");
+            if current > initial {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "agent metric watcher did not invalidate the cached generation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 
     struct FakeInteractionModel {
         response: &'static str,

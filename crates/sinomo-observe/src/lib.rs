@@ -64,8 +64,9 @@ pub use runtime::{
     observe_metric_descriptors, observe_metric_records_interval_delta,
     observe_metrics_interval_delta, observe_process_started_at, read_observe_metrics,
     read_observe_metrics_for_data_dir, read_observe_traces, register_observe_metric_descriptor,
-    register_observe_metric_exporter, register_observe_metric_exporter_with_policy,
-    register_observe_metric_exporter_with_prefixes, update_observe_control,
+    register_observe_metric_exporter, register_observe_metric_exporter_with_generation,
+    register_observe_metric_exporter_with_policy, register_observe_metric_exporter_with_prefixes,
+    update_observe_control,
 };
 pub use timeline::{
     OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME, OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT,

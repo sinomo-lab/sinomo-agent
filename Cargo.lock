@@ -9510,6 +9510,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "notify",
  "reqwest",
  "serde",
  "serde_json",
@@ -9521,6 +9522,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

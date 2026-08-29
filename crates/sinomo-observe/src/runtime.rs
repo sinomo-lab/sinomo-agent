@@ -393,11 +393,14 @@ struct ObserveFilterState {
 static OBSERVE_RUNTIME: OnceLock<ObserveRuntime> = OnceLock::new();
 type ObserveMetricExporter =
     Arc<dyn Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError> + Send + Sync>;
+type ObserveMetricExporterGeneration =
+    Arc<dyn Fn(&SinomoDataDir) -> Result<u64, ObserveError> + Send + Sync>;
 #[derive(Clone)]
 struct ObserveMetricExporterRegistration {
     prefixes: Vec<String>,
     exporter: ObserveMetricExporter,
     cache_ttl: Option<Duration>,
+    cache_generation: Option<ObserveMetricExporterGeneration>,
     cache: Arc<Mutex<Option<ObserveMetricExporterCache>>>,
 }
 
@@ -406,6 +409,7 @@ struct ObserveMetricExporterCache {
     data_dir: std::path::PathBuf,
     collected_at: OffsetDateTime,
     cached_at: Instant,
+    generation: Option<u64>,
     duration_us: u64,
     records: Vec<ObserveMetricRecord>,
 }
@@ -452,6 +456,40 @@ pub fn register_observe_metric_exporter_with_policy(
     + Sync
     + 'static,
 ) {
+    register_observe_metric_exporter_with_cache_policy(name, prefixes, cache_ttl, None, exporter);
+}
+
+/// Registers an exporter whose successful snapshot remains current until a
+/// process-local generation changes. The generation callback must be a cheap
+/// resident read; hosts typically drive it from durable write notifications.
+pub fn register_observe_metric_exporter_with_generation(
+    name: impl Into<String>,
+    prefixes: impl IntoIterator<Item = impl Into<String>>,
+    generation: impl Fn(&SinomoDataDir) -> Result<u64, ObserveError> + Send + Sync + 'static,
+    exporter: impl Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError>
+    + Send
+    + Sync
+    + 'static,
+) {
+    register_observe_metric_exporter_with_cache_policy(
+        name,
+        prefixes,
+        None,
+        Some(Arc::new(generation)),
+        exporter,
+    );
+}
+
+fn register_observe_metric_exporter_with_cache_policy(
+    name: impl Into<String>,
+    prefixes: impl IntoIterator<Item = impl Into<String>>,
+    cache_ttl: Option<Duration>,
+    cache_generation: Option<ObserveMetricExporterGeneration>,
+    exporter: impl Fn(&SinomoDataDir) -> Result<Vec<ObserveMetricRecord>, ObserveError>
+    + Send
+    + Sync
+    + 'static,
+) {
     observe_metric_exporters()
         .lock()
         .expect("observe metric exporters lock poisoned")
@@ -461,6 +499,7 @@ pub fn register_observe_metric_exporter_with_policy(
                 prefixes: prefixes.into_iter().map(Into::into).collect(),
                 exporter: Arc::new(exporter),
                 cache_ttl,
+                cache_generation,
                 cache: Arc::new(Mutex::new(None)),
             },
         );
@@ -1191,11 +1230,20 @@ fn collect_observe_metric_exporter(
     data_dir: &SinomoDataDir,
 ) -> Result<ObserveMetricExporterCollection, ObserveError> {
     let data_dir_root = data_dir.root();
-    if let Some(ttl) = registration.cache_ttl
+    let generation = registration
+        .cache_generation
+        .as_ref()
+        .map(|generation| generation(data_dir))
+        .transpose()?;
+    let cache_enabled = registration.cache_ttl.is_some() || generation.is_some();
+    if cache_enabled
         && let Ok(cache) = registration.cache.lock()
         && let Some(cache) = cache.as_ref()
         && cache.data_dir == data_dir_root
-        && cache.cached_at.elapsed() <= ttl
+        && registration
+            .cache_ttl
+            .is_none_or(|ttl| cache.cached_at.elapsed() <= ttl)
+        && generation.is_none_or(|generation| cache.generation == Some(generation))
     {
         return Ok(ObserveMetricExporterCollection {
             records: cache.records.clone(),
@@ -1209,13 +1257,12 @@ fn collect_observe_metric_exporter(
     let observed_at = OffsetDateTime::now_utc();
     let records = (registration.exporter)(data_dir)?;
     let duration_us = duration_as_micros_u64(started.elapsed());
-    if registration.cache_ttl.is_some()
-        && let Ok(mut cache) = registration.cache.lock()
-    {
+    if cache_enabled && let Ok(mut cache) = registration.cache.lock() {
         *cache = Some(ObserveMetricExporterCache {
             data_dir: data_dir_root.to_path_buf(),
             collected_at: observed_at,
             cached_at: Instant::now(),
+            generation,
             duration_us,
             records: records.clone(),
         });
@@ -2274,6 +2321,7 @@ mod tests {
             prefixes: vec!["sinomo.kv.".to_string()],
             exporter: Arc::new(|_| Ok(Vec::new())),
             cache_ttl: None,
+            cache_generation: None,
             cache: Arc::new(Mutex::new(None)),
         };
         assert!(exporter_matches_request(
@@ -2316,6 +2364,7 @@ mod tests {
                 })
             },
             cache_ttl: Some(Duration::from_secs(30)),
+            cache_generation: None,
             cache: Arc::new(Mutex::new(None)),
         };
         let root = sinomo_testdir::TestDir::new("observe-exporter-cache");
@@ -2331,6 +2380,49 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(first.records, second.records);
         assert_eq!(first.observed_at, second.observed_at);
+    }
+
+    #[test]
+    fn exporter_cache_recollects_only_after_generation_changes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let generation = Arc::new(AtomicU64::new(1));
+        let registration = ObserveMetricExporterRegistration {
+            prefixes: vec!["sinomo.test.".to_string()],
+            exporter: {
+                let calls = Arc::clone(&calls);
+                Arc::new(move |_| {
+                    let value = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                    Ok(vec![ObserveMetricRecord::gauge(
+                        "sinomo.test.value",
+                        BTreeMap::new(),
+                        value as f64,
+                    )])
+                })
+            },
+            cache_ttl: None,
+            cache_generation: Some({
+                let generation = Arc::clone(&generation);
+                Arc::new(move |_| Ok(generation.load(Ordering::Acquire)))
+            }),
+            cache: Arc::new(Mutex::new(None)),
+        };
+        let root = sinomo_testdir::TestDir::new("observe-exporter-generation-cache");
+        let data_dir = SinomoDataDir::new(root.path());
+
+        let first =
+            collect_observe_metric_exporter(&registration, &data_dir).expect("first collection");
+        let cached =
+            collect_observe_metric_exporter(&registration, &data_dir).expect("cached collection");
+        generation.fetch_add(1, Ordering::AcqRel);
+        let refreshed =
+            collect_observe_metric_exporter(&registration, &data_dir).expect("generation refresh");
+
+        assert!(!first.cached);
+        assert!(cached.cached);
+        assert!(!refreshed.cached);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(first.records, cached.records);
+        assert_ne!(cached.records, refreshed.records);
     }
 
     #[test]
