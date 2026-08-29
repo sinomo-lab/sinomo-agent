@@ -235,7 +235,7 @@ impl ClusterConnectivityTopologyProjection {
         if delta.revision.0 <= revision {
             return Some(ClusterConnectivityProjectionChange::default());
         }
-        if revision < delta.compacted_revision.0 || delta.events.is_empty() {
+        if revision < delta.compacted_revision.0 {
             return None;
         }
         if !cluster_connectivity_events_cover_revision_range(
@@ -303,6 +303,7 @@ pub fn cluster_connectivity_events_cover_revision_range(
     events: &[KvEvent],
 ) -> bool {
     current_revision <= previous_revision
+        || (events.is_empty() && current_revision == previous_revision.saturating_add(1))
         || (events.first().map(|event| event.revision.0)
             == Some(previous_revision.saturating_add(1))
             && events.last().map(|event| event.revision.0) == Some(current_revision)
@@ -379,4 +380,43 @@ fn connectivity_probe_input_key(key: &str) -> bool {
 
 fn connectivity_record_key(key: &str) -> bool {
     key.starts_with("/cluster/network/connectivity/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sinomo_kv::KvRevision;
+
+    #[test]
+    fn contiguous_noop_delta_advances_without_snapshot_rebuild() {
+        let mut projection = ClusterConnectivityTopologyProjection::new(true);
+        projection.revision = Some(7);
+        let delta = ClusterKvCommittedDelta {
+            revision: KvRevision(8),
+            compacted_revision: KvRevision::ZERO,
+            events: Vec::new(),
+            final_key_states: Vec::new(),
+        };
+
+        assert_eq!(
+            projection.observe_delta(&delta),
+            Some(ClusterConnectivityProjectionChange::default())
+        );
+        assert_eq!(projection.revision(), Some(8));
+    }
+
+    #[test]
+    fn gapped_noop_delta_requests_snapshot_rebuild() {
+        let mut projection = ClusterConnectivityTopologyProjection::new(true);
+        projection.revision = Some(7);
+        let delta = ClusterKvCommittedDelta {
+            revision: KvRevision(9),
+            compacted_revision: KvRevision::ZERO,
+            events: Vec::new(),
+            final_key_states: Vec::new(),
+        };
+
+        assert_eq!(projection.observe_delta(&delta), None);
+        assert_eq!(projection.revision(), Some(7));
+    }
 }

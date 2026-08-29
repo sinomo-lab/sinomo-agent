@@ -265,6 +265,7 @@ fn events_cover_revision_range(
     events: &[sinomo_core::kv::KvEvent],
 ) -> bool {
     current_revision <= previous_revision
+        || (events.is_empty() && current_revision == previous_revision.next())
         || (events.first().map(|event| event.revision) == Some(previous_revision.next())
             && events.last().map(|event| event.revision) == Some(current_revision)
             && events.windows(2).all(|events| {
@@ -451,7 +452,7 @@ impl DefaultDfsCommittedProjectionObserver {
         if delta.revision <= previous_revision {
             return true;
         }
-        if previous_revision < delta.compacted_revision || delta.events.is_empty() {
+        if previous_revision < delta.compacted_revision {
             return false;
         }
         if !events_cover_revision_range(previous_revision, delta.revision, &delta.events) {
@@ -715,5 +716,60 @@ mod tests {
         };
         assert!(!observer.observe_delta(&projection_tx, &gapped));
         assert_eq!(observer.revision(), Some(KvRevision(1)));
+    }
+
+    #[test]
+    fn contiguous_noop_delta_advances_without_authoritative_rebuild() {
+        let config_key = crate::file_system_config_key(&crate::sifs_file_system_id());
+        let (projection_tx, projection_rx) =
+            tokio::sync::watch::channel(DefaultDfsReconciliationProjection::default());
+        let mut observer = DefaultDfsCommittedProjectionObserver::default();
+        observer.rebuild_from_entries(
+            &projection_tx,
+            KvRevision(1),
+            &[entry(config_key, vec![1], 1)],
+        );
+        let rebuild_count = observer.rebuild_count();
+
+        let delta = ClusterKvCommittedDelta {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            events: Vec::new(),
+            final_key_states: Vec::new(),
+        };
+
+        assert!(observer.observe_delta(&projection_tx, &delta));
+        assert_eq!(observer.revision(), Some(KvRevision(2)));
+        assert_eq!(projection_rx.borrow().revision, Some(KvRevision(2)));
+        assert_eq!(observer.rebuild_count(), rebuild_count);
+    }
+
+    #[test]
+    fn contiguous_noop_snapshot_advances_without_projection_rebuild() {
+        let config_key = crate::file_system_config_key(&crate::sifs_file_system_id());
+        let (projection_tx, projection_rx) =
+            tokio::sync::watch::channel(DefaultDfsReconciliationProjection::default());
+        let mut observer = DefaultDfsCommittedProjectionObserver::default();
+        observer.rebuild_from_entries(
+            &projection_tx,
+            KvRevision(1),
+            &[entry(config_key.clone(), vec![1], 1)],
+        );
+        let rebuild_count = observer.rebuild_count();
+        let snapshot = KvSnapshot {
+            revision: KvRevision(2),
+            compacted_revision: KvRevision::ZERO,
+            entries: vec![entry(config_key, vec![1], 1)],
+            leases: Vec::new(),
+            events: Vec::new(),
+            committed_requests: Vec::new(),
+            expired_requests: Vec::new(),
+        };
+
+        observer.observe_snapshot(&projection_tx, &snapshot);
+
+        assert_eq!(observer.revision(), Some(KvRevision(2)));
+        assert_eq!(projection_rx.borrow().revision, Some(KvRevision(2)));
+        assert_eq!(observer.rebuild_count(), rebuild_count);
     }
 }
