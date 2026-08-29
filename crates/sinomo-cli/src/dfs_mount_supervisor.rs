@@ -35,6 +35,8 @@ pub(crate) struct SifsMountSupervisorService {
 
 struct SupervisorInner {
     status: RwLock<SifsMountRuntimeStatus>,
+    persisted_status: Mutex<Option<SifsMountRuntimeStatus>>,
+    config_dirty: AtomicBool,
     shutdown: AtomicBool,
     wake: Arc<SupervisorWake>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -86,6 +88,8 @@ impl SifsMountSupervisorService {
         let wake = Arc::new(SupervisorWake::default());
         let inner = Arc::new(SupervisorInner {
             status: RwLock::new(SifsMountRuntimeStatus::default()),
+            persisted_status: Mutex::new(None),
+            config_dirty: AtomicBool::new(true),
             shutdown: AtomicBool::new(false),
             wake: Arc::clone(&wake),
             worker: Mutex::new(None),
@@ -210,16 +214,28 @@ fn run_supervisor(
             return;
         }
     };
-    let _watcher = start_config_watcher(&data_dir, Arc::clone(&inner.wake)).ok();
+    let config_watcher = match start_config_watcher(&data_dir, Arc::clone(&inner)) {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!("watch SIFS mount config; falling back to bounded polling: {error}");
+            None
+        }
+    };
     let mut active: Option<ActiveMount> = None;
     let mut active_config: Option<SifsMountConfig> = None;
+    let mut desired_config: Option<SifsMountConfig> = None;
     let mut restart_count = 0_u64;
     while !inner.shutdown.load(Ordering::Acquire) {
-        let config =
+        if config_watcher.is_none() {
+            inner.config_dirty.store(true, Ordering::Release);
+        }
+        if desired_config.is_none() || inner.config_dirty.swap(false, Ordering::AcqRel) {
             match store.get_typed::<SifsMountConfig>(&data_dir, None, SIFS_MOUNT_CONFIG_KEY) {
-                Ok(config) => config,
+                Ok(config) => desired_config = Some(config),
                 Err(error) => {
                     stop_active(&mut active);
+                    active_config = None;
+                    inner.config_dirty.store(true, Ordering::Release);
                     publish(
                         &store,
                         &data_dir,
@@ -233,7 +249,12 @@ fn run_supervisor(
                     inner.wake.wait(Some(RETRY_DELAY));
                     continue;
                 }
-            };
+            }
+        }
+        let config = desired_config
+            .as_ref()
+            .expect("mount config is loaded before reconciliation")
+            .clone();
         if !config.enabled {
             stop_active(&mut active);
             active_config = None;
@@ -289,7 +310,14 @@ fn run_supervisor(
         }
         if let Some(mount) = active.as_mut() {
             match mount.status(daemon_pid, restart_count) {
-                Ok(status) => publish(&store, &data_dir, &inner, status),
+                Ok(status) => {
+                    // A newly mounted provider and callback-driven Windows
+                    // updates are state transitions. Linux's bounded health
+                    // poll is intentionally memory-only while healthy.
+                    if needs_start || cfg!(windows) {
+                        publish(&store, &data_dir, &inner, status);
+                    }
+                }
                 Err(error) => {
                     publish(
                         &store,
@@ -302,7 +330,10 @@ fn run_supervisor(
                 }
             }
         }
-        inner.wake.wait(Some(RETRY_DELAY));
+        let wait = active
+            .as_ref()
+            .map_or(Some(RETRY_DELAY), ActiveMount::health_poll_interval);
+        inner.wake.wait(wait);
     }
     stop_active(&mut active);
 }
@@ -347,7 +378,7 @@ pub(crate) fn configure_managed_sifs_mount(
 
 fn start_config_watcher(
     data_dir: &SinomoDataDir,
-    wake: Arc<SupervisorWake>,
+    inner: Arc<SupervisorInner>,
 ) -> Result<notify::RecommendedWatcher, String> {
     let path = sifs_mount_config_definition().local_path(data_dir);
     if let Some(parent) = path.parent() {
@@ -359,7 +390,8 @@ fn start_config_watcher(
             .ok()
             .is_some_and(|event| event.paths.iter().any(|path| path == &watched))
         {
-            wake.signal();
+            inner.config_dirty.store(true, Ordering::Release);
+            inner.wake.signal();
         }
     })
     .map_err(|error| error.to_string())?;
@@ -419,6 +451,17 @@ enum ActiveMount {
 }
 
 impl ActiveMount {
+    fn health_poll_interval(&self) -> Option<Duration> {
+        match self {
+            #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
+            Self::Fuse { .. } => Some(RETRY_DELAY),
+            #[cfg(windows)]
+            Self::External(_) => None,
+            #[cfg(not(any(all(target_os = "linux", feature = "dfs-fuse"), windows)))]
+            Self::Unsupported => Some(RETRY_DELAY),
+        }
+    }
+
     fn start(
         data_dir: &SinomoDataDir,
         config: &SifsMountConfig,
@@ -527,6 +570,7 @@ impl ExternalMount {
         let worker_data_dir = data_dir_root.clone();
         let worker_mount_point = mount_point.to_path_buf();
         let worker_config = config.clone();
+        let finished_inner = Arc::clone(&inner);
         let sink: Arc<dyn sinomo_runtime::dfs::HostFilesystemStatusSink> =
             Arc::new(ExternalStatusSink {
                 inner: Arc::clone(&inner),
@@ -558,6 +602,7 @@ impl ExternalMount {
                     }
                 })();
                 let _ = finished_tx.send(result);
+                finished_inner.wake.signal();
             })
             .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -736,16 +781,43 @@ fn publish(
     inner: &SupervisorInner,
     status: SifsMountRuntimeStatus,
 ) {
-    if let Err(error) = store.set_typed(
+    let unchanged = inner
+        .persisted_status
+        .lock()
+        .ok()
+        .and_then(|persisted| persisted.as_ref().cloned())
+        .is_some_and(|persisted| mount_status_persistence_equal(&persisted, &status));
+    if unchanged {
+        return;
+    }
+    let persisted = match store.set_typed(
         data_dir,
         None,
         SIFS_MOUNT_STATUS_CONFIG_KEY,
         &status,
         ConfigWriteTarget::Local,
     ) {
-        tracing::warn!("persist SIFS mount status: {error}");
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!("persist SIFS mount status: {error}");
+            false
+        }
+    };
+    if persisted && let Ok(mut previous) = inner.persisted_status.lock() {
+        *previous = Some(status.clone());
     }
     publish_observed(inner, status);
+}
+
+fn mount_status_persistence_equal(
+    left: &SifsMountRuntimeStatus,
+    right: &SifsMountRuntimeStatus,
+) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.updated_at.clear();
+    right.updated_at.clear();
+    left == right
 }
 
 fn publish_observed(inner: &SupervisorInner, status: SifsMountRuntimeStatus) {
@@ -790,5 +862,64 @@ mod tests {
         let resolved = configure_managed_sifs_mount(&data_dir, &config).expect("configure");
         assert_eq!(resolved, root.join("mount"));
         assert_eq!(managed_sifs_mount_config(&data_dir).expect("read"), config);
+    }
+
+    #[test]
+    fn mount_status_persistence_ignores_only_observation_time() {
+        let mut current = SifsMountRuntimeStatus {
+            phase: SifsMountRuntimePhase::Mounted,
+            updated_at: "2026-08-29T00:00:00Z".to_string(),
+            ..SifsMountRuntimeStatus::default()
+        };
+        let mut next = current.clone();
+        next.updated_at = "2026-08-29T00:00:01Z".to_string();
+
+        assert!(mount_status_persistence_equal(&current, &next));
+
+        next.pending_operations = 1;
+        assert!(!mount_status_persistence_equal(&current, &next));
+
+        current.pending_operations = 1;
+        assert!(mount_status_persistence_equal(&current, &next));
+    }
+
+    #[test]
+    fn mount_status_persistence_is_transition_driven() {
+        let root = sinomo_testdir::TestDir::new("sifs-mount-status-transition");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data layout");
+        let store = mount_config_store().expect("config store");
+        let inner = SupervisorInner {
+            status: RwLock::new(SifsMountRuntimeStatus::default()),
+            persisted_status: Mutex::new(None),
+            config_dirty: AtomicBool::new(false),
+            shutdown: AtomicBool::new(false),
+            wake: Arc::new(SupervisorWake::default()),
+            worker: Mutex::new(None),
+        };
+        let initial = SifsMountRuntimeStatus {
+            phase: SifsMountRuntimePhase::Mounted,
+            updated_at: "2026-08-29T00:00:00Z".to_string(),
+            ..SifsMountRuntimeStatus::default()
+        };
+
+        publish(&store, &data_dir, &inner, initial.clone());
+        let mut timestamp_only = initial.clone();
+        timestamp_only.updated_at = "2026-08-29T00:00:01Z".to_string();
+        publish(&store, &data_dir, &inner, timestamp_only);
+
+        let persisted = store
+            .get_typed::<SifsMountRuntimeStatus>(&data_dir, None, SIFS_MOUNT_STATUS_CONFIG_KEY)
+            .expect("persisted status");
+        assert_eq!(persisted.updated_at, initial.updated_at);
+
+        let mut changed = initial;
+        changed.pending_operations = 1;
+        changed.updated_at = "2026-08-29T00:00:02Z".to_string();
+        publish(&store, &data_dir, &inner, changed.clone());
+        let persisted = store
+            .get_typed::<SifsMountRuntimeStatus>(&data_dir, None, SIFS_MOUNT_STATUS_CONFIG_KEY)
+            .expect("updated persisted status");
+        assert_eq!(persisted, changed);
     }
 }
