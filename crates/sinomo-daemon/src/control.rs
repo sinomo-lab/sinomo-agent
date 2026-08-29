@@ -977,6 +977,7 @@ pub fn run_daemon_control_loop_with_catalog_and_profile(
         tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
     }
     sinomo_observe::register_builtin_observe_metric_exporters();
+    crate::dfs::register_daemon_dfs_observe_metric_exporter();
     let startup_local_raft_resident_initialized =
         match prune_local_cluster_raft_uncommitted_tail(&paths) {
             Ok(initialized) => initialized,

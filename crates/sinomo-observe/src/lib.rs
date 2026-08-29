@@ -32,7 +32,7 @@ use sinomo_observe_contract::{
     ObserveMetricExportRequest, ObserveMetricExportResponse,
 };
 
-pub use builtin_metrics::register_builtin_observe_metric_exporters;
+pub use builtin_metrics::{dfs_status_observe_metrics, register_builtin_observe_metric_exporters};
 pub use cli::{
     ObserveCliCommandHandler, observe_cli_command_handler,
     observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,

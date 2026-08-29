@@ -629,6 +629,36 @@ impl DfsRuntimeMessageCacheEntry {
         })
     }
 
+    /// Borrow the already-validated process-local resident generation for a
+    /// passive observation. Unlike authority-sensitive admission, this does
+    /// not refresh peer discovery or read durable state: the cache signature
+    /// and retained authority generation are the complete validity fence.
+    pub fn bounded_status_resident_current(
+        &self,
+    ) -> Result<ResidentLocalShardedMetadataBackend, crate::DfsError> {
+        let observed_generation = self.metadata_authority_generation.generation();
+        if self.signature.metadata_authority_generation != observed_generation {
+            return Err(crate::DfsError::Network {
+                message: format!(
+                    "bounded DFS status unavailable while resident metadata authority advances from generation {} to {observed_generation}",
+                    self.signature.metadata_authority_generation
+                ),
+            });
+        }
+        if !self.resident_metadata_initialized {
+            return Err(crate::DfsError::Network {
+                message: "bounded DFS status unavailable because the resident metadata generation is not hydrated"
+                    .to_string(),
+            });
+        }
+        self.resident_metadata_backend.clone().ok_or_else(|| {
+            crate::DfsError::Network {
+                message: "bounded DFS status unavailable because this resident generation has no sharded metadata backend"
+                    .to_string(),
+            }
+        })
+    }
+
     pub fn exact_admission_handle(
         &self,
         peer_snapshot: &DfsRuntimeMessagePeerSnapshot,

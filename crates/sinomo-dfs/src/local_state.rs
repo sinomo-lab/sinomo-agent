@@ -1126,10 +1126,25 @@ pub fn inspect_dfs_status_from_resident_snapshot(
     cluster_paths: &ClusterPaths,
     snapshot: DfsResidentMetadataStatusSnapshot,
 ) -> Result<DfsOperatorStatus, DfsError> {
+    let local_node_id =
+        sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(cluster_paths)
+            .ok()
+            .map(|state| state.local_node_id.clone());
+    let mut status = project_dfs_status_from_resident_snapshot(local_node_id.as_ref(), snapshot);
+    attach_cluster_aware_dfs_maintenance_observations(&mut status, data_dir)?;
+    Ok(status)
+}
+
+/// Project an already-resident DFS generation into operator status without
+/// reading cluster state, repair ledgers, or metadata files.
+pub fn project_dfs_status_from_resident_snapshot(
+    local_node_id: Option<&NodeId>,
+    snapshot: DfsResidentMetadataStatusSnapshot,
+) -> DfsOperatorStatus {
     let DfsResidentMetadataStatusSnapshot {
         summary,
         primary_summary,
-        metadata_shards,
+        mut metadata_shards,
         incomplete_reasons,
         bounded_omissions,
     } = snapshot;
@@ -1139,6 +1154,15 @@ pub fn inspect_dfs_status_from_resident_snapshot(
             .contains(&crate::DfsOperatorStatusMetric::CrossShardNamespaceLockCount)
     }))
     .then_some(summary.cross_shard_namespace_lock_count);
+    if let Some(local_node_id) = local_node_id {
+        for shard in &mut metadata_shards {
+            if shard.primary_node_id.as_ref() == Some(local_node_id) {
+                shard.replay_cursors.clear();
+            } else {
+                shard.replica_lag.clear();
+            }
+        }
+    }
     let mut status = DfsOperatorStatus {
         incomplete_reasons,
         bounded_omissions,
@@ -1157,8 +1181,8 @@ pub fn inspect_dfs_status_from_resident_snapshot(
         metadata_shards,
         repair_attempts: Vec::new(),
     };
-    finalize_dfs_status_projection(data_dir, cluster_paths, &mut status, &primary_summary)?;
-    Ok(status)
+    attach_primary_owned_operational_status(&mut status, &primary_summary);
+    status
 }
 
 /// Return a bounded topology-only status image when no complete resident

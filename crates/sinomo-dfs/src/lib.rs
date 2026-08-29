@@ -344,9 +344,9 @@ pub use local_state::{
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     open_cluster_sharded_dfs_metadata_backend, open_local_metadata_shard_backend,
     open_local_sharded_metadata_backend, open_local_sharded_metadata_backend_for_replica_repair,
-    open_root_local_metadata_backend, read_local_dfs_metadata_shard_write_freeze,
-    remove_local_dfs_pin, resolve_dfs_metadata_root, resolve_dfs_pin_root,
-    with_cached_cluster_aware_dfs_metadata_inspection,
+    open_root_local_metadata_backend, project_dfs_status_from_resident_snapshot,
+    read_local_dfs_metadata_shard_write_freeze, remove_local_dfs_pin, resolve_dfs_metadata_root,
+    resolve_dfs_pin_root, with_cached_cluster_aware_dfs_metadata_inspection,
     with_cached_cluster_aware_dfs_metadata_inspection_with_topology,
 };
 pub(crate) use maintenance::record_anti_entropy_issue;

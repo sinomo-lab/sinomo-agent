@@ -745,6 +745,14 @@ fn dfs_observe_metrics(
             detail: format!("dfs snapshot metric export failed: {source}"),
         },
     )?;
+    Ok(dfs_status_observe_metrics(status))
+}
+
+/// Convert a bounded DFS status image into the built-in metric contract.
+/// Hosts with resident runtimes can use this without reopening durable state.
+pub fn dfs_status_observe_metrics(
+    status: sinomo_dfs::DfsOperatorStatus,
+) -> Vec<crate::ObserveMetricRecord> {
     let mut metrics = vec![
         gauge("sinomo.dfs.filesystems", status.file_system_count),
         gauge("sinomo.dfs.objects", status.object_count),
@@ -822,30 +830,46 @@ fn dfs_observe_metrics(
             ));
         }
     }
-    Ok(metrics)
+    metrics
 }
 
 fn kv_observe_metrics(
     data_dir: &SinomoDataDir,
 ) -> Result<Vec<crate::ObserveMetricRecord>, crate::ObserveError> {
     let cluster_paths = ClusterPaths::new(data_dir);
-    let state = match sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
-        Ok(state) => state,
-        Err(_) if !cluster_paths.state.exists() => return Ok(Vec::new()),
-        Err(source) => {
-            return Err(crate::ObserveError::Runtime {
-                detail: format!("kv snapshot metric export failed to read cluster state: {source}"),
-            });
-        }
-    };
+    let state =
+        match sinomo_core::cluster::read_cluster_state_without_kv_cached_shared(&cluster_paths) {
+            Ok(state) => state,
+            Err(_) if !cluster_paths.state.exists() => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(crate::ObserveError::Runtime {
+                    detail: format!(
+                        "kv snapshot metric export failed to read cluster state: {source}"
+                    ),
+                });
+            }
+        };
     let kv_paths = cluster_paths.kv_paths();
-    let snapshot = sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
-        &kv_paths,
-        state.local_node_id.clone(),
-    )
-    .map_err(|source| crate::ObserveError::Runtime {
-        detail: format!("kv snapshot metric export failed: {source}"),
-    })?;
+    let resident_snapshot =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            &cluster_paths,
+        )
+        .map_err(|source| crate::ObserveError::Runtime {
+            detail: format!("kv resident snapshot metric export failed: {source}"),
+        })?;
+    let durable_snapshot;
+    let snapshot = if let Some(snapshot) = resident_snapshot.as_deref() {
+        snapshot
+    } else {
+        durable_snapshot = sinomo_core::kv::read_cluster_kv_current_snapshot_for_node(
+            &kv_paths,
+            state.local_node_id.clone(),
+        )
+        .map_err(|source| crate::ObserveError::Runtime {
+            detail: format!("kv snapshot metric export failed: {source}"),
+        })?;
+        &durable_snapshot
+    };
     let node_labels = labels([("node_id", state.local_node_id.to_string())]);
     let mut metrics = vec![
         crate::ObserveMetricRecord::gauge(

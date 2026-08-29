@@ -35,6 +35,47 @@ pub(crate) fn daemon_dfs_bounded_status_resident(
     entry.bounded_status_resident(peer_snapshot)
 }
 
+pub(crate) fn register_daemon_dfs_observe_metric_exporter() {
+    sinomo_observe::register_observe_metric_exporter_with_prefixes(
+        "sinomo-dfs",
+        ["sinomo.dfs."],
+        |data_dir| {
+            let (resident, local_node_id) = {
+                let cache = daemon_dfs_message_service_cache().try_lock().map_err(|error| {
+                    sinomo_observe::ObserveError::Runtime {
+                        detail: format!(
+                            "resident DFS observe exporter could not borrow its generation cache: {error}"
+                        ),
+                    }
+                })?;
+                let entry = cache.get(&data_dir.root()).ok_or_else(|| {
+                    sinomo_observe::ObserveError::Runtime {
+                        detail:
+                            "resident DFS observe exporter has no published metadata generation"
+                                .to_string(),
+                    }
+                })?;
+                let resident = entry.bounded_status_resident_current().map_err(|error| {
+                    sinomo_observe::ObserveError::Runtime {
+                        detail: format!("resident DFS observe exporter is unavailable: {error}"),
+                    }
+                })?;
+                (resident, entry.signature.local_node_id.clone())
+            };
+            let snapshot = resident.bounded_status_snapshot().map_err(|error| {
+                sinomo_observe::ObserveError::Runtime {
+                    detail: format!("resident DFS observe snapshot is unavailable: {error}"),
+                }
+            })?;
+            let status = sinomo_dfs::project_dfs_status_from_resident_snapshot(
+                Some(&local_node_id),
+                snapshot,
+            );
+            Ok(sinomo_observe::dfs_status_observe_metrics(status))
+        },
+    );
+}
+
 #[cfg(test)]
 pub(crate) fn record_daemon_dfs_test_message_service_lane_open(data_dir: &SinomoDataDir) {
     let mut opens = DAEMON_DFS_TEST_MESSAGE_SERVICE_LANE_OPENS
