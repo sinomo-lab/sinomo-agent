@@ -26,11 +26,13 @@ use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_CLEAR_STATUS_ROUTE,
     ROLLOUT_DIAGNOSTICS_ROUTE, ROLLOUT_FINALIZE_SHADOW_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
 };
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -39,7 +41,6 @@ pub use sinomo_api::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_core::network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
 pub const DAEMON_AUTH_NONCE_RETENTION_SECONDS: i64 = DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS * 2;
-const DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE: Duration = Duration::from_secs(1);
 pub use sinomo_core::network::SignedDaemonCommand;
 /// In-memory replay-protection nonce sets, keyed by daemon data root. Replacing the
 /// previous per-RPC `auth-nonces.sobjlog` append (a disk read + write on *every*
@@ -51,15 +52,28 @@ static DAEMON_AUTH_NONCES: OnceLock<sinomo_api::ScopedReplayNonceCache<PathBuf>>
 static DAEMON_AUTH_VERIFIER_CONTEXTS: OnceLock<
     Mutex<HashMap<PathBuf, CachedDaemonAuthVerifierContext>>,
 > = OnceLock::new();
+static DAEMON_AUTH_VERIFIER_CONTEXT_GENERATIONS: OnceLock<Mutex<HashMap<PathBuf, u64>>> =
+    OnceLock::new();
+static DAEMON_AUTH_VERIFIER_CONTEXT_WATCHERS: OnceLock<
+    Mutex<HashMap<PathBuf, DaemonAuthVerifierContextWatcher>>,
+> = OnceLock::new();
+static DAEMON_AUTH_VERIFIER_CONTEXT_REARM: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static DAEMON_AUTH_FILE_MARK_READS: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Clone)]
 struct CachedDaemonAuthVerifierContext {
-    mark: DaemonAuthVerifierContextMark,
-    checked_at: Instant,
     main_public_key: String,
     shadow_public_key: Option<String>,
     members_by_node_and_key: BTreeMap<(String, String), DaemonSignerAuthority>,
     members_by_key: BTreeMap<String, DaemonSignerAuthority>,
+}
+
+struct DaemonAuthVerifierContextWatcher {
+    watcher: notify::RecommendedWatcher,
+    watched_paths: BTreeSet<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -771,9 +785,7 @@ fn authorize_daemon_signer_after_membership_refresh(
 fn load_uncached_daemon_auth_verifier_context(
     data_dir: &Path,
 ) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
-    let checked_at = Instant::now();
-    let mark = daemon_auth_verifier_context_mark(data_dir)?;
-    load_daemon_auth_verifier_context(data_dir, mark, checked_at)
+    load_daemon_auth_verifier_context(data_dir)
 }
 
 fn replace_cached_daemon_auth_verifier_context(
@@ -794,6 +806,179 @@ fn replace_cached_daemon_auth_verifier_context(
             guard.remove(data_dir);
         }
     }
+}
+
+fn invalidate_cached_daemon_auth_verifier_context(data_dir: &Path) {
+    let root = data_dir.to_path_buf();
+    if let Ok(mut generations) = DAEMON_AUTH_VERIFIER_CONTEXT_GENERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        let generation = generations.entry(root.clone()).or_default();
+        *generation = generation.saturating_add(1);
+    }
+    replace_cached_daemon_auth_verifier_context(&root, None);
+}
+
+fn request_daemon_auth_verifier_context_rearm(data_dir: &Path) {
+    if let Ok(mut roots) = DAEMON_AUTH_VERIFIER_CONTEXT_REARM
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+    {
+        roots.insert(data_dir.to_path_buf());
+    }
+}
+
+fn daemon_auth_verifier_context_generation(data_dir: &Path) -> Result<u64, DaemonError> {
+    DAEMON_AUTH_VERIFIER_CONTEXT_GENERATIONS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map(|generations| generations.get(data_dir).copied().unwrap_or_default())
+        .map_err(|source| DaemonError::Io {
+            path: data_dir.display().to_string(),
+            detail: source.to_string(),
+        })
+}
+
+fn daemon_auth_verifier_context_paths(data_dir: &Path) -> BTreeSet<PathBuf> {
+    let identity_paths = NodeIdentityPaths::new(data_dir);
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let kv_snapshot = cluster_paths.kv_paths().snapshot;
+    [
+        identity_paths.main,
+        identity_paths.shadow,
+        cluster_paths.state,
+        kv_snapshot,
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn daemon_auth_verifier_event_invalidates(
+    event: &notify::Event,
+    watched_paths: &BTreeSet<PathBuf>,
+) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
+        && event.paths.iter().any(|path| watched_paths.contains(path))
+}
+
+fn handle_daemon_auth_verifier_event(
+    data_dir: &Path,
+    watched_paths: &BTreeSet<PathBuf>,
+    event: &notify::Event,
+) {
+    if daemon_auth_verifier_event_invalidates(event, watched_paths) {
+        // Atomic replacement retires a file's inotify watch along with the old
+        // inode. The next verifier lookup re-arms direct file watches after it
+        // observes this invalidation.
+        request_daemon_auth_verifier_context_rearm(data_dir);
+        invalidate_cached_daemon_auth_verifier_context(data_dir);
+    }
+}
+
+fn daemon_auth_verifier_watch_paths(data_dir: &Path) -> BTreeSet<PathBuf> {
+    let mut watch_paths = BTreeSet::new();
+    let identity_paths = NodeIdentityPaths::new(data_dir);
+    // Main and shadow identities share one quiet directory. Watching it also
+    // observes first creation of an optional shadow identity without watching
+    // the noisy data-root directory.
+    if let Some(identity_dir) = identity_paths.main.parent() {
+        watch_paths.insert(identity_dir.to_path_buf());
+    }
+    let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
+    let kv_snapshot = cluster_paths.kv_paths().snapshot;
+    for path in [cluster_paths.state, kv_snapshot] {
+        if path.exists() {
+            watch_paths.insert(path);
+        } else if let Some(parent) = path.parent() {
+            // Cluster initialization may not have materialized the target yet.
+            // This parent watch is replaced by a direct file watch immediately
+            // after the first relevant creation event.
+            watch_paths.insert(parent.to_path_buf());
+        }
+    }
+    watch_paths
+}
+
+fn ensure_daemon_auth_verifier_context_watcher(data_dir: &Path) -> Result<(), DaemonError> {
+    let root = data_dir.to_path_buf();
+    let watched_paths = daemon_auth_verifier_context_paths(data_dir);
+    let rearm_requested = DAEMON_AUTH_VERIFIER_CONTEXT_REARM
+        .get_or_init(|| Mutex::new(BTreeSet::new()))
+        .lock()
+        .map_err(|source| DaemonError::Io {
+            path: root.display().to_string(),
+            detail: source.to_string(),
+        })?
+        .remove(&root);
+    let mut watchers = DAEMON_AUTH_VERIFIER_CONTEXT_WATCHERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|source| DaemonError::Io {
+            path: root.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if watchers.contains_key(&root) && !rearm_requested {
+        return Ok(());
+    }
+
+    let watch_paths = daemon_auth_verifier_watch_paths(data_dir);
+    if let Some(registered) = watchers.get_mut(&root) {
+        for path in std::mem::take(&mut registered.watched_paths) {
+            let _ = notify::Watcher::unwatch(&mut registered.watcher, &path);
+        }
+        for path in &watch_paths {
+            notify::Watcher::watch(
+                &mut registered.watcher,
+                path,
+                notify::RecursiveMode::NonRecursive,
+            )
+            .map_err(|source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: format!("re-arm authentication authority watch: {source}"),
+            })?;
+        }
+        registered.watched_paths = watch_paths;
+        return Ok(());
+    }
+
+    let callback_root = root.clone();
+    let callback_paths = watched_paths.clone();
+    let mut watcher =
+        notify::recommended_watcher(move |result: notify::Result<notify::Event>| match result {
+            Ok(event) => {
+                handle_daemon_auth_verifier_event(&callback_root, &callback_paths, &event);
+            }
+            Err(error) => {
+                request_daemon_auth_verifier_context_rearm(&callback_root);
+                invalidate_cached_daemon_auth_verifier_context(&callback_root);
+                tracing::warn!(
+                    data_dir = %callback_root.display(),
+                    %error,
+                    "authentication authority watcher failed; invalidated cached verifier context"
+                );
+            }
+        })
+        .map_err(|source| DaemonError::Io {
+            path: root.display().to_string(),
+            detail: format!("start authentication authority watcher: {source}"),
+        })?;
+    for path in &watch_paths {
+        notify::Watcher::watch(&mut watcher, path, notify::RecursiveMode::NonRecursive).map_err(
+            |source| DaemonError::Io {
+                path: path.display().to_string(),
+                detail: format!("watch authentication authority path: {source}"),
+            },
+        )?;
+    }
+    watchers.insert(
+        root,
+        DaemonAuthVerifierContextWatcher {
+            watcher,
+            watched_paths: watch_paths,
+        },
+    );
+    Ok(())
 }
 
 fn refresh_daemon_auth_membership_snapshot(data_dir: &Path) -> Result<(), DaemonError> {
@@ -912,7 +1097,6 @@ fn cached_daemon_auth_verifier_context(
     data_dir: &Path,
 ) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
     let root = data_dir.to_path_buf();
-    let checked_at = Instant::now();
     {
         let guard = DAEMON_AUTH_VERIFIER_CONTEXTS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -921,33 +1105,22 @@ fn cached_daemon_auth_verifier_context(
                 path: root.display().to_string(),
                 detail: source.to_string(),
             })?;
-        if let Some(cached) = guard.get(&root)
-            && checked_at.duration_since(cached.checked_at) < DAEMON_AUTH_VERIFIER_CONTEXT_MAX_AGE
-        {
+        if let Some(cached) = guard.get(&root) {
             return Ok(cached.clone());
         }
     }
 
+    // Authority files are replaced atomically by their owners. Watch their
+    // parent directories before loading so steady authentication never polls
+    // filesystem metadata, while cross-process identity and membership changes
+    // still invalidate this process's verifier immediately.
+    ensure_daemon_auth_verifier_context_watcher(data_dir)?;
+    let generation = daemon_auth_verifier_context_generation(data_dir)?;
     let mark = daemon_auth_verifier_context_mark(data_dir)?;
-    {
-        let mut guard = DAEMON_AUTH_VERIFIER_CONTEXTS
-            .get_or_init(|| Mutex::new(HashMap::new()))
-            .lock()
-            .map_err(|source| DaemonError::Io {
-                path: root.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        if let Some(cached) = guard.get_mut(&root)
-            && cached.mark == mark
-        {
-            cached.checked_at = checked_at;
-            return Ok(cached.clone());
-        }
-    }
-
-    let loaded = load_daemon_auth_verifier_context(data_dir, mark, checked_at)?;
+    let loaded = load_daemon_auth_verifier_context(data_dir)?;
     let after_mark = daemon_auth_verifier_context_mark(data_dir)?;
-    if after_mark == mark {
+    let after_generation = daemon_auth_verifier_context_generation(data_dir)?;
+    if after_mark == mark && after_generation == generation {
         let mut guard = DAEMON_AUTH_VERIFIER_CONTEXTS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
@@ -964,8 +1137,6 @@ fn cached_daemon_auth_verifier_context(
 
 fn load_daemon_auth_verifier_context(
     data_dir: &Path,
-    mark: DaemonAuthVerifierContextMark,
-    checked_at: Instant,
 ) -> Result<CachedDaemonAuthVerifierContext, DaemonError> {
     let identity_paths = NodeIdentityPaths::new(data_dir);
     let main_identity = load_existing_node_identity(&identity_paths.main)?;
@@ -992,8 +1163,6 @@ fn load_daemon_auth_verifier_context(
     }
 
     Ok(CachedDaemonAuthVerifierContext {
-        mark,
-        checked_at,
         main_public_key: main_identity.public_key,
         shadow_public_key: shadow_identity.map(|identity| identity.public_key),
         members_by_node_and_key,
@@ -1015,6 +1184,8 @@ fn daemon_auth_verifier_context_mark(
 }
 
 fn daemon_auth_file_mark(path: &Path) -> Result<DaemonAuthFileMark, DaemonError> {
+    #[cfg(test)]
+    DAEMON_AUTH_FILE_MARK_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
     match fs::metadata(path) {
         Ok(metadata) => Ok(DaemonAuthFileMark {
             exists: true,
@@ -1233,6 +1404,73 @@ mod tests {
             daemon_auth_membership_rpc_options(Duration::from_secs(5))
                 .destination_process_affinity(),
             sinomo_core::network::DestinationProcessAffinity::MainDaemon
+        );
+    }
+
+    #[test]
+    fn auth_verifier_cache_hits_do_not_touch_authority_files() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-event-cache-hit");
+        let data_dir = SinomoDataDir::new(&data_root);
+        load_or_create_main_node_identity(&data_root).expect("main identity");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        std::fs::create_dir_all(
+            cluster_paths
+                .kv_paths()
+                .snapshot
+                .parent()
+                .expect("KV snapshot parent"),
+        )
+        .expect("KV snapshot directory");
+
+        DAEMON_AUTH_FILE_MARK_READS.with(|reads| reads.set(0));
+        let first = cached_daemon_auth_verifier_context(&data_root).expect("first verifier");
+        let reads_after_load = DAEMON_AUTH_FILE_MARK_READS.with(Cell::get);
+        assert!(reads_after_load > 0);
+
+        let second = cached_daemon_auth_verifier_context(&data_root).expect("cached verifier");
+        assert_eq!(first.main_public_key, second.main_public_key);
+        assert_eq!(
+            DAEMON_AUTH_FILE_MARK_READS.with(Cell::get),
+            reads_after_load,
+            "a steady cache hit must not poll authority-file metadata"
+        );
+    }
+
+    #[test]
+    fn auth_verifier_events_ignore_reads_and_invalidate_changes() {
+        let data_root = unique_auth_test_root("sinomo-daemon-auth-event-invalidation");
+        let watched_paths = daemon_auth_verifier_context_paths(&data_root);
+        let watched = watched_paths.iter().next().expect("watched path").clone();
+        let unrelated = data_root.join("unrelated.sobj");
+        let before = daemon_auth_verifier_context_generation(&data_root).expect("generation");
+
+        let access = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Read))
+            .add_path(watched.clone());
+        handle_daemon_auth_verifier_event(&data_root, &watched_paths, &access);
+        assert_eq!(
+            daemon_auth_verifier_context_generation(&data_root).expect("access generation"),
+            before
+        );
+
+        let unrelated_change = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(unrelated);
+        handle_daemon_auth_verifier_event(&data_root, &watched_paths, &unrelated_change);
+        assert_eq!(
+            daemon_auth_verifier_context_generation(&data_root).expect("unrelated generation"),
+            before
+        );
+
+        let authority_change = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(watched);
+        handle_daemon_auth_verifier_event(&data_root, &watched_paths, &authority_change);
+        assert_eq!(
+            daemon_auth_verifier_context_generation(&data_root).expect("changed generation"),
+            before.saturating_add(1)
         );
     }
 
