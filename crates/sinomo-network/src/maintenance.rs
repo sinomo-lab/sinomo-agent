@@ -6,11 +6,11 @@ pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 // audit is only the quiet-cluster safety net; running it every minute on every
 // workstation/server creates continuous control traffic with no fresher
 // authority guarantee (connectivity evidence itself is valid for 15 minutes).
-pub const CLUSTER_NETWORK_PUBLISH_INTERVAL: Duration = Duration::from_secs(2 * 60);
+pub const CLUSTER_NETWORK_PUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
 pub const CLUSTER_NETWORK_SENSOR_PUBLISH_INTERVAL: Duration = Duration::from_secs(900);
 pub const CLUSTER_NETWORK_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
-pub const CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(2 * 60);
+pub const CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const CLUSTER_NETWORK_MOBILE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 pub const CLUSTER_NETWORK_SENSOR_PROBE_INTERVAL: Duration = Duration::from_secs(900);
 pub const CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL: Duration = Duration::from_millis(250);
