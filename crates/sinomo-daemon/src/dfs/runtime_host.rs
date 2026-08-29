@@ -661,9 +661,8 @@ pub(crate) use maintenance_host::{
 
 mod placement_environment;
 pub(crate) use placement_environment::{
-    cached_daemon_dfs_placement_snapshot_cache,
-    refresh_daemon_dfs_remote_placement_observation_on_runtime,
-    refresh_daemon_dfs_storage_environment_on_runtime,
+    cached_daemon_dfs_placement_snapshot_cache, refresh_daemon_dfs_storage_environment_on_runtime,
+    subscribe_daemon_dfs_remote_placement_observation,
 };
 use placement_environment::{
     daemon_dfs_local_content_advertisement, refresh_daemon_dfs_placement_snapshot,

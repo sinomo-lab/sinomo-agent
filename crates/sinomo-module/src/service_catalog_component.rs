@@ -10,7 +10,6 @@ use sinomo_core::service::ServiceRegistrySnapshot;
 use crate::{ComponentDescriptor, ComponentError, StaticComponentFactory};
 
 pub const SERVICE_CATALOG_PUBLISHER_COMPONENT_ID: &str = "sinomo.cluster.service-catalog-publisher";
-const SERVICE_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const SERVICE_CATALOG_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SERVICE_CATALOG_RETRY_MAX: Duration = Duration::from_secs(30);
 
@@ -91,7 +90,6 @@ async fn run_service_catalog_publisher(
                         }
                         let _ = versions.borrow_and_update();
                     }
-                    _ = tokio::time::sleep(SERVICE_CATALOG_REFRESH_INTERVAL) => {}
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
                             break;
@@ -176,6 +174,34 @@ mod tests {
         })
         .await
         .expect("generation publication");
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher task");
+    }
+
+    #[tokio::test]
+    async fn stable_registry_parks_after_successful_publication() {
+        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_service_catalog_publisher(
+            host.clone(),
+            registry.clone(),
+            shutdown_rx,
+        ));
+        registry
+            .replace_registry(sinomo_core::service::ServiceRegistry::default())
+            .expect("publish reconciled registry");
+        while host.0.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            1,
+            "an unchanged service generation must remain parked"
+        );
+
         shutdown_tx.send_replace(true);
         task.await.expect("publisher task");
     }

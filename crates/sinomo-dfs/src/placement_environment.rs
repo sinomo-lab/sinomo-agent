@@ -19,8 +19,11 @@ use time::OffsetDateTime;
 
 pub const DFS_PLACEMENT_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 pub const DFS_NODE_HEALTH_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(20);
-pub const DEFAULT_DFS_STORAGE_OBSERVATION_TTL: Duration = Duration::from_secs(90);
+/// A bounded safety audit for capacity changes made outside Sinomo. Normal
+/// placement updates are driven by committed control-plane generations; idle
+/// nodes must not rescan their filesystem every few seconds.
+pub const DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_DFS_STORAGE_OBSERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 pub const DEFAULT_DFS_STORAGE_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const DFS_STORAGE_RECOVERY_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
 const DFS_ADVERTISEMENT_TRANSITION_SAMPLES: u8 = 2;
@@ -562,7 +565,7 @@ impl DfsDeviceHealthMonitor {
         if self.last_sampled_at.is_some_and(|last| {
             now - last
                 < time::Duration::try_from(DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL)
-                    .unwrap_or(time::Duration::seconds(20))
+                    .unwrap_or(time::Duration::minutes(5))
         }) {
             return self.cached_snapshot();
         }
@@ -666,7 +669,7 @@ impl DfsDeviceHealthMonitor {
         desired.updated_at = now;
         desired.expires_at = Some(
             now + time::Duration::try_from(DEFAULT_DFS_STORAGE_OBSERVATION_TTL)
-                .unwrap_or(time::Duration::seconds(90)),
+                .unwrap_or(time::Duration::minutes(15)),
         );
 
         if self.last_advertisement_evaluated_sequence == Some(snapshot.sequence)

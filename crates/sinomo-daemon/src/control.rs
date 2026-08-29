@@ -10,9 +10,9 @@ use crate::dfs::{
     daemon_dfs_repair_queue_work_is_known, evict_daemon_dfs_message_service_cache_on_shutdown,
     notify_daemon_dfs_maintenance_work,
     notify_daemon_dfs_metadata_publish_route_generation_on_runtime,
-    refresh_daemon_dfs_remote_placement_observation_on_runtime,
     refresh_daemon_dfs_storage_environment_on_runtime, register_daemon_dfs_data_owner_lock,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
+    subscribe_daemon_dfs_remote_placement_observation,
 };
 use crate::{
     AuthenticatedDaemonCommand, DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR, DaemonClusterStatus,
@@ -360,7 +360,7 @@ fn daemon_network_environment_watch_enabled_for(value: Option<&str>, is_linux: b
 struct DaemonConnectivityTopologySubscriptions {
     _snapshot_subscription: sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription,
     _delta_subscription: sinomo_core::cluster::ClusterKvCommittedDeltaSubscription,
-    _external_snapshot_watcher: notify::RecommendedWatcher,
+    _external_snapshot_watcher: Option<notify::RecommendedWatcher>,
     // The callbacks retain this too. Keeping it here makes the ownership
     // explicit and lets focused tests inspect the independent observer.
     _projection: Arc<Mutex<DaemonConnectivityTopologyProjection>>,
@@ -578,8 +578,12 @@ fn subscribe_daemon_connectivity_topology_sources(
         sinomo_core::cluster::subscribe_cluster_kv_committed_deltas(&cluster_paths, move |delta| {
             delta_observer.observe_delta(delta)
         });
-    let external_snapshot_watcher =
-        daemon_connectivity_topology_snapshot_watcher(&cluster_paths, observer)?;
+    // Main-daemon Raft/read-model mutations publish exact process-local
+    // snapshot and delta callbacks above. Only the storage-fenced shadow needs
+    // a filesystem bridge for generations written by the main process.
+    let external_snapshot_watcher = crate::daemon_paths_are_shadow(paths)
+        .then(|| daemon_connectivity_topology_snapshot_watcher(&cluster_paths, observer))
+        .transpose()?;
     // Close the register/read race without creating a synthetic startup wake:
     // the maintenance owner already performs one startup reconciliation, and
     // callbacks are blocked on this projection lock until the coherent sample
@@ -1468,29 +1472,22 @@ async fn run_daemon_dfs_storage_environment_runtime_task(
 
 async fn run_daemon_dfs_remote_placement_observation_runtime_task(
     paths: DaemonPaths,
-    runtime: tokio::runtime::Handle,
+    _runtime: tokio::runtime::Handle,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    loop {
-        if daemon_shutdown_requested(&shutdown_rx) {
-            break;
-        }
-        if !daemon_rollout_handoff_pending(&paths)
-            && let Err(error) =
-                refresh_daemon_dfs_remote_placement_observation_on_runtime(&paths, &runtime).await
-        {
+    let _subscription = match subscribe_daemon_dfs_remote_placement_observation(&paths) {
+        Ok(subscription) => subscription,
+        Err(error) => {
             tracing::warn!(
                 target: "sinomo.dfs.placement",
-                "DFS remote placement observation failed: {error}"
+                "DFS remote placement subscription failed: {error}"
             );
+            None
         }
-        tokio::select! {
-            _ = tokio::time::sleep(DAEMON_DFS_STORAGE_SAMPLE_INTERVAL) => {}
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
-                    break;
-                }
-            }
+    };
+    while !daemon_shutdown_requested(&shutdown_rx) {
+        if shutdown_rx.changed().await.is_err() {
+            break;
         }
     }
 }
@@ -5209,7 +5206,7 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("daemon-connectivity-external-critical-snapshot");
         let data_dir = SinomoDataDir::new(&root);
         data_dir.ensure_root_layout().expect("data layout");
-        let daemon_paths = DaemonPaths::new(&data_dir);
+        let daemon_paths = DaemonPaths::for_shadow(&data_dir);
         daemon_paths.ensure().expect("daemon paths");
         let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
         cluster_paths.ensure().expect("cluster paths");

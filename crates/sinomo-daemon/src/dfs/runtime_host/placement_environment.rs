@@ -1,5 +1,4 @@
 use super::*;
-use sinomo_core::cluster::ClusterKvPathsExt;
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 
@@ -11,7 +10,7 @@ struct DaemonDfsPlacementEnvironment {
     metering_sampled_at: Option<Instant>,
     last_published_local_advertisement: Option<sinomo_dfs::DfsNodeAdvertisement>,
     advertisements: BTreeMap<NodeId, sinomo_dfs::DfsNodeAdvertisement>,
-    next_remote_observation_index: usize,
+    remote_projection_revision: u64,
 }
 
 static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
@@ -19,7 +18,7 @@ static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
 > = OnceLock::new();
 
 const DAEMON_DFS_METERING_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-const DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN: time::Duration = time::Duration::seconds(30);
+const DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN: time::Duration = time::Duration::minutes(5);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DAEMON_DFS_METERING_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -50,7 +49,7 @@ fn with_placement_environment<R>(
             metering_sampled_at: None,
             last_published_local_advertisement: None,
             advertisements: BTreeMap::new(),
-            next_remote_observation_index: 0,
+            remote_projection_revision: 0,
         });
     operation(environment)
 }
@@ -297,16 +296,9 @@ pub(crate) async fn refresh_daemon_dfs_storage_environment_on_runtime(
     Ok(published)
 }
 
-struct PreparedDaemonDfsRemotePlacementObservation {
-    data_dir: SinomoDataDir,
-    cluster_paths: ClusterPaths,
-    local_node_id: NodeId,
-    remote_node_id: Option<NodeId>,
-}
-
-fn prepare_daemon_dfs_remote_placement_observation(
+fn prepare_daemon_dfs_remote_placement_subscription(
     paths: &DaemonPaths,
-) -> Result<Option<PreparedDaemonDfsRemotePlacementObservation>, DaemonError> {
+) -> Result<Option<(SinomoDataDir, ClusterPaths, NodeId)>, DaemonError> {
     if crate::daemon_paths_are_shadow(paths) {
         return Ok(None);
     }
@@ -316,110 +308,107 @@ fn prepare_daemon_dfs_remote_placement_observation(
         return Ok(None);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let mut remote_node_ids = state
-        .members
-        .iter()
-        .map(|member| member.node_id.clone())
-        .filter(|node_id| node_id != &state.local_node_id)
-        .collect::<Vec<_>>();
-    remote_node_ids.sort();
-    remote_node_ids.dedup();
-    let remote_node_id_set = remote_node_ids.iter().cloned().collect::<BTreeSet<_>>();
-    let remote_node_id =
-        with_placement_environment(&data_dir, &state.local_node_id, |environment| {
-            environment.advertisements.retain(|node_id, _| {
-                node_id == &state.local_node_id || remote_node_id_set.contains(node_id)
-            });
-            if remote_node_ids.is_empty() {
-                environment.next_remote_observation_index = 0;
-                None
-            } else {
-                let index = environment.next_remote_observation_index % remote_node_ids.len();
-                environment.next_remote_observation_index = index.saturating_add(1);
-                Some(remote_node_ids[index].clone())
-            }
-        });
-    Ok(Some(PreparedDaemonDfsRemotePlacementObservation {
-        data_dir,
-        cluster_paths,
-        local_node_id: state.local_node_id,
-        remote_node_id,
-    }))
+    Ok(Some((data_dir, cluster_paths, state.local_node_id)))
 }
 
-pub(crate) async fn refresh_daemon_dfs_remote_placement_observation_on_runtime(
-    paths: &DaemonPaths,
-    _runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    let prepare_paths = paths.clone();
-    let Some(prepared) = tokio::task::spawn_blocking(move || {
-        prepare_daemon_dfs_remote_placement_observation(&prepare_paths)
-    })
-    .await
-    .map_err(|error| DaemonError::Network {
-        address: "DFS remote placement observation preparation".to_string(),
-        detail: error.to_string(),
-    })??
-    else {
-        return Ok(());
-    };
-    let PreparedDaemonDfsRemotePlacementObservation {
-        data_dir,
-        cluster_paths,
-        local_node_id,
-        remote_node_id,
-    } = prepared;
-    tokio::task::spawn_blocking(move || -> Result<(), DaemonError> {
-        // Placement advertisements are leased observations, not authority.
-        // Read the replicated local projection so telemetry cannot consume or
-        // queue behind Raft ReadIndex. Expired records remain present only as
-        // stale/unknown evidence and are never treated as healthy, fast, or
-        // unmetered by the snapshot planner.
-        let remote_advertisement = remote_node_id
-            .as_ref()
-            .map(|remote_node_id| {
-                sinomo_core::kv::read_cluster_kv_entry(
-                    &cluster_paths.kv_paths(),
-                    &sinomo_dfs::content_service_key(remote_node_id),
-                )
-                .and_then(|entry| {
-                    entry
-                        .map(|entry| entry.decode::<sinomo_dfs::DfsNodeAdvertisement>())
-                        .transpose()
-                })
-            })
-            .transpose()?
-            .flatten();
-        let advertisements = with_placement_environment(&data_dir, &local_node_id, |environment| {
-            if let Some(remote_node_id) = remote_node_id {
-                if let Some(advertisement) = remote_advertisement {
-                    environment
-                        .advertisements
-                        .insert(remote_node_id, advertisement);
-                } else {
-                    environment.advertisements.remove(&remote_node_id);
-                }
-            }
+fn observe_daemon_dfs_remote_placement_snapshot(
+    data_dir: &SinomoDataDir,
+    cluster_paths: &ClusterPaths,
+    local_node_id: &NodeId,
+    snapshot: &sinomo_core::kv::KvSnapshot,
+) {
+    let revision = snapshot.revision.0;
+    let member_node_ids = snapshot
+        .prefix_entries("/cluster/members/")
+        .filter_map(|entry| entry.decode::<sinomo_core::ClusterMemberRecord>().ok())
+        .filter(|member| member.state.is_authorized())
+        .map(|member| member.node_id)
+        .collect::<BTreeSet<_>>();
+    let remote_advertisements = snapshot
+        .prefix_entries(sinomo_dfs::content_services_prefix())
+        .filter_map(|entry| entry.decode::<sinomo_dfs::DfsNodeAdvertisement>().ok())
+        .filter(|advertisement| {
+            advertisement.node_id != *local_node_id
+                && member_node_ids.contains(&advertisement.node_id)
+        })
+        .map(|advertisement| (advertisement.node_id.clone(), advertisement))
+        .collect::<BTreeMap<_, _>>();
+    let advertisements = with_placement_environment(data_dir, local_node_id, |environment| {
+        if revision < environment.remote_projection_revision {
+            return None;
+        }
+        environment.remote_projection_revision = revision;
+        let current_remote = environment
+            .advertisements
+            .iter()
+            .filter(|(node_id, _)| *node_id != local_node_id)
+            .map(|(node_id, advertisement)| (node_id.clone(), advertisement.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if current_remote == remote_advertisements {
+            return None;
+        }
+        environment
+            .advertisements
+            .retain(|node_id, _| node_id == local_node_id);
+        environment.advertisements.extend(remote_advertisements);
+        Some(
             environment
                 .advertisements
                 .values()
                 .cloned()
-                .collect::<Vec<_>>()
-        });
+                .collect::<Vec<_>>(),
+        )
+    });
+    if let Some(advertisements) = advertisements {
         refresh_daemon_dfs_placement_snapshot(
+            data_dir,
+            cluster_paths,
+            local_node_id,
+            advertisements,
+        );
+    }
+}
+
+pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
+    paths: &DaemonPaths,
+) -> Result<Option<sinomo_core::cluster::ClusterKvCommittedSnapshotSubscription>, DaemonError> {
+    let Some((data_dir, cluster_paths, local_node_id)) =
+        prepare_daemon_dfs_remote_placement_subscription(paths)?
+    else {
+        return Ok(None);
+    };
+    let callback_data_dir = data_dir.clone();
+    let callback_cluster_paths = cluster_paths.clone();
+    let callback_local_node_id = local_node_id.clone();
+    let subscription = sinomo_core::cluster::subscribe_cluster_kv_committed_snapshots(
+        &cluster_paths,
+        move |snapshot| {
+            observe_daemon_dfs_remote_placement_snapshot(
+                &callback_data_dir,
+                &callback_cluster_paths,
+                &callback_local_node_id,
+                snapshot,
+            );
+        },
+    );
+    // Register before seeding. The revision fence makes a callback that races
+    // this read win over an older snapshot, while the latest observed read
+    // closes the registration gap without a periodic filesystem scan.
+    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+        &cluster_paths,
+    ) {
+        Ok(Some(snapshot)) => observe_daemon_dfs_remote_placement_snapshot(
             &data_dir,
             &cluster_paths,
             &local_node_id,
-            advertisements,
-        );
-        Ok(())
-    })
-    .await
-    .map_err(|error| DaemonError::Network {
-        address: "DFS remote placement snapshot cache".to_string(),
-        detail: error.to_string(),
-    })??;
-    Ok(())
+            snapshot.as_ref(),
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            "DFS remote placement subscription started without an initial projection: {error}"
+        ),
+    }
+    Ok(Some(subscription))
 }
 
 fn daemon_advertisement_semantics_equal(
@@ -695,6 +684,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn committed_snapshot_updates_remote_placement_without_polling() {
+        let root = sinomo_testdir::TestDir::new("daemon-dfs-remote-placement-subscription");
+        let data_dir = SinomoDataDir::new(&root);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let now = time::OffsetDateTime::now_utc();
+        let cluster_id = sinomo_core::node::ClusterId::from_legacy_named(
+            "cluster_dfs_remote_placement_subscription",
+        )
+        .expect("cluster");
+        let local = NodeId::from_legacy_named("node_dfs_remote_placement_local").expect("local");
+        let remote = NodeId::from_legacy_named("node_dfs_remote_placement_remote").expect("remote");
+        let local_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id.clone(),
+            local.clone(),
+            "local",
+            "local-public-key",
+            now,
+        );
+        let remote_member = sinomo_core::ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "remote-public-key",
+            now,
+        );
+        let mut store = sinomo_core::kv::InProcessKvStore::new();
+        store
+            .put_serde(
+                sinomo_core::node::cluster_member_key(&local),
+                &local_member,
+                None,
+            )
+            .expect("local member");
+        store
+            .put_serde(
+                sinomo_core::node::cluster_member_key(&remote),
+                &remote_member,
+                None,
+            )
+            .expect("remote member");
+        let remote_key = sinomo_dfs::content_service_key(&remote);
+        store
+            .put_serde(
+                remote_key.clone(),
+                &sinomo_dfs::DfsNodeAdvertisement::content(remote.clone()),
+                None,
+            )
+            .expect("remote advertisement");
+
+        observe_daemon_dfs_remote_placement_snapshot(
+            &data_dir,
+            &cluster_paths,
+            &local,
+            &store.snapshot().expect("advertised snapshot"),
+        );
+        let cache = cached_daemon_dfs_placement_snapshot_cache(&data_dir, &local);
+        assert!(
+            cache
+                .snapshot()
+                .expect("placement snapshot")
+                .nodes
+                .iter()
+                .any(|node| node.node_id == remote)
+        );
+
+        store.delete(remote_key).expect("remove advertisement");
+        observe_daemon_dfs_remote_placement_snapshot(
+            &data_dir,
+            &cluster_paths,
+            &local,
+            &store.snapshot().expect("removed snapshot"),
+        );
+        assert!(
+            cache
+                .snapshot()
+                .expect("updated placement snapshot")
+                .nodes
+                .iter()
+                .all(|node| node.node_id != remote)
+        );
+    }
+
+    #[test]
     fn advertisement_semantics_ignore_sample_only_measurement_changes() {
         let node_id = NodeId::from_legacy_named("placement-advertisement-node").expect("node");
         let mut left = sinomo_dfs::DfsNodeAdvertisement::content(node_id);
@@ -709,22 +782,24 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_advertisement_renews_only_in_final_lease_third() {
+    fn unchanged_advertisement_renews_only_at_the_safety_margin() {
         let node_id = NodeId::from_legacy_named("placement-advertisement-lease").expect("node");
         let now = time::OffsetDateTime::now_utc();
         let mut current = sinomo_dfs::DfsNodeAdvertisement::content(node_id);
-        current.expires_at = Some(now + time::Duration::seconds(90));
+        let ttl = time::Duration::try_from(sinomo_dfs::DEFAULT_DFS_STORAGE_OBSERVATION_TTL)
+            .expect("storage observation TTL");
+        current.expires_at = Some(now + ttl);
         let desired = current.clone();
 
         assert!(!daemon_advertisement_publish_required(
             Some(&current),
             &desired,
-            now + time::Duration::seconds(59),
+            now + ttl - DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN - time::Duration::seconds(1),
         ));
         assert!(daemon_advertisement_publish_required(
             Some(&current),
             &desired,
-            now + time::Duration::seconds(60),
+            now + ttl - DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN,
         ));
     }
 
