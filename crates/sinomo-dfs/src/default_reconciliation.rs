@@ -394,6 +394,8 @@ pub struct DefaultDfsReconciliationRuntime {
     local_wake_rx: tokio::sync::watch::Receiver<u64>,
     parked_subscription: Arc<Mutex<Option<DefaultDfsParkedHandoff>>>,
     owner_state: DefaultDfsReconciliationState,
+    local_node_id: NodeId,
+    placement_authority_process_identity: Option<crate::DfsPlacementAuthorityProcessIdentity>,
 }
 
 impl std::fmt::Debug for DefaultDfsReconciliationRuntime {
@@ -421,6 +423,7 @@ impl DefaultDfsReconciliationRuntime {
         cluster_paths: &ClusterPaths,
         local_node_id: &NodeId,
         metadata_authority_generation: Option<Arc<crate::DfsMetadataAuthorityRuntime>>,
+        placement_authority_process_identity: Option<crate::DfsPlacementAuthorityProcessIdentity>,
     ) -> Result<Self, crate::DfsError> {
         let local_wake = default_dfs_reconciliation_wake(cluster_paths)?;
         let local_wake_rx = local_wake.generation_tx.subscribe();
@@ -485,6 +488,8 @@ impl DefaultDfsReconciliationRuntime {
             local_wake_rx,
             parked_subscription,
             owner_state: DefaultDfsReconciliationState::new(),
+            local_node_id: local_node_id.clone(),
+            placement_authority_process_identity,
         })
     }
 
@@ -508,7 +513,7 @@ impl DefaultDfsReconciliationRuntime {
     }
 
     pub fn exact_retry_generation(&self) -> DefaultDfsExactRetryGeneration {
-        let current = self.projection_rx.borrow().clone();
+        let current = self.normalized_projection(self.projection_rx.borrow().clone());
         self.owner_state.exact_retry_generation(
             current,
             *self.local_wake_rx.borrow(),
@@ -518,6 +523,7 @@ impl DefaultDfsReconciliationRuntime {
 
     pub fn pending_work(&mut self) -> Option<DefaultDfsReconciliationWork> {
         let current = self.projection_rx.borrow_and_update().clone();
+        let current = self.normalized_projection(current);
         let local_generation = *self.local_wake_rx.borrow_and_update();
         self.owner_state.pending_work(current, local_generation)
     }
@@ -565,6 +571,38 @@ impl DefaultDfsReconciliationRuntime {
             *parked = None;
         }
     }
+
+    fn normalized_projection(
+        &self,
+        projection: DefaultDfsReconciliationProjection,
+    ) -> DefaultDfsReconciliationProjection {
+        normalize_default_dfs_reconciliation_projection_for_process(
+            projection,
+            &self.local_node_id,
+            self.placement_authority_process_identity.as_ref(),
+        )
+    }
+}
+
+fn normalize_default_dfs_reconciliation_projection_for_process(
+    mut projection: DefaultDfsReconciliationProjection,
+    local_node_id: &NodeId,
+    process: Option<&crate::DfsPlacementAuthorityProcessIdentity>,
+) -> DefaultDfsReconciliationProjection {
+    if let (Some(permit), Some(process)) = (projection.placement_authority_permit.as_ref(), process)
+        && crate::control_plane::placement_authority_permit_value_owned_by_process(
+            &permit.value,
+            local_node_id,
+            process,
+        )
+        .unwrap_or(false)
+    {
+        // Current-process placement work is already fenced by this exact
+        // permit. Only a different process incarnation can require the
+        // startup/replacement recovery lane.
+        projection.placement_authority_permit = None;
+    }
+    projection
 }
 
 pub fn notify_default_dfs_reconciliation_replica_progress(cluster_paths: &ClusterPaths) {
@@ -690,6 +728,47 @@ mod tests {
             inputs,
             placement_authority_permit: None,
         }
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestPlacementPermitRecord {
+        job_id: String,
+        holder_id: String,
+        holder_cluster_id: Option<String>,
+        holder_node_id: Option<NodeId>,
+        holder_session_id: Option<String>,
+    }
+
+    #[test]
+    fn current_process_permit_does_not_reopen_recovery_work() {
+        let local_node_id =
+            NodeId::from_legacy_named("default-dfs-current-permit").expect("local node");
+        let process = crate::DfsPlacementAuthorityProcessIdentity {
+            cluster_id: "cluster-current-permit".to_string(),
+            process_session_id: "session-current-permit".to_string(),
+        };
+        let value = sinomo_core::kv::encode_kv_value(&TestPlacementPermitRecord {
+            job_id: "job".to_string(),
+            holder_id: "holder".to_string(),
+            holder_cluster_id: Some(process.cluster_id.clone()),
+            holder_node_id: Some(local_node_id.clone()),
+            holder_session_id: Some(process.process_session_id.clone()),
+        })
+        .expect("encode current permit");
+        let mut current = projection(Vec::new());
+        current.placement_authority_permit = Some(DefaultDfsPermitGeneration {
+            modify_revision: KvRevision(2),
+            version: sinomo_core::kv::KvVersion(1),
+            value,
+        });
+
+        let normalized = normalize_default_dfs_reconciliation_projection_for_process(
+            current,
+            &local_node_id,
+            Some(&process),
+        );
+
+        assert_eq!(normalized.placement_authority_permit, None);
     }
 
     #[test]

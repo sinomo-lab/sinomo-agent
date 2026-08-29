@@ -71,10 +71,15 @@ impl DaemonDefaultDfsReconciliationReactor {
                 .map_err(DaemonError::from)
             })
             .transpose()?;
+        let placement_authority_process_identity = runtime.and_then(|runtime| {
+            let client = DaemonDfsControlPlaneKvClient::new_on_runtime(cluster_paths, runtime);
+            sinomo_dfs::DfsControlPlaneKvClient::placement_authority_process_identity(&client)
+        });
         let owner_runtime = sinomo_dfs::DefaultDfsReconciliationRuntime::new(
             cluster_paths,
             local_node_id,
             metadata_authority_generation,
+            placement_authority_process_identity,
         )?;
         Ok(Self {
             #[cfg(test)]

@@ -392,6 +392,19 @@ pub fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> Strin
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-authority-permit-v1")
 }
 
+pub(crate) fn placement_authority_permit_value_owned_by_process(
+    value: &[u8],
+    local_node_id: &NodeId,
+    process: &DfsPlacementAuthorityProcessIdentity,
+) -> Result<bool, KvError> {
+    let record: DfsPlacementAuthorityPermitRecord = sinomo_core::kv::decode_kv_value(value)?;
+    Ok(
+        record.holder_cluster_id.as_deref() == Some(process.cluster_id.as_str())
+            && record.holder_node_id.as_ref() == Some(local_node_id)
+            && record.holder_session_id.as_deref() == Some(process.process_session_id.as_str()),
+    )
+}
+
 fn placement_authority_permit_holder_kind(
     record: &DfsPlacementAuthorityPermitRecord,
 ) -> DfsPlacementAuthorityPermitHolderKind {
@@ -6086,6 +6099,44 @@ mod tests {
             cluster_id: "placement-test-cluster".to_string(),
             process_session_id: "placement-test-process-session".to_string(),
         }
+    }
+
+    #[test]
+    fn placement_permit_process_match_is_exact() {
+        let process = placement_authority_test_process_identity();
+        let local_node_id = node("placement-permit-process-match");
+        let record = DfsPlacementAuthorityPermitRecord {
+            job_id: "job".to_string(),
+            holder_id: "holder".to_string(),
+            holder_cluster_id: Some(process.cluster_id.clone()),
+            holder_node_id: Some(local_node_id.clone()),
+            holder_session_id: Some(process.process_session_id.clone()),
+        };
+        let value = sinomo_core::kv::encode_kv_value(&record).expect("encode permit");
+
+        assert!(
+            placement_authority_permit_value_owned_by_process(&value, &local_node_id, &process)
+                .expect("match permit")
+        );
+        assert!(
+            !placement_authority_permit_value_owned_by_process(
+                &value,
+                &node("placement-permit-other-node"),
+                &process,
+            )
+            .expect("reject other node")
+        );
+        assert!(
+            !placement_authority_permit_value_owned_by_process(
+                &value,
+                &local_node_id,
+                &DfsPlacementAuthorityProcessIdentity {
+                    cluster_id: process.cluster_id,
+                    process_session_id: "other-session".to_string(),
+                },
+            )
+            .expect("reject other process")
+        );
     }
 
     fn placement_authority_operator_test_cluster_id() -> sinomo_core::Id {
