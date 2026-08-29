@@ -709,7 +709,6 @@ impl DfsMetadataAuthorityState {
             return DfsMetadataAuthorityDeltaObservation::accepted(false);
         }
         if previous_revision < delta.compacted_revision
-            || delta.events.is_empty()
             || !kv_events_cover_revision_range(previous_revision, delta.revision, &delta.events)
         {
             self.invalidate_for_revision_catchup_locked(&mut observed, delta.revision);
@@ -890,6 +889,7 @@ fn kv_events_cover_revision_range(
     events: &[KvEvent],
 ) -> bool {
     current_revision <= previous_revision
+        || (events.is_empty() && current_revision == previous_revision.next())
         || (events.first().map(|event| event.revision) == Some(previous_revision.next())
             && events.last().map(|event| event.revision) == Some(current_revision)
             && events.windows(2).all(|events| {
@@ -986,6 +986,36 @@ mod tests {
         assert_eq!(snapshot.required_revision, KvRevision(3));
         assert!(snapshot.topology_comparison_baseline);
         assert_eq!(snapshot.entry_count, 1);
+    }
+
+    #[test]
+    fn contiguous_noop_delta_advances_without_authoritative_refresh() {
+        let state = DfsMetadataAuthorityState::new();
+        let key = "/dfs/filesystems/sifs/metadata-shards/root";
+        state
+            .install_authoritative_projection(projection(7, vec![entry(key, b"v1", 7, 1)]))
+            .expect("initial projection");
+        let generation = state.generation();
+        let projection_generation = state.projection_generation();
+
+        let observation = state.observe_delta(&ClusterKvCommittedDelta {
+            revision: KvRevision(8),
+            compacted_revision: KvRevision::ZERO,
+            events: Vec::new(),
+            final_key_states: Vec::new(),
+        });
+
+        assert_eq!(
+            observation,
+            DfsMetadataAuthorityDeltaObservation::accepted(false)
+        );
+        assert_eq!(state.generation(), generation);
+        assert_eq!(state.projection_generation(), projection_generation);
+        assert_eq!(
+            state.retained_complete_prefix_revision_for_generation(generation),
+            Some(KvRevision(8)),
+            "a contiguous no-op must retain readiness at the newer revision"
+        );
     }
 
     #[test]
