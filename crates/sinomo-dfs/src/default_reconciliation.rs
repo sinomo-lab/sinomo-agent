@@ -590,16 +590,16 @@ fn normalize_default_dfs_reconciliation_projection_for_process(
     process: Option<&crate::DfsPlacementAuthorityProcessIdentity>,
 ) -> DefaultDfsReconciliationProjection {
     if let (Some(permit), Some(process)) = (projection.placement_authority_permit.as_ref(), process)
-        && crate::control_plane::placement_authority_permit_value_owned_by_process(
+        && !crate::control_plane::placement_authority_permit_value_requires_local_process_recovery(
             &permit.value,
             local_node_id,
             process,
         )
         .unwrap_or(false)
     {
-        // Current-process placement work is already fenced by this exact
-        // permit. Only a different process incarnation can require the
-        // startup/replacement recovery lane.
+        // Current-process and remote-node placement work is already owned by a
+        // live authority. Only this node's prior process incarnation can enter
+        // the automatic startup/replacement recovery lane.
         projection.placement_authority_permit = None;
     }
     projection
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn current_process_permit_does_not_reopen_recovery_work() {
+    fn nonrecoverable_permit_does_not_reopen_recovery_work() {
         let local_node_id =
             NodeId::from_legacy_named("default-dfs-current-permit").expect("local node");
         let process = crate::DfsPlacementAuthorityProcessIdentity {
@@ -769,6 +769,32 @@ mod tests {
         );
 
         assert_eq!(normalized.placement_authority_permit, None);
+
+        let remote_value = sinomo_core::kv::encode_kv_value(&TestPlacementPermitRecord {
+            job_id: "job".to_string(),
+            holder_id: "holder".to_string(),
+            holder_cluster_id: Some(process.cluster_id.clone()),
+            holder_node_id: Some(
+                NodeId::from_legacy_named("default-dfs-remote-permit").expect("remote node"),
+            ),
+            holder_session_id: Some("remote-session".to_string()),
+        })
+        .expect("encode remote permit");
+        let mut remote = projection(Vec::new());
+        remote.placement_authority_permit = Some(DefaultDfsPermitGeneration {
+            modify_revision: KvRevision(3),
+            version: sinomo_core::kv::KvVersion(1),
+            value: remote_value,
+        });
+        assert_eq!(
+            normalize_default_dfs_reconciliation_projection_for_process(
+                remote,
+                &local_node_id,
+                Some(&process),
+            )
+            .placement_authority_permit,
+            None
+        );
     }
 
     #[test]

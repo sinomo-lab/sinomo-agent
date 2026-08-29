@@ -392,7 +392,7 @@ pub fn placement_authority_permit_key(file_system_id: &DfsFileSystemId) -> Strin
     format!("{DFS_KV_PREFIX}/filesystems/{file_system_id}/placement-authority-permit-v1")
 }
 
-pub(crate) fn placement_authority_permit_value_owned_by_process(
+pub(crate) fn placement_authority_permit_value_requires_local_process_recovery(
     value: &[u8],
     local_node_id: &NodeId,
     process: &DfsPlacementAuthorityProcessIdentity,
@@ -401,7 +401,8 @@ pub(crate) fn placement_authority_permit_value_owned_by_process(
     Ok(
         record.holder_cluster_id.as_deref() == Some(process.cluster_id.as_str())
             && record.holder_node_id.as_ref() == Some(local_node_id)
-            && record.holder_session_id.as_deref() == Some(process.process_session_id.as_str()),
+            && record.holder_session_id.is_some()
+            && record.holder_session_id.as_deref() != Some(process.process_session_id.as_str()),
     )
 }
 
@@ -6102,40 +6103,55 @@ mod tests {
     }
 
     #[test]
-    fn placement_permit_process_match_is_exact() {
+    fn placement_permit_recovery_is_scoped_to_prior_local_process() {
         let process = placement_authority_test_process_identity();
         let local_node_id = node("placement-permit-process-match");
-        let record = DfsPlacementAuthorityPermitRecord {
+        let record = |holder_node_id, holder_session_id| DfsPlacementAuthorityPermitRecord {
             job_id: "job".to_string(),
             holder_id: "holder".to_string(),
             holder_cluster_id: Some(process.cluster_id.clone()),
-            holder_node_id: Some(local_node_id.clone()),
-            holder_session_id: Some(process.process_session_id.clone()),
+            holder_node_id: Some(holder_node_id),
+            holder_session_id: Some(holder_session_id),
         };
-        let value = sinomo_core::kv::encode_kv_value(&record).expect("encode permit");
+        let current = sinomo_core::kv::encode_kv_value(&record(
+            local_node_id.clone(),
+            process.process_session_id.clone(),
+        ))
+        .expect("encode current permit");
+        let prior = sinomo_core::kv::encode_kv_value(&record(
+            local_node_id.clone(),
+            "prior-session".to_string(),
+        ))
+        .expect("encode prior permit");
+        let remote = sinomo_core::kv::encode_kv_value(&record(
+            node("placement-permit-other-node"),
+            "remote-session".to_string(),
+        ))
+        .expect("encode remote permit");
 
         assert!(
-            placement_authority_permit_value_owned_by_process(&value, &local_node_id, &process)
-                .expect("match permit")
-        );
-        assert!(
-            !placement_authority_permit_value_owned_by_process(
-                &value,
-                &node("placement-permit-other-node"),
+            !placement_authority_permit_value_requires_local_process_recovery(
+                &current,
+                &local_node_id,
                 &process,
             )
-            .expect("reject other node")
+            .expect("ignore current permit")
         );
         assert!(
-            !placement_authority_permit_value_owned_by_process(
-                &value,
+            placement_authority_permit_value_requires_local_process_recovery(
+                &prior,
                 &local_node_id,
-                &DfsPlacementAuthorityProcessIdentity {
-                    cluster_id: process.cluster_id,
-                    process_session_id: "other-session".to_string(),
-                },
+                &process,
             )
-            .expect("reject other process")
+            .expect("recover prior local permit")
+        );
+        assert!(
+            !placement_authority_permit_value_requires_local_process_recovery(
+                &remote,
+                &local_node_id,
+                &process,
+            )
+            .expect("ignore remote permit")
         );
     }
 
