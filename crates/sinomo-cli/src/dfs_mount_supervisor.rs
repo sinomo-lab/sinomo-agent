@@ -388,7 +388,7 @@ fn start_config_watcher(
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if event
             .ok()
-            .is_some_and(|event| event.paths.iter().any(|path| path == &watched))
+            .is_some_and(|event| config_watcher_event_requires_reload(&event, &watched))
         {
             inner.config_dirty.store(true, Ordering::Release);
             inner.wake.signal();
@@ -402,6 +402,11 @@ fn start_config_watcher(
         )
         .map_err(|error| error.to_string())?;
     Ok(watcher)
+}
+
+fn config_watcher_event_requires_reload(event: &notify::Event, watched: &Path) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
+        && event.paths.iter().any(|path| path == watched)
 }
 
 pub(crate) struct SifsMountLease {
@@ -921,5 +926,23 @@ mod tests {
             .get_typed::<SifsMountRuntimeStatus>(&data_dir, None, SIFS_MOUNT_STATUS_CONFIG_KEY)
             .expect("updated persisted status");
         assert_eq!(persisted, changed);
+    }
+    #[test]
+    fn config_watcher_ignores_reads_but_wakes_for_changes() {
+        let watched = PathBuf::from("/tmp/sifs-mount.json");
+        let access = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Read))
+            .add_path(watched.clone());
+        assert!(!config_watcher_event_requires_reload(&access, &watched));
+
+        let modified = notify::Event::new(notify::EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Any),
+        ))
+        .add_path(watched.clone());
+        assert!(config_watcher_event_requires_reload(&modified, &watched));
+
+        let unrelated =
+            notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+                .add_path(PathBuf::from("/tmp/sifs-mount-status.json"));
+        assert!(!config_watcher_event_requires_reload(&unrelated, &watched));
     }
 }
