@@ -58,6 +58,12 @@ pub trait NativeModuleHostCallbacks: Send + Sync {
     fn is_cancelled(&self) -> bool {
         false
     }
+    /// Return a process-local native wait handle which is signaled when this
+    /// invocation is cancelled. Modules must treat the value as borrowed for
+    /// the duration of the invocation only.
+    fn cancellation_wait_handle(&self) -> Option<u64> {
+        None
+    }
     fn local_permission_granted(&self, _permission: &str) -> bool {
         false
     }

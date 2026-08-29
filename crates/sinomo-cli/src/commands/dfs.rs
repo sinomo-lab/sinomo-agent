@@ -2670,9 +2670,70 @@ fn print_live_dfs_mount_status(
     if let Some(resolved_mount_point) = &status.resolved_mount_point {
         println!("  resolved mount point: {resolved_mount_point}");
     }
+    if status.platform == sinomo_runtime::dfs::SifsMountPlatform::ExternalProvider {
+        println!(
+            "  cloud provider: registered={} connected={} worker={} ready={} writeback={:?}",
+            status.provider_registered,
+            status.provider_connected,
+            status.worker_alive,
+            status.worker_ready,
+            status.writeback_mode
+        );
+        println!(
+            "  writeback: {} pending, {} retrying, {} failed, {} conflicts",
+            status.pending_operations,
+            status.retrying_operations,
+            status.failed_operations,
+            status.conflict_count
+        );
+        for attention in &status.attention {
+            println!(
+                "  attention: {:?} at {} [{}]",
+                attention.kind, attention.path, attention.reason_code
+            );
+            println!("    reason: {}", attention.reason);
+            println!(
+                "    safe next action: {}",
+                sifs_mount_attention_next_action(attention.safe_next_action)
+            );
+        }
+        if status.attention_overflow > 0 {
+            println!(
+                "  attention: {} additional issues omitted from this bounded status",
+                status.attention_overflow
+            );
+        }
+    }
+    if let Some(last_error) = &status.last_error {
+        println!("  last error: {last_error}");
+    }
     println!("  detail: {}", status.detail);
     println!("  updated: {}", status.updated_at);
     Ok(())
+}
+
+fn sifs_mount_attention_next_action(
+    action: sinomo_runtime::dfs::SifsMountAttentionNextAction,
+) -> &'static str {
+    use sinomo_runtime::dfs::SifsMountAttentionNextAction;
+
+    match action {
+        SifsMountAttentionNextAction::ReviewAndResolve => {
+            "preserve both local and authoritative evidence, then resolve explicitly"
+        }
+        SifsMountAttentionNextAction::RepairCauseAndRetry => {
+            "repair the reported cause and retry without discarding retained evidence"
+        }
+        SifsMountAttentionNextAction::PreserveLocalCopyAndRescan => {
+            "preserve or move the local copy outside the mount, then retry reconciliation"
+        }
+        SifsMountAttentionNextAction::ReviewUnsupportedEntry => {
+            "review and preserve the unsupported entry outside the sync workflow"
+        }
+        SifsMountAttentionNextAction::WaitForAuthoritativeReconciliation => {
+            "wait for authoritative reconciliation, then refresh status"
+        }
+    }
 }
 
 fn run_dfs_mount_status_command(json: bool) -> Result<(), CliError> {

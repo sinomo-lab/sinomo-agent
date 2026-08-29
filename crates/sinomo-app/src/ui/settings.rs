@@ -7417,7 +7417,7 @@ fn sifs_mount_attention_next_action_label(action: SifsMountAttentionNextAction) 
             "Preserve retained local evidence, repair the reported cause, and refresh status to retry."
         }
         SifsMountAttentionNextAction::PreserveLocalCopyAndRescan => {
-            "Preserve the local copy, keep the mount enabled, and refresh after an authoritative namespace rescan."
+            "Preserve or move the local copy outside the mount, then retry reconciliation. Sinomo will clear the issue automatically when the local path matches the authoritative delete."
         }
         SifsMountAttentionNextAction::ReviewUnsupportedEntry => {
             "Review the unsupported entry and preserve it outside the sync workflow before making any change."
@@ -7513,11 +7513,20 @@ fn sifs_mount_presentation_at(
             "Keep the daemon running and refresh status. Replacement activation stays blocked until cleanup completes.",
         );
     }
-    if status.failed_operations > 0
-        || status.conflict_count > 0
-        || !status.attention.is_empty()
-        || status.attention_overflow > 0
-    {
+    if status.failed_operations > 0 {
+        return needs_attention(
+            format!(
+                "{} failed writeback operations require review; latest detail: {}",
+                status.failed_operations,
+                status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| status.detail.clone())
+            ),
+            "Keep the mount enabled so journaled work remains recoverable. Preserve retained evidence, repair the reported cause, and refresh status.",
+        );
+    }
+    if status.conflict_count > 0 || !status.attention.is_empty() || status.attention_overflow > 0 {
         let evidence = status.attention.first().map_or_else(
             || {
                 status
@@ -7545,15 +7554,26 @@ fn sifs_mount_presentation_at(
             "Keep the mount enabled so journaled work remains recoverable. Review the reported local path or provider error, then refresh; conflicts are never overwritten automatically.",
             |attention| sifs_mount_attention_next_action_label(attention.safe_next_action),
         );
-        return needs_attention(
-            format!(
-                "{} failed writeback operations and {} local/remote conflicts require review; latest detail: {evidence}{}",
-                status.failed_operations,
+        let connected = status.phase == SifsMountRuntimePhase::Connected && status.worker_ready;
+        return SifsMountPresentation {
+            label: if connected {
+                "Mounted with conflicts".to_string()
+            } else {
+                "Needs attention".to_string()
+            },
+            tone: if connected {
+                SemanticTone::Warning
+            } else {
+                SemanticTone::Danger
+            },
+            detail: format!(
+                "{} local/remote conflicts require review; unrelated paths {} available; latest detail: {evidence}{}",
                 status.conflict_count,
+                if connected { "remain" } else { "are not yet" },
                 overflow.as_deref().unwrap_or_default()
             ),
-            action,
-        );
+            operator_action: Some(action.to_string()),
+        };
     }
     if let Some(error) = status.last_error.as_deref() {
         return needs_attention(
@@ -16446,22 +16466,40 @@ mod tests {
     }
 
     #[test]
-    fn sifs_mount_failed_and_conflicted_operations_are_never_green() {
+    fn sifs_mount_failed_operations_are_never_green() {
         let observed_at = time::OffsetDateTime::parse(
             "2026-08-10T21:00:00Z",
             &time::format_description::well_known::Rfc3339,
         )
         .expect("fixed observation time");
-        for (failed_operations, conflict_count) in [(1, 0), (0, 1)] {
-            let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
-            snapshot.status.failed_operations = failed_operations;
-            snapshot.status.conflict_count = conflict_count;
+        let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
+        snapshot.status.failed_operations = 1;
 
-            let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
-            assert_eq!(presentation.label, "Needs attention");
-            assert_eq!(presentation.tone, SemanticTone::Danger);
-            assert!(presentation.operator_action.is_some());
-        }
+        let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
+        assert_eq!(presentation.label, "Needs attention");
+        assert_eq!(presentation.tone, SemanticTone::Danger);
+        assert!(presentation.operator_action.is_some());
+    }
+
+    #[test]
+    fn sifs_mount_path_conflict_is_warning_while_mount_remains_functional() {
+        let observed_at = time::OffsetDateTime::parse(
+            "2026-08-10T21:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("fixed observation time");
+        let mut snapshot = connected_sifs_mount_snapshot_at(observed_at);
+        snapshot.status.conflict_count = 1;
+
+        let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
+        assert_eq!(presentation.label, "Mounted with conflicts");
+        assert_eq!(presentation.tone, SemanticTone::Warning);
+        assert!(
+            presentation
+                .detail
+                .contains("unrelated paths remain available")
+        );
+        assert!(presentation.operator_action.is_some());
     }
 
     #[test]
@@ -16490,8 +16528,8 @@ mod tests {
         snapshot.status.attention_overflow = 3;
 
         let presentation = sifs_mount_presentation_at(&snapshot, observed_at);
-        assert_eq!(presentation.label, "Needs attention");
-        assert_eq!(presentation.tone, SemanticTone::Danger);
+        assert_eq!(presentation.label, "Mounted with conflicts");
+        assert_eq!(presentation.tone, SemanticTone::Warning);
         assert!(presentation.detail.contains("/teams/design/socket"));
         assert!(presentation.detail.contains("3 additional"));
 

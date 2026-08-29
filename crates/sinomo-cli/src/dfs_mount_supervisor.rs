@@ -297,13 +297,14 @@ fn run_supervisor(
                     active_config = Some(config.clone());
                 }
                 Err(error) => {
+                    let retry_delay = mount_error_retry_delay(&error);
                     publish(
                         &store,
                         &data_dir,
                         &inner,
                         error_status(&config, Some(&mount_point), error),
                     );
-                    inner.wake.wait(Some(RETRY_DELAY));
+                    inner.wake.wait(retry_delay);
                     continue;
                 }
             }
@@ -319,6 +320,7 @@ fn run_supervisor(
                     }
                 }
                 Err(error) => {
+                    let retry_delay = mount_error_retry_delay(&error);
                     publish(
                         &store,
                         &data_dir,
@@ -327,6 +329,8 @@ fn run_supervisor(
                     );
                     stop_active(&mut active);
                     active_config = None;
+                    inner.wake.wait(retry_delay);
+                    continue;
                 }
             }
         }
@@ -336,6 +340,17 @@ fn run_supervisor(
         inner.wake.wait(wait);
     }
     stop_active(&mut active);
+}
+
+fn mount_error_retry_delay(error: &str) -> Option<Duration> {
+    if error.contains("mount-cancellation-event:")
+        || error
+            .contains("full-reconciliation-effect: refusing to remove non-placeholder local path")
+    {
+        None
+    } else {
+        Some(RETRY_DELAY)
+    }
 }
 
 fn mount_config_store() -> Result<ConfigStore, String> {
@@ -827,6 +842,58 @@ fn mount_status_persistence_equal(
 
 fn publish_observed(inner: &SupervisorInner, status: SifsMountRuntimeStatus) {
     if let Ok(mut observed) = inner.status.write() {
+        let was_functional =
+            observed.phase == SifsMountRuntimePhase::Connected && observed.worker_ready;
+        let is_functional = status.phase == SifsMountRuntimePhase::Connected && status.worker_ready;
+        for attention in &status.attention {
+            if !observed.attention.iter().any(|previous| {
+                previous.kind == attention.kind
+                    && previous.path == attention.path
+                    && previous.reason_code == attention.reason_code
+            }) {
+                tracing::warn!(
+                    target: "sinomo.sifs.mount",
+                    path = %attention.path,
+                    reason_code = %attention.reason_code,
+                    reason = %attention.reason,
+                    safe_next_action = ?attention.safe_next_action,
+                    mount_functional = status.phase == SifsMountRuntimePhase::Connected
+                        && status.worker_ready,
+                    "SIFS mount preserved a path-level issue for operator review"
+                );
+            }
+        }
+        for previous in &observed.attention {
+            if !status.attention.iter().any(|attention| {
+                attention.kind == previous.kind
+                    && attention.path == previous.path
+                    && attention.reason_code == previous.reason_code
+            }) {
+                tracing::info!(
+                    target: "sinomo.sifs.mount",
+                    path = %previous.path,
+                    reason_code = %previous.reason_code,
+                    "SIFS mount path-level issue was resolved"
+                );
+            }
+        }
+        if status.last_error != observed.last_error
+            && let Some(error) = status.last_error.as_deref()
+        {
+            tracing::warn!(
+                target: "sinomo.sifs.mount",
+                error = %error,
+                "SIFS mount entered an error state"
+            );
+        }
+        if is_functional && !was_functional && status.conflict_count > 0 {
+            tracing::warn!(
+                target: "sinomo.sifs.mount",
+                conflict_count = status.conflict_count,
+                attention_overflow = status.attention_overflow,
+                "SIFS mount is functional with preserved path-level issues; unrelated paths remain available"
+            );
+        }
         *observed = status;
     }
 }
@@ -926,6 +993,32 @@ mod tests {
             .get_typed::<SifsMountRuntimeStatus>(&data_dir, None, SIFS_MOUNT_STATUS_CONFIG_KEY)
             .expect("updated persisted status");
         assert_eq!(persisted, changed);
+    }
+
+    #[test]
+    fn missing_native_cancellation_event_waits_for_a_state_change() {
+        assert_eq!(
+            mount_error_retry_delay(
+                "mount-cancellation-event: Cloud Files mount requires a host-owned cancellation event"
+            ),
+            None
+        );
+        assert_eq!(
+            mount_error_retry_delay("connect-sync-root: transient failure"),
+            Some(RETRY_DELAY)
+        );
+        assert_eq!(
+            mount_error_retry_delay(
+                "full-reconciliation-effect: refusing to remove non-placeholder local path D:\\sinomo\\protected.json for a remote delete",
+            ),
+            None,
+            "protected local conflicts require an operator or config change"
+        );
+        assert_eq!(
+            mount_error_retry_delay("network: cluster is read-only while authority rejoins"),
+            Some(RETRY_DELAY),
+            "transient cluster failures must remain recoverable"
+        );
     }
     #[test]
     fn config_watcher_ignores_reads_but_wakes_for_changes() {

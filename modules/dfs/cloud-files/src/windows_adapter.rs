@@ -89,10 +89,10 @@ use crate::windows_sync::{
     CLOUD_FILES_DIRECTORY_PAGE_ENTRIES, CloudFilesCapturedChangeBatch, CloudFilesCapturedContent,
     CloudFilesCapturedLocalChange, CloudFilesConcreteDfsAdapter, CloudFilesCursorRecoveryControl,
     CloudFilesDfsServiceMutationBackend, CloudFilesDirectoryChange,
-    CloudFilesDirectoryChangeAction, CloudFilesDirectoryChangePlan, CloudFilesFullScanSnapshot,
-    CloudFilesLocalCaptureRetries, CloudFilesLocalChangeAccelerator,
-    CloudFilesMountedMutationHandoff, CloudFilesNamespaceSource, CloudFilesObjectProjection,
-    CloudFilesOfflineCreatePlan, CloudFilesRenamePairingState,
+    CloudFilesDirectoryChangeAction, CloudFilesDirectoryChangePlan,
+    CloudFilesFullScanEffectOutcome, CloudFilesFullScanSnapshot, CloudFilesLocalCaptureRetries,
+    CloudFilesLocalChangeAccelerator, CloudFilesMountedMutationHandoff, CloudFilesNamespaceSource,
+    CloudFilesObjectProjection, CloudFilesOfflineCreatePlan, CloudFilesRenamePairingState,
     CloudFilesSparsePlaceholderObservation, CloudFilesStartupConflictEvidence,
     CloudFilesStartupScanBatch, CloudFilesWindowsPlaceholderEffect, CloudFilesWritableSyncState,
     CloudFilesWritableSyncWorker, cloud_files_object_projection,
@@ -4472,23 +4472,37 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
     }
 
     fn remove_local_path(&self, path: &str) -> Result<(), String> {
+        match self.remove_local_path_for_full_scan(path)? {
+            CloudFilesLocalRemovalOutcome::RemovedOrAbsent => Ok(()),
+            CloudFilesLocalRemovalOutcome::Preserved(conflict) => Err(conflict.detail),
+        }
+    }
+
+    fn remove_local_path_for_full_scan(
+        &self,
+        path: &str,
+    ) -> Result<CloudFilesLocalRemovalOutcome, String> {
         self.check_cancelled()?;
         let local = self.local_path(path)?;
         if !local.exists() {
-            return Ok(());
+            return Ok(CloudFilesLocalRemovalOutcome::RemovedOrAbsent);
         }
         let metadata = fs::symlink_metadata(&local)
             .map_err(|error| format!("stat local path {}: {error}", local.display()))?;
         let Some((in_sync, _identity)) = query_placeholder_state(&local)? else {
-            return Err(format!(
-                "refusing to remove non-placeholder local path {} for a remote delete",
-                local.display()
+            return Ok(self.preserve_remote_delete_conflict(
+                path,
+                &local,
+                "local-non-placeholder-blocks-remote-delete",
+                "the local entry is a normal file or directory, not a Cloud Files placeholder",
             ));
         };
         if !in_sync {
-            return Err(format!(
-                "refusing to remove dirty local placeholder {} for a remote delete",
-                local.display()
+            return Ok(self.preserve_remote_delete_conflict(
+                path,
+                &local,
+                "local-dirty-placeholder-blocks-remote-delete",
+                "the local Cloud Files placeholder contains changes which are not marked in sync",
             ));
         }
         self.suppress_local_path(&local)?;
@@ -4502,6 +4516,27 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
                 "remove remote-deleted placeholder {}: {error}",
                 local.display()
             )
+        })?;
+        Ok(CloudFilesLocalRemovalOutcome::RemovedOrAbsent)
+    }
+
+    fn preserve_remote_delete_conflict(
+        &self,
+        path: &str,
+        local: &Path,
+        reason_code: &str,
+        reason: &str,
+    ) -> CloudFilesLocalRemovalOutcome {
+        let detail = format!(
+            "{reason_code}: authoritative SIFS state deletes `{path}`, but {} was preserved because {reason}. Move or preserve the local entry outside this mount, or resolve the authoritative state, then retry reconciliation; unrelated paths remain available",
+            local.display()
+        );
+        super::host_log(&format!(
+            "Cloud Files preserved path-level conflict at `{path}`: {detail}"
+        ));
+        CloudFilesLocalRemovalOutcome::Preserved(CloudFilesStartupConflictEvidence {
+            path: path.to_string(),
+            detail,
         })
     }
 
@@ -4786,7 +4821,11 @@ impl<T: DfsMessageTransport> CloudFilesLocalCompletionEffect for WindowsPlacehol
 }
 
 impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlaceholderEffects<T> {
-    fn apply_full_scan(&mut self, snapshot: &CloudFilesFullScanSnapshot) -> Result<(), String> {
+    fn apply_full_scan(
+        &mut self,
+        snapshot: &CloudFilesFullScanSnapshot,
+    ) -> Result<CloudFilesFullScanEffectOutcome, String> {
+        let mut outcome = CloudFilesFullScanEffectOutcome::default();
         let mut entries = snapshot.manifest.values().collect::<Vec<_>>();
         entries.sort_by_key(|entry| entry.path.matches('/').count());
         for entry in entries {
@@ -4797,11 +4836,32 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
                 // The authoritative manifest tracks the unprojectable entry so
                 // parent/name conflicts remain visible, but Windows receives
                 // no misleading regular-file placeholder.
-                if matches!(
-                    self.local_path_state(&entry.path)?,
-                    CloudFilesLocalPathState::Clean
-                ) {
-                    self.remove_local_path(&entry.path)?;
+                match self.local_path_state(&entry.path)? {
+                    CloudFilesLocalPathState::Clean => {
+                        record_local_removal_outcome(
+                            &mut outcome,
+                            &entry.path,
+                            self.remove_local_path_for_full_scan(&entry.path)?,
+                        );
+                    }
+                    CloudFilesLocalPathState::Dirty { detail } => {
+                        outcome.conflicts.push(startup_conflict(
+                            &entry.path,
+                            format!(
+                                "local-dirty-entry-blocks-authoritative-projection: authoritative SIFS kind `{}` cannot replace the preserved local entry: {detail}",
+                                entry.kind
+                            ),
+                        ));
+                    }
+                    CloudFilesLocalPathState::Pending { operation_id } => {
+                        outcome.conflicts.push(startup_conflict(
+                            &entry.path,
+                            format!(
+                                "local-operation-blocks-authoritative-projection: operation `{operation_id}` must settle before authoritative SIFS kind `{}` can be projected",
+                                entry.kind
+                            ),
+                        ));
+                    }
                 }
                 continue;
             }
@@ -4816,15 +4876,39 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
             self.ensure_remote_placeholder(&entry.path, true)?;
         }
         for path in &snapshot.removed_paths {
-            self.remove_local_path(path)?;
+            record_local_removal_outcome(
+                &mut outcome,
+                path,
+                self.remove_local_path_for_full_scan(path)?,
+            );
         }
-        Ok(())
+        Ok(outcome)
     }
 
     fn drain_namespace_suppressions(&mut self) -> Vec<CloudFilesNamespaceSuppression> {
         std::mem::take(&mut self.namespace_suppressions)
             .into_values()
             .collect()
+    }
+}
+
+enum CloudFilesLocalRemovalOutcome {
+    RemovedOrAbsent,
+    Preserved(CloudFilesStartupConflictEvidence),
+}
+
+fn record_local_removal_outcome(
+    outcome: &mut CloudFilesFullScanEffectOutcome,
+    path: &str,
+    removal: CloudFilesLocalRemovalOutcome,
+) {
+    match removal {
+        CloudFilesLocalRemovalOutcome::RemovedOrAbsent => {
+            outcome.resolved_paths.push(path.to_string());
+        }
+        CloudFilesLocalRemovalOutcome::Preserved(conflict) => {
+            outcome.conflicts.push(conflict);
+        }
     }
 }
 

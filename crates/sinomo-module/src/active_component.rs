@@ -213,9 +213,13 @@ impl ActiveNativeComponent {
                 operation: operation.to_string(),
                 detail: error.to_string(),
             })?;
+        let cancellation_wait_handle = callbacks
+            .as_ref()
+            .and_then(|callbacks| callbacks.cancellation_wait_handle());
         let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: operation.to_string(),
             payload_sobj,
+            cancellation_wait_handle,
             request_body: None,
             response_body_path: None,
         });

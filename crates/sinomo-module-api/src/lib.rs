@@ -591,6 +591,12 @@ pub struct NativeModuleProbeCapabilitiesRequest {}
 pub struct NativeModuleInvocationRequest {
     pub operation: String,
     pub payload_sobj: Vec<u8>,
+    /// Optional process-local wait handle which becomes signaled when the
+    /// host cancels this invocation. This is an opaque native value and must
+    /// never be persisted, returned to a remote caller, or used by a module
+    /// running outside the host process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_wait_handle: Option<u64>,
     /// Host-private request attachment staged for this invocation.
     ///
     /// The path is local to the receiving host and must never be returned to a
@@ -840,6 +846,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: "files.write".to_string(),
             payload_sobj: vec![1, 2, 3],
+            cancellation_wait_handle: Some(u64::MAX),
             request_body: Some(staged.clone()),
             response_body_path: Some("/private/session/response.body".to_string()),
         });

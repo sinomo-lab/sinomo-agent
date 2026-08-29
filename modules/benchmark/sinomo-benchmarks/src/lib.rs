@@ -1842,6 +1842,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
             payload_sobj,
+            cancellation_wait_handle: None,
             request_body: None,
             response_body_path: None,
         });
@@ -1900,6 +1901,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
             payload_sobj,
+            cancellation_wait_handle: None,
             request_body: None,
             response_body_path: None,
         });

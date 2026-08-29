@@ -337,6 +337,7 @@ fn invoke_native_module_service_request(
                 sinomo_module_api::NativeModuleInvocationRequest {
                     operation: target.operation.clone(),
                     payload_sobj: request.body,
+                    cancellation_wait_handle: callbacks.cancellation_wait_handle(),
                     request_body: staged_request_body,
                     response_body_path,
                 },

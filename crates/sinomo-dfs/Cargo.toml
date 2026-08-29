@@ -32,7 +32,10 @@ sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }

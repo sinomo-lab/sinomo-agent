@@ -9,6 +9,7 @@
 mod protocol;
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -41,14 +42,19 @@ use sinomo_module_api::{
     SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
     decode_sobj, encode_sobj,
 };
+#[cfg(windows)]
+use sinomo_runtime::dfs::HostFilesystemProviderEvent;
 use sinomo_runtime::dfs::{
     HOST_FILESYSTEM_PROVIDER_INTERFACE_ID, HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION,
     HOST_FILESYSTEM_PROVIDER_OPERATION, HostFilesystemProviderError, HostFilesystemProviderRequest,
     HostFilesystemProviderResponse, SifsMountPlatform, SifsMountRuntimePhase,
     SifsMountRuntimeStatus,
 };
-#[cfg(windows)]
-use sinomo_runtime::dfs::{HostFilesystemProviderEvent, SifsMountWritebackMode};
+#[cfg(any(windows, test))]
+use sinomo_runtime::dfs::{
+    SifsMountAttentionKind, SifsMountAttentionNextAction, SifsMountAttentionSummary,
+    SifsMountRetainedLocalEvidence, SifsMountWritebackMode,
+};
 
 pub mod local_change_queue;
 pub mod namespace_reconciler;
@@ -454,6 +460,7 @@ fn invoke_cloud_files_operation(request: NativeModuleInvocationRequest) -> Nativ
 }
 
 fn invoke_host_filesystem_provider(request: NativeModuleInvocationRequest) -> NativeModuleResponse {
+    let cancellation_wait_handle = request.cancellation_wait_handle;
     let provider_request = match decode_sobj::<HostFilesystemProviderRequest>(&request.payload_sobj)
     {
         Ok(request) => request,
@@ -465,7 +472,7 @@ fn invoke_host_filesystem_provider(request: NativeModuleInvocationRequest) -> Na
         }
     };
     GENERIC_HOST_PROTOCOL_ACTIVE.store(true, Ordering::Release);
-    let response = host_filesystem_provider_response(provider_request);
+    let response = host_filesystem_provider_response(provider_request, cancellation_wait_handle);
     GENERIC_HOST_PROTOCOL_ACTIVE.store(false, Ordering::Release);
     match encode_sobj(&response) {
         Ok(payload_sobj) => NativeModuleResponse::Invocation(NativeModuleInvocationResponse {
@@ -482,6 +489,7 @@ fn invoke_host_filesystem_provider(request: NativeModuleInvocationRequest) -> Na
 
 fn host_filesystem_provider_response(
     request: HostFilesystemProviderRequest,
+    cancellation_wait_handle: Option<u64>,
 ) -> HostFilesystemProviderResponse {
     match request {
         HostFilesystemProviderRequest::Reconcile {
@@ -489,21 +497,12 @@ fn host_filesystem_provider_response(
             mount_point,
             config,
         } => {
-            let request = crate::protocol::CloudFilesMountRequest {
-                sync_root: mount_point,
-                root_path: config.root_path.clone(),
-                data_dir_root: Some(data_dir_root),
-                read_only: config.read_only,
-                sync_local_changes: config.sync_local_changes,
-                provider_name: "Sinomo SIFS".to_string(),
-                provider_version: env!("CARGO_PKG_VERSION").to_string(),
-                prepopulate_depth: 0,
-                connect: true,
-                max_run_seconds: None,
-                cancellation_event_handle: None,
-                cursor_recovery: None,
-                provider_replacement: None,
-            };
+            let request = host_filesystem_mount_request(
+                data_dir_root,
+                mount_point,
+                &config,
+                cancellation_wait_handle,
+            );
             match mount_sifs_cloud_files(request) {
                 Ok(response) => HostFilesystemProviderResponse::Status(cloud_files_mount_status(
                     &config, response,
@@ -554,6 +553,29 @@ fn host_filesystem_provider_response(
             };
             HostFilesystemProviderResponse::Status(status)
         }
+    }
+}
+
+fn host_filesystem_mount_request(
+    data_dir_root: PathBuf,
+    mount_point: PathBuf,
+    config: &sinomo_runtime::dfs::SifsMountConfig,
+    cancellation_wait_handle: Option<u64>,
+) -> crate::protocol::CloudFilesMountRequest {
+    crate::protocol::CloudFilesMountRequest {
+        sync_root: mount_point,
+        root_path: config.root_path.clone(),
+        data_dir_root: Some(data_dir_root),
+        read_only: config.read_only,
+        sync_local_changes: config.sync_local_changes,
+        provider_name: "Sinomo SIFS".to_string(),
+        provider_version: env!("CARGO_PKG_VERSION").to_string(),
+        prepopulate_depth: 0,
+        connect: true,
+        max_run_seconds: None,
+        cancellation_event_handle: cancellation_wait_handle,
+        cursor_recovery: None,
+        provider_replacement: None,
     }
 }
 
@@ -795,7 +817,7 @@ pub(crate) fn host_emit_event(event: &CloudFilesModuleEvent) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn cloud_files_lifecycle_status(
     event: &crate::protocol::CloudFilesMountLifecycleEvent,
 ) -> SifsMountRuntimeStatus {
@@ -833,12 +855,83 @@ fn cloud_files_lifecycle_status(
     status.retrying_operations = event.local_change_sync.retrying_operations;
     status.failed_operations = event.local_change_sync.failed_operations;
     status.conflict_count = event.local_change_sync.conflict_count;
+    status.attention = event
+        .local_change_sync
+        .attention
+        .iter()
+        .map(sifs_mount_attention_summary)
+        .collect();
+    status.attention_overflow = event.local_change_sync.attention_overflow;
     status.placeholders_created = Some(event.placeholders_created);
     status.provider_interface_version =
         Some(HOST_FILESYSTEM_PROVIDER_INTERFACE_VERSION.to_string());
     status.last_error = event.error.as_ref().map(ToString::to_string);
-    status.detail = event.detail.clone();
+    status.detail = if status.conflict_count == 0 {
+        event.detail.clone()
+    } else {
+        format!(
+            "{}; {} tracked writeback or path-level conflicts require review while unrelated paths remain available",
+            event.detail, status.conflict_count
+        )
+    };
     status
+}
+
+#[cfg(any(windows, test))]
+fn sifs_mount_attention_summary(
+    attention: &crate::protocol::CloudFilesSyncAttentionSummary,
+) -> SifsMountAttentionSummary {
+    use crate::protocol::{CloudFilesSyncAttentionKind, CloudFilesSyncAttentionNextAction};
+
+    SifsMountAttentionSummary {
+        kind: match attention.kind {
+            CloudFilesSyncAttentionKind::LocalOperationConflict => {
+                SifsMountAttentionKind::LocalOperationConflict
+            }
+            CloudFilesSyncAttentionKind::FailedLocalOperation => {
+                SifsMountAttentionKind::FailedLocalOperation
+            }
+            CloudFilesSyncAttentionKind::RemoteNamespaceConflict => {
+                SifsMountAttentionKind::RemoteNamespaceConflict
+            }
+            CloudFilesSyncAttentionKind::StartupConflict => SifsMountAttentionKind::StartupConflict,
+            CloudFilesSyncAttentionKind::UnsupportedObjectKind => {
+                SifsMountAttentionKind::UnsupportedObjectKind
+            }
+            CloudFilesSyncAttentionKind::StaleOrAmbiguousReconciliation => {
+                SifsMountAttentionKind::StaleOrAmbiguousReconciliation
+            }
+        },
+        path: attention.path.clone(),
+        reason_code: attention.reason_code.clone(),
+        reason: attention.reason.clone(),
+        retained_local_evidence: attention.retained_local_evidence.as_ref().map(|evidence| {
+            SifsMountRetainedLocalEvidence {
+                operation_id: evidence.operation_id.clone(),
+                evidence_id: evidence.evidence_id.clone(),
+                staged_content_hash: evidence.staged_content_hash.clone(),
+                staged_content_size_bytes: evidence.staged_content_size_bytes,
+                local_state: evidence.local_state.clone(),
+            }
+        }),
+        safe_next_action: match attention.safe_next_action {
+            CloudFilesSyncAttentionNextAction::ReviewAndResolve => {
+                SifsMountAttentionNextAction::ReviewAndResolve
+            }
+            CloudFilesSyncAttentionNextAction::RepairCauseAndRetry => {
+                SifsMountAttentionNextAction::RepairCauseAndRetry
+            }
+            CloudFilesSyncAttentionNextAction::PreserveLocalCopyAndRescan => {
+                SifsMountAttentionNextAction::PreserveLocalCopyAndRescan
+            }
+            CloudFilesSyncAttentionNextAction::ReviewUnsupportedEntry => {
+                SifsMountAttentionNextAction::ReviewUnsupportedEntry
+            }
+            CloudFilesSyncAttentionNextAction::WaitForAuthoritativeReconciliation => {
+                SifsMountAttentionNextAction::WaitForAuthoritativeReconciliation
+            }
+        },
+    }
 }
 
 #[cfg(windows)]
@@ -1048,6 +1141,7 @@ mod tests {
                 let response = invoke_cloud_files_operation(NativeModuleInvocationRequest {
                     operation: operation.to_string(),
                     payload_sobj: encode_sobj(payload).expect("encode mismatched request"),
+                    cancellation_wait_handle: None,
                     request_body: None,
                     response_body_path: None,
                 });
@@ -1065,6 +1159,67 @@ mod tests {
             }
         }
         assert_eq!(rejected, 20, "the complete 5x5 off-diagonal matrix ran");
+    }
+
+    #[test]
+    fn generic_host_reconcile_forwards_the_native_cancellation_handle() {
+        let config = sinomo_runtime::dfs::SifsMountConfig::default();
+        let request = host_filesystem_mount_request(
+            PathBuf::from("data"),
+            PathBuf::from("mount"),
+            &config,
+            Some(42),
+        );
+
+        assert_eq!(request.cancellation_event_handle, Some(42));
+        assert_eq!(request.sync_root, PathBuf::from("mount"));
+        assert_eq!(request.data_dir_root, Some(PathBuf::from("data")));
+    }
+
+    #[test]
+    fn lifecycle_status_preserves_actionable_path_conflicts_for_host_ui() {
+        let local_change_sync =
+            crate::protocol::CloudFilesLocalChangeSyncStatus::writable_active(0, 0, 1, 0)
+                .with_attention(
+                    vec![crate::protocol::CloudFilesSyncAttentionSummary {
+                kind: crate::protocol::CloudFilesSyncAttentionKind::StartupConflict,
+                path: "/services/protected.json".to_string(),
+                reason_code: "startup-conflict".to_string(),
+                reason: "local copy was preserved instead of applying an authoritative delete"
+                    .to_string(),
+                retained_local_evidence: Some(
+                    crate::protocol::CloudFilesRetainedLocalEvidenceSummary {
+                        local_state: Some("ordinary local file preserved".to_string()),
+                        ..crate::protocol::CloudFilesRetainedLocalEvidenceSummary::default()
+                    },
+                ),
+                safe_next_action:
+                    crate::protocol::CloudFilesSyncAttentionNextAction::PreserveLocalCopyAndRescan,
+            }],
+                    1,
+                );
+        let event = crate::protocol::CloudFilesMountLifecycleEvent::connected(
+            "C:\\SinomoSIFS",
+            "/services",
+            12,
+        )
+        .with_local_change_sync(local_change_sync)
+        .with_worker_health(true, true, 7);
+
+        let status = cloud_files_lifecycle_status(&event);
+
+        assert_eq!(status.phase, SifsMountRuntimePhase::Connected);
+        assert!(status.provider_connected);
+        assert!(status.worker_ready);
+        assert_eq!(status.writeback_mode, SifsMountWritebackMode::Active);
+        assert_eq!(status.conflict_count, 1);
+        assert_eq!(status.attention.len(), 1);
+        assert_eq!(status.attention[0].path, "/services/protected.json");
+        assert_eq!(
+            status.attention[0].safe_next_action,
+            SifsMountAttentionNextAction::PreserveLocalCopyAndRescan
+        );
+        assert!(status.detail.contains("unrelated paths remain available"));
     }
 
     #[test]
