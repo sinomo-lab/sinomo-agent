@@ -695,7 +695,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
             sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
                 .ok()
                 .map(|state| {
-                    daemon_dfs_local_content_advertisement(
+                    cached_daemon_dfs_local_content_advertisement(
                         &data_dir,
                         &state.local_node_id,
                         daemon_dfs_local_zone(),

@@ -7,6 +7,7 @@ struct DaemonDfsPlacementEnvironment {
     monitor: sinomo_dfs::DfsDeviceHealthMonitor,
     cache: sinomo_dfs::DfsPlacementSnapshotCache,
     metering: sinomo_dfs::DfsNetworkMetering,
+    resource_pressure: sinomo_dfs::DfsResourcePressure,
     metering_sampled_at: Option<Instant>,
     last_published_local_advertisement: Option<sinomo_dfs::DfsNodeAdvertisement>,
     advertisements: BTreeMap<NodeId, sinomo_dfs::DfsNodeAdvertisement>,
@@ -16,11 +17,53 @@ struct DaemonDfsPlacementEnvironment {
 static DAEMON_DFS_PLACEMENT_ENVIRONMENTS: OnceLock<
     Mutex<BTreeMap<PathBuf, DaemonDfsPlacementEnvironment>>,
 > = OnceLock::new();
+#[derive(Debug)]
+struct DaemonDfsStorageEnvironmentSignal {
+    generation: AtomicU64,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+static DAEMON_DFS_STORAGE_ENVIRONMENT_SIGNALS: OnceLock<
+    Mutex<BTreeMap<PathBuf, Arc<DaemonDfsStorageEnvironmentSignal>>>,
+> = OnceLock::new();
 
 const DAEMON_DFS_METERING_SAMPLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const DAEMON_DFS_ADVERTISEMENT_RENEWAL_MARGIN: time::Duration = time::Duration::minutes(5);
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 const DAEMON_DFS_METERING_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn daemon_dfs_storage_environment_signal(
+    data_dir: &SinomoDataDir,
+) -> Arc<DaemonDfsStorageEnvironmentSignal> {
+    let mut signals = DAEMON_DFS_STORAGE_ENVIRONMENT_SIGNALS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(signals.entry(data_dir.root()).or_insert_with(|| {
+        Arc::new(DaemonDfsStorageEnvironmentSignal {
+            generation: AtomicU64::new(0),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }))
+}
+
+pub(crate) fn daemon_dfs_storage_environment_notify(
+    data_dir: &SinomoDataDir,
+) -> Arc<tokio::sync::Notify> {
+    Arc::clone(&daemon_dfs_storage_environment_signal(data_dir).notify)
+}
+
+pub(crate) fn daemon_dfs_storage_environment_dirty_generation(data_dir: &SinomoDataDir) -> u64 {
+    daemon_dfs_storage_environment_signal(data_dir)
+        .generation
+        .load(Ordering::Acquire)
+}
+
+pub(crate) fn notify_daemon_dfs_storage_environment_dirty(data_dir: &SinomoDataDir) {
+    let signal = daemon_dfs_storage_environment_signal(data_dir);
+    signal.generation.fetch_add(1, Ordering::AcqRel);
+    signal.notify.notify_one();
+}
 
 fn placement_environments() -> &'static Mutex<BTreeMap<PathBuf, DaemonDfsPlacementEnvironment>> {
     DAEMON_DFS_PLACEMENT_ENVIRONMENTS.get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -46,6 +89,7 @@ fn with_placement_environment<R>(
             ),
             cache: sinomo_dfs::DfsPlacementSnapshotCache::default(),
             metering: sinomo_dfs::DfsNetworkMetering::Unknown,
+            resource_pressure: sinomo_dfs::DfsResourcePressure::Normal,
             metering_sampled_at: None,
             last_published_local_advertisement: None,
             advertisements: BTreeMap::new(),
@@ -54,7 +98,18 @@ fn with_placement_environment<R>(
     operation(environment)
 }
 
-fn refresh_os_metering(environment: &mut DaemonDfsPlacementEnvironment) {
+fn refresh_network_metering(
+    environment: &mut DaemonDfsPlacementEnvironment,
+    node_resources: Option<sinomo_device::NodeResourceSnapshot>,
+) {
+    if let Some(metering) = node_resources.and_then(dfs_network_metering_from_node_resources) {
+        environment.metering = metering;
+        environment.resource_pressure = node_resources
+            .map(dfs_resource_pressure_from_node_resources)
+            .unwrap_or_default();
+        return;
+    }
+    environment.resource_pressure = sinomo_dfs::DfsResourcePressure::Normal;
     if environment
         .metering_sampled_at
         .is_some_and(|sampled| sampled.elapsed() < DAEMON_DFS_METERING_SAMPLE_INTERVAL)
@@ -65,20 +120,58 @@ fn refresh_os_metering(environment: &mut DaemonDfsPlacementEnvironment) {
     environment.metering_sampled_at = Some(Instant::now());
 }
 
-pub(super) fn daemon_dfs_local_content_advertisement(
+fn dfs_resource_pressure_from_node_resources(
+    resources: sinomo_device::NodeResourceSnapshot,
+) -> sinomo_dfs::DfsResourcePressure {
+    match resources.mode {
+        sinomo_device::NodeResourceMode::Normal => sinomo_dfs::DfsResourcePressure::Normal,
+        sinomo_device::NodeResourceMode::Constrained => {
+            sinomo_dfs::DfsResourcePressure::Constrained
+        }
+        sinomo_device::NodeResourceMode::Restricted => sinomo_dfs::DfsResourcePressure::Restricted,
+    }
+}
+
+fn dfs_network_metering_from_node_resources(
+    resources: sinomo_device::NodeResourceSnapshot,
+) -> Option<sinomo_dfs::DfsNetworkMetering> {
+    resources
+        .observed
+        .then_some(match resources.network_metering {
+            sinomo_device::NodeNetworkMetering::Unmetered => {
+                sinomo_dfs::DfsNetworkMetering::Unmetered
+            }
+            sinomo_device::NodeNetworkMetering::Metered => sinomo_dfs::DfsNetworkMetering::Metered,
+            sinomo_device::NodeNetworkMetering::Unknown => sinomo_dfs::DfsNetworkMetering::Unknown,
+        })
+}
+
+fn daemon_dfs_local_content_advertisement_with_resources(
     data_dir: &SinomoDataDir,
     node_id: &NodeId,
     zone: Option<String>,
+    node_resources: Option<sinomo_device::NodeResourceSnapshot>,
+    sample_storage: bool,
 ) -> sinomo_dfs::DfsNodeAdvertisement {
     with_placement_environment(data_dir, node_id, |environment| {
-        refresh_os_metering(environment);
+        refresh_network_metering(environment, node_resources);
         let now = time::OffsetDateTime::now_utc();
-        environment.monitor.sample_if_due(now, environment.metering);
+        if sample_storage {
+            environment.monitor.sample_with_resources(
+                now,
+                environment.metering,
+                environment.resource_pressure,
+            );
+        } else {
+            environment
+                .monitor
+                .update_advisory_evidence(environment.metering, environment.resource_pressure);
+        }
         environment.monitor.aggregate_advertisement(zone, now)
     })
 }
 
-fn cached_daemon_dfs_local_content_advertisement(
+pub(super) fn cached_daemon_dfs_local_content_advertisement(
     data_dir: &SinomoDataDir,
     node_id: &NodeId,
     zone: Option<String>,
@@ -196,6 +289,8 @@ struct PreparedDaemonDfsStorageEnvironmentRefresh {
 
 fn prepare_daemon_dfs_storage_environment_refresh(
     paths: &DaemonPaths,
+    node_resources: Option<sinomo_device::NodeResourceSnapshot>,
+    sample_storage: bool,
 ) -> Result<Option<PreparedDaemonDfsStorageEnvironmentRefresh>, DaemonError> {
     if crate::daemon_paths_are_shadow(paths) {
         return Ok(None);
@@ -206,10 +301,12 @@ fn prepare_daemon_dfs_storage_environment_refresh(
         return Ok(None);
     }
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
-    let desired = daemon_dfs_local_content_advertisement(
+    let desired = daemon_dfs_local_content_advertisement_with_resources(
         &data_dir,
         &state.local_node_id,
         daemon_dfs_local_zone(),
+        node_resources,
+        sample_storage,
     );
     let publish_required =
         with_placement_environment(&data_dir, &state.local_node_id, |environment| {
@@ -228,13 +325,34 @@ fn prepare_daemon_dfs_storage_environment_refresh(
     }))
 }
 
-pub(crate) async fn refresh_daemon_dfs_storage_environment_on_runtime(
+pub(crate) async fn refresh_daemon_dfs_storage_environment_with_resources_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
+    sample_storage: bool,
+) -> Result<bool, DaemonError> {
+    refresh_daemon_dfs_storage_environment_inner_on_runtime(
+        paths,
+        runtime,
+        Some(node_resources),
+        sample_storage,
+    )
+    .await
+}
+
+async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
+    paths: &DaemonPaths,
+    runtime: &tokio::runtime::Handle,
+    node_resources: Option<sinomo_device::NodeResourceSnapshot>,
+    sample_storage: bool,
 ) -> Result<bool, DaemonError> {
     let prepare_paths = paths.clone();
     let Some(prepared) = tokio::task::spawn_blocking(move || {
-        prepare_daemon_dfs_storage_environment_refresh(&prepare_paths)
+        prepare_daemon_dfs_storage_environment_refresh(
+            &prepare_paths,
+            node_resources,
+            sample_storage,
+        )
     })
     .await
     .map_err(|error| DaemonError::Network {
@@ -423,6 +541,7 @@ fn daemon_advertisement_semantics_equal(
         && left.storage_freshness == right.storage_freshness
         && left.content_location_count == right.content_location_count
         && left.network_metering == right.network_metering
+        && left.resource_pressure == right.resource_pressure
 }
 
 fn daemon_advertisement_publish_required(
@@ -779,6 +898,33 @@ mod tests {
         assert!(daemon_advertisement_semantics_equal(&left, &right));
         right.storage_health = sinomo_dfs::DfsHealthState::Degraded;
         assert!(!daemon_advertisement_semantics_equal(&left, &right));
+    }
+
+    #[test]
+    fn host_resource_metering_requires_an_observed_snapshot() {
+        assert_eq!(
+            dfs_network_metering_from_node_resources(sinomo_device::NodeResourceSnapshot::default()),
+            None,
+            "startup uncertainty must retain the daemon's native OS sampler"
+        );
+        assert_eq!(
+            dfs_network_metering_from_node_resources(
+                sinomo_device::NodeResourceSnapshot::observed(
+                    sinomo_device::NodeResourceMode::Constrained,
+                    sinomo_device::NodeNetworkMetering::Metered,
+                )
+            ),
+            Some(sinomo_dfs::DfsNetworkMetering::Metered)
+        );
+        assert_eq!(
+            dfs_resource_pressure_from_node_resources(
+                sinomo_device::NodeResourceSnapshot::observed(
+                    sinomo_device::NodeResourceMode::Restricted,
+                    sinomo_device::NodeNetworkMetering::Unmetered,
+                )
+            ),
+            sinomo_dfs::DfsResourcePressure::Restricted
+        );
     }
 
     #[test]

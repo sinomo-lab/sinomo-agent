@@ -9549,7 +9549,6 @@ dependencies = [
  "blake3",
  "image",
  "jni 0.22.4",
- "netwatcher",
  "rfd",
  "serde",
  "serde_json",
@@ -9759,6 +9758,7 @@ dependencies = [
  "sinomo-build",
  "sinomo-config",
  "sinomo-core",
+ "sinomo-device",
  "sinomo-dfs",
  "sinomo-dfs-nfs",
  "sinomo-module",
@@ -9800,6 +9800,7 @@ dependencies = [
  "serde_json",
  "sinomo-core",
  "thiserror 2.0.20",
+ "tokio",
  "v4l",
 ]
 
@@ -10388,6 +10389,7 @@ name = "sinomo-storage"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "libc",
  "serde",
  "sinomo-object",
  "sinomo-testdir",

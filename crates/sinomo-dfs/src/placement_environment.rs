@@ -59,6 +59,17 @@ pub enum DfsNetworkMetering {
     Unknown,
 }
 
+/// Coarse node-local pressure used only to rank new placement candidates.
+/// Exact battery, thermal, and OS policy readings remain private to the node.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsResourcePressure {
+    #[default]
+    Normal,
+    Constrained,
+    Restricted,
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsPlacementPathState {
@@ -158,6 +169,8 @@ pub struct DfsNodeHealthSnapshot {
     pub issue_codes: Vec<String>,
     #[serde(default)]
     pub network_metering: DfsNetworkMetering,
+    #[serde(default)]
+    pub resource_pressure: DfsResourcePressure,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -181,6 +194,8 @@ pub struct DfsPlacementNodeObservation {
     pub content_location_count: u32,
     #[serde(default)]
     pub network_metering: DfsNetworkMetering,
+    #[serde(default)]
+    pub resource_pressure: DfsResourcePressure,
     #[serde(with = "time::serde::rfc3339")]
     pub observed_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -200,6 +215,7 @@ impl DfsPlacementNodeObservation {
             reserved_free_bytes: advertisement.reserved_free_bytes,
             content_location_count: advertisement.content_location_count,
             network_metering: advertisement.network_metering,
+            resource_pressure: advertisement.resource_pressure,
             observed_at: advertisement.updated_at,
             expires_at: advertisement
                 .expires_at
@@ -312,6 +328,7 @@ impl DfsPlacementSnapshot {
                 node.freshness_at(self.observed_at) as u8,
                 node.accepts_new_content as u8,
                 node.network_metering as u8,
+                node.resource_pressure as u8,
             ]);
             hasher.update(&node.capacity_weight.to_be_bytes());
         }
@@ -491,7 +508,18 @@ impl DfsPlacementSnapshotCache {
                         .cmp(&health_rank(snapshot.node(right), now))
                 })
                 .then_with(|| {
-                    compare_path_evidence(
+                    compare_path_safety(
+                        snapshot.path(left, local_node_id),
+                        snapshot.path(right, local_node_id),
+                        now,
+                    )
+                })
+                .then_with(|| {
+                    resource_pressure_rank(snapshot.node(left), now)
+                        .cmp(&resource_pressure_rank(snapshot.node(right), now))
+                })
+                .then_with(|| {
+                    compare_path_performance(
                         snapshot.path(left, local_node_id),
                         snapshot.path(right, local_node_id),
                         now,
@@ -537,6 +565,7 @@ impl DfsDeviceHealthMonitor {
             content_locations: Vec::new(),
             issue_codes: vec!["never-sampled".to_string()],
             network_metering: DfsNetworkMetering::Unknown,
+            resource_pressure: DfsResourcePressure::Normal,
         });
         Self {
             node_id,
@@ -561,21 +590,56 @@ impl DfsDeviceHealthMonitor {
         &mut self,
         now: OffsetDateTime,
         metering: DfsNetworkMetering,
+        resource_pressure: DfsResourcePressure,
     ) -> Arc<DfsNodeHealthSnapshot> {
         if self.last_sampled_at.is_some_and(|last| {
             now - last
                 < time::Duration::try_from(DEFAULT_DFS_STORAGE_SAMPLE_INTERVAL)
                     .unwrap_or(time::Duration::minutes(5))
         }) {
-            return self.cached_snapshot();
+            return self.update_advisory_evidence(metering, resource_pressure);
         }
-        self.sample(now, metering)
+        self.sample_with_resources(now, metering, resource_pressure)
+    }
+
+    /// Update callback-owned placement evidence without touching storage.
+    /// Physical capacity has a separate explicit dirty edge in daemon hosts;
+    /// lease renewal and resource transitions consume this cached projection.
+    pub fn update_advisory_evidence(
+        &mut self,
+        metering: DfsNetworkMetering,
+        resource_pressure: DfsResourcePressure,
+    ) -> Arc<DfsNodeHealthSnapshot> {
+        let current = self.cached_snapshot();
+        if current.network_metering == metering && current.resource_pressure == resource_pressure {
+            return current;
+        }
+        self.sequence = self.sequence.max(current.sequence).saturating_add(1);
+        let mut updated = (*current).clone();
+        updated.sequence = self.sequence;
+        updated.network_metering = metering;
+        updated.resource_pressure = resource_pressure;
+        let updated = Arc::new(updated);
+        *self
+            .snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::clone(&updated);
+        updated
     }
 
     pub fn sample(
         &mut self,
         now: OffsetDateTime,
         metering: DfsNetworkMetering,
+    ) -> Arc<DfsNodeHealthSnapshot> {
+        self.sample_with_resources(now, metering, DfsResourcePressure::Normal)
+    }
+
+    pub fn sample_with_resources(
+        &mut self,
+        now: OffsetDateTime,
+        metering: DfsNetworkMetering,
+        resource_pressure: DfsResourcePressure,
     ) -> Arc<DfsNodeHealthSnapshot> {
         let previous = self.cached_snapshot();
         let previous_by_id = previous
@@ -613,6 +677,7 @@ impl DfsDeviceHealthMonitor {
             content_locations: observations,
             issue_codes,
             network_metering: metering,
+            resource_pressure,
         });
         *self
             .snapshot
@@ -665,11 +730,13 @@ impl DfsDeviceHealthMonitor {
             .try_into()
             .unwrap_or(u32::MAX);
         desired.network_metering = snapshot.network_metering;
+        desired.resource_pressure = snapshot.resource_pressure;
         desired.advertisement_generation = snapshot.sequence;
         desired.updated_at = now;
         desired.expires_at = Some(
-            now + time::Duration::try_from(DEFAULT_DFS_STORAGE_OBSERVATION_TTL)
-                .unwrap_or(time::Duration::minutes(15)),
+            snapshot.observed_at
+                + time::Duration::try_from(DEFAULT_DFS_STORAGE_OBSERVATION_TTL)
+                    .unwrap_or(time::Duration::minutes(15)),
         );
 
         if self.last_advertisement_evaluated_sequence == Some(snapshot.sequence)
@@ -730,8 +797,14 @@ fn refresh_advertisement_lease(
 ) -> DfsNodeAdvertisement {
     // Keep decision-affecting state behind the transition hysteresis while
     // still publishing the newest bounded measurements and provenance.
+    // Metering and resource pressure come from exact host callbacks and are
+    // advisory ranking evidence, not storage-health samples. Applying them
+    // immediately lets a restricted mobile host park its sampler without
+    // requiring a synthetic second observation.
     current.usable_capacity_bytes = desired.usable_capacity_bytes;
     current.reserved_free_bytes = desired.reserved_free_bytes;
+    current.network_metering = desired.network_metering;
+    current.resource_pressure = desired.resource_pressure;
     current.advertisement_generation = desired.advertisement_generation;
     current.updated_at = desired.updated_at;
     current.expires_at = desired.expires_at;
@@ -874,6 +947,7 @@ fn advertisement_semantics_equal(
         && left.storage_health == right.storage_health
         && left.storage_freshness == right.storage_freshness
         && left.network_metering == right.network_metering
+        && left.resource_pressure == right.resource_pressure
         && left.content_location_count == right.content_location_count
 }
 
@@ -1085,6 +1159,7 @@ pub fn explain_replicas_with_placement_snapshot(
                         }
                     })
                     .or_else(|| node.map(|node| node.network_metering)),
+                resource_pressure: node.map(|node| node.resource_pressure),
                 observation_freshness: path
                     .map(|path| path.freshness_at(now))
                     .or_else(|| node.map(|node| node.freshness_at(now))),
@@ -1149,8 +1224,12 @@ fn compare_candidate_evidence(
     right_coordinator
         .cmp(&left_coordinator)
         .then_with(|| health_rank(left.node, now).cmp(&health_rank(right.node, now)))
-        .then_with(|| compare_path_evidence(left.path, right.path, now))
+        .then_with(|| compare_path_safety(left.path, right.path, now))
         .then_with(|| right.current.cmp(&left.current))
+        .then_with(|| {
+            resource_pressure_rank(left.node, now).cmp(&resource_pressure_rank(right.node, now))
+        })
+        .then_with(|| compare_path_performance(left.path, right.path, now))
         .then_with(|| right.candidate.weight.cmp(&left.candidate.weight))
         .then_with(|| {
             stable_candidate_score(request, right.candidate)
@@ -1172,7 +1251,28 @@ fn health_rank(node: Option<&DfsPlacementNodeObservation>, now: OffsetDateTime) 
     }
 }
 
+fn resource_pressure_rank(node: Option<&DfsPlacementNodeObservation>, now: OffsetDateTime) -> u8 {
+    let Some(node) = node else { return 0 };
+    if node.freshness_at(now) != DfsObservationFreshness::Fresh {
+        return 0;
+    }
+    match node.resource_pressure {
+        DfsResourcePressure::Normal => 0,
+        DfsResourcePressure::Constrained => 1,
+        DfsResourcePressure::Restricted => 2,
+    }
+}
+
+#[cfg(test)]
 fn compare_path_evidence(
+    left: Option<&DfsPlacementPathObservation>,
+    right: Option<&DfsPlacementPathObservation>,
+    now: OffsetDateTime,
+) -> Ordering {
+    compare_path_safety(left, right, now).then_with(|| compare_path_performance(left, right, now))
+}
+
+fn compare_path_safety(
     left: Option<&DfsPlacementPathObservation>,
     right: Option<&DfsPlacementPathObservation>,
     now: OffsetDateTime,
@@ -1182,26 +1282,33 @@ fn compare_path_evidence(
     path_state_rank(left)
         .cmp(&path_state_rank(right))
         .then_with(|| metering_rank(left).cmp(&metering_rank(right)))
-        // Unknown latency/bandwidth is not converted to a pessimistic number:
-        // compare measurements only when both candidates have the evidence.
-        .then_with(|| {
-            match (
-                left.and_then(|path| path.latency_micros),
-                right.and_then(|path| path.latency_micros),
-            ) {
-                (Some(left), Some(right)) => left.cmp(&right),
-                _ => Ordering::Equal,
-            }
-        })
-        .then_with(|| {
-            match (
-                left.and_then(|path| path.delivered_bytes_per_second),
-                right.and_then(|path| path.delivered_bytes_per_second),
-            ) {
-                (Some(left), Some(right)) => right.cmp(&left),
-                _ => Ordering::Equal,
-            }
-        })
+}
+
+fn compare_path_performance(
+    left: Option<&DfsPlacementPathObservation>,
+    right: Option<&DfsPlacementPathObservation>,
+    now: OffsetDateTime,
+) -> Ordering {
+    let left = left.filter(|path| path.freshness_at(now) == DfsObservationFreshness::Fresh);
+    let right = right.filter(|path| path.freshness_at(now) == DfsObservationFreshness::Fresh);
+    // Unknown latency/bandwidth is not converted to a pessimistic number:
+    // compare measurements only when both candidates have the evidence.
+    match (
+        left.and_then(|path| path.latency_micros),
+        right.and_then(|path| path.latency_micros),
+    ) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        _ => Ordering::Equal,
+    }
+    .then_with(|| {
+        match (
+            left.and_then(|path| path.delivered_bytes_per_second),
+            right.and_then(|path| path.delivered_bytes_per_second),
+        ) {
+            (Some(left), Some(right)) => right.cmp(&left),
+            _ => Ordering::Equal,
+        }
+    })
 }
 
 fn path_state_rank(path: Option<&DfsPlacementPathObservation>) -> u8 {
@@ -1296,6 +1403,7 @@ mod tests {
             reserved_free_bytes: Some(0),
             content_location_count: 1,
             network_metering: DfsNetworkMetering::Unknown,
+            resource_pressure: DfsResourcePressure::Normal,
             observed_at: now,
             expires_at: now + time::Duration::minutes(1),
         };
@@ -1375,6 +1483,7 @@ mod tests {
                     reserved_free_bytes: Some(10),
                     content_location_count: if candidate.node_id == fast { 3 } else { 1 },
                     network_metering: DfsNetworkMetering::Unknown,
+                    resource_pressure: DfsResourcePressure::Normal,
                     observed_at: now,
                     expires_at: now + time::Duration::minutes(1),
                 })
@@ -1438,6 +1547,74 @@ mod tests {
     }
 
     #[test]
+    fn resource_pressure_avoids_new_replicas_without_evacuating_current_ones() {
+        let now = OffsetDateTime::now_utc();
+        let normal_candidate = DfsReplicaCandidate::new(node("normal-resource-node"));
+        let restricted_candidate = DfsReplicaCandidate::new(node("restricted-resource-node"));
+        let observation =
+            |candidate: &DfsReplicaCandidate, resource_pressure| DfsPlacementNodeObservation {
+                node_id: candidate.node_id.clone(),
+                zone: None,
+                storage_health: DfsHealthState::Healthy,
+                storage_freshness: DfsObservationFreshness::Fresh,
+                accepts_new_content: true,
+                capacity_weight: 1,
+                usable_capacity_bytes: Some(1024),
+                reserved_free_bytes: Some(0),
+                content_location_count: 1,
+                network_metering: DfsNetworkMetering::Unmetered,
+                resource_pressure,
+                observed_at: now,
+                expires_at: now + time::Duration::minutes(1),
+            };
+        let normal = observation(&normal_candidate, DfsResourcePressure::Normal);
+        let restricted = observation(&restricted_candidate, DfsResourcePressure::Restricted);
+        let request = DfsReplicaPlacementRequest {
+            file_system_id: DfsFileSystemId::from_legacy_named("resource-pressure-fs")
+                .expect("filesystem"),
+            object_id: DfsObjectId::from_legacy_named("resource-pressure-object").expect("object"),
+            target_version: DfsVersion::from_legacy_named("resource-pressure-version")
+                .expect("version"),
+            coordinator_node_id: node("resource-pressure-coordinator"),
+            policy: DfsReplicationPolicy::new(1, 1).expect("policy"),
+            candidates: vec![normal_candidate.clone(), restricted_candidate.clone()],
+        };
+        let normal_evidence = CandidateEvidence {
+            candidate: &normal_candidate,
+            node: Some(&normal),
+            path: None,
+            current: false,
+            pinned: false,
+        };
+        let restricted_evidence = CandidateEvidence {
+            candidate: &restricted_candidate,
+            node: Some(&restricted),
+            path: None,
+            current: false,
+            pinned: false,
+        };
+
+        assert_eq!(
+            compare_candidate_evidence(&request, normal_evidence, restricted_evidence, now),
+            Ordering::Less,
+            "new placement should prefer the normal node"
+        );
+        assert_eq!(
+            compare_candidate_evidence(
+                &request,
+                normal_evidence,
+                CandidateEvidence {
+                    current: true,
+                    ..restricted_evidence
+                },
+                now,
+            ),
+            Ordering::Greater,
+            "resource pressure alone must not evacuate an existing replica"
+        );
+    }
+
+    #[test]
     fn aggregate_advertisement_counts_locations_but_keeps_one_node_identity() {
         let root = sinomo_testdir::TestDir::new("dfs-health-multiple-locations");
         let first = root.join("first");
@@ -1465,6 +1642,63 @@ mod tests {
         assert_eq!(advertisement.node_id, local);
         assert_eq!(advertisement.content_location_count, 2);
         assert!(advertisement.accepts_content);
+    }
+
+    #[test]
+    fn metering_transition_updates_cached_health_without_resampling_storage() {
+        let root = sinomo_testdir::TestDir::new("dfs-health-metering-transition");
+        let content = root.join("content");
+        std::fs::create_dir_all(&content).expect("content location");
+        let mut monitor = DfsDeviceHealthMonitor::new(
+            node("metering-transition"),
+            vec![DfsContentLocationConfig::legacy(content.clone())],
+        );
+        let sampled_at = OffsetDateTime::now_utc();
+        let initial = monitor.sample(sampled_at, DfsNetworkMetering::Unmetered);
+        std::fs::remove_dir_all(&content).expect("remove after initial sample");
+
+        let updated = monitor.sample_if_due(
+            sampled_at + time::Duration::seconds(1),
+            DfsNetworkMetering::Metered,
+            DfsResourcePressure::Restricted,
+        );
+
+        assert_eq!(updated.sequence, initial.sequence + 1);
+        assert_eq!(updated.observed_at, initial.observed_at);
+        assert_eq!(updated.summary, initial.summary);
+        assert_eq!(updated.content_locations, initial.content_locations);
+        assert_eq!(updated.network_metering, DfsNetworkMetering::Metered);
+        assert_eq!(updated.resource_pressure, DfsResourcePressure::Restricted);
+        assert_eq!(monitor.last_sampled_at, Some(sampled_at));
+    }
+
+    #[test]
+    fn advisory_resource_transition_bypasses_storage_health_hysteresis() {
+        let root = sinomo_testdir::TestDir::new("dfs-health-advisory-transition");
+        let content = root.join("content");
+        std::fs::create_dir_all(&content).expect("content location");
+        let local = node("advisory-transition");
+        let mut monitor =
+            DfsDeviceHealthMonitor::new(local, vec![DfsContentLocationConfig::legacy(content)]);
+        let now = OffsetDateTime::now_utc();
+        monitor.sample(now, DfsNetworkMetering::Unmetered);
+        let initial = monitor.aggregate_advertisement(None, now);
+        assert_eq!(initial.resource_pressure, DfsResourcePressure::Normal);
+
+        monitor
+            .update_advisory_evidence(DfsNetworkMetering::Metered, DfsResourcePressure::Restricted);
+        let restricted = monitor.aggregate_advertisement(None, now + time::Duration::seconds(1));
+
+        assert_eq!(restricted.network_metering, DfsNetworkMetering::Metered);
+        assert_eq!(
+            restricted.resource_pressure,
+            DfsResourcePressure::Restricted
+        );
+        assert_eq!(restricted.storage_health, initial.storage_health);
+        assert_eq!(
+            restricted.expires_at, initial.expires_at,
+            "an advisory callback must not renew unsampled capacity evidence"
+        );
     }
 
     #[test]

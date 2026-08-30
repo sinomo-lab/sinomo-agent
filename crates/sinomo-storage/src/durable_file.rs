@@ -1,6 +1,10 @@
 use std::collections::HashMap;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::os::unix::ffi::OsStrExt as _;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 #[cfg(windows)]
@@ -565,11 +569,16 @@ pub fn write_file_create_new_atomic(
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    if let Err(source) = fs::hard_link(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(io_error(path.display(), source));
+    let publication = match publish_staged_no_replace(&temp_path, path) {
+        Ok(publication) => publication,
+        Err(source) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(io_error(path.display(), source));
+        }
+    };
+    if publication == NoReplacePublication::Linked {
+        fs::remove_file(&temp_path).map_err(|source| io_error(temp_path.display(), source))?;
     }
-    fs::remove_file(&temp_path).map_err(|source| io_error(temp_path.display(), source))?;
     sync_directory(parent)
 }
 
@@ -596,8 +605,9 @@ where
             let _ = fs::remove_file(&temp_path);
             return Err(error);
         }
-        match fs::hard_link(&temp_path, path) {
-            Ok(()) => {}
+        match publish_staged_no_replace(&temp_path, path) {
+            Ok(NoReplacePublication::Renamed) => continue,
+            Ok(NoReplacePublication::Linked) => {}
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
             Err(source) => {
                 let _ = fs::remove_file(&temp_path);
@@ -607,6 +617,71 @@ where
         fs::remove_file(&temp_path).map_err(|source| io_error(temp_path.display(), source))?;
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoReplacePublication {
+    Renamed,
+    Linked,
+}
+
+fn publish_staged_no_replace(
+    staged_path: &Path,
+    destination_path: &Path,
+) -> io::Result<NoReplacePublication> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    match rename_noreplace(staged_path, destination_path) {
+        Ok(()) => return Ok(NoReplacePublication::Renamed),
+        Err(source) if source.kind() == io::ErrorKind::AlreadyExists => return Err(source),
+        Err(source) if !rename_noreplace_can_fallback(&source) => return Err(source),
+        Err(_) => {}
+    }
+
+    fs::hard_link(staged_path, destination_path)?;
+    Ok(NoReplacePublication::Linked)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(staged_path: &Path, destination_path: &Path) -> io::Result<()> {
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    let staged_path = CString::new(staged_path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staged path contains an interior NUL byte",
+        )
+    })?;
+    let destination_path = CString::new(destination_path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination path contains an interior NUL byte",
+        )
+    })?;
+    // SAFETY: both C strings remain alive for the syscall and point at
+    // NUL-terminated path bytes. RENAME_NOREPLACE performs one atomic
+    // same-filesystem namespace operation without replacing an existing name.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            staged_path.as_ptr(),
+            libc::AT_FDCWD,
+            destination_path.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace_can_fallback(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+    )
 }
 
 #[derive(Clone)]
@@ -1119,55 +1194,77 @@ fn create_private_staged_file_platform(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
-/// Atomically publishes an already-synced staged file from the destination's
-/// directory and then makes the destination directory entry durable.
+/// Atomically publishes an already-synced staged file on the destination's
+/// filesystem and then makes both namespace updates durable.
 ///
-/// The staged path and destination must name distinct entries in the same
-/// directory. With `overwrite` disabled, destination creation is a hard-link
-/// operation, so an existing destination wins atomically without a preflight
-/// existence check. With `overwrite` enabled, the platform's atomic replace
-/// operation is used; the destination is never deleted as a fallback.
+/// The staged path and destination must name distinct entries on the same
+/// filesystem, but may live in different directories. With `overwrite`
+/// disabled, destination creation uses an atomic
+/// no-replace rename where supported and otherwise a hard-link publication, so
+/// an existing destination wins without a preflight existence check. With
+/// `overwrite` enabled, the platform's atomic replace operation is used; the
+/// destination is never deleted as a fallback.
 ///
 /// A failed publish leaves the staged path in place for the caller's cleanup
 /// guard. Once the atomic namespace operation succeeds, a subsequent directory
 /// sync error can only report an indeterminate durability outcome: the staged
-/// name has already been consumed for replacement, or is still linked to the
-/// installed file for a no-clobber publish.
+/// name has already been consumed by a rename, or is still linked to the
+/// installed file on a hard-link fallback.
 pub fn install_staged_file(
     staged_path: &Path,
     destination_path: &Path,
     overwrite: bool,
 ) -> Result<(), DurableFileError> {
-    let parent = validate_staged_install_paths(staged_path, destination_path)?;
+    let (staged_parent, destination_parent) =
+        validate_staged_install_paths(staged_path, destination_path)?;
     prepare_staged_install_metadata(staged_path, destination_path, overwrite)?;
 
     if overwrite {
         replace_file(staged_path, destination_path)?;
-        return sync_directory(&parent);
+        sync_install_directories(&staged_parent, &destination_parent)?;
+        return Ok(());
     }
 
-    fs::hard_link(staged_path, destination_path).map_err(|source| {
-        io_error(
-            format!(
-                "{} -> {}",
-                staged_path.display(),
-                destination_path.display()
-            ),
-            source,
-        )
-    })?;
+    let publication =
+        publish_staged_no_replace(staged_path, destination_path).map_err(|source| {
+            io_error(
+                format!(
+                    "{} -> {}",
+                    staged_path.display(),
+                    destination_path.display()
+                ),
+                source,
+            )
+        })?;
 
-    sync_directory(&parent)?;
+    sync_directory(&destination_parent)?;
 
-    // The destination link is durable before the staging name is removed. A
-    // crash during this cleanup can therefore only leave a harmless extra link.
-    fs::remove_file(staged_path).map_err(|source| io_error(staged_path.display(), source))
+    if publication == NoReplacePublication::Linked {
+        // The destination link is durable before the staging name is removed.
+        // A crash during cleanup can therefore only leave a harmless extra link.
+        fs::remove_file(staged_path).map_err(|source| io_error(staged_path.display(), source))?;
+    }
+    if staged_parent != destination_parent {
+        sync_directory(&staged_parent)?;
+    }
+    Ok(())
+}
+
+fn sync_install_directories(
+    staged_parent: &Path,
+    destination_parent: &Path,
+) -> Result<(), DurableFileError> {
+    sync_directory(destination_parent)?;
+    if staged_parent != destination_parent {
+        sync_directory(staged_parent)?;
+    }
+    Ok(())
 }
 
 fn validate_staged_install_paths(
     staged_path: &Path,
     destination_path: &Path,
-) -> Result<PathBuf, DurableFileError> {
+) -> Result<(PathBuf, PathBuf), DurableFileError> {
     let staged_name = staged_path
         .file_name()
         .ok_or_else(|| DurableFileError::Io {
@@ -1189,18 +1286,7 @@ fn validate_staged_install_paths(
         .map_err(|source| io_error(staged_parent.display(), source))?;
     let destination_parent = fs::canonicalize(destination_parent)
         .map_err(|source| io_error(destination_parent.display(), source))?;
-    if staged_parent != destination_parent {
-        return Err(DurableFileError::Io {
-            path: format!(
-                "{} -> {}",
-                staged_path.display(),
-                destination_path.display()
-            ),
-            kind: io::ErrorKind::InvalidInput,
-            detail: "staged file and destination must be in the same directory".to_string(),
-        });
-    }
-    if staged_name == destination_name {
+    if staged_parent == destination_parent && staged_name == destination_name {
         return Err(DurableFileError::Io {
             path: staged_path.display().to_string(),
             kind: io::ErrorKind::InvalidInput,
@@ -1218,7 +1304,7 @@ fn validate_staged_install_paths(
         });
     }
 
-    Ok(staged_parent)
+    Ok((staged_parent, destination_parent))
 }
 
 fn prepare_staged_install_metadata(
@@ -1937,6 +2023,26 @@ mod tests {
             b"content"
         );
         assert!(!staged.exists(), "successful publish removes staged link");
+    }
+
+    #[test]
+    fn staged_install_no_clobber_moves_across_directories_on_one_filesystem() {
+        let root = sinomo_testdir::TestDir::new("storage-staged-install-cross-directory");
+        let staging = root.join("staging");
+        let destination_dir = root.join("destination");
+        fs::create_dir_all(&staging).expect("staging directory");
+        fs::create_dir_all(&destination_dir).expect("destination directory");
+        let staged = staging.join("payload.bin");
+        let destination = destination_dir.join("payload.bin");
+        write_private_stage(&staged, b"cross-directory content");
+
+        install_staged_file(&staged, &destination, false).expect("publish across directories");
+
+        assert_eq!(
+            fs::read(&destination).expect("read destination"),
+            b"cross-directory content"
+        );
+        assert!(!staged.exists(), "successful rename consumes staged name");
     }
 
     #[test]

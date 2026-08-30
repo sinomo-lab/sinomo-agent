@@ -660,12 +660,14 @@ pub(crate) use maintenance_host::{
 };
 
 mod placement_environment;
-pub(crate) use placement_environment::{
-    cached_daemon_dfs_placement_snapshot_cache, refresh_daemon_dfs_storage_environment_on_runtime,
-    subscribe_daemon_dfs_remote_placement_observation,
-};
 use placement_environment::{
-    daemon_dfs_local_content_advertisement, refresh_daemon_dfs_placement_snapshot,
+    cached_daemon_dfs_local_content_advertisement, refresh_daemon_dfs_placement_snapshot,
+};
+pub(crate) use placement_environment::{
+    cached_daemon_dfs_placement_snapshot_cache, daemon_dfs_storage_environment_dirty_generation,
+    daemon_dfs_storage_environment_notify, notify_daemon_dfs_storage_environment_dirty,
+    refresh_daemon_dfs_storage_environment_with_resources_on_runtime,
+    subscribe_daemon_dfs_remote_placement_observation,
 };
 
 mod message_host;
@@ -687,7 +689,8 @@ mod maintenance_runtime;
 #[cfg(test)]
 use maintenance_runtime::*;
 pub(crate) use maintenance_runtime::{
-    DaemonDfsMaintenanceTickOutcome, replay_daemon_dfs_mounted_mutation_committed_work_on_runtime,
+    DaemonDfsMaintenanceTickOutcome, daemon_dfs_background_network_work_deferred,
+    replay_daemon_dfs_mounted_mutation_committed_work_on_runtime,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
     run_daemon_dfs_repair_queue_recovery_on_runtime,
 };

@@ -1979,6 +1979,10 @@ impl sinomo_dfs::DfsCommittedEffectsHost for DaemonDfsCommittedEffectsHost<'_> {
             DaemonDfsMutationLaneKey::from_scope(self.execution_scope),
         );
     }
+
+    fn storage_environment_changed(&self) {
+        notify_daemon_dfs_storage_environment_dirty(self.data_dir);
+    }
 }
 
 pub(crate) fn emit_daemon_dfs_committed_edges(

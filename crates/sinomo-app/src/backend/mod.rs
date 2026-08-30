@@ -36,8 +36,8 @@ use sinomo_runtime::cluster::{
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
 use sinomo_runtime::core::ClusterNodeRole;
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonComponentFactory, DaemonExecutionProfile, daemon_cluster_status,
-    run_daemon_control_loop_with_catalog_and_profile,
+    DaemonClusterProcess, DaemonComponentFactory, DaemonExecutionProfile, DaemonRuntimeConfig,
+    daemon_cluster_status, run_daemon_control_loop_with_catalog_and_runtime,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::ClusterPaths;
@@ -86,6 +86,19 @@ fn embedded_daemon_execution_profile() -> DaemonExecutionProfile {
     #[cfg(not(target_os = "android"))]
     {
         DaemonExecutionProfile::Standard
+    }
+}
+
+fn embedded_product_component_profile(
+    cluster_initialized: bool,
+) -> sinomo_product_profile::ProductComponentProfile {
+    #[cfg(target_os = "android")]
+    {
+        sinomo_product_profile::ProductComponentProfile::mobile_embedded(cluster_initialized)
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        sinomo_product_profile::ProductComponentProfile::embedded(cluster_initialized)
     }
 }
 
@@ -176,6 +189,16 @@ impl Backend {
     /// surface. This blocks while the in-process daemon starts, so it is meant to run off the UI
     /// thread; `progress` reports each step for the launch status indicator.
     pub fn connect(progress: impl Fn(&str)) -> Self {
+        Self::connect_with_node_resources(
+            progress,
+            sinomo_runtime::device::NodeResourceMonitor::default(),
+        )
+    }
+
+    pub(crate) fn connect_with_node_resources(
+        progress: impl Fn(&str),
+        node_resources: sinomo_runtime::device::NodeResourceMonitor,
+    ) -> Self {
         progress("Preparing…");
         // When attached to an external daemon no in-process daemon installs the
         // KV-backed cluster directory, and the app's direct-probe fallbacks
@@ -205,7 +228,12 @@ impl Backend {
             // in-process, falling back to direct config only if that fails.
             DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
                 progress("Starting a local daemon…");
-                match start_in_process_daemon(&paths, &progress, agent_runtime_control.clone()) {
+                match start_in_process_daemon(
+                    &paths,
+                    &progress,
+                    agent_runtime_control.clone(),
+                    node_resources.clone(),
+                ) {
                     Ok((status, handle)) => {
                         (Connection::InProcessDaemon(Box::new(status)), Some(handle))
                     }
@@ -231,6 +259,7 @@ impl Backend {
                 &paths,
                 &progress,
                 agent_runtime_control.clone(),
+                node_resources.clone(),
                 &mut daemon,
             ) {
                 Ok(status) => {
@@ -769,6 +798,7 @@ fn restart_in_process_daemon_after_cluster_init(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
     agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
+    node_resources: sinomo_runtime::device::NodeResourceMonitor,
     daemon: &mut Option<InProcessDaemon>,
 ) -> Result<DaemonStatus, String> {
     let current = daemon.as_ref().ok_or_else(|| {
@@ -777,7 +807,8 @@ fn restart_in_process_daemon_after_cluster_init(
     wait_for_in_process_daemon_exit(current, IN_PROCESS_DAEMON_STOP_TIMEOUT)?;
     daemon.take();
 
-    let (status, replacement) = start_in_process_daemon(paths, progress, agent_runtime_control)?;
+    let (status, replacement) =
+        start_in_process_daemon(paths, progress, agent_runtime_control, node_resources)?;
     *daemon = Some(replacement);
     if status.cluster.is_none() {
         return Err(
@@ -845,6 +876,7 @@ fn start_in_process_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
     agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
+    node_resources: sinomo_runtime::device::NodeResourceMonitor,
 ) -> Result<(DaemonStatus, InProcessDaemon), String> {
     let options = DaemonRunOptions::default();
     let execution_profile = embedded_daemon_execution_profile();
@@ -861,29 +893,35 @@ fn start_in_process_daemon(
                 .map(SinomoDataDir::new)
                 .expect("embedded daemon paths must have a data directory parent");
             let result = (|| {
-                let base_catalog = sinomo_product_profile::base_component_catalog(
-                    &data_dir,
-                    sinomo_product_profile::ProductComponentProfile::embedded(cluster.is_some()),
-                )
-                .map_err(|error| format!("build embedded product component profile: {error}"))?;
-                let hooks = vec![
-                    agent_runtime_control_component_factory(control_host),
-                    sinomo_cli::sifs_mount_supervisor_component_factory(
-                        data_dir,
-                        loop_paths.clone(),
-                    ),
-                ];
+                let product_profile = embedded_product_component_profile(cluster.is_some());
+                let base_catalog =
+                    sinomo_product_profile::base_component_catalog(&data_dir, product_profile)
+                        .map_err(|error| {
+                            format!("build embedded product component profile: {error}")
+                        })?;
+                let hooks = vec![agent_runtime_control_component_factory(control_host)];
+                #[cfg(not(target_os = "android"))]
+                let hooks = {
+                    let mut hooks = hooks;
+                    if product_profile.hosts_native_filesystem_projection() {
+                        hooks.push(sinomo_cli::sifs_mount_supervisor_component_factory(
+                            data_dir,
+                            loop_paths.clone(),
+                        ));
+                    }
+                    hooks
+                };
                 let component_catalog =
                     sinomo_product_profile::with_components(&base_catalog, hooks).map_err(
                         |error| format!("extend embedded product component profile: {error}"),
                     )?;
-                run_daemon_control_loop_with_catalog_and_profile(
+                run_daemon_control_loop_with_catalog_and_runtime(
                     options,
                     loop_paths,
                     "daemon",
                     cluster,
                     component_catalog,
-                    execution_profile,
+                    DaemonRuntimeConfig::new(execution_profile).with_node_resources(node_resources),
                 )
                 .map_err(|error| error.to_string())
             })();

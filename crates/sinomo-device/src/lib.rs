@@ -1,12 +1,14 @@
 //! Device profile, permission, and capability metadata.
 
 mod native;
+mod runtime_resources;
 
 use serde::{Deserialize, Serialize};
 use sinomo_core::node::NodeId;
 use sinomo_core::{CapabilityName, DeviceCapability};
 
 pub use native::*;
+pub use runtime_resources::*;
 
 pub type DeviceId = sinomo_core::Id;
 

@@ -55,6 +55,10 @@ pub struct DfsNodeAdvertisement {
     pub content_location_count: u32,
     #[serde(default)]
     pub network_metering: crate::DfsNetworkMetering,
+    /// Sanitized scheduling pressure. Exact power/thermal observations remain
+    /// node-local and this field never overrides pins or replication policy.
+    #[serde(default)]
+    pub resource_pressure: crate::DfsResourcePressure,
     #[serde(default)]
     pub advertisement_generation: u64,
     #[serde(with = "time::serde::rfc3339")]
@@ -81,6 +85,7 @@ impl DfsNodeAdvertisement {
             reserved_free_bytes: None,
             content_location_count: 0,
             network_metering: crate::DfsNetworkMetering::Unknown,
+            resource_pressure: crate::DfsResourcePressure::Normal,
             advertisement_generation: 0,
             updated_at: OffsetDateTime::now_utc(),
             expires_at: None,
@@ -100,6 +105,7 @@ impl DfsNodeAdvertisement {
             reserved_free_bytes: None,
             content_location_count: 1,
             network_metering: crate::DfsNetworkMetering::Unknown,
+            resource_pressure: crate::DfsResourcePressure::Normal,
             advertisement_generation: 0,
             updated_at: OffsetDateTime::now_utc(),
             expires_at: None,

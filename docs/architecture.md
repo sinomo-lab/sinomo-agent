@@ -101,6 +101,36 @@ battery and bandwidth, data residency, current node health, and action
 authority. A remote node may propose an action, but the node that owns the
 affected device or data performs the final authorization.
 
+### Node-local resource conditions
+
+Native application hosts publish battery, thermal, metering, and OS data-policy
+conditions through the process-local `sinomo-device` resource monitor. These
+observations are advisory scheduling inputs: they are not persisted, written to
+cluster KV, or accepted as authority for a distributed mutation. Embedded
+daemons subscribe to the same monitor, so a condition change is an exact wake
+edge rather than another filesystem or control-plane polling loop.
+
+Resource restrictions may defer passive discovery, observation, DFS placement,
+repair, and replica catch-up. Foreground requests, local recovery, explicit
+operator recovery, pins, W/N replication requirements, and final authority
+checks retain their normal typed paths. DFS publishes only coarse metering and
+resource-pressure evidence; exact battery and thermal readings remain local.
+Every daemon samples physical DFS capacity at startup and after coalesced,
+committed storage-dirty edges. Lease expiry, idle time, and resource callbacks
+consume cached evidence and never become filesystem polling triggers; request,
+maintenance, and reconciliation lanes consume the same cached projection.
+The mobile embedded product profile also omits native build and host-filesystem
+projection workers; those capabilities remain discoverable from suitable remote
+nodes instead of creating idle toolchain, watcher, lease, or mount state on the
+phone.
+Android lifecycle, window-inset, network-capability, Data Saver, battery,
+power-saver, and thermal changes arrive through framework callbacks registered
+only while the Activity is resumed. The app therefore retains no visible-state
+JNI polling timer for those signals, and a background Activity retains no
+condition listeners. Hiding the Activity immediately projects Restricted mode
+to its embedded daemon; a fresh framework-driven condition sample is required
+to lift that restriction after the Activity returns.
+
 ## Distributed Foundation
 
 ### Cluster Control

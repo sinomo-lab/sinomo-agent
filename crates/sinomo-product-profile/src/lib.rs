@@ -16,6 +16,14 @@ use sinomo_runtime::module::{
 pub struct ProductComponentProfile {
     pub host_role: ComponentHostRole,
     pub cluster_initialized: bool,
+    pub resource_class: ProductResourceClass,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProductResourceClass {
+    #[default]
+    Standard,
+    Mobile,
 }
 
 impl ProductComponentProfile {
@@ -23,6 +31,7 @@ impl ProductComponentProfile {
         Self {
             host_role: ComponentHostRole::Main,
             cluster_initialized,
+            resource_class: ProductResourceClass::Standard,
         }
     }
 
@@ -30,6 +39,7 @@ impl ProductComponentProfile {
         Self {
             host_role: ComponentHostRole::Shadow,
             cluster_initialized,
+            resource_class: ProductResourceClass::Standard,
         }
     }
 
@@ -37,7 +47,32 @@ impl ProductComponentProfile {
         Self {
             host_role: ComponentHostRole::Embedded,
             cluster_initialized,
+            resource_class: ProductResourceClass::Standard,
         }
+    }
+
+    pub fn mobile_embedded(cluster_initialized: bool) -> Self {
+        Self {
+            host_role: ComponentHostRole::Embedded,
+            cluster_initialized,
+            resource_class: ProductResourceClass::Mobile,
+        }
+    }
+
+    fn hosts_native_build_worker(self) -> bool {
+        self.resource_class == ProductResourceClass::Standard
+            && matches!(
+                self.host_role,
+                ComponentHostRole::Main | ComponentHostRole::Embedded
+            )
+    }
+
+    pub fn hosts_native_filesystem_projection(self) -> bool {
+        self.resource_class == ProductResourceClass::Standard
+            && matches!(
+                self.host_role,
+                ComponentHostRole::Main | ComponentHostRole::Embedded
+            )
     }
 }
 
@@ -63,17 +98,21 @@ pub fn base_component_catalog(
         )?;
     }
 
-    if matches!(
-        profile.host_role,
-        ComponentHostRole::Main | ComponentHostRole::Embedded
-    ) {
-        builder = register_module_factory(
-            builder,
-            sinomo_runtime::build::build_module_registration(),
-            sinomo_runtime::build::component_factory()
-                .expect("build product component descriptor must be valid"),
-        )?;
-        if profile.cluster_initialized
+    if profile.hosts_native_build_worker() {
+        #[cfg(feature = "native-workers")]
+        {
+            builder = register_module_factory(
+                builder,
+                sinomo_runtime::build::build_module_registration(),
+                sinomo_runtime::build::component_factory()
+                    .expect("build product component descriptor must be valid"),
+            )?;
+        }
+    }
+    #[cfg(feature = "native-workers")]
+    {
+        if profile.hosts_native_filesystem_projection()
+            && profile.cluster_initialized
             && sinomo_runtime::dfs_nfs::nfs_module_enabled(data_dir).unwrap_or(false)
         {
             builder = builder.register_factory(Arc::new(
@@ -163,6 +202,7 @@ fn register_module_factory(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "native-workers")]
     #[test]
     fn main_and_shadow_profiles_share_base_selection_but_not_main_workers() {
         let data_dir = SinomoDataDir::new(
@@ -192,6 +232,54 @@ mod tests {
                 .modules()
                 .get(&sinomo_runtime::rollout::rollout_module_id())
                 .is_some()
+        );
+    }
+
+    #[cfg(feature = "native-workers")]
+    #[test]
+    fn mobile_embedded_profile_omits_native_build_worker() {
+        let data_dir =
+            SinomoDataDir::new(std::env::temp_dir().join("sinomo-product-mobile-profile-missing"));
+        let standard = base_component_catalog(&data_dir, ProductComponentProfile::embedded(false))
+            .expect("standard embedded profile");
+        let mobile =
+            base_component_catalog(&data_dir, ProductComponentProfile::mobile_embedded(false))
+                .expect("mobile embedded profile");
+        let build_component_id = sinomo_runtime::build::build_module_id();
+
+        assert!(standard.modules().get(&build_component_id).is_some());
+        assert!(
+            standard.factories().iter().any(|factory| {
+                factory.descriptor().component_id == build_component_id.as_str()
+            })
+        );
+        assert!(mobile.modules().get(&build_component_id).is_none());
+        assert!(
+            !mobile.factories().iter().any(|factory| {
+                factory.descriptor().component_id == build_component_id.as_str()
+            })
+        );
+        assert!(ProductComponentProfile::embedded(false).hosts_native_filesystem_projection());
+        assert!(
+            !ProductComponentProfile::mobile_embedded(false).hosts_native_filesystem_projection()
+        );
+    }
+
+    #[cfg(not(feature = "native-workers"))]
+    #[test]
+    fn native_worker_free_build_omits_build_component_for_every_profile() {
+        let data_dir = SinomoDataDir::new(
+            std::env::temp_dir().join("sinomo-product-no-native-workers-missing"),
+        );
+        let catalog = base_component_catalog(&data_dir, ProductComponentProfile::main(false))
+            .expect("worker-free main profile");
+        let build_component_id = sinomo_runtime::build::build_module_id();
+
+        assert!(catalog.modules().get(&build_component_id).is_none());
+        assert!(
+            !catalog.factories().iter().any(|factory| {
+                factory.descriptor().component_id == build_component_id.as_str()
+            })
         );
     }
 

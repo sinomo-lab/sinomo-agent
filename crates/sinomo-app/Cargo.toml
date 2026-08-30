@@ -18,6 +18,7 @@ desktop = [
     "gui",
     "dep:rfd",
     "sui/desktop",
+    "sinomo-product-profile/native-workers",
     "sinomo-cli/sandbox",
     "sinomo-cli/dfs-fuse",
 ]
@@ -55,7 +56,7 @@ sinomo-agent = { path = "../sinomo-agent" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
-sinomo-product-profile = { path = "../sinomo-product-profile" }
+sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
 sinomo-video = { path = "../sinomo-video" }
 
 # R0/R1 surface is reached only through the runtime facade (ring boundary).
@@ -63,7 +64,6 @@ sinomo-runtime = { path = "../sinomo-runtime" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
-netwatcher.workspace = true
 
 [build-dependencies]
 android-build = "0.1.4"

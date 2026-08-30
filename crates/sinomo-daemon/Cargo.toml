@@ -35,6 +35,7 @@ sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
+sinomo-device = { path = "../sinomo-device" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-observe = { path = "../sinomo-observe", features = ["cpu-profiler"] }
 sinomo-registry = { path = "../sinomo-registry" }

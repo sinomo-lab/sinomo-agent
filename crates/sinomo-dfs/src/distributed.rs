@@ -214,6 +214,8 @@ pub struct DfsReplicaPlacementDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_metering: Option<crate::DfsNetworkMetering>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_pressure: Option<crate::DfsResourcePressure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_freshness: Option<crate::DfsObservationFreshness>,
 }
 
@@ -401,6 +403,7 @@ fn explain_replicas_with_environment_validation(
                 path_latency_micros: None,
                 path_throughput_bytes_per_second: None,
                 path_metering: None,
+                resource_pressure: None,
                 observation_freshness: None,
             }
         })

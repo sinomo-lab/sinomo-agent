@@ -366,7 +366,7 @@ impl NativeMicrophoneCapture {
         #[cfg(not(feature = "native-devices"))]
         {
             let _ = timeout;
-            return Err(native_devices_disabled_error("microphone capture"));
+            Err(native_devices_disabled_error("microphone capture"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -393,7 +393,7 @@ impl NativeMicrophoneCapture {
     pub fn check_health(&self) -> Result<(), NativeDeviceError> {
         #[cfg(not(feature = "native-devices"))]
         {
-            return Err(native_devices_disabled_error("microphone capture"));
+            Err(native_devices_disabled_error("microphone capture"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -426,7 +426,7 @@ impl NativeSpeakerPlayback {
         #[cfg(not(feature = "native-devices"))]
         {
             let _ = bytes;
-            return Err(native_devices_disabled_error("speaker playback"));
+            Err(native_devices_disabled_error("speaker playback"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -447,7 +447,7 @@ impl NativeSpeakerPlayback {
     pub fn check_health(&self) -> Result<(), NativeDeviceError> {
         #[cfg(not(feature = "native-devices"))]
         {
-            return Err(native_devices_disabled_error("speaker playback"));
+            Err(native_devices_disabled_error("speaker playback"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -483,7 +483,7 @@ impl NativeCameraCapture {
         #[cfg(not(feature = "native-devices"))]
         {
             let _ = timeout;
-            return Err(native_devices_disabled_error("camera capture"));
+            Err(native_devices_disabled_error("camera capture"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -510,7 +510,7 @@ impl NativeCameraCapture {
     pub fn check_health(&self) -> Result<(), NativeDeviceError> {
         #[cfg(not(feature = "native-devices"))]
         {
-            return Err(native_devices_disabled_error("camera capture"));
+            Err(native_devices_disabled_error("camera capture"))
         }
         #[cfg(feature = "native-devices")]
         {
@@ -1012,7 +1012,7 @@ fn enumerate_native_devices_with_camera(
                     .to_string(),
             );
         }
-        return inventory;
+        inventory
     }
     #[cfg(feature = "native-devices")]
     {

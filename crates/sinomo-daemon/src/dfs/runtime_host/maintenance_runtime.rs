@@ -121,6 +121,7 @@ where
 pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let mounted_mutation_recovery =
         prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
@@ -133,8 +134,13 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     } else {
         DaemonDfsMaintenanceKind::Routine
     };
-    let outcome =
-        run_daemon_dfs_maintenance_tick_kind_on_runtime(paths, runtime, maintenance_kind).await?;
+    let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
+        paths,
+        runtime,
+        maintenance_kind,
+        node_resources,
+    )
+    .await?;
     complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
     Ok(outcome)
 }
@@ -159,6 +165,7 @@ pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
             content_reservation_reconciliation_requested: false,
             commit_promotion_recovery_requested: false,
         },
+        sinomo_device::NodeResourceSnapshot::default(),
     )
     .await?;
     complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
@@ -192,6 +199,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
     maintenance_kind: DaemonDfsMaintenanceKind,
+    node_resources: sinomo_device::NodeResourceSnapshot,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let data_dir = daemon_data_dir(paths)?;
     let data_dir = SinomoDataDir::new(data_dir);
@@ -242,6 +250,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
                 runtime,
                 &metadata_authority_preflight,
                 maintenance_kind,
+                node_resources,
                 committed_work_tracker.clone(),
                 &mut deferred_work,
                 &foreground_preemption,
@@ -312,6 +321,12 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
             "could not refresh bounded DFS repair queue state after maintenance"
         );
     }
+    if matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. }) {
+        // Lifecycle work can delete or compact content without producing a
+        // served-message event. One coalesced dirty edge after a completed pass
+        // keeps capacity evidence current without a periodic filesystem scan.
+        notify_daemon_dfs_storage_environment_dirty(&data_dir);
+    }
     Ok(outcome)
 }
 
@@ -321,6 +336,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     runtime: &tokio::runtime::Handle,
     metadata_authority_preflight: &DaemonDfsMetadataAuthorityPreflight,
     maintenance_kind: DaemonDfsMaintenanceKind,
+    node_resources: sinomo_device::NodeResourceSnapshot,
     committed_work_tracker: DfsCommittedWorkTracker,
     _deferred_work: &mut Option<(Arc<DaemonDfsDetachedSendRuntime>, DfsNodeDetachedSendWorker)>,
     _foreground_preemption: &DaemonDfsMaintenanceForegroundPreemption,
@@ -362,7 +378,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         resident_metadata_scope,
         ..
     } = lane;
-    let local_advertisement = daemon_dfs_local_content_advertisement(
+    let local_advertisement = cached_daemon_dfs_local_content_advertisement(
         &data_dir,
         &cluster_state.local_node_id,
         daemon_dfs_local_zone(),
@@ -404,7 +420,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
                 async_peer_transport,
                 execution_exclusions,
                 committed_work_tracker,
-                daemon_dfs_routine_maintenance_tick_options(),
+                daemon_dfs_routine_maintenance_tick_options(node_resources),
             )
             .await
             .map(Some)
@@ -643,6 +659,7 @@ pub(super) fn daemon_dfs_maintenance_report_reached_limit(
 pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
+    node_resources: sinomo_device::NodeResourceSnapshot,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
@@ -651,6 +668,7 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
         runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
             &paths,
             &tick_runtime,
+            node_resources,
         ))
     })
     .await
@@ -660,8 +678,37 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     })?
 }
 
-pub(super) fn daemon_dfs_routine_maintenance_tick_options() -> DfsMaintenanceTickOptions {
-    sinomo_dfs::dfs_resident_routine_maintenance_tick_options()
+pub(super) fn daemon_dfs_routine_maintenance_tick_options(
+    node_resources: sinomo_device::NodeResourceSnapshot,
+) -> DfsMaintenanceTickOptions {
+    let mut options = sinomo_dfs::dfs_resident_routine_maintenance_tick_options();
+    if daemon_dfs_background_network_work_deferred(node_resources) {
+        // Local intent/namespace/handoff recovery remains active. Background
+        // data-plane repair, placement migration, and metadata catch-up wait
+        // for an exact resource-change wake or an explicit operator recovery.
+        // Metered links receive the same protection even when battery and
+        // thermal conditions alone would otherwise be merely constrained.
+        options.repair_max_jobs = 0;
+        options.placement_reconciliation_max_objects = 0;
+        options.metadata_replication.max_batches_per_target = 0;
+    } else if node_resources.mode == sinomo_device::NodeResourceMode::Constrained {
+        // An unmetered node under battery, power-saver, congestion, or thermal
+        // pressure can still make bounded healing progress without running a
+        // workstation-sized maintenance batch.
+        options.repair_max_jobs = options.repair_max_jobs.min(1);
+        options.placement_reconciliation_max_objects =
+            options.placement_reconciliation_max_objects.min(16);
+        options.metadata_replication.max_batches_per_target =
+            options.metadata_replication.max_batches_per_target.min(1);
+    }
+    options
+}
+
+pub(crate) fn daemon_dfs_background_network_work_deferred(
+    node_resources: sinomo_device::NodeResourceSnapshot,
+) -> bool {
+    node_resources.mode == sinomo_device::NodeResourceMode::Restricted
+        || node_resources.network_metering == sinomo_device::NodeNetworkMetering::Metered
 }
 
 pub(super) fn daemon_dfs_explicit_disaster_recovery_tick_options(

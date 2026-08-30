@@ -7,11 +7,11 @@ pub const CLUSTER_NETWORK_STABLE_REFRESH_MARGIN_SECONDS: i64 = 60;
 // workstation/server creates continuous control traffic with no fresher
 // authority guarantee (connectivity evidence itself is valid for 15 minutes).
 pub const CLUSTER_NETWORK_PUBLISH_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL: Duration = Duration::from_secs(300);
+pub const CLUSTER_NETWORK_MOBILE_PUBLISH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const CLUSTER_NETWORK_SENSOR_PUBLISH_INTERVAL: Duration = Duration::from_secs(900);
 pub const CLUSTER_NETWORK_DISCOVERY_INTERVAL: Duration = Duration::from_secs(60);
 pub const CLUSTER_NETWORK_PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const CLUSTER_NETWORK_MOBILE_PROBE_INTERVAL: Duration = Duration::from_secs(300);
+pub const CLUSTER_NETWORK_MOBILE_PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const CLUSTER_NETWORK_SENSOR_PROBE_INTERVAL: Duration = Duration::from_secs(900);
 pub const CLUSTER_NETWORK_CONVERGENCE_TICK_INTERVAL: Duration = Duration::from_millis(250);
 pub const CLUSTER_NETWORK_STABLE_DISCOVERY_ANNOUNCE_TICK_STRIDE: u64 = 8;
@@ -268,5 +268,25 @@ mod tests {
         assert!(due.publish_due);
         assert!(due.probe_due);
         assert!(due.discovery_due);
+    }
+
+    #[test]
+    fn mobile_cadence_is_longer_than_workstation_but_inside_evidence_ttl() {
+        assert_eq!(
+            cluster_network_publish_interval_for_role(&ClusterNodeRole::Mobile),
+            Duration::from_secs(10 * 60)
+        );
+        assert_eq!(
+            cluster_network_probe_interval_for_role(&ClusterNodeRole::Mobile),
+            Duration::from_secs(10 * 60)
+        );
+        assert!(
+            cluster_network_probe_interval_for_role(&ClusterNodeRole::Mobile)
+                > cluster_network_probe_interval_for_role(&ClusterNodeRole::Workstation)
+        );
+        assert!(
+            cluster_network_probe_interval_for_role(&ClusterNodeRole::Mobile)
+                < cluster_network_probe_interval_for_role(&ClusterNodeRole::Sensor)
+        );
     }
 }

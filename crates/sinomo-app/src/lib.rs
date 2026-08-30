@@ -35,6 +35,10 @@ static ANDROID_SAFE_AREA: std::sync::OnceLock<std::sync::RwLock<sui::Insets>> =
 #[cfg(all(target_os = "android", feature = "mobile"))]
 static ANDROID_APP: std::sync::OnceLock<sui::AndroidApp> = std::sync::OnceLock::new();
 
+#[cfg(all(target_os = "android", feature = "mobile"))]
+static ANDROID_UI_HANDLE: std::sync::OnceLock<std::sync::Mutex<Option<sui::UiHandle>>> =
+    std::sync::OnceLock::new();
+
 pub(crate) fn platform_safe_area_insets() -> sui::Insets {
     #[cfg(all(target_os = "android", feature = "mobile"))]
     {
@@ -145,13 +149,15 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
     install_app_observability();
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
-    let safe_area_app = android_app.clone();
     let conditions_app = android_app.clone();
     let lifecycle_app = android_app.clone();
     app.run_android_with_handle(android_app, move |ui| {
+        *ANDROID_UI_HANDLE
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ui.clone());
         shared.borrow_mut().waker = Some(ui.clone());
         mobile_runtime::start_android_lifecycle_monitor(lifecycle_app);
-        start_android_safe_area_monitor(safe_area_app, ui.clone());
         mobile_runtime::start_android_operating_conditions_monitor(conditions_app, ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
@@ -159,10 +165,13 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
             .name("sinomo-app-connect".to_string())
             .spawn(move || {
                 mobile_runtime::wait_until_interactive_blocking();
-                let backend = Backend::connect(|status| {
-                    let _ = tx.send(ConnectEvent::Status(status.to_string()));
-                    ui.wake();
-                });
+                let backend = Backend::connect_with_node_resources(
+                    |status| {
+                        let _ = tx.send(ConnectEvent::Status(status.to_string()));
+                        ui.wake();
+                    },
+                    mobile_runtime::node_resource_monitor(),
+                );
                 tracing::info!(mode = %backend.mode_label(), "sinomo-app connected");
                 let _ = tx.send(ConnectEvent::Status("Loading workspace…".to_string()));
                 ui.wake();
@@ -243,48 +252,31 @@ fn open_android_external_url_on_java_main_thread(
 }
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
-fn start_android_safe_area_monitor(android_app: sui::AndroidApp, ui: sui::UiHandle) {
-    std::thread::Builder::new()
-        .name("sinomo-app-insets".to_string())
-        .spawn(move || {
-            let mut last = None;
-            loop {
-                let generation = mobile_runtime::wait_until_interactive_blocking();
-                let insets = android_safe_area_insets(&android_app);
-                if last != Some(insets) {
-                    last = Some(insets);
-                    let content = android_app.content_rect();
-                    let config = android_app.config();
-                    tracing::info!(
-                        ?content,
-                        density = ?config.density(),
-                        screen_width_dp = ?config.screen_width_dp(),
-                        screen_height_dp = ?config.screen_height_dp(),
-                        ?insets,
-                        "Android safe area changed"
-                    );
-                    ui.broadcast_application(ANDROID_SAFE_AREA_CHANGED, insets);
-                }
-                // Keep keyboard/cutout changes responsive while visible, but
-                // stop this JNI polling thread completely in the background.
-                mobile_runtime::wait_for_change_or_timeout(
-                    generation,
-                    mobile_runtime::interactive_poll_interval(std::time::Duration::from_millis(
-                        250,
-                    )),
-                );
-            }
-        })
-        .expect("spawn Android safe-area monitor");
-}
-
-#[cfg(all(target_os = "android", feature = "mobile"))]
-fn android_safe_area_insets(android_app: &sui::AndroidApp) -> sui::Insets {
+pub(crate) fn android_safe_area_changed_physical(physical: [i32; 4]) {
+    let Some(android_app) = ANDROID_APP.get() else {
+        return;
+    };
     let config = android_app.config();
     let scale = config.density().unwrap_or(160).max(1) as f32 / 160.0;
-    android_window_insets(android_app)
-        .map(|insets| safe_area_insets_from_physical(insets, scale))
-        .unwrap_or(sui::Insets::ZERO)
+    let insets = safe_area_insets_from_physical(physical, scale);
+    if platform_safe_area_insets() == insets {
+        return;
+    }
+    set_android_safe_area_insets(insets);
+    tracing::info!(
+        content = ?android_app.content_rect(),
+        density = ?config.density(),
+        screen_width_dp = ?config.screen_width_dp(),
+        screen_height_dp = ?config.screen_height_dp(),
+        ?insets,
+        "Android safe area changed"
+    );
+    let ui = ANDROID_UI_HANDLE
+        .get()
+        .and_then(|ui| ui.lock().ok().and_then(|ui| ui.as_ref().cloned()));
+    if let Some(ui) = ui {
+        ui.broadcast_application(ANDROID_SAFE_AREA_CHANGED, insets);
+    }
 }
 
 #[cfg(any(all(target_os = "android", feature = "mobile"), test))]
@@ -296,162 +288,6 @@ fn safe_area_insets_from_physical(insets: [i32; 4], scale: f32) -> sui::Insets {
         right: insets[2].max(0) as f32 / scale,
         bottom: insets[3].max(0) as f32 / scale,
     }
-}
-
-/// Read the system-bar and display-cutout insets from the NativeActivity's
-/// decor view. `content_rect()` spans the entire edge-to-edge surface when
-/// targeting recent Android releases, so it cannot describe the safe area.
-#[cfg(all(target_os = "android", feature = "mobile"))]
-fn android_window_insets(android_app: &sui::AndroidApp) -> Option<[i32; 4]> {
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    let app = android_app.clone();
-    android_app.run_on_java_main_thread(Box::new(move || {
-        let _ = send.send(android_window_insets_on_java_main_thread(&app));
-    }));
-    match receive.recv_timeout(std::time::Duration::from_millis(500)) {
-        Ok(Ok(insets)) => insets,
-        Ok(Err(error)) => {
-            tracing::debug!(%error, "failed to read Android window insets");
-            None
-        }
-        Err(error) => {
-            tracing::debug!(%error, "Android window-insets query did not complete");
-            None
-        }
-    }
-}
-
-#[cfg(all(target_os = "android", feature = "mobile"))]
-fn android_window_insets_on_java_main_thread(
-    android_app: &sui::AndroidApp,
-) -> jni::errors::Result<Option<[i32; 4]>> {
-    use jni::objects::{JObject, JValue};
-    use jni::refs::Global;
-
-    let vm = unsafe { jni::JavaVM::from_raw(android_app.vm_as_ptr().cast()) };
-    let raw_activity = android_app.activity_as_ptr() as jni::sys::jobject;
-    vm.attach_current_thread(|env| {
-        let activity = unsafe { env.as_cast_raw::<Global<JObject>>(&raw_activity)? };
-        let window = env
-            .call_method(
-                &activity,
-                jni::jni_str!("getWindow"),
-                jni::jni_sig!("()Landroid/view/Window;"),
-                &[],
-            )?
-            .l()?;
-        let decor = env
-            .call_method(
-                &window,
-                jni::jni_str!("getDecorView"),
-                jni::jni_sig!("()Landroid/view/View;"),
-                &[],
-            )?
-            .l()?;
-        let root_insets = env
-            .call_method(
-                &decor,
-                jni::jni_str!("getRootWindowInsets"),
-                jni::jni_sig!("()Landroid/view/WindowInsets;"),
-                &[],
-            )?
-            .l()?;
-        if root_insets.is_null() {
-            env.call_method(
-                &decor,
-                jni::jni_str!("requestApplyInsets"),
-                jni::jni_sig!("()V"),
-                &[],
-            )?;
-            return Ok(None);
-        }
-
-        let sdk = env
-            .get_static_field(
-                jni::jni_str!("android/os/Build$VERSION"),
-                jni::jni_str!("SDK_INT"),
-                jni::jni_sig!("I"),
-            )?
-            .i()?;
-        if sdk >= 30 {
-            let system_bars = env
-                .call_static_method(
-                    jni::jni_str!("android/view/WindowInsets$Type"),
-                    jni::jni_str!("systemBars"),
-                    jni::jni_sig!("()I"),
-                    &[],
-                )?
-                .i()?;
-            let display_cutout = env
-                .call_static_method(
-                    jni::jni_str!("android/view/WindowInsets$Type"),
-                    jni::jni_str!("displayCutout"),
-                    jni::jni_sig!("()I"),
-                    &[],
-                )?
-                .i()?;
-            let insets = env
-                .call_method(
-                    &root_insets,
-                    jni::jni_str!("getInsetsIgnoringVisibility"),
-                    jni::jni_sig!("(I)Landroid/graphics/Insets;"),
-                    &[JValue::Int(system_bars | display_cutout)],
-                )?
-                .l()?;
-            return Ok(Some([
-                env.get_field(&insets, jni::jni_str!("left"), jni::jni_sig!("I"))?
-                    .i()?,
-                env.get_field(&insets, jni::jni_str!("top"), jni::jni_sig!("I"))?
-                    .i()?,
-                env.get_field(&insets, jni::jni_str!("right"), jni::jni_sig!("I"))?
-                    .i()?,
-                env.get_field(&insets, jni::jni_str!("bottom"), jni::jni_sig!("I"))?
-                    .i()?,
-            ]));
-        }
-
-        let mut insets = [0; 4];
-        for (index, method) in [
-            jni::jni_str!("getStableInsetLeft"),
-            jni::jni_str!("getStableInsetTop"),
-            jni::jni_str!("getStableInsetRight"),
-            jni::jni_str!("getStableInsetBottom"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            insets[index] = env
-                .call_method(&root_insets, method, jni::jni_sig!("()I"), &[])?
-                .i()?;
-        }
-        if sdk >= 28 {
-            let cutout = env
-                .call_method(
-                    &root_insets,
-                    jni::jni_str!("getDisplayCutout"),
-                    jni::jni_sig!("()Landroid/view/DisplayCutout;"),
-                    &[],
-                )?
-                .l()?;
-            if !cutout.is_null() {
-                for (index, method) in [
-                    jni::jni_str!("getSafeInsetLeft"),
-                    jni::jni_str!("getSafeInsetTop"),
-                    jni::jni_str!("getSafeInsetRight"),
-                    jni::jni_str!("getSafeInsetBottom"),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let cutout_inset = env
-                        .call_method(&cutout, method, jni::jni_sig!("()I"), &[])?
-                        .i()?;
-                    insets[index] = insets[index].max(cutout_inset);
-                }
-            }
-        }
-        Ok(Some(insets))
-    })
 }
 
 /// Bind every embedded subsystem to Android's durable app-private files

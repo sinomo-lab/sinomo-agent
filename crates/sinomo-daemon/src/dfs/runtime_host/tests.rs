@@ -2311,6 +2311,7 @@ fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
     let cluster_paths = ClusterPaths::new(&data_dir);
     let runtime = daemon_test_runtime("committed-work-publish-edge");
     let initial = daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root());
+    let initial_storage_generation = daemon_dfs_storage_environment_dirty_generation(&data_dir);
 
     emit_daemon_dfs_committed_edges(
         &data_dir,
@@ -2326,6 +2327,11 @@ fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
         daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()),
         initial,
         "an empty committed-work receipt must not wake discovery"
+    );
+    assert_eq!(
+        daemon_dfs_storage_environment_dirty_generation(&data_dir),
+        initial_storage_generation,
+        "an empty receipt must not claim that storage changed"
     );
 
     emit_daemon_dfs_committed_edges(
@@ -2349,6 +2355,10 @@ fn committed_work_emitter_is_quiet_for_noop_and_retains_publish_edge() {
     assert!(
         daemon_dfs_metadata_publish_discovery_attempts(&data_dir.root()).0 > initial.0,
         "a committed metadata edge must remain owned even when discovery cannot yet read cluster topology"
+    );
+    assert!(
+        daemon_dfs_storage_environment_dirty_generation(&data_dir) > initial_storage_generation,
+        "a committed mutation must retain one capacity-resample edge"
     );
 }
 
@@ -2952,6 +2962,7 @@ fn run_daemon_dfs_maintenance_body_for_test(
             content_reservation_reconciliation_requested: true,
             commit_promotion_recovery_requested: true,
         },
+        sinomo_device::NodeResourceSnapshot::default(),
         DfsCommittedWorkTracker::new(),
         &mut deferred_work,
         &foreground_preemption,
@@ -3081,7 +3092,33 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
         lifecycle.content_reservation_reconciliation_max_records,
         DAEMON_DFS_CONTENT_RESERVATION_RECONCILIATION_MAX_RECORDS
     );
-    let unrelated_work = daemon_dfs_routine_maintenance_tick_options().lifecycle;
+    let restricted =
+        daemon_dfs_routine_maintenance_tick_options(sinomo_device::NodeResourceSnapshot::observed(
+            sinomo_device::NodeResourceMode::Restricted,
+            sinomo_device::NodeNetworkMetering::Unknown,
+        ));
+    assert_eq!(restricted.repair_max_jobs, 0);
+    assert_eq!(restricted.placement_reconciliation_max_objects, 0);
+    assert_eq!(restricted.metadata_replication.max_batches_per_target, 0);
+    let constrained =
+        daemon_dfs_routine_maintenance_tick_options(sinomo_device::NodeResourceSnapshot::observed(
+            sinomo_device::NodeResourceMode::Constrained,
+            sinomo_device::NodeNetworkMetering::Unmetered,
+        ));
+    assert_eq!(constrained.repair_max_jobs, 1);
+    assert_eq!(constrained.placement_reconciliation_max_objects, 16);
+    assert_eq!(constrained.metadata_replication.max_batches_per_target, 1);
+    let metered =
+        daemon_dfs_routine_maintenance_tick_options(sinomo_device::NodeResourceSnapshot::observed(
+            sinomo_device::NodeResourceMode::Constrained,
+            sinomo_device::NodeNetworkMetering::Metered,
+        ));
+    assert_eq!(metered.repair_max_jobs, 0);
+    assert_eq!(metered.placement_reconciliation_max_objects, 0);
+    assert_eq!(metered.metadata_replication.max_batches_per_target, 0);
+    let unrelated_work =
+        daemon_dfs_routine_maintenance_tick_options(sinomo_device::NodeResourceSnapshot::default())
+            .lifecycle;
     assert!(!unrelated_work.repair_metadata);
     assert!(!unrelated_work.cleanup_stale_staging);
     assert!(!unrelated_work.compact_tombstones);

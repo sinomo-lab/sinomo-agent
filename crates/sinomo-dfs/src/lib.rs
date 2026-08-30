@@ -647,7 +647,7 @@ pub use placement_environment::{
     DfsContentLocationObservation, DfsDeviceHealthMonitor, DfsHealthState, DfsNetworkMetering,
     DfsNodeHealthSnapshot, DfsObservationFreshness, DfsPlacementNodeObservation,
     DfsPlacementPathObservation, DfsPlacementPathState, DfsPlacementSnapshot,
-    DfsPlacementSnapshotCache, explain_replicas_with_placement_snapshot,
+    DfsPlacementSnapshotCache, DfsResourcePressure, explain_replicas_with_placement_snapshot,
 };
 pub use posix::sync::{DfsPosixDirectorySyncCertificate, DfsPosixFileSyncCertificate};
 pub use posix_model::{

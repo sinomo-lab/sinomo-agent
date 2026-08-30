@@ -20,6 +20,7 @@ cpal = { workspace = true, optional = true }
 serde.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 thiserror.workspace = true
+tokio.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 v4l = { workspace = true, optional = true }

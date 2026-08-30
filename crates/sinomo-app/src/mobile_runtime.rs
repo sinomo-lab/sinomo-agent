@@ -50,13 +50,7 @@ pub(crate) struct MobileOperatingConditions {
     pub(crate) power: MobilePowerConditions,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) enum MobileResourceMode {
-    #[default]
-    Normal,
-    Constrained,
-    Restricted,
-}
+pub(crate) type MobileResourceMode = sinomo_runtime::device::NodeResourceMode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MobilePassiveNetworkClass {
@@ -74,6 +68,7 @@ struct MobileRuntimeSnapshot {
     interactive: bool,
     operating: MobileOperatingConditions,
     operating_observed: bool,
+    operating_refresh_generation: u64,
     generation: u64,
 }
 
@@ -91,6 +86,7 @@ impl Default for MobileRuntimeSnapshot {
             interactive: active,
             operating: MobileOperatingConditions::default(),
             operating_observed: false,
+            operating_refresh_generation: 0,
             generation: 0,
         }
     }
@@ -100,16 +96,27 @@ struct MobileRuntimeControl {
     snapshot: Mutex<MobileRuntimeSnapshot>,
     changed: Condvar,
     updates: tokio::sync::watch::Sender<MobileRuntimeSnapshot>,
+    #[cfg(any(target_os = "android", test))]
+    node_resource_publisher: sinomo_runtime::device::NodeResourcePublisher,
+    #[cfg(any(target_os = "android", test))]
+    node_resource_monitor: sinomo_runtime::device::NodeResourceMonitor,
 }
 
 impl Default for MobileRuntimeControl {
     fn default() -> Self {
         let snapshot = MobileRuntimeSnapshot::default();
         let (updates, _) = tokio::sync::watch::channel(snapshot);
+        #[cfg(any(target_os = "android", test))]
+        let (node_resource_publisher, node_resource_monitor) =
+            sinomo_runtime::device::node_resource_channel();
         Self {
             snapshot: Mutex::new(snapshot),
             changed: Condvar::new(),
             updates,
+            #[cfg(any(target_os = "android", test))]
+            node_resource_publisher,
+            #[cfg(any(target_os = "android", test))]
+            node_resource_monitor,
         }
     }
 }
@@ -125,12 +132,21 @@ impl MobileRuntimeControl {
             if snapshot.lifecycle_observed && snapshot.activity_resumed == resumed {
                 return false;
             }
+            let was_interactive = snapshot.interactive;
             snapshot.lifecycle_observed = true;
             snapshot.activity_resumed = resumed;
             snapshot.interactive = resumed && snapshot.window_focused;
+            if snapshot.interactive && !was_interactive {
+                snapshot.operating_refresh_generation =
+                    snapshot.operating_refresh_generation.wrapping_add(1);
+            }
             snapshot.generation = snapshot.generation.wrapping_add(1);
             *snapshot
         };
+        if !next.interactive {
+            self.node_resource_publisher
+                .publish(node_resource_snapshot_for_runtime(next));
+        }
         self.updates.send_replace(next);
         self.changed.notify_all();
         true
@@ -146,6 +162,7 @@ impl MobileRuntimeControl {
             if snapshot.window_focused == focused {
                 return false;
             }
+            let was_interactive = snapshot.interactive;
             snapshot.window_focused = focused;
             // A NativeActivity can reach Rust after onActivityResumed. Until a
             // lifecycle callback is observed, gaining focus is sufficient
@@ -155,9 +172,17 @@ impl MobileRuntimeControl {
                 snapshot.activity_resumed = true;
             }
             snapshot.interactive = snapshot.activity_resumed && focused;
+            if snapshot.interactive && !was_interactive {
+                snapshot.operating_refresh_generation =
+                    snapshot.operating_refresh_generation.wrapping_add(1);
+            }
             snapshot.generation = snapshot.generation.wrapping_add(1);
             *snapshot
         };
+        if !next.interactive {
+            self.node_resource_publisher
+                .publish(node_resource_snapshot_for_runtime(next));
+        }
         self.updates.send_replace(next);
         self.changed.notify_all();
         true
@@ -165,31 +190,38 @@ impl MobileRuntimeControl {
 
     #[cfg(any(target_os = "android", test))]
     fn set_operating_conditions(&self, operating: MobileOperatingConditions) -> bool {
-        let next = {
+        let (next, operating_changed) = {
             let mut snapshot = self
                 .snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if snapshot.operating_observed && snapshot.operating == operating {
-                return false;
+            let operating_changed = !snapshot.operating_observed || snapshot.operating != operating;
+            if operating_changed {
+                snapshot.operating = operating;
+                snapshot.operating_observed = true;
+                snapshot.generation = snapshot.generation.wrapping_add(1);
             }
-            snapshot.operating = operating;
-            snapshot.operating_observed = true;
-            snapshot.generation = snapshot.generation.wrapping_add(1);
-            *snapshot
+            (*snapshot, operating_changed)
         };
-        self.updates.send_replace(next);
-        self.changed.notify_all();
-        true
+        let resources_changed = self
+            .node_resource_publisher
+            .publish(node_resource_snapshot_for_runtime(next));
+        if operating_changed {
+            self.updates.send_replace(next);
+            self.changed.notify_all();
+        }
+        operating_changed || resources_changed
     }
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", test))]
     fn request_conditions_refresh(&self) {
         let next = {
             let mut snapshot = self
                 .snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot.operating_refresh_generation =
+                snapshot.operating_refresh_generation.wrapping_add(1);
             snapshot.generation = snapshot.generation.wrapping_add(1);
             *snapshot
         };
@@ -209,6 +241,21 @@ impl MobileRuntimeControl {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         snapshot.generation
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    fn wait_for_operating_conditions_refresh(&self, applied_generation: u64) -> u64 {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !snapshot.interactive || snapshot.operating_refresh_generation == applied_generation {
+            snapshot = self
+                .changed
+                .wait(snapshot)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        snapshot.operating_refresh_generation
     }
 
     fn wait_for_change_or_timeout(&self, generation: u64, timeout: Duration) {
@@ -303,39 +350,32 @@ pub(crate) fn resource_mode() -> MobileResourceMode {
     )
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn node_resource_monitor() -> sinomo_runtime::device::NodeResourceMonitor {
+    runtime_control().node_resource_monitor.clone()
+}
+
 pub(crate) fn passive_network_interval(
     base: Duration,
     class: MobilePassiveNetworkClass,
 ) -> Duration {
-    passive_network_interval_for_mode(base, class, resource_mode())
-}
-
-#[cfg(any(target_os = "android", test))]
-pub(crate) fn interactive_poll_interval(base: Duration) -> Duration {
-    interactive_poll_interval_for_mode(base, resource_mode())
-}
-
-#[cfg(any(target_os = "android", test))]
-fn interactive_poll_interval_for_mode(base: Duration, mode: MobileResourceMode) -> Duration {
-    let multiplier = match mode {
-        MobileResourceMode::Normal => 1,
-        MobileResourceMode::Constrained => 2,
-        MobileResourceMode::Restricted => 4,
-    };
-    base.saturating_mul(multiplier)
+    passive_network_interval_for_mode(base, class, resource_mode(), cfg!(target_os = "android"))
 }
 
 fn passive_network_interval_for_mode(
     base: Duration,
     class: MobilePassiveNetworkClass,
     mode: MobileResourceMode,
+    mobile: bool,
 ) -> Duration {
-    let multiplier = match (class, mode) {
-        (_, MobileResourceMode::Normal) => 1,
-        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Constrained) => 4,
-        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Restricted) => 12,
-        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Constrained) => 12,
-        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Restricted) => 60,
+    let multiplier = match (class, mode, mobile) {
+        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Normal, true) => 2,
+        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Normal, true) => 3,
+        (_, MobileResourceMode::Normal, false) => 1,
+        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Constrained, _) => 4,
+        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Restricted, _) => 12,
+        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Constrained, _) => 12,
+        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Restricted, _) => 60,
     };
     base.saturating_mul(multiplier)
 }
@@ -372,6 +412,42 @@ fn resource_mode_for_conditions(
     } else {
         MobileResourceMode::Normal
     }
+}
+
+#[cfg(any(target_os = "android", test))]
+fn node_resource_snapshot_for_conditions(
+    operating: MobileOperatingConditions,
+    observed: bool,
+) -> sinomo_runtime::device::NodeResourceSnapshot {
+    if !observed {
+        return sinomo_runtime::device::NodeResourceSnapshot::default();
+    }
+    let network_metering = if operating.network.metered {
+        sinomo_runtime::device::NodeNetworkMetering::Metered
+    } else if operating.network.available && operating.network.validated {
+        sinomo_runtime::device::NodeNetworkMetering::Unmetered
+    } else {
+        sinomo_runtime::device::NodeNetworkMetering::Unknown
+    };
+    sinomo_runtime::device::NodeResourceSnapshot::observed(
+        resource_mode_for_conditions(operating, true, true),
+        network_metering,
+    )
+}
+
+#[cfg(any(target_os = "android", test))]
+fn node_resource_snapshot_for_runtime(
+    snapshot: MobileRuntimeSnapshot,
+) -> sinomo_runtime::device::NodeResourceSnapshot {
+    let mut resources =
+        node_resource_snapshot_for_conditions(snapshot.operating, snapshot.operating_observed);
+    if resources.observed && !snapshot.interactive {
+        // A hidden mobile host remains available for local/correctness work,
+        // but its embedded daemon must not treat the phone like an unattended
+        // workstation. A fresh foreground condition sample lifts this mode.
+        resources.mode = sinomo_runtime::device::NodeResourceMode::Restricted;
+    }
+    resources
 }
 
 fn network_transport_is_cellular(transport: MobileNetworkTransport) -> bool {
@@ -506,13 +582,29 @@ fn install_android_lifecycle_monitor(
         let lifecycle_class = JClass::cast_local(env, lifecycle_class)?;
         let _ = std::fs::remove_file(&dex_path);
 
-        let native_methods = [unsafe {
-            NativeMethod::from_raw_parts(
-                jni_str!("sinomoLifecycleChanged"),
-                jni_str!("(Z)V"),
-                android_lifecycle_changed as *mut _,
-            )
-        }];
+        let native_methods = [
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    jni_str!("sinomoLifecycleChanged"),
+                    jni_str!("(Z)V"),
+                    android_lifecycle_changed as *mut _,
+                )
+            },
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    jni_str!("sinomoWindowInsetsChanged"),
+                    jni_str!("(IIII)V"),
+                    android_window_insets_changed as *mut _,
+                )
+            },
+            unsafe {
+                NativeMethod::from_raw_parts(
+                    jni_str!("sinomoOperatingConditionsChanged"),
+                    jni_str!("()V"),
+                    android_operating_conditions_changed as *mut _,
+                )
+            },
+        ];
         unsafe {
             env.register_native_methods(&lifecycle_class, &native_methods)?;
         }
@@ -536,6 +628,26 @@ extern "system" fn android_lifecycle_changed(
 }
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
+extern "system" fn android_window_insets_changed(
+    _env: jni::EnvUnowned<'_>,
+    _callback: jni::objects::JObject<'_>,
+    left: jni::sys::jint,
+    top: jni::sys::jint,
+    right: jni::sys::jint,
+    bottom: jni::sys::jint,
+) {
+    crate::android_safe_area_changed_physical([left, top, right, bottom]);
+}
+
+#[cfg(all(target_os = "android", feature = "mobile"))]
+extern "system" fn android_operating_conditions_changed(
+    _env: jni::EnvUnowned<'_>,
+    _callback: jni::objects::JObject<'_>,
+) {
+    runtime_control().request_conditions_refresh();
+}
+
+#[cfg(all(target_os = "android", feature = "mobile"))]
 pub(crate) fn start_android_operating_conditions_monitor(
     android_app: sui::AndroidApp,
     ui: sui::UiHandle,
@@ -543,21 +655,10 @@ pub(crate) fn start_android_operating_conditions_monitor(
     std::thread::Builder::new()
         .name("sinomo-app-conditions".to_string())
         .spawn(move || {
-            // Netwatcher already carries a small Android NetworkCallback DEX.
-            // Keep its handle alive to wake this sampler promptly on address
-            // changes; the bounded timer also observes Data Saver/power changes
-            // that do not alter the interface list.
-            let _network_watch = match netwatcher::watch_interfaces_with_callback(|_| {
-                runtime_control().request_conditions_refresh();
-            }) {
-                Ok(watch) => Some(watch),
-                Err(error) => {
-                    tracing::debug!(%error, "Android network-change callback unavailable");
-                    None
-                }
-            };
+            let mut applied_refresh_generation = 0;
             loop {
-                let generation = runtime_control().wait_until_interactive();
+                applied_refresh_generation = runtime_control()
+                    .wait_for_operating_conditions_refresh(applied_refresh_generation);
                 match android_operating_conditions(&android_app) {
                     Ok(conditions) => {
                         if runtime_control().set_operating_conditions(conditions) {
@@ -584,9 +685,6 @@ pub(crate) fn start_android_operating_conditions_monitor(
                         tracing::debug!(%error, "failed to read Android operating conditions");
                     }
                 }
-                // Focus/network transitions wake immediately. In the
-                // background this waits indefinitely without polling.
-                runtime_control().wait_for_change_or_timeout(generation, Duration::from_secs(60));
             }
         })
         .expect("spawn Android operating-conditions monitor");
@@ -1046,21 +1144,32 @@ mod tests {
             MobileResourceMode::Normal,
             "desktop targets must retain their ordinary cadence"
         );
+
+        assert_eq!(
+            node_resource_snapshot_for_conditions(normal, true),
+            sinomo_runtime::device::NodeResourceSnapshot::observed(
+                sinomo_runtime::device::NodeResourceMode::Normal,
+                sinomo_runtime::device::NodeNetworkMetering::Unmetered,
+            )
+        );
+        assert_eq!(
+            node_resource_snapshot_for_conditions(metered, true),
+            sinomo_runtime::device::NodeResourceSnapshot::observed(
+                sinomo_runtime::device::NodeResourceMode::Constrained,
+                sinomo_runtime::device::NodeNetworkMetering::Metered,
+            )
+        );
     }
 
     #[test]
     fn mobile_resource_mode_scales_only_passive_work() {
         let base = Duration::from_secs(5);
         assert_eq!(
-            interactive_poll_interval(Duration::from_millis(250)),
-            Duration::from_millis(250),
-            "desktop tests retain normal cadence through the public helper"
-        );
-        assert_eq!(
             passive_network_interval_for_mode(
                 base,
                 MobilePassiveNetworkClass::Essential,
                 MobileResourceMode::Normal,
+                false,
             ),
             Duration::from_secs(5)
         );
@@ -1068,7 +1177,26 @@ mod tests {
             passive_network_interval_for_mode(
                 base,
                 MobilePassiveNetworkClass::Essential,
+                MobileResourceMode::Normal,
+                true,
+            ),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Observability,
+                MobileResourceMode::Normal,
+                true,
+            ),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Essential,
                 MobileResourceMode::Constrained,
+                true,
             ),
             Duration::from_secs(20)
         );
@@ -1077,6 +1205,7 @@ mod tests {
                 base,
                 MobilePassiveNetworkClass::Essential,
                 MobileResourceMode::Restricted,
+                true,
             ),
             Duration::from_secs(60)
         );
@@ -1085,6 +1214,7 @@ mod tests {
                 base,
                 MobilePassiveNetworkClass::Observability,
                 MobileResourceMode::Constrained,
+                true,
             ),
             Duration::from_secs(60)
         );
@@ -1093,15 +1223,9 @@ mod tests {
                 base,
                 MobilePassiveNetworkClass::Observability,
                 MobileResourceMode::Restricted,
+                true,
             ),
             Duration::from_secs(300)
-        );
-        assert_eq!(
-            interactive_poll_interval_for_mode(
-                Duration::from_millis(250),
-                MobileResourceMode::Restricted,
-            ),
-            Duration::from_secs(1)
         );
     }
 
@@ -1113,6 +1237,79 @@ mod tests {
         assert!(snapshot.operating_observed);
         assert_eq!(snapshot.generation, 1);
         drop(snapshot);
+        assert_eq!(
+            control.node_resource_monitor.latest(),
+            sinomo_runtime::device::NodeResourceSnapshot::observed(
+                sinomo_runtime::device::NodeResourceMode::Restricted,
+                sinomo_runtime::device::NodeNetworkMetering::Unknown,
+            )
+        );
         assert!(!control.set_operating_conditions(MobileOperatingConditions::default()));
+    }
+
+    #[test]
+    fn operating_condition_refresh_generation_is_event_driven() {
+        let control = MobileRuntimeControl::default();
+        {
+            let mut snapshot = control.snapshot.lock().expect("snapshot");
+            snapshot.activity_resumed = false;
+            snapshot.window_focused = false;
+            snapshot.lifecycle_observed = false;
+            snapshot.interactive = false;
+            snapshot.operating_refresh_generation = 0;
+        }
+
+        assert!(control.set_window_focused(true));
+        assert_eq!(
+            control
+                .snapshot
+                .lock()
+                .expect("snapshot")
+                .operating_refresh_generation,
+            1,
+            "becoming interactive schedules one condition read"
+        );
+
+        assert!(control.set_operating_conditions(connected_conditions()));
+        assert_eq!(
+            control
+                .snapshot
+                .lock()
+                .expect("snapshot")
+                .operating_refresh_generation,
+            1,
+            "publishing the sample must not schedule a duplicate read"
+        );
+
+        control.request_conditions_refresh();
+        assert_eq!(control.wait_for_operating_conditions_refresh(1), 2);
+    }
+
+    #[test]
+    fn background_runtime_stays_restricted_until_a_fresh_foreground_sample() {
+        let control = MobileRuntimeControl::default();
+        assert!(control.set_operating_conditions(connected_conditions()));
+        assert_eq!(
+            control.node_resource_monitor.latest().mode,
+            sinomo_runtime::device::NodeResourceMode::Normal
+        );
+
+        assert!(control.set_activity_resumed(false));
+        assert_eq!(
+            control.node_resource_monitor.latest().mode,
+            sinomo_runtime::device::NodeResourceMode::Restricted
+        );
+
+        assert!(control.set_activity_resumed(true));
+        assert_eq!(
+            control.node_resource_monitor.latest().mode,
+            sinomo_runtime::device::NodeResourceMode::Restricted,
+            "resume must not trust conditions sampled before the background interval"
+        );
+        assert!(control.set_operating_conditions(connected_conditions()));
+        assert_eq!(
+            control.node_resource_monitor.latest().mode,
+            sinomo_runtime::device::NodeResourceMode::Normal
+        );
     }
 }

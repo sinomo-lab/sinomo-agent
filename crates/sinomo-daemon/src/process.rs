@@ -26,6 +26,48 @@ pub enum DaemonExecutionProfile {
     Mobile,
 }
 
+/// Process-local runtime inputs supplied by the daemon host.
+///
+/// Listener configuration remains in [`DaemonRunOptions`]. This value carries
+/// only host resource policy and live, advisory node conditions; it is never
+/// persisted or treated as cluster authority.
+#[derive(Clone, Debug)]
+pub struct DaemonRuntimeConfig {
+    execution_profile: DaemonExecutionProfile,
+    node_resources: sinomo_device::NodeResourceMonitor,
+}
+
+impl Default for DaemonRuntimeConfig {
+    fn default() -> Self {
+        Self::new(DaemonExecutionProfile::Standard)
+    }
+}
+
+impl DaemonRuntimeConfig {
+    pub fn new(execution_profile: DaemonExecutionProfile) -> Self {
+        Self {
+            execution_profile,
+            node_resources: sinomo_device::NodeResourceMonitor::default(),
+        }
+    }
+
+    pub fn with_node_resources(
+        mut self,
+        node_resources: sinomo_device::NodeResourceMonitor,
+    ) -> Self {
+        self.node_resources = node_resources;
+        self
+    }
+
+    pub fn execution_profile(&self) -> DaemonExecutionProfile {
+        self.execution_profile
+    }
+
+    pub fn node_resources(&self) -> sinomo_device::NodeResourceMonitor {
+        self.node_resources.clone()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DaemonRuntimeLimits {
     worker_threads: usize,

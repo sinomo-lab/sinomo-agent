@@ -10,5 +10,11 @@ include = ["**/*.rs", "Cargo.toml"]
 [package.metadata.sinomo]
 ring = "r2"
 
+[features]
+default = ["native-workers"]
+# Native build queues and host-filesystem projections are desktop/server
+# capabilities. Mobile embedded products omit both at compile time.
+native-workers = []
+
 [dependencies]
 sinomo-runtime = { path = "../sinomo-runtime" }

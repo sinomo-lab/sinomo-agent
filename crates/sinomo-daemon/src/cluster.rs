@@ -2079,6 +2079,47 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     .map_err(Into::into)
 }
 
+/// Refreshes this process's local capability advertisement and commits the
+/// matching member/capability-policy records before a solo default-DFS
+/// bootstrap can select a new on-disk codec.
+pub(crate) async fn publish_startup_local_daemon_capabilities_async(
+    daemon_paths: &DaemonPaths,
+    main_options: &DaemonRunOptions,
+    runtime: &tokio::runtime::Handle,
+) -> Result<bool, DaemonError> {
+    let cluster_paths = cluster_paths_from_daemon_paths(daemon_paths)?;
+    let mut state =
+        sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths).await?;
+    let data_dir = cluster_paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: cluster_paths.root.display().to_string(),
+        detail: "cluster paths have no data directory parent".to_string(),
+    })?;
+    let shadow_options = current_shadow_daemon_options_for_cluster_async(
+        data_dir,
+        DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
+        runtime,
+    )
+    .await;
+    let refreshed = refresh_local_daemon_membership_async(
+        runtime,
+        &cluster_paths,
+        &mut state,
+        main_options,
+        &shadow_options,
+        OffsetDateTime::now_utc(),
+    )
+    .await?;
+    let published = publish_local_members_to_quorum_if_needed_async(
+        &cluster_paths,
+        &state,
+        false,
+        runtime.clone(),
+        cluster_control_plane_timeouts(),
+    )
+    .await?;
+    Ok(refreshed.changed() || published.is_some())
+}
+
 /// Installs the KV-backed cluster directory provider exactly once per process
 /// so routing, endpoint selection, and cache invalidation read cluster state.
 /// Idempotent; called from daemon startup and defensively from the
@@ -2322,6 +2363,7 @@ impl LocalRaftResidentInitialization {
 #[derive(Debug)]
 pub(crate) struct ClusterNetworkMaintenance {
     cadence: sinomo_core::cluster::ClusterNetworkMaintenanceCadence,
+    resource_mode: sinomo_device::NodeResourceMode,
     pub discovery: Option<AsyncMdnsDiscoverySocket>,
     pub discovery_cache: MdnsDiscoveryCache,
     pub connectivity:
@@ -2340,6 +2382,22 @@ pub(crate) struct ClusterNetworkMaintenance {
     /// cancellation never discards it.
     retained_connectivity_publish: Option<ClusterConnectivityPendingPublish>,
     pub idle_stats: Arc<IdleStatsAtomics>,
+}
+
+fn effective_network_maintenance_role(
+    configured_role: &ClusterNodeRole,
+    resource_mode: sinomo_device::NodeResourceMode,
+) -> ClusterNodeRole {
+    match resource_mode {
+        sinomo_device::NodeResourceMode::Normal => configured_role.clone(),
+        sinomo_device::NodeResourceMode::Constrained => match configured_role {
+            ClusterNodeRole::Mobile | ClusterNodeRole::Sensor => configured_role.clone(),
+            ClusterNodeRole::Workstation | ClusterNodeRole::Server | ClusterNodeRole::Test => {
+                ClusterNodeRole::Mobile
+            }
+        },
+        sinomo_device::NodeResourceMode::Restricted => ClusterNodeRole::Sensor,
+    }
 }
 
 impl std::ops::Deref for ClusterNetworkMaintenance {
@@ -2474,6 +2532,7 @@ impl ClusterNetworkMaintenance {
                 now,
                 ClusterNodeRole::default(),
             ),
+            resource_mode: sinomo_device::NodeResourceMode::Normal,
             discovery: AsyncMdnsDiscoverySocket::bind_default().await.ok(),
             discovery_cache: MdnsDiscoveryCache::new(),
             connectivity: std::collections::BTreeMap::new(),
@@ -2921,7 +2980,7 @@ impl ClusterNetworkMaintenance {
 
     #[cfg(test)]
     fn schedule(&self) -> sinomo_core::network::ClusterNetworkMaintenanceSchedule {
-        self.cadence.schedule(self.discovery.is_some())
+        self.resource_adjusted_schedule(self.cadence.schedule(self.discovery.is_some()))
     }
 
     fn plan_connectivity_publish(
@@ -2963,13 +3022,73 @@ impl ClusterNetworkMaintenance {
         &self,
         now: Instant,
     ) -> sinomo_core::network::ClusterNetworkMaintenanceSchedule {
-        self.cadence
-            .schedule_with_connectivity_publish_backoff(now, self.discovery.is_some())
+        self.resource_adjusted_schedule(
+            self.cadence
+                .schedule_with_connectivity_publish_backoff(now, self.discovery.is_some()),
+        )
     }
 
     pub fn next_due_duration(&self, now: Instant) -> Duration {
-        self.cadence
-            .next_due_duration(now, self.discovery.is_some())
+        let mut cadence = self.cadence.clone();
+        cadence.local_node_role = self.effective_network_maintenance_role();
+        cadence.next_due_duration(now, self.discovery.is_some())
+    }
+
+    pub fn set_resource_mode(&mut self, resource_mode: sinomo_device::NodeResourceMode) {
+        self.resource_mode = resource_mode;
+    }
+
+    fn effective_network_maintenance_role(&self) -> ClusterNodeRole {
+        effective_network_maintenance_role(&self.local_node_role, self.resource_mode)
+    }
+
+    fn resource_adjusted_schedule(
+        &self,
+        mut schedule: sinomo_core::network::ClusterNetworkMaintenanceSchedule,
+    ) -> sinomo_core::network::ClusterNetworkMaintenanceSchedule {
+        schedule.local_node_role = self.effective_network_maintenance_role();
+        schedule
+    }
+
+    pub fn request_publish_refresh(&mut self, now: Instant) {
+        self.last_publish =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                sinomo_core::network::cluster_network_publish_interval_for_role(
+                    &self.effective_network_maintenance_role(),
+                ),
+                Duration::ZERO,
+            );
+    }
+
+    pub fn request_connectivity_refresh(&mut self, now: Instant) {
+        self.cadence.request_connectivity_refresh(now);
+        self.last_probe =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                sinomo_core::network::cluster_network_probe_interval_for_role(
+                    &self.effective_network_maintenance_role(),
+                ),
+                Duration::ZERO,
+            );
+    }
+
+    pub fn request_network_environment_refresh(&mut self, now: Instant) {
+        self.request_connectivity_refresh(now);
+        self.startup_settle_until = now
+            .checked_add(sinomo_core::cluster::CLUSTER_NETWORK_MAINTENANCE_STARTUP_SETTLE_DURATION);
+    }
+
+    pub fn request_discovery_refresh(&mut self, now: Instant) {
+        self.cadence.request_discovery_refresh(now);
+        self.last_discovery =
+            sinomo_core::network::cluster_network_maintenance_last_timestamp_for_next_due(
+                now,
+                sinomo_core::network::cluster_network_discovery_interval_for_role(
+                    &self.effective_network_maintenance_role(),
+                ),
+                Duration::ZERO,
+            );
     }
 
     fn complete_all_active_due_claims(&mut self) {
@@ -3783,7 +3902,7 @@ impl ClusterNetworkMaintenance {
             .is_some_and(|deadline| Instant::now() < deadline);
         let convergence_active = !self.connectivity_converged;
         let force_probe = self.connectivity_force_probe;
-        let local_node_role = self.local_node_role.clone();
+        let local_node_role = self.effective_network_maintenance_role();
         let batch = sinomo_core::network::select_cluster_connectivity_probe_batch(
             paths,
             state,
@@ -8626,6 +8745,7 @@ mod tests {
                 cadence: sinomo_core::cluster::ClusterNetworkMaintenanceCadence {
                     $($cadence)*
                 },
+                resource_mode: sinomo_device::NodeResourceMode::Normal,
                 $($host)*
             }
         };
@@ -11111,6 +11231,45 @@ mod tests {
     }
 
     #[test]
+    fn resource_constraints_reduce_only_passive_network_cadence() {
+        assert_eq!(
+            effective_network_maintenance_role(
+                &ClusterNodeRole::Workstation,
+                sinomo_device::NodeResourceMode::Constrained,
+            ),
+            ClusterNodeRole::Mobile
+        );
+        assert_eq!(
+            effective_network_maintenance_role(
+                &ClusterNodeRole::Mobile,
+                sinomo_device::NodeResourceMode::Restricted,
+            ),
+            ClusterNodeRole::Sensor
+        );
+
+        let now = Instant::now();
+        let five_minutes = Duration::from_secs(5 * 60);
+        let mut maintenance = cluster_network_scheduler_maintenance_for_test(now);
+        maintenance.local_node_role = ClusterNodeRole::Mobile;
+        maintenance.last_publish = now.checked_sub(five_minutes).expect("publish timestamp");
+        maintenance.last_probe = now.checked_sub(five_minutes).expect("probe timestamp");
+        maintenance.set_resource_mode(sinomo_device::NodeResourceMode::Restricted);
+
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            Duration::from_secs(10 * 60),
+            "restricted mobile passive work uses the sensor-grade 15 minute cadence"
+        );
+
+        maintenance.request_publish_refresh(now);
+        assert_eq!(
+            maintenance.next_due_duration(now),
+            Duration::ZERO,
+            "an explicit dirty edge remains immediate under resource restriction"
+        );
+    }
+
+    #[test]
     fn due_class_claim_failure_advances_once_and_backs_off_monotonically() {
         let first_claimed_at = Instant::now();
         let mut maintenance = cluster_network_scheduler_maintenance_for_test(first_claimed_at);
@@ -12613,7 +12772,7 @@ mod tests {
 
         assert_eq!(
             maintenance.next_due_duration(now),
-            Duration::from_secs(40),
+            DAEMON_CLUSTER_NETWORK_PROBE_INTERVAL.saturating_sub(Duration::from_secs(20)),
             "without an mDNS socket the next wake should be driven by publish/probe, not discovery"
         );
     }
@@ -18487,6 +18646,73 @@ mod tests {
         let runtime = daemon_cluster_test_runtime();
         publish_local_members_to_quorum_if_needed_on_runtime(&paths, &state, runtime.handle())
             .expect("stable local members should not be republished");
+    }
+
+    #[test]
+    fn startup_capability_publish_repairs_stale_local_policy_before_dfs_bootstrap() {
+        let root = unique_cluster_test_root("sinomo-daemon-startup-capability-publish");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data dir");
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        cluster_paths.ensure().expect("cluster paths");
+        let daemon_paths = DaemonPaths::new(&data_dir);
+        daemon_paths.ensure().expect("daemon paths");
+        let options = DaemonRunOptions::default();
+        write_daemon_status(
+            &daemon_paths,
+            &crate::DaemonStatus::new(&options, &daemon_paths, None),
+        )
+        .expect("write daemon status");
+        let local_public_key = load_or_create_main_node_identity(&data_dir.root())
+            .expect("create local identity")
+            .public_key;
+
+        let now = OffsetDateTime::now_utc();
+        let mut state = ClusterBootstrapState::initialized_locally(
+            ClusterId::from_legacy_named("cluster_startup_capability_publish").expect("cluster"),
+            "startup capability publish".to_string(),
+            NodeId::from_legacy_named("node_startup_capability_publish").expect("node"),
+            "local".to_string(),
+            local_public_key,
+            now,
+        );
+        let local_node_id = state.local_node_id.clone();
+        state
+            .members
+            .iter_mut()
+            .find(|member| member.node_id == local_node_id)
+            .expect("local member")
+            .capabilities
+            .clear();
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
+            .expect("write stale cluster state");
+        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
+            .expect("seed stale capability policy");
+
+        let runtime = daemon_cluster_test_runtime();
+        assert!(
+            runtime
+                .block_on(publish_startup_local_daemon_capabilities_async(
+                    &daemon_paths,
+                    &options,
+                    runtime.handle(),
+                ))
+                .expect("publish current capabilities")
+        );
+
+        let snapshot = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
+            .expect("read authoritative snapshot");
+        let policy = snapshot
+            .get(&sinomo_core::node::cluster_capability_policy_key(
+                &local_node_id,
+            ))
+            .expect("local capability policy")
+            .decode::<sinomo_core::node::ClusterCapabilityPolicyRecord>()
+            .expect("decode capability policy");
+        assert!(policy.capabilities.iter().any(|capability| {
+            capability.as_str()
+                == sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY
+        }));
     }
 
     #[test]

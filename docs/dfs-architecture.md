@@ -318,16 +318,19 @@ policy no longer permits serving them.
 
 ## Placement
 
-The current planner receives candidate nodes from its caller, prefers the
-coordinator where required, and uses stable weighted hashing to select a
-deterministic set for the object and version. The replication policy supplies
-the minimum commit and desired replica counts.
+The planner receives candidate nodes from its caller, prefers the coordinator
+where required, and uses stable weighted hashing to select a deterministic set
+for the object and version. The replication policy supplies the minimum commit
+and desired replica counts. Fresh placement snapshots rank storage health, path
+state, network metering, coarse node resource pressure, path performance, and
+capacity. Current replicas rank ahead of resource pressure so a transient low
+battery state does not create evacuation traffic; required nodes and manual pins
+remain hard constraints. Exact battery and thermal readings never leave their
+node.
 
-Health, capacity, endpoint quality, session locality, battery, bandwidth,
-privacy, and trust-domain inputs belong in upstream eligibility today; the
-planner does not yet score all of them directly. Bringing those inputs into one
-auditable placement policy is tracked in the
-[DFS policy and authority plan](plans/dfs-policy-and-authority-hardening.md).
+Session locality, privacy, and trust-domain inputs still belong in upstream
+eligibility. Bringing every input into one auditable placement policy is tracked
+in the [DFS policy and authority plan](plans/dfs-policy-and-authority-hardening.md).
 
 Read caches remain distinct from durable receipts and never become write
 authorities merely because they possess current bytes. If the minimum durability
@@ -910,6 +913,26 @@ Repair is manifest-based rather than an arbitrary directory scan:
 Persisted intents and receipts reconstruct the repair backlog after restart.
 Scrub, old-version collection, orphan cleanup, and tombstone compaction are
 background lifecycle operations.
+
+On a resource-restricted mobile node or a metered link, remote-only routine
+repair, placement reconciliation, metadata catch-up, and deferred sends park
+without a periodic probe. A constrained node on an unmetered link may make
+progress with one repair, a small placement page, and one metadata batch per
+pass instead of workstation-sized budgets. A change in either resource mode or
+metering re-probes the durable queue. Local write/namespace/conflict/handoff
+recovery continues, while an explicit operator disaster-recovery request
+bypasses this advisory background policy.
+
+The storage sampler is event-driven on every daemon, not only mobile hosts. It
+samples physical capacity once at startup and after a short coalescing delay for
+committed DFS mutations or completed lifecycle maintenance. Idle time and
+advertisement lease age never sample storage or publish a heartbeat. Exact
+resource transitions re-evaluate cached advisory fields, while the capacity
+evidence keeps its original expiry and becomes conservatively stale if no later
+storage mutation supplies a fresh sample.
+Metering and resource-pressure fields bypass storage-health hysteresis because
+they come from exact host callbacks; capacity and health transitions retain
+their ordinary consecutive-sample protection.
 
 ## Roaming and Failure Behavior
 

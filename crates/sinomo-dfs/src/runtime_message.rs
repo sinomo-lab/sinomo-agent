@@ -339,6 +339,7 @@ pub struct DfsCommittedEffects {
     pub replica_progress: bool,
     pub repair_maintenance: bool,
     pub namespace_maintenance: bool,
+    pub storage_environment: bool,
 }
 
 impl DfsCommittedEffects {
@@ -354,6 +355,16 @@ impl DfsCommittedEffects {
             repair_maintenance: committed_work.repair_maintenance
                 || crate::dfs_events_should_wake_repair_maintenance(events),
             namespace_maintenance: committed_work.namespace_maintenance,
+            storage_environment: *committed_work != DfsMessageCommittedWork::default()
+                || events.iter().any(|event| {
+                    matches!(
+                        event,
+                        crate::NetworkedDfsServiceEvent::BlobStaged { .. }
+                            | crate::NetworkedDfsServiceEvent::VersionCommitted { .. }
+                            | crate::NetworkedDfsServiceEvent::ReplicaRepaired { .. }
+                            | crate::NetworkedDfsServiceEvent::BlobFetched { .. }
+                    )
+                }),
         }
     }
 }
@@ -365,6 +376,11 @@ pub trait DfsCommittedEffectsHost {
     fn record_replica_progress(&self) -> bool;
     fn wake_maintenance(&self, repair: bool, namespace: bool);
     fn publish_metadata(&self);
+
+    /// Coalesced hint that local DFS bytes or durable metadata changed enough
+    /// to make cached capacity evidence worth resampling. Hosts may debounce
+    /// this edge; it is advisory and grants no storage or metadata authority.
+    fn storage_environment_changed(&self) {}
 }
 
 pub fn emit_runtime_committed_effects(
@@ -381,6 +397,9 @@ pub fn emit_runtime_committed_effects(
     }
     if effects.publish_metadata {
         host.publish_metadata();
+    }
+    if effects.storage_environment {
+        host.storage_environment_changed();
     }
     effects
 }
@@ -1198,5 +1217,6 @@ mod tests {
         assert!(effects.namespace_maintenance);
         assert!(!effects.replica_progress);
         assert!(!effects.repair_maintenance);
+        assert!(effects.storage_environment);
     }
 }

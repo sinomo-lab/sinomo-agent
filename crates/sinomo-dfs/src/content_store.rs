@@ -4087,22 +4087,19 @@ impl LocalContentStore {
             create_dir_all(parent.to_owned())?;
         }
         let before_len = file_len_if_exists(blob_path)?;
-        match fs::hard_link(temporary_path, blob_path) {
+        match durable_file::install_staged_file(temporary_path, blob_path, false)
+            .map_err(content_durable_file_error)
+        {
             Ok(()) => {
+                // The durable installer consumes the staged name and syncs the
+                // destination directory on successful publication.
+            }
+            Err(ContentStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::AlreadyExists =>
+            {
                 remove_file_if_exists(temporary_path)?;
-                if let Some(parent) = blob_path.parent() {
-                    sync_dir(parent)?;
-                }
             }
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                remove_file_if_exists(temporary_path)?;
-            }
-            Err(source) => {
-                return Err(ContentStoreError::Io {
-                    path: blob_path.to_owned(),
-                    source,
-                });
-            }
+            Err(error) => return Err(error),
         }
         let after_len = file_len_if_exists(blob_path)?;
         self.apply_stats_delta(ContentStoreStatsDelta::blob_file_change(
@@ -4295,14 +4292,16 @@ impl LocalContentStore {
                 }
             }
             if !blob_exists {
-                match fs::hard_link(&tmp_path, &blob_path) {
+                match durable_file::install_staged_file(&tmp_path, &blob_path, false)
+                    .map_err(content_durable_file_error)
+                {
                     Ok(()) => {
-                        remove_file_if_exists(&tmp_path)?;
-                        if let Some(parent) = blob_path.parent() {
-                            sync_dir(parent)?;
-                        }
+                        // The durable installer consumed the staged file and
+                        // synced the destination directory.
                     }
-                    Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                    Err(ContentStoreError::Io { source, .. })
+                        if source.kind() == io::ErrorKind::AlreadyExists =>
+                    {
                         let actual = file_content_hash(&blob_path)?;
                         if actual != manifest.content_hash {
                             return Err(ContentStoreError::BlobHashMismatch {
@@ -4313,12 +4312,7 @@ impl LocalContentStore {
                         remove_file_if_exists(&tmp_path)?;
                         blob_exists = true;
                     }
-                    Err(source) => {
-                        return Err(ContentStoreError::Io {
-                            path: blob_path.clone(),
-                            source,
-                        });
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             let publish_ms = publish_started.elapsed().as_millis();
@@ -5650,10 +5644,18 @@ impl LocalContentStore {
             match fs::hard_link(&manifest_path, &index_path) {
                 Ok(()) => Ok(()),
                 Err(source) if source.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-                Err(source) => Err(ContentStoreError::Io {
-                    path: index_path,
-                    source,
-                }),
+                Err(_) => {
+                    let bytes = read_file(&manifest_path)?;
+                    match write_file_create_new_atomic(&index_path, &bytes) {
+                        Ok(()) => Ok(()),
+                        Err(ContentStoreError::Io { source, .. })
+                            if source.kind() == io::ErrorKind::AlreadyExists =>
+                        {
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
             }
         })();
         if let Err(error) = result {

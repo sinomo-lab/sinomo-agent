@@ -158,7 +158,8 @@ pub use control::{
     handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
     handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
     run_daemon_control_loop, run_daemon_control_loop_with_catalog,
-    run_daemon_control_loop_with_catalog_and_profile, run_daemon_control_loop_with_components,
+    run_daemon_control_loop_with_catalog_and_profile,
+    run_daemon_control_loop_with_catalog_and_runtime, run_daemon_control_loop_with_components,
     run_daemon_control_loop_with_components_and_profile,
 };
 pub use error::DaemonError;
@@ -175,8 +176,8 @@ pub(crate) use process::{
     spawn_main_daemon_process, spawn_shadow_rollout_recovery_helper_process,
 };
 pub use process::{
-    DaemonExecutionProfile, daemon_main_binary_for_shadow_start, prepare_background_command,
-    start_daemon_command_process,
+    DaemonExecutionProfile, DaemonRuntimeConfig, daemon_main_binary_for_shadow_start,
+    prepare_background_command, start_daemon_command_process,
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,

@@ -17,5 +17,8 @@ serde.workspace = true
 thiserror.workspace = true
 sinomo-object = { path = "../sinomo-object", features = ["serde"] }
 
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }
