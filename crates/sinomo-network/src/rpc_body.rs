@@ -166,6 +166,43 @@ pub(crate) trait ObjectRpcBodyReceiver: fmt::Debug + Send {
     fn recv_chunk(&mut self) -> ObjectRpcBodyReceiverFuture<'_>;
 }
 
+pub(crate) struct ObjectRpcBodyDropGuard {
+    armed: bool,
+    callback: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl fmt::Debug for ObjectRpcBodyDropGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectRpcBodyDropGuard")
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ObjectRpcBodyDropGuard {
+    pub(crate) fn new(callback: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            armed: false,
+            callback: Some(Box::new(callback)),
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+}
+
+impl Drop for ObjectRpcBodyDropGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(callback) = self.callback.take()
+        {
+            callback();
+        }
+    }
+}
+
 /// Bounded test-support producer for an application-visible incoming body.
 ///
 /// Production bodies are created by the owned object-RPC record reader. This
@@ -1791,6 +1828,9 @@ enum ObjectRpcIncomingBodyInner {
 /// through a bounded ownership ring whose pressure propagates to the stream.
 #[derive(Debug)]
 pub struct ObjectRpcIncomingBody {
+    // Declared first so cancellation is signalled before the receiver field is
+    // dropped. Rust drops fields in declaration order after this value's Drop.
+    drop_guard: Option<ObjectRpcBodyDropGuard>,
     inner: ObjectRpcIncomingBodyInner,
     // Natural EOF clears these handles, detaching still-needed RPC work; an
     // early application drop leaves them here so Drop cancels that work.
@@ -1812,6 +1852,7 @@ impl ObjectRpcIncomingBody {
             total_bytes: Some(0),
             role: ObjectRpcBodyRole::None,
             multiplexed_terminal: None,
+            drop_guard: None,
         }
     }
 
@@ -1827,6 +1868,7 @@ impl ObjectRpcIncomingBody {
             total_bytes,
             role: ObjectRpcBodyRole::Attachment,
             multiplexed_terminal: None,
+            drop_guard: None,
         }
     }
 
@@ -1841,7 +1883,11 @@ impl ObjectRpcIncomingBody {
         let (sender, receiver) = tokio::sync::mpsc::channel(buffered_chunks.max(1));
         (
             ObjectRpcTestBodySender { sender },
-            Self::receiver(total_bytes, Box::new(TestChannelBodyReceiver { receiver })),
+            Self::receiver_with_drop_guard(
+                total_bytes,
+                Box::new(TestChannelBodyReceiver { receiver }),
+                None,
+            ),
         )
     }
 
@@ -1865,13 +1911,15 @@ impl ObjectRpcIncomingBody {
                 total_bytes,
                 role: ObjectRpcBodyRole::Attachment,
                 multiplexed_terminal: Some(terminal),
+                drop_guard: None,
             },
         )
     }
 
-    pub(crate) fn receiver(
+    pub(crate) fn receiver_with_drop_guard(
         total_bytes: Option<u64>,
         receiver: Box<dyn ObjectRpcBodyReceiver>,
+        drop_guard: Option<ObjectRpcBodyDropGuard>,
     ) -> Self {
         Self {
             inner: ObjectRpcIncomingBodyInner::Receiver {
@@ -1881,7 +1929,18 @@ impl ObjectRpcIncomingBody {
             total_bytes,
             role: ObjectRpcBodyRole::Attachment,
             multiplexed_terminal: None,
+            drop_guard,
         }
+    }
+
+    /// Reset an unfinished logical RPC stream when this body is abandoned.
+    /// Finite request/response bodies retain drain-and-validate semantics by
+    /// default; indefinitely lived subscriptions opt into cancellation.
+    pub fn cancel_on_drop(mut self) -> Self {
+        if let Some(drop_guard) = self.drop_guard.as_mut() {
+            drop_guard.arm();
+        }
+        self
     }
 
     pub fn is_empty(&self) -> bool {
@@ -3923,6 +3982,7 @@ mod tests {
             total_bytes: Some(payload.len() as u64),
             role: ObjectRpcBodyRole::Attachment,
             multiplexed_terminal: None,
+            drop_guard: None,
         };
         let source = ObjectRpcBodySource::from_incoming_body(incoming);
         let mut producer = source

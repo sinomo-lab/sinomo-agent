@@ -1289,6 +1289,7 @@ pub(crate) trait AuthenticatedChunkReader: Send {
     fn allocator(&self) -> &ChunkAllocator;
     fn max_payload_bytes(&self) -> usize;
     fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>>;
+    fn abort(&mut self, _reason: ResetReason) {}
 }
 
 /// Send half of the canonical internal authenticated record stream.

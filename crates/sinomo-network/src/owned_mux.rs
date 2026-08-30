@@ -666,6 +666,24 @@ impl TxScheduler {
         self.writer_waker.wake();
     }
 
+    fn abort_stream(&self, stream_id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.streams.remove(&stream_id);
+        }
+        // The receive half can outlive the locally finished send queue. An
+        // explicit application cancellation must still reach the peer even
+        // when there is no transmit queue left for `reset_stream` to remove.
+        self.enqueue_control(ControlCommand::reset(stream_id));
+    }
+
+    fn discard_stream(&self, stream_id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.streams.remove(&stream_id);
+            state.active.retain(|active| *active != stream_id);
+        }
+        self.writer_waker.wake();
+    }
+
     fn enqueue_control(&self, control: ControlCommand) {
         if let Ok(mut state) = self.state.lock() {
             if state.controls.len() >= MAX_CONTROL_COMMANDS {
@@ -912,6 +930,13 @@ impl AuthenticatedChunkReader for LogicalChunkReader {
 
     fn recv_chunk(&mut self) -> ChunkStreamFuture<'_, Option<ChunkLease>> {
         Box::pin(self.slot.inbound.recv())
+    }
+
+    fn abort(&mut self, reason: ResetReason) {
+        self.slot.reset(reason.detail);
+        if let Some(tx) = self.slot.tx.upgrade() {
+            tx.abort_stream(self.slot.stream_id);
+        }
     }
 }
 
@@ -1291,6 +1316,14 @@ fn lookup_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
         .and_then(|slot| slot.upgrade())
 }
 
+fn take_slot(streams: &StreamMap, stream_id: u64) -> Option<Arc<StreamSlot>> {
+    streams
+        .lock()
+        .ok()
+        .and_then(|mut streams| streams.remove(&stream_id))
+        .and_then(|slot| slot.upgrade())
+}
+
 fn register_slot(
     streams: &StreamMap,
     slot: &Arc<StreamSlot>,
@@ -1391,9 +1424,13 @@ async fn process_common_record(
             Ok(true)
         }
         FRAME_RESET => {
-            if let Some(slot) = lookup_slot(streams, record.stream_id) {
+            if let Some(slot) = take_slot(streams, record.stream_id) {
                 slot.reset("peer reset the owned logical stream");
             }
+            // RESET is bidirectional cancellation for this logical stream.
+            // Remove any response records still queued locally, but do not
+            // echo RESET back to the peer that initiated it.
+            tx.discard_stream(record.stream_id);
             Ok(true)
         }
         FRAME_WINDOW => {
@@ -1812,6 +1849,61 @@ mod tests {
     use crate::owned_chunk::{
         BODY_CHUNK_MAX, ChunkPool, PayloadCopyReason, RPC_RECORD_MAX, SECURE_WIRE_MAX,
     };
+
+    #[test]
+    fn receive_side_abort_queues_reset_after_send_queue_is_gone() {
+        let tx = TxScheduler::new();
+        let stream_id = 41;
+
+        tx.abort_stream(stream_id);
+
+        let state = tx.state.lock().expect("transmitter state");
+        let reset = state.controls.back().expect("queued reset");
+        assert_eq!(reset.kind, FRAME_RESET);
+        assert_eq!(reset.stream_id, stream_id);
+        assert!(!state.streams.contains_key(&stream_id));
+    }
+
+    #[tokio::test]
+    async fn peer_reset_discards_response_queue_without_reset_echo() {
+        let tx = TxScheduler::new();
+        let connection = CarrierCredits::new(&tx);
+        let stream_id = 43;
+        let slot = StreamSlot::new(stream_id, &tx, &connection);
+        tx.register_stream(stream_id, true)
+            .expect("register transmit stream");
+        let streams = Arc::new(Mutex::new(BTreeMap::new()));
+        register_slot(&streams, &slot, "register reset test slot").expect("register slot");
+        let allocator = ChunkAllocator::default();
+        let mut chunk = allocator
+            .allocate_control(0)
+            .await
+            .expect("allocate reset record");
+        chunk.commit_payload(0).expect("empty reset payload");
+
+        assert!(
+            process_common_record(
+                ParsedMuxRecord {
+                    kind: FRAME_RESET,
+                    stream_id,
+                    chunk,
+                },
+                &streams,
+                &tx,
+                &connection,
+            )
+            .await
+            .expect("process peer reset")
+        );
+
+        assert!(lookup_slot(&streams, stream_id).is_none());
+        let state = tx.state.lock().expect("transmitter state");
+        assert!(!state.streams.contains_key(&stream_id));
+        assert!(
+            state.controls.is_empty(),
+            "peer reset must not be echoed back"
+        );
+    }
 
     struct RuntimeBoundTestChunkReader {
         allocator: ChunkAllocator,

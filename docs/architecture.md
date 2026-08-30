@@ -317,6 +317,12 @@ receive derived observations, summaries, embeddings, commands, or evidence
 handles. Blocked actions and policy incidents are events too, which keeps audit
 and replay on the same path as successful work.
 
+Finite RPC bodies drain and validate their terminal framing if an application
+abandons them. Indefinitely lived event subscriptions instead opt into
+cancel-on-drop: owner cancellation resets only that logical mux stream and
+releases its server producer, without closing the shared carrier or leaving a
+background keepalive drain.
+
 ## Agent and Memory Boundary
 
 The agent runtime owns provider-neutral model requests, context assembly, tool
