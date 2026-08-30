@@ -4733,6 +4733,10 @@ impl FilesState {
             return;
         }
 
+        let delay = crate::mobile_runtime::passive_network_interval(
+            delay,
+            crate::mobile_runtime::MobilePassiveNetworkClass::Observability,
+        );
         let result_tx = self.worker_result_tx.clone();
         let waker = self.worker_waker.clone();
         let active_poll_generation = Arc::clone(&self.placement_activity_poll_generation);
@@ -5287,7 +5291,12 @@ impl FilesState {
         let _ = thread::Builder::new()
             .name("sinomo-app-files-placement-progress".to_string())
             .spawn(move || {
-                crate::mobile_runtime::wait_for_interactive_delay(Duration::from_millis(500));
+                crate::mobile_runtime::wait_for_interactive_delay(
+                    crate::mobile_runtime::passive_network_interval(
+                        Duration::from_millis(500),
+                        crate::mobile_runtime::MobilePassiveNetworkClass::Essential,
+                    ),
+                );
                 let _ = tx.send(FilesWorkerCommand::PlacementProgress { request_id, job_id });
                 if let Some(waker) = waker {
                     waker.wake();

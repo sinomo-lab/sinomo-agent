@@ -15,6 +15,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use sui::{
     Align, Alignment, ArrangeCtx, Button, ButtonAppearance, Command, CommandController, CommandCtx,
@@ -199,8 +200,8 @@ const HEALTH_CONTENT_MIN_H: f32 = 176.0;
 const HEALTH_CONTENT_MAX_H: f32 = 548.0;
 const HEALTH_ISSUE_ESTIMATED_H: f32 = 104.0;
 const HEALTH_ACTION_H: f32 = 30.0;
-const HEALTH_PROBE_INTERVAL_SECS: f64 = 5.0;
-const CLUSTER_OBSERVE_INTERVAL_SECS: f64 = 5.0;
+const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+const CLUSTER_OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 /// Stock spinner shown in the centered launch-progress surface.
 const LOADING_SPINNER_SIZE: f32 = 24.0;
 /// Loading screen: show the per-step elapsed time once a launch step has been in
@@ -311,8 +312,12 @@ impl Shell {
         {
             return;
         }
+        let interval = crate::mobile_runtime::passive_network_interval(
+            HEALTH_PROBE_INTERVAL,
+            crate::mobile_runtime::MobilePassiveNetworkClass::Essential,
+        );
         self.health_probe_timer
-            .set(Some(ctx.schedule_timer_after(HEALTH_PROBE_INTERVAL_SECS)));
+            .set(Some(ctx.schedule_timer_after(interval.as_secs_f64())));
     }
 
     fn schedule_cluster_observe_timer(&self, ctx: &mut EventCtx) {
@@ -324,9 +329,12 @@ impl Shell {
         {
             return;
         }
-        self.cluster_observe_timer.set(Some(
-            ctx.schedule_timer_after(CLUSTER_OBSERVE_INTERVAL_SECS),
-        ));
+        let interval = crate::mobile_runtime::passive_network_interval(
+            CLUSTER_OBSERVE_INTERVAL,
+            crate::mobile_runtime::MobilePassiveNetworkClass::Observability,
+        );
+        self.cluster_observe_timer
+            .set(Some(ctx.schedule_timer_after(interval.as_secs_f64())));
     }
 
     fn sync_render_options(&self, ctx: &mut EventCtx) {

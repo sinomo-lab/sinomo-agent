@@ -50,6 +50,22 @@ pub(crate) struct MobileOperatingConditions {
     pub(crate) power: MobilePowerConditions,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum MobileResourceMode {
+    #[default]
+    Normal,
+    Constrained,
+    Restricted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MobilePassiveNetworkClass {
+    /// Connectivity needed to keep the visible app usable.
+    Essential,
+    /// Metrics, status, and other passive observations which can be stale.
+    Observability,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MobileRuntimeSnapshot {
     activity_resumed: bool,
@@ -57,6 +73,7 @@ struct MobileRuntimeSnapshot {
     lifecycle_observed: bool,
     interactive: bool,
     operating: MobileOperatingConditions,
+    operating_observed: bool,
     generation: u64,
 }
 
@@ -73,6 +90,7 @@ impl Default for MobileRuntimeSnapshot {
             lifecycle_observed: active,
             interactive: active,
             operating: MobileOperatingConditions::default(),
+            operating_observed: false,
             generation: 0,
         }
     }
@@ -152,10 +170,11 @@ impl MobileRuntimeControl {
                 .snapshot
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if snapshot.operating == operating {
+            if snapshot.operating_observed && snapshot.operating == operating {
                 return false;
             }
             snapshot.operating = operating;
+            snapshot.operating_observed = true;
             snapshot.generation = snapshot.generation.wrapping_add(1);
             *snapshot
         };
@@ -270,6 +289,101 @@ pub(crate) fn interactive() -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .interactive
+}
+
+pub(crate) fn resource_mode() -> MobileResourceMode {
+    let snapshot = runtime_control()
+        .snapshot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    resource_mode_for_conditions(
+        snapshot.operating,
+        snapshot.operating_observed,
+        cfg!(target_os = "android"),
+    )
+}
+
+pub(crate) fn passive_network_interval(
+    base: Duration,
+    class: MobilePassiveNetworkClass,
+) -> Duration {
+    passive_network_interval_for_mode(base, class, resource_mode())
+}
+
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn interactive_poll_interval(base: Duration) -> Duration {
+    interactive_poll_interval_for_mode(base, resource_mode())
+}
+
+#[cfg(any(target_os = "android", test))]
+fn interactive_poll_interval_for_mode(base: Duration, mode: MobileResourceMode) -> Duration {
+    let multiplier = match mode {
+        MobileResourceMode::Normal => 1,
+        MobileResourceMode::Constrained => 2,
+        MobileResourceMode::Restricted => 4,
+    };
+    base.saturating_mul(multiplier)
+}
+
+fn passive_network_interval_for_mode(
+    base: Duration,
+    class: MobilePassiveNetworkClass,
+    mode: MobileResourceMode,
+) -> Duration {
+    let multiplier = match (class, mode) {
+        (_, MobileResourceMode::Normal) => 1,
+        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Constrained) => 4,
+        (MobilePassiveNetworkClass::Essential, MobileResourceMode::Restricted) => 12,
+        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Constrained) => 12,
+        (MobilePassiveNetworkClass::Observability, MobileResourceMode::Restricted) => 60,
+    };
+    base.saturating_mul(multiplier)
+}
+
+fn resource_mode_for_conditions(
+    operating: MobileOperatingConditions,
+    observed: bool,
+    mobile: bool,
+) -> MobileResourceMode {
+    if !mobile || !observed {
+        return MobileResourceMode::Normal;
+    }
+    let network = operating.network;
+    let power = operating.power;
+    let restricted_network = !network.available
+        || !network.validated
+        || network.data_saver
+        || network.roaming == Some(true)
+        || network.suspended == Some(true);
+    let restricted_power = (!power.charging
+        && power.battery_percent.is_some_and(|percent| percent <= 15))
+        || power.thermal_status.is_some_and(|status| status >= 4);
+    if restricted_network || restricted_power {
+        return MobileResourceMode::Restricted;
+    }
+    let constrained_network = network.metered
+        || network.congested == Some(true)
+        || network_transport_is_cellular(network.transport);
+    let constrained_power = power.power_saver
+        || (!power.charging && power.battery_percent.is_some_and(|percent| percent <= 30))
+        || power.thermal_status.is_some_and(|status| status >= 3);
+    if constrained_network || constrained_power {
+        MobileResourceMode::Constrained
+    } else {
+        MobileResourceMode::Normal
+    }
+}
+
+fn network_transport_is_cellular(transport: MobileNetworkTransport) -> bool {
+    #[cfg(any(target_os = "android", test))]
+    {
+        transport == MobileNetworkTransport::Cellular
+    }
+    #[cfg(not(any(target_os = "android", test)))]
+    {
+        let _ = transport;
+        false
+    }
 }
 
 pub(crate) async fn wait_for_interactive() {
@@ -422,7 +536,10 @@ extern "system" fn android_lifecycle_changed(
 }
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
-pub(crate) fn start_android_operating_conditions_monitor(android_app: sui::AndroidApp) {
+pub(crate) fn start_android_operating_conditions_monitor(
+    android_app: sui::AndroidApp,
+    ui: sui::UiHandle,
+) {
     std::thread::Builder::new()
         .name("sinomo-app-conditions".to_string())
         .spawn(move || {
@@ -445,6 +562,7 @@ pub(crate) fn start_android_operating_conditions_monitor(android_app: sui::Andro
                     Ok(conditions) => {
                         if runtime_control().set_operating_conditions(conditions) {
                             tracing::info!(
+                                resource_mode = ?resource_mode_for_conditions(conditions, true, true),
                                 network_available = conditions.network.available,
                                 network_validated = conditions.network.validated,
                                 network_metered = conditions.network.metered,
@@ -459,6 +577,7 @@ pub(crate) fn start_android_operating_conditions_monitor(android_app: sui::Andro
                                 thermal_status = ?conditions.power.thermal_status,
                                 "Android operating conditions changed"
                             );
+                            ui.wake();
                         }
                     }
                     Err(error) => {
@@ -859,5 +978,141 @@ mod tests {
         assert!(control.set_window_focused(false));
         assert!(control.set_window_focused(true));
         assert!(!control.snapshot.lock().expect("snapshot").interactive);
+    }
+
+    fn connected_conditions() -> MobileOperatingConditions {
+        MobileOperatingConditions {
+            network: MobileNetworkConditions {
+                available: true,
+                validated: true,
+                transport: MobileNetworkTransport::Wifi,
+                ..MobileNetworkConditions::default()
+            },
+            power: MobilePowerConditions {
+                battery_percent: Some(80),
+                ..MobilePowerConditions::default()
+            },
+        }
+    }
+
+    #[test]
+    fn mobile_resource_mode_uses_network_power_and_thermal_evidence() {
+        let normal = connected_conditions();
+        assert_eq!(
+            resource_mode_for_conditions(normal, true, true),
+            MobileResourceMode::Normal
+        );
+        assert_eq!(
+            resource_mode_for_conditions(normal, false, true),
+            MobileResourceMode::Normal,
+            "unknown startup conditions must not delay initial attachment"
+        );
+
+        let mut metered = normal;
+        metered.network.metered = true;
+        metered.network.transport = MobileNetworkTransport::Cellular;
+        assert_eq!(
+            resource_mode_for_conditions(metered, true, true),
+            MobileResourceMode::Constrained
+        );
+
+        let mut data_saver = normal;
+        data_saver.network.data_saver = true;
+        assert_eq!(
+            resource_mode_for_conditions(data_saver, true, true),
+            MobileResourceMode::Restricted
+        );
+
+        let mut low_battery = normal;
+        low_battery.power.battery_percent = Some(10);
+        assert_eq!(
+            resource_mode_for_conditions(low_battery, true, true),
+            MobileResourceMode::Restricted
+        );
+        low_battery.power.charging = true;
+        assert_eq!(
+            resource_mode_for_conditions(low_battery, true, true),
+            MobileResourceMode::Normal
+        );
+
+        let mut critical_thermal = normal;
+        critical_thermal.power.thermal_status = Some(4);
+        assert_eq!(
+            resource_mode_for_conditions(critical_thermal, true, true),
+            MobileResourceMode::Restricted
+        );
+        assert_eq!(
+            resource_mode_for_conditions(data_saver, true, false),
+            MobileResourceMode::Normal,
+            "desktop targets must retain their ordinary cadence"
+        );
+    }
+
+    #[test]
+    fn mobile_resource_mode_scales_only_passive_work() {
+        let base = Duration::from_secs(5);
+        assert_eq!(
+            interactive_poll_interval(Duration::from_millis(250)),
+            Duration::from_millis(250),
+            "desktop tests retain normal cadence through the public helper"
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Essential,
+                MobileResourceMode::Normal,
+            ),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Essential,
+                MobileResourceMode::Constrained,
+            ),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Essential,
+                MobileResourceMode::Restricted,
+            ),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Observability,
+                MobileResourceMode::Constrained,
+            ),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            passive_network_interval_for_mode(
+                base,
+                MobilePassiveNetworkClass::Observability,
+                MobileResourceMode::Restricted,
+            ),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            interactive_poll_interval_for_mode(
+                Duration::from_millis(250),
+                MobileResourceMode::Restricted,
+            ),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn first_default_operating_sample_is_observed_and_wakes_waiters() {
+        let control = MobileRuntimeControl::default();
+        assert!(control.set_operating_conditions(MobileOperatingConditions::default()));
+        let snapshot = control.snapshot.lock().expect("snapshot");
+        assert!(snapshot.operating_observed);
+        assert_eq!(snapshot.generation, 1);
+        drop(snapshot);
+        assert!(!control.set_operating_conditions(MobileOperatingConditions::default()));
     }
 }

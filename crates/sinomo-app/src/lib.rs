@@ -152,7 +152,7 @@ pub fn run_android(android_app: sui::AndroidApp) -> sui::Result<()> {
         shared.borrow_mut().waker = Some(ui.clone());
         mobile_runtime::start_android_lifecycle_monitor(lifecycle_app);
         start_android_safe_area_monitor(safe_area_app, ui.clone());
-        mobile_runtime::start_android_operating_conditions_monitor(conditions_app);
+        mobile_runtime::start_android_operating_conditions_monitor(conditions_app, ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
         shared.borrow_mut().connect_rx = Some(rx);
         std::thread::Builder::new()
@@ -269,7 +269,9 @@ fn start_android_safe_area_monitor(android_app: sui::AndroidApp, ui: sui::UiHand
                 // stop this JNI polling thread completely in the background.
                 mobile_runtime::wait_for_change_or_timeout(
                     generation,
-                    std::time::Duration::from_millis(250),
+                    mobile_runtime::interactive_poll_interval(std::time::Duration::from_millis(
+                        250,
+                    )),
                 );
             }
         })
