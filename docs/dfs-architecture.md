@@ -910,9 +910,16 @@ Repair is manifest-based rather than an arbitrary directory scan:
 5. Continue until the desired placement is satisfied or authority/policy
    suppresses the work explicitly.
 
-Persisted intents and receipts reconstruct the repair backlog after restart.
-Scrub, old-version collection, orphan cleanup, and tombstone compaction are
-background lifecycle operations.
+Committed mutations append their exact missing-copy identities to the durable
+repair queue before releasing the service lane. Routine maintenance consumes
+that queue; users never reconstruct or administer it directly. On the first
+daemon generation after the durable-queue contract is introduced, one internal
+metadata reconciliation rebuilds any legacy backlog from authoritative intents
+and receipts and records a durable migration marker. A manual maintenance
+request forces the same reconciliation immediately before bounded repair and
+placement work, while ordinary restarts with a completed marker remain
+queue-driven and scan-free. Scrub, old-version collection, orphan cleanup, and
+tombstone compaction are background lifecycle operations.
 
 On a resource-restricted mobile node or a metered link, remote-only routine
 repair, placement reconciliation, metadata catch-up, and deferred sends park

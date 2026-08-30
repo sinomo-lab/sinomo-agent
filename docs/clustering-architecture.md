@@ -211,6 +211,11 @@ absence.
 
 Leader preference is a routing optimization, not a third consistency level. A
 reachable leader without current quorum evidence does not prove freshness.
+An entirely unobserved leader remains preferred until liveness evidence
+arrives. Once at least one main-daemon endpoint has active unreachable evidence
+and no observed main route is healthy or degraded, unobserved alternate
+endpoints do not preserve stale leader preference; an eligible candidate may
+campaign, but still becomes leader only with the committed voter quorum.
 Status and telemetry views normally use local reads. Membership changes,
 invitations, migration, authority changes, cluster configuration, and rollout
 decisions use authoritative reads or fail with structured quorum diagnostics.

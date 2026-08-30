@@ -1879,7 +1879,7 @@ pub(crate) fn process_daemon_dfs_message_command_on_runtime(
             request = %request_id,
             kind = message_kind,
             error = %error,
-            "failed to persist committed DFS repair queue; restart recovery may require explicit disaster recovery"
+            "failed to persist committed DFS repair queue; internal maintenance reconciliation remains required"
         );
     }
     #[cfg(test)]

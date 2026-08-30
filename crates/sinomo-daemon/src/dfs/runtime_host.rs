@@ -442,6 +442,8 @@ static DAEMON_DFS_METADATA_AUTHORITY_GENERATIONS: OnceLock<
 > = OnceLock::new();
 static DAEMON_DFS_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_DFS_REPAIR_QUEUE_NONEMPTY: OnceLock<Mutex<BTreeMap<PathBuf, bool>>> = OnceLock::new();
+static DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS: OnceLock<Mutex<BTreeMap<PathBuf, u64>>> =
+    OnceLock::new();
 #[cfg(test)]
 static DAEMON_DFS_MAINTENANCE_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 static DAEMON_DFS_PLACEMENT_AUTHORITY_SESSION_ID: OnceLock<String> = OnceLock::new();
@@ -649,14 +651,16 @@ pub(crate) use maintenance_host::daemon_dfs_maintenance_wake_count;
 #[cfg(test)]
 use maintenance_host::*;
 use maintenance_host::{
-    daemon_dfs_maintenance_execution_exclusions, daemon_dfs_offline_node_ids,
-    persist_daemon_dfs_repair_queue_records, record_daemon_dfs_repair_queue_nonempty,
-    refresh_daemon_dfs_repair_queue_nonempty,
+    complete_daemon_dfs_maintenance_reconciliation, daemon_dfs_maintenance_execution_exclusions,
+    daemon_dfs_offline_node_ids, persist_daemon_dfs_repair_queue_records,
+    record_daemon_dfs_repair_queue_nonempty, refresh_daemon_dfs_repair_queue_nonempty,
 };
 pub(crate) use maintenance_host::{
-    daemon_dfs_maintenance_notify, daemon_dfs_pending_reactive_maintenance_work_on_runtime,
-    daemon_dfs_repair_queue_work_is_known, handle_daemon_dfs_mounted_mutation_handoff_on_runtime,
-    notify_daemon_dfs_maintenance_work,
+    daemon_dfs_maintenance_notify, daemon_dfs_maintenance_reconciliation_generation,
+    daemon_dfs_pending_reactive_maintenance_work_on_runtime, daemon_dfs_repair_queue_work_is_known,
+    handle_daemon_dfs_mounted_mutation_handoff_on_runtime, notify_daemon_dfs_maintenance_work,
+    request_daemon_dfs_maintenance_reconciliation,
+    schedule_daemon_dfs_maintenance_reconciliation_if_needed,
 };
 
 mod placement_environment;
@@ -692,7 +696,6 @@ pub(crate) use maintenance_runtime::{
     DaemonDfsMaintenanceTickOutcome, daemon_dfs_background_network_work_deferred,
     replay_daemon_dfs_mounted_mutation_committed_work_on_runtime,
     run_daemon_dfs_maintenance_tick_in_blocking_task,
-    run_daemon_dfs_repair_queue_recovery_on_runtime,
 };
 mod publish_host;
 #[cfg(test)]

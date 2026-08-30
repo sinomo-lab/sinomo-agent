@@ -15,8 +15,6 @@ const DFS_CLUSTER_STATUS_REMOTE_TIMEOUT: std::time::Duration = std::time::Durati
 const DFS_SMOKE_DAEMON_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(9_500);
 const DFS_PLACEMENT_AUTHORITY_ADMIN_RPC_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(30);
-const DFS_REPAIR_QUEUE_RECOVERY_RPC_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(10 * 60);
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum DfsCliCommand {
@@ -40,9 +38,6 @@ pub(crate) enum DfsCliCommand {
     UseConflictVersion(DfsConflictUseVersionOptions),
     SaveConflictVersion(DfsConflictSaveVersionOptions),
     Repair(DfsFilterOptions),
-    RecoverRepairQueue {
-        json: bool,
-    },
     Smoke {
         json: bool,
     },
@@ -434,17 +429,6 @@ fn dfs_cli_spec() -> CliCommandSpec {
                 ))]),
             conflicts,
             CliCommandSpec::new("repair", "list inferred replica repairs").with_options(filter()),
-            CliCommandSpec::new(
-                "recover-repair-queue",
-                "explicitly rebuild a lost repair queue from a full metadata scan",
-            )
-            .with_options([
-                CliOptionSpec::flag(
-                    "--acknowledge-full-metadata-scan",
-                    "acknowledge that explicit disaster recovery scans all DFS metadata",
-                ),
-                json(),
-            ]),
             CliCommandSpec::new("services", "list DFS service advertisements")
                 .with_options([json()]),
             CliCommandSpec::new("smoke", "write a small replicated SIFS smoke file")
@@ -763,17 +747,6 @@ fn parse_dfs_matches(matches: &CliCommandMatches) -> Result<DfsCliCommand, CliPa
             ))
         }
         ["dfs", "repair"] => dfs_filter_from_matches(matches).map(DfsCliCommand::Repair),
-        ["dfs", "recover-repair-queue"] => {
-            if !matches.contains("--acknowledge-full-metadata-scan") {
-                return Err(CliParseError::Parse {
-                    detail: "recover-repair-queue requires --acknowledge-full-metadata-scan"
-                        .to_string(),
-                });
-            }
-            Ok(DfsCliCommand::RecoverRepairQueue {
-                json: matches.contains("--json"),
-            })
-        }
         ["dfs", "services"] => Ok(DfsCliCommand::Services {
             json: matches.contains("--json"),
         }),
@@ -1467,35 +1440,6 @@ pub(crate) fn run_dfs_cli_command(command: DfsCliCommand) -> Result<(), CliError
                 if let Some(next_cursor) = next_cursor {
                     println!("next cursor: {next_cursor}");
                 }
-            }
-            Ok(())
-        }
-        DfsCliCommand::RecoverRepairQueue { json } => {
-            let status =
-                default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
-                    detail: "DFS repair queue recovery requires the local main daemon".to_string(),
-                })?;
-            let response = sinomo_runtime::daemon::send_daemon_dfs_repair_queue_recovery(
-                &status.address,
-                DFS_REPAIR_QUEUE_RECOVERY_RPC_TIMEOUT,
-            )?;
-            if json {
-                print_json("<dfs-repair-queue-recovery>", &response)?;
-            } else {
-                println!("DFS repair queue recovery:");
-                println!("  completed: {}", response.completed);
-                println!("  reached limit: {}", response.reached_limit);
-                println!(
-                    "  remaining queued repairs: {}",
-                    response.remaining_queued_repairs
-                );
-            }
-            if !response.completed {
-                return Err(CliError::Parse {
-                    detail:
-                        "DFS repair queue recovery yielded to foreground work; retry the command"
-                            .to_string(),
-                });
             }
             Ok(())
         }
