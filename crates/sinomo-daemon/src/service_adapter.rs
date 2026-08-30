@@ -7886,6 +7886,44 @@ mod tests {
     }
 
     #[test]
+    fn dfs_component_publishes_sifs_path_access_provider() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-path-provider-discovery");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let registry = daemon_service_registry(&paths, None, &[]);
+        let local_node_id =
+            sinomo_core::node::NodeId::from_legacy_named("node_daemon_dfs_path_access_discovery")
+                .expect("local node id");
+
+        let service_instances = sinomo_core::service::service_instance_records_from_registry(
+            &registry,
+            &local_node_id,
+            2,
+            time::OffsetDateTime::UNIX_EPOCH,
+        );
+        let path_access = service_instances
+            .iter()
+            .find(|instance| {
+                instance
+                    .provider_capabilities
+                    .iter()
+                    .any(|capability| capability == sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY)
+            })
+            .expect("active DFS browser publishes a SIFS path-access provider");
+
+        for route in crate::DAEMON_DFS_BROWSER_ROUTES {
+            assert_eq!(
+                path_access
+                    .routes
+                    .iter()
+                    .any(|published| published == route),
+                daemon_dfs_browser_route_is_path_access(route),
+                "SIFS provider route classification for {route}"
+            );
+        }
+    }
+
+    #[test]
     fn daemon_service_registry_host_installs_active_native_dylib_routes_from_descriptor() {
         let Ok(library_path) = std::env::var("SINOMO_DAEMON_TEST_NATIVE_DYLIB") else {
             return;
