@@ -10,6 +10,105 @@ pub(crate) fn notify_daemon_dfs_maintenance_work() {
     daemon_dfs_maintenance_notify().notify_one();
 }
 
+const DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER: &str = "repair-queue-reconciled-v1";
+const DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER_CONTENT: &[u8] =
+    b"sinomo-dfs-repair-queue-reconciled-v1\n";
+
+fn daemon_dfs_maintenance_reconciliation_marker_path(data_dir: &SinomoDataDir) -> PathBuf {
+    data_dir
+        .dfs_dir()
+        .join("maintenance")
+        .join(DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER)
+}
+
+fn daemon_dfs_maintenance_reconciliation_data_root(
+    paths: &DaemonPaths,
+) -> Result<PathBuf, DaemonError> {
+    daemon_data_dir(paths).map(|path| path.to_path_buf())
+}
+
+/// Request one authoritative metadata reconciliation before the next bounded
+/// repair pass. Requests are generation-counted so a manual request arriving
+/// during a running pass cannot be cleared by the older completion.
+pub(crate) fn request_daemon_dfs_maintenance_reconciliation(
+    paths: &DaemonPaths,
+) -> Result<u64, DaemonError> {
+    let data_root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
+    let generation = {
+        let mut requests = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let generation = requests
+            .get(&data_root)
+            .copied()
+            .unwrap_or_default()
+            .wrapping_add(1)
+            .max(1);
+        requests.insert(data_root, generation);
+        generation
+    };
+    notify_daemon_dfs_maintenance_work();
+    Ok(generation)
+}
+
+pub(crate) fn daemon_dfs_maintenance_reconciliation_generation(paths: &DaemonPaths) -> Option<u64> {
+    let data_root = daemon_dfs_maintenance_reconciliation_data_root(paths).ok()?;
+    DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS
+        .get()
+        .and_then(|requests| {
+            requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&data_root)
+                .copied()
+        })
+}
+
+/// Upgrade installations created before committed mutations durably owned
+/// their repair-queue delta. The marker makes the inventory reconciliation a
+/// one-time internal migration rather than work repeated at every restart.
+pub(crate) fn schedule_daemon_dfs_maintenance_reconciliation_if_needed(
+    paths: &DaemonPaths,
+) -> Result<bool, DaemonError> {
+    let data_dir = SinomoDataDir::new(daemon_dfs_maintenance_reconciliation_data_root(paths)?);
+    if daemon_dfs_maintenance_reconciliation_marker_path(&data_dir).is_file() {
+        return Ok(false);
+    }
+    request_daemon_dfs_maintenance_reconciliation(paths).map(|_| true)
+}
+
+pub(super) fn complete_daemon_dfs_maintenance_reconciliation(
+    paths: &DaemonPaths,
+    generation: u64,
+) -> Result<(), DaemonError> {
+    let data_root = daemon_dfs_maintenance_reconciliation_data_root(paths)?;
+    let data_dir = SinomoDataDir::new(data_root.clone());
+    let marker = daemon_dfs_maintenance_reconciliation_marker_path(&data_dir);
+    sinomo_core::storage::durable_file::write_file_atomic(
+        &marker,
+        DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER_CONTENT,
+        sinomo_core::storage::durable_file::DurableAtomicFileOptions::new(
+            DAEMON_DFS_MAINTENANCE_RECONCILIATION_MARKER,
+            "repair-queue-reconciliation",
+        )
+        .sync_all(),
+    )
+    .map_err(|source| DaemonError::Io {
+        path: marker.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    if let Some(requests) = DAEMON_DFS_MAINTENANCE_RECONCILIATION_REQUESTS.get() {
+        let mut requests = requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if requests.get(&data_root).copied() == Some(generation) {
+            requests.remove(&data_root);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn record_daemon_dfs_repair_queue_nonempty(data_dir: &SinomoDataDir, nonempty: bool) {
     DAEMON_DFS_REPAIR_QUEUE_NONEMPTY
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -376,7 +475,7 @@ pub(crate) fn daemon_dfs_pending_reactive_maintenance_work(
     daemon_dfs_pending_reactive_maintenance_work_from_authority_entries(paths, &entries)
 }
 
-/// Full metadata classifier retained for explicit recovery/operator tests.
+/// Full metadata classifier retained for authoritative reconciliation tests.
 ///
 /// Unlike [`daemon_dfs_pending_reactive_maintenance_work`], this opens the
 /// cluster-aware metadata image and is therefore O(total metadata). Production
@@ -395,7 +494,7 @@ pub(crate) fn daemon_dfs_pending_maintenance_work(
     // Routine scheduling observes only indexed metadata work queues and their
     // bounded retry records. Content-store inventory (reservations, manifests,
     // versions, blobs, and orphan observations) is deliberately excluded:
-    // those O(total-content) scans belong to explicit disaster recovery, never
+    // those O(total-content) scans belong to authoritative reconciliation, never
     // to daemon startup, notification handling, or an idle safety poll.
     let DaemonDfsMaintenanceMetadataObservation {
         summary,

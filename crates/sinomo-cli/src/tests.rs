@@ -8310,16 +8310,7 @@ fn dfs_parser_accepts_operator_and_pin_commands() {
     );
     assert!(
         parse_dfs_schema_for_test(&["recover-repair-queue".to_string()]).is_err(),
-        "the full metadata recovery scan must require explicit acknowledgement"
-    );
-    assert_eq!(
-        parse_dfs_schema_for_test(&[
-            "recover-repair-queue".to_string(),
-            "--acknowledge-full-metadata-scan".to_string(),
-            "--json".to_string(),
-        ])
-        .expect("dfs recover repair queue"),
-        DfsCliCommand::RecoverRepairQueue { json: true }
+        "repair queue reconstruction is internal maintenance, not an operator command"
     );
     assert_eq!(
         parse_dfs_schema_for_test(&[

@@ -1865,21 +1865,6 @@ pub fn send_daemon_cluster_maintenance_refresh_to_endpoint(
     )
 }
 
-pub fn send_daemon_dfs_repair_queue_recovery(
-    address: &str,
-    timeout: Duration,
-) -> Result<crate::DaemonDfsRepairQueueRecoveryResponse, DaemonError> {
-    send_daemon_rpc_value(
-        address,
-        crate::DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
-        crate::DAEMON_RPC_CATEGORY,
-        crate::DaemonDfsRepairQueueRecoveryRequest {
-            acknowledgement: crate::DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT.to_string(),
-        },
-        timeout,
-    )
-}
-
 pub fn send_daemon_shutdown_request(
     address: &str,
     timeout: Duration,

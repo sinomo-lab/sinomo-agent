@@ -73,7 +73,6 @@ pub const DAEMON_SHUTDOWN_ROUTE: &str = "/daemon/shutdown";
 /// main daemon.
 pub const DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE: &str = "/daemon/shadow/shutdown-remote";
 pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/maintenance-refresh";
-pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE: &str = "/daemon/dfs/repair-queue/recover";
 /// Main-daemon local-command route which durably owns work committed by a
 /// separately supervised FUSE or Cloud Files mount process.
 ///
@@ -86,8 +85,6 @@ pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE: &str =
 /// Keep this no larger than the durable outbox state which receives it.
 pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES: usize =
     sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES;
-pub const DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT: &str =
-    "acknowledge-explicit-full-metadata-repair-queue-recovery";
 pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
 pub const DAEMON_NETWORK_CHUNK_METRICS_ROUTE: &str = "/daemon/network/chunk-metrics";
@@ -237,22 +234,6 @@ pub struct DaemonClusterMaintenanceRefreshRequest;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonClusterMaintenanceRefreshResponse;
-
-/// Explicit operator request to reconstruct a lost DFS repair queue.
-///
-/// This is intentionally separate from routine maintenance: reconstructing
-/// identities which predate the durable queue requires a full metadata hydrate.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsRepairQueueRecoveryRequest {
-    pub acknowledgement: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
-pub struct DaemonDfsRepairQueueRecoveryResponse {
-    pub completed: bool,
-    pub reached_limit: bool,
-    pub remaining_queued_repairs: usize,
-}
 
 pub use sinomo_dfs::{
     MountedSifsMutationHandoffPhase as DaemonDfsMountedMutationHandoffPhase,

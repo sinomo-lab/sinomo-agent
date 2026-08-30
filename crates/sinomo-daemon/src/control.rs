@@ -1268,6 +1268,7 @@ pub fn run_daemon_control_loop_with_catalog_and_runtime(
     // after a successful join. Its replacement owns distributed DFS maintenance;
     // the stale process must not acquire a backend generation while draining.
     if maintenance_default_dfs_enabled {
+        crate::dfs::schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)?;
         let cluster_paths = cluster_paths_from_daemon_paths(&paths)?;
         let route_generation_subscription =
             sinomo_core::network::__connectivity_store::subscribe_local_cluster_connectivity_routing_generation(

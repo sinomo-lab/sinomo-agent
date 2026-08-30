@@ -2957,7 +2957,7 @@ fn run_daemon_dfs_maintenance_body_for_test(
         cluster_paths.clone(),
         runtime.handle(),
         &metadata_authority_preflight,
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             content_gc_requested: true,
             content_reservation_reconciliation_requested: true,
             commit_promotion_recovery_requested: true,
@@ -3164,6 +3164,49 @@ fn daemon_dfs_explicit_recovery_uses_bounds_and_routine_work_skips_inventory() {
     assert_eq!(
         daemon_dfs_metadata_publish_schedule_options().max_retry_delay,
         DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY
+    );
+}
+
+#[test]
+fn daemon_dfs_repair_queue_reconciliation_is_an_internal_one_time_migration() {
+    let root = temp_root("repair-queue-reconciliation-marker");
+    let data_dir = SinomoDataDir::new(root.path());
+    let paths = DaemonPaths::new(&data_dir);
+
+    assert!(
+        schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)
+            .expect("schedule initial reconciliation")
+    );
+    let initial_generation = daemon_dfs_maintenance_reconciliation_generation(&paths)
+        .expect("initial reconciliation generation");
+    complete_daemon_dfs_maintenance_reconciliation(&paths, initial_generation)
+        .expect("complete initial reconciliation");
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
+    );
+    assert!(
+        !schedule_daemon_dfs_maintenance_reconciliation_if_needed(&paths)
+            .expect("completed migration stays scan-free after restart")
+    );
+
+    let first_manual = request_daemon_dfs_maintenance_reconciliation(&paths)
+        .expect("first manual maintenance reconciliation");
+    let second_manual = request_daemon_dfs_maintenance_reconciliation(&paths)
+        .expect("second manual maintenance reconciliation");
+    assert!(second_manual > first_manual);
+    complete_daemon_dfs_maintenance_reconciliation(&paths, first_manual)
+        .expect("older pass completion");
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        Some(second_manual),
+        "an older pass must not clear a newer manual maintenance request"
+    );
+    complete_daemon_dfs_maintenance_reconciliation(&paths, second_manual)
+        .expect("newest pass completion");
+    assert_eq!(
+        daemon_dfs_maintenance_reconciliation_generation(&paths),
+        None
     );
 }
 

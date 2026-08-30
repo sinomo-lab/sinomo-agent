@@ -5,7 +5,7 @@ pub(crate) type DaemonDfsMaintenanceTickOutcome = sinomo_dfs::DfsMaintenanceTick
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DaemonDfsMaintenanceKind {
     Routine,
-    ExplicitDisasterRecovery {
+    AuthoritativeReconciliation {
         content_gc_requested: bool,
         content_reservation_reconciliation_requested: bool,
         commit_promotion_recovery_requested: bool,
@@ -125,8 +125,11 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let mounted_mutation_recovery =
         prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
-    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery() {
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+    let reconciliation_generation = daemon_dfs_maintenance_reconciliation_generation(paths);
+    let maintenance_kind = if mounted_mutation_recovery.requires_full_recovery()
+        || reconciliation_generation.is_some()
+    {
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             content_gc_requested: false,
             content_reservation_reconciliation_requested: false,
             commit_promotion_recovery_requested: false,
@@ -142,57 +145,12 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_on_runtime(
     )
     .await?;
     complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
-    Ok(outcome)
-}
-
-pub(crate) async fn run_daemon_dfs_repair_queue_recovery_on_runtime(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<crate::DaemonDfsRepairQueueRecoveryResponse, DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
-    tracing::warn!(
-        target: "sinomo.dfs.fault_healing",
-        data_root = %data_dir.root().display(),
-        "operator requested explicit full-metadata DFS repair queue recovery"
-    );
-    let mounted_mutation_recovery =
-        prepare_daemon_dfs_mounted_mutation_recovery_on_runtime(paths, runtime)?;
-    let outcome = run_daemon_dfs_maintenance_tick_kind_on_runtime(
-        paths,
-        runtime,
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
-            content_gc_requested: false,
-            content_reservation_reconciliation_requested: false,
-            commit_promotion_recovery_requested: false,
-        },
-        sinomo_device::NodeResourceSnapshot::default(),
-    )
-    .await?;
-    complete_daemon_dfs_mounted_mutation_recovery(mounted_mutation_recovery, outcome)?;
-    let remaining_queued_repairs =
-        read_dfs_repair_attempt_snapshot(&default_dfs_repair_attempt_snapshot_path(&data_dir))?
-            .map(|snapshot| snapshot.records.len())
-            .unwrap_or_default();
-    let (completed, reached_limit) = match outcome {
-        DaemonDfsMaintenanceTickOutcome::Completed { reached_limit } => (true, reached_limit),
-        DaemonDfsMaintenanceTickOutcome::Deferred => (false, false),
-    };
-    if remaining_queued_repairs > 0 || !completed {
-        notify_daemon_dfs_maintenance_work();
+    if let Some(generation) = reconciliation_generation
+        && matches!(outcome, DaemonDfsMaintenanceTickOutcome::Completed { .. })
+    {
+        complete_daemon_dfs_maintenance_reconciliation(paths, generation)?;
     }
-    tracing::warn!(
-        target: "sinomo.dfs.fault_healing",
-        data_root = %data_dir.root().display(),
-        completed,
-        reached_limit,
-        remaining_queued_repairs,
-        "explicit full-metadata DFS repair queue recovery finished"
-    );
-    Ok(crate::DaemonDfsRepairQueueRecoveryResponse {
-        completed,
-        reached_limit,
-        remaining_queued_repairs,
-    })
+    Ok(outcome)
 }
 
 pub(super) async fn run_daemon_dfs_maintenance_tick_kind_on_runtime(
@@ -426,7 +384,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             .map(Some)
             .map_err(DaemonError::from)
         }
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             content_gc_requested,
             content_reservation_reconciliation_requested,
             ..
@@ -460,7 +418,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         Ok(Some(_))
             if matches!(
                 maintenance_kind,
-                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
+                DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
             ) =>
         {
             let authority_generation_after_maintenance = metadata_authority_generation.generation();
@@ -479,11 +437,11 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         Err(_)
             if matches!(
                 maintenance_kind,
-                DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
+                DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
             ) =>
         {
             // A disaster-recovery hydrate can repair a durable intent before
-            // failing later. Preserve that explicit recovery obligation.
+            // failing later. Preserve that authoritative reconciliation obligation.
             detached_send_runtime.reset_recovery_scan_generation();
         }
         Ok(Some(_)) | Ok(None) | Err(_) => {}
@@ -498,7 +456,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             Ok(0) => {
                 let reset_to_lazy = matches!(
                     maintenance_kind,
-                    DaemonDfsMaintenanceKind::ExplicitDisasterRecovery { .. }
+                    DaemonDfsMaintenanceKind::AuthoritativeReconciliation { .. }
                 ) || maintenance_service
                     .can_release_hydrated_metadata_projection();
                 if reset_to_lazy {
@@ -540,7 +498,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     };
     if matches!(
         maintenance_kind,
-        DaemonDfsMaintenanceKind::ExplicitDisasterRecovery {
+        DaemonDfsMaintenanceKind::AuthoritativeReconciliation {
             commit_promotion_recovery_requested: true,
             ..
         }
@@ -561,7 +519,7 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
             }
             Err(error) => {
                 tracing::warn!(
-                    "sinomo daemon DFS commit-promotion disaster recovery remains pending: {error}"
+                    "sinomo daemon DFS commit-promotion reconciliation remains pending: {error}"
                 );
             }
         }

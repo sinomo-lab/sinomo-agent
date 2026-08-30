@@ -4,14 +4,12 @@ use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
-    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT,
-    DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
     DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonClusterMaintenanceRefreshRequest,
     DaemonClusterMaintenanceRefreshResponse, DaemonDfsMountedMutationHandoffRequest,
-    DaemonDfsMountedMutationHandoffResponse, DaemonDfsRepairQueueRecoveryRequest,
-    DaemonDfsRepairQueueRecoveryResponse, DaemonLocalConnectivityReloadRequest,
+    DaemonDfsMountedMutationHandoffResponse, DaemonLocalConnectivityReloadRequest,
     DaemonLocalConnectivityReloadResponse, DaemonNetworkChunkMetricsResponse,
     DaemonObjectRpcDestinationProcessAffinity, DaemonObjectRpcForwardRequest,
     DaemonObjectRpcForwardResponse, DaemonStatus,
@@ -129,7 +127,6 @@ pub fn register_hosted_daemon_lifecycle_service(
 
 const MAIN_OPERATIONS_ROUTES: &[&str] = &[
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-    DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
     DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
@@ -167,11 +164,6 @@ pub trait DaemonOperationsHost: Send + Sync + 'static {
     >;
 
     fn cluster_maintenance_refresh_requested(&self, traceparent: Option<String>);
-
-    fn recover_dfs_repair_queue(
-        &self,
-        request: DaemonDfsRepairQueueRecoveryRequest,
-    ) -> DaemonOperationsFuture<'_, Result<DaemonDfsRepairQueueRecoveryResponse, ServiceError>>;
 
     fn handoff_dfs_mounted_mutation(
         &self,
@@ -234,7 +226,6 @@ impl Service for HostedDaemonOperationsService {
                 && matches!(
                     request.route.as_str(),
                     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
-                        | DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE
                         | DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
                 )
             {
@@ -266,18 +257,6 @@ impl Service for HostedDaemonOperationsService {
                         DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
                         DaemonClusterMaintenanceRefreshResponse,
                     )?;
-                }
-                DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE => {
-                    let recovery: DaemonDfsRepairQueueRecoveryRequest =
-                        ctx.decode_request_body(&request).await?;
-                    if recovery.acknowledgement != DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT
-                    {
-                        return Err(ServiceError::Service(format!(
-                            "DFS repair queue recovery requires acknowledgement `{DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ACKNOWLEDGEMENT}`"
-                        )));
-                    }
-                    let response = host.recover_dfs_repair_queue(recovery).await?;
-                    ctx.respond_value(DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE, response)?;
                 }
                 DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE => {
                     let handoff: DaemonDfsMountedMutationHandoffRequest = ctx
@@ -497,14 +476,6 @@ mod tests {
 
         fn cluster_maintenance_refresh_requested(&self, _traceparent: Option<String>) {}
 
-        fn recover_dfs_repair_queue(
-            &self,
-            _request: DaemonDfsRepairQueueRecoveryRequest,
-        ) -> DaemonOperationsFuture<'_, Result<DaemonDfsRepairQueueRecoveryResponse, ServiceError>>
-        {
-            Box::pin(async { Err(ServiceError::Service("unused test recovery".to_string())) })
-        }
-
         fn handoff_dfs_mounted_mutation(
             &self,
             _traceparent: Option<String>,
@@ -569,10 +540,5 @@ mod tests {
         let shadow =
             HostedDaemonOperationsService::new(Arc::new(TestOperationsHost { shadow: true }));
         assert_eq!(shadow.routes(), SHADOW_OPERATIONS_ROUTES);
-        assert!(
-            !shadow
-                .routes()
-                .contains(&DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE)
-        );
     }
 }

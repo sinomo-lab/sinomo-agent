@@ -80,9 +80,9 @@ use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
     DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE, DAEMON_DFS_BROWSER_ROUTES,
     DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
-    DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE, DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
-    DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE, DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
-    DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE, DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
+    DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
+    DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_RPC_CATEGORY,
 };
 use crate::{
     DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE,
@@ -647,7 +647,12 @@ impl sinomo_api::DaemonOperationsHost for DaemonOperationsServiceHost {
         crate::control::request_daemon_cluster_maintenance(
             crate::control::DaemonClusterMaintenanceReason::ManualBroad,
         );
-        crate::dfs::notify_daemon_dfs_maintenance_work();
+        if let Err(error) = crate::dfs::request_daemon_dfs_maintenance_reconciliation(&self.paths) {
+            tracing::warn!(
+                "sinomo daemon DFS maintenance reconciliation could not be scheduled: {error}"
+            );
+            crate::dfs::notify_daemon_dfs_maintenance_work();
+        }
         if let Some(runtime) = self.runtime.as_ref()
             && let Err(error) = crate::dfs::schedule_daemon_dfs_metadata_publish_on_runtime(
                 &self.paths,
@@ -660,24 +665,6 @@ impl sinomo_api::DaemonOperationsHost for DaemonOperationsServiceHost {
             );
         }
         tracing::info!("sinomo daemon cluster maintenance refresh requested by RPC");
-    }
-
-    fn recover_dfs_repair_queue(
-        &self,
-        _request: crate::DaemonDfsRepairQueueRecoveryRequest,
-    ) -> sinomo_api::DaemonOperationsFuture<
-        '_,
-        Result<crate::DaemonDfsRepairQueueRecoveryResponse, ServiceError>,
-    > {
-        Box::pin(async move {
-            let runtime = require_service_runtime(
-                self.runtime.as_ref(),
-                "DFS repair queue disaster recovery",
-            )?;
-            crate::dfs::run_daemon_dfs_repair_queue_recovery_on_runtime(&self.paths, runtime)
-                .await
-                .map_err(daemon_error)
-        })
     }
 
     fn handoff_dfs_mounted_mutation(
@@ -6027,6 +6014,7 @@ mod tests {
             .build()
             .expect("runtime");
         let data_dir = SinomoDataDir::new(&root);
+        std::fs::create_dir_all(data_dir.root().join("cluster")).expect("cluster watch directory");
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
             .register(sinomo_api::HostedDaemonOperationsService::new(
@@ -6066,49 +6054,9 @@ mod tests {
                 .await
                 .expect("DFS maintenance notification");
         });
-    }
-
-    #[test]
-    fn daemon_dfs_repair_queue_recovery_rejects_missing_acknowledgement() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-repair-recovery-ack");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = DaemonPaths::new(&data_dir);
-        let registry = ServiceRegistry::builder()
-            .register(sinomo_api::HostedDaemonOperationsService::new(
-                daemon_operations_service_host(paths.clone(), Some(runtime.handle().clone())),
-            ))
-            .build();
-        let host = test_service_host(&root, registry);
-        let mut request = ObjectRpcRequest::encode_body(
-            DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
-            DAEMON_RPC_CATEGORY,
-            &crate::DaemonDfsRepairQueueRecoveryRequest {
-                acknowledgement: String::new(),
-            },
-        )
-        .expect("request");
-        request.auth = Some(
-            crate::auth::sign_daemon_rpc_request_from_data_dir(&data_dir, &request)
-                .expect("sign DFS repair recovery request"),
-        );
-        let authenticated =
-            authenticate_daemon_control_request_via_registry(&paths, &request, &host)
-                .expect("authenticate local DFS repair recovery request");
-        assert_eq!(authenticated.signer, DaemonSignerAuthority::Local);
-        annotate_daemon_service_request(&mut request, &authenticated);
-
-        let error = runtime
-            .block_on(call_value_service_host_async(&host, request))
-            .expect_err("missing recovery acknowledgement must fail");
         assert!(
-            error
-                .to_string()
-                .contains("DFS repair queue recovery requires acknowledgement"),
-            "unexpected error: {error}"
+            crate::dfs::daemon_dfs_maintenance_reconciliation_generation(&paths).is_some(),
+            "manual maintenance must request metadata-to-queue reconciliation"
         );
     }
 
@@ -9117,7 +9065,6 @@ mod tests {
         );
         for route in [
             DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-            DAEMON_DFS_REPAIR_QUEUE_RECOVERY_ROUTE,
             DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
         ] {
             assert!(
