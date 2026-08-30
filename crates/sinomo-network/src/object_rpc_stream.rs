@@ -10,11 +10,11 @@ use crate::error::NetworkError;
 use crate::object::{ObjectFrameIoOptions, SinomoObjectCodec};
 use crate::owned_chunk::{
     AuthenticatedChunkReader, AuthenticatedChunkStream, AuthenticatedChunkWriter, BODY_CHUNK_MAX,
-    ChunkAllocator, OwnedChunk, RPC_CONTROL_PAYLOAD_MAX, observe_chunk_identity,
+    ChunkAllocator, OwnedChunk, RPC_CONTROL_PAYLOAD_MAX, ResetReason, observe_chunk_identity,
 };
 use crate::rpc_body::{
-    ObjectRpcBodyChunk, ObjectRpcBodyReceiver, ObjectRpcBodyReceiverFuture, ObjectRpcBodySource,
-    ObjectRpcIncomingBody,
+    ObjectRpcBodyChunk, ObjectRpcBodyDropGuard, ObjectRpcBodyReceiver, ObjectRpcBodyReceiverFuture,
+    ObjectRpcBodySource, ObjectRpcIncomingBody,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -765,6 +769,7 @@ impl RpcRecord {
 
 trait RpcRecordReader: Send + 'static {
     fn read_record(&mut self, options: ObjectFrameIoOptions) -> RpcRecordFuture<'_, RpcRecord>;
+    fn abort(&mut self, _detail: &str) {}
 }
 
 trait RpcRecordWriter: Send + 'static {
@@ -931,6 +936,12 @@ impl RpcRecordReader for OwnedRpcRecordReader {
                 payload: ObjectRpcBodyChunk::lease(payload),
             })
         })
+    }
+
+    fn abort(&mut self, detail: &str) {
+        self.reader.abort(ResetReason {
+            detail: detail.to_string(),
+        });
     }
 }
 
@@ -1263,6 +1274,39 @@ fn incoming_body_completion(
     }
 }
 
+struct PullIncomingBodyControl {
+    cancelled: watch::Sender<bool>,
+    terminal: AtomicBool,
+}
+
+impl PullIncomingBodyControl {
+    fn new() -> (Arc<Self>, watch::Receiver<bool>) {
+        let (cancelled, receiver) = watch::channel(false);
+        (
+            Arc::new(Self {
+                cancelled,
+                terminal: AtomicBool::new(false),
+            }),
+            receiver,
+        )
+    }
+
+    fn cancel_if_pending(&self) {
+        if !self.terminal.load(Ordering::Acquire) {
+            self.cancelled.send_replace(true);
+        }
+    }
+
+    fn mark_terminal(&self) {
+        self.terminal.store(true, Ordering::Release);
+    }
+}
+
+fn incoming_body_drop_guard(control: &Arc<PullIncomingBodyControl>) -> ObjectRpcBodyDropGuard {
+    let control = Arc::clone(control);
+    ObjectRpcBodyDropGuard::new(move || control.cancel_if_pending())
+}
+
 struct PullIncomingBodyState<R> {
     reader: R,
     options: ObjectFrameIoOptions,
@@ -1274,6 +1318,7 @@ struct PullIncomingBodyState<R> {
     pending_chunk: Option<ObjectRpcBodyChunk>,
     terminal_sender: watch::Sender<Option<Result<IncomingTerminal, NetworkError>>>,
     terminal_published: bool,
+    control: Arc<PullIncomingBodyControl>,
 }
 
 impl<R: RpcRecordReader> PullIncomingBodyState<R> {
@@ -1282,7 +1327,16 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
             return;
         }
         self.terminal_published = true;
+        self.control.mark_terminal();
         self.terminal_sender.send_replace(Some(result));
+    }
+
+    fn abort(&mut self) -> NetworkError {
+        const DETAIL: &str = "application cancelled object RPC response body";
+        self.reader.abort(DETAIL);
+        let error = delivery_error("cancel object RPC response body", DETAIL);
+        self.publish(Err(error.clone()));
+        error
     }
 
     async fn recv_chunk(&mut self) -> Result<Option<ObjectRpcBodyChunk>, NetworkError> {
@@ -1379,6 +1433,7 @@ impl<R: RpcRecordReader> PullIncomingBodyState<R> {
 
 struct PullIncomingBodyReceiver<R: RpcRecordReader> {
     state: Option<PullIncomingBodyState<R>>,
+    cancellation: watch::Receiver<bool>,
 }
 
 impl<R: RpcRecordReader> std::fmt::Debug for PullIncomingBodyReceiver<R> {
@@ -1398,14 +1453,30 @@ impl<R: RpcRecordReader> std::fmt::Debug for PullIncomingBodyReceiver<R> {
 
 impl<R: RpcRecordReader> ObjectRpcBodyReceiver for PullIncomingBodyReceiver<R> {
     fn recv_chunk(&mut self) -> ObjectRpcBodyReceiverFuture<'_> {
+        let Self {
+            state,
+            cancellation,
+        } = self;
         Box::pin(async move {
-            let Some(state) = self.state.as_mut() else {
+            let Some(state) = state.as_mut() else {
                 return Ok(None);
             };
-            state
-                .recv_chunk()
-                .await
-                .map_err(|error| std::io::Error::other(error.to_string()))
+            if *cancellation.borrow() {
+                return Err(std::io::Error::other(state.abort().to_string()));
+            }
+            tokio::select! {
+                biased;
+                changed = cancellation.changed() => {
+                    let detail = match changed {
+                        Ok(()) => state.abort().to_string(),
+                        Err(error) => format!("object RPC cancellation source closed: {error}"),
+                    };
+                    Err(std::io::Error::other(detail))
+                }
+                result = state.recv_chunk() => {
+                    result.map_err(|error| std::io::Error::other(error.to_string()))
+                }
+            }
         })
     }
 }
@@ -1416,6 +1487,10 @@ impl<R: RpcRecordReader> Drop for PullIncomingBodyReceiver<R> {
             return;
         };
         if state.terminal_published {
+            return;
+        }
+        if *self.cancellation.borrow() {
+            state.abort();
             return;
         }
         match tokio::runtime::Handle::try_current() {
@@ -1445,6 +1520,7 @@ where
 {
     let total_bytes = descriptor_total_bytes(&spec.descriptor);
     let (terminal_sender, terminal_receiver) = watch::channel(None);
+    let (control, cancellation) = PullIncomingBodyControl::new();
     let body_completion = ObjectRpcStreamBodyCompletion {
         receiver: terminal_receiver.clone(),
     };
@@ -1465,7 +1541,7 @@ where
             let observed_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
             let pending_chunk =
                 (!bytes.is_empty()).then(|| ObjectRpcBodyChunk::bytes(Bytes::from(bytes)));
-            ObjectRpcIncomingBody::receiver(
+            ObjectRpcIncomingBody::receiver_with_drop_guard(
                 total_bytes,
                 Box::new(PullIncomingBodyReceiver {
                     state: Some(PullIncomingBodyState {
@@ -1479,8 +1555,11 @@ where
                         pending_chunk,
                         terminal_sender,
                         terminal_published: false,
+                        control: Arc::clone(&control),
                     }),
+                    cancellation: cancellation.clone(),
                 }),
+                Some(incoming_body_drop_guard(&control)),
             )
         }
         (Ok(()), BodyDescriptor::KnownLength { length: 0 }, None) => {
@@ -1489,7 +1568,7 @@ where
             ))));
             ObjectRpcIncomingBody::empty()
         }
-        (Ok(()), descriptor, None) => ObjectRpcIncomingBody::receiver(
+        (Ok(()), descriptor, None) => ObjectRpcIncomingBody::receiver_with_drop_guard(
             total_bytes,
             Box::new(PullIncomingBodyReceiver {
                 state: Some(PullIncomingBodyState {
@@ -1503,8 +1582,11 @@ where
                     pending_chunk: None,
                     terminal_sender,
                     terminal_published: false,
+                    control: Arc::clone(&control),
                 }),
+                cancellation,
             }),
+            Some(incoming_body_drop_guard(&control)),
         ),
         (Ok(()), _, Some(_)) => unreachable!("inline descriptor validation matched the body"),
         (Err(error), _, _) => {
@@ -2710,6 +2792,23 @@ mod tests {
         }
     }
 
+    struct PendingAbortRecordReader {
+        aborts: Arc<AtomicUsize>,
+    }
+
+    impl RpcRecordReader for PendingAbortRecordReader {
+        fn read_record(
+            &mut self,
+            _options: ObjectFrameIoOptions,
+        ) -> RpcRecordFuture<'_, RpcRecord> {
+            Box::pin(std::future::pending())
+        }
+
+        fn abort(&mut self, _detail: &str) {
+            self.aborts.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     fn test_owned_chunk_pair() -> (
         AuthenticatedChunkStream,
         AuthenticatedChunkStream,
@@ -2937,6 +3036,77 @@ mod tests {
                 .expect("complete pulled body"),
             IncomingTerminal::Completed(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_on_drop_aborts_indefinite_body_after_async_read_bridge() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let request_id =
+            Id::from_legacy_named("request_cancel_indefinite_body").expect("request id");
+        let (body, _body_completion, receive_completion) = make_incoming_body(
+            PendingAbortRecordReader {
+                aborts: Arc::clone(&aborts),
+            },
+            ObjectFrameIoOptions::default(),
+            IncomingBodySpec {
+                direction: IncomingDirection::Response,
+                request_id,
+                last_progress_nonce: 0,
+                descriptor: BodyDescriptor::Deferred,
+                inline_body: None,
+            },
+            false,
+        );
+        let mut body = body.into_application_body().cancel_on_drop();
+
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), body.read(&mut byte))
+                .await
+                .is_err(),
+            "indefinite body unexpectedly completed before cancellation"
+        );
+        drop(body);
+
+        let error = tokio::time::timeout(Duration::from_secs(1), receive_completion.join())
+            .await
+            .expect("cancelled body did not wake its bridged receiver")
+            .expect_err("cancelled body reported successful completion");
+        assert!(
+            error.to_string().contains("application cancelled"),
+            "unexpected cancellation error: {error}"
+        );
+        assert_eq!(aborts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_on_drop_aborts_indefinite_body_before_first_read() {
+        let aborts = Arc::new(AtomicUsize::new(0));
+        let request_id =
+            Id::from_legacy_named("request_cancel_unread_indefinite_body").expect("request id");
+        let (body, _body_completion, receive_completion) = make_incoming_body(
+            PendingAbortRecordReader {
+                aborts: Arc::clone(&aborts),
+            },
+            ObjectFrameIoOptions::default(),
+            IncomingBodySpec {
+                direction: IncomingDirection::Response,
+                request_id,
+                last_progress_nonce: 0,
+                descriptor: BodyDescriptor::Deferred,
+                inline_body: None,
+            },
+            false,
+        );
+
+        drop(body.into_application_body().cancel_on_drop());
+
+        assert_eq!(aborts.load(Ordering::Relaxed), 1);
+        let error = receive_completion
+            .join()
+            .await
+            .expect_err("cancelled unread body reported successful completion");
+        assert!(error.to_string().contains("application cancelled"));
     }
 
     #[tokio::test]

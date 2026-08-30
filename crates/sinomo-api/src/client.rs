@@ -2137,7 +2137,10 @@ pub async fn send_daemon_rpc_stream_from_data_dir_async(
     let options = sinomo_core::network::ClusterObjectRpcOptions::new(timeouts);
     let result = call_daemon_address_rpc_async(data_dir, address, call, options, &runtime).await?;
     result.response.error_detail()?;
-    let mut body = result.body;
+    // Event streams are deliberately unbounded. If their owner is cancelled
+    // (for example when a mobile Activity enters the background), reset the
+    // logical mux stream instead of spawning the finite-body drain path.
+    let mut body = result.body.cancel_on_drop();
     loop {
         let rpc = sinomo_core::network::read_object_frame_async(
             &mut body,
