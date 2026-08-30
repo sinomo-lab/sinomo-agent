@@ -12053,13 +12053,15 @@ fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
         "node_raft_stale_remote_leader_peer",
     );
     let peer_endpoint = daemon_lan_endpoint(&peer_node_id, "10.0.0.84:21353".to_string(), 10);
+    let unobserved_peer_endpoint =
+        daemon_lan_endpoint(&peer_node_id, "10.0.0.84:22353".to_string(), 20);
     state
         .members
         .iter_mut()
         .find(|member| member.node_id == peer_node_id)
         .expect("peer member")
         .endpoints
-        .push(peer_endpoint.clone());
+        .extend([peer_endpoint.clone(), unobserved_peer_endpoint]);
     write_cluster_state(&paths, &state).expect("write state");
     let heartbeat = RaftAppendEntriesRequest {
         term: 1,
@@ -12104,6 +12106,19 @@ fn cluster_raft_leader_election_replaces_unchanged_remote_leader() {
         &state,
         &peer_node_id
     ));
+    assert_eq!(
+        sinomo_network::cluster_member_main_daemon_connectivity(
+            &paths,
+            &state,
+            state
+                .members
+                .iter()
+                .find(|member| member.node_id == peer_node_id)
+                .expect("peer member"),
+        ),
+        sinomo_network::ClusterMemberMainDaemonConnectivity::Unknown,
+        "the unobserved alternate keeps diagnostics unknown without preserving stale leadership"
+    );
     let mut host = RecordingLeaderElectionHost::default();
 
     let elected = elect_cluster_raft_leader_with_host(

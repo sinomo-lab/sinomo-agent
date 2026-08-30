@@ -885,7 +885,43 @@ pub fn cluster_node_blocks_leader_preference(
         .members
         .iter()
         .find(|member| member.node_id == *node_id)
-        .is_some_and(|member| cluster_member_unreachable_via_connectivity(paths, state, member))
+        .is_some_and(|member| {
+            cluster_member_has_active_unreachable_leader_evidence(paths, state, member)
+        })
+}
+
+/// True when no observed main-daemon route remains usable and at least one
+/// main endpoint has active unreachable evidence.
+///
+/// Unobserved alternate endpoints keep the member's general connectivity
+/// classification `Unknown`, but they must not preserve stale Raft leadership
+/// indefinitely after an active probe has established route failure. Starting
+/// a campaign remains safe: Raft still requires the committed voter quorum.
+fn cluster_member_has_active_unreachable_leader_evidence(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    member: &ClusterMemberRecord,
+) -> bool {
+    if cluster_member_is_local_process(state, member) {
+        return false;
+    }
+    let graph = ClusterConnectivityGraph::read_for_local(paths, state);
+    let mut has_unreachable_endpoint = false;
+    for endpoint in &member.endpoints {
+        if !cluster_endpoint_is_probeable(endpoint)
+            || !cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+        {
+            continue;
+        }
+        match graph.state_for_endpoint(endpoint) {
+            Some(ClusterConnectivityState::Healthy | ClusterConnectivityState::Degraded) => {
+                return false;
+            }
+            Some(ClusterConnectivityState::Unreachable) => has_unreachable_endpoint = true,
+            None => {}
+        }
+    }
+    has_unreachable_endpoint
 }
 
 /// True when `member` has probeable endpoints but the local node's active
@@ -2312,6 +2348,121 @@ mod tests {
             connectivity,
             ClusterMemberMainDaemonConnectivity::Unreachable,
             "a degraded shadow endpoint must not make the main daemon look reachable"
+        );
+    }
+
+    #[test]
+    fn stale_leader_is_depreferred_with_active_failure_and_unobserved_alternate() {
+        let root = sinomo_testdir::TestDir::new("sinomo-leader-partial-unreachable");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_leader_partial_unreachable").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_leader_partial_unreachable_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_leader_partial_unreachable_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "leader partial unreachable",
+            local.clone(),
+            "local",
+            "pk-local",
+            now,
+        );
+        let failed = selector_test_endpoint(
+            &remote,
+            "failed.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        );
+        let unobserved = selector_test_endpoint(
+            &remote,
+            "unobserved.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            1,
+        );
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![failed.clone(), unobserved];
+        state.members.push(member);
+        let failed_connectivity = crate::connectivity::cluster_connectivity_record(
+            &state,
+            &failed,
+            ClusterConnectivityState::Unreachable,
+            None,
+            3,
+            None,
+            Some(now.to_string()),
+            now,
+            60,
+        );
+        crate::connectivity_store::write_local_cluster_connectivity_records(
+            &paths,
+            &local,
+            &[failed_connectivity],
+        )
+        .expect("write partial connectivity");
+
+        assert_eq!(
+            cluster_member_main_daemon_connectivity(&paths, &state, &state.members[1]),
+            ClusterMemberMainDaemonConnectivity::Unknown,
+            "an unobserved alternate remains unknown for general routing diagnostics"
+        );
+        assert!(
+            cluster_node_blocks_leader_preference(&paths, &state, &remote),
+            "active main-route failure must permit the voter quorum to replace a stale leader"
+        );
+    }
+
+    #[test]
+    fn wholly_unobserved_leader_remains_preferred() {
+        let root = sinomo_testdir::TestDir::new("sinomo-leader-wholly-unobserved");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_leader_wholly_unobserved").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_leader_wholly_unobserved_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_leader_wholly_unobserved_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "leader wholly unobserved",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints = vec![selector_test_endpoint(
+            &remote,
+            "unknown.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        )];
+        state.members.push(member);
+
+        assert!(
+            !cluster_node_blocks_leader_preference(&paths, &state, &remote),
+            "absence of all probe evidence must not manufacture an offline leader"
         );
     }
 }
