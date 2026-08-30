@@ -94,8 +94,11 @@ pub fn component_factory_with_hosts(
     data_plane_host: Option<Arc<dyn DfsDataPlaneHost>>,
     browser_host: Option<Arc<dyn crate::DfsBrowserServiceHost>>,
 ) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
-    let descriptor =
+    let mut descriptor =
         sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?;
+    if browser_host.is_some() {
+        descriptor = descriptor.with_offer(sifs_path_access_service_offer());
+    }
     Ok(
         sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
             let mut builder = ServiceRegistryBuilder::default();
@@ -116,6 +119,28 @@ pub fn component_factory_with_hosts(
         .with_config_definitions(register_component_config_definitions)
         .with_storage_paths(crate::register_storage_paths),
     )
+}
+
+/// The hosted browser routes are supplied by the daemon rather than the
+/// host-agnostic DFS module surface. Declare their provider capability on the
+/// component that actually mounts them so service-catalog discovery can select
+/// only nodes with an active path-access provider.
+fn sifs_path_access_service_offer() -> sinomo_module::ServiceOffer {
+    let mut offer = sinomo_module::ServiceOffer::new(
+        crate::SIFS_PATH_ACCESS_CAPABILITY,
+        "sinomo.sifs.path-access",
+        crate::DFS_PROTOCOL,
+    )
+    .cluster_visible()
+    .with_provider_capability(crate::SIFS_PATH_ACCESS_CAPABILITY);
+    for route in crate::DAEMON_DFS_BROWSER_ROUTES
+        .iter()
+        .copied()
+        .filter(|route| crate::browser_service::daemon_dfs_browser_route_is_path_access(route))
+    {
+        offer = offer.with_route(route);
+    }
+    offer
 }
 
 fn register_component_config_definitions(
