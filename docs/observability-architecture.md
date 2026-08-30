@@ -27,6 +27,10 @@ An exact `sinomo.dfs.perf` directive already present in
 `SINOMO_OBSERVE_FILTER` wins, including an explicit lower level or `off`, so the
 convenience flag never overwrites operator intent. Runtime `/observe/control`
 updates remain authoritative after startup.
+`sinomo test run` initializes this explicit trace mode on stderr, preserving
+its machine-readable `--json` stdout while retaining the client-side
+`content_ms` and `send_ms` records. Long-lived daemons retain their supervised
+observe runtime and normal log sink.
 
 ## Cluster Interface
 

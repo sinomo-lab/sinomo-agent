@@ -98,6 +98,106 @@ use std::io::{Cursor, Read};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+struct RangedWriteOverlayReader<R> {
+    current: Vec<u8>,
+    patch: R,
+    write_offset: u64,
+    prefix_end: usize,
+    prefix_offset: usize,
+    gap_remaining: u64,
+    patch_size_bytes: u64,
+    patch_complete: bool,
+    suffix_offset: usize,
+}
+
+impl<R> RangedWriteOverlayReader<R> {
+    fn new(current: Vec<u8>, write_offset: u64, patch: R) -> Self {
+        let current_size = current.len() as u64;
+        let prefix_end = usize::try_from(write_offset.min(current_size))
+            .expect("bounded by the resident current buffer length");
+        Self {
+            current,
+            patch,
+            write_offset,
+            prefix_end,
+            prefix_offset: 0,
+            gap_remaining: write_offset.saturating_sub(current_size),
+            patch_size_bytes: 0,
+            patch_complete: false,
+            suffix_offset: prefix_end,
+        }
+    }
+
+    fn result_size_bytes(&self) -> Option<u64> {
+        self.patch_complete.then(|| {
+            (self.current.len() as u64).max(
+                self.write_offset
+                    .checked_add(self.patch_size_bytes)
+                    .expect("overflow is rejected while reading the patch"),
+            )
+        })
+    }
+}
+
+impl<R: Read> Read for RangedWriteOverlayReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.prefix_offset < self.prefix_end {
+            let len = buffer.len().min(self.prefix_end - self.prefix_offset);
+            buffer[..len].copy_from_slice(
+                &self.current[self.prefix_offset..self.prefix_offset.saturating_add(len)],
+            );
+            self.prefix_offset += len;
+            return Ok(len);
+        }
+        if self.gap_remaining > 0 {
+            let len = usize::try_from(self.gap_remaining.min(buffer.len() as u64))
+                .expect("bounded by the destination buffer length");
+            buffer[..len].fill(0);
+            self.gap_remaining -= len as u64;
+            return Ok(len);
+        }
+        if !self.patch_complete {
+            let len = self.patch.read(buffer)?;
+            if len > 0 {
+                self.patch_size_bytes =
+                    self.patch_size_bytes
+                        .checked_add(len as u64)
+                        .ok_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "ranged write patch length exceeds u64",
+                            )
+                        })?;
+                return Ok(len);
+            }
+            self.patch_complete = true;
+            let patch_end = self
+                .write_offset
+                .checked_add(self.patch_size_bytes)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "ranged write result length exceeds u64",
+                    )
+                })?;
+            self.suffix_offset = usize::try_from(patch_end.min(self.current.len() as u64))
+                .expect("bounded by the resident current buffer length");
+        }
+        if self.suffix_offset < self.current.len() {
+            let len = buffer.len().min(self.current.len() - self.suffix_offset);
+            buffer[..len].copy_from_slice(
+                &self.current[self.suffix_offset..self.suffix_offset.saturating_add(len)],
+            );
+            self.suffix_offset += len;
+            return Ok(len);
+        }
+        Ok(0)
+    }
+}
+
 fn touch_directory_for_batched_child(directory: &mut DfsObjectMetadata, advance_version: bool) {
     let touch_time = now_unix_nanos()
         .max(directory.modified_at_unix_nanos.saturating_add(1))
@@ -3812,19 +3912,39 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        if object
-            .content_size_bytes
-            .is_some_and(|current_size| offset <= current_size)
-            && let Some(outcome) = self.write_distributed_eventual_patch_from_reader_with_base(
-                request,
-                base_version,
-                offset,
-                &mut reader,
-                plan.desired_replica_nodes,
-                options.policy.clone(),
-                options.foreground_replica_repair,
-            )?
-        {
+        let patch_outcome = if let Some(current_size) = object.content_size_bytes {
+            if offset <= current_size {
+                self.write_distributed_eventual_patch_from_reader_with_base(
+                    request.clone(),
+                    base_version.clone(),
+                    offset,
+                    &mut reader,
+                    plan.desired_replica_nodes.clone(),
+                    options.policy.clone(),
+                    options.foreground_replica_repair,
+                )?
+            } else {
+                // Represent a sparse POSIX extension as one streamed patch from
+                // the old EOF. The zero-filled gap is generated in bounded
+                // chunks and becomes an extent beside the unchanged base,
+                // avoiding both a full-object read and an offset-sized Vec.
+                let mut sparse_patch = std::io::repeat(0)
+                    .take(offset - current_size)
+                    .chain(&mut reader);
+                self.write_distributed_eventual_patch_from_reader_with_base(
+                    request.clone(),
+                    base_version.clone(),
+                    current_size,
+                    &mut sparse_patch,
+                    plan.desired_replica_nodes.clone(),
+                    options.policy.clone(),
+                    options.foreground_replica_repair,
+                )?
+            }
+        } else {
+            None
+        };
+        if let Some(outcome) = patch_outcome {
             let outcome = if options.wait_for_commit {
                 self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
             } else {
@@ -3864,13 +3984,72 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
         }
 
-        let mut bytes = Vec::new();
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| DfsError::ContentStore {
-                message: format!("failed to buffer POSIX write_at fallback for {path}: {source}"),
+        let current = match self.read_current_object_or_fetch_remote(&object.object_id)? {
+            NetworkedDfsReadOutcome::Found {
+                data: DfsReadData { bytes, .. },
+                ..
+            } => bytes,
+            NetworkedDfsReadOutcome::PendingReplication { .. }
+            | NetworkedDfsReadOutcome::NotConfirmed { .. } => {
+                return Err(DfsError::Busy { path }.into());
+            }
+            NetworkedDfsReadOutcome::NotFound => return Err(DfsPosixError::NotFound { path }),
+            NetworkedDfsReadOutcome::Conflicted { conflicts, .. } => {
+                return Err(read_conflict_error(path, conflicts));
+            }
+        };
+        let mut overlay = RangedWriteOverlayReader::new(current, offset, reader);
+        let outcome = self.write_distributed_eventual_from_reader_with_base_and_parent_touch(
+            request,
+            Some(base_version),
+            &mut overlay,
+            plan.desired_replica_nodes,
+            options.policy,
+            false,
+            options.foreground_replica_repair,
+        )?;
+        let result_size = overlay
+            .result_size_bytes()
+            .ok_or_else(|| DfsError::ContentStore {
+                message: format!("POSIX write_at fallback did not consume its input for {path}"),
             })?;
-        self.posix_write_file_at(&path, offset, &bytes, options)
+        let outcome = if options.wait_for_commit {
+            self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
+        } else {
+            outcome
+        };
+        match outcome {
+            NetworkedDfsWriteOutcome::Committed { .. } => {
+                let object = self.stat_target_for_path(&path)?;
+                self.stat_object_for_path(&object, &path)
+            }
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            } if !options.wait_for_commit => {
+                let object = self.stat_target_for_path(&path)?;
+                let mut stat = self.stat_object_for_path(&object, &path)?;
+                stat.size_bytes = Some(result_size);
+                let _ = intent_id;
+                let _ = durable_receipts;
+                let _ = required_receipts;
+                Ok(stat)
+            }
+            NetworkedDfsWriteOutcome::Pending {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            } => Err(DfsPosixError::PendingWrite {
+                intent_id,
+                durable_receipts,
+                required_receipts,
+            }),
+            NetworkedDfsWriteOutcome::Conflict { conflict } => Err(DfsPosixError::Conflict {
+                path,
+                reason: conflict.reason,
+            }),
+        }
     }
 
     pub fn posix_write_file_at(

@@ -59,7 +59,7 @@ pub use runtime::{
     ObserveMetricExporterStatus, ObserveMetricKind, ObserveMetricRecord, ObserveMetricSemantics,
     ObserveMetricUnit, ObserveMetricsRequest, ObserveMetricsResponse, ObserveRuntimeConfig,
     ObserveTraceRecord, ObserveTracesRequest, ObserveTracesResponse, init_observe_runtime,
-    init_observe_runtime_with_log_file, observe_control_snapshot,
+    init_observe_runtime_with_log_file, init_observe_runtime_with_stderr, observe_control_snapshot,
     observe_filter_with_builtin_quiet_directives, observe_filter_with_quiet_directives,
     observe_metric_descriptors, observe_metric_records_interval_delta,
     observe_metrics_interval_delta, observe_process_started_at, read_observe_metrics,
