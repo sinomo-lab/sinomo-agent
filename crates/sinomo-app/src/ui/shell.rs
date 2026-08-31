@@ -516,7 +516,7 @@ fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
 
 /// Build the tab strip `TabBar`, bound to the active tab and writing the selection back to
 /// `shared.active_tab` on change. Threads the theme reader so it restyles on theme switch.
-fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
+fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
     let labels = Tab::ALL.iter().map(|tab| tab_label(*tab, compact));
     let on_change = {
         let s = shared.clone();
@@ -530,12 +530,19 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> TabBar {
         .signals()
         .active_tab
         .select_named("shell tab selection", |tab| Some(tab.index()));
-    TabBar::new("shell-tabs")
+    let tabs = TabBar::new("shell-tabs")
         .tabs(labels)
         .selected_from(selected)
         .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
         .theme_when(tab_bar_theme(shared, compact))
-        .on_change(on_change)
+        .on_change(on_change);
+    ScrollView::horizontal(tabs)
+        .name("Primary navigation tabs")
+        .theme_when({
+            let shared = shared.clone();
+            move || shared.theme()
+        })
+        .overlay_scroll_bars(false)
 }
 
 fn tab_bar_theme(shared: &Shared, compact: bool) -> impl Fn() -> sui::DefaultTheme + 'static {
@@ -727,11 +734,7 @@ impl Widget for Shell {
         let seg_y = bounds.y() + (TOPBAR_HEIGHT - TAB_SEG_HEIGHT) / 2.0;
         let status_rect = status_pill_arrange_rect(bounds, compact);
         let status_x = status_rect.x();
-        let tab_right = if compact {
-            bounds.x() + bounds.width()
-        } else {
-            status_x - STATUS_GAP
-        };
+        let tab_right = status_x - STATUS_GAP;
         let seg_w = self
             .tab_strip_rect
             .width()
@@ -2097,13 +2100,13 @@ fn tab_strip_x(bounds_x: f32, compact: bool) -> f32 {
     }
 }
 
-/// Position reserved for the status affordance during arrange. On compact title bars the full status
-/// text remains in semantics while the visual treatment becomes a small logo badge, keeping the tab
-/// strip free to use the remaining title-bar width.
+/// Position reserved for the status affordance during arrange. Compact title bars retain the full
+/// status in semantics while the visual treatment becomes a small trailing badge. The tab strip
+/// scrolls horizontally through the space before it.
 fn status_pill_arrange_rect(bounds: Rect, compact: bool) -> Rect {
     if compact {
         Rect::new(
-            bounds.x() + EDGE_PAD + LOGO_SIZE - COMPACT_STATUS_PILL_W + 15.0,
+            bounds.max_x() - EDGE_PAD - COMPACT_STATUS_PILL_W,
             bounds.y() + (TOPBAR_HEIGHT - COMPACT_STATUS_PILL_W) / 2.0,
             COMPACT_STATUS_PILL_W,
             COMPACT_STATUS_PILL_W,
@@ -2599,7 +2602,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_titlebar_keeps_attention_pill_out_of_tabs() -> sui::Result<()> {
+    fn compact_titlebar_keeps_attention_pill_trailing_and_tabs_scrollable() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let mut state = AppState::ready(backend);
         state.active_tab = Tab::Settings;
@@ -2646,6 +2649,15 @@ mod tests {
             }),
             "compact chrome should omit the hidden wordmark from semantics"
         );
+        let navigation = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("Primary navigation tabs")
+            })
+            .expect("shell navigation scroll semantics");
         let tab_bar = snapshot
             .accessibility
             .nodes
@@ -2660,29 +2672,76 @@ mod tests {
             .iter()
             .find(|node| {
                 node.role == SemanticsRole::Button
-                    && node.name.as_deref() == Some("Needs attention")
+                    && node.description.as_deref().is_some_and(|description| {
+                        description.starts_with("Open Health and recovery.")
+                    })
             })
-            .expect("attention status semantics");
+            .expect("health status control semantics");
 
         assert!(
-            status.bounds.max_x() <= tab_bar.bounds.x(),
-            "compact status badge {:?} should stay before tab bar {:?}",
+            navigation.bounds.max_x() <= status.bounds.x(),
+            "compact status badge {:?} should stay after navigation viewport {:?}",
             status.bounds,
-            tab_bar.bounds
+            navigation.bounds
         );
         assert!(
-            tab_bar.bounds.max_x() <= COMPACT_CHROME_WIDTH + 0.5,
-            "tab bar should use the remaining title-bar width without running under right chrome: {:?}",
-            tab_bar.bounds
+            status.bounds.max_x() <= COMPACT_CHROME_WIDTH - EDGE_PAD + 0.5,
+            "compact status badge should remain against the trailing inset: {:?}",
+            status.bounds
         );
         assert!(
-            tab_bar.bounds.width() <= 390.0,
-            "compact tab labels should fit at their natural width instead of being clipped to the viewport: {:?}",
-            tab_bar.bounds
+            tab_bar.bounds.width() <= navigation.bounds.width() + 0.5,
+            "tabs should fit without overflow at the compact breakpoint: tabs={:?}, viewport={:?}",
+            tab_bar.bounds,
+            navigation.bounds
         );
         assert!(
             status.bounds.width() <= COMPACT_STATUS_PILL_W + 0.5,
             "compact status should not reserve the full pill width: {:?}",
+            status.bounds
+        );
+
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(360.0, 720.0))))?;
+        app.run_until_idle()?;
+        let narrow = window.snapshot()?;
+        let navigation = narrow
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("Primary navigation tabs")
+            })
+            .expect("narrow shell navigation scroll semantics");
+        let tab_bar = narrow
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+            })
+            .expect("narrow shell tab bar semantics");
+        let status = narrow
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.description.as_deref().is_some_and(|description| {
+                        description.starts_with("Open Health and recovery.")
+                    })
+            })
+            .expect("narrow health status control semantics");
+        assert!(
+            tab_bar.bounds.width() > navigation.bounds.width(),
+            "narrow tabs should retain their natural width inside a scrollable viewport: tabs={:?}, viewport={:?}",
+            tab_bar.bounds,
+            navigation.bounds
+        );
+        assert!(
+            navigation.bounds.max_x() <= status.bounds.x(),
+            "narrow navigation must stop before the trailing health control: viewport={:?}, status={:?}",
+            navigation.bounds,
             status.bounds
         );
 

@@ -792,7 +792,10 @@ fn settings_narrow_click_navigates() {
 
 #[test]
 fn mobile_phone_layout_accepts_touch_navigation() {
-    use sui::{Event, SemanticsRole, Size, WindowEvent};
+    use sui::{
+        Event, Point, PointerEvent, PointerEventKind, ScrollDelta, SemanticsRole, Size, Vector,
+        WindowEvent,
+    };
 
     let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "mobile-phone");
     let runtime = build_runtime(shared.clone()).expect("build runtime");
@@ -805,6 +808,30 @@ fn mobile_phone_layout_accepts_touch_navigation() {
     app.pump_frames(8).expect("pump phone layout");
 
     let snapshot = window.snapshot_now().expect("snapshot phone shell");
+    let navigation = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::ScrollView
+                && node.name.as_deref() == Some("Primary navigation tabs")
+        })
+        .expect("shell navigation scroll semantics");
+    let mut scroll = PointerEvent::new(
+        PointerEventKind::Scroll,
+        Point::new(
+            navigation.bounds.x() + navigation.bounds.width() / 2.0,
+            navigation.bounds.y() + navigation.bounds.height() / 2.0,
+        ),
+    );
+    scroll.scroll_delta = Some(ScrollDelta::Pixels(Vector::new(-120.0, 0.0)));
+    root.dispatch_event_now(Event::Pointer(scroll))
+        .expect("scroll compact tabs toward Settings");
+    app.pump_frames(8).expect("pump horizontal tab scroll");
+
+    let snapshot = window
+        .snapshot_now()
+        .expect("snapshot scrolled phone shell");
     let tab_bar = snapshot
         .accessibility
         .nodes

@@ -38,20 +38,20 @@ use sui::{
     ContextMenu, ControlSize, DefaultTheme, DetailRow, Dock, EmptyState, Event, EventCtx,
     EventPhase, Flex, FlexItem, FlexWrap, FontWeight, IconButton, IconGlyph, ImageHandle,
     ImageSource, Insets, KeyState, Label, LeadingLabelCellPaint, ListItem, ListView, MeasureCtx,
-    MenuItem, NumberInput, Observable, PaintCtx, PanelSection, PlacementBadge, PlacementBadgePaint,
-    Point, PointerButton, PointerEventKind, Popover, PopoverAlignment, RadioButton,
-    RebuildOnChange, Rect, RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView,
-    SectionLabel, SegmentedControl, SegmentedControlItem, Select, SemanticRegion, SemanticTone,
-    SemanticsAction, SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole,
-    SemanticsValue, Separator, SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack,
-    StackHostOptions, StatusBadge, StatusBar, StatusBarSegment, Surface, SurfaceBorder,
-    SurfaceRole, SwitchView, TextAlign, TextBlockPaint, TextCellPaint, TextSurface, TextWrap,
-    ToggleState, Tooltip, TooltipPlacement, TrailingSlotRow, Vector, VirtualCollectionModel,
-    VirtualList, VirtualListChrome, VirtualListSelectionMode, VirtualTable, VirtualTableColumn,
-    VirtualTableRowActivationKind, VirtualTableRowContext, VirtualTableSortDirection,
-    VirtualTableState, Widget, WidgetId, WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor,
-    containers::Padding as WidgetPadding, draw_glyph, paint_checkbox_indicator,
-    paint_leading_label_cell, paint_placement_badge_with, paint_text_block, paint_text_cell,
+    MenuItem, NumberInput, Observable, PaintCtx, PanelSection, PlacementBadgePaint, Point,
+    PointerButton, PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect,
+    RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView, SectionLabel,
+    SegmentedControl, SegmentedControlItem, Select, SemanticRegion, SemanticTone, SemanticsAction,
+    SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
+    SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
+    StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextAlign,
+    TextBlockPaint, TextCellPaint, TextSurface, TextWrap, ToggleState, Tooltip, TooltipPlacement,
+    TrailingSlotRow, Vector, VirtualCollectionModel, VirtualList, VirtualListChrome,
+    VirtualListSelectionMode, VirtualTable, VirtualTableColumn, VirtualTableRowActivationKind,
+    VirtualTableRowContext, VirtualTableSortDirection, VirtualTableState, Widget, WidgetId,
+    WidgetPod, WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding,
+    draw_glyph, paint_checkbox_indicator, paint_leading_label_cell, paint_placement_badge_with,
+    paint_text_block, paint_text_cell,
 };
 
 #[cfg(test)]
@@ -16407,7 +16407,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             .alignment(Alignment::Stretch)
             .spacing(8.0)
             .with_child(
-                PlacementBadge::new(short_node_label(&files.node_id))
+                StatusBadge::new(short_node_label(&files.node_id))
                     .icon(IconGlyph::Storage)
                     .tone(SemanticTone::Accent)
                     .theme_when(clone_reader(reader)),
@@ -31113,6 +31113,59 @@ mod tests {
             .with_name("Hide advanced")
             .click()?;
         assert!(!shared.files().inspector_details_open);
+
+        Ok(())
+    }
+
+    #[test]
+    fn availability_node_badge_reserves_its_full_status_text() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        {
+            let mut files = shared.files_mut();
+            files.loaded = true;
+            files.loading = false;
+            files.path = "/".to_string();
+            files.node_id = "node-abcdefghijklmnop".to_string();
+            files.entries = vec![SifsEntry {
+                name: "artifact.txt".to_string(),
+                path: "/artifact.txt".to_string(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            }];
+            files.selected = Some(0);
+            files.details_error = Some("device authorization was denied".to_string());
+        }
+        let label = short_node_label(&shared.files().node_id);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Files availability badge")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(320.0, 640.0))
+                            .with_child(InspectorView::new(shared)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let badge = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some(label.as_str())
+            })
+            .expect("availability node badge semantics");
+        assert!(
+            badge.bounds.width() > 86.0,
+            "node status text should not use the placement-coverage badge cap: {:?}",
+            badge.bounds
+        );
 
         Ok(())
     }

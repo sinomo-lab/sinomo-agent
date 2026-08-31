@@ -5634,6 +5634,16 @@ fn skill_catalog_row(shared: &Shared, skill: &SkillSummary) -> TrailingSlotRow {
     TrailingSlotRow::new(body, SizedBox::new())
 }
 
+/// Keep custom virtual-list content clear of the leading selection indicator. Canonical SUI has
+/// this behavior in `3a37e31`; the public GitHub dependency can drop this wrapper once it contains
+/// that change.
+fn padded_virtual_list_row<W>(reader: &ThemeReader, child: W) -> WidgetPadding
+where
+    W: Widget + 'static,
+{
+    WidgetPadding::new(reader().metrics.data_row_padding, child).fill_child_width()
+}
+
 fn provider_model_label(form: &ProviderForm) -> String {
     let model = form.default_model.trim();
     if model.is_empty() {
@@ -10488,15 +10498,21 @@ fn agent_catalog_section(shared: &Shared, reader: &ThemeReader) -> FormSection {
         },
     );
     let row_shared = shared.clone();
+    let row_reader = Rc::clone(reader);
     let action_shared = shared.clone();
     let list = widgets::VirtualCollectionHost::new(
         "Settings agent collection",
         collection,
         move |model, state| {
+            let row_reader = Rc::clone(&row_reader);
             VirtualList::new("agent-config-list", model, move |_id, agent| {
                 let shared = row_shared.clone();
+                let reader = Rc::clone(&row_reader);
                 RebuildOnChange::new_observable(agent, move |row| {
-                    WidgetPod::new(agent_catalog_row(&shared, &row.agent))
+                    WidgetPod::new(padded_virtual_list_row(
+                        &reader,
+                        agent_catalog_row(&shared, &row.agent),
+                    ))
                 })
             })
             .state(state)
@@ -13072,15 +13088,21 @@ fn skill_virtual_catalog(shared: &Shared, reader: &ThemeReader) -> FormSection {
         },
     );
     let row_shared = shared.clone();
+    let row_reader = Rc::clone(reader);
     let action_shared = shared.clone();
     let list = widgets::VirtualCollectionHost::new(
         "Settings skill collection",
         collection,
         move |model, state| {
+            let row_reader = Rc::clone(&row_reader);
             VirtualList::new("skill-catalog", model, move |_key, skill| {
                 let shared = row_shared.clone();
+                let reader = Rc::clone(&row_reader);
                 RebuildOnChange::new_observable(skill, move |row| {
-                    WidgetPod::new(skill_catalog_row(&shared, &row.skill))
+                    WidgetPod::new(padded_virtual_list_row(
+                        &reader,
+                        skill_catalog_row(&shared, &row.skill),
+                    ))
                 })
             })
             .state(state)
@@ -14513,7 +14535,8 @@ fn config_schema_primitive_row(
                         s.settings_mut().field_errors.insert(key, error);
                     }
                 }
-            });
+            })
+            .stacked();
             let mut body = Stack::vertical()
                 .spacing(4.0)
                 .alignment(Alignment::Stretch)
@@ -18011,6 +18034,37 @@ mod tests {
             .to_have_value(
                 "---\nname: render-skill\ndescription: Skill for Settings tests.\n---\n\n# render-skill\n\nRendered skill detail.\n",
             )?;
+        let snapshot = window.snapshot()?;
+        let row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("render-skill @ 1.0.0")
+            })
+            .expect("render skill row semantics");
+        let title = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("render-skill @ 1.0.0")
+                    && node.bounds.y() >= row.bounds.y()
+                    && node.bounds.max_y() <= row.bounds.max_y()
+            })
+            .expect("render skill title semantics");
+        let expected_inset = settings_control_theme(&shared, ControlSize::Small)
+            .metrics
+            .data_row_padding
+            .left;
+        assert!(
+            title.bounds.x() >= row.bounds.x() + expected_inset - 0.5,
+            "skill title must clear the leading selection indicator: row={:?}, title={:?}",
+            row.bounds,
+            title.bounds
+        );
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
@@ -18465,6 +18519,36 @@ mod tests {
                     && node.name.as_deref() == Some("agent-id")
             })
             .expect("agent editor semantics");
+        let agent_row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::ListItem
+                    && node.name.as_deref() == Some("render-agent")
+            })
+            .expect("render agent row semantics");
+        let agent_title = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::Text
+                    && node.name.as_deref() == Some("render-agent")
+                    && node.bounds.y() >= agent_row.bounds.y()
+                    && node.bounds.max_y() <= agent_row.bounds.max_y()
+            })
+            .expect("render agent title semantics");
+        let expected_inset = settings_control_theme(&shared, ControlSize::Small)
+            .metrics
+            .data_row_padding
+            .left;
+        assert!(
+            agent_title.bounds.x() >= agent_row.bounds.x() + expected_inset - 0.5,
+            "agent title must clear the leading selection indicator: row={:?}, title={:?}",
+            agent_row.bounds,
+            agent_title.bounds
+        );
         assert!(
             agent_list.bounds.max_x() < agent_editor.bounds.x(),
             "wide agent settings should place the second-level agent menu left of the editor"
@@ -19166,6 +19250,83 @@ mod tests {
                 &ConfigSchemaValue::secret_string(),
             ),
             "unset"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn schema_boolean_labels_stack_clear_of_switches() -> sui::Result<()> {
+        let backend = Backend::local_fallback();
+        let shared = Shared::new(AppState::ready(backend));
+        let index = {
+            let mut settings = shared.settings_mut();
+            let index = settings.config_items.len();
+            settings.config_items.push(test_config_item(
+                "test.schema-toggle",
+                ConfigEditKind::Json,
+                r#"{"allow_remote_local_owned_mounts":false}"#,
+            ));
+            index
+        };
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let label = "Allow remote local-owned mounts";
+        let row = config_schema_primitive_row(
+            &shared,
+            &reader,
+            index,
+            &Value::Bool(false),
+            &ConfigSchemaValue::Bool,
+            vec![ConfigPathSegment::Field(
+                "allow_remote_local_owned_mounts".to_string(),
+            )],
+            label,
+            "Permit placement away from the owner of a local-owned mount.",
+            false,
+        );
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Schema boolean layout")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(320.0, 120.0))
+                            .with_child(PodHost::new(row)),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        let snapshot = window.snapshot()?;
+        let form_row = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == sui::SemanticsRole::GenericContainer
+                    && node.name.as_deref() == Some(label)
+            })
+            .expect("boolean form row semantics");
+        let toggle = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| node.role == sui::SemanticsRole::Switch)
+            .expect("boolean switch semantics");
+        assert!(
+            toggle.bounds.y() > form_row.bounds.y() + 1.0,
+            "switch must be arranged below the complete label: row={:?}, switch={:?}",
+            form_row.bounds,
+            toggle.bounds
+        );
+        assert!(
+            toggle.bounds.x() <= form_row.bounds.x() + 0.5,
+            "stacked switch should start at the row's leading edge: row={:?}, switch={:?}",
+            form_row.bounds,
+            toggle.bounds
         );
 
         Ok(())
