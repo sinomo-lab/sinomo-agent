@@ -709,6 +709,58 @@ impl CloudFilesLocalChangeQueue {
         })
     }
 
+    /// Retire a bounded set of already-terminal operations with one durable
+    /// journal replacement. This is used for historical cleanup where
+    /// appending and fsyncing one successor per old conflict would create an
+    /// avoidable startup write burst. Every requested ID is validated before
+    /// the compacted journal is installed, so a pending operation leaves the
+    /// queue unchanged.
+    pub fn retire_terminal_operations(
+        &mut self,
+        operation_ids: &[String],
+    ) -> Result<u64, CloudFilesLocalChangeQueueError> {
+        self.ensure_usable()?;
+        if operation_ids.is_empty() {
+            return Ok(0);
+        }
+        let unique = operation_ids.iter().collect::<BTreeSet<_>>();
+        for operation_id in &unique {
+            let operation = self.require_operation(operation_id)?;
+            if matches!(
+                operation.status,
+                CloudFilesLocalOperationStatus::Queued
+                    | CloudFilesLocalOperationStatus::InFlight
+                    | CloudFilesLocalOperationStatus::Retrying
+                    | CloudFilesLocalOperationStatus::RemoteApplied
+            ) {
+                return Err(queue_error(
+                    "operation-not-terminal",
+                    format!(
+                        "operation `{operation_id}` is {:?}; pending work cannot be retired",
+                        operation.status
+                    ),
+                ));
+            }
+        }
+
+        let mut compacted = self.operations.clone();
+        let mut retired = 0_u64;
+        for operation_id in unique {
+            let operation = compacted
+                .get_mut(operation_id)
+                .expect("validated operation remains in compacted queue");
+            if operation.status != CloudFilesLocalOperationStatus::Superseded {
+                operation.status = CloudFilesLocalOperationStatus::Superseded;
+                retired = retired.saturating_add(1);
+            }
+        }
+        if retired != 0 {
+            self.install_compacted_operations(compacted)?;
+            self.prune_released_blobs()?;
+        }
+        Ok(retired)
+    }
+
     /// Move feed-reconciled successful operations out of the active journal.
     ///
     /// The caller may acknowledge an ID only after the authoritative namespace
@@ -3266,6 +3318,71 @@ mod tests {
             retirement.operation.status,
             CloudFilesLocalOperationStatus::Superseded
         );
+    }
+
+    #[test]
+    fn batch_terminal_retirement_is_atomic_and_reopens_superseded() {
+        let root = TestRoot::new("batch-terminal-retirement");
+        let mut active = queue(&root);
+        for operation_id in ["op-batch-a", "op-batch-b", "op-batch-pending"] {
+            active
+                .enqueue(directory_request(
+                    operation_id,
+                    format!("/services/{operation_id}"),
+                ))
+                .expect("enqueue operation");
+        }
+        let evidence = CloudFilesConflictEvidence {
+            code: "historical-conflict".to_string(),
+            detail: "old terminal conflict".to_string(),
+            observed_object_id: None,
+            observed_version: None,
+            observed_content_hash: None,
+        };
+        for operation_id in ["op-batch-a", "op-batch-b"] {
+            active
+                .mark_conflict(operation_id, evidence.clone())
+                .expect("mark terminal conflict");
+        }
+
+        let error = active
+            .retire_terminal_operations(&["op-batch-a".to_string(), "op-batch-pending".to_string()])
+            .expect_err("one pending ID rejects the entire batch");
+        assert_eq!(error.code, "operation-not-terminal");
+        assert_eq!(
+            active
+                .operation("op-batch-a")
+                .expect("first operation")
+                .status,
+            CloudFilesLocalOperationStatus::Conflict
+        );
+
+        active
+            .mark_conflict("op-batch-pending", evidence)
+            .expect("settle final operation");
+        assert_eq!(
+            active
+                .retire_terminal_operations(&[
+                    "op-batch-a".to_string(),
+                    "op-batch-b".to_string(),
+                    "op-batch-a".to_string(),
+                    "op-batch-pending".to_string(),
+                ])
+                .expect("retire one compacted batch"),
+            3
+        );
+        drop(active);
+
+        let reopened = queue(&root);
+        for operation_id in ["op-batch-a", "op-batch-b", "op-batch-pending"] {
+            assert_eq!(
+                reopened
+                    .operation(operation_id)
+                    .expect("replayed retired operation")
+                    .status,
+                CloudFilesLocalOperationStatus::Superseded
+            );
+        }
     }
 
     #[test]

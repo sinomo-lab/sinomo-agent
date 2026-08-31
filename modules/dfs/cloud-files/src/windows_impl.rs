@@ -417,6 +417,7 @@ struct RegistrationActivation {
     data_dir: SinomoDataDir,
     journal: RegistrationJournal,
     state_owned: bool,
+    registration_preexisting: bool,
     armed: bool,
     terminal_completion_handoff: bool,
 }
@@ -795,6 +796,7 @@ impl RegistrationActivation {
             data_dir,
             journal,
             state_owned,
+            registration_preexisting: false,
             armed: true,
             terminal_completion_handoff: false,
         }
@@ -993,7 +995,12 @@ impl RegistrationActivation {
     }
 
     fn rollback(&mut self) -> Result<(), CloudFilesModuleError> {
-        rollback_activation_registration(&self.data_dir, &self.journal, self.state_owned)?;
+        rollback_activation_registration(
+            &self.data_dir,
+            &self.journal,
+            self.state_owned,
+            self.registration_preexisting,
+        )?;
         self.armed = false;
         Ok(())
     }
@@ -1011,12 +1018,18 @@ impl RegistrationActivation {
         }
         match self.rollback() {
             Ok(()) => {
-                lifecycle.registered = false;
-                if self.state_owned {
+                if self.registration_preexisting {
+                    lifecycle.registered = true;
+                    error.detail.push_str(
+                        "; pre-existing nonce-owned Cloud Files registration and durable state ownership were retained for retry",
+                    );
+                } else if self.state_owned {
+                    lifecycle.registered = false;
                     error.detail.push_str(
                         "; nonce-owned Cloud Files registration rolled back and verified absent while durable state ownership was retained",
                     );
                 } else {
+                    lifecycle.registered = false;
                     error.detail.push_str(
                         "; nonce-owned Cloud Files registration rolled back and verified absent",
                     );
@@ -3802,6 +3815,7 @@ fn mount_sifs_cloud_files_inner(
         terminal_ready_handoff,
     )?;
     let mut activation = RegistrationActivation::new(data_dir.clone(), journal, state_owned);
+    activation.registration_preexisting = existing_registration;
     if terminal_ready_handoff {
         activation.retain_terminal_completion_handoff()?;
     }
@@ -4271,27 +4285,24 @@ fn mount_sifs_cloud_files_inner(
         request.root_path
     ));
     let started = Instant::now();
-    loop {
-        let timeout = request.max_run_seconds.map(|max_run_seconds| {
-            Duration::from_secs(max_run_seconds).saturating_sub(started.elapsed())
-        });
-        match writable_worker.wait_for_stop_or_cancellation(cancellation_event_handle, timeout)? {
-            windows_adapter::WindowsWritableWorkerWait::Cancelled => break,
-            windows_adapter::WindowsWritableWorkerWait::TimedOut => break,
-            windows_adapter::WindowsWritableWorkerWait::Stopped => {
-                let failure =
-                    writable_worker
-                        .take_failure()
-                        .unwrap_or_else(|| CloudFilesModuleError {
-                            code: "writable-worker-stopped".to_string(),
-                            detail: "writable Cloud Files worker stopped without a terminal status"
-                                .to_string(),
-                        });
-                writable_worker.stop_and_join()?;
-                connection.disconnect()?;
-                lifecycle.connected = false;
-                return Err(failure);
-            }
+    let timeout = request.max_run_seconds.map(|max_run_seconds| {
+        Duration::from_secs(max_run_seconds).saturating_sub(started.elapsed())
+    });
+    match writable_worker.wait_for_stop_or_cancellation(cancellation_event_handle, timeout)? {
+        windows_adapter::WindowsWritableWorkerWait::Cancelled
+        | windows_adapter::WindowsWritableWorkerWait::TimedOut => {}
+        windows_adapter::WindowsWritableWorkerWait::Stopped => {
+            let failure = writable_worker
+                .take_failure()
+                .unwrap_or_else(|| CloudFilesModuleError {
+                    code: "writable-worker-stopped".to_string(),
+                    detail: "writable Cloud Files worker stopped without a terminal status"
+                        .to_string(),
+                });
+            writable_worker.stop_and_join()?;
+            connection.disconnect()?;
+            lifecycle.connected = false;
+            return Err(failure);
         }
     }
     writable_worker.stop_and_join()?;
@@ -6913,7 +6924,23 @@ fn rollback_activation_registration(
     data_dir: &SinomoDataDir,
     journal: &RegistrationJournal,
     state_owned: bool,
+    registration_preexisting: bool,
 ) -> Result<(), CloudFilesModuleError> {
+    if registration_preexisting {
+        let observed = query_registered_sync_root(&journal.sync_root)?.ok_or_else(|| {
+            CloudFilesModuleError {
+                code: "preexisting-registration-lost".to_string(),
+                detail: format!(
+                    "pre-existing Cloud Files registration for {} disappeared during failed activation",
+                    journal.sync_root.display()
+                ),
+            }
+        })?;
+        verify_journal_registration_ownership(journal, &observed)?;
+        let mut retained = journal.clone();
+        retained.phase = RegistrationPhase::StateOwned;
+        return persist_registration_journal(data_dir, &retained);
+    }
     if !state_owned {
         return rollback_owned_registration(data_dir, journal);
     }

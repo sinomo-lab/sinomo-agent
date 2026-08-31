@@ -16,6 +16,122 @@ use time::OffsetDateTime;
 
 const PREPARED_ROUTE_CACHE_TTL: Duration = Duration::from_secs(1);
 const MAX_STABLE_ROUTE_CAPTURE_ATTEMPTS: usize = 3;
+/// A target-bound RPC that exhausts its complete route/response budget is the
+/// reactive equivalent of a missed Raft leader heartbeat. Keep that evidence
+/// only in process memory: it must unblock the request-owned election that
+/// immediately follows, without creating idle connectivity-file writes or
+/// permanently poisoning a recovered target.
+const CLUSTER_TARGET_RPC_FAILURE_TTL: Duration = Duration::from_secs(60);
+const CLUSTER_TARGET_RPC_FAILURE_CAPACITY: usize = 256;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ClusterTargetRpcFailureKey {
+    cluster_root: PathBuf,
+    local_node_id: NodeId,
+    target_node_id: NodeId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ClusterTargetRpcFailure {
+    expires_at: Instant,
+}
+
+static CLUSTER_TARGET_RPC_FAILURES: LazyLock<
+    Mutex<BTreeMap<ClusterTargetRpcFailureKey, ClusterTargetRpcFailure>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn cluster_target_rpc_failure_key(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) -> ClusterTargetRpcFailureKey {
+    ClusterTargetRpcFailureKey {
+        cluster_root: paths.root.clone(),
+        local_node_id: state.local_node_id.clone(),
+        target_node_id: target_node_id.clone(),
+    }
+}
+
+fn cluster_target_rpc_failed_after_route_admission(error: &NetworkError) -> bool {
+    matches!(
+        error,
+        NetworkError::Timeout {
+            phase: NetworkTimeoutPhase::Overall,
+            ..
+        } | NetworkError::RetryExhausted { .. }
+            | NetworkError::DeliveryFailed { .. }
+    )
+}
+
+pub(crate) fn record_cluster_target_rpc_outcome(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+    result: &Result<ObjectRpcResult, NetworkError>,
+) {
+    let Ok(mut failures) = CLUSTER_TARGET_RPC_FAILURES.lock() else {
+        return;
+    };
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    let key = cluster_target_rpc_failure_key(paths, state, target_node_id);
+    match result {
+        Ok(_) => {
+            failures.remove(&key);
+        }
+        Err(error) if cluster_target_rpc_failed_after_route_admission(error) => {
+            failures.insert(
+                key,
+                ClusterTargetRpcFailure {
+                    expires_at: now + CLUSTER_TARGET_RPC_FAILURE_TTL,
+                },
+            );
+            while failures.len() > CLUSTER_TARGET_RPC_FAILURE_CAPACITY {
+                let Some(oldest) = failures
+                    .iter()
+                    .min_by_key(|(_, failure)| failure.expires_at)
+                    .map(|(key, _)| key.clone())
+                else {
+                    break;
+                };
+                failures.remove(&oldest);
+            }
+        }
+        Err(_) => {}
+    }
+}
+
+fn record_cluster_target_rpc_authenticated_response(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) {
+    let Ok(mut failures) = CLUSTER_TARGET_RPC_FAILURES.lock() else {
+        return;
+    };
+    failures.remove(&cluster_target_rpc_failure_key(
+        paths,
+        state,
+        target_node_id,
+    ));
+}
+
+pub(crate) fn cluster_target_rpc_failure_blocks_leader_preference(
+    paths: &ClusterPaths,
+    state: &ClusterBootstrapState,
+    target_node_id: &NodeId,
+) -> bool {
+    let Ok(mut failures) = CLUSTER_TARGET_RPC_FAILURES.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    failures.retain(|_, failure| failure.expires_at > now);
+    failures.contains_key(&cluster_target_rpc_failure_key(
+        paths,
+        state,
+        target_node_id,
+    ))
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PreparedRouteCacheKey {
@@ -1399,7 +1515,7 @@ where
             &[],
         );
         prepare_call_for_active_network_timeline(&mut call);
-        cluster_object_rpc_call_with_deadline(
+        let result = cluster_object_rpc_call_with_deadline(
             Box::pin(self.call_target_stream_native(
                 context.paths,
                 directory,
@@ -1413,7 +1529,9 @@ where
             deadline,
             timeout_error,
         )
-        .await
+        .await;
+        record_cluster_target_rpc_outcome(context.paths, state, target_node_id, &result);
+        result
     }
 
     async fn call_target_stream_native(
@@ -1622,6 +1740,10 @@ where
             result.is_ok(),
         );
         let result = result?;
+        // A remote service error is still an authenticated response from the
+        // exact target. Clear earlier liveness failure before translating that
+        // response into its application-level error below.
+        record_cluster_target_rpc_authenticated_response(paths, state, target_node_id);
         result.response.error_detail()?;
         Ok(result)
     }

@@ -233,7 +233,7 @@ fn run_supervisor(
             match store.get_typed::<SifsMountConfig>(&data_dir, None, SIFS_MOUNT_CONFIG_KEY) {
                 Ok(config) => desired_config = Some(config),
                 Err(error) => {
-                    stop_active(&mut active);
+                    stop_active(&mut active, ActiveMountStopDisposition::Disconnect);
                     active_config = None;
                     inner.config_dirty.store(true, Ordering::Release);
                     publish(
@@ -256,7 +256,10 @@ fn run_supervisor(
             .expect("mount config is loaded before reconciliation")
             .clone();
         if !config.enabled {
-            stop_active(&mut active);
+            stop_active(
+                &mut active,
+                ActiveMountStopDisposition::UnregisterPreservingState,
+            );
             active_config = None;
             publish(
                 &store,
@@ -270,7 +273,7 @@ fn run_supervisor(
         let mount_point = match resolve_mount_point(&data_dir, &config.mount_point) {
             Ok(path) => path,
             Err(error) => {
-                stop_active(&mut active);
+                stop_active(&mut active, ActiveMountStopDisposition::Disconnect);
                 publish(
                     &store,
                     &data_dir,
@@ -283,7 +286,8 @@ fn run_supervisor(
         };
         let needs_start = active.is_none() || active_config.as_ref() != Some(&config);
         if needs_start {
-            stop_active(&mut active);
+            let stop_disposition = replacement_stop_disposition(active_config.as_ref(), &config);
+            stop_active(&mut active, stop_disposition);
             restart_count = restart_count.saturating_add(1);
             publish(
                 &store,
@@ -327,7 +331,7 @@ fn run_supervisor(
                         &inner,
                         error_status(&config, Some(&mount_point), error),
                     );
-                    stop_active(&mut active);
+                    stop_active(&mut active, ActiveMountStopDisposition::Disconnect);
                     active_config = None;
                     inner.wake.wait(retry_delay);
                     continue;
@@ -339,7 +343,7 @@ fn run_supervisor(
             .map_or(Some(RETRY_DELAY), ActiveMount::health_poll_interval);
         inner.wake.wait(wait);
     }
-    stop_active(&mut active);
+    stop_active(&mut active, ActiveMountStopDisposition::Disconnect);
 }
 
 fn mount_error_retry_delay(error: &str) -> Option<Duration> {
@@ -470,6 +474,29 @@ enum ActiveMount {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveMountStopDisposition {
+    /// End the process-local projection worker while retaining Windows' durable
+    /// sync-root registration and every placeholder identity beneath it.
+    Disconnect,
+    /// Explicitly relinquish this configured mount identity while retaining
+    /// the provider's private queue/reconciliation state for a later re-enable.
+    UnregisterPreservingState,
+}
+
+fn replacement_stop_disposition(
+    active: Option<&SifsMountConfig>,
+    desired: &SifsMountConfig,
+) -> ActiveMountStopDisposition {
+    if active.is_some_and(|active| {
+        active.mount_point != desired.mount_point || active.root_path != desired.root_path
+    }) {
+        ActiveMountStopDisposition::UnregisterPreservingState
+    } else {
+        ActiveMountStopDisposition::Disconnect
+    }
+}
+
 impl ActiveMount {
     fn health_poll_interval(&self) -> Option<Duration> {
         match self {
@@ -550,7 +577,9 @@ impl ActiveMount {
         }
     }
 
-    fn stop(&mut self) -> Result<(), String> {
+    fn stop(&mut self, disposition: ActiveMountStopDisposition) -> Result<(), String> {
+        #[cfg(not(windows))]
+        let _ = disposition;
         match self {
             #[cfg(all(target_os = "linux", feature = "dfs-fuse"))]
             Self::Fuse { handle, .. } => match handle.take() {
@@ -558,7 +587,7 @@ impl ActiveMount {
                 None => Ok(()),
             },
             #[cfg(windows)]
-            Self::External(mount) => mount.stop(),
+            Self::External(mount) => mount.stop(disposition),
             #[cfg(not(any(all(target_os = "linux", feature = "dfs-fuse"), windows)))]
             Self::Unsupported => Ok(()),
         }
@@ -662,12 +691,20 @@ impl ExternalMount {
         Ok(status)
     }
 
-    fn stop(&mut self) -> Result<(), String> {
+    fn stop(&mut self, disposition: ActiveMountStopDisposition) -> Result<(), String> {
         self.cancellation.cancel();
         if let Some(thread) = self.thread.take() {
             thread
                 .join()
                 .map_err(|_| "filesystem provider thread panicked".to_string())?;
+        }
+        if disposition == ActiveMountStopDisposition::Disconnect {
+            // The long-running native invocation has already stopped its
+            // writable worker and called CfDisconnectSyncRoot. Registration is
+            // persistent Windows state and must survive daemon restarts and
+            // routine provider retries; CfUnregisterSyncRoot would rewrite
+            // fully hydrated placeholders into ordinary files.
+            return Ok(());
         }
         let provider = sinomo_runtime::dfs::HostFilesystemProviderClient::from_active_component(
             &self.data_dir_root,
@@ -703,9 +740,9 @@ impl sinomo_runtime::dfs::HostFilesystemStatusSink for ExternalStatusSink {
     }
 }
 
-fn stop_active(active: &mut Option<ActiveMount>) {
+fn stop_active(active: &mut Option<ActiveMount>, disposition: ActiveMountStopDisposition) {
     if let Some(mut mount) = active.take()
-        && let Err(error) = mount.stop()
+        && let Err(error) = mount.stop(disposition)
     {
         tracing::warn!("stop SIFS host mount: {error}");
     }
@@ -934,6 +971,41 @@ mod tests {
         let resolved = configure_managed_sifs_mount(&data_dir, &config).expect("configure");
         assert_eq!(resolved, root.join("mount"));
         assert_eq!(managed_sifs_mount_config(&data_dir).expect("read"), config);
+    }
+
+    #[test]
+    fn routine_restart_disconnects_but_mount_identity_change_unregisters() {
+        let active = SifsMountConfig {
+            enabled: true,
+            mount_point: r"D:\sinomo".to_string(),
+            root_path: "/".to_string(),
+            read_only: false,
+            sync_local_changes: true,
+            ..SifsMountConfig::default()
+        };
+        let mut same_identity = active.clone();
+        same_identity.allow_other = !same_identity.allow_other;
+        assert_eq!(
+            replacement_stop_disposition(Some(&active), &same_identity),
+            ActiveMountStopDisposition::Disconnect
+        );
+        assert_eq!(
+            replacement_stop_disposition(None, &same_identity),
+            ActiveMountStopDisposition::Disconnect
+        );
+
+        let mut moved = active.clone();
+        moved.mount_point = r"E:\sinomo".to_string();
+        assert_eq!(
+            replacement_stop_disposition(Some(&active), &moved),
+            ActiveMountStopDisposition::UnregisterPreservingState
+        );
+        let mut rerooted = active.clone();
+        rerooted.root_path = "/services".to_string();
+        assert_eq!(
+            replacement_stop_disposition(Some(&active), &rerooted),
+            ActiveMountStopDisposition::UnregisterPreservingState
+        );
     }
 
     #[test]
