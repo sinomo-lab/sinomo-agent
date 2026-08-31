@@ -74,7 +74,10 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
                     .controller(crate::ui::shell::BackgroundWorkController::new(
                         shared.clone(),
                     ))
-                    .root(Shell::new(shared)),
+                    // Shell is a custom composite with flattened title chrome and descendant
+                    // overlays. A zero-duration retained boundary keeps that normal chrome alive
+                    // while Select/ContextMenu overlays update in their independent stack layer.
+                    .root(sui::LayoutTransition::new(Shell::new(shared)).duration(0.0)),
             )
         })
 }

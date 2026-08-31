@@ -26,6 +26,7 @@ use sui::{
     SemanticsNode, SemanticsRole, SemanticsValue, SingleChild, Size, SizedBox, Spinner,
     StatusBadge, Surface, SurfaceAppearance, SwitchView, TabBar, TimerToken, Widget, WidgetPod,
     WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, WindowRenderOptions,
+    containers::Padding as WidgetPadding,
 };
 
 #[cfg(test)]
@@ -186,7 +187,10 @@ impl CommandController for BackgroundWorkController {
 }
 const LOGO_SIZE: f32 = 24.0;
 const EDGE_PAD: f32 = 18.0;
-const TAB_SEG_HEIGHT: f32 = 32.0;
+const TAB_HEIGHT: f32 = 32.0;
+/// Keep outward SUI focus chrome inside the horizontally clipped tab viewport.
+const TAB_VIEWPORT_PADDING: f32 = 4.0;
+const TAB_SEG_HEIGHT: f32 = TAB_HEIGHT + (TAB_VIEWPORT_PADDING * 2.0);
 const TAB_GAP: f32 = 6.0;
 const COMPACT_TAB_GAP: f32 = 2.0;
 const STATUS_GAP: f32 = 12.0;
@@ -536,7 +540,9 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
         .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
         .theme_when(tab_bar_theme(shared, compact))
         .on_change(on_change);
-    ScrollView::horizontal(tabs)
+    // Match the SUI demo shell: scroll clips remain strict, while an inner safe area owns the
+    // standard outward focus overlay on every side of the first, last, and selected tabs.
+    ScrollView::horizontal(WidgetPadding::all(TAB_VIEWPORT_PADDING, tabs))
         .name("Primary navigation tabs")
         .theme_when({
             let shared = shared.clone();

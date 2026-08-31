@@ -22960,6 +22960,7 @@ mod tests {
             let options = DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port,
+                port_fallback: false,
             };
             let paths = DaemonPaths::new(backend.data_dir.as_ref());
             backend.connection =

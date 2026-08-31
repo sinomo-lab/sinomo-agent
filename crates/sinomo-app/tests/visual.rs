@@ -859,6 +859,213 @@ fn mobile_phone_layout_accepts_touch_navigation() {
     assert_eq!((shot.width(), shot.height()), (390, 844));
 }
 
+#[test]
+fn shell_tab_focus_ring_is_not_clipped_by_horizontal_scrolling() {
+    use sui::{Rect, SemanticsRole};
+
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Cluster, "tab-focus-ring");
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle shell layout");
+
+    let before_snapshot = window.snapshot_now().expect("snapshot unfocused shell");
+    let tab_bar = before_snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    let tab_bounds = tab_bar.bounds;
+    let before = window
+        .capture_screenshot_now()
+        .expect("capture unfocused shell");
+
+    click_at(
+        &window.root(),
+        tab_bounds.x() + tab_bounds.width() / 2.0,
+        tab_bounds.y() + tab_bounds.height() / 2.0,
+    );
+    app.advance_time(0.5).expect("finish focus animation");
+    app.run_until_idle().expect("paint focused shell tabs");
+    let after = window
+        .capture_screenshot_now()
+        .expect("capture focused shell");
+
+    let focus_outset_band = Rect::new(
+        tab_bounds.x(),
+        (tab_bounds.y() - 4.0).max(0.0),
+        tab_bounds.width(),
+        4.0,
+    );
+    let changed_pixels = pixel_diff_in_rect(&before, &after, focus_outset_band);
+    assert!(
+        changed_pixels > 8,
+        "focused TabBar must paint above the horizontal ScrollView viewport; \
+         changed_pixels={changed_pixels}, tab_bounds={tab_bounds:?}"
+    );
+}
+
+#[test]
+fn shell_tabs_remain_painted_while_evolution_select_is_open() {
+    use sui::SemanticsRole;
+
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Evolution, "evolution-select-tabs");
+    let runtime = build_runtime(shared).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle evolution shell");
+
+    window
+        .get_by_role(SemanticsRole::Button)
+        .with_name("Options")
+        .click()
+        .expect("show advanced evolution options");
+    app.run_until_idle().expect("settle evolution options");
+
+    let snapshot = window.snapshot_now().expect("snapshot evolution options");
+    let tab_bar = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    let tab_region = tab_bar.bounds.inflate(4.0, 4.0);
+    let before = window
+        .capture_screenshot_now()
+        .expect("capture closed target-ring select");
+
+    window
+        .get_by_role(SemanticsRole::ComboBox)
+        .with_name("evolution-target-ring")
+        .click()
+        .expect("open target-ring select");
+    app.advance_time(0.5).expect("finish select animation");
+    app.run_until_idle().expect("paint target-ring select");
+    let expanded = window.snapshot_now().expect("snapshot target-ring select");
+    assert!(expanded.accessibility.nodes.iter().any(|node| {
+        node.role == SemanticsRole::ComboBox
+            && node.name.as_deref() == Some("evolution-target-ring")
+            && node.state.expanded == Some(true)
+    }));
+    let after = window
+        .capture_screenshot_now()
+        .expect("capture open target-ring select");
+    let changed_pixels = pixel_diff_in_rect(&before, &after, tab_region);
+
+    assert_eq!(
+        changed_pixels, 0,
+        "opening a Select must not clear or repaint the shell tab strip"
+    );
+}
+
+#[test]
+fn shell_tabs_remain_painted_while_files_context_menu_is_open() {
+    use sinomo_app::ui::files::FilesSourceKind;
+    use sinomo_client::SifsEntry;
+    use sui::SemanticsRole;
+
+    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Files, "files-menu-tabs");
+    let fixture_root = shared
+        .borrow()
+        .data_dir
+        .root()
+        .join("files-context-fixture");
+    std::fs::create_dir_all(&fixture_root).expect("create files context fixture");
+    let first_path = fixture_root.join("first.txt");
+    let second_path = fixture_root.join("second.txt");
+    std::fs::write(&first_path, b"first").expect("write first file");
+    std::fs::write(&second_path, b"second").expect("write second file");
+    {
+        let mut files = shared.files_mut();
+        files.source = FilesSourceKind::Local;
+        files.loaded = true;
+        files.loading = false;
+        files.error = None;
+        files.path = fixture_root.to_string_lossy().into_owned();
+        files.entries = vec![
+            SifsEntry {
+                name: "first.txt".to_string(),
+                path: first_path.to_string_lossy().into_owned(),
+                is_dir: false,
+                is_link: false,
+                size: Some(5),
+            },
+            SifsEntry {
+                name: "second.txt".to_string(),
+                path: second_path.to_string_lossy().into_owned(),
+                is_dir: false,
+                is_link: false,
+                size: Some(6),
+            },
+        ];
+        files.entries_total_count = 2;
+        files.selected = Some(0);
+    }
+    shared.publish_files_signals();
+    let runtime = build_runtime(shared.clone()).expect("build runtime");
+    let app = TestApp::from_runtime(runtime).expect("headless test app");
+    let window = app.main_window().expect("main window");
+    app.run_until_idle().expect("settle files shell");
+
+    let snapshot = window.snapshot_now().expect("snapshot files shell");
+    let tab_bar = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
+        })
+        .expect("shell tab bar semantics");
+    let file = snapshot
+        .accessibility
+        .nodes
+        .iter()
+        .find(|node| {
+            node.role == SemanticsRole::ListItem && node.name.as_deref() == Some("second.txt")
+        })
+        .expect("seeded file row semantics");
+    let tab_region = tab_bar.bounds.inflate(4.0, 4.0);
+    let before = window
+        .capture_screenshot_now()
+        .expect("capture closed files context menu");
+
+    right_click_at(
+        &window.root(),
+        file.bounds.x() + file.bounds.width() / 2.0,
+        file.bounds.y() + file.bounds.height() / 2.0,
+    );
+    app.advance_time(0.5)
+        .expect("finish context-menu animation");
+    app.run_until_idle().expect("paint files context menu");
+    assert_eq!(
+        shared.files().selected,
+        Some(1),
+        "right click must reach the second file row at {:?}",
+        file.bounds
+    );
+    let expanded = window.snapshot_now().expect("snapshot files context menu");
+    assert!(
+        expanded.accessibility.nodes.iter().any(|node| {
+            node.role == SemanticsRole::MenuItem && node.name.as_deref() == Some("Open")
+        }),
+        "right click should open the Files context menu"
+    );
+    let after = window
+        .capture_screenshot_now()
+        .expect("capture open files context menu");
+
+    assert_eq!(
+        pixel_diff_in_rect(&before, &after, tab_region),
+        0,
+        "opening a ContextMenu must not clear or repaint the shell tab strip"
+    );
+}
+
 fn click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
@@ -2658,11 +2865,18 @@ fn command_key(root: &sui_testing::Locator, key: &str) {
 fn right_click_at(root: &sui_testing::Locator, x: f32, y: f32) {
     use sui::{Event, Point, PointerButton, PointerButtons, PointerEvent, PointerEventKind};
     let pos = Point::new(x, y);
+    root.dispatch_event(Event::Pointer(PointerEvent::new(
+        PointerEventKind::Move,
+        pos,
+    )))
+    .expect("move");
     let mut down = PointerEvent::new(PointerEventKind::Down, pos);
+    down.pointer_id = 1;
     down.button = Some(PointerButton::Secondary);
     down.buttons = PointerButtons::new(2);
     root.dispatch_event(Event::Pointer(down)).expect("down");
     let mut up = PointerEvent::new(PointerEventKind::Up, pos);
+    up.pointer_id = 1;
     up.button = Some(PointerButton::Secondary);
     root.dispatch_event(Event::Pointer(up)).expect("up");
 }
