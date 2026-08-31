@@ -1531,6 +1531,7 @@ impl sinomo_rollout::RolloutServiceHost for DaemonRolloutServiceHost {
     ) -> sinomo_rollout::RolloutHostFuture<'a, Result<ClusterRolloutBinaryResponse, String>> {
         let paths = self.paths.clone();
         Box::pin(async move {
+            reject_persistent_rollout_from_app_owned_daemon()?;
             tokio::task::spawn_blocking(move || {
                 activate_daemon_rollout_binary_manifest(&paths, manifest)
             })
@@ -1552,10 +1553,12 @@ impl sinomo_rollout::RolloutServiceHost for DaemonRolloutServiceHost {
         &self,
         request: sinomo_rollout::ClusterRolloutBuildRequest,
     ) -> Result<ClusterRolloutBinaryResponse, String> {
+        reject_persistent_rollout_from_app_owned_daemon()?;
         handle_daemon_rollout_build_request(&self.paths, request).map_err(|error| error.to_string())
     }
 
     fn finalize_shadow(&self) -> Result<String, String> {
+        reject_persistent_rollout_from_app_owned_daemon()?;
         handle_daemon_finalize_shadow_rollout(&self.paths).map_err(|error| error.to_string())
     }
 
@@ -1564,8 +1567,19 @@ impl sinomo_rollout::RolloutServiceHost for DaemonRolloutServiceHost {
     }
 
     fn should_stop_after(&self, response: &ClusterRolloutBinaryResponse) -> bool {
-        accepted_rollout_should_stop_current_daemon(&self.paths, response)
+        std::env::var_os(sinomo_api::SINOMO_APP_DAEMON_LAUNCH_ID_ENV).is_none()
+            && accepted_rollout_should_stop_current_daemon(&self.paths, response)
     }
+}
+
+fn reject_persistent_rollout_from_app_owned_daemon() -> Result<(), String> {
+    if std::env::var_os(sinomo_api::SINOMO_APP_DAEMON_LAUNCH_ID_ENV).is_some() {
+        return Err(
+            "binary rollout is unavailable in an app-owned daemon because no detached shadow or recovery process may outlive the app"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Process transports and effects for the DFS-owned browser and placement

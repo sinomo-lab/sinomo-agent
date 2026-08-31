@@ -218,6 +218,8 @@ pub fn register_storage_paths(
             ObjectSchema::new("DaemonStatus", STORAGE_CONTRACT_OBJECT_VERSION)
                 .field("pid", "u32")
                 .field("address", "String")
+                .field("api_protocol_version", "u32")
+                .field("app_launch_id", "Option<String>")
                 .field("started_at", "String")
                 .field("cluster", "Option<DaemonClusterStatus>"),
         )?;

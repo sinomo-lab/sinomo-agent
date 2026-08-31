@@ -54,7 +54,18 @@ use sui::{
     paint_leading_label_cell, paint_placement_badge_with, paint_text_block, paint_text_cell,
 };
 
+#[cfg(test)]
 use sinomo_cli::app_api::{
+    DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
+    DfsOperatorRepairView, DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry,
+    SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
+    SifsListSortDirection, SifsListSortKey, SifsMetadataShardDetails, SifsObjectDetails,
+    SifsObjectHealth, SifsPlacementActivityRequest, SifsPlacementPolicy, SifsPlacementPreview,
+    SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
+    SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
+};
+#[cfg(not(test))]
+use sinomo_client::{
     DfsConflictRecord, DfsFileSystemId, DfsObjectId, DfsOperatorClient, DfsOperatorObjectView,
     DfsOperatorRepairView, DfsOperatorStatus, DfsVersion, SifsBrowser, SifsEntry,
     SifsEntryMetadata, SifsEntryPage, SifsFileRead, SifsHealthSummary, SifsListOptions,
@@ -7967,10 +7978,10 @@ fn save_local_text_document(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("document");
-    sinomo_runtime::storage::durable_file::write_file_atomic(
+    sinomo_runtime::core::storage::durable_file::write_file_atomic(
         &current.canonical_path,
         bytes,
-        sinomo_runtime::storage::durable_file::DurableAtomicFileOptions::new(
+        sinomo_runtime::core::storage::durable_file::DurableAtomicFileOptions::new(
             fallback_name,
             "sinomo-app-edit",
         )

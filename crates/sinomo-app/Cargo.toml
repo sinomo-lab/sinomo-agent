@@ -18,14 +18,10 @@ desktop = [
     "gui",
     "dep:rfd",
     "sui/desktop",
-    "sinomo-product-profile/native-workers",
-    "sinomo-cli/sandbox",
-    "sinomo-cli/dfs-fuse",
 ]
 mobile = ["gui", "sui/mobile"]
 native-devices = [
     "sinomo-audio/native-devices",
-    "sinomo-runtime/native-devices",
     "sinomo-video/native-devices",
 ]
 
@@ -51,24 +47,36 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", branch = "main", optional = true, default-features = false, features = ["wgpu"] }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
-sinomo-cli = { path = "../sinomo-cli", default-features = false }
-sinomo-agent = { path = "../sinomo-agent" }
+sinomo-client = { path = "../sinomo-client" }
 sinomo-audio = { path = "../sinomo-audio" }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-lm = { path = "../sinomo-lm" }
-sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
 sinomo-video = { path = "../sinomo-video" }
 
 # R0/R1 surface is reached only through the runtime facade (ring boundary).
-sinomo-runtime = { path = "../sinomo-runtime" }
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = [
+    "client",
+    "native-devices",
+    "module-client",
+    "observe-client",
+    "dfs-nfs-client",
+] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni.workspace = true
+sinomo-agent = { path = "../sinomo-agent" }
+sinomo-cli = { path = "../sinomo-cli", default-features = false }
+sinomo-evolution = { path = "../sinomo-evolution" }
+sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
+sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
 
 [build-dependencies]
 android-build = "0.1.4"
 
 [dev-dependencies]
+sinomo-agent = { path = "../sinomo-agent" }
+sinomo-cli = { path = "../sinomo-cli", default-features = false }
+sinomo-evolution = { path = "../sinomo-evolution" }
+sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 # Headless rendering harness for visual verification of the widget tree.
 sui-testing = { package = "sinomo-ui-testing", git = "https://github.com/sinomo-lab/sui.git", branch = "main" }

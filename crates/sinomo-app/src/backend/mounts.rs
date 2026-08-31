@@ -120,7 +120,7 @@ impl Backend {
         )
         .map_err(|error| error.to_string())?
         .with_trace_context_if_missing();
-        let response = sinomo_runtime::api::DaemonApiClient::at_address(address.to_string())
+        let response = sinomo_client::api::DaemonApiClient::at_address(address.to_string())
             .with_timeout(super::DAEMON_RPC_TIMEOUT)
             .call_request(&request)
             .map_err(|error| format!("live SIFS mount status unavailable: {error}"))?;

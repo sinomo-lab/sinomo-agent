@@ -8,8 +8,10 @@
 //! daemon and CLI. This module just builds the registry (for the embedded client) and adapts
 //! the client into flat, UI-friendly views.
 
+use std::time::{Duration, Instant};
+
 use serde_json::Value;
-use sinomo_cli::app_api::ProviderSummary;
+use sinomo_client::chat_contract::{ProviderCapabilities, ProviderSummary};
 use sinomo_lm::{
     CODEX_PROVIDER_ID, DEFAULT_PROVIDER_ACCOUNT, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KEY,
     LM_PROVIDER_HEALTH_CONFIG_KEY, LM_STUDIO_PROVIDER_ID, LanguageModelProviderHealthConfig,
@@ -93,6 +95,7 @@ impl ConfigItem {
 }
 
 /// Build the config registry/store the app knows about (mirrors the CLI wiring).
+#[cfg(any(test, target_os = "android"))]
 pub fn build_config_store() -> Result<ConfigStore, String> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
     let builder = sinomo_runtime::module::register_config_definitions(builder)
@@ -229,7 +232,7 @@ pub fn cluster_provider_summaries(client: &dyn ConfigClient) -> Vec<ProviderSumm
             models: vec![account.default_model.clone().unwrap_or_else(|| {
                 sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
             })],
-            capabilities: sinomo_lm::provider_capabilities(&provider),
+            capabilities: provider_capabilities(&provider),
         });
     }
     summaries
@@ -814,6 +817,32 @@ pub fn provider_display_name(id: &str) -> String {
     .to_string()
 }
 
+#[cfg(all(not(test), not(target_os = "android")))]
+pub fn build_config_store() -> Result<ConfigStore, String> {
+    // A disconnected desktop frontend has no authority-owning implementation
+    // catalog. Once a daemon is connected, RemoteConfigClient supplies the
+    // complete live schema.
+    Ok(ConfigStore::new(
+        sinomo_runtime::config::ConfigRegistry::builder().build(),
+    ))
+}
+
+pub fn provider_capabilities(provider: &str) -> ProviderCapabilities {
+    let capabilities = sinomo_lm::provider_capabilities(provider);
+    ProviderCapabilities {
+        responses_http: capabilities.responses_http,
+        responses_websocket: capabilities.responses_websocket,
+        realtime_websocket: capabilities.realtime_websocket,
+        realtime_webrtc: capabilities.realtime_webrtc,
+        web_search: capabilities.web_search,
+        image_generation: capabilities.image_generation,
+        image_editing: capabilities.image_editing,
+        transcription: capabilities.transcription,
+        local_model_management: capabilities.local_model_management,
+        mcp: capabilities.mcp,
+    }
+}
+
 pub fn provider_default_model(id: &str) -> String {
     normalize_model_provider(id)
         .map(|provider| {
@@ -851,7 +880,25 @@ pub fn provider_requires_api_key(provider: &str) -> bool {
     };
     provider != OLLAMA_PROVIDER_ID
         && provider != LM_STUDIO_PROVIDER_ID
-        && !sinomo_cli::provider_uses_device_login(&provider)
+        && !provider_uses_device_login(&provider)
+}
+
+pub fn provider_uses_device_login(provider: &str) -> bool {
+    matches!(provider, "codex" | "github-copilot")
+}
+
+fn provider_signed_in(provider: &str) -> bool {
+    match provider {
+        "codex" => sinomo_lm::codex_provider()
+            .ok()
+            .and_then(|(_, path)| std::fs::metadata(path).ok())
+            .is_some_and(|metadata| metadata.len() > 0),
+        "github-copilot" => sinomo_lm::github_copilot_provider()
+            .ok()
+            .and_then(|(_, path)| std::fs::metadata(path).ok())
+            .is_some_and(|metadata| metadata.len() > 0),
+        _ => false,
+    }
 }
 
 /// A provider's editable configuration, flattened for the Settings UI.
@@ -909,7 +956,7 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
         }
         let account_name = normalize_provider_account_name(Some(&account.account));
         let default_model = account.default_model.clone().unwrap_or_default();
-        let uses_device_login = sinomo_cli::provider_uses_device_login(&provider);
+        let uses_device_login = provider_uses_device_login(&provider);
         let requires_api_key = provider_requires_api_key(&provider);
         let has_inline_api_key = account
             .api_key
@@ -917,7 +964,7 @@ pub fn provider_forms(client: &dyn ConfigClient) -> Vec<ProviderForm> {
             .is_some_and(|key| !key.trim().is_empty());
         let has_api_key = has_inline_api_key;
         let signed_in = if uses_device_login {
-            sinomo_cli::provider_signed_in(&provider)
+            provider_signed_in(&provider)
         } else if requires_api_key {
             has_api_key
         } else {
@@ -1122,10 +1169,71 @@ pub fn run_provider_device_login(
     provider: &str,
     on_prompt: impl FnOnce(String, String),
 ) -> Result<(), String> {
-    sinomo_cli::run_device_login(provider, |prompt| {
-        on_prompt(prompt.verification_uri, prompt.user_code)
-    })
-    .map_err(|e| e.to_string())
+    match provider {
+        "codex" => {
+            let (provider, _) = sinomo_lm::codex_provider().map_err(|error| error.to_string())?;
+            let device = provider
+                .device_login_start()
+                .map_err(|error| error.to_string())?;
+            on_prompt(device.verification_uri.clone(), device.user_code.clone());
+            let started = Instant::now();
+            let expires = Duration::from_secs(device.expires_in);
+            let interval = Duration::from_secs(device.interval.max(5));
+            loop {
+                if started.elapsed() >= expires {
+                    return Err("device authorization expired".to_string());
+                }
+                std::thread::sleep(interval);
+                if provider
+                    .device_login_poll(&device)
+                    .map_err(|error| error.to_string())?
+                    .tokens
+                    .is_some()
+                {
+                    sinomo_lm::test_provider_credentials("codex")
+                        .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        "github-copilot" => {
+            let (provider, _) =
+                sinomo_lm::github_copilot_provider().map_err(|error| error.to_string())?;
+            let device = provider
+                .device_login_start()
+                .map_err(|error| error.to_string())?;
+            on_prompt(device.verification_uri.clone(), device.user_code.clone());
+            let started = Instant::now();
+            let expires = Duration::from_secs(device.expires_in.max(900));
+            let mut interval = Duration::from_secs(device.interval.max(5));
+            loop {
+                if started.elapsed() >= expires {
+                    return Err("device authorization expired".to_string());
+                }
+                std::thread::sleep(interval);
+                let poll = provider
+                    .device_login_poll(&device.device_code)
+                    .map_err(|error| error.to_string())?;
+                if poll.access_token.is_some() {
+                    sinomo_lm::test_provider_credentials("github-copilot")
+                        .map_err(|error| error.to_string())?;
+                    return Ok(());
+                }
+                match poll.error.as_deref() {
+                    Some("authorization_pending") | None => {}
+                    Some("slow_down") => {
+                        interval += Duration::from_secs(poll.interval.unwrap_or(5));
+                    }
+                    Some("expired_token") => return Err("device authorization expired".to_string()),
+                    Some("access_denied") => return Err("device authorization denied".to_string()),
+                    Some(error) => {
+                        return Err(poll.error_description.unwrap_or_else(|| error.to_string()));
+                    }
+                }
+            }
+        }
+        other => Err(format!("provider `{other}` does not use device login")),
+    }
 }
 
 /// Toggle a provider account enabled/disabled in `lm.providers`.

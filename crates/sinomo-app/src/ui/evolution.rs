@@ -227,6 +227,7 @@ struct EvolutionDashboardRefreshRequest {
     id: EvolutionDashboardRequestId,
     reason: EvolutionDashboardRefreshReason,
     prefer_newest: bool,
+    daemon_address: Option<String>,
     data_dir: Arc<SinomoDataDir>,
     waker: Option<sui::UiHandle>,
 }
@@ -239,6 +240,7 @@ struct EvolutionDashboardRefreshResult {
 }
 
 pub struct EvolutionState {
+    daemon_address: Option<String>,
     pub dashboard: EvolutionDashboard,
     pub selected: Option<usize>,
     pub objective_draft: String,
@@ -458,12 +460,16 @@ impl EvolutionState {
     }
 
     pub fn new(backend: &Backend) -> Self {
-        let dashboard = EvolutionDashboard::load(backend);
-        Self::from_dashboard(dashboard)
+        let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        let dashboard =
+            load_evolution_dashboard(daemon_address.as_deref(), backend.data_dir.as_ref());
+        let mut state = Self::from_dashboard(dashboard);
+        state.daemon_address = daemon_address;
+        state
     }
 
     pub fn new_lightweight(backend: &Backend) -> Self {
-        Self::from_dashboard(EvolutionDashboard {
+        let mut state = Self::from_dashboard(EvolutionDashboard {
             source: backend
                 .data_dir
                 .root()
@@ -472,12 +478,15 @@ impl EvolutionState {
                 .to_string(),
             jobs: Vec::new(),
             error: Some("Evolution data is loading.".to_string()),
-        })
+        });
+        state.daemon_address = backend.connection.daemon_address().map(str::to_string);
+        state
     }
 
     fn from_dashboard(dashboard: EvolutionDashboard) -> Self {
         let selected = (!dashboard.jobs.is_empty()).then_some(0);
         Self {
+            daemon_address: None,
             dashboard,
             selected,
             objective_draft: String::new(),
@@ -584,6 +593,7 @@ impl EvolutionState {
             id,
             reason,
             prefer_newest,
+            daemon_address: self.daemon_address.clone(),
             data_dir,
             waker,
         };
@@ -608,13 +618,15 @@ impl EvolutionState {
             id,
             reason,
             prefer_newest,
+            daemon_address,
             data_dir,
             waker,
         } = request;
         match thread::Builder::new()
             .name(format!("sinomo-app-evolution-refresh-{}", id.0))
             .spawn(move || {
-                let dashboard = load_evolution_dashboard(data_dir.as_ref());
+                let dashboard =
+                    load_evolution_dashboard(daemon_address.as_deref(), data_dir.as_ref());
                 let _ = tx.send(EvolutionDashboardRefreshResult {
                     id,
                     reason,
@@ -758,7 +770,7 @@ impl EvolutionState {
         };
         self.start_status = Some("starting evolution agent".to_string());
         self.start_error = None;
-        self.start_rx = Some(spawn_evolution_job(request));
+        self.start_rx = Some(spawn_evolution_job(self.daemon_address.clone(), request));
     }
 
     pub fn pump_start_events(&mut self, backend: &Backend, waker: Option<sui::UiHandle>) -> bool {
@@ -826,7 +838,10 @@ impl EvolutionState {
         self.decision_status = Some(format!("{} {}", action.running_label(), short_id));
         self.decision_error = None;
         self.decision_action = Some(action);
-        self.decision_rx = Some(spawn_evolution_decision(request));
+        self.decision_rx = Some(spawn_evolution_decision(
+            self.daemon_address.clone(),
+            request,
+        ));
     }
 
     pub fn pump_decision_events(

@@ -3,8 +3,8 @@
 //! Five tabs sit under a brand title bar: **Chat** (agent chat), **Evolution**
 //! (self-evolution jobs and evidence), **Cluster** (network topology graph), **Files**
 //! (the SIFS distributed file browser) and **Settings** (app + cluster config).
-//! The app probes for a local daemon and, if none is found, runs as an embedded
-//! desktop app surface so it stays daemon-backed during bootstrap.
+//! The app probes for a local daemon and, if none is found, starts an app-owned sibling daemon
+//! process on desktop so the UI stays daemon-backed without linking the daemon host into the GUI.
 
 pub mod backend;
 pub mod metrics;
@@ -102,8 +102,8 @@ pub fn build_runtime(shared: Shared) -> sui::Result<sui::Runtime> {
 /// Build and run the desktop application. Blocks until the window closes.
 ///
 /// The window opens immediately in a *connecting* state; the backend (daemon probe / starting an
-/// in-process daemon) resolves on a background thread, which wakes the UI as it progresses and
-/// once it's ready. This keeps launch responsive even when the in-process daemon takes a moment.
+/// app-owned daemon process) resolves on a background thread, which wakes the UI as it progresses
+/// and once it's ready. This keeps launch responsive while the daemon becomes ready.
 #[cfg(feature = "desktop")]
 pub fn run() -> sui::Result<()> {
     install_app_observability();
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_impl_imports_stay_in_embedded_backend_wrapper() {
+    fn daemon_impl_imports_stay_in_android_embedded_backend_wrapper() {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let src_dir = manifest_dir.join("src");
         let mut violations = Vec::new();
@@ -429,9 +429,119 @@ mod tests {
 
         assert!(
             violations.is_empty(),
-            "app code should use sinomo_runtime::api; daemon implementation imports are allowed only in backend/mod.rs: {}",
+            "desktop app code should use sinomo_client::api; the Android implementation exception is isolated in backend/mod.rs: {}",
             violations.join(", ")
         );
+    }
+
+    #[test]
+    fn desktop_binary_does_not_enable_daemon_host_features_or_cli_mode() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let manifest =
+            std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read app manifest");
+        let desktop_feature = manifest
+            .split("desktop = [")
+            .nth(1)
+            .and_then(|tail| tail.split(']').next())
+            .expect("desktop feature");
+        assert!(!desktop_feature.contains("sinomo-cli/sandbox"));
+        assert!(!desktop_feature.contains("sinomo-cli/dfs-fuse"));
+        assert!(!desktop_feature.contains("sinomo-product-profile"));
+
+        let main =
+            std::fs::read_to_string(manifest_dir.join("src/main.rs")).expect("read app entrypoint");
+        assert!(
+            !main.contains("sinomo_cli::run"),
+            "the graphical binary must not double as the full CLI host"
+        );
+
+        let client_dir = manifest_dir
+            .parent()
+            .expect("app crate parent")
+            .join("sinomo-client");
+        let supervisor = std::fs::read_to_string(client_dir.join("src/daemon_process.rs"))
+            .expect("read desktop daemon supervisor");
+        assert!(!supervisor.contains("run_daemon_control_loop"));
+        assert!(!supervisor.contains("sinomo_product_profile"));
+    }
+
+    #[test]
+    fn desktop_chat_engine_is_a_contract_client_not_an_agent_host() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let engine = std::fs::read_to_string(manifest_dir.join("src/backend/chat_engine.rs"))
+            .expect("read desktop chat client actor");
+
+        for forbidden in ["sinomo_agent", "sinomo_cli::app_api", "AgentChat"] {
+            assert!(
+                !engine.contains(forbidden),
+                "desktop chat engine must not compile daemon-owned `{forbidden}` execution"
+            );
+        }
+        assert!(engine.contains("sinomo_client::ChatDaemonClient"));
+        assert!(engine.contains("sinomo_client::chat_contract"));
+    }
+
+    #[test]
+    fn desktop_normal_graph_excludes_authority_owning_implementations() {
+        use std::collections::BTreeSet;
+        use std::process::Command;
+
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let output = Command::new(env!("CARGO"))
+            .args([
+                "tree",
+                "-p",
+                "sinomo-app",
+                "--edges",
+                "normal",
+                "--prefix",
+                "none",
+            ])
+            .current_dir(workspace)
+            .output()
+            .expect("inspect desktop app dependency graph");
+        assert!(
+            output.status.success(),
+            "cargo tree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tree = String::from_utf8_lossy(&output.stdout);
+        let packages = tree
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|name| !name.starts_with('('))
+            .collect::<BTreeSet<_>>();
+        for forbidden in [
+            "sinomo-agent",
+            "sinomo-cli",
+            "sinomo-evolution",
+            "sinomo-daemon",
+            "sinomo-build",
+            "sinomo-rollout",
+            "sinomo-sandbox",
+            "sinomo-sandbox-simple",
+            "sinomo-product-profile",
+            "sinomo-pytorch",
+            "sinomo-memory",
+            "sinomo-eval",
+            "sinomo-installer",
+            "sinomo-policy",
+            "sinomo-registry",
+            "sinomo-remote-management",
+            "sinomo-supervision",
+            "sinomo-test",
+            "sinomo-vfs",
+            "sinomo-vfs-sifs",
+        ] {
+            assert!(
+                !packages.contains(forbidden),
+                "desktop sinomo-app normal graph must not contain {forbidden}"
+            );
+        }
     }
 
     fn collect_daemon_impl_import_violations(

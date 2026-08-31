@@ -453,7 +453,7 @@ fn drain_files_chat_attachment(shared: &Shared) -> bool {
                 canonical_path,
                 modified_at_unix_nanos,
             } => {
-                let provenance = sinomo_cli::app_api::ChatLocalAttachmentProvenance {
+                let provenance = sinomo_client::chat_contract::ChatLocalAttachmentProvenance {
                     original_path: path,
                     canonical_path: (!canonical_path.trim().is_empty()).then_some(canonical_path),
                     modified_at_unix_nanos,
@@ -468,7 +468,7 @@ fn drain_files_chat_attachment(shared: &Shared) -> bool {
                 content_hash,
                 policy,
             } => {
-                let provenance = sinomo_cli::app_api::ChatSifsAttachmentProvenance {
+                let provenance = sinomo_client::chat_contract::ChatSifsAttachmentProvenance {
                     path,
                     object_id: (!object_id.trim().is_empty()).then_some(object_id),
                     version: (!version.trim().is_empty()).then_some(version),

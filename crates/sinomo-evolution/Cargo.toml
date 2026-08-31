@@ -18,6 +18,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
+sinomo-app-contract = { path = "../sinomo-app-contract" }
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 

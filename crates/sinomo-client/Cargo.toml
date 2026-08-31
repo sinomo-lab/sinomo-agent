@@ -1,0 +1,24 @@
+[package]
+name = "sinomo-client"
+version.workspace = true
+description = "Thin typed client facade for Sinomo frontends"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r2"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sinomo-app-contract = { path = "../sinomo-app-contract" }
+tokio.workspace = true
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["client"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

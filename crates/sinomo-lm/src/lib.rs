@@ -15,6 +15,7 @@ mod openai;
 mod realtime_audio;
 #[cfg(feature = "webrtc-media")]
 pub mod realtime_webrtc;
+#[cfg(feature = "test-cases")]
 mod test_cases;
 
 pub use anthropic::{AnthropicConfig, AnthropicProvider};
@@ -80,6 +81,7 @@ pub use realtime_audio::{
     openai_session_update_payload, openai_tool_result_payload, parse_realtime_audio_event,
     realtime_audio_event_from_value, realtime_call_session_payload, realtime_sideband_ws_url,
 };
+#[cfg(feature = "test-cases")]
 pub use test_cases::register_lm_test_cases;
 
 use serde::{Deserialize, Serialize};

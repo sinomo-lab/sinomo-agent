@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use sui::{DefaultTheme, Signal, WindowRenderOptions};
 
-use sinomo_runtime::{api::DaemonStatus, local::SinomoDataDir};
+use sinomo_client::api::DaemonStatus;
+use sinomo_runtime::local::SinomoDataDir;
 
 use crate::backend::{Backend, Connection, app_config, probe_runtime_connection};
 use crate::rendering::{AppRenderMode, resolve_render_options};
@@ -139,7 +140,7 @@ impl ConnectionHealth {
 
     fn from_backend(backend: &Backend) -> Self {
         let (phase, last_error) = match &backend.connection {
-            Connection::Daemon(_) | Connection::InProcessDaemon(_) => {
+            Connection::Daemon(_) | Connection::AppOwnedDaemon(_) => {
                 (ConnectionPhase::Online, None)
             }
             Connection::LocalFallback {
@@ -1523,9 +1524,9 @@ mod tests {
         let status = {
             let state = shared.borrow();
             let ready = state.ready.as_ref().expect("ready");
-            let paths = sinomo_runtime::api::DaemonPaths::new(ready.backend.data_dir.as_ref());
-            sinomo_runtime::api::DaemonStatus::new(
-                &sinomo_runtime::api::DaemonRunOptions::default(),
+            let paths = sinomo_client::api::DaemonPaths::new(ready.backend.data_dir.as_ref());
+            sinomo_client::api::DaemonStatus::new(
+                &sinomo_client::api::DaemonRunOptions::default(),
                 &paths,
                 None,
             )

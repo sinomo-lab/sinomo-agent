@@ -9555,6 +9555,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-audio",
  "sinomo-cli",
+ "sinomo-client",
  "sinomo-evolution",
  "sinomo-lm",
  "sinomo-product-profile",
@@ -9576,6 +9577,24 @@ dependencies = [
  "sinomo-app",
  "sinomo-ui",
  "tracing",
+]
+
+[[package]]
+name = "sinomo-app-contract"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "sinomo-app-daemon"
+version = "0.1.0"
+dependencies = [
+ "sinomo-cli",
+ "sinomo-client",
+ "sinomo-runtime",
+ "sinomo-testdir",
 ]
 
 [[package]]
@@ -9657,8 +9676,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
+ "sinomo-app-contract",
  "sinomo-audio",
  "sinomo-dfs-fuse",
+ "sinomo-evolution",
  "sinomo-lm",
  "sinomo-memory",
  "sinomo-models",
@@ -9677,6 +9698,18 @@ dependencies = [
 [[package]]
 name = "sinomo-cli-registry"
 version = "0.1.0"
+
+[[package]]
+name = "sinomo-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sinomo-app-contract",
+ "sinomo-runtime",
+ "tokio",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "sinomo-cluster"
@@ -9913,6 +9946,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
+ "sinomo-app-contract",
  "sinomo-lm",
  "sinomo-runtime",
  "sinomo-testdir",

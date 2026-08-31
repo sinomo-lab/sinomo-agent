@@ -1,7 +1,9 @@
 //! SIFS / DFS browsing: directory listings, per-object node placement and DFS
 //! replication policy. (Wired in a later phase.)
 
-use sinomo_cli::app_api::SifsBrowser;
+#[cfg(test)]
+use sinomo_cli::app_api::SifsAgentChannelStore;
+use sinomo_client::{ChatHistoryClient, SifsBrowser};
 
 #[derive(Clone)]
 pub struct SifsDaemonAccess {
@@ -19,5 +21,15 @@ impl SifsDaemonAccess {
 
     pub fn open_browser(&self) -> Result<SifsBrowser, String> {
         SifsBrowser::open_daemon_on_runtime(&self.address, &self.runtime)
+    }
+
+    #[cfg(test)]
+    pub fn open_agent_channel_store(&self) -> Result<SifsAgentChannelStore, String> {
+        sinomo_cli::app_api::SifsBrowser::open_daemon_on_runtime(&self.address, &self.runtime)
+            .map(SifsAgentChannelStore::from_browser)
+    }
+
+    pub fn history_client(&self) -> ChatHistoryClient {
+        ChatHistoryClient::at_address(self.address.clone())
     }
 }

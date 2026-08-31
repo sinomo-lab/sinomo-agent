@@ -13,6 +13,7 @@ ring = "r2"
 
 [features]
 default = []
+test-cases = ["sinomo-runtime/host"]
 # Carries realtime audio over a WebRTC peer connection for providers that negotiate one.
 # Off by default: it pulls in a full WebRTC stack and a C Opus codec that most builds never use.
 webrtc-media = ["dep:webrtc", "dep:rtc", "dep:audiopus", "dep:async-trait"]
@@ -34,7 +35,7 @@ tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"
 rtc = { version = "0.20.2", optional = true }
 webrtc = { version = "0.20.2", optional = true }
 tokio-websockets = { version = "0.13.3", default-features = false, features = ["client", "getrandom", "ring", "rustls-native-roots"] }
-sinomo-runtime = { path = "../sinomo-runtime" }
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["client"] }
 
 [dev-dependencies]
 sinomo-testdir = { path = "../sinomo-testdir" }

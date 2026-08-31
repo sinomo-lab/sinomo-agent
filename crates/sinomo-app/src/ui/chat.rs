@@ -34,13 +34,9 @@
 //! `Select`s live in the model popup above the field.
 
 use std::cell::{Cell, RefCell};
-#[cfg(not(test))]
-use std::collections::BTreeMap;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
 use std::rc::Rc;
-#[cfg(not(test))]
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -69,24 +65,30 @@ use sui::{
 };
 
 #[cfg(test)]
-use sinomo_agent::AGENT_CHANNEL_APP_USER_ID;
-#[cfg(not(test))]
-use sinomo_agent::AgentCancellationToken;
 use sinomo_agent::{
-    AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT, AgentChannel, AgentChannelAuthor, AgentChannelKind,
-    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore, AgentToolCall, TaskId,
+    AGENT_CHANNEL_APP_USER_ID, AgentChannel, AgentChannelAuthor, AgentChannelKind,
+    AgentChannelMessageKind, AgentChannelSource, AgentChannelStore,
 };
-#[cfg(not(test))]
-use sinomo_cli::app_api::AgentChatToolContext;
+#[cfg(test)]
+use sinomo_cli::app_api::SifsAgentChannelStore;
+#[cfg(test)]
+use sinomo_cli::app_api::agent_summaries_with_error;
+#[cfg(test)]
 use sinomo_cli::app_api::{
     AgentChannelMessagePage, AgentChannelMessageReconciliation, AgentChannelTimelineOverview,
-    AgentChannelTimelineSegment, AgentChatSifsStorage, AgentSummary, ChatAttachmentInput,
-    ChatAttachmentSource, ChatContextSnapshot, ChatHistoryMessage, ChatLocalAttachmentProvenance,
-    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind,
-    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
-    ChatUsageSnapshot, ProviderSummary, SifsAgentChannelStore, agent_summaries_with_error,
-    built_in_agent_summaries, project_stable_chat_agent_message, reasoning_efforts,
+    AgentChannelTimelineSegment,
 };
+#[cfg(not(test))]
+use sinomo_client::chat_contract::{
+    ChatHistoryAuthor, ChatHistoryConversationKind, ChatHistoryLoadMode, ChatHistoryLoadRequest,
+    ChatHistoryMessageKind, ChatHistoryPage as AgentChannelMessagePage,
+    ChatHistoryParticipantRequest, ChatHistoryStoredMessage,
+    ChatHistoryTimelineOverview as AgentChannelTimelineOverview,
+    ChatHistoryTimelineSegment as AgentChannelTimelineSegment,
+};
+use sinomo_client::chat_contract::{fallback_agent_summaries, reasoning_efforts};
+#[cfg(test)]
+use sinomo_runtime::vfs::VfsHandle;
 use sinomo_runtime::{
     api::{
         DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiError, DaemonEventStreamItem,
@@ -96,15 +98,21 @@ use sinomo_runtime::{
     events::SessionId,
     local::SinomoDataDir,
     network::{DaemonRpcTimeouts, ObjectRpcRequest},
-    vfs::VfsHandle,
 };
 
 use crate::backend::Backend;
 #[cfg(not(test))]
 use crate::backend::chat_engine::ChatRealtimeHandoff;
 use crate::backend::chat_engine::{
-    ChatCommand, ChatEvent, ChatEventWake, ChatFilesystemProvider, ChatHandle, ChatRole,
-    RuntimeInfo,
+    AgentSummary, ChatAttachmentInput, ChatAttachmentSource, ChatCommand, ChatContextSnapshot,
+    ChatEvent, ChatEventWake, ChatHandle, ChatHistoryMessage, ChatLocalAttachmentProvenance,
+    ChatProcessSnapshot, ChatQueuedTurnInput, ChatQueuedTurnInputKind, ChatRole,
+    ChatSifsAttachmentProvenance, ChatTaskSnapshot, ChatToolCallSnapshot, ChatToolRuntimeSelection,
+    ChatUsageSnapshot, ProviderSummary, RuntimeInfo,
+};
+#[cfg(test)]
+use crate::backend::chat_engine::{
+    ChatContextLane, ChatControlState, ChatControlStatus, ChatSpeaker,
 };
 use crate::backend::sifs::SifsDaemonAccess;
 use crate::native_picker::{
@@ -170,12 +178,14 @@ const SESSION_LIST_UI_TIMEOUT: Duration = Duration::from_secs(8);
 const TRANSCRIPT_LOAD_UI_TIMEOUT: Duration = Duration::from_secs(8);
 /// Budget for the background SIFS-backed agent-catalog load; past this the app
 /// keeps the built-in agents and reports the catalog as degraded.
+#[cfg(test)]
 const AGENT_CATALOG_LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const TOOL_CHAIN_COLLAPSE_AFTER: usize = 1;
 const TOOL_DETAIL_COLLAPSE_CHARS: usize = 420;
 const TOOL_DETAIL_PREVIEW_CHARS: usize = 220;
-const VISIBLE_TRANSCRIPT_RECENT_LIMIT: usize = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT;
-const TRANSCRIPT_PAGE_SIZE: usize = AGENT_CHANNEL_RECENT_TRANSCRIPT_LIMIT;
+const VISIBLE_TRANSCRIPT_RECENT_LIMIT: usize = 400;
+const TRANSCRIPT_PAGE_SIZE: usize = 400;
+const AGENT_CHANNELS_SIFS_ROOT: &str = "/services/sinomo-agent/channels";
 const TRANSCRIPT_MAX_LOADED_MESSAGES: usize = TRANSCRIPT_PAGE_SIZE * 3;
 const TRANSCRIPT_OLDER_LOAD_THRESHOLD_PX: f32 = 72.0;
 const TRANSCRIPT_PREPEND_ESTIMATED_MESSAGE_H: f32 = 76.0;
@@ -670,7 +680,7 @@ struct StableRealtimeChatTarget {
 
 #[derive(Debug, PartialEq, Eq)]
 struct StableRealtimeTextTurn {
-    message_id: TaskId,
+    message_id: SessionId,
     created_at: time::OffsetDateTime,
     text: String,
 }
@@ -684,7 +694,7 @@ struct StableRealtimeTextTurn {
 /// into duplicate history content.
 #[derive(Default)]
 struct StableRealtimeTextAccumulator {
-    message_id: Option<TaskId>,
+    message_id: Option<SessionId>,
     created_at: Option<time::OffsetDateTime>,
     audio_text: String,
     transcript_text: String,
@@ -745,7 +755,7 @@ impl StableRealtimeTextAccumulator {
 
     fn ensure_identity(&mut self) {
         if self.message_id.is_none() {
-            self.message_id = Some(TaskId::generate());
+            self.message_id = Some(SessionId::generate());
             self.created_at = Some(time::OffsetDateTime::now_utc());
         }
     }
@@ -828,9 +838,24 @@ struct StableRealtimeChatProjection {
 }
 
 impl StableRealtimeChatProjection {
-    #[cfg_attr(test, allow(dead_code))]
-    fn new(store: SifsAgentChannelStore, target: StableRealtimeChatTarget) -> Self {
-        Self::with_writer(move |turn| persist_stable_realtime_turn(&store, &target, turn))
+    #[cfg(not(test))]
+    fn new(client: sinomo_client::ChatHistoryClient, target: StableRealtimeChatTarget) -> Self {
+        Self::with_writer(move |turn| {
+            client
+                .append_agent(
+                    sinomo_client::chat_contract::ChatHistoryAppendAgentRequest {
+                        session_id: target.channel_id.to_string(),
+                        agent_key: target.agent_key.clone(),
+                        agent_name: target.agent_name.clone(),
+                        agent_session_id: target.agent_session_id.to_string(),
+                        message_id: turn.message_id.to_string(),
+                        created_at_unix_nanos: turn.created_at.unix_timestamp_nanos(),
+                        content: turn.text,
+                        source_adapter: "sinomo-app-realtime".to_string(),
+                    },
+                )
+                .map_err(|error| format!("persist realtime text to stable chat failed: {error}"))
+        })
     }
 
     fn disabled() -> Self {
@@ -877,36 +902,6 @@ impl StableRealtimeChatProjection {
     }
 }
 
-#[cfg_attr(test, allow(dead_code))]
-fn persist_stable_realtime_turn(
-    store: &SifsAgentChannelStore,
-    target: &StableRealtimeChatTarget,
-    turn: StableRealtimeTextTurn,
-) -> Result<(), String> {
-    let source = AgentChannelSource {
-        adapter: "sinomo-app-realtime".to_string(),
-        external_channel_id: Some(target.channel_id.to_string()),
-        external_message_id: Some(turn.message_id.to_string()),
-        metadata: serde_json::json!({
-            "surface_event": "realtime_output_text_turn",
-            "text_source": "provider_neutral_visible_output",
-        }),
-        ..AgentChannelSource::default()
-    };
-    project_stable_chat_agent_message(
-        store,
-        &target.channel_id,
-        &target.agent_key,
-        &target.agent_name,
-        &target.agent_session_id,
-        turn.message_id,
-        turn.created_at,
-        &turn.text,
-        source,
-    )
-    .map_err(|error| format!("persist realtime text to stable chat failed: {error}"))
-}
-
 #[cfg(not(test))]
 enum ChatRealtimeSessionEvent {
     Realtime(sinomo_lm::RealtimeAudioEvent),
@@ -930,8 +925,6 @@ struct ChatRealtimeSessionRuntime {
     event_rx: tokio::sync::mpsc::Receiver<ChatRealtimeSessionEvent>,
     tool_result_tx: tokio::sync::mpsc::Sender<ChatRealtimeToolResult>,
     latest_video: Arc<ChatMediaLatestVideoSlot<Arc<sinomo_video::NativeVideoSurfaceFrame>>>,
-    tool_cancellations: Arc<Mutex<BTreeMap<String, AgentCancellationToken>>>,
-    next_tool_call_index: AtomicUsize,
     stop: Arc<AtomicBool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -968,8 +961,6 @@ impl ChatRealtimeSessionRuntime {
             event_rx,
             tool_result_tx,
             latest_video,
-            tool_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
-            next_tool_call_index: AtomicUsize::new(0),
             stop,
             task: Some(task),
         }
@@ -994,62 +985,6 @@ impl ChatRealtimeSessionRuntime {
                 Err("realtime session pump stopped".to_string())
             }
         }
-    }
-
-    fn dispatch_tool_call(
-        &self,
-        context: AgentChatToolContext,
-        call_id: String,
-        name: String,
-        arguments: String,
-    ) -> Result<(), String> {
-        let call = match realtime_agent_tool_call(&call_id, &name, &arguments) {
-            Ok(call) => call,
-            Err(detail) => {
-                return self
-                    .tool_result_tx
-                    .try_send(ChatRealtimeToolResult {
-                        call_id,
-                        tool: name,
-                        output: serde_json::json!({
-                            "status": "failed",
-                            "summary": "invalid realtime tool arguments",
-                            "output": { "error": "invalid_tool_arguments", "detail": detail },
-                        })
-                        .to_string(),
-                        summary: "realtime tool call had invalid arguments".to_string(),
-                    })
-                    .map_err(|error| format!("queue invalid realtime tool result: {error}"));
-            }
-        };
-        let cancellation_token = AgentCancellationToken::new();
-        self.tool_cancellations
-            .lock()
-            .map_err(|_| "realtime tool cancellation lock poisoned".to_string())?
-            .insert(call_id.clone(), cancellation_token.clone());
-        let cancellations = self.tool_cancellations.clone();
-        let result_tx = self.tool_result_tx.clone();
-        let call_index = self.next_tool_call_index.fetch_add(1, Ordering::Relaxed);
-        tokio::task::spawn_blocking(move || {
-            let outcome = context.execute(call_index, &call, cancellation_token);
-            let output = serde_json::json!({
-                "status": &outcome.status,
-                "summary": &outcome.summary,
-                "output": &outcome.output,
-            })
-            .to_string();
-            let summary = outcome.summary.clone();
-            if let Ok(mut cancellations) = cancellations.lock() {
-                cancellations.remove(&call_id);
-            }
-            let _ = result_tx.blocking_send(ChatRealtimeToolResult {
-                call_id,
-                tool: name,
-                output,
-                summary,
-            });
-        });
-        Ok(())
     }
 
     fn dispatch_handoff(
@@ -1094,17 +1029,8 @@ impl ChatRealtimeSessionRuntime {
         Ok(())
     }
 
-    fn cancel_tools(&self) {
-        if let Ok(cancellations) = self.tool_cancellations.lock() {
-            for cancellation in cancellations.values() {
-                cancellation.cancel();
-            }
-        }
-    }
-
     async fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.cancel_tools();
         let Some(mut task) = self.task.take() else {
             return;
         };
@@ -1122,7 +1048,6 @@ impl ChatRealtimeSessionRuntime {
 impl Drop for ChatRealtimeSessionRuntime {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        self.cancel_tools();
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -1130,9 +1055,7 @@ impl Drop for ChatRealtimeSessionRuntime {
 }
 
 #[cfg(not(test))]
-fn realtime_audio_tool_definitions(
-    context: Option<&AgentChatToolContext>,
-) -> Vec<sinomo_lm::RealtimeAudioToolDefinition> {
+fn realtime_audio_tool_definitions() -> Vec<sinomo_lm::RealtimeAudioToolDefinition> {
     let mut background = sinomo_lm::RealtimeAudioToolDefinition::new(
         REALTIME_BACKGROUND_AGENT_TOOL_NAME,
         serde_json::json!({
@@ -1148,57 +1071,7 @@ fn realtime_audio_tool_definitions(
         }),
     );
     background.description = Some(REALTIME_BACKGROUND_AGENT_TOOL_DESCRIPTION.to_string());
-    std::iter::once(background)
-        .chain(
-            context
-                .into_iter()
-                .flat_map(AgentChatToolContext::descriptors)
-                .map(|descriptor| {
-                    let parameters = if descriptor.input_schema.is_object() {
-                        descriptor.input_schema.clone()
-                    } else {
-                        serde_json::json!({ "type": "object", "properties": {} })
-                    };
-                    let mut tool = sinomo_lm::RealtimeAudioToolDefinition::new(
-                        descriptor.spec.name.clone(),
-                        parameters,
-                    );
-                    if !descriptor.spec.description.trim().is_empty() {
-                        tool.description = Some(descriptor.spec.description.clone());
-                    }
-                    tool
-                }),
-        )
-        .collect()
-}
-
-fn realtime_agent_tool_call(
-    call_id: &str,
-    name: &str,
-    arguments: &str,
-) -> Result<AgentToolCall, String> {
-    if call_id.trim().is_empty() {
-        return Err("realtime tool call is missing its provider call id".to_string());
-    }
-    if name.trim().is_empty() {
-        return Err("realtime tool call is missing its tool name".to_string());
-    }
-    let input = if arguments.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(arguments)
-            .map_err(|error| format!("tool `{name}` arguments are not valid JSON: {error}"))?
-    };
-    if !input.is_object() {
-        return Err(format!("tool `{name}` arguments must be a JSON object"));
-    }
-    Ok(AgentToolCall {
-        call_id: Some(call_id.to_string()),
-        tool: name.to_string(),
-        input,
-        r#async: false,
-        summary: format!("realtime model called `{name}`"),
-    })
+    vec![background]
 }
 
 fn realtime_background_agent_prompt(
@@ -1759,6 +1632,7 @@ struct ConversationTimelineLoad {
 pub struct ChatState {
     pub data_dir: Arc<SinomoDataDir>,
     daemon_address: Option<String>,
+    #[cfg(test)]
     agent_catalog_vfs: Option<VfsHandle>,
     sifs_daemon: Option<SifsDaemonAccess>,
     daemon_event_rx: Receiver<DaemonEventWorkerUpdate>,
@@ -2425,51 +2299,31 @@ impl ChatState {
     }
 
     pub fn new_with_waker(backend: &Backend, waker: Option<sui::UiHandle>) -> Self {
+        #[cfg(test)]
         let daemon_connected = backend.connection.is_daemon();
         let daemon_address = backend.connection.daemon_address().map(str::to_string);
+        #[cfg(test)]
         let (agent_catalog_vfs, agent_catalog_transport_error) = match backend.catalog_read_vfs() {
             Ok(vfs) => (Some(vfs), None),
             Err(error) if daemon_connected => (None, Some(error)),
             Err(_) => (None, None),
         };
-        let filesystem_provider = match daemon_address.as_deref() {
-            Some(address) => ChatFilesystemProvider::Cluster(AgentChatSifsStorage::new(
-                (*backend.data_dir).clone(),
-                address,
-                backend.app_runtime.handle(),
-            )),
-            None if daemon_connected => ChatFilesystemProvider::Unavailable(
-                "connected chat cannot resolve a filesystem provider without a daemon address"
-                    .to_string(),
-            ),
-            None => ChatFilesystemProvider::LocalSifs,
-        };
+        #[cfg(not(test))]
+        let agent_catalog_transport_error: Option<String> = None;
         let event_wake: Option<ChatEventWake> = waker.as_ref().map(|waker| {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
-        let handle = ChatHandle::spawn(
-            (*backend.data_dir).clone(),
-            daemon_connected,
-            backend.agent_runtime_control.clone(),
-            filesystem_provider,
-            event_wake,
-        );
+        let handle = ChatHandle::spawn(daemon_address.clone(), event_wake);
 
         // The interactive app must not read the SIFS-backed agent catalog here: this
         // constructor runs on the connect thread while the window shows the launch
         // status, and SIFS grinds through multi-second distributed timeouts whenever
         // the cluster DFS is unhealthy. Boot with the built-ins (no I/O) and let the
         // shell load the stored catalog in the background once the app is ready.
-        let defer_agent_load = waker.is_some() && agent_catalog_vfs.is_some();
-        let (agents, agent_catalog_load_error) = if defer_agent_load {
-            (built_in_agent_summaries(), None)
-        } else {
-            agent_catalog_vfs
-                .as_ref()
-                .map(agent_summaries_with_error)
-                .unwrap_or_else(|| (built_in_agent_summaries(), None))
-        };
+        let defer_agent_load = waker.is_some() && daemon_address.is_some();
+        let agents = fallback_agent_summaries();
+        let agent_catalog_load_error = None;
         let defer_provider_load = waker.is_some() && backend.connection.daemon_address().is_some();
         let providers = if defer_provider_load {
             Vec::new()
@@ -2506,6 +2360,7 @@ impl ChatState {
         let mut state = Self {
             data_dir: backend.data_dir.clone(),
             daemon_address,
+            #[cfg(test)]
             agent_catalog_vfs,
             sifs_daemon,
             daemon_event_rx,
@@ -2643,30 +2498,11 @@ impl ChatState {
             .clone()
             .unwrap_or_else(|| "default".to_string());
         let tool_runtime = self.tool_runtime.clone();
-        let daemon_connected = backend.connection.is_daemon();
-        let filesystem_provider = match daemon_address.as_deref() {
-            Some(address) => ChatFilesystemProvider::Cluster(AgentChatSifsStorage::new(
-                (*backend.data_dir).clone(),
-                address,
-                backend.app_runtime.handle(),
-            )),
-            None if daemon_connected => ChatFilesystemProvider::Unavailable(
-                "connected chat cannot resolve a filesystem provider without a daemon address"
-                    .to_string(),
-            ),
-            None => ChatFilesystemProvider::LocalSifs,
-        };
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
-        let handle = ChatHandle::spawn(
-            (*backend.data_dir).clone(),
-            daemon_connected,
-            backend.agent_runtime_control.clone(),
-            filesystem_provider,
-            event_wake,
-        );
+        let handle = ChatHandle::spawn(daemon_address.clone(), event_wake);
 
         if let Some(abort) = self.daemon_event_abort.take() {
             abort.abort();
@@ -2684,7 +2520,10 @@ impl ChatState {
 
         self.handle = handle;
         self.daemon_address = daemon_address.clone();
-        self.agent_catalog_vfs = backend.catalog_read_vfs().ok();
+        #[cfg(test)]
+        {
+            self.agent_catalog_vfs = backend.catalog_read_vfs().ok();
+        }
         self.sifs_daemon = daemon_address
             .map(|address| SifsDaemonAccess::new(address, backend.app_runtime.handle()));
         self.daemon_event_rx = daemon_event_rx;
@@ -2766,7 +2605,7 @@ impl ChatState {
 
         let waker = self.ui_waker.clone();
         self.start_provider_list_load(backend.config.clone(), waker.clone());
-        self.agents_loading = self.agent_catalog_vfs.is_some();
+        self.agents_loading = backend.connection.daemon_address().is_some();
         self.agent_list_rx = None;
         self.start_agent_list_load(waker.clone());
         self.start_session_list_load(waker);
@@ -3096,10 +2935,12 @@ impl ChatState {
         self.start_session_list_load(waker);
     }
 
+    #[cfg(test)]
     fn agent_channel_store(&self) -> std::io::Result<SifsAgentChannelStore> {
         open_agent_channel_store(&self.data_dir, self.sifs_daemon.as_ref())
     }
 
+    #[cfg(test)]
     fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
         let Ok(channel_id) = id.parse::<SessionId>() else {
             return Vec::new();
@@ -3122,6 +2963,27 @@ impl ChatState {
                 pending_store: false,
             })
             .collect()
+    }
+
+    #[cfg(not(test))]
+    fn channel_agent_refs(&self, id: &str) -> Vec<ChannelAgentRef> {
+        self.sifs_daemon
+            .as_ref()
+            .and_then(|daemon| daemon.history_client().channel(id).ok().flatten())
+            .map(|channel| {
+                channel
+                    .participants
+                    .into_iter()
+                    .filter(|participant| participant.enabled)
+                    .map(|participant| ChannelAgentRef {
+                        participant_id: participant.participant_id,
+                        agent_name: participant.agent_name,
+                        agent_key: participant.agent_key,
+                        pending_store: false,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn fallback_channel_agent_refs(
@@ -5227,7 +5089,6 @@ impl ChatState {
                 ),
             };
             let sifs_daemon = self.sifs_daemon.clone();
-            let tool_context = self.handle.tool_context();
             let realtime_handoff = self.handle.realtime_handoff(channel_id_text.clone());
             let (event_tx, event_rx) = mpsc::channel();
             let (control_tx, control_rx) = mpsc::channel();
@@ -5259,7 +5120,6 @@ impl ChatState {
                         worker_camera_enabled,
                         camera_surface,
                         stable_chat,
-                        tool_context,
                         realtime_handoff,
                         sifs_daemon,
                         worker_waker,
@@ -5845,6 +5705,19 @@ impl ChatState {
                 }
                 self.models_loading = false;
             }
+            ChatEvent::Agents { agents, warning } => {
+                self.agents_loading = false;
+                if !agents.is_empty() {
+                    self.refresh_agents(agents);
+                }
+                if let Some(warning) = warning {
+                    self.replace_activity("agents", warning, ActivityTone::Warn);
+                }
+            }
+            ChatEvent::RealtimeHandoffResult { .. } => {
+                // The thin client resolves handoff responses before forwarding
+                // ordinary stream events to the UI reducer.
+            }
             ChatEvent::Error { session_id, error } => {
                 tracing::warn!(
                     session_id = session_id.as_deref().unwrap_or_default(),
@@ -6226,50 +6099,59 @@ impl ChatState {
         if !self.agents_loading || self.agent_list_rx.is_some() {
             return false;
         }
-        let Some(agent_catalog_vfs) = self.agent_catalog_vfs.clone() else {
-            self.agents_loading = false;
-            self.replace_activity(
-                "agents",
-                "agent catalog unavailable: resident daemon SIFS is not connected",
-                ActivityTone::Warn,
-            );
+        #[cfg(not(test))]
+        {
+            let _ = waker;
+            self.handle.send_command(ChatCommand::FetchAgents);
             return true;
-        };
-        let (tx, rx) = mpsc::channel();
-        match thread::Builder::new()
-            .name("sinomo-app-chat-agents".to_string())
-            .spawn(move || {
-                let result = match crate::backend::run_with_timeout(
-                    "agent-catalog",
-                    AGENT_CATALOG_LOAD_TIMEOUT,
-                    move || agent_summaries_with_error(&agent_catalog_vfs),
-                ) {
-                    Ok((agents, error)) => AgentListWorkerResult {
-                        agents: Some(agents),
-                        error,
-                    },
-                    Err(error) => AgentListWorkerResult {
-                        agents: None,
-                        error: Some(error),
-                    },
-                };
-                let _ = tx.send(result);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }) {
-            Ok(_) => {
-                self.agent_list_rx = Some(rx);
-                true
-            }
-            Err(error) => {
+        }
+        #[cfg(test)]
+        {
+            let Some(agent_catalog_vfs) = self.agent_catalog_vfs.clone() else {
                 self.agents_loading = false;
                 self.replace_activity(
                     "agents",
-                    format!("agent catalog load failed: {error}"),
+                    "agent catalog unavailable: resident daemon SIFS is not connected",
                     ActivityTone::Warn,
                 );
-                true
+                return true;
+            };
+            let (tx, rx) = mpsc::channel();
+            match thread::Builder::new()
+                .name("sinomo-app-chat-agents".to_string())
+                .spawn(move || {
+                    let result = match crate::backend::run_with_timeout(
+                        "agent-catalog",
+                        AGENT_CATALOG_LOAD_TIMEOUT,
+                        move || agent_summaries_with_error(&agent_catalog_vfs),
+                    ) {
+                        Ok((agents, error)) => AgentListWorkerResult {
+                            agents: Some(agents),
+                            error,
+                        },
+                        Err(error) => AgentListWorkerResult {
+                            agents: None,
+                            error: Some(error),
+                        },
+                    };
+                    let _ = tx.send(result);
+                    if let Some(waker) = waker {
+                        waker.wake();
+                    }
+                }) {
+                Ok(_) => {
+                    self.agent_list_rx = Some(rx);
+                    true
+                }
+                Err(error) => {
+                    self.agents_loading = false;
+                    self.replace_activity(
+                        "agents",
+                        format!("agent catalog load failed: {error}"),
+                        ActivityTone::Warn,
+                    );
+                    true
+                }
             }
         }
     }
@@ -6909,73 +6791,149 @@ impl ChatState {
                 reason: "user started a new channel from app chat".to_string(),
             });
         }
-        let mut channel = AgentChannel::new_channel(
-            session_id
-                .parse::<SessionId>()
-                .unwrap_or_else(|_| SessionId::generate()),
-            "New channel",
-        );
-        channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
-        let (agent_key, agent_name) = self.default_channel_agent();
-        let participant_id = channel.ensure_participant(agent_key.clone(), agent_name);
-        let tool_runtime = self.agent_tool_runtime(&agent_key);
-        set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
-        let session_ref = session_ref_for_channel(&channel);
-
-        self.reset_visible_session(session_id.clone());
-        self.pending_session_reset = Some(session_id.clone());
-        self.upsert_session_ref(session_ref.clone());
-        self.session_edit_id = Some(session_id.clone());
-        self.session_edit_details_open = false;
-        self.session_title_draft = session_ref.title.clone();
-        self.session_delete_confirm_id = None;
-        self.channel_agent_idx = 0;
-        self.notice = Some("creating channel...".to_string());
-        self.replace_activity(
-            "channel create",
-            "Saving channel to SIFS".to_string(),
-            ActivityTone::Running,
-        );
-        let (tx, rx) = mpsc::channel();
-        let data_dir = self.data_dir.clone();
-        let sifs_daemon = self.sifs_daemon.clone();
-        let worker_channel = channel;
-        let worker_session = session_ref;
-        let worker_waker = waker.clone();
-        let spawn_result = thread::Builder::new()
-            .name("sinomo-app-channel-create".to_string())
-            .spawn(move || {
-                let result = open_agent_channel_store(&data_dir, sifs_daemon.as_ref())
-                    .and_then(|store| {
-                        store
-                            .save_channel(&worker_channel)
-                            .map_err(channel_store_io_error)?;
-                        let (sessions, error) =
-                            list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
-                        Ok(SessionListWorkerResult { sessions, error })
-                    })
-                    .map_err(|error| error.to_string());
-                let _ = tx.send(ChannelCreateWorkerResult {
-                    session: worker_session,
-                    result,
+        #[cfg(not(test))]
+        {
+            let (agent_key, agent_name) = self.default_channel_agent();
+            let tool_runtime = self.agent_tool_runtime(&agent_key);
+            let session_ref = SessionRef {
+                id: session_id.clone(),
+                title: "New channel".to_string(),
+                kind: ConversationKind::Channel,
+                updated_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+                participant_count: 1,
+                participant_names: vec![agent_name.clone()],
+            };
+            self.reset_visible_session(session_id.clone());
+            self.pending_session_reset = Some(session_id.clone());
+            self.upsert_session_ref(session_ref.clone());
+            self.session_edit_id = Some(session_id.clone());
+            self.session_edit_details_open = false;
+            self.session_title_draft = session_ref.title.clone();
+            self.session_delete_confirm_id = None;
+            self.channel_agent_idx = 0;
+            self.notice = Some("creating channel...".to_string());
+            self.replace_activity(
+                "channel create",
+                "Saving channel through daemon".to_string(),
+                ActivityTone::Running,
+            );
+            let (tx, rx) = mpsc::channel();
+            let history = self
+                .sifs_daemon
+                .as_ref()
+                .map(SifsDaemonAccess::history_client);
+            let worker_session = session_ref;
+            let worker_waker = waker.clone();
+            let request = sinomo_client::chat_contract::ChatHistoryCreateChannelRequest {
+                session_id: session_id.clone(),
+                title: "New channel".to_string(),
+                agent_key,
+                agent_name,
+                sandbox_node_id: tool_runtime.sandbox_node_id,
+            };
+            let spawn_result = thread::Builder::new()
+                .name("sinomo-app-channel-create".to_string())
+                .spawn(move || {
+                    let result = history
+                        .ok_or_else(|| "chat history requires a daemon connection".to_string())
+                        .and_then(|client| {
+                            client
+                                .create_channel(request)
+                                .map_err(|error| error.to_string())?;
+                            let sessions = client.list().map_err(|error| error.to_string())?;
+                            Ok(SessionListWorkerResult {
+                                sessions: sessions.into_iter().map(session_ref_from_wire).collect(),
+                                error: None,
+                            })
+                        });
+                    let _ = tx.send(ChannelCreateWorkerResult {
+                        session: worker_session,
+                        result,
+                    });
+                    if let Some(waker) = worker_waker {
+                        waker.wake();
+                    }
                 });
-                if let Some(waker) = worker_waker {
-                    waker.wake();
-                }
-            });
-
-        match spawn_result {
-            Ok(_) => {
-                self.channel_create_rx = Some(rx);
-            }
-            Err(error) => {
-                self.channel_create_rx = None;
-                if self.pending_session_reset.as_deref() == Some(session_id.as_str()) {
+            match spawn_result {
+                Ok(_) => self.channel_create_rx = Some(rx),
+                Err(error) => {
+                    self.channel_create_rx = None;
                     self.pending_session_reset = None;
+                    self.notice = Some(format!("channel create failed: {error}"));
                 }
-                let detail = error.to_string();
-                self.notice = Some(format!("channel create failed: {detail}"));
-                self.push_activity("channel create", detail, ActivityTone::Warn);
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            let mut channel = AgentChannel::new_channel(
+                session_id
+                    .parse::<SessionId>()
+                    .unwrap_or_else(|_| SessionId::generate()),
+                "New channel",
+            );
+            channel.ensure_user(sinomo_agent::AgentChannelUser::app_local());
+            let (agent_key, agent_name) = self.default_channel_agent();
+            let participant_id = channel.ensure_participant(agent_key.clone(), agent_name);
+            let tool_runtime = self.agent_tool_runtime(&agent_key);
+            set_channel_participant_tool_runtime(&mut channel, &participant_id, &tool_runtime);
+            let session_ref = session_ref_for_channel(&channel);
+
+            self.reset_visible_session(session_id.clone());
+            self.pending_session_reset = Some(session_id.clone());
+            self.upsert_session_ref(session_ref.clone());
+            self.session_edit_id = Some(session_id.clone());
+            self.session_edit_details_open = false;
+            self.session_title_draft = session_ref.title.clone();
+            self.session_delete_confirm_id = None;
+            self.channel_agent_idx = 0;
+            self.notice = Some("creating channel...".to_string());
+            self.replace_activity(
+                "channel create",
+                "Saving channel to SIFS".to_string(),
+                ActivityTone::Running,
+            );
+            let (tx, rx) = mpsc::channel();
+            let data_dir = self.data_dir.clone();
+            let sifs_daemon = self.sifs_daemon.clone();
+            let worker_channel = channel;
+            let worker_session = session_ref;
+            let worker_waker = waker.clone();
+            let spawn_result = thread::Builder::new()
+                .name("sinomo-app-channel-create".to_string())
+                .spawn(move || {
+                    let result = open_agent_channel_store(&data_dir, sifs_daemon.as_ref())
+                        .and_then(|store| {
+                            store
+                                .save_channel(&worker_channel)
+                                .map_err(channel_store_io_error)?;
+                            let (sessions, error) =
+                                list_conversations_with_error(&data_dir, sifs_daemon.as_ref());
+                            Ok(SessionListWorkerResult { sessions, error })
+                        })
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(ChannelCreateWorkerResult {
+                        session: worker_session,
+                        result,
+                    });
+                    if let Some(waker) = worker_waker {
+                        waker.wake();
+                    }
+                });
+
+            match spawn_result {
+                Ok(_) => {
+                    self.channel_create_rx = Some(rx);
+                }
+                Err(error) => {
+                    self.channel_create_rx = None;
+                    if self.pending_session_reset.as_deref() == Some(session_id.as_str()) {
+                        self.pending_session_reset = None;
+                    }
+                    let detail = error.to_string();
+                    self.notice = Some(format!("channel create failed: {detail}"));
+                    self.push_activity("channel create", detail, ActivityTone::Warn);
+                }
             }
         }
     }
@@ -7002,7 +6960,10 @@ impl ChatState {
         self.agents
             .iter()
             .find(|agent| agent.key == agent_key || agent.name == agent_key)
-            .map(|agent| agent.tool_runtime.clone())
+            .map(|agent| ChatToolRuntimeSelection {
+                sandbox_node_id: agent.tool_runtime.sandbox_node_id.clone(),
+                workspace_root: agent.tool_runtime.workspace_root.clone(),
+            })
             .unwrap_or_default()
     }
 
@@ -7029,7 +6990,10 @@ impl ChatState {
         };
         let agent_key = agent.key.clone();
         let agent_name = agent.name.clone();
-        let tool_runtime = agent.tool_runtime.clone();
+        let tool_runtime = ChatToolRuntimeSelection {
+            sandbox_node_id: agent.tool_runtime.sandbox_node_id.clone(),
+            workspace_root: agent.tool_runtime.workspace_root.clone(),
+        };
         self.start_channel_config(
             channel_id,
             format!("adding {agent_name}"),
@@ -7260,9 +7224,7 @@ fn spawn_daemon_event_subscription(
         let request = match ObjectRpcRequest::encode_body(
             DAEMON_EVENT_SUBSCRIBE_ROUTE,
             DAEMON_RPC_CATEGORY,
-            &DaemonEventSubscribeRequest::for_path_prefix(
-                sinomo_cli::app_api::SIFS_AGENT_CHANNELS_ROOT,
-            ),
+            &DaemonEventSubscribeRequest::for_path_prefix(AGENT_CHANNELS_SIFS_ROOT),
         ) {
             Ok(request) => request,
             Err(error) => {
@@ -7335,6 +7297,7 @@ fn spawn_daemon_event_subscription(
     task.abort_handle()
 }
 
+#[cfg(test)]
 fn list_conversations_with_error(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -7386,6 +7349,48 @@ fn list_conversations_with_error(
     (conversations, error)
 }
 
+#[cfg(not(test))]
+fn list_conversations_with_error(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+) -> (Vec<SessionRef>, Option<String>) {
+    let Some(daemon) = sifs_daemon else {
+        return (
+            Vec::new(),
+            Some("chat history requires a daemon connection".to_string()),
+        );
+    };
+    match daemon.history_client().list() {
+        Ok(sessions) => {
+            let mut conversations = sessions
+                .into_iter()
+                .map(|session| SessionRef {
+                    id: session.id,
+                    title: if session.title.trim().is_empty() {
+                        match session.kind {
+                            ChatHistoryConversationKind::Chat => "New chat".to_string(),
+                            ChatHistoryConversationKind::Channel => "New channel".to_string(),
+                        }
+                    } else {
+                        session.title
+                    },
+                    kind: match session.kind {
+                        ChatHistoryConversationKind::Chat => ConversationKind::Chat,
+                        ChatHistoryConversationKind::Channel => ConversationKind::Channel,
+                    },
+                    updated_unix: session.updated_unix,
+                    participant_count: session.participant_count,
+                    participant_names: session.participant_names,
+                })
+                .collect::<Vec<_>>();
+            sort_conversations(&mut conversations);
+            (conversations, None)
+        }
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
+#[cfg(test)]
 fn session_ref_for_channel(channel: &AgentChannel) -> SessionRef {
     SessionRef {
         id: channel.channel_id.to_string(),
@@ -7420,6 +7425,24 @@ fn sort_conversations(conversations: &mut [SessionRef]) {
     });
 }
 
+#[cfg(not(test))]
+fn session_ref_from_wire(
+    session: sinomo_client::chat_contract::ChatHistorySessionSummary,
+) -> SessionRef {
+    SessionRef {
+        id: session.id,
+        title: session.title,
+        kind: match session.kind {
+            ChatHistoryConversationKind::Chat => ConversationKind::Chat,
+            ChatHistoryConversationKind::Channel => ConversationKind::Channel,
+        },
+        updated_unix: session.updated_unix,
+        participant_count: session.participant_count,
+        participant_names: session.participant_names,
+    }
+}
+
+#[cfg(test)]
 fn delete_conversation_records(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -7437,6 +7460,21 @@ fn delete_conversation_records(
     }
 }
 
+#[cfg(not(test))]
+fn delete_conversation_records(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    _kind: ConversationKind,
+) -> std::io::Result<()> {
+    sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| std::io::Error::other("chat history requires a daemon connection"))?
+        .delete(id)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(test)]
 fn tombstone_channel_record_in(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -7458,6 +7496,7 @@ fn tombstone_channel_record_in(
     Ok(true)
 }
 
+#[cfg(test)]
 fn rename_chat_channel(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -7485,6 +7524,7 @@ fn channel_messages(channel: &AgentChannel) -> Vec<ChatMessage> {
     channel_messages_from_agent(&channel.transcript, channel.channel_kind)
 }
 
+#[cfg(test)]
 fn channel_messages_from_agent(
     messages: &[sinomo_agent::AgentChannelMessage],
     channel_kind: AgentChannelKind,
@@ -7563,6 +7603,7 @@ fn load_conversation_timeline(
     }
 }
 
+#[cfg(test)]
 fn load_channel_timeline_from_sifs(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -7629,6 +7670,7 @@ fn load_channel_timeline_from_sifs(
     }))
 }
 
+#[cfg(test)]
 fn reconciliation_from_page(page: AgentChannelMessagePage) -> AgentChannelMessageReconciliation {
     let discovered_message_ids = page
         .messages
@@ -7641,12 +7683,138 @@ fn reconciliation_from_page(page: AgentChannelMessagePage) -> AgentChannelMessag
     }
 }
 
+#[cfg(not(test))]
+fn load_channel_timeline_from_sifs(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    id: &str,
+    mode: TranscriptLoadMode,
+    known_message_ids: &BTreeSet<String>,
+) -> Result<Option<ConversationTimelineLoad>, String> {
+    let client = sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| "chat history requires a daemon connection".to_string())?;
+    let Some(channel) = client.channel(id).map_err(|error| error.to_string())? else {
+        return Ok(None);
+    };
+    let (wire_mode, sequence) = match mode {
+        TranscriptLoadMode::Initial => (ChatHistoryLoadMode::Initial, None),
+        TranscriptLoadMode::Older { before_sequence } => {
+            (ChatHistoryLoadMode::Before, Some(before_sequence))
+        }
+        TranscriptLoadMode::Newer { after_sequence } => {
+            (ChatHistoryLoadMode::After, Some(after_sequence))
+        }
+        TranscriptLoadMode::ReconcileLatest => (ChatHistoryLoadMode::ReconcileLatest, None),
+    };
+    let response = client
+        .load(ChatHistoryLoadRequest {
+            session_id: id.to_string(),
+            mode: wire_mode,
+            sequence,
+            limit: TRANSCRIPT_PAGE_SIZE,
+            include_overview: mode == TranscriptLoadMode::Initial,
+            known_message_ids: known_message_ids.iter().cloned().collect(),
+        })
+        .map_err(|error| error.to_string())?;
+    let messages = channel_messages_from_wire(&response.page.messages, channel.kind);
+    let discovered_message_ids = response.page.discovered_message_ids.clone();
+    Ok(Some(ConversationTimelineLoad {
+        messages,
+        page: response.page,
+        overview: response.overview,
+        discovered_message_ids,
+    }))
+}
+
+#[cfg(not(test))]
+fn channel_messages_from_wire(
+    messages: &[ChatHistoryStoredMessage],
+    channel_kind: ChatHistoryConversationKind,
+) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            if message.content.trim().is_empty() && message.attachments.is_empty() {
+                return None;
+            }
+            let mut content = if matches!(message.author, ChatHistoryAuthor::Agent { .. }) {
+                visible_model_message_text(&message.content)
+            } else {
+                message.content.clone()
+            };
+            if !message.attachments.is_empty() {
+                append_visible_attachment_summary(
+                    &mut content,
+                    message.attachments.iter().map(|attachment| {
+                        (
+                            attachment.file_name.as_str(),
+                            attachment.size_bytes,
+                            Some(attachment.stored_path.as_str()),
+                        )
+                    }),
+                );
+            }
+            let chat_message = match &message.author {
+                ChatHistoryAuthor::User { .. } => ChatMessage::user(content),
+                ChatHistoryAuthor::Agent { .. }
+                    if channel_kind == ChatHistoryConversationKind::Chat =>
+                {
+                    ChatMessage::model(content)
+                }
+                ChatHistoryAuthor::Agent { agent_name } => ChatMessage::model(format!(
+                    "{}: {content}",
+                    if agent_name.trim().is_empty() {
+                        "Agent"
+                    } else {
+                        agent_name
+                    }
+                )),
+                ChatHistoryAuthor::System => {
+                    if message.message_kind == ChatHistoryMessageKind::Error {
+                        ChatMessage::system_error(content)
+                    } else {
+                        ChatMessage::system_info(content)
+                    }
+                }
+            };
+            Some(chat_message.with_durable_identity(message.message_id.clone(), message.sequence))
+        })
+        .collect()
+}
+
+#[cfg(not(test))]
 fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimelineLoad {
-    let overview_channel_id = channel_id.clone();
+    let _ = channel_id;
     ConversationTimelineLoad {
         messages: Vec::new(),
         page: AgentChannelMessagePage {
-            channel_id,
+            messages: Vec::new(),
+            start_sequence: None,
+            end_sequence: None,
+            has_older: false,
+            has_newer: false,
+            total_messages: 0,
+            chunk_size: 0,
+            discovered_message_ids: Vec::new(),
+        },
+        overview: Some(AgentChannelTimelineOverview {
+            total_messages: 0,
+            oldest_sequence: None,
+            newest_sequence: None,
+            chunk_size: 0,
+            segments: Vec::new(),
+        }),
+        discovered_message_ids: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimelineLoad {
+    ConversationTimelineLoad {
+        messages: Vec::new(),
+        page: AgentChannelMessagePage {
+            channel_id: channel_id.clone(),
             messages: Vec::new(),
             start_sequence: None,
             end_sequence: None,
@@ -7656,7 +7824,7 @@ fn empty_conversation_timeline_load(channel_id: SessionId) -> ConversationTimeli
             chunk_size: 0,
         },
         overview: Some(AgentChannelTimelineOverview {
-            channel_id: overview_channel_id,
+            channel_id,
             total_messages: 0,
             oldest_sequence: None,
             newest_sequence: None,
@@ -7908,6 +8076,7 @@ fn transcript_load_failed_notice(mode: TranscriptLoadMode, detail: &str) -> Stri
     }
 }
 
+#[cfg(test)]
 fn visible_channel_message_text(message: &sinomo_agent::AgentChannelMessage) -> String {
     let mut text = if matches!(&message.author, AgentChannelAuthor::Agent { .. }) {
         visible_model_message_text(&message.content)
@@ -8098,14 +8267,14 @@ fn validate_local_attachment_path(path: PathBuf) -> LocalAttachmentValidationOut
     }
 }
 
+#[cfg(test)]
 fn open_agent_channel_store(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
 ) -> std::io::Result<SifsAgentChannelStore> {
     match sifs_daemon {
         Some(daemon) => daemon
-            .open_browser()
-            .map(SifsAgentChannelStore::from_browser)
+            .open_agent_channel_store()
             .map_err(std::io::Error::other),
         None => open_local_agent_channel_store(data_dir),
     }
@@ -8118,6 +8287,7 @@ fn conversation_kind_label(kind: ConversationKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn rename_session_in_store(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -8143,6 +8313,29 @@ fn rename_session_in_store(
     }
 }
 
+#[cfg(not(test))]
+fn rename_session_in_store(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    kind: ConversationKind,
+    session_id: &str,
+    title: &str,
+) -> std::io::Result<()> {
+    sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| std::io::Error::other("chat history requires a daemon connection"))?
+        .rename(sinomo_client::chat_contract::ChatHistoryRenameRequest {
+            session_id: session_id.to_string(),
+            title: title.to_string(),
+            kind: match kind {
+                ConversationKind::Chat => ChatHistoryConversationKind::Chat,
+                ConversationKind::Channel => ChatHistoryConversationKind::Channel,
+            },
+        })
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(test)]
 fn update_channel_membership_in_store(
     data_dir: &SinomoDataDir,
     sifs_daemon: Option<&SifsDaemonAccess>,
@@ -8194,6 +8387,40 @@ fn update_channel_membership_in_store(
     store.save_channel(&channel).map_err(channel_store_io_error)
 }
 
+#[cfg(not(test))]
+fn update_channel_membership_in_store(
+    _data_dir: &SinomoDataDir,
+    sifs_daemon: Option<&SifsDaemonAccess>,
+    channel_id: &str,
+    operation: ChannelConfigOperation,
+) -> std::io::Result<()> {
+    let client = sifs_daemon
+        .map(SifsDaemonAccess::history_client)
+        .ok_or_else(|| std::io::Error::other("chat history requires a daemon connection"))?;
+    let request = match operation {
+        ChannelConfigOperation::AddAgent {
+            agent_key,
+            agent_name,
+            tool_runtime,
+        } => ChatHistoryParticipantRequest::Add {
+            session_id: channel_id.to_string(),
+            agent_key,
+            agent_name,
+            sandbox_node_id: tool_runtime.sandbox_node_id,
+        },
+        ChannelConfigOperation::RemoveAgent { participant_id } => {
+            ChatHistoryParticipantRequest::Remove {
+                session_id: channel_id.to_string(),
+                participant_id,
+            }
+        }
+    };
+    client
+        .update_participant(request)
+        .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(test)]
 fn open_local_agent_channel_store(
     data_dir: &SinomoDataDir,
 ) -> std::io::Result<SifsAgentChannelStore> {
@@ -8209,10 +8436,12 @@ fn parse_channel_id(id: &str) -> std::io::Result<SessionId> {
     })
 }
 
+#[cfg(test)]
 fn channel_store_io_error(error: sinomo_agent::AgentChannelStoreError) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
+#[cfg(test)]
 fn set_channel_participant_tool_runtime(
     channel: &mut AgentChannel,
     participant_id: &sinomo_agent::TaskId,
@@ -8269,7 +8498,6 @@ fn run_chat_media_call_worker(
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
     stable_chat: StableRealtimeChatTarget,
-    tool_context: Option<AgentChatToolContext>,
     realtime_handoff: ChatRealtimeHandoff,
     sifs_daemon: Option<SifsDaemonAccess>,
     waker: Option<sui::UiHandle>,
@@ -8299,21 +8527,21 @@ fn run_chat_media_call_worker(
         // Open daemon-backed SIFS before entering the call's Tokio runtime:
         // the browser owns the app runtime handle and its synchronous facade
         // must not nest `block_on` inside this worker runtime.
-        let stable_projection =
-            match open_agent_channel_store(data_dir.as_ref(), sifs_daemon.as_ref()) {
-                Ok(stable_store) => StableRealtimeChatProjection::new(stable_store, stable_chat),
-                Err(error) => {
-                    tracing::warn!(%error, "stable realtime chat projection unavailable");
-                    let _ = send_chat_media_call_event(
-                        &event_tx,
-                        &waker,
-                        ChatMediaCallWorkerEvent::Notice(
-                            STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE.to_string(),
-                        ),
-                    );
-                    StableRealtimeChatProjection::disabled()
-                }
-            };
+        let stable_projection = match sifs_daemon.as_ref() {
+            Some(daemon) => StableRealtimeChatProjection::new(daemon.history_client(), stable_chat),
+            None => {
+                let error = "chat history requires a daemon connection";
+                tracing::warn!(%error, "stable realtime chat projection unavailable");
+                let _ = send_chat_media_call_event(
+                    &event_tx,
+                    &waker,
+                    ChatMediaCallWorkerEvent::Notice(
+                        STABLE_REALTIME_HISTORY_UNAVAILABLE_NOTICE.to_string(),
+                    ),
+                );
+                StableRealtimeChatProjection::disabled()
+            }
+        };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -8330,7 +8558,6 @@ fn run_chat_media_call_worker(
             microphone_requested,
             camera_requested,
             camera_surface,
-            tool_context,
             realtime_handoff,
             stable_projection,
             waker.clone(),
@@ -8637,7 +8864,6 @@ async fn run_chat_media_call_async(
     microphone_requested: Arc<AtomicBool>,
     camera_requested: Arc<AtomicBool>,
     camera_surface: Arc<sinomo_video::NativeVideoSurface>,
-    tool_context: Option<AgentChatToolContext>,
     realtime_handoff: ChatRealtimeHandoff,
     mut stable_projection: StableRealtimeChatProjection,
     waker: Option<sui::UiHandle>,
@@ -8661,13 +8887,8 @@ async fn run_chat_media_call_async(
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     authorize_chat_media_realtime_config(&data_dir, &mut config)?;
-    let tool_context = if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
-        tool_context
-    } else {
-        None
-    };
     if provider == sinomo_lm::RealtimeAudioProvider::OpenAi {
-        config.tools = realtime_audio_tool_definitions(tool_context.as_ref());
+        config.tools = realtime_audio_tool_definitions();
         if !config.tools.is_empty() {
             config.tool_choice = Some("auto".to_string());
         }
@@ -9120,13 +9341,6 @@ async fn run_chat_media_call_async(
                                 realtime_handoff.clone(),
                                 call_id.clone(),
                                 realtime_background_agent_prompt(arguments, &tail),
-                            )?;
-                        } else if let Some(context) = tool_context.as_ref() {
-                            realtime_session.dispatch_tool_call(
-                                context.clone(),
-                                call_id.clone(),
-                                name.clone(),
-                                arguments.clone(),
                             )?;
                         }
                     }
@@ -18483,7 +18697,7 @@ mod tests {
                 account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
                 name: "OpenAI".to_string(),
                 models: vec!["gpt-5".to_string()],
-                capabilities: sinomo_lm::provider_capabilities("openai"),
+                capabilities: crate::backend::config::provider_capabilities("openai"),
             });
         }
         state.models_loading = false;
@@ -18759,7 +18973,7 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         // Mirror the interactive boot: built-ins only, catalog deferred.
-        state.agents = built_in_agent_summaries();
+        state.agents = fallback_agent_summaries();
         state.agent_catalog_vfs = Some(VfsHandle::memory());
         state.agents_loading = true;
 
@@ -22669,15 +22883,13 @@ mod tests {
 
         // A control-state snapshot with drained queues means the runtime
         // consumed the steering mid-turn: the pending chip disappears.
-        state.apply_event(ChatEvent::ControlState(
-            sinomo_cli::app_api::ChatControlState {
-                session_id: state.session_id.clone(),
-                accepted: true,
-                steering_count: 0,
-                follow_up_count: 0,
-                ..Default::default()
-            },
-        ));
+        state.apply_event(ChatEvent::ControlState(ChatControlState {
+            session_id: state.session_id.clone(),
+            accepted: true,
+            steering_count: 0,
+            follow_up_count: 0,
+            ..Default::default()
+        }));
         assert!(
             state.queued_turn_inputs.is_empty(),
             "drained runtime queues clear the pending chips"
@@ -22699,10 +22911,10 @@ mod tests {
 
     fn control_status_with_queue(
         session_id: &str,
-        queued_input: Option<sinomo_cli::app_api::ChatQueuedTurnInput>,
+        queued_input: Option<ChatQueuedTurnInput>,
         removed_input_id: Option<String>,
-    ) -> sinomo_cli::app_api::ChatControlStatus {
-        sinomo_cli::app_api::ChatControlStatus {
+    ) -> ChatControlStatus {
+        ChatControlStatus {
             session_id: session_id.to_string(),
             accepted: true,
             runtime_attached: true,
@@ -22785,27 +22997,25 @@ mod tests {
 
         // The resume snapshot replaces local chips wholesale — including a
         // follow-up queued from another surface that this composer never saw.
-        state.apply_event(ChatEvent::ControlState(
-            sinomo_cli::app_api::ChatControlState {
-                session_id: state.session_id.clone(),
-                accepted: true,
-                steering_count: 1,
-                follow_up_count: 1,
-                queued_inputs: vec![
-                    ChatQueuedTurnInput {
-                        input_id: "task_steer_1".to_string(),
-                        kind: ChatQueuedTurnInputKind::Steering,
-                        message: "prefer AV1".to_string(),
-                    },
-                    ChatQueuedTurnInput {
-                        input_id: "task_follow_1".to_string(),
-                        kind: ChatQueuedTurnInputKind::FollowUp,
-                        message: "share to #renders".to_string(),
-                    },
-                ],
-                ..Default::default()
-            },
-        ));
+        state.apply_event(ChatEvent::ControlState(ChatControlState {
+            session_id: state.session_id.clone(),
+            accepted: true,
+            steering_count: 1,
+            follow_up_count: 1,
+            queued_inputs: vec![
+                ChatQueuedTurnInput {
+                    input_id: "task_steer_1".to_string(),
+                    kind: ChatQueuedTurnInputKind::Steering,
+                    message: "prefer AV1".to_string(),
+                },
+                ChatQueuedTurnInput {
+                    input_id: "task_follow_1".to_string(),
+                    kind: ChatQueuedTurnInputKind::FollowUp,
+                    message: "share to #renders".to_string(),
+                },
+            ],
+            ..Default::default()
+        }));
         assert_eq!(
             state.queued_turn_inputs,
             vec![
@@ -23004,7 +23214,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_daemon_failure_initializes_chat_attention() {
+    fn app_owned_daemon_failure_initializes_chat_attention() {
         let mut backend = Backend::local_fallback();
         backend.connection = Connection::LocalFallback {
             reason: Some("embedded daemon exited before ready: duplicate config key".to_string()),
@@ -23015,7 +23225,7 @@ mod tests {
         assert_eq!(
             state.notice.as_deref(),
             Some(
-                "embedded daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
+                "app-owned daemon failed: embedded daemon exited before ready: duplicate config key; daemon-backed chat and SIFS are unavailable"
             )
         );
         assert_eq!(
@@ -23330,7 +23540,7 @@ mod tests {
 
         state.apply_event(ChatEvent::AgentToken {
             session_id,
-            speaker: sinomo_cli::app_api::ChatSpeaker {
+            speaker: ChatSpeaker {
                 agent_key: "main-agent".to_string(),
                 agent_name: "main-agent".to_string(),
                 ..Default::default()
@@ -23380,7 +23590,7 @@ mod tests {
             participant_names: vec!["main-agent".to_string()],
         }];
         state.messages = vec![ChatMessage::user("hi"), ChatMessage::model("")];
-        let speaker = sinomo_cli::app_api::ChatSpeaker {
+        let speaker = ChatSpeaker {
             agent_key: "main-agent".to_string(),
             agent_name: "main-agent".to_string(),
             ..Default::default()
@@ -24608,23 +24818,6 @@ mod tests {
     }
 
     #[test]
-    fn realtime_tool_calls_use_standard_agent_call_shape() {
-        let call = realtime_agent_tool_call(
-            "call-7",
-            "edit_file",
-            r#"{"path":"notes.md","old_text":"before","new_text":"after"}"#,
-        )
-        .expect("valid realtime tool call");
-
-        assert_eq!(call.call_id.as_deref(), Some("call-7"));
-        assert_eq!(call.tool, "edit_file");
-        assert_eq!(call.input["path"], "notes.md");
-        assert!(!call.r#async);
-        assert!(realtime_agent_tool_call("call-8", "edit_file", "[]").is_err());
-        assert!(realtime_agent_tool_call("call-9", "edit_file", "not-json").is_err());
-    }
-
-    #[test]
     fn realtime_background_handoff_preserves_role_bearing_tail_and_user_request() {
         let prompt = realtime_background_agent_prompt(
             r#"{"prompt":"Please update the parser and run its tests."}"#,
@@ -25648,22 +25841,20 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.streaming = true;
 
-        state.apply_event(ChatEvent::ControlStatus(
-            sinomo_cli::app_api::ChatControlStatus {
-                session_id: "sess_ui_control".to_string(),
-                accepted: true,
-                runtime_attached: true,
-                sequence: 3,
-                event_count: 1,
-                active_turn: true,
-                task_count: 0,
-                terminal_result_count: 0,
-                tasks: Vec::new(),
-                queued_input: None,
-                removed_input_id: None,
-                warning: None,
-            },
-        ));
+        state.apply_event(ChatEvent::ControlStatus(ChatControlStatus {
+            session_id: "sess_ui_control".to_string(),
+            accepted: true,
+            runtime_attached: true,
+            sequence: 3,
+            event_count: 1,
+            active_turn: true,
+            task_count: 0,
+            terminal_result_count: 0,
+            tasks: Vec::new(),
+            queued_input: None,
+            removed_input_id: None,
+            warning: None,
+        }));
         assert!(state.streaming);
         assert_eq!(
             state.notice.as_deref(),
@@ -25672,15 +25863,13 @@ mod tests {
         assert!(state.control.runtime_attached);
         assert_eq!(state.runtime_health().label, "RUNNING");
 
-        state.apply_event(ChatEvent::ControlState(
-            sinomo_cli::app_api::ChatControlState {
-                session_id: "sess_ui_control".to_string(),
-                accepted: true,
-                steering_count: 2,
-                follow_up_count: 1,
-                ..Default::default()
-            },
-        ));
+        state.apply_event(ChatEvent::ControlState(ChatControlState {
+            session_id: "sess_ui_control".to_string(),
+            accepted: true,
+            steering_count: 2,
+            follow_up_count: 1,
+            ..Default::default()
+        }));
         assert!(state.streaming);
         assert_eq!(
             state.notice.as_deref(),
@@ -25694,22 +25883,20 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.control.runtime_attached = false;
 
-        state.apply_event(ChatEvent::ControlStatus(
-            sinomo_cli::app_api::ChatControlStatus {
-                session_id: "sess_ui_control_done".to_string(),
-                accepted: true,
-                runtime_attached: true,
-                sequence: 4,
-                event_count: 1,
-                active_turn: false,
-                task_count: 0,
-                terminal_result_count: 1,
-                tasks: Vec::new(),
-                queued_input: None,
-                removed_input_id: None,
-                warning: None,
-            },
-        ));
+        state.apply_event(ChatEvent::ControlStatus(ChatControlStatus {
+            session_id: "sess_ui_control_done".to_string(),
+            accepted: true,
+            runtime_attached: true,
+            sequence: 4,
+            event_count: 1,
+            active_turn: false,
+            task_count: 0,
+            terminal_result_count: 1,
+            tasks: Vec::new(),
+            queued_input: None,
+            removed_input_id: None,
+            warning: None,
+        }));
 
         let health = state.runtime_health();
         assert_ne!(
@@ -25735,7 +25922,7 @@ mod tests {
                 total_bytes: 4096,
                 max_context_bytes: Some(8192),
                 compaction_threshold_bytes: Some(7000),
-                lanes: vec![sinomo_cli::app_api::ChatContextLane {
+                lanes: vec![ChatContextLane {
                     kind: "recent_tail".to_string(),
                     label: "recent transcript".to_string(),
                     bytes: 1024,
@@ -27001,7 +27188,7 @@ mod tests {
             total_bytes: 4096,
             max_context_bytes: Some(8192),
             compaction_threshold_bytes: Some(7000),
-            lanes: vec![sinomo_cli::app_api::ChatContextLane {
+            lanes: vec![ChatContextLane {
                 kind: "recent_tail".to_string(),
                 label: "recent transcript".to_string(),
                 bytes: 1024,
@@ -28022,7 +28209,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("deepseek"),
+            capabilities: crate::backend::config::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;
@@ -28051,7 +28238,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("deepseek"),
+            capabilities: crate::backend::config::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 99;
@@ -28087,7 +28274,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("deepseek"),
+            capabilities: crate::backend::config::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;
@@ -28127,7 +28314,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: Vec::new(),
-            capabilities: sinomo_lm::provider_capabilities("deepseek"),
+            capabilities: crate::backend::config::provider_capabilities("deepseek"),
         }];
         state.provider_idx = 0;
         state.model_idx = 0;

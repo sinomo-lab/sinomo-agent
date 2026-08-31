@@ -26,16 +26,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use sinomo_agent::{
-    AgentDefinition, AgentMcpProtocolEra, AgentMcpServerDefinition, AgentOutputFormat,
-    AgentPackageDefinition, AgentRole, AgentToolDescriptor, AgentToolInvocationMode, AgentToolSpec,
-    agent_home_sifs_path_for_id, default_agent_tool_descriptors, image_generation_descriptor,
-    web_search_descriptor,
-};
-use sinomo_cli::app_api::{
-    AgentSummary, ProviderSummary, SkillDetail, SkillMutationResult, SkillSummary, agent_summaries,
-    built_in_agent_summaries,
-};
+#[cfg(not(test))]
+use sinomo_client::SkillClient;
+use sinomo_client::chat_contract::fallback_agent_summaries;
+#[cfg(not(test))]
+use sinomo_client::skill_contract::{SkillActivateRequest, SkillExportRequest, SkillImportRequest};
+use sinomo_client::skill_contract::{SkillDetail, SkillMutationResult, SkillSummary};
 use sui::{
     Align, Alignment, ArrangeCtx, Checkbox, Command, ConstraintQuery, ConstraintView, Constraints,
     ContextMenu, ControlSize, DefaultTheme, Event, EventCtx, EventPhase, FieldGroup,
@@ -60,26 +56,30 @@ use sinomo_runtime::dfs::{
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::node::LocalNodePermissions;
+#[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
 
 use crate::backend::Backend;
 use crate::backend::agents::{
-    AgentConfigSnapshot, AgentConfigSummary, AgentReadiness, AgentValidationReport,
-    agent_definition_is_editable, agent_role_label, agent_source_label,
-    built_in_agent_config_snapshot,
+    AgentConfigSnapshot, AgentConfigSummary, AgentDefinition, AgentMcpProtocolEra,
+    AgentMcpServerDefinition, AgentOutputFormat, AgentPackageDefinition, AgentReadiness, AgentRole,
+    AgentToolDescriptor, AgentToolInvocationMode, AgentToolSpec, AgentValidationReport,
+    agent_definition_is_editable, agent_home_sifs_path_for_id, agent_role_label,
+    agent_source_label, built_in_agent_config_snapshot, fallback_agent_tool_descriptors,
 };
+use crate::backend::chat_engine::{AgentSummary, ProviderSummary};
 use crate::backend::cluster::{AppClusterInvite, AppClusterStatus, ClusterSnapshot};
 use crate::backend::config::{
     CONFIGURABLE_PROVIDERS, ConfigEditKind, ConfigItem, ProviderForm, REASONING_EFFORT_OPTIONS,
     TEXT_VERBOSITY_OPTIONS, add_provider_account, cluster_provider_summaries, load_provider_health,
-    mark_provider_health_stale, provider_default_model, provider_display_name, provider_forms,
-    provider_requires_api_key, reasoning_effort_index, remove_provider_account,
-    remove_provider_health, resolve_items, run_provider_device_login, set_bool,
-    set_provider_api_key, set_provider_auto_compact_token_limit, set_provider_base_url,
-    set_provider_chat_default, set_provider_effort, set_provider_enabled,
-    set_provider_max_context_tokens, set_provider_model, set_provider_reasoning_budget,
-    set_provider_text_verbosity, set_provider_vendor_options, set_value, test_provider_connection,
-    text_verbosity_index,
+    mark_provider_health_stale, provider_capabilities, provider_default_model,
+    provider_display_name, provider_forms, provider_requires_api_key, provider_uses_device_login,
+    reasoning_effort_index, remove_provider_account, remove_provider_health, resolve_items,
+    run_provider_device_login, set_bool, set_provider_api_key,
+    set_provider_auto_compact_token_limit, set_provider_base_url, set_provider_chat_default,
+    set_provider_effort, set_provider_enabled, set_provider_max_context_tokens, set_provider_model,
+    set_provider_reasoning_budget, set_provider_text_verbosity, set_provider_vendor_options,
+    set_value, test_provider_connection, text_verbosity_index,
 };
 use crate::backend::modules::{ModuleConfigSnapshot, ModuleObservedState, module_ids_match};
 use crate::backend::mounts::{
@@ -1695,6 +1695,23 @@ impl SettingsState {
         let provider_health = provider_health_states(load_provider_health(config.as_ref()));
         let data_dir = backend.data_dir.clone();
         let skills_include_all = true;
+        #[cfg(not(test))]
+        let skill_address = backend.connection.daemon_address().map(str::to_string);
+        #[cfg(not(test))]
+        let (skills, skill_selected, skill_detail, skill_action_error) = match skill_address
+            .ok_or_else(|| "skill catalog requires a daemon connection".to_string())
+            .and_then(|address| {
+                crate::backend::run_with_timeout("skill-catalog", sifs_timeout, move || {
+                    load_initial_skill_state_from_client(&address, skills_include_all)
+                })
+            }) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "settings skill catalog load degraded");
+                (Vec::new(), None, None, Some(error))
+            }
+        };
+        #[cfg(test)]
         let (skills, skill_selected, skill_detail, skill_action_error) =
             match backend.catalog_read_vfs().and_then(|catalog_vfs| {
                 crate::backend::run_with_timeout("skill-catalog", sifs_timeout, move || {
@@ -1702,10 +1719,7 @@ impl SettingsState {
                 })
             }) {
                 Ok(state) => state,
-                Err(error) => {
-                    tracing::warn!(%error, "settings skill catalog load degraded");
-                    (Vec::new(), None, None, Some(error))
-                }
+                Err(error) => (Vec::new(), None, None, Some(error)),
             };
         let agent_backend = backend.clone();
         let agent_snapshot =
@@ -1743,7 +1757,7 @@ impl SettingsState {
         } else {
             match &backend.connection {
                 crate::backend::Connection::Daemon(status)
-                | crate::backend::Connection::InProcessDaemon(status) => {
+                | crate::backend::Connection::AppOwnedDaemon(status) => {
                     let summary = status.cluster.as_ref().map(|cluster| {
                         format!(
                             "cluster {} · {:?}",
@@ -1864,7 +1878,7 @@ impl SettingsState {
         } else {
             match &backend.connection {
                 crate::backend::Connection::Daemon(status)
-                | crate::backend::Connection::InProcessDaemon(status) => {
+                | crate::backend::Connection::AppOwnedDaemon(status) => {
                     let summary = status.cluster.as_ref().map(|cluster| {
                         format!(
                             "cluster {} · {:?}",
@@ -3378,7 +3392,10 @@ impl SettingsState {
     }
 
     fn add_selected_agent_tool(&mut self) {
-        let available = available_agent_tool_specs(&self.agent_form.definition.tools);
+        let available = available_agent_tool_specs(
+            &self.agent_snapshot.available_tools,
+            &self.agent_form.definition.tools,
+        );
         let Some(spec) = available.get(self.agent_form.tool_add_index).cloned() else {
             return;
         };
@@ -3477,7 +3494,7 @@ impl SettingsState {
     }
 
     fn provider_add_uses_device_login(&self) -> bool {
-        sinomo_cli::provider_uses_device_login(self.provider_add_provider())
+        provider_uses_device_login(self.provider_add_provider())
     }
 
     fn provider_add_requires_api_key(&self) -> bool {
@@ -4510,13 +4527,7 @@ fn execute_settings_operation(
             None,
         )),
         SettingsOperation::ImportSkill { path } => SettingsOperationPayload::Skills((|| {
-            let result = sinomo_cli::app_api::import_skill(
-                backend.data_dir.as_ref(),
-                &path,
-                None,
-                None,
-                false,
-            )?;
+            let result = import_skill_for_backend(backend, path, false)?;
             load_skill_operation_success(
                 backend,
                 true,
@@ -4530,13 +4541,8 @@ fn execute_settings_operation(
             output,
             include_all,
         } => SettingsOperationPayload::Skills((|| {
-            let catalog_vfs = backend.catalog_read_vfs()?;
-            let result = sinomo_cli::app_api::export_skill(
-                &catalog_vfs,
-                &skill_id,
-                Some(&version),
-                Some(&output),
-            )?;
+            let result =
+                export_skill_for_backend(backend, skill_id.clone(), version.clone(), output)?;
             load_skill_operation_success(
                 backend,
                 include_all,
@@ -4549,11 +4555,7 @@ fn execute_settings_operation(
             version,
             include_all,
         } => SettingsOperationPayload::Skills((|| {
-            let result = sinomo_cli::app_api::activate_skill(
-                backend.data_dir.as_ref(),
-                &skill_id,
-                Some(&version),
-            )?;
+            let result = activate_skill_for_backend(backend, skill_id, version)?;
             load_skill_operation_success(
                 backend,
                 include_all,
@@ -4630,18 +4632,40 @@ fn agent_operation_success(
     selected_id: Option<&str>,
     effect: AgentOperationEffect,
 ) -> AgentOperationSuccess {
+    let snapshot = backend.agent_config_snapshot(selected_id);
+    let chat_agents = agent_summaries_from_snapshot(&snapshot);
     AgentOperationSuccess {
-        snapshot: backend.agent_config_snapshot(selected_id),
-        chat_agents: agent_summaries_for_backend(backend),
+        snapshot,
+        chat_agents,
         effect,
     }
 }
 
+fn agent_summaries_from_snapshot(snapshot: &AgentConfigSnapshot) -> Vec<AgentSummary> {
+    let agents = snapshot
+        .agents
+        .iter()
+        .filter(|agent| matches!(agent.role.as_str(), "main" | "deliberation"))
+        .map(|agent| AgentSummary {
+            key: agent.id.clone(),
+            name: agent.name.clone(),
+            description: agent.description.clone(),
+            tool_runtime: sinomo_client::chat_contract::ChatToolRuntimeSelection {
+                sandbox_node_id: agent.sandbox_node_id.clone(),
+                workspace_root: None,
+            },
+        })
+        .collect::<Vec<_>>();
+    if agents.is_empty() {
+        fallback_agent_summaries()
+    } else {
+        agents
+    }
+}
+
+#[cfg(test)]
 fn agent_summaries_for_backend(backend: &Backend) -> Vec<AgentSummary> {
-    backend
-        .catalog_read_vfs()
-        .map(|vfs| agent_summaries(&vfs))
-        .unwrap_or_else(|_| built_in_agent_summaries())
+    agent_summaries_from_snapshot(&backend.agent_config_snapshot(None))
 }
 
 fn module_operation_success(
@@ -4671,8 +4695,7 @@ fn load_skill_operation_success(
     selected: Option<(String, String)>,
     message: Option<String>,
 ) -> Result<SkillOperationSuccess, String> {
-    let catalog_vfs = backend.catalog_read_vfs()?;
-    let skills = sinomo_cli::app_api::skill_summaries(&catalog_vfs, include_all)?;
+    let skills = list_skills_for_backend(backend, include_all)?;
     let selected = selected
         .filter(|(id, version)| {
             skills
@@ -4685,11 +4708,7 @@ fn load_skill_operation_success(
                 .map(|skill| (skill.id.clone(), skill.version.clone()))
         });
     let detail = match selected.as_ref() {
-        Some((id, version)) => Some(sinomo_cli::app_api::skill_detail(
-            &catalog_vfs,
-            id,
-            Some(version),
-        )?),
+        Some((id, version)) => Some(skill_detail_for_backend(backend, id, version)?),
         None => None,
     };
     Ok(SkillOperationSuccess {
@@ -4700,6 +4719,147 @@ fn load_skill_operation_success(
     })
 }
 
+#[cfg(not(test))]
+fn skill_client_for_backend(backend: &Backend) -> Result<SkillClient, String> {
+    backend
+        .connection
+        .daemon_address()
+        .map(SkillClient::at_address)
+        .ok_or_else(|| "skill catalog requires a daemon connection".to_string())
+}
+
+fn list_skills_for_backend(
+    backend: &Backend,
+    include_all: bool,
+) -> Result<Vec<SkillSummary>, String> {
+    #[cfg(test)]
+    {
+        return backend
+            .catalog_read_vfs()
+            .and_then(|vfs| sinomo_cli::app_api::skill_summaries(&vfs, include_all));
+    }
+    #[cfg(not(test))]
+    skill_client_for_backend(backend)?
+        .list(include_all)
+        .map_err(|error| error.to_string())
+}
+
+fn skill_detail_for_backend(
+    backend: &Backend,
+    skill_id: &str,
+    version: &str,
+) -> Result<SkillDetail, String> {
+    #[cfg(test)]
+    {
+        return backend
+            .catalog_read_vfs()
+            .and_then(|vfs| sinomo_cli::app_api::skill_detail(&vfs, skill_id, Some(version)));
+    }
+    #[cfg(not(test))]
+    skill_client_for_backend(backend)?
+        .detail(skill_id, Some(version.to_string()))
+        .map_err(|error| error.to_string())
+}
+
+fn import_skill_for_backend(
+    backend: &Backend,
+    path: PathBuf,
+    activate: bool,
+) -> Result<SkillMutationResult, String> {
+    #[cfg(test)]
+    {
+        return sinomo_cli::app_api::import_skill(
+            backend.data_dir.as_ref(),
+            &path,
+            None,
+            None,
+            activate,
+        );
+    }
+    #[cfg(not(test))]
+    skill_client_for_backend(backend)?
+        .import(SkillImportRequest {
+            path,
+            skill_id: None,
+            version: None,
+            activate,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn export_skill_for_backend(
+    backend: &Backend,
+    skill_id: String,
+    version: String,
+    output: PathBuf,
+) -> Result<SkillMutationResult, String> {
+    #[cfg(test)]
+    {
+        return backend.catalog_read_vfs().and_then(|vfs| {
+            sinomo_cli::app_api::export_skill(&vfs, &skill_id, Some(&version), Some(&output))
+        });
+    }
+    #[cfg(not(test))]
+    skill_client_for_backend(backend)?
+        .export(SkillExportRequest {
+            skill_id,
+            version: Some(version),
+            output: Some(output),
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn activate_skill_for_backend(
+    backend: &Backend,
+    skill_id: String,
+    version: String,
+) -> Result<SkillMutationResult, String> {
+    #[cfg(test)]
+    {
+        return sinomo_cli::app_api::activate_skill(
+            backend.data_dir.as_ref(),
+            &skill_id,
+            Some(&version),
+        );
+    }
+    #[cfg(not(test))]
+    skill_client_for_backend(backend)?
+        .activate(SkillActivateRequest {
+            skill_id,
+            version: Some(version),
+        })
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(test))]
+fn load_initial_skill_state_from_client(
+    daemon_address: &str,
+    include_all: bool,
+) -> (
+    Vec<SkillSummary>,
+    Option<(String, String)>,
+    Option<SkillDetail>,
+    Option<String>,
+) {
+    let client = SkillClient::at_address(daemon_address);
+    let skills = match client.list(include_all) {
+        Ok(skills) => skills,
+        Err(error) => return (Vec::new(), None, None, Some(error.to_string())),
+    };
+    let selected = skills
+        .first()
+        .map(|skill| (skill.id.clone(), skill.version.clone()));
+    let detail = match selected.as_ref() {
+        Some((skill_id, version)) => match client.detail(skill_id, Some(version.clone())) {
+            Ok(detail) => Some(detail),
+            Err(error) => return (skills, selected, None, Some(error.to_string())),
+        },
+        None => None,
+    };
+    (skills, selected, detail, None)
+}
+
+#[cfg(test)]
 fn load_initial_skill_state(
     catalog_vfs: &VfsHandle,
     include_all: bool,
@@ -5394,20 +5554,17 @@ fn agent_catalog_row(shared: &Shared, agent: &AgentConfigSummary) -> TrailingSlo
         .gap(8.0)
 }
 
-fn configurable_agent_tool_descriptors() -> Vec<AgentToolDescriptor> {
-    let mut descriptors = default_agent_tool_descriptors();
-    descriptors.extend([web_search_descriptor(), image_generation_descriptor()]);
-    descriptors
-}
-
-fn available_agent_tool_specs(selected: &[AgentToolSpec]) -> Vec<AgentToolSpec> {
+fn available_agent_tool_specs(
+    descriptors: &[AgentToolDescriptor],
+    selected: &[AgentToolSpec],
+) -> Vec<AgentToolSpec> {
     let selected_names = selected
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
-    let mut tools = configurable_agent_tool_descriptors()
-        .into_iter()
-        .map(|descriptor| descriptor.spec)
+    let mut tools = descriptors
+        .iter()
+        .map(|descriptor| descriptor.spec.clone())
         .filter(|tool| !selected_names.contains(tool.name.as_str()))
         .collect::<Vec<_>>();
     tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -5487,7 +5644,7 @@ fn provider_model_label(form: &ProviderForm) -> String {
 }
 
 fn provider_capabilities_summary(provider: &str) -> String {
-    let capabilities = sinomo_lm::provider_capabilities(provider);
+    let capabilities = provider_capabilities(provider);
     let mut labels = Vec::new();
     if capabilities.responses_http {
         labels.push("Responses API");
@@ -10458,6 +10615,7 @@ fn agent_catalog_summary_host(
         let catalog = AgentConfigSnapshot {
             agents,
             selected_agent: None,
+            available_tools: Vec::new(),
             error,
         };
         let mut rows = FieldGroup::new()
@@ -10817,7 +10975,10 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
             tools = tools.with_child(agent_tool_editor_row(shared, reader, tool));
         }
     }
-    let available_tools = available_agent_tool_specs(&form.definition.tools);
+    let available_tools = available_agent_tool_specs(
+        &shared.settings().agent_snapshot.available_tools,
+        &form.definition.tools,
+    );
     if !available_tools.is_empty() {
         let names = available_tools
             .iter()
@@ -11510,15 +11671,13 @@ fn agent_tool_editor_row(shared: &Shared, reader: &ThemeReader, tool: AgentToolS
 }
 
 fn agent_tool_invocation_mode_label(tool_name: &str) -> &'static str {
-    let descriptor = configurable_agent_tool_descriptors()
-        .into_iter()
-        .find(|descriptor| descriptor.spec.name == tool_name);
-    let turn_based = descriptor.as_ref().is_some_and(|descriptor| {
-        descriptor.supports_invocation_mode(AgentToolInvocationMode::TurnBased)
-    });
-    let realtime = descriptor.as_ref().is_some_and(|descriptor| {
-        descriptor.supports_invocation_mode(AgentToolInvocationMode::Realtime)
-    });
+    let modes = fallback_agent_tool_descriptors()
+        .iter()
+        .find(|descriptor| descriptor.spec.name == tool_name)
+        .map(|descriptor| descriptor.invocation_modes.clone())
+        .unwrap_or_default();
+    let turn_based = modes.contains(&AgentToolInvocationMode::TurnBased);
+    let realtime = modes.contains(&AgentToolInvocationMode::Realtime);
     match (turn_based, realtime) {
         (true, true) => "Chat + voice",
         (false, true) => "Voice",
@@ -16960,7 +17119,7 @@ mod tests {
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Codex".to_string(),
             models: vec!["gpt-5.4".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("codex"),
+            capabilities: provider_capabilities("codex"),
         };
 
         let mut current = SettingsState::new_lightweight(&backend);
@@ -17942,11 +18101,14 @@ mod tests {
         state.set_agent_home_server_node_id("home-node".to_string());
         state.set_agent_skills_text("docs.skill\nreview.skill".to_string());
         let default_tool_count = state.agent_form.definition.tools.len();
-        let added_tool = available_agent_tool_specs(&state.agent_form.definition.tools)
-            .get(state.agent_form.tool_add_index)
-            .expect("an additional agent tool")
-            .name
-            .clone();
+        let added_tool = available_agent_tool_specs(
+            &state.agent_snapshot.available_tools,
+            &state.agent_form.definition.tools,
+        )
+        .get(state.agent_form.tool_add_index)
+        .expect("an additional agent tool")
+        .name
+        .clone();
         state.add_selected_agent_tool();
 
         let operation = state.agent_save_operation().expect("save operation");
@@ -18092,7 +18254,7 @@ mod tests {
                 "Chat + voice"
             );
         }
-        let available = available_agent_tool_specs(&[]);
+        let available = available_agent_tool_specs(&fallback_agent_tool_descriptors(), &[]);
         assert!(available.iter().any(|tool| tool.name == "web_search"));
         assert!(available.iter().any(|tool| tool.name == "image_generation"));
     }
@@ -19336,7 +19498,7 @@ mod tests {
         state.set_provider_add_provider(
             CONFIGURABLE_PROVIDERS
                 .iter()
-                .position(|provider| sinomo_cli::provider_uses_device_login(provider))
+                .position(|provider| provider_uses_device_login(provider))
                 .expect("device-login provider"),
         );
         assert!(

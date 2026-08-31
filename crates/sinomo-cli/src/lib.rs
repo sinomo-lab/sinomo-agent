@@ -711,14 +711,22 @@ fn cli_fetch_cluster_health_rows_from_member(
     None
 }
 
+mod agent_management_service;
+mod chat_service;
 mod commands;
 mod completion;
 mod dfs_mount_supervisor;
 mod file_manager;
 mod sifs_file_manager;
+mod skill_service;
 mod sobj_file_preview;
+pub use agent_management_service::register_hosted_agent_management_service;
+pub use chat_service::register_hosted_chat_service;
+mod evolution_service;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
+pub use evolution_service::register_hosted_evolution_service;
+pub use skill_service::register_hosted_skill_service;
 
 /// Application-host integration for one node-local supervised SIFS mount.
 ///
@@ -729,6 +737,46 @@ pub fn sifs_mount_supervisor_component_factory(
     daemon_paths: sinomo_runtime::daemon::DaemonPaths,
 ) -> sinomo_runtime::daemon::DaemonComponentFactory {
     dfs_mount_supervisor::sifs_mount_supervisor_component_factory(data_dir, daemon_paths)
+}
+
+/// Full daemon-hosted agent and interactive-chat service component shared by standalone and
+/// app-owned daemon products.
+pub fn hosted_agent_chat_component_factory(
+    daemon_address: impl Into<String>,
+) -> Result<sinomo_runtime::daemon::DaemonComponentFactory, String> {
+    let daemon_address = daemon_address.into();
+    let factory = sinomo_runtime::module::StaticComponentFactory::new(
+        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
+        move |_, scope| {
+            let runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
+            let control_host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
+                Arc::new(runtime_control.clone());
+            let services = sinomo_agent::register_services_with_runtime_control(
+                sinomo_runtime::service::ServiceRegistry::builder(),
+                control_host,
+            );
+            let services =
+                register_hosted_chat_service(services, daemon_address.clone(), runtime_control);
+            let services = register_hosted_evolution_service(services);
+            let services = register_hosted_skill_service(services, daemon_address.clone());
+            let services =
+                register_hosted_agent_management_service(services, daemon_address.clone());
+            scope.set_services(services.build());
+            scope.on_host_start(sinomo_agent::register_observe_metric_exporters);
+            Ok(())
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .with_config_definitions(register_hosted_agent_chat_config_definitions);
+    Ok(Arc::new(factory))
+}
+
+fn register_hosted_agent_chat_config_definitions(
+    builder: sinomo_runtime::config::ConfigRegistryBuilder,
+) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
+    let builder =
+        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
+    register_cli_runtime_config_definitions(builder)
 }
 
 thread_local! {
@@ -5914,6 +5962,14 @@ pub(crate) fn ensure_cluster_directory_installed() {
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
     run_parsed_cli_invocation(parse_cli_invocation(&args)?)
+}
+
+/// Host the full main-daemon product catalog in a foreground process whose external wrapper owns
+/// its lifetime. This is intentionally separate from CLI parsing so the graphical app's sibling
+/// daemon executable does not masquerade as a general command-line surface.
+pub fn run_app_owned_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
+    ensure_cluster_directory_installed();
+    commands::run_app_owned_daemon_host(options)
 }
 
 fn run_cli_command(args: &[String]) -> Result<(), CliError> {

@@ -6,7 +6,6 @@
 
 use sinomo_runtime::module::ModuleRuntimeConfigSource;
 use sinomo_runtime::node::{LocalNodePermissionStore, LocalNodePermissions};
-use sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID;
 
 use crate::backend::Backend;
 use crate::backend::modules::{
@@ -14,6 +13,7 @@ use crate::backend::modules::{
 };
 
 pub const REMOTE_MANAGEMENT_ALLOW_COMMAND: &str = "sinomo node permissions allow remote-management";
+pub const REMOTE_MANAGEMENT_MODULE_ID: &str = "module.remote-management";
 pub const REMOTE_MANAGEMENT_DENY_COMMAND: &str = "sinomo node permissions deny remote-management";
 pub const EXTERNAL_INTEGRATIONS_ALLOW_COMMAND: &str =
     "sinomo node permissions allow external-integrations";

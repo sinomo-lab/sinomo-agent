@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_client::api::DaemonApiClient;
 use sinomo_runtime::config::{
     CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY, CONFIG_SET_ROUTE, ConfigGetRequest, ConfigGetResponse,
     ConfigSetRequest, ConfigSetResponse, ConfigWriteTarget,
@@ -23,6 +23,7 @@ use sinomo_runtime::network::{ClusterPaths, ObjectRpcRequest};
 use sinomo_runtime::node::NodeId;
 
 use crate::backend::Backend;
+use crate::backend::remote_management::REMOTE_MANAGEMENT_MODULE_ID;
 
 const MODULE_CONFIG_RPC_TIMEOUT: Duration = Duration::from_secs(8);
 static LOCAL_MODULE_OVERRIDE_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -437,18 +438,13 @@ impl Backend {
         );
         insert_module_summary(
             &mut modules,
-            sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID,
+            REMOTE_MANAGEMENT_MODULE_ID,
             "native-dylib",
             "Privileged node administration module",
         );
         let remote_management_module = modules
             .keys()
-            .find(|module_id| {
-                module_ids_match(
-                    module_id,
-                    sinomo_runtime::remote_management::REMOTE_MANAGEMENT_MODULE_ID,
-                )
-            })
+            .find(|module_id| module_ids_match(module_id, REMOTE_MANAGEMENT_MODULE_ID))
             .cloned();
         if let Some(module) = remote_management_module
             .as_ref()
@@ -673,7 +669,7 @@ impl Backend {
                 &target_node_id,
                 inner,
                 MODULE_CONFIG_RPC_TIMEOUT,
-                sinomo_runtime::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                sinomo_client::api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
             )
             .map_err(|error| error.to_string())?;
         response.decode_body().map_err(|error| error.to_string())

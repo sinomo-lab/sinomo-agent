@@ -1,12 +1,16 @@
 //! Explicit R1 runtime boundary facade.
 //!
 //! R2 service crates should treat this crate as the public foundation surface
-//! for trusted runtime contracts. The facade aggregates the R0 boundary
-//! (`sinomo-core`) plus the R1 crates; it must never depend on R2 service or
+//! for trusted runtime contracts. The `client` profile exposes only contracts
+//! and local daemon clients; the default `host` profile aggregates the complete
+//! R0/R1 implementation set. The facade must never depend on R2 service or
 //! application crates, and it reaches R0 exclusively through `sinomo-core`.
 //!
 //! The crate does not add behavior. It makes the trust-ring cut visible in the
 //! Cargo graph and gives architecture tests one concrete boundary to enforce.
+
+#[cfg(not(feature = "client"))]
+compile_error!("sinomo-runtime requires either the `client` or default `host` feature profile");
 
 /// R0 cluster foundation, re-exported from the `sinomo-core` boundary facade.
 ///
@@ -29,34 +33,53 @@ pub mod r0 {
 /// but R1 crates must not depend back on R2 service crates.
 pub mod r1 {
     pub use sinomo_api as api;
+    #[cfg(feature = "host")]
     pub use sinomo_build as build;
+    #[cfg(feature = "host")]
     pub use sinomo_cli_registry as cli_registry;
     pub use sinomo_config as config;
+    #[cfg(feature = "host")]
     pub use sinomo_daemon as daemon;
+    #[cfg(feature = "device-client")]
     pub use sinomo_device as device;
     pub use sinomo_dfs as dfs;
+    #[cfg(feature = "dfs-nfs-client")]
     pub use sinomo_dfs_nfs as dfs_nfs;
+    #[cfg(feature = "host")]
     pub use sinomo_eval as eval;
+    #[cfg(feature = "host")]
     pub use sinomo_installer as installer;
+    #[cfg(feature = "module-client")]
     pub use sinomo_module as module;
     pub use sinomo_module_api as module_api;
+    #[cfg(feature = "host")]
     pub mod network_module {
         pub use sinomo_daemon::registry::{
             network_module_capabilities, network_module_id, network_module_registration,
             network_module_surfaces,
         };
     }
+    #[cfg(feature = "observe-client")]
     pub use sinomo_observe as observe;
+    #[cfg(feature = "host")]
     pub use sinomo_policy as policy;
+    #[cfg(feature = "host")]
     pub use sinomo_registry as registry;
+    #[cfg(feature = "host")]
     pub use sinomo_remote_management as remote_management;
+    #[cfg(feature = "host")]
     pub use sinomo_rollout as rollout;
     // The sandbox crate owns both its provider-neutral protocol and the typed
     // client that binds that protocol to the generic component loader.
+    #[cfg(feature = "host")]
     pub use sinomo_sandbox as sandbox;
+    #[cfg(feature = "host")]
     pub use sinomo_sandbox_simple as sandbox_simple;
+    #[cfg(feature = "host")]
     pub use sinomo_supervision as supervision;
+    #[cfg(feature = "host")]
     pub use sinomo_test as test;
+    #[cfg(feature = "host")]
     pub mod vfs {
         pub use sinomo_vfs::*;
         pub use sinomo_vfs_sifs::{
@@ -68,6 +91,7 @@ pub mod r1 {
 
     pub use sinomo_core::{cluster, events, kv, local, network, node, service};
 
+    #[cfg(feature = "host")]
     pub mod storage {
         pub use sinomo_core::storage::*;
         pub use sinomo_daemon::registry::{
@@ -76,6 +100,7 @@ pub mod r1 {
         };
     }
 
+    #[cfg(feature = "host")]
     pub mod modules {
         pub use sinomo_daemon::registry::{
             InternalModuleTable, ModuleRegistration, ModuleRegistry, ModuleRegistryError,
@@ -91,13 +116,23 @@ pub mod r1 {
 
 pub use r0::cluster;
 pub use r0::{core, object};
+#[cfg(feature = "device-client")]
+pub use r1::device;
+#[cfg(feature = "dfs-nfs-client")]
+pub use r1::dfs_nfs;
+#[cfg(feature = "module-client")]
+pub use r1::module;
+#[cfg(feature = "observe-client")]
+pub use r1::observe;
+pub use r1::{api, config, dfs, module_api};
+#[cfg(feature = "host")]
 pub use r1::{
-    api, build, cli_registry, config, daemon, device, dfs, dfs_nfs, eval, events, installer, kv,
-    local, module, module_api, modules, network, network_module, node, observe, policy, registry,
-    remote_management, rollout, sandbox, sandbox_simple, service, storage, supervision, test, vfs,
+    build, cli_registry, daemon, eval, installer, modules, network_module, policy, registry,
+    remote_management, rollout, sandbox, sandbox_simple, storage, supervision, test, vfs,
 };
+pub use r1::{events, kv, local, network, node, service};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "host"))]
 mod tests {
     use super::modules::{
         internal_module_registry, internal_module_table,

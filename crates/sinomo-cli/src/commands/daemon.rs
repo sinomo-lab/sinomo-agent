@@ -227,6 +227,28 @@ pub(crate) fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     run_daemon_with_paths(options, DaemonPaths::new(&data_dir), "daemon", registration)
 }
 
+/// Run the main daemon as a foreground child owned by the graphical app.
+///
+/// The process lifecycle is supplied by the small `sinomo-app-daemon` wrapper; this function
+/// deliberately changes only the product host role. It keeps the same data directory, lock,
+/// cluster identity, service routes, and authority paths as a normal main daemon.
+pub(crate) fn run_app_owned_daemon_host(options: DaemonRunOptions) -> Result<(), CliError> {
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    data_dir.ensure_root_layout()?;
+    let registration = daemon_cluster_registration_if_initialized(daemon_cluster_registration(
+        DaemonClusterProcess::Main,
+        options.clone(),
+        DaemonRunOptions::shadow_default(),
+    ))?;
+    run_daemon_with_paths_and_profile(
+        options,
+        DaemonPaths::new(&data_dir),
+        "daemon",
+        registration,
+        sinomo_product_profile::ProductComponentProfile::embedded,
+    )
+}
+
 pub(crate) fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     daemon_sleep_for_shadow_start_delay()?;
     let data_dir = SinomoDataDir::from_env_or_home()?;
@@ -308,6 +330,22 @@ pub(crate) fn run_daemon_with_paths(
     label: &str,
     registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
+    run_daemon_with_paths_and_profile(options, paths, label, registration, |cluster_initialized| {
+        if label == "daemon" {
+            sinomo_product_profile::ProductComponentProfile::main(cluster_initialized)
+        } else {
+            sinomo_product_profile::ProductComponentProfile::shadow(cluster_initialized)
+        }
+    })
+}
+
+fn run_daemon_with_paths_and_profile(
+    options: DaemonRunOptions,
+    paths: DaemonPaths,
+    label: &str,
+    registration: Option<DaemonClusterRegistration>,
+    product_profile: impl FnOnce(bool) -> sinomo_product_profile::ProductComponentProfile,
+) -> Result<(), CliError> {
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
@@ -316,18 +354,17 @@ pub(crate) fn run_daemon_with_paths(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let data_dir = SinomoDataDir::new(data_dir);
-    let profile = if label == "daemon" {
-        sinomo_product_profile::ProductComponentProfile::main(cluster.is_some())
-    } else {
-        sinomo_product_profile::ProductComponentProfile::shadow(cluster.is_some())
-    };
+    let profile = product_profile(cluster.is_some());
     let base_catalog =
         sinomo_product_profile::base_component_catalog(&data_dir, profile).map_err(|error| {
             CliError::Parse {
                 detail: format!("build daemon product component profile: {error}"),
             }
         })?;
-    let mut component_factories = vec![cli_agent_component_factory()?, audio_component_factory()?];
+    let mut component_factories = vec![
+        cli_agent_component_factory(&options)?,
+        audio_component_factory()?,
+    ];
     if label == "daemon" {
         component_factories.push(
             crate::dfs_mount_supervisor::sifs_mount_supervisor_component_factory(
@@ -346,34 +383,11 @@ pub(crate) fn run_daemon_with_paths(
         .map_err(Into::into)
 }
 
-fn register_daemon_component_config_definitions(
-    builder: sinomo_runtime::config::ConfigRegistryBuilder,
-) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
-    let builder =
-        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
-    register_cli_runtime_config_definitions(builder)
-}
-
-fn cli_agent_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError>
-{
-    let factory = sinomo_runtime::module::StaticComponentFactory::new(
-        sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
-        |_, scope| {
-            scope.set_services(
-                sinomo_agent::register_services(
-                    sinomo_runtime::service::ServiceRegistry::builder(),
-                )
-                .build(),
-            );
-            scope.on_host_start(sinomo_agent::register_observe_metric_exporters);
-            Ok(())
-        },
-    )
-    .map_err(|error| CliError::Parse {
-        detail: error.to_string(),
-    })?
-    .with_config_definitions(register_daemon_component_config_definitions);
-    Ok(Arc::new(factory))
+fn cli_agent_component_factory(
+    options: &DaemonRunOptions,
+) -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError> {
+    crate::hosted_agent_chat_component_factory(daemon_connect_address(&options.host, options.port))
+        .map_err(|detail| CliError::Parse { detail })
 }
 
 fn audio_component_factory() -> Result<sinomo_runtime::daemon::DaemonComponentFactory, CliError> {

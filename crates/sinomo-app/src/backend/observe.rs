@@ -9,7 +9,7 @@ use std::future::Future;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_client::api::DaemonApiClient;
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::node::NodeId;
 use sinomo_runtime::observe::{
@@ -122,7 +122,7 @@ impl Backend {
 
     fn observe_local_node_id(&self) -> Option<&NodeId> {
         match &self.connection {
-            Connection::Daemon(status) | Connection::InProcessDaemon(status) => {
+            Connection::Daemon(status) | Connection::AppOwnedDaemon(status) => {
                 status.cluster.as_ref().map(|cluster| &cluster.node_id)
             }
             Connection::LocalFallback { .. } => None,

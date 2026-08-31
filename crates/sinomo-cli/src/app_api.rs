@@ -7,6 +7,8 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+pub use sinomo_app_contract::chat::{AgentSummary, ProviderSummary};
+pub use sinomo_app_contract::skill::{SkillDetail, SkillMutationResult, SkillSummary};
 use sinomo_runtime::cluster;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -805,109 +807,6 @@ pub struct ChatControlState {
     /// so clients can render removable pending chips.
     pub queued_inputs: Vec<ChatQueuedTurnInput>,
     pub detail: Option<String>,
-}
-
-/// A selectable agent.
-#[derive(Clone, Debug)]
-pub struct AgentSummary {
-    pub key: String,
-    pub name: String,
-    pub description: String,
-    pub tool_runtime: ChatToolRuntimeSelection,
-}
-
-/// A skill catalog entry exposed to the GUI.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SkillSummary {
-    pub id: String,
-    pub version: String,
-    pub description: String,
-    pub source_kind: String,
-    pub source_id: Option<String>,
-    pub source_version: Option<String>,
-    pub active: bool,
-    pub status: String,
-    pub sifs_path: String,
-    pub content_hash: String,
-}
-
-impl SkillSummary {
-    fn from_entry(entry: &SkillCatalogEntry, active: bool) -> Self {
-        Self {
-            id: entry.skill_id.clone(),
-            version: entry.version.clone(),
-            description: entry.description.clone(),
-            source_kind: entry.source.kind.as_str().to_string(),
-            source_id: entry.source.source_id.clone(),
-            source_version: entry.source.source_version.clone(),
-            active,
-            status: entry.status.as_str().to_string(),
-            sifs_path: entry.sifs_path.clone(),
-            content_hash: entry.content_hash.clone(),
-        }
-    }
-}
-
-/// A full skill detail exposed to management surfaces.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SkillDetail {
-    pub summary: SkillSummary,
-    pub manifest_path: String,
-    pub base_hash: Option<String>,
-    pub license: Option<String>,
-    pub compatibility: Option<String>,
-    pub allowed_tools: Option<String>,
-    pub metadata: BTreeMap<String, String>,
-    pub resources: Vec<String>,
-    pub target_agents: Vec<String>,
-    pub model_families: Vec<String>,
-    pub activation_tags: Vec<String>,
-    pub required_capabilities: Vec<String>,
-    pub text: String,
-}
-
-impl SkillDetail {
-    fn from_entry(entry: &SkillCatalogEntry, active: bool, text: String) -> Self {
-        Self {
-            summary: SkillSummary::from_entry(entry, active),
-            manifest_path: entry.manifest_path.clone(),
-            base_hash: entry.base_hash.clone(),
-            license: entry.license.clone(),
-            compatibility: entry.compatibility.clone(),
-            allowed_tools: entry.allowed_tools.clone(),
-            metadata: entry.metadata.clone(),
-            resources: entry
-                .resources
-                .iter()
-                .map(|resource| resource.relative_path.clone())
-                .collect(),
-            target_agents: entry.target_agents.clone(),
-            model_families: entry.model_families.clone(),
-            activation_tags: entry.activation_tags.clone(),
-            required_capabilities: entry.required_capabilities.clone(),
-            text,
-        }
-    }
-}
-
-/// Result of importing, exporting, or activating a skill from the app.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SkillMutationResult {
-    pub status: String,
-    pub skill: SkillSummary,
-    pub path: Option<String>,
-    pub scope: Option<String>,
-}
-
-/// A selectable language-model provider with a small starter model list.
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct ProviderSummary {
-    pub id: String,
-    pub account: String,
-    pub name: String,
-    pub models: Vec<String>,
-    #[serde(default)]
-    pub capabilities: sinomo_lm::LanguageModelProviderCapabilities,
 }
 
 /// The app's current local cluster state, as plain strings.
@@ -7050,7 +6949,10 @@ fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
                 definition.name.clone()
             },
             description: definition.description.clone(),
-            tool_runtime: ChatToolRuntimeSelection::from_agent_definition(definition),
+            tool_runtime: sinomo_app_contract::chat::ChatToolRuntimeSelection {
+                sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
+                workspace_root: None,
+            },
         })
         .collect()
 }
@@ -7097,6 +6999,43 @@ fn resolve_agent(
 }
 
 /// List skills available to app management surfaces.
+fn skill_summary_from_entry(entry: &SkillCatalogEntry, active: bool) -> SkillSummary {
+    SkillSummary {
+        id: entry.skill_id.clone(),
+        version: entry.version.clone(),
+        description: entry.description.clone(),
+        source_kind: entry.source.kind.as_str().to_string(),
+        source_id: entry.source.source_id.clone(),
+        source_version: entry.source.source_version.clone(),
+        active,
+        status: entry.status.as_str().to_string(),
+        sifs_path: entry.sifs_path.clone(),
+        content_hash: entry.content_hash.clone(),
+    }
+}
+
+fn skill_detail_from_entry(entry: &SkillCatalogEntry, active: bool, text: String) -> SkillDetail {
+    SkillDetail {
+        summary: skill_summary_from_entry(entry, active),
+        manifest_path: entry.manifest_path.clone(),
+        base_hash: entry.base_hash.clone(),
+        license: entry.license.clone(),
+        compatibility: entry.compatibility.clone(),
+        allowed_tools: entry.allowed_tools.clone(),
+        metadata: entry.metadata.clone(),
+        resources: entry
+            .resources
+            .iter()
+            .map(|resource| resource.relative_path.clone())
+            .collect(),
+        target_agents: entry.target_agents.clone(),
+        model_families: entry.model_families.clone(),
+        activation_tags: entry.activation_tags.clone(),
+        required_capabilities: entry.required_capabilities.clone(),
+        text,
+    }
+}
+
 pub fn skill_summaries(
     catalog_vfs: &VfsHandle,
     include_all: bool,
@@ -7111,7 +7050,7 @@ pub fn skill_summaries(
     Ok(entries
         .into_iter()
         .map(|entry| {
-            SkillSummary::from_entry(entry, skill_entry_is_active_for_app(&catalog, entry))
+            skill_summary_from_entry(entry, skill_entry_is_active_for_app(&catalog, entry))
         })
         .collect())
 }
@@ -7134,7 +7073,7 @@ pub fn skill_detail(
                 entry.skill_id, entry.version, entry.sifs_path
             )
         })?;
-    Ok(SkillDetail::from_entry(
+    Ok(skill_detail_from_entry(
         &entry,
         skill_entry_is_active_for_app(&catalog, &entry),
         text,
@@ -7173,7 +7112,7 @@ pub fn import_skill(
         .map_err(|error| error.to_string())?;
     Ok(SkillMutationResult {
         status: "imported".to_string(),
-        skill: SkillSummary::from_entry(&entry, activate),
+        skill: skill_summary_from_entry(&entry, activate),
         path: Some(path.display().to_string()),
         scope: activate.then(|| SkillActivationScope::Cluster.as_str().to_string()),
     })
@@ -7217,7 +7156,7 @@ pub fn export_skill(
     }
     Ok(SkillMutationResult {
         status: "exported".to_string(),
-        skill: SkillSummary::from_entry(&entry, skill_entry_is_active_for_app(&catalog, &entry)),
+        skill: skill_summary_from_entry(&entry, skill_entry_is_active_for_app(&catalog, &entry)),
         path: output_path.map(|path| path.display().to_string()),
         scope: None,
     })
@@ -7239,7 +7178,7 @@ pub fn activate_skill(
         .map_err(|error| error.to_string())?;
     Ok(SkillMutationResult {
         status: "activated".to_string(),
-        skill: SkillSummary::from_entry(&entry, true),
+        skill: skill_summary_from_entry(&entry, true),
         path: None,
         scope: Some(scope.to_string()),
     })
@@ -7297,7 +7236,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "claude-sonnet-4-6".to_string(),
                 "claude-haiku-4-5".to_string(),
             ]),
-            capabilities: sinomo_lm::provider_capabilities("anthropic"),
+            capabilities: app_provider_capabilities("anthropic"),
         },
         ProviderSummary {
             id: "claude".to_string(),
@@ -7309,7 +7248,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "claude-sonnet-4-6".to_string(),
                 "claude-haiku-4-5".to_string(),
             ]),
-            capabilities: sinomo_lm::provider_capabilities("claude"),
+            capabilities: app_provider_capabilities("claude"),
         },
         ProviderSummary {
             id: "openai".to_string(),
@@ -7321,7 +7260,7 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "gpt-5.6-terra".to_string(),
                 "gpt-5.6-luna".to_string(),
             ]),
-            capabilities: sinomo_lm::provider_capabilities("openai"),
+            capabilities: app_provider_capabilities("openai"),
         },
         ProviderSummary {
             id: "gemini".to_string(),
@@ -7332,44 +7271,60 @@ pub fn provider_summaries() -> Vec<ProviderSummary> {
                 "gemini-2.5-pro".to_string(),
                 "gemini-2.5-flash".to_string(),
             ]),
-            capabilities: sinomo_lm::provider_capabilities("gemini"),
+            capabilities: app_provider_capabilities("gemini"),
         },
         ProviderSummary {
             id: "claude-code".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Claude Code (CLI)".to_string(),
             models: dedup(vec![ClaudeCodeConfig::default().model]),
-            capabilities: sinomo_lm::provider_capabilities("claude-code"),
+            capabilities: app_provider_capabilities("claude-code"),
         },
         ProviderSummary {
             id: "codex-cli".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Codex (CLI)".to_string(),
             models: dedup(vec![CodexCliConfig::default().model]),
-            capabilities: sinomo_lm::provider_capabilities("codex-cli"),
+            capabilities: app_provider_capabilities("codex-cli"),
         },
         ProviderSummary {
             id: "github-copilot".to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "GitHub Copilot".to_string(),
             models: dedup(vec![GitHubCopilotConfig::default().default_model]),
-            capabilities: sinomo_lm::provider_capabilities("github-copilot"),
+            capabilities: app_provider_capabilities("github-copilot"),
         },
         ProviderSummary {
             id: sinomo_lm::OLLAMA_PROVIDER_ID.to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "Ollama (local)".to_string(),
             models: vec![sinomo_lm::OLLAMA_DEFAULT_MODEL.to_string()],
-            capabilities: sinomo_lm::provider_capabilities(sinomo_lm::OLLAMA_PROVIDER_ID),
+            capabilities: app_provider_capabilities(sinomo_lm::OLLAMA_PROVIDER_ID),
         },
         ProviderSummary {
             id: sinomo_lm::LM_STUDIO_PROVIDER_ID.to_string(),
             account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "LM Studio (local)".to_string(),
             models: vec![sinomo_lm::LM_STUDIO_DEFAULT_MODEL.to_string()],
-            capabilities: sinomo_lm::provider_capabilities(sinomo_lm::LM_STUDIO_PROVIDER_ID),
+            capabilities: app_provider_capabilities(sinomo_lm::LM_STUDIO_PROVIDER_ID),
         },
     ]
+}
+
+fn app_provider_capabilities(provider: &str) -> sinomo_app_contract::chat::ProviderCapabilities {
+    let capabilities = sinomo_lm::provider_capabilities(provider);
+    sinomo_app_contract::chat::ProviderCapabilities {
+        responses_http: capabilities.responses_http,
+        responses_websocket: capabilities.responses_websocket,
+        realtime_websocket: capabilities.realtime_websocket,
+        realtime_webrtc: capabilities.realtime_webrtc,
+        web_search: capabilities.web_search,
+        image_generation: capabilities.image_generation,
+        image_editing: capabilities.image_editing,
+        transcription: capabilities.transcription,
+        local_model_management: capabilities.local_model_management,
+        mcp: capabilities.mcp,
+    }
 }
 
 /// Reasoning-effort values, lowest to highest.

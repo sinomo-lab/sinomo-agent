@@ -10,36 +10,76 @@ rust-version.workspace = true
 ring = "r1-boundary"
 
 [features]
-default = []
+default = ["host"]
+# Contract/client profile used by frontends and other non-authority-owning consumers.
+client = [
+    "dep:sinomo-api",
+    "dep:sinomo-config",
+    "dep:sinomo-core",
+    "dep:sinomo-dfs",
+    "sinomo-core/client",
+    "dep:sinomo-module-api",
+]
+# Native device contracts and process-local capture used by graphical clients.
+# This does not enable daemon, DFS, module-host, rollout, or sandbox implementations.
+device-client = ["client", "dep:sinomo-device"]
+module-client = ["client", "dep:sinomo-module"]
+observe-client = ["module-client", "dep:sinomo-observe"]
+dfs-nfs-client = ["module-client", "dep:sinomo-dfs-nfs"]
+# Complete trusted-runtime aggregation. This preserves the historical facade for daemon hosts,
+# R2 services, CLI applications, tests, and native module packages.
+host = [
+    "client",
+    "dep:sinomo-build",
+    "sinomo-core/host",
+    "dep:sinomo-cli-registry",
+    "dep:sinomo-daemon",
+    "device-client",
+    "dfs-nfs-client",
+    "dep:sinomo-eval",
+    "dep:sinomo-installer",
+    "module-client",
+    "observe-client",
+    "dep:sinomo-policy",
+    "dep:sinomo-registry",
+    "dep:sinomo-remote-management",
+    "dep:sinomo-rollout",
+    "dep:sinomo-sandbox",
+    "dep:sinomo-sandbox-simple",
+    "dep:sinomo-supervision",
+    "dep:sinomo-test",
+    "dep:sinomo-vfs",
+    "dep:sinomo-vfs-sifs",
+]
 # Enable sandbox execution through the native-module host loader. This does not
 # link the build-heavy WASIX engine.
-sandbox = ["sinomo-daemon/sandbox"]
-native-devices = ["sinomo-device/native-devices"]
+sandbox = ["host", "sinomo-daemon/sandbox"]
+native-devices = ["device-client", "sinomo-device/native-devices"]
 # Forwards the cluster test-support surface to application-crate tests.
-cluster-test-support = ["sinomo-core/cluster-test-support"]
+cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
 
 [dependencies]
-sinomo-api = { path = "../sinomo-api" }
-sinomo-build = { path = "../sinomo-build" }
-sinomo-cli-registry = { path = "../sinomo-cli-registry" }
-sinomo-config = { path = "../sinomo-config" }
-sinomo-core = { path = "../sinomo-core" }
-sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
-sinomo-device = { path = "../sinomo-device" }
-sinomo-dfs = { path = "../sinomo-dfs" }
-sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
-sinomo-eval = { path = "../sinomo-eval" }
-sinomo-installer = { path = "../sinomo-installer" }
-sinomo-module = { path = "../sinomo-module" }
-sinomo-module-api = { path = "../sinomo-module-api" }
-sinomo-observe = { path = "../sinomo-observe" }
-sinomo-policy = { path = "../sinomo-policy" }
-sinomo-registry = { path = "../sinomo-registry" }
-sinomo-remote-management = { path = "../sinomo-remote-management" }
-sinomo-rollout = { path = "../sinomo-rollout" }
-sinomo-sandbox = { path = "../sinomo-sandbox" }
-sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple" }
-sinomo-supervision = { path = "../sinomo-supervision" }
-sinomo-test = { path = "../sinomo-test" }
-sinomo-vfs = { path = "../sinomo-vfs" }
-sinomo-vfs-sifs = { path = "../sinomo-vfs-sifs" }
+sinomo-api = { path = "../sinomo-api", optional = true }
+sinomo-build = { path = "../sinomo-build", optional = true }
+sinomo-cli-registry = { path = "../sinomo-cli-registry", optional = true }
+sinomo-config = { path = "../sinomo-config", optional = true }
+sinomo-core = { path = "../sinomo-core", default-features = false, optional = true }
+sinomo-daemon = { path = "../sinomo-daemon", default-features = false, optional = true }
+sinomo-device = { path = "../sinomo-device", optional = true }
+sinomo-dfs = { path = "../sinomo-dfs", optional = true }
+sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs", optional = true }
+sinomo-eval = { path = "../sinomo-eval", optional = true }
+sinomo-installer = { path = "../sinomo-installer", optional = true }
+sinomo-module = { path = "../sinomo-module", optional = true }
+sinomo-module-api = { path = "../sinomo-module-api", optional = true }
+sinomo-observe = { path = "../sinomo-observe", optional = true }
+sinomo-policy = { path = "../sinomo-policy", optional = true }
+sinomo-registry = { path = "../sinomo-registry", optional = true }
+sinomo-remote-management = { path = "../sinomo-remote-management", optional = true }
+sinomo-rollout = { path = "../sinomo-rollout", optional = true }
+sinomo-sandbox = { path = "../sinomo-sandbox", optional = true }
+sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple", optional = true }
+sinomo-supervision = { path = "../sinomo-supervision", optional = true }
+sinomo-test = { path = "../sinomo-test", optional = true }
+sinomo-vfs = { path = "../sinomo-vfs", optional = true }
+sinomo-vfs-sifs = { path = "../sinomo-vfs-sifs", optional = true }

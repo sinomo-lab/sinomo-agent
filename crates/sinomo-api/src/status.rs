@@ -20,6 +20,17 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
+/// Current revision of the local daemon control protocol understood by first-party clients.
+///
+/// This is deliberately independent from the package version: compatible app and daemon builds
+/// may have different release versions, while an incompatible wire change must advance this
+/// value explicitly.
+pub const SINOMO_DAEMON_API_PROTOCOL_VERSION: u32 = 1;
+/// Environment variable set only on an app-owned daemon child. The value is observational
+/// process-instance identity, not an authority token.
+pub const SINOMO_APP_DAEMON_LAUNCH_ID_ENV: &str = "SINOMO_APP_DAEMON_LAUNCH_ID";
+/// Optional development/test override for the sibling app-daemon executable.
+pub const SINOMO_APP_DAEMON_BINARY_ENV: &str = "SINOMO_APP_DAEMON_BINARY";
 
 static DAEMON_BUILD_INFO: OnceLock<DaemonBuildInfo> = OnceLock::new();
 
@@ -117,6 +128,12 @@ pub struct DaemonStatus {
     pub host: String,
     pub port: u16,
     pub address: String,
+    #[serde(default = "initial_daemon_api_protocol_version")]
+    pub api_protocol_version: u32,
+    /// Present only for a daemon whose lifecycle is owned by one graphical app process.
+    /// Callers must also match the observed PID before treating the daemon as owned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_launch_id: Option<String>,
     #[serde(default = "daemon_package_version")]
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +168,11 @@ impl DaemonStatus {
             host: options.host.clone(),
             port: options.port,
             address: daemon_connect_address(&options.host, options.port),
+            api_protocol_version: SINOMO_DAEMON_API_PROTOCOL_VERSION,
+            app_launch_id: std::env::var(SINOMO_APP_DAEMON_LAUNCH_ID_ENV)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             version: daemon_package_version(),
             commit: daemon_git_commit(),
             target_os: Some(std::env::consts::OS.to_string()),
@@ -417,6 +439,8 @@ fn stale_daemon_lock_probe(paths: &DaemonPaths, status: Option<DaemonStatus>) ->
 
 fn daemon_status_matches_probe(expected: &DaemonStatus, actual: &DaemonStatus) -> bool {
     expected.pid == actual.pid
+        && expected.app_launch_id == actual.app_launch_id
+        && expected.api_protocol_version == actual.api_protocol_version
         && expected.data_dir == actual.data_dir
         && expected.lock_file == actual.lock_file
         && expected.port == actual.port
@@ -448,4 +472,33 @@ pub fn daemon_data_dir_from_paths(paths: &DaemonPaths) -> Result<&Path, DaemonAp
         path: paths.root.display().to_string(),
         detail: "daemon root has no parent data directory".to_string(),
     })
+}
+
+fn initial_daemon_api_protocol_version() -> u32 {
+    // Status records written before the explicit field was introduced speak the protocol now
+    // named revision 1. Future incompatible revisions must write their number explicitly.
+    SINOMO_DAEMON_API_PROTOCOL_VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_status_without_protocol_or_launch_identity_decodes_as_unowned() {
+        let paths = DaemonPaths::with_root(std::env::temp_dir().join("sinomo-api-status-legacy"));
+        let status = DaemonStatus::new(&DaemonRunOptions::default(), &paths, None);
+        let mut value = serde_json::to_value(status).expect("status JSON");
+        let object = value.as_object_mut().expect("status object");
+        object.remove("api_protocol_version");
+        object.remove("app_launch_id");
+
+        let decoded: DaemonStatus = serde_json::from_value(value).expect("legacy status");
+
+        assert_eq!(
+            decoded.api_protocol_version,
+            SINOMO_DAEMON_API_PROTOCOL_VERSION
+        );
+        assert_eq!(decoded.app_launch_id, None);
+    }
 }

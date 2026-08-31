@@ -5516,6 +5516,8 @@ mod tests {
             host: "127.0.0.1".to_string(),
             port: 21353,
             address: "127.0.0.1:21353".to_string(),
+            api_protocol_version: sinomo_api::SINOMO_DAEMON_API_PROTOCOL_VERSION,
+            app_launch_id: None,
             version: "0.1.0".to_string(),
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),

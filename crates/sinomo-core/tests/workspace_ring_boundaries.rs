@@ -225,6 +225,47 @@ fn r2_and_application_crates_cross_the_boundary_through_sinomo_runtime() {
 }
 
 #[test]
+fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
+    let packages = read_workspace_packages();
+    let app = packages
+        .get("sinomo-app")
+        .expect("sinomo-app package should exist");
+    let daemon_host = packages
+        .get("sinomo-app-daemon")
+        .expect("sinomo-app-daemon package should exist");
+    let client = packages
+        .get("sinomo-client")
+        .expect("sinomo-client package should exist");
+
+    assert_eq!(app.ring, "application");
+    assert_eq!(daemon_host.ring, "application");
+    assert_eq!(client.ring, "r2");
+    assert!(
+        app.dependencies.contains(&client.name),
+        "sinomo-app must reach daemon wire contracts through sinomo-client"
+    );
+    assert_eq!(
+        client.dependencies,
+        vec![
+            "sinomo-app-contract".to_string(),
+            "sinomo-runtime".to_string(),
+        ],
+        "sinomo-client may compose the R2 app contract but must reach workspace foundations only through sinomo-runtime"
+    );
+    assert!(
+        !app.dependencies.contains(&daemon_host.name),
+        "sinomo-app must discover the sibling daemon executable at runtime instead of linking its package"
+    );
+    assert!(
+        daemon_host.dependencies.contains(&"sinomo-cli".to_string())
+            && daemon_host
+                .dependencies
+                .contains(&"sinomo-runtime".to_string()),
+        "the dedicated daemon host, not the GUI, owns full product composition"
+    );
+}
+
+#[test]
 fn network_and_kv_stay_decoupled_through_the_cluster_crate() {
     // Optional dependencies are exempt only when every feature enabling them
     // is the dev-only `test-support` feature (or they are explicitly

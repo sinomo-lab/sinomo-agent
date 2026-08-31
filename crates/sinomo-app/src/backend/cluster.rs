@@ -6,8 +6,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-pub use sinomo_cli::app_api::{AppClusterInvite, AppClusterStatus};
-use sinomo_runtime::api::DaemonApiClient;
+use sinomo_client::api::DaemonApiClient;
+pub use sinomo_client::{AppClusterInvite, AppClusterStatus};
 use sinomo_runtime::cluster::ClusterHealthRow;
 use sinomo_runtime::core::{
     ClusterEndpointPrivacy, ClusterMemberRecord, ClusterMemberState, ClusterNodeAvailability,
@@ -92,7 +92,15 @@ pub struct ClusterLinkInfo {
 
 impl Backend {
     pub fn app_cluster_status(&self) -> AppClusterStatus {
-        sinomo_cli::app_api::cluster_status(self.data_dir.as_ref())
+        match &self.connection {
+            Connection::Daemon(status) | Connection::AppOwnedDaemon(status) => {
+                AppClusterStatus::from_daemon_status(status)
+            }
+            Connection::LocalFallback { reason } => AppClusterStatus {
+                error: reason.clone(),
+                ..AppClusterStatus::default()
+            },
+        }
     }
 
     /// Daemon-first cluster mutations: a client for the attached daemon's
@@ -140,14 +148,20 @@ impl Backend {
                 node_role: app_requested_cluster_node_role(),
             })
             .map_err(|error| error.to_string())?;
-        Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))
+        client
+            .status()
+            .map(|status| AppClusterStatus::from_daemon_status(&status))
+            .map_err(|error| error.to_string())
     }
 
     pub fn leave_cluster(&self) -> Result<AppClusterStatus, String> {
         self.cluster_control_client()?
             .cluster_leave()
             .map_err(|error| error.to_string())?;
-        Ok(sinomo_cli::app_api::cluster_status(self.data_dir.as_ref()))
+        self.cluster_control_client()?
+            .status()
+            .map(|status| AppClusterStatus::from_daemon_status(&status))
+            .map_err(|error| error.to_string())
     }
 
     pub fn cluster_snapshot(&self) -> ClusterSnapshot {
@@ -273,7 +287,7 @@ impl Backend {
 }
 
 fn fetch_daemon_health_rows(
-    data_dir: &sinomo_runtime::local::SinomoDataDir,
+    _data_dir: &sinomo_runtime::local::SinomoDataDir,
     address: &str,
     health_scope: ClusterHealthScope,
 ) -> Result<(Vec<ClusterHealthRow>, Option<String>), String> {
@@ -281,24 +295,16 @@ fn fetch_daemon_health_rows(
         ClusterHealthScope::Local => fetch_local_health_rows(address).map(|rows| (rows, None)),
         ClusterHealthScope::Full => match fetch_cluster_health_rows(address) {
             Ok(rows) => Ok((rows, None)),
-            Err(cluster_error) => match sinomo_cli::app_api::cluster_health_rows(data_dir) {
+            Err(cluster_error) => match fetch_local_health_rows(address) {
                 Ok(rows) => Ok((
                     rows,
                     Some(format!(
-                        "daemon health aggregation unavailable: {cluster_error}; showing direct cluster probes"
+                        "daemon health aggregation unavailable: {cluster_error}; showing local daemon health"
                     )),
                 )),
-                Err(probe_error) => match fetch_local_health_rows(address) {
-                    Ok(rows) => Ok((
-                        rows,
-                        Some(format!(
-                            "daemon health aggregation unavailable: {cluster_error}; direct cluster probes unavailable: {probe_error}; showing local daemon health"
-                        )),
-                    )),
-                    Err(local_error) => Err(format!(
-                        "cluster health unavailable: {cluster_error}; direct cluster probes unavailable: {probe_error}; local health unavailable: {local_error}"
-                    )),
-                },
+                Err(local_error) => Err(format!(
+                    "cluster health unavailable: {cluster_error}; local health unavailable: {local_error}"
+                )),
             },
         },
     }
@@ -621,7 +627,7 @@ fn reachable_endpoint_ids(records: &[ClusterConnectivityRecord]) -> BTreeSet<(St
 fn connection_source(connection: &Connection) -> String {
     match connection {
         Connection::Daemon(status) => format!("daemon {}", status.address),
-        Connection::InProcessDaemon(status) => format!("in-process daemon {}", status.address),
+        Connection::AppOwnedDaemon(status) => format!("app-owned daemon {}", status.address),
         Connection::LocalFallback { .. } => "local files".to_string(),
     }
 }

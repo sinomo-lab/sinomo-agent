@@ -1,10 +1,10 @@
 //! The app's view of the Sinomo runtime.
 //!
 //! The app shares the cluster's data directory and always operates *through a daemon*: on
-//! launch it probes for one and attaches over RPC if present. If none is running it starts its
-//! own daemon **in-process** (a background thread running the daemon control loop) and attaches
-//! to that as a desktop app surface. The app is a pure frontend; runtime/cluster config still
-//! goes through daemon services.
+//! launch it probes for one and attaches over RPC if present. On desktop, if none is running it
+//! starts the full daemon in a sibling process whose lifetime is leased by this app. Android keeps
+//! its resource-constrained embedded host until its Activity callbacks have a cross-process bridge.
+//! Runtime and cluster configuration still go through daemon services.
 //! App-only UI preferences live locally under the Sinomo data directory.
 
 pub mod agents;
@@ -22,32 +22,57 @@ pub mod sifs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::thread;
+#[cfg(target_os = "android")]
+use std::thread::JoinHandle;
+use std::time::Duration;
+#[cfg(target_os = "android")]
+use std::time::Instant;
 
-use sinomo_runtime::api::{
-    DaemonApiClient, DaemonApiError, DaemonClusterStatus, DaemonPaths, DaemonProbeStatus,
-    DaemonRunOptions, DaemonStatus, RemoteConfigClient, probe_daemon_status,
-    probe_daemon_status_at_address,
+#[cfg(target_os = "android")]
+use sinomo_client::api::DaemonClusterStatus;
+#[cfg(any(target_os = "android", test))]
+use sinomo_client::api::DaemonRunOptions;
+use sinomo_client::api::{
+    DaemonApiClient, DaemonApiError, DaemonPaths, DaemonProbeStatus, DaemonStatus,
+    RemoteConfigClient, probe_daemon_status, probe_daemon_status_at_address,
 };
 use sinomo_runtime::cluster::{
     CLUSTER_CONTROL_ROLE_ROUTE, ClusterControlInitRequest, ClusterControlRoleRequest,
 };
 use sinomo_runtime::config::{ConfigClient, ConfigRegistry, ConfigStore, LocalConfigClient};
 use sinomo_runtime::core::ClusterNodeRole;
+#[cfg(target_os = "android")]
 use sinomo_runtime::daemon::{
-    DaemonClusterProcess, DaemonComponentFactory, DaemonExecutionProfile, DaemonRuntimeConfig,
-    daemon_cluster_status, run_daemon_control_loop_with_catalog_and_runtime,
+    DaemonClusterProcess, DaemonExecutionProfile, DaemonRuntimeConfig, daemon_cluster_status,
+    run_daemon_control_loop_with_catalog_and_runtime,
 };
 use sinomo_runtime::local::SinomoDataDir;
+#[cfg(target_os = "android")]
 use sinomo_runtime::network::ClusterPaths;
 use sinomo_runtime::node::{NodeId, NodeProfile};
+#[cfg(test)]
 use sinomo_runtime::vfs::VfsHandle;
+
+#[cfg(target_os = "android")]
+type AppAgentRuntimeControl = sinomo_agent::AgentRuntimeControlRegistry;
+#[cfg(not(target_os = "android"))]
+type AppAgentRuntimeControl = ();
+
+fn app_agent_runtime_control() -> AppAgentRuntimeControl {
+    #[cfg(target_os = "android")]
+    {
+        sinomo_agent::AgentRuntimeControlRegistry::new()
+    }
+    #[cfg(not(target_os = "android"))]
+    {}
+}
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
 /// Timeout for bounded startup/config RPCs to a connected daemon.
 const DAEMON_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long to wait for an app-started in-process daemon to bind and publish its status.
+/// How long to wait for an Android embedded daemon to bind and publish its status.
+#[cfg(target_os = "android")]
 const IN_PROCESS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cluster initialization replaces the identity captured by foundational daemon services. Give
 /// the old embedded daemon time to drain before binding its replacement to the same address.
@@ -78,60 +103,57 @@ pub(crate) fn app_requested_cluster_node_role() -> Option<ClusterNodeRole> {
     }
 }
 
+#[cfg(target_os = "android")]
 fn embedded_daemon_execution_profile() -> DaemonExecutionProfile {
-    #[cfg(target_os = "android")]
-    {
-        DaemonExecutionProfile::Mobile
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        DaemonExecutionProfile::Standard
-    }
+    DaemonExecutionProfile::Mobile
 }
 
+#[cfg(target_os = "android")]
 fn embedded_product_component_profile(
     cluster_initialized: bool,
 ) -> sinomo_product_profile::ProductComponentProfile {
-    #[cfg(target_os = "android")]
-    {
-        sinomo_product_profile::ProductComponentProfile::mobile_embedded(cluster_initialized)
-    }
-    #[cfg(not(target_os = "android"))]
-    {
-        sinomo_product_profile::ProductComponentProfile::embedded(cluster_initialized)
-    }
+    sinomo_product_profile::ProductComponentProfile::mobile_embedded(cluster_initialized)
 }
 
-/// Owns the thread running an app-started in-process daemon, keeping it alive for the lifetime
-/// of the [`Backend`]. The OS reclaims the thread on process exit; a clean shutdown RPC is a
-/// future refinement.
-struct InProcessDaemon {
+/// Owns the thread running the Android embedded daemon.
+#[cfg(target_os = "android")]
+struct OwnedDaemonHandle {
     _thread: JoinHandle<()>,
 }
 
+#[cfg(target_os = "android")]
+impl OwnedDaemonHandle {
+    fn owns_status(&self, status: &DaemonStatus) -> bool {
+        status.pid == std::process::id()
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+use sinomo_client::OwnedDaemonHandle;
+
 /// How the app is talking to the runtime. The app always works through a daemon — either a
-/// pre-existing one, or one it starts itself in-process. Only a hard failure leaves it on the
-/// degraded local fallback.
+/// pre-existing one or one whose lifecycle it owns. Only a hard failure leaves it on the degraded
+/// local fallback.
 #[derive(Clone)]
 pub enum Connection {
     /// Attached to a daemon we did not start (and, through it, possibly a cluster).
     Daemon(Box<DaemonStatus>),
-    /// No external daemon was running, so the app started its own in-process daemon and
-    /// attached to it as a desktop app surface.
-    InProcessDaemon(Box<DaemonStatus>),
+    /// No external daemon was running, so the app started and owns this daemon's lifecycle.
+    /// It is a sibling process on desktop and remains embedded on Android.
+    AppOwnedDaemon(Box<DaemonStatus>),
     /// Degraded: no daemon could be reached or started; reading local config directly.
     LocalFallback { reason: Option<String> },
 }
 
 impl Connection {
     pub fn is_daemon(&self) -> bool {
-        matches!(self, Connection::Daemon(_) | Connection::InProcessDaemon(_))
+        matches!(self, Connection::Daemon(_) | Connection::AppOwnedDaemon(_))
     }
 
     pub fn is_clustered(&self) -> bool {
         matches!(
             self,
-            Connection::Daemon(status) | Connection::InProcessDaemon(status)
+            Connection::Daemon(status) | Connection::AppOwnedDaemon(status)
                 if status.cluster.is_some()
         )
     }
@@ -139,7 +161,7 @@ impl Connection {
     /// The control address of the attached daemon, if any.
     pub(crate) fn daemon_address(&self) -> Option<&str> {
         match self {
-            Connection::Daemon(status) | Connection::InProcessDaemon(status) => {
+            Connection::Daemon(status) | Connection::AppOwnedDaemon(status) => {
                 Some(status.address.as_str())
             }
             Connection::LocalFallback { .. } => None,
@@ -149,11 +171,12 @@ impl Connection {
     pub fn local_fallback_reason(&self) -> Option<&str> {
         match self {
             Connection::LocalFallback { reason } => reason.as_deref(),
-            Connection::Daemon(_) | Connection::InProcessDaemon(_) => None,
+            Connection::Daemon(_) | Connection::AppOwnedDaemon(_) => None,
         }
     }
 }
 
+#[cfg(test)]
 fn build_catalog_read_vfs(connection: &Connection) -> Result<VfsHandle, String> {
     let address = connection.daemon_address().ok_or_else(|| {
         "resident daemon SIFS is unavailable; catalog reads require a daemon connection".to_string()
@@ -168,16 +191,13 @@ pub struct Backend {
     pub app_runtime: Arc<tokio::runtime::Runtime>,
     pub node: NodeProfile,
     pub connection: Connection,
-    /// Read-only SIFS transport into the resident daemon. Catalog mutations
-    /// deliberately continue to use their mounted authority stores.
+    #[cfg(test)]
     catalog_read_vfs: Result<VfsHandle, String>,
     /// The configuration service the app reads/writes through — always RPC to a daemon (the
     /// app's own in-process one when no external daemon exists). The app holds no config state.
     pub config: Arc<dyn ConfigClient>,
-    /// Runtime-control host shared by the chat worker and the app-started in-process daemon.
-    pub agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
-    /// Keeps an app-started in-process daemon alive; `None` when attached to an external one.
-    _daemon: Option<Arc<InProcessDaemon>>,
+    /// Keeps the exact app-owned daemon alive; `None` when attached to an external one.
+    _daemon: Option<Arc<OwnedDaemonHandle>>,
     /// Keeps the isolated data directory used by [`Backend::local_fallback`] alive for exactly as
     /// long as the headless backend. Integration tests compile this crate without `cfg(test)`, so
     /// this cannot be test-only without silently falling back to the operator's real data dir.
@@ -185,9 +205,9 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// Probe for a daemon and, failing that, stand up an embedded daemon for this desktop app
-    /// surface. This blocks while the in-process daemon starts, so it is meant to run off the UI
-    /// thread; `progress` reports each step for the launch status indicator.
+    /// Probe for a daemon and, failing that, start an app-owned daemon for this surface. This
+    /// blocks during readiness, so it is meant to run off the UI thread; `progress` reports each
+    /// step for the launch status indicator.
     pub fn connect(progress: impl Fn(&str)) -> Self {
         Self::connect_with_node_resources(
             progress,
@@ -212,42 +232,33 @@ impl Backend {
 
         let node = NodeProfile::local("Sinomo App")
             .unwrap_or_else(|_| panic!("local node profile uses a valid trust domain"));
-        let agent_runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
+        let agent_runtime_control = app_agent_runtime_control();
 
-        progress("Looking for a daemon…");
         let paths = DaemonPaths::new(&data_dir);
-        let (connection, mut daemon) = match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
-            DaemonProbeStatus::Running(status)
-            | DaemonProbeStatus::Locked {
-                status: Some(status),
-            } => {
+        let daemon_connection = connect_local_daemon(
+            data_dir.as_ref(),
+            &paths,
+            &progress,
+            agent_runtime_control.clone(),
+            node_resources.clone(),
+        );
+        let (connection, mut daemon) = match daemon_connection {
+            Ok((status, Some(handle))) => {
+                (Connection::AppOwnedDaemon(Box::new(status)), Some(handle))
+            }
+            Ok((status, None)) => {
                 progress("Connecting to daemon…");
                 (Connection::Daemon(Box::new(status)), None)
             }
-            // No usable daemon. The app is near-useless without one, so start our own daemon
-            // in-process, falling back to direct config only if that fails.
-            DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
-                progress("Starting a local daemon…");
-                match start_in_process_daemon(
-                    &paths,
-                    &progress,
-                    agent_runtime_control.clone(),
-                    node_resources.clone(),
-                ) {
-                    Ok((status, handle)) => {
-                        (Connection::InProcessDaemon(Box::new(status)), Some(handle))
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "sinomo-app could not start embedded daemon");
-                        progress(&format!("Local daemon failed: {error}"));
-                        (
-                            Connection::LocalFallback {
-                                reason: Some(error),
-                            },
-                            None,
-                        )
-                    }
-                }
+            Err(error) => {
+                tracing::warn!(%error, "sinomo-app could not connect to an app-compatible daemon");
+                progress(&format!("Local daemon failed: {error}"));
+                (
+                    Connection::LocalFallback {
+                        reason: Some(error),
+                    },
+                    None,
+                )
             }
         };
 
@@ -255,18 +266,21 @@ impl Backend {
             ensure_app_cluster(connection, &paths, data_dir.as_ref(), &node, &progress);
         if restart_embedded_daemon {
             progress("Restarting the local daemon with its cluster identity...");
-            match restart_in_process_daemon_after_cluster_init(
+            match restart_owned_daemon_after_cluster_init(
                 &paths,
                 &progress,
                 agent_runtime_control.clone(),
                 node_resources.clone(),
                 &mut daemon,
             ) {
-                Ok(status) => {
-                    connection = Connection::InProcessDaemon(Box::new(status));
+                Ok((status, true)) => {
+                    connection = Connection::AppOwnedDaemon(Box::new(status));
+                }
+                Ok((status, false)) => {
+                    connection = Connection::Daemon(Box::new(status));
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "sinomo-app could not restart embedded daemon after cluster initialization");
+                    tracing::warn!(%error, "sinomo-app could not restart app-owned daemon after cluster initialization");
                     progress(&format!("Local daemon failed: {error}"));
                     connection = Connection::LocalFallback {
                         reason: Some(error),
@@ -277,6 +291,7 @@ impl Backend {
         reconcile_android_cluster_node_role(&connection, data_dir.as_ref());
         progress("Preparing configuration…");
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
+        #[cfg(test)]
         let catalog_read_vfs = build_catalog_read_vfs(&connection);
 
         Backend {
@@ -284,9 +299,9 @@ impl Backend {
             app_runtime,
             node,
             connection,
+            #[cfg(test)]
             catalog_read_vfs,
             config,
-            agent_runtime_control,
             _daemon: daemon.map(Arc::new),
             _local_fallback_data_dir_cleanup: None,
         }
@@ -319,6 +334,7 @@ impl Backend {
 
         let connection = Connection::LocalFallback { reason: None };
         let config = build_config_client(&connection, &data_dir, app_runtime.handle());
+        #[cfg(test)]
         let catalog_read_vfs = build_catalog_read_vfs(&connection);
 
         Backend {
@@ -326,9 +342,9 @@ impl Backend {
             app_runtime,
             node,
             connection,
+            #[cfg(test)]
             catalog_read_vfs,
             config,
-            agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry::new(),
             _daemon: None,
             _local_fallback_data_dir_cleanup: None,
         }
@@ -344,11 +360,15 @@ impl Backend {
                     "Daemon".to_string()
                 }
             }
-            Connection::InProcessDaemon(status) => {
+            Connection::AppOwnedDaemon(status) => {
+                #[cfg(target_os = "android")]
+                let surface = "mobile";
+                #[cfg(not(target_os = "android"))]
+                let surface = "app-owned";
                 if status.cluster.is_some() {
-                    "Cluster · mobile".to_string()
+                    format!("Cluster · {surface}")
                 } else {
-                    "Local · mobile".to_string()
+                    format!("Local · {surface}")
                 }
             }
             Connection::LocalFallback { reason: Some(_) } => "Local (daemon failed)".to_string(),
@@ -359,7 +379,7 @@ impl Backend {
     /// One-line human description of the current connection.
     pub fn status_detail(&self) -> String {
         match &self.connection {
-            Connection::Daemon(status) | Connection::InProcessDaemon(status) => {
+            Connection::Daemon(status) | Connection::AppOwnedDaemon(status) => {
                 match &status.cluster {
                     Some(cluster) => format!(
                         "Connected to daemon at {} · cluster {} · {}",
@@ -368,8 +388,15 @@ impl Backend {
                         format!("{:?}", cluster.member_role).to_lowercase(),
                     ),
                     None => {
-                        let kind = if matches!(self.connection, Connection::InProcessDaemon(_)) {
-                            "in-process"
+                        let kind = if matches!(self.connection, Connection::AppOwnedDaemon(_)) {
+                            #[cfg(target_os = "android")]
+                            {
+                                "embedded"
+                            }
+                            #[cfg(not(target_os = "android"))]
+                            {
+                                "app-owned"
+                            }
                         } else {
                             "local"
                         };
@@ -383,7 +410,7 @@ impl Backend {
             Connection::LocalFallback {
                 reason: Some(reason),
             } => {
-                format!("No daemon available · embedded daemon failed: {reason}")
+                format!("No daemon available · app-owned daemon failed: {reason}")
             }
             Connection::LocalFallback { reason: None } => {
                 "No daemon available · reading local config directly".to_string()
@@ -393,10 +420,13 @@ impl Backend {
 
     pub fn connection_issue_detail(&self) -> Option<String> {
         self.connection.local_fallback_reason().map(|reason| {
-            format!("embedded daemon failed: {reason}; daemon-backed chat and SIFS are unavailable")
+            format!(
+                "app-owned daemon failed: {reason}; daemon-backed chat and SIFS are unavailable"
+            )
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn catalog_read_vfs(&self) -> Result<VfsHandle, String> {
         self.catalog_read_vfs.clone()
     }
@@ -413,30 +443,36 @@ impl Backend {
 
     /// Apply a live daemon observation and rebuild connection-bound clients as one backend update.
     ///
-    /// An in-process classification is retained only when the probe reached the exact process this
-    /// backend started and still owns. If a replacement process appears at the same address, it is
-    /// an external daemon from this app surface's perspective.
+    /// App ownership is retained only when the probe reached the exact process instance this
+    /// backend started and still owns. If a replacement appears at the same address, it is an
+    /// external daemon from this app surface's perspective.
     pub(crate) fn apply_live_daemon_status(&mut self, status: DaemonStatus) -> bool {
         let binding_changed = !matches!(
             &self.connection,
-            Connection::Daemon(previous) | Connection::InProcessDaemon(previous)
+            Connection::Daemon(previous) | Connection::AppOwnedDaemon(previous)
                 if previous.pid == status.pid && previous.address == status.address
         );
-        let remains_in_process = self._daemon.is_some()
+        let remains_in_process = self
+            ._daemon
+            .as_ref()
+            .is_some_and(|daemon| daemon.owns_status(&status))
             && matches!(
                 &self.connection,
-                Connection::InProcessDaemon(previous)
+                Connection::AppOwnedDaemon(previous)
                     if previous.pid == status.pid && previous.address == status.address
             );
         self.connection = if remains_in_process {
-            Connection::InProcessDaemon(Box::new(status))
+            Connection::AppOwnedDaemon(Box::new(status))
         } else {
             Connection::Daemon(Box::new(status))
         };
         if binding_changed {
             self.config =
                 build_config_client(&self.connection, &self.data_dir, self.app_runtime.handle());
-            self.catalog_read_vfs = build_catalog_read_vfs(&self.connection);
+            #[cfg(test)]
+            {
+                self.catalog_read_vfs = build_catalog_read_vfs(&self.connection);
+            }
         }
         binding_changed
     }
@@ -452,7 +488,7 @@ impl Backend {
 /// no requested role short-circuits before inspecting cluster state, keeping
 /// non-Android app startup unchanged.
 fn app_cluster_node_role_migration_request(
-    status: &sinomo_cli::app_api::AppClusterStatus,
+    status: &sinomo_client::AppClusterStatus,
     requested_role: Option<ClusterNodeRole>,
 ) -> Result<Option<ClusterControlRoleRequest>, String> {
     let Some(role) = requested_role else {
@@ -555,7 +591,7 @@ fn wait_for_mobile_role_migration_retry(delay: Duration) {
 /// Best-effort Android compatibility migration. New daemons normally persist
 /// the mobile role during init/join, while older daemons may reject the role
 /// route entirely; neither outcome is allowed to make app startup fail.
-fn reconcile_android_cluster_node_role(connection: &Connection, data_dir: &SinomoDataDir) {
+fn reconcile_android_cluster_node_role(connection: &Connection, _data_dir: &SinomoDataDir) {
     let requested_role = app_requested_cluster_node_role();
     if requested_role.is_none() {
         return;
@@ -563,7 +599,12 @@ fn reconcile_android_cluster_node_role(connection: &Connection, data_dir: &Sinom
     let Some(address) = connection.daemon_address() else {
         return;
     };
-    let status = sinomo_cli::app_api::cluster_status(data_dir);
+    let status = match connection {
+        Connection::Daemon(status) | Connection::AppOwnedDaemon(status) => {
+            sinomo_client::AppClusterStatus::from_daemon_status(status)
+        }
+        Connection::LocalFallback { .. } => sinomo_client::AppClusterStatus::default(),
+    };
     let request = match app_cluster_node_role_migration_request(&status, requested_role) {
         Ok(Some(request)) => request,
         Ok(None) => return,
@@ -739,10 +780,10 @@ fn ensure_app_cluster(
 
     progress("Initializing single-node cluster...");
     match ensure_app_cluster_through_daemon(&connection, data_dir, node) {
-        Ok(initialized) if initialized && matches!(&connection, Connection::InProcessDaemon(_)) => {
+        Ok(initialized) if initialized && matches!(&connection, Connection::AppOwnedDaemon(_)) => {
             // `/cluster/control/init` drains the serving daemon because its foundational services
-            // captured the pre-cluster identity. An embedded daemon has no shadow supervisor, so
-            // the app must replace it before exposing the backend as ready.
+            // captured the pre-cluster identity. An app-owned daemon has no detached shadow
+            // supervisor, so the app must replace it before exposing the backend as ready.
             (connection, true)
         }
         Ok(_) => (
@@ -752,7 +793,7 @@ fn ensure_app_cluster(
                     status: Some(status),
                 } => match connection {
                     Connection::Daemon(_) => Connection::Daemon(Box::new(status)),
-                    Connection::InProcessDaemon(_) => Connection::InProcessDaemon(Box::new(status)),
+                    Connection::AppOwnedDaemon(_) => Connection::AppOwnedDaemon(Box::new(status)),
                     Connection::LocalFallback { reason } => Connection::LocalFallback { reason },
                 },
                 DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
@@ -773,12 +814,9 @@ fn ensure_app_cluster(
 /// cluster state already exists (the daemon's status simply lagged).
 fn ensure_app_cluster_through_daemon(
     connection: &Connection,
-    data_dir: &SinomoDataDir,
+    _data_dir: &SinomoDataDir,
     node: &NodeProfile,
 ) -> Result<bool, String> {
-    if sinomo_cli::app_api::cluster_status(data_dir).clustered {
-        return Ok(false);
-    }
     let address = connection
         .daemon_address()
         .ok_or_else(|| "no daemon connection for cluster init".to_string())?;
@@ -794,35 +832,39 @@ fn ensure_app_cluster_through_daemon(
         .map_err(|error| error.to_string())
 }
 
-fn restart_in_process_daemon_after_cluster_init(
+fn restart_owned_daemon_after_cluster_init(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
-    agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
+    agent_runtime_control: AppAgentRuntimeControl,
     node_resources: sinomo_runtime::device::NodeResourceMonitor,
-    daemon: &mut Option<InProcessDaemon>,
-) -> Result<DaemonStatus, String> {
+    daemon: &mut Option<OwnedDaemonHandle>,
+) -> Result<(DaemonStatus, bool), String> {
     let current = daemon.as_ref().ok_or_else(|| {
-        "embedded daemon ownership was lost during cluster initialization".to_string()
+        "app-owned daemon ownership was lost during cluster initialization".to_string()
     })?;
-    wait_for_in_process_daemon_exit(current, IN_PROCESS_DAEMON_STOP_TIMEOUT)?;
+    wait_for_owned_daemon_exit(current, IN_PROCESS_DAEMON_STOP_TIMEOUT)?;
     daemon.take();
 
     let (status, replacement) =
-        start_in_process_daemon(paths, progress, agent_runtime_control, node_resources)?;
-    *daemon = Some(replacement);
+        start_local_daemon(paths, progress, agent_runtime_control, node_resources)?;
+    let owned = replacement.is_some();
+    *daemon = replacement;
     if status.cluster.is_none() {
         return Err(
-            "replacement embedded daemon started without the initialized cluster identity"
+            "replacement app-owned daemon started without the initialized cluster identity"
                 .to_string(),
         );
     }
-    Ok(status)
+    Ok((status, owned))
 }
 
-fn wait_for_in_process_daemon_exit(
-    daemon: &InProcessDaemon,
-    timeout: Duration,
-) -> Result<(), String> {
+#[cfg(not(target_os = "android"))]
+fn wait_for_owned_daemon_exit(daemon: &OwnedDaemonHandle, timeout: Duration) -> Result<(), String> {
+    daemon.wait_for_exit(timeout)
+}
+
+#[cfg(target_os = "android")]
+fn wait_for_owned_daemon_exit(daemon: &OwnedDaemonHandle, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     while !daemon._thread.is_finished() {
         if Instant::now() >= deadline {
@@ -836,8 +878,77 @@ fn wait_for_in_process_daemon_exit(
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
+fn connect_local_daemon(
+    data_dir: &SinomoDataDir,
+    _paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    _agent_runtime_control: AppAgentRuntimeControl,
+    _node_resources: sinomo_runtime::device::NodeResourceMonitor,
+) -> Result<(DaemonStatus, Option<OwnedDaemonHandle>), String> {
+    sinomo_client::connect_or_start_local_daemon(data_dir, progress)
+        .map(sinomo_client::LocalDaemonConnection::into_parts)
+}
+
+#[cfg(target_os = "android")]
+fn connect_local_daemon(
+    _data_dir: &SinomoDataDir,
+    paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    agent_runtime_control: AppAgentRuntimeControl,
+    node_resources: sinomo_runtime::device::NodeResourceMonitor,
+) -> Result<(DaemonStatus, Option<OwnedDaemonHandle>), String> {
+    progress("Looking for a daemon…");
+    match probe_daemon_status(paths, DAEMON_PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => {
+            if sinomo_client::daemon_protocol_is_compatible(&status) {
+                Ok((status, None))
+            } else {
+                Err(sinomo_client::incompatible_daemon_protocol_detail(&status))
+            }
+        }
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
+            progress("Starting a local daemon…");
+            start_local_daemon(paths, progress, agent_runtime_control, node_resources)
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+fn start_local_daemon(
+    paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    _agent_runtime_control: AppAgentRuntimeControl,
+    _node_resources: sinomo_runtime::device::NodeResourceMonitor,
+) -> Result<(DaemonStatus, Option<OwnedDaemonHandle>), String> {
+    match sinomo_client::start_app_owned_daemon(paths, progress)? {
+        sinomo_client::StartAppDaemonOutcome::Started(status, daemon) => Ok((status, Some(daemon))),
+        sinomo_client::StartAppDaemonOutcome::Attached(status) => {
+            if sinomo_client::daemon_protocol_is_compatible(&status) {
+                Ok((status, None))
+            } else {
+                Err(sinomo_client::incompatible_daemon_protocol_detail(&status))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+fn start_local_daemon(
+    paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    agent_runtime_control: AppAgentRuntimeControl,
+    node_resources: sinomo_runtime::device::NodeResourceMonitor,
+) -> Result<(DaemonStatus, Option<OwnedDaemonHandle>), String> {
+    start_in_process_daemon(paths, progress, agent_runtime_control, node_resources)
+        .map(|(status, daemon)| (status, Some(daemon)))
+}
+
 /// Build the [`ConfigClient`] for the current connection. Normally this is an RPC client to the
-/// attached daemon (external or the app's own in-process one). Only in the degraded
+/// attached daemon (external or app-owned). Only in the degraded
 /// [`Connection::LocalFallback`] case does it read local config directly.
 fn build_config_client(
     connection: &Connection,
@@ -872,17 +983,19 @@ fn build_app_runtime() -> Arc<tokio::runtime::Runtime> {
 
 /// Start an in-process daemon on a background thread and wait for it to become reachable. Returns
 /// An error leaves the app on the daemonless fallback with a concrete reason to show in the UI.
+#[cfg(target_os = "android")]
 fn start_in_process_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
-    agent_runtime_control: sinomo_agent::AgentRuntimeControlRegistry,
+    agent_runtime_control: AppAgentRuntimeControl,
     node_resources: sinomo_runtime::device::NodeResourceMonitor,
-) -> Result<(DaemonStatus, InProcessDaemon), String> {
+) -> Result<(DaemonStatus, OwnedDaemonHandle), String> {
     let options = DaemonRunOptions::default();
+    let daemon_address = format!("{}:{}", options.host, options.port);
     let execution_profile = embedded_daemon_execution_profile();
     let cluster = in_process_daemon_cluster_status(paths)?;
     let loop_paths = paths.clone();
-    let control_host = agent_runtime_control.clone();
+    let _ = agent_runtime_control;
     let (exit_tx, exit_rx) = mpsc::channel::<String>();
     let thread = thread::Builder::new()
         .name("sinomo-app-daemon".to_string())
@@ -899,7 +1012,10 @@ fn start_in_process_daemon(
                         .map_err(|error| {
                             format!("build embedded product component profile: {error}")
                         })?;
-                let hooks = vec![agent_runtime_control_component_factory(control_host)];
+                let hooks = vec![
+                    sinomo_cli::hosted_agent_chat_component_factory(daemon_address)
+                        .map_err(|error| format!("build embedded chat component: {error}"))?,
+                ];
                 #[cfg(not(target_os = "android"))]
                 let hooks = {
                     let mut hooks = hooks;
@@ -948,7 +1064,7 @@ fn start_in_process_daemon(
         if let DaemonProbeStatus::Running(status) =
             probe_daemon_status(paths, Duration::from_millis(300))
         {
-            return Ok((status, InProcessDaemon { _thread: thread }));
+            return Ok((status, OwnedDaemonHandle { _thread: thread }));
         }
         if Instant::now() >= deadline {
             tracing::warn!("in-process daemon did not become ready within the timeout");
@@ -961,6 +1077,7 @@ fn start_in_process_daemon(
     }
 }
 
+#[cfg(target_os = "android")]
 fn in_process_daemon_cluster_status(
     paths: &DaemonPaths,
 ) -> Result<Option<DaemonClusterStatus>, String> {
@@ -987,41 +1104,6 @@ fn in_process_daemon_cluster_status(
         })
 }
 
-fn agent_runtime_control_component_factory(
-    control_host: sinomo_agent::AgentRuntimeControlRegistry,
-) -> DaemonComponentFactory {
-    Arc::new(
-        sinomo_runtime::module::StaticComponentFactory::new(
-            sinomo_runtime::module::ComponentDescriptor::new(
-                "sinomo-agent-runtime-control",
-                env!("CARGO_PKG_VERSION"),
-            ),
-            move |_, scope| {
-                let host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
-                    Arc::new(control_host.clone());
-                scope.set_services(
-                    sinomo_agent::register_services_with_runtime_control(
-                        sinomo_runtime::service::ServiceRegistry::builder(),
-                        host,
-                    )
-                    .build(),
-                );
-                Ok(())
-            },
-        )
-        .expect("agent runtime control component descriptor must be valid")
-        .with_config_definitions(register_agent_runtime_component_config_definitions),
-    )
-}
-
-fn register_agent_runtime_component_config_definitions(
-    builder: sinomo_runtime::config::ConfigRegistryBuilder,
-) -> Result<sinomo_runtime::config::ConfigRegistryBuilder, String> {
-    let builder =
-        sinomo_lm::register_config_definitions(builder).map_err(|error| error.to_string())?;
-    sinomo_evolution::register_config_definitions(builder).map_err(|error| error.to_string())
-}
-
 fn short_id(id: &str) -> String {
     let trimmed = id.trim();
     if trimmed.len() <= 10 {
@@ -1034,24 +1116,23 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_runtime::core::{ClusterBootstrapState, Id};
+    #[cfg(target_os = "android")]
+    use sinomo_runtime::core::ClusterBootstrapState;
+    use sinomo_runtime::core::Id;
     use sinomo_runtime::node::NodeRole;
+    #[cfg(target_os = "android")]
     use time::OffsetDateTime;
 
     #[cfg(not(target_os = "android"))]
     #[test]
-    fn desktop_embedded_daemon_keeps_standard_execution_defaults() {
+    fn desktop_app_does_not_request_mobile_cluster_role() {
         assert_eq!(app_requested_cluster_node_role(), None);
-        assert_eq!(
-            embedded_daemon_execution_profile(),
-            DaemonExecutionProfile::Standard
-        );
     }
 
     #[test]
     fn cluster_node_role_migration_builds_mobile_update_for_clustered_node() {
         let node_id = Id::generate();
-        let status = sinomo_cli::app_api::AppClusterStatus {
+        let status = sinomo_client::AppClusterStatus {
             clustered: true,
             local_node_id: Some(node_id.to_string()),
             ..Default::default()
@@ -1069,7 +1150,7 @@ mod tests {
 
     #[test]
     fn cluster_node_role_migration_is_noop_without_android_role_or_cluster() {
-        let malformed_clustered_status = sinomo_cli::app_api::AppClusterStatus {
+        let malformed_clustered_status = sinomo_client::AppClusterStatus {
             clustered: true,
             local_node_id: None,
             ..Default::default()
@@ -1081,7 +1162,7 @@ mod tests {
             "desktop startup must not inspect or mutate cluster role state"
         );
 
-        let unclustered_status = sinomo_cli::app_api::AppClusterStatus::default();
+        let unclustered_status = sinomo_client::AppClusterStatus::default();
         assert_eq!(
             app_cluster_node_role_migration_request(
                 &unclustered_status,
@@ -1167,25 +1248,46 @@ mod tests {
     }
 
     #[test]
+    fn daemon_protocol_compatibility_is_explicit_not_package_version_based() {
+        let (data_dir, _cleanup) = local_fallback_data_dir();
+        let mut status = DaemonStatus::new(
+            &DaemonRunOptions::default(),
+            &DaemonPaths::new(&data_dir),
+            None,
+        );
+        status.version = "999.0.0".to_string();
+        assert!(sinomo_client::daemon_protocol_is_compatible(&status));
+
+        status.api_protocol_version = 0;
+        assert!(!sinomo_client::daemon_protocol_is_compatible(&status));
+        assert!(
+            sinomo_client::incompatible_daemon_protocol_detail(&status)
+                .contains("daemon protocol 0")
+        );
+    }
+
+    #[cfg(target_os = "android")]
+    #[test]
     fn embedded_daemon_restart_wait_observes_completed_thread() {
-        let daemon = InProcessDaemon {
+        let daemon = OwnedDaemonHandle {
             _thread: thread::spawn(|| {}),
         };
 
-        wait_for_in_process_daemon_exit(&daemon, Duration::from_secs(1))
+        wait_for_owned_daemon_exit(&daemon, Duration::from_secs(1))
             .expect("completed embedded daemon should be ready to replace");
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn embedded_daemon_restart_wait_times_out_without_losing_thread_ownership() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let daemon = InProcessDaemon {
+        let daemon = OwnedDaemonHandle {
             _thread: thread::spawn(move || {
                 let _ = release_rx.recv();
             }),
         };
 
-        let error = wait_for_in_process_daemon_exit(&daemon, Duration::from_millis(25))
+        let error = wait_for_owned_daemon_exit(&daemon, Duration::from_millis(25))
             .expect_err("a running embedded daemon must not be replaced on the same address");
         assert!(
             error.contains("did not stop"),
@@ -1197,10 +1299,11 @@ mod tests {
         );
 
         let _ = release_tx.send(());
-        wait_for_in_process_daemon_exit(&daemon, Duration::from_secs(1))
+        wait_for_owned_daemon_exit(&daemon, Duration::from_secs(1))
             .expect("released daemon thread should finish");
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn embedded_daemon_startup_has_no_cluster_for_fresh_data_dir() {
         let (data_dir, _cleanup) = local_fallback_data_dir();
@@ -1214,6 +1317,7 @@ mod tests {
         assert!(cluster.is_none());
     }
 
+    #[cfg(target_os = "android")]
     #[test]
     fn embedded_daemon_startup_loads_initialized_cluster_identity() {
         let (data_dir, _cleanup) = local_fallback_data_dir();
@@ -1310,15 +1414,18 @@ mod tests {
             "a healthy same-process probe must not churn connection-bound clients"
         );
 
-        backend.connection = Connection::InProcessDaemon(Box::new(status.clone()));
-        backend._daemon = Some(Arc::new(InProcessDaemon {
-            _thread: thread::spawn(|| {}),
-        }));
-        assert!(!backend.apply_live_daemon_status(status.clone()));
-        assert!(
-            matches!(backend.connection, Connection::InProcessDaemon(_)),
-            "the exact daemon process still owned by this backend remains in-process"
-        );
+        #[cfg(target_os = "android")]
+        {
+            backend.connection = Connection::AppOwnedDaemon(Box::new(status.clone()));
+            backend._daemon = Some(Arc::new(OwnedDaemonHandle {
+                _thread: thread::spawn(|| {}),
+            }));
+            assert!(!backend.apply_live_daemon_status(status.clone()));
+            assert!(
+                matches!(backend.connection, Connection::AppOwnedDaemon(_)),
+                "the exact daemon process still owned by this backend remains embedded"
+            );
+        }
 
         let mut replacement = status;
         replacement.pid = replacement.pid.wrapping_add(1);
@@ -1327,58 +1434,5 @@ mod tests {
             matches!(backend.connection, Connection::Daemon(_)),
             "a replacement process at the same address is external to this app surface"
         );
-    }
-
-    #[test]
-    fn app_agent_runtime_control_hook_registers_read_and_control_routes() {
-        let hook = agent_runtime_control_component_factory(
-            sinomo_agent::AgentRuntimeControlRegistry::new(),
-        );
-        let config_registry = hook
-            .register_config_definitions(sinomo_runtime::config::ConfigRegistry::builder())
-            .expect("register app config definitions")
-            .build();
-        assert!(
-            config_registry
-                .get(sinomo_lm::LM_PROVIDER_CONFIG_KEY)
-                .is_ok()
-        );
-        assert!(
-            config_registry
-                .get(sinomo_evolution::EVOLUTION_CONFIG_KEY)
-                .is_ok(),
-            "the embedded app hook must expose evolution's detailed settings schema"
-        );
-        assert!(
-            config_registry
-                .get(sinomo_runtime::module::MODULE_CLUSTER_CONFIG_KEY)
-                .is_err(),
-            "the app hook must not re-register daemon-owned module config definitions"
-        );
-        let daemon_owned_builder = sinomo_runtime::module::register_config_definitions(
-            sinomo_runtime::config::ConfigRegistry::builder(),
-        )
-        .expect("register daemon-owned module config definitions");
-        hook.register_config_definitions(daemon_owned_builder)
-            .expect("app hook must compose with daemon-owned config definitions");
-
-        let root = sinomo_testdir::TestDir::new("app-agent-component");
-        let scope = hook
-            .mount(&sinomo_runtime::module::ComponentContext::new(Arc::new(
-                SinomoDataDir::new(&root),
-            )))
-            .expect("mount app agent component");
-        let registry = scope.services();
-
-        for route in sinomo_agent::AGENT_OBJECT_RPC_ROUTES
-            .iter()
-            .chain(sinomo_agent::AGENT_RUNTIME_CONTROL_OBJECT_RPC_ROUTES.iter())
-        {
-            assert!(registry.owns(route), "missing app agent route {route}");
-            assert_eq!(
-                registry.category_for_route(route),
-                Some(sinomo_agent::AGENT_RPC_CATEGORY)
-            );
-        }
     }
 }

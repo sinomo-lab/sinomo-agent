@@ -881,7 +881,7 @@ fn refresh_visual_layout(window: &sui_testing::TestWindow) {
 }
 
 fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
-    use sinomo_cli::app_api::ProviderSummary;
+    use sinomo_app::backend::chat_engine::ProviderSummary;
 
     let mut chat = shared.chat_mut();
     chat.providers = vec![
@@ -890,14 +890,14 @@ fn seed_chat_providers(shared: &sinomo_app::state::Shared) {
             account: "default".to_string(),
             name: "OpenAI".to_string(),
             models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("openai"),
+            capabilities: sinomo_app::backend::config::provider_capabilities("openai"),
         },
         ProviderSummary {
             id: "anthropic".to_string(),
             account: "default".to_string(),
             name: "Anthropic".to_string(),
             models: vec!["claude-opus".to_string(), "claude-sonnet".to_string()],
-            capabilities: sinomo_lm::provider_capabilities("anthropic"),
+            capabilities: sinomo_app::backend::config::provider_capabilities("anthropic"),
         },
     ];
     chat.provider_idx = 0;
@@ -966,7 +966,7 @@ fn open_chat_provider_select(window: &sui_testing::TestWindow) -> sui::Rect {
 #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_files_composed() {
     use sinomo_app::theme::AppThemeMode;
-    use sinomo_cli::app_api::{SifsEntry, SifsObjectDetails, SifsObjectHealth, SifsPinDetails};
+    use sinomo_client::{SifsEntry, SifsObjectDetails, SifsObjectHealth, SifsPinDetails};
     use sui::{Event, Size, WindowEvent};
 
     let dir = shots_dir();
@@ -1807,7 +1807,7 @@ fn capture_chat_composed() {
     // async at construction; here we seed a default provider + its model list directly so the
     // capture is deterministic and shows the populated picker.
     {
-        use sinomo_cli::app_api::ProviderSummary;
+        use sinomo_app::backend::chat_engine::ProviderSummary;
         let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Sinomo, "chat-models-loaded");
         seed_conversation(&shared);
         {
@@ -1821,7 +1821,7 @@ fn capture_chat_composed() {
                     "claude-sonnet-4".to_string(),
                     "claude-haiku-4".to_string(),
                 ],
-                capabilities: sinomo_lm::provider_capabilities("anthropic"),
+                capabilities: sinomo_app::backend::config::provider_capabilities("anthropic"),
             }];
             chat.provider_idx = 0;
             chat.model_idx = 0;
@@ -1991,11 +1991,11 @@ fn capture_chat_composed() {
 #[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
 fn capture_chat_runtime_activity() {
     use sinomo_app::backend::chat_engine::RuntimeInfo;
-    use sinomo_app::theme::AppThemeMode;
-    use sinomo_app::ui::chat::{ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity};
-    use sinomo_cli::app_api::{
+    use sinomo_app::backend::chat_engine::{
         ChatContextLane, ChatContextSnapshot, ChatTaskSnapshot, ChatUsageSnapshot,
     };
+    use sinomo_app::theme::AppThemeMode;
+    use sinomo_app::ui::chat::{ActivityTone, ChatActivityEntry, ChatMessage, ChatToolActivity};
 
     let dir = target_shots_dir();
     std::fs::create_dir_all(&dir).expect("create shots dir");

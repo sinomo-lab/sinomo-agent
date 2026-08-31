@@ -16,4 +16,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
-sinomo-runtime = { path = "../sinomo-runtime" }
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["device-client"] }

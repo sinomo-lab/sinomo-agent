@@ -6079,6 +6079,8 @@ mod rollout_authority_readiness_tests {
             host: "127.0.0.1".to_string(),
             port: SINOMO_DAEMON_DEFAULT_PORT,
             address: format!("127.0.0.1:{SINOMO_DAEMON_DEFAULT_PORT}"),
+            api_protocol_version: sinomo_runtime::api::SINOMO_DAEMON_API_PROTOCOL_VERSION,
+            app_launch_id: None,
             version: "test".to_string(),
             commit: Some("test".to_string()),
             target_os: Some(std::env::consts::OS.to_string()),

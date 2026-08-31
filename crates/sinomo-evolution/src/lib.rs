@@ -1,5 +1,6 @@
 //! Autonomous self-evolution planning skeleton.
 
+mod app_api;
 pub mod cli;
 mod cli_runtime;
 mod engine;
@@ -9,6 +10,7 @@ mod test_cases;
 pub mod tools;
 mod types;
 
+pub use app_api::{app_evolution_dashboard, run_app_evolution_decision, run_app_evolution_job};
 pub use cli::*;
 pub use cli_runtime::*;
 pub use engine::*;

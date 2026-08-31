@@ -12,10 +12,16 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r0-boundary"
 
 [features]
+default = ["host"]
+# Wire/client profile. Its dependency set is intentionally ratcheted down as R0 protocol and
+# implementation crates are separated; all paths still cross this single R0 boundary facade.
+client = []
+# Complete R0 cluster foundation used by trusted runtime hosts.
+host = ["client"]
 # Forwards the cluster test-support surface to sibling-crate tests.
-cluster-test-support = ["sinomo-cluster/test-support"]
+cluster-test-support = ["host", "sinomo-cluster/test-support"]
 # Forwards exact network wire-encoding probes to sibling-crate tests.
-network-test-support = ["sinomo-network/test-support"]
+network-test-support = ["host", "sinomo-network/test-support"]
 
 [dependencies]
 sinomo-base = { path = "../sinomo-base" }

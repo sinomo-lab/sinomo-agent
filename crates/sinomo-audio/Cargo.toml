@@ -19,7 +19,7 @@ native-devices = ["sinomo-runtime/native-devices"]
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sinomo-gateway = { path = "../sinomo-gateway" }
-sinomo-runtime = { path = "../sinomo-runtime" }
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["device-client"] }
 thiserror.workspace = true
 tokio.workspace = true
 
