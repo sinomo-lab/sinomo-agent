@@ -107,8 +107,8 @@ Native application hosts publish battery, thermal, metering, and OS data-policy
 conditions through the process-local `sinomo-device` resource monitor. These
 observations are advisory scheduling inputs: they are not persisted, written to
 cluster KV, or accepted as authority for a distributed mutation. Embedded
-daemons subscribe to the same monitor, so a condition change is an exact wake
-edge rather than another filesystem or control-plane polling loop.
+mobile daemons subscribe to the same monitor, so a condition change is an exact
+wake edge rather than another filesystem or control-plane polling loop.
 
 Resource restrictions may defer passive discovery, observation, DFS placement,
 repair, and replica catch-up. Foreground requests, local recovery, explicit
@@ -173,7 +173,12 @@ ability to change ordinary node configuration.
 
 One installation contributes one normal cluster member. The main daemon owns
 cluster participation. The shadow daemon is a supervision and recovery endpoint
-and does not vote, own DFS data, or accept normal workload placement.
+and does not vote, own DFS data, or accept normal workload placement. A desktop
+graphical app attaches to that main daemon when it already exists; otherwise it
+starts the same full product in a sibling foreground process. The app keeps an
+inherited lifetime lease and exact child handle, so only the daemon instance it
+started is stopped with the app. The GUI process never hosts the daemon control
+loop or product component catalog.
 
 See [clustering architecture](clustering-architecture.md) for membership,
 consensus, identity, and failure semantics.
@@ -351,9 +356,9 @@ Trust rings constrain both dependency direction and mutation risk:
 | Ring | Purpose | Dependency rule |
 |---|---|---|
 | R0 | Minimal cluster foundation: base contracts, object format, local storage, node/events, network, KV, cluster, and service discovery. | R0 crates depend only on R0 crates. |
-| R0 boundary | `sinomo-core`, the facade over the complete R0 set. | Aggregates R0 without adding service behavior. |
+| R0 boundary | `sinomo-core`, the facade over R0. | The `client` profile is the wire/client cut being ratcheted toward contract-only dependencies; the default `host` profile aggregates the complete R0 set without adding behavior. |
 | R1 | Trusted runtime: daemon, DFS, build, policy, modules, registry, rollout, observation, config, evaluation, sandboxes, and support APIs. | Crosses into R0 through `sinomo-core`. |
-| R1 boundary | `sinomo-runtime`, the facade over R0 and R1. | Aggregates trusted runtime surfaces without owning application behavior. |
+| R1 boundary | `sinomo-runtime`, the facade over R0 and R1. | The `client` profile exposes contracts and daemon clients; the default `host` profile aggregates the complete trusted runtime without owning application behavior. |
 | R2 | Agent, memory, models, perception, action, and evolution services. | Depends on the foundation through `sinomo-runtime`. |
 | Application | CLI, GUI, mounts, and test applications. | May depend on R2 services directly; accesses R0 and R1 through `sinomo-runtime`. |
 
@@ -363,6 +368,54 @@ codec. New R1 code should use `sinomo_core::...`; R2 code uses
 `sinomo_runtime::...` for the trusted foundation. Applications may import R2
 services directly but must also use `sinomo_runtime::...` for R0 and R1
 surfaces.
+
+Graphical application code reaches client-safe runtime surfaces through the R2
+`sinomo-client` facade. Its normal dependency closure must not contain daemon,
+agent, model, rollout, sandbox, build, or product-composition implementations.
+Feature unification while building a multi-binary installer may compile the
+host graph for the sibling daemon artifact; it must not expose host types
+through `sinomo-client` or `sinomo-app` public APIs.
+
+Interactive chat follows the same process boundary. The
+`sinomo-app-contract::chat` module owns the serializable commands,
+cursor-sequenced events, attachment snapshots, and UI projections.
+`sinomo-client::ChatDaemonClient` is the thin transport;
+the graphical `ChatHandle` is only a client actor that pumps those events into
+the UI. `AgentChat`, model provider access, tool registries, session control,
+and stable-history projection are instantiated by the daemon host. Desktop UI
+code must not retain an `AgentChat` or an executable tool context. Realtime
+media may hand a request to the regular agent through the chat RPC, but it does
+not execute ordinary agent tools in the app process.
+
+Each app surface opens a daemon chat client identity, submits commands, and
+long-polls an exclusive event cursor. The daemon retains a bounded per-client
+event tail and routes steering, follow-up, removal, interruption, and control
+snapshots through its live runtime-control registry even while the chat worker
+is blocked in a model turn. Chat-session routes are local-command-only; cluster
+members use the separately authorized agent session APIs rather than guessing
+an app client identity. Closing the surface requests release of its session
+worker; closing the app releases the daemon process lease described below.
+
+The same boundary applies to the rest of the desktop surface. The data-only R2
+`sinomo-app-contract` crate namespaces agent, chat, evolution, and skill
+commands and projections by domain. These app-private protocols share a
+release boundary and deliberately remain one package; independently versioned
+module interfaces remain owned by `sinomo-module-api` and their domain contract
+owners. `sinomo-client` owns the typed clients for agent definitions,
+chat/channel history, SIFS/DFS browsing, skills, evolution, and daemon lifecycle.
+Agent/skill/evolution stores and mutations execute in daemon services; the GUI
+never opens their authority stores or invokes CLI handlers on a normal desktop
+build.
+
+Desktop `sinomo-app` uses the runtime `client` profile plus narrowly named
+device, module-inspection, observation, and NFS client profiles. Those
+profiles do not enable the daemon, build, rollout, sandbox, product profile,
+agent, CLI, evolution engine, VFS host, or supervision implementations. A
+dependency-boundary test checks this normal graph for forbidden implementations
+without constraining its transitive package count. Android deliberately adds the
+complete host profile and implementation crates in its target-specific table
+because it still embeds the daemon; test-only dependencies retain local stores
+as deterministic fixtures without changing the desktop production graph.
 
 Self-evolution also uses an extended `TrustRing` risk classification through R5
 for candidate artifacts, disposable workspaces, and model providers. Those
@@ -394,9 +447,38 @@ component's routes before unwinding its effects.
 `ComponentCatalog` is the single composition input for factories, module
 registrations, config definitions, and storage contributions. A host must not
 maintain separate per-surface built-in lists. The shared product profile builds
-the common catalog used by standalone CLI and embedded app hosts; each may add
-process-specific component overlays before handing the catalog to the daemon.
-The daemon supplies only host infrastructure components and adapters.
+the common catalog used by standalone CLI daemons, app-owned desktop daemon
+processes, and embedded mobile hosts; each may add process-specific component
+overlays before handing the catalog to the daemon. The daemon supplies only host
+infrastructure components and adapters. `sinomo-app` is a client surface on
+desktop and must not import daemon implementation or product-composition code.
+
+Modules may extend existing presentation and behavior only through typed,
+versioned extension points declared by the subsystem that owns the affected
+surface. An extension-point definition owns its schemas, locality, composition
+policy, deterministic ordering, resource limits, failure behavior, and final
+authority. A module supplies a namespaced contribution containing bounded data
+or a reference to one of its logical exported operations; it cannot intercept
+an arbitrary function, route, event, or rendered node.
+
+Extension points compose through explicit policies: ordered additive entries,
+independent collection, a trusted host reducer, a bounded typed pipeline,
+explicit single-provider selection, or deny-wins constraints. Install and
+activation order never choose a winner. Replacement providers require user,
+configuration, operator, or policy selection, and extensions cannot grant
+authority or replace foundational identity, integrity, consensus, policy, or
+recovery checks. Services remain the checked invocation substrate and events
+remain attributable facts rather than implicit middleware.
+
+Application UI is one family of extension points. Semantic host slots accept
+actions, panels, views, inspector or settings sections, status items, and
+decorations. UI extension-point owners define bounded, versioned payload
+schemas for native-rendered content or logical providers; a payload is content
+for a contributed surface, not a general rendered-tree patch format. The
+application owns rendering, accessibility, focus, theming, input, and user
+layout preferences; the daemon mediates logical query and command operations.
+A module cannot load Rust/SUI widgets, name arbitrary routes, mutate child
+indexes, or gain authority through presentation metadata.
 
 External providers are selected by interface offer, never by provider crate or
 hardcoded module ID in the main runtime. WASIX implements the generic sandbox
@@ -530,6 +612,9 @@ Changes to the runtime must preserve these properties:
     of authority.
 12. Rollout, cluster membership, and service discovery never imply node-local
     consent to remote host or device access.
+13. Modules alter existing behavior only through owner-declared extension
+    points with typed inputs and outputs, deterministic host-owned composition,
+    explicit failure semantics, and final authority checks.
 
 Detailed contracts belong in the subsystem documents linked from the
 [documentation index](README.md). Delivery sequencing and unfinished work

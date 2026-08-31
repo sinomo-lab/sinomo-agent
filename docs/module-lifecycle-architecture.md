@@ -32,6 +32,12 @@ same execution technology.
   applied runtime records.
 - Runtime assembly must be deterministic. Sinomo must not discover executable
   modules by scanning arbitrary directories.
+- Existing behavior may be extended only through versioned extension points
+  declared by the subsystem that owns the behavior. A module cannot intercept
+  arbitrary functions, routes, events, or rendered UI nodes.
+- Extension-point owners define composition, ordering, authority, timeout, and
+  failure semantics. Contributors provide typed data or operations; they do not
+  choose how competing contributions are resolved.
 - Native dynamic libraries are trusted build and deployment isolation, not
   security isolation.
 - Wasm is optional. It should be chosen for isolation, portability, or ABI
@@ -240,6 +246,148 @@ Public surfaces include object-RPC methods, event kinds, capability imports and
 exports, settings definitions, and storage contract owners. This data is
 serializable, inspectable, comparable across nodes, and safe to place in
 registry or cluster desired state.
+
+### Typed Extension Points And Contributions
+
+Module services answer what a component provides. Extension points answer
+where several modules may participate in one host-owned behavior or
+presentation surface. The mechanisms share module identity, typed interface
+operations, capability checks, lifecycle generations, and provenance, but an
+extension point adds an explicit host-owned composition contract.
+
+Every extension point has a stable ID and version and is declared by the
+subsystem that owns the affected behavior. Its definition specifies:
+
+- input, contribution, and output schema IDs;
+- whether contributions are declarative, operation-backed, or either;
+- locality and whether remote providers are permitted;
+- a composition policy and deterministic ordering policy;
+- latency, request, response, fan-out, and result-count bounds;
+- timeout, cancellation, and partial-failure behavior;
+- capabilities required to contribute and capabilities required to apply the
+  result;
+- whether user or operator selection is required; and
+- which host-owned context keys may affect eligibility.
+
+A module contributes a bounded record containing a namespaced contribution ID,
+the target extension-point ID and compatible version, an optional declarative
+payload, and an optional reference to a logical operation in one of the
+module's typed interface exports. Operation-backed contributions name only the
+export and logical operation; the live registry resolves the concrete provider
+and route. A contribution cannot name a raw host function, Rust type, rendered
+node selector, or undeclared object-RPC route.
+
+Common contribution metadata is shared across UI and behavior surfaces:
+
+```text
+contribution id
+target extension point and version
+module and artifact provenance
+optional context predicate
+group and numeric order
+optional before/after contribution IDs
+declarative payload or logical operation reference
+```
+
+The host compiles active definitions and contributions into one immutable,
+generation-stamped extension registry. Eligibility is evaluated first, then
+group order, acyclic before/after constraints, numeric order, module ID, and
+contribution ID. Activation order is never a tie-breaker. Cyclic relative-order
+constraints are diagnosed and discarded without discarding otherwise valid
+contributions. An extension registry generation is published atomically with
+the service generation it references; unloading or replacing a module removes
+its contributions before its scope is unwound.
+
+#### Composition Policies
+
+An extension point chooses one composition policy. A contributor cannot change
+the policy for the point it targets.
+
+| Policy | Use | Multiple-contributor behavior |
+|---|---|---|
+| `many-ordered` | UI sections, menu items, handlers that all produce independent output | Retain every eligible contribution in deterministic order. |
+| `collect` | Enrichers, diagnostics, candidate generation, metadata providers | Invoke providers independently and return attributed partial results. |
+| `reduce` | Scores, decorations, constraints, or domain-specific patches | The point owner applies a trusted reducer to all attributed results. |
+| `pipeline` | Explicit staged transformation of a typed value | Apply bounded validated deltas in deterministic order; no contributor receives a `next` callback. |
+| `select-one` | Replaceable provider or renderer | Use an explicit user, operator, configuration, or policy selection; ambiguity never resolves by install order. |
+| `veto` | Admission and safety constraints | Any valid denial constrains the result; contributors can never manufacture authority or convert a host denial into approval. |
+
+`pipeline` is not general middleware. The extension-point owner defines the
+typed delta vocabulary and validates every intermediate result. Core identity,
+authentication, policy, storage integrity, consensus, final device authority,
+and recovery checks remain outside replaceable pipelines. An extension may
+propose a change or add a constraint, but the owning subsystem performs the
+authoritative state transition after revalidation.
+
+Failure behavior is also point-owned. Observational enrichment may preserve
+partial success, an optional presentation contribution may be omitted, and an
+authority constraint normally fails closed. Timeouts, malformed output, and
+provider disappearance are recorded per contribution with module and artifact
+provenance. A module cannot mark its own failure ignorable.
+
+#### Relation To Services And Events
+
+Existing service offers and requirements remain the execution substrate.
+`ServiceRequirement` declares exactly which logical operations and caller
+capabilities a component may exercise. The extension registry resolves an
+operation-backed contribution through that checked path and never creates a
+parallel callback registry. Existing deterministic local fan-out provides the
+base for `collect` and `reduce`; selected providers use the same live discovery
+identity and health evidence.
+
+Events remain typed facts, not mutation waterfalls. They are appropriate for
+observation, refresh, audit, and asynchronous reactions. A synchronous
+composition decision uses an extension point so its ordering, deadline,
+failure, and authority semantics are explicit. Publishing an event does not
+insert a module into a behavior pipeline, and subscribing to an event does not
+grant permission to alter the action that emitted it.
+
+#### Application UI Contributions
+
+Application UI uses the same extension registry rather than a separate plugin
+system. The app defines semantic extension points such as navigation views,
+toolbar groups, context menus, inspector sections, settings sections, status
+items, and named slots inside built-in surfaces. UI points normally use
+`many-ordered`, `reduce`, or `select-one` composition.
+
+Each UI extension point owns a bounded, versioned payload schema appropriate to
+its semantic slot. A contributed view, panel, or inspector section may use a
+host-rendered document payload, while actions and provider-backed surfaces may
+reference logical operations from the contributor's typed interface export.
+Those payload schemas do not own placement or cross-extension conflict
+resolution. Raw routes, arbitrary rendered-tree patches, native widget
+callbacks, arbitrary colors, and executable UI payloads are not catalog data.
+
+Built-in surfaces expose stable semantic slots rather than mutable child
+indexes or selectors. Additive contributions such as actions, panels, badges,
+and tooltip sections compose as ordered collections. Scalar properties such as
+the label or visibility of a core control are not general multi-writer
+extension points. Replacement surfaces use `select-one`, preserve a safe
+built-in provider, and require explicit selection. User-owned layout,
+visibility, and ordering preferences override module defaults without changing
+the module artifact.
+
+The application owns native rendering, accessibility, focus, semantic theming,
+input state, and confirmation UI. The daemon owns catalog mediation and command
+dispatch. Invoking a contributed action sends the contribution identity and
+semantic context to the daemon; the daemon resolves the logical operation and
+rechecks authority. Presentation metadata never grants direct access to a
+module route.
+
+#### Behavior Contributions
+
+Behavior extension points are declared at stable domain join points, not
+around arbitrary implementation functions. Illustrative points include agent
+context enrichment (`collect`), diagnostic providers (`collect`), ranking
+adjustments (`reduce` or a typed `pipeline`), replaceable file openers
+(`select-one`), and additional admission constraints (`veto`). The point owner
+defines domain-specific schemas and the trusted reducer or delta validator.
+
+First-party behavior may use the same contribution path when it is naturally
+replaceable or additive. Foundational authority and recovery behavior remains a
+host-owned baseline rather than an ordinary removable contribution. This lets
+modules extend existing functionality without turning module activation into
+arbitrary monkey-patching.
 
 ### Settings Surfaces
 
@@ -543,20 +691,27 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-module` owns low-level module glue: backend-neutral catalog
   registration, loader activation state, routing and invocation primitives,
   native dynamic-library host loading, unload records, raw replay contracts,
-  module telemetry contracts, and serializable module surface declarations. It
-  must not own policy decisions, rollout admission, rollout transition state,
-  or self-evolution scoring.
+  module telemetry contracts, serializable module surface declarations, and
+  the live extension registry and deterministic resolver. It must not own
+  domain reducers, policy decisions, rollout admission, rollout transition
+  state, or self-evolution scoring.
 - `sinomo-module-api` owns the sole stable native dynamic-library ABI and the
-  provider-neutral component descriptor vocabulary. There are no
+  provider-neutral component descriptor vocabulary, including generic
+  extension-point definitions, contribution envelopes, operation references,
+  ordering metadata, and composition-policy identifiers. There are no
   provider-specific API crates in the runtime facade; an external module keeps
   private provider protocols inside its own package and exposes standardized
   services through component offers.
+- `sinomo-client` is the R2 client facade for application surfaces. It owns
+  connection supervision and typed remote clients, never domain authority or
+  daemon-side implementations.
 - The direct-link layer inside `sinomo-network` owns the network-transport
   registry, descriptors, and network-module dylib vtable that transport modules
   implement.
 - `sinomo-daemon` owns the runtime registry that assembles the module table:
   internal native-rust registrations and bindings, dylib loader adaptation,
-  module-to-method conversion, and the composed storage layout.
+  module-to-method conversion, the composed extension-registry generation, and
+  the composed storage layout.
   `sinomo-runtime` re-exports that machinery as
   `sinomo_runtime::{modules, storage}` without adding behavior.
 - `sinomo-policy` owns policy decisions and policy vocabulary interpretation.
@@ -574,9 +729,11 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-evolution` owns candidate generation, evidence assembly, evidence
   interpretation, self-evolution scorecard adapters, and promotion requests; it
   consumes module lifecycle contracts but does not define R1 module primitives.
-- Domain module crates own their domain method names, event kinds, storage roots,
-  and host-service binding helpers. Generic infrastructure crates own framing,
-  dispatch, storage verification, and daemon event-loop mechanics.
+- Domain module crates own their domain method names, event kinds, storage
+  roots, extension-point schemas, trusted reducers and delta validators, and
+  host-service binding helpers. Generic infrastructure crates own framing,
+  dispatch, deterministic contribution resolution, storage verification, and
+  daemon event-loop mechanics.
 
 R1 crates cross into the cluster foundation through the `sinomo-core` facade.
 R2 and application crates cross into these foundations through
@@ -602,8 +759,10 @@ R2 and application crates cross into these foundations through
 11. Wasm remains optional and backend-specific.
 12. Self-evolution targets modules only when the behavior has a natural,
     evaluable boundary.
-13. Module catalog data must not contain executable bindings; native runtime
-    binding is deterministic `ComponentFactory` assembly keyed by catalog
+13. Module catalog data must not contain executable callbacks or raw host
+    bindings. A contribution may reference a typed logical operation, but the
+    live service registry resolves its provider and route; native runtime
+    binding remains deterministic `ComponentFactory` assembly keyed by catalog
     entries.
 14. Every mounted runtime effect belongs to a `ComponentScope`; durable effects
     register replayable compensation rather than relying on process-local drop.
@@ -614,3 +773,20 @@ R2 and application crates cross into these foundations through
 16. Active-provider discovery and native loading have one implementation in
     `sinomo-module`; domain crates may own typed clients but not parallel loader
     scans or standalone host-adapter crates.
+17. Module UI contributions use bounded, versioned extension-point payloads;
+    modules never load Rust/SUI widgets, patch rendered child indexes, or name
+    unvalidated transport routes in the app.
+18. A module may affect existing behavior only through a typed, versioned
+    extension point declared by the subsystem that owns that behavior.
+19. Extension-point composition, ordering, failure handling, and final
+    authority are host-owned and deterministic; activation order is never an
+    implicit precedence rule.
+20. Contributions may add results, propose bounded deltas, provide a selected
+    implementation, or add constraints. They cannot grant authority, bypass a
+    host denial, or replace foundational identity, integrity, consensus,
+    policy, or recovery checks.
+21. Active extension contributions and the service operations they reference
+    share an atomic lifecycle generation. Unloading a component removes its
+    contributions before unwinding its effects.
+22. Component events remain attributable facts and notifications, not an
+    implicit ordered mutation or middleware chain.

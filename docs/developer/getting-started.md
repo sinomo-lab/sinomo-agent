@@ -67,7 +67,8 @@ cargo build
 # Every workspace member with default features.
 cargo check --workspace
 
-# Graphical desktop application.
+# Graphical desktop application and its app-owned daemon sibling.
+cargo build -p sinomo-app-daemon -p sinomo-app
 cargo run -p sinomo-app
 ```
 
@@ -75,6 +76,8 @@ The desktop app needs platform libraries used by SUI/wgpu and native audio and
 video backends. The repository does not yet maintain a verified package list
 for every Linux distribution, macOS, and Windows release; treat the CLI as the
 portable baseline and diagnose app dependencies for the target platform.
+The app resolves `sinomo-app-daemon` beside its own executable and never searches
+`PATH`; packages must therefore install or bundle both artifacts together.
 
 These packages are deliberately outside default members because they require a
 platform, runtime, or explicit benchmark choice:
