@@ -1023,6 +1023,32 @@ pub fn run_daemon_control_loop_with_catalog_and_runtime(
     component_catalog: crate::DaemonComponentCatalog,
     runtime_config: crate::DaemonRuntimeConfig,
 ) -> Result<(), DaemonError> {
+    let listener = crate::prepare_daemon_control_listener(options)?;
+    run_daemon_control_loop_with_prepared_listener(
+        listener,
+        paths,
+        label,
+        cluster,
+        component_catalog,
+        runtime_config,
+    )
+}
+
+pub fn run_daemon_control_loop_with_prepared_listener(
+    listener: crate::PreparedDaemonControlListener,
+    paths: DaemonPaths,
+    label: &str,
+    cluster: Option<DaemonClusterStatus>,
+    component_catalog: crate::DaemonComponentCatalog,
+    runtime_config: crate::DaemonRuntimeConfig,
+) -> Result<(), DaemonError> {
+    let (options, listener, fallback_from_port) = listener.into_parts();
+    if let Some(requested_port) = fallback_from_port {
+        eprintln!(
+            "warning: sinomo {label} port {requested_port} is unavailable; listening on automatic fallback port {}",
+            options.port
+        );
+    }
     crate::cluster::deny_shadow_daemon_local_raft_access(&paths)?;
     crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
@@ -1044,6 +1070,13 @@ pub fn run_daemon_control_loop_with_catalog_and_runtime(
     {
         tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
     }
+    if let Some(requested_port) = fallback_from_port {
+        tracing::warn!(
+            requested_port,
+            fallback_port = options.port,
+            "sinomo {label} preferred port unavailable; using automatic fallback"
+        );
+    }
     sinomo_observe::register_builtin_observe_metric_exporters();
     crate::dfs::register_daemon_dfs_observe_metric_exporter();
     let startup_local_raft_resident_initialized =
@@ -1064,12 +1097,32 @@ pub fn run_daemon_control_loop_with_catalog_and_runtime(
     let startup_cluster_runtime_enabled = cluster.is_some();
     let bind_address = format!("{}:{}", options.host, options.port);
     let listener = daemon_runtime.block_on(
-        sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
+        sinomo_core::network::AsyncDaemonControlListener::from_std(listener, &bind_address),
     )?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let shutdown_signal = shutdown_tx.clone();
     let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
     tracing::info!("sinomo {label} listening on {bind_address}");
+    if let Some(requested_port) = fallback_from_port {
+        crate::append_operational_event_best_effort(
+            &paths,
+            crate::OperationalSeverity::Warn,
+            "daemon-control",
+            "daemon.lifecycle.port-fallback",
+            format!(
+                "sinomo {label} preferred port {requested_port} was unavailable; listening on fallback port {}",
+                options.port
+            ),
+            None,
+            serde_json::json!({
+                "label": label,
+                "requested_port": requested_port,
+                "fallback_port": options.port,
+                "address": bind_address,
+                "pid": std::process::id(),
+            }),
+        );
+    }
     crate::append_operational_event_best_effort(
         &paths,
         crate::OperationalSeverity::Info,
@@ -1080,6 +1133,7 @@ pub fn run_daemon_control_loop_with_catalog_and_runtime(
         serde_json::json!({
             "label": label,
             "address": bind_address,
+            "fallback_from_port": fallback_from_port,
             "pid": std::process::id(),
             "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
         }),
@@ -7142,6 +7196,7 @@ mod tests {
         let options = DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port,
+            port_fallback: false,
         };
         let cluster = crate::daemon_cluster_status(&state, crate::DaemonClusterProcess::Main)
             .expect("main cluster status");
@@ -7222,6 +7277,7 @@ mod tests {
         let options = DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port,
+            port_fallback: false,
         };
         let daemon = thread::spawn({
             let paths = paths.clone();

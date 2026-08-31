@@ -45,7 +45,7 @@ use sinomo_runtime::core::ClusterNodeRole;
 #[cfg(target_os = "android")]
 use sinomo_runtime::daemon::{
     DaemonClusterProcess, DaemonExecutionProfile, DaemonRuntimeConfig, daemon_cluster_status,
-    run_daemon_control_loop_with_catalog_and_runtime,
+    prepare_daemon_control_listener, run_daemon_control_loop_with_prepared_listener,
 };
 use sinomo_runtime::local::SinomoDataDir;
 #[cfg(target_os = "android")]
@@ -990,7 +990,9 @@ fn start_in_process_daemon(
     agent_runtime_control: AppAgentRuntimeControl,
     node_resources: sinomo_runtime::device::NodeResourceMonitor,
 ) -> Result<(DaemonStatus, OwnedDaemonHandle), String> {
-    let options = DaemonRunOptions::default();
+    let listener = prepare_daemon_control_listener(DaemonRunOptions::default())
+        .map_err(|error| error.to_string())?;
+    let options = listener.options().clone();
     let daemon_address = format!("{}:{}", options.host, options.port);
     let execution_profile = embedded_daemon_execution_profile();
     let cluster = in_process_daemon_cluster_status(paths)?;
@@ -1031,8 +1033,8 @@ fn start_in_process_daemon(
                     sinomo_product_profile::with_components(&base_catalog, hooks).map_err(
                         |error| format!("extend embedded product component profile: {error}"),
                     )?;
-                run_daemon_control_loop_with_catalog_and_runtime(
-                    options,
+                run_daemon_control_loop_with_prepared_listener(
+                    listener,
                     loop_paths,
                     "daemon",
                     cluster,

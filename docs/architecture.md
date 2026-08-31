@@ -180,6 +180,14 @@ inherited lifetime lease and exact child handle, so only the daemon instance it
 started is stopped with the app. The GUI process never hosts the daemon control
 loop or product component catalog.
 
+Daemon ports are preferences unless an operator supplies an explicit CLI or
+environment port. An automatic bind conflict selects and holds an OS-assigned
+listener before status, component, or cluster registration is constructed.
+The actual address is then the single source for local client discovery and
+endpoint advertisement. A node may still establish cluster reachability by
+initiating connections to known peers when its fallback listener is not
+directly reachable; discovery changes reachability, never authority.
+
 See [clustering architecture](clustering-architecture.md) for membership,
 consensus, identity, and failure semantics.
 

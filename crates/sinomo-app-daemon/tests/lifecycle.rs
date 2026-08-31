@@ -4,12 +4,36 @@ use std::time::{Duration, Instant};
 
 use sinomo_runtime::api::{
     DaemonApiClient, DaemonPaths, DaemonProbeStatus, SINOMO_APP_DAEMON_LAUNCH_ID_ENV,
-    SINOMO_DAEMON_API_PROTOCOL_VERSION, probe_daemon_status,
+    SINOMO_DAEMON_API_PROTOCOL_VERSION, SINOMO_DAEMON_DEFAULT_PORT, probe_daemon_status,
 };
 use sinomo_runtime::cluster::ClusterControlInitRequest;
 use sinomo_runtime::local::SinomoDataDir;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+#[test]
+fn automatic_port_fallback_is_discovered_through_shared_status() {
+    let occupied = TcpListener::bind(("127.0.0.1", SINOMO_DAEMON_DEFAULT_PORT)).ok();
+    let root = sinomo_testdir::TestDir::new("sinomo-app-daemon-port-fallback");
+    let data_dir = SinomoDataDir::new(root.path().to_path_buf());
+    data_dir.ensure_root_layout().expect("data layout");
+    let launch_id = format!("fallback-test-{}", std::process::id());
+    let mut child = spawn_automatic_helper(&data_dir, &launch_id);
+    let paths = DaemonPaths::new(&data_dir);
+    let status = wait_for_owned_status(&mut child, &paths, &launch_id);
+
+    assert_ne!(status.port, SINOMO_DAEMON_DEFAULT_PORT);
+    assert_eq!(
+        DaemonApiClient::connect_for_paths(&paths)
+            .expect("discover fallback daemon")
+            .address(),
+        status.address
+    );
+
+    drop(child.stdin.take());
+    assert!(wait_for_exit(&mut child, Duration::from_secs(15)).success());
+    drop(occupied);
+}
 
 #[test]
 fn lifetime_pipe_bounds_the_real_daemon_process() {
@@ -201,6 +225,19 @@ fn spawn_helper(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn app daemon helper")
+}
+
+fn spawn_automatic_helper(data_dir: &SinomoDataDir, launch_id: &str) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_sinomo-app-daemon"))
+        .arg("--host")
+        .arg("127.0.0.1")
+        .env("SINOMO_DATA_DIR", data_dir.root())
+        .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn automatic app daemon helper")
 }
 
 fn available_loopback_port() -> u16 {

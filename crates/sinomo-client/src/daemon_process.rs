@@ -115,14 +115,14 @@ pub fn start_app_owned_daemon(
     let binary = app_daemon_binary()?;
     let launch_id = next_launch_id();
     let (stdout, stderr) = app_daemon_log_files(data_dir)?;
-    let options = DaemonRunOptions::default();
+    let options = DaemonRunOptions::main_from_environment()?;
     let mut command = Command::new(&binary);
     prepare_app_daemon_command(&mut command);
+    command.arg("--host").arg(&options.host);
+    if !options.port_fallback {
+        command.arg("--port").arg(options.port.to_string());
+    }
     command
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
         .env("SINOMO_DATA_DIR", data_dir)
         .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, &launch_id)
         .stdin(Stdio::piped())
@@ -280,13 +280,13 @@ fn next_launch_id() -> String {
     format!("app-{}-{nanos:x}-{sequence:x}", std::process::id())
 }
 
-fn prepare_app_daemon_command(command: &mut Command) {
+fn prepare_app_daemon_command(_command: &mut Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
-        command.creation_flags(CREATE_NO_WINDOW);
+        _command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 

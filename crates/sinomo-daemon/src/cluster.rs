@@ -10645,10 +10645,12 @@ mod tests {
         let main_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 32_153,
+            port_fallback: false,
         };
         let shadow_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 32_154,
+            port_fallback: false,
         };
         write_daemon_status(
             &main_paths,
@@ -10738,10 +10740,12 @@ mod tests {
         let main_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 32_153,
+            port_fallback: false,
         };
         let shadow_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 32_154,
+            port_fallback: false,
         };
         write_daemon_status(
             &main_paths,
@@ -16042,10 +16046,12 @@ mod tests {
         let main_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 21_353,
+            port_fallback: false,
         };
         let shadow_options = DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 21_354,
+            port_fallback: false,
         };
         ensure_daemon_cluster_members(&mut state, &main_options, &shadow_options, now);
         sinomo_core::cluster::write_cluster_state(&paths, &state).expect("write local state");

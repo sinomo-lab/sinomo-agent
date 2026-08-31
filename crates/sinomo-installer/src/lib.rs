@@ -1,10 +1,11 @@
 //! Local runtime installation, managed-source deployment, and boot-entry orchestration.
 
-use sinomo_api::{daemon_probe_status_needs_restart_for_options, daemon_status_matches_options};
+use sinomo_api::daemon_status_matches_options;
 use sinomo_core::local::SinomoDataDir;
 use sinomo_daemon::{
-    DaemonError, DaemonPaths, DaemonRunOptions, DaemonStatus, daemon_connect_address,
-    probe_daemon_status, probe_daemon_status_at_address, send_daemon_shutdown_request,
+    DaemonError, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
+    daemon_connect_address, probe_daemon_status, probe_daemon_status_at_address,
+    send_daemon_shutdown_request,
 };
 use sinomo_rollout::{
     SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV, SelfRolloutPaths,
@@ -118,6 +119,8 @@ pub struct InstalledDaemonInstallPlanRequest {
     pub host: String,
     pub port: u16,
     pub shadow_port: u16,
+    pub port_fallback: bool,
+    pub shadow_port_fallback: bool,
     pub start: bool,
 }
 
@@ -163,41 +166,50 @@ fn installed_daemon_start_specs(
     host: &str,
     main_port: u16,
     shadow_port: u16,
+    main_port_fallback: bool,
+    shadow_port_fallback: bool,
 ) -> [InstalledDaemonStartSpec; 2] {
     let daemon_paths = installed_daemon_paths(layout);
+    let mut main_args = vec![
+        "daemon".to_string(),
+        "run".to_string(),
+        "--host".to_string(),
+        host.to_string(),
+    ];
+    if !main_port_fallback {
+        main_args.extend(["--port".to_string(), main_port.to_string()]);
+    }
+    let mut shadow_args = vec![
+        "daemon".to_string(),
+        "shadow".to_string(),
+        "run".to_string(),
+        "--host".to_string(),
+        host.to_string(),
+    ];
+    if !shadow_port_fallback {
+        shadow_args.extend(["--port".to_string(), shadow_port.to_string()]);
+    }
+    let mut shadow_env = vec![
+        (SHADOW_MAIN_BINARY_ENV, layout.binary.display().to_string()),
+        (SHADOW_MAIN_HOST_ENV, host.to_string()),
+    ];
+    if !main_port_fallback {
+        shadow_env.push((SHADOW_MAIN_PORT_ENV, main_port.to_string()));
+    }
     [
         InstalledDaemonStartSpec {
             binary: layout.binary.clone(),
-            args: vec![
-                "daemon".to_string(),
-                "run".to_string(),
-                "--host".to_string(),
-                host.to_string(),
-                "--port".to_string(),
-                main_port.to_string(),
-            ],
+            args: main_args,
             paths: daemon_paths.main,
             label: "daemon",
             extra_env: Vec::new(),
         },
         InstalledDaemonStartSpec {
             binary: layout.shadow_binary.clone(),
-            args: vec![
-                "daemon".to_string(),
-                "shadow".to_string(),
-                "run".to_string(),
-                "--host".to_string(),
-                host.to_string(),
-                "--port".to_string(),
-                shadow_port.to_string(),
-            ],
+            args: shadow_args,
             paths: daemon_paths.shadow,
             label: "shadow daemon",
-            extra_env: vec![
-                (SHADOW_MAIN_BINARY_ENV, layout.binary.display().to_string()),
-                (SHADOW_MAIN_HOST_ENV, host.to_string()),
-                (SHADOW_MAIN_PORT_ENV, main_port.to_string()),
-            ],
+            extra_env: shadow_env,
         },
     ]
 }
@@ -215,15 +227,24 @@ pub fn prepare_installed_daemon_install_plan(
             &request.host,
             request.port,
             request.shadow_port,
+            request.port_fallback,
+            request.shadow_port_fallback,
             &daemon_paths.main,
             &daemon_paths.shadow,
             probe_timeout,
         );
     let stop_reason = installed_daemon_install_stop_reason(updating_binary, restarting_for_options);
     let start_specs = if request.start {
-        installed_daemon_start_specs(layout, &request.host, request.port, request.shadow_port)
-            .into_iter()
-            .collect()
+        installed_daemon_start_specs(
+            layout,
+            &request.host,
+            request.port,
+            request.shadow_port,
+            request.port_fallback,
+            request.shadow_port_fallback,
+        )
+        .into_iter()
+        .collect()
     } else {
         Vec::new()
     };
@@ -502,19 +523,38 @@ fn installed_daemons_need_restart(
     host: &str,
     main_port: u16,
     shadow_port: u16,
+    main_port_fallback: bool,
+    shadow_port_fallback: bool,
     main_paths: &DaemonPaths,
     shadow_paths: &DaemonPaths,
     timeout: Duration,
 ) -> bool {
-    daemon_probe_status_needs_restart_for_options(
+    installed_daemon_probe_needs_restart(
         probe_daemon_status(main_paths, timeout),
         host,
         main_port,
-    ) || daemon_probe_status_needs_restart_for_options(
+        main_port_fallback,
+    ) || installed_daemon_probe_needs_restart(
         probe_daemon_status(shadow_paths, timeout),
         host,
         shadow_port,
+        shadow_port_fallback,
     )
+}
+
+fn installed_daemon_probe_needs_restart(
+    status: DaemonProbeStatus,
+    host: &str,
+    port: u16,
+    port_fallback: bool,
+) -> bool {
+    match status {
+        DaemonProbeStatus::Running(status)
+        | DaemonProbeStatus::Locked {
+            status: Some(status),
+        } => status.host != host || !port_fallback && status.port != port,
+        DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => false,
+    }
 }
 
 pub fn stop_daemon_if_running(
@@ -844,6 +884,7 @@ fn daemon_run_options_from_args(args: &[String]) -> Option<DaemonRunOptions> {
     Some(DaemonRunOptions {
         host: host?,
         port: port?,
+        port_fallback: false,
     })
 }
 
@@ -909,6 +950,7 @@ fn write_boot_entry(
     command_prefix: &[&str],
     host: &str,
     port: u16,
+    port_fallback: bool,
     description: &str,
     child_process_policy: BootEntryChildProcessPolicy,
     extra_env: &[(&str, String)],
@@ -925,6 +967,7 @@ fn write_boot_entry(
         command_prefix,
         host,
         port,
+        port_fallback,
         description,
         child_process_policy,
         extra_env,
@@ -940,6 +983,8 @@ pub fn write_install_boot_entries(
     host: &str,
     main_port: u16,
     shadow_port: u16,
+    main_port_fallback: bool,
+    shadow_port_fallback: bool,
 ) -> Result<(), DaemonError> {
     #[cfg(windows)]
     let main_command_prefix = ["daemon", "start"];
@@ -957,15 +1002,18 @@ pub fn write_install_boot_entries(
         &main_command_prefix,
         host,
         main_port,
+        main_port_fallback,
         "Sinomo daemon",
         BootEntryChildProcessPolicy::SystemdDefault,
         &[],
     )?;
-    let shadow_env = vec![
+    let mut shadow_env = vec![
         (SHADOW_MAIN_BINARY_ENV, layout.binary.display().to_string()),
         (SHADOW_MAIN_HOST_ENV, host.to_string()),
-        (SHADOW_MAIN_PORT_ENV, main_port.to_string()),
     ];
+    if !main_port_fallback {
+        shadow_env.push((SHADOW_MAIN_PORT_ENV, main_port.to_string()));
+    }
     write_boot_entry(
         &layout.shadow_boot_entry,
         &layout.data_dir,
@@ -973,6 +1021,7 @@ pub fn write_install_boot_entries(
         &shadow_command_prefix,
         host,
         shadow_port,
+        shadow_port_fallback,
         "Sinomo shadow daemon",
         BootEntryChildProcessPolicy::PreserveDetachedChildren,
         &shadow_env,
@@ -996,6 +1045,7 @@ fn boot_entry_content(
     command_prefix: &[&str],
     host: &str,
     port: u16,
+    port_fallback: bool,
     description: &str,
     child_process_policy: BootEntryChildProcessPolicy,
     extra_env: &[(&str, String)],
@@ -1014,8 +1064,13 @@ fn boot_entry_content(
                 )
             })
             .collect::<String>();
+        let port = if port_fallback {
+            String::new()
+        } else {
+            format!(" --port {port}")
+        };
         let command_line = format!(
-            "\"{}\" {} --host {} --port {}",
+            "\"{}\" {} --host {}{}",
             binary.display(),
             command,
             host,
@@ -1038,8 +1093,13 @@ fn boot_entry_content(
             .iter()
             .map(|(key, value)| format!("Environment={key}={value}\n"))
             .collect::<String>();
+        let port = if port_fallback {
+            String::new()
+        } else {
+            format!(" --port {port}")
+        };
         format!(
-            "[Unit]\nDescription={description}\n\n[Service]\n{kill_mode}Environment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {} --port {}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
+            "[Unit]\nDescription={description}\n\n[Service]\n{kill_mode}Environment=SINOMO_DATA_DIR={}\n{}ExecStart={} {} --host {}{}\nRestart=on-failure\n\n[Install]\nWantedBy=default.target\n",
             data_dir.display(),
             extra_env,
             binary.display(),
@@ -1077,7 +1137,8 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let layout = InstallLayout::new(&data_dir, root.join("startup"));
 
-        let [main, shadow] = installed_daemon_start_specs(&layout, "127.0.0.1", 21400, 21401);
+        let [main, shadow] =
+            installed_daemon_start_specs(&layout, "127.0.0.1", 21400, 21401, false, false);
 
         assert_eq!(main.binary, layout.binary);
         assert_eq!(main.label, "daemon");
@@ -1116,6 +1177,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn installed_default_ports_remain_automatic_in_process_and_boot_specs() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-install-auto-ports");
+        let data_dir = SinomoDataDir::new(&root);
+        let layout = InstallLayout::new(&data_dir, root.join("startup"));
+
+        let [main, shadow] =
+            installed_daemon_start_specs(&layout, "0.0.0.0", 21353, 21354, true, true);
+        assert_eq!(main.args, ["daemon", "run", "--host", "0.0.0.0"]);
+        assert_eq!(
+            shadow.args,
+            ["daemon", "shadow", "run", "--host", "0.0.0.0"]
+        );
+        assert!(
+            shadow
+                .extra_env
+                .iter()
+                .all(|(name, _)| *name != SHADOW_MAIN_PORT_ENV)
+        );
+
+        write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, true, true)
+            .expect("write automatic-port boot entries");
+        let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
+        let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
+        assert!(!main.contains("--port"), "{main}");
+        assert!(!shadow.contains("--port"), "{shadow}");
+        assert!(!shadow.contains(SHADOW_MAIN_PORT_ENV), "{shadow}");
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn unix_shadow_boot_entry_preserves_detached_rollout_children() {
@@ -1123,7 +1213,8 @@ mod tests {
         let data_dir = SinomoDataDir::new(&root);
         let layout = InstallLayout::new(&data_dir, root.join("startup"));
 
-        write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354).expect("write boot entries");
+        write_install_boot_entries(&layout, "0.0.0.0", 21353, 21354, false, false)
+            .expect("write boot entries");
 
         let main = fs::read_to_string(&layout.main_boot_entry).expect("read main boot entry");
         let shadow = fs::read_to_string(&layout.shadow_boot_entry).expect("read shadow boot entry");
@@ -1270,6 +1361,8 @@ mod tests {
                 host: "127.0.0.1".to_string(),
                 port: 21400,
                 shadow_port: 21401,
+                port_fallback: false,
+                shadow_port_fallback: false,
                 start: false,
             },
             Duration::from_millis(1),

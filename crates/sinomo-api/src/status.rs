@@ -20,6 +20,14 @@ use time::format_description::well_known::Rfc3339;
 pub const SINOMO_DAEMON_DEFAULT_HOST: &str = "127.0.0.1";
 pub const SINOMO_DAEMON_DEFAULT_PORT: u16 = 21_353;
 pub const SINOMO_SHADOW_DAEMON_DEFAULT_PORT: u16 = 21_354;
+pub const SINOMO_DAEMON_PORT_ENV: &str = "SINOMO_DAEMON_PORT";
+pub const SINOMO_SHADOW_DAEMON_PORT_ENV: &str = "SINOMO_SHADOW_DAEMON_PORT";
+pub const SINOMO_DAEMON_PORT_FALLBACK_ENV: &str = "SINOMO_DAEMON_PORT_FALLBACK";
+pub const SINOMO_SHADOW_DAEMON_PORT_FALLBACK_ENV: &str = "SINOMO_SHADOW_DAEMON_PORT_FALLBACK";
+
+const fn default_daemon_port_fallback() -> bool {
+    true
+}
 /// Current revision of the local daemon control protocol understood by first-party clients.
 ///
 /// This is deliberately independent from the package version: compatible app and daemon builds
@@ -86,6 +94,8 @@ pub fn daemon_build_info() -> DaemonBuildInfo {
 pub struct DaemonRunOptions {
     pub host: String,
     pub port: u16,
+    #[serde(default = "default_daemon_port_fallback")]
+    pub port_fallback: bool,
 }
 
 impl Default for DaemonRunOptions {
@@ -93,6 +103,7 @@ impl Default for DaemonRunOptions {
         Self {
             host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
             port: SINOMO_DAEMON_DEFAULT_PORT,
+            port_fallback: true,
         }
     }
 }
@@ -102,7 +113,54 @@ impl DaemonRunOptions {
         Self {
             host: SINOMO_DAEMON_DEFAULT_HOST.to_string(),
             port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+            port_fallback: true,
         }
+    }
+
+    pub fn strict_port(mut self) -> Self {
+        self.port_fallback = false;
+        self
+    }
+
+    pub fn main_from_environment() -> Result<Self, String> {
+        Self::from_environment(
+            Self::default(),
+            SINOMO_DAEMON_PORT_ENV,
+            SINOMO_DAEMON_PORT_FALLBACK_ENV,
+        )
+    }
+
+    pub fn shadow_from_environment() -> Result<Self, String> {
+        Self::from_environment(
+            Self::shadow_default(),
+            SINOMO_SHADOW_DAEMON_PORT_ENV,
+            SINOMO_SHADOW_DAEMON_PORT_FALLBACK_ENV,
+        )
+    }
+
+    fn from_environment(
+        mut options: Self,
+        port_env: &str,
+        fallback_env: &str,
+    ) -> Result<Self, String> {
+        if let Ok(value) = std::env::var(fallback_env) {
+            options.port_fallback = parse_daemon_fallback_bool(fallback_env, &value)?;
+        }
+        if let Ok(value) = std::env::var(port_env) {
+            options.port = value
+                .parse::<u16>()
+                .map_err(|source| format!("invalid {port_env} `{value}`: {source}"))?;
+            options.port_fallback = false;
+        }
+        Ok(options)
+    }
+}
+
+fn parse_daemon_fallback_bool(name: &str, value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("invalid {name} `{value}`: expected true or false")),
     }
 }
 
@@ -255,6 +313,9 @@ pub fn daemon_options_from_status(status: &DaemonStatus) -> DaemonRunOptions {
     DaemonRunOptions {
         host: status.host.clone(),
         port: status.port,
+        // A status describes an already selected concrete listener. Rollout
+        // and supervision preserve that exact reachable endpoint.
+        port_fallback: false,
     }
 }
 

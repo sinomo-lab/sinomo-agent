@@ -159,6 +159,7 @@ pub use control::{
     run_daemon_control_loop_with_catalog_and_profile,
     run_daemon_control_loop_with_catalog_and_runtime, run_daemon_control_loop_with_components,
     run_daemon_control_loop_with_components_and_profile,
+    run_daemon_control_loop_with_prepared_listener,
 };
 pub use error::DaemonError;
 pub(crate) use observe::{
@@ -174,16 +175,17 @@ pub(crate) use process::{
     spawn_main_daemon_process, spawn_shadow_rollout_recovery_helper_process,
 };
 pub use process::{
-    DaemonExecutionProfile, DaemonRuntimeConfig, daemon_main_binary_for_shadow_start,
-    prepare_background_command, start_daemon_command_process,
+    DaemonExecutionProfile, DaemonRuntimeConfig, PreparedDaemonControlListener,
+    daemon_main_binary_for_shadow_start, prepare_background_command,
+    prepare_daemon_control_listener, start_daemon_command_process,
 };
 pub use rollout::{
     LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
     handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,
     prepare_local_rollout_main_activation, run_shadow_daemon_supervision_loop,
-    shadow_main_binary_from_env, shadow_main_options_from_env, sleep_for_shadow_start_delay,
-    stage_rollout_main_activation, wait_for_local_shadow_rollout_completion,
-    wait_for_main_daemon_health,
+    run_shadow_daemon_supervision_loop_with_prepared_listener, shadow_main_binary_from_env,
+    shadow_main_options_from_env, sleep_for_shadow_start_delay, stage_rollout_main_activation,
+    wait_for_local_shadow_rollout_completion, wait_for_main_daemon_health,
 };
 pub(crate) use rollout::{daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout};
 pub(crate) use sinomo_observe::{

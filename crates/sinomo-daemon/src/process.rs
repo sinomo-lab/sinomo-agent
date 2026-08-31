@@ -5,6 +5,7 @@ use crate::{
 use sinomo_rollout::{SelfRolloutPaths, rollout_artifact_suffix};
 use std::env;
 use std::fs::{self, File};
+use std::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,111 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS: &[&str] = &["daemon", "__complete-shadow-rollout"];
+
+#[derive(Debug)]
+pub struct PreparedDaemonControlListener {
+    options: DaemonRunOptions,
+    listener: TcpListener,
+    fallback_from_port: Option<u16>,
+}
+
+impl PreparedDaemonControlListener {
+    pub fn options(&self) -> &DaemonRunOptions {
+        &self.options
+    }
+
+    pub fn fallback_from_port(&self) -> Option<u16> {
+        self.fallback_from_port
+    }
+
+    pub(crate) fn into_parts(self) -> (DaemonRunOptions, TcpListener, Option<u16>) {
+        (self.options, self.listener, self.fallback_from_port)
+    }
+}
+
+pub fn prepare_daemon_control_listener(
+    mut options: DaemonRunOptions,
+) -> Result<PreparedDaemonControlListener, DaemonError> {
+    let requested_port = options.port;
+    let listener = match TcpListener::bind((options.host.as_str(), requested_port)) {
+        Ok(listener) => listener,
+        Err(source) if options.port_fallback && daemon_port_bind_conflict(&source) => {
+            let listener = TcpListener::bind((options.host.as_str(), 0)).map_err(|fallback| {
+                DaemonError::Network {
+                    address: format!("{}:{requested_port}", options.host),
+                    detail: format!(
+                        "preferred daemon port is unavailable ({source}); automatic fallback also failed: {fallback}"
+                    ),
+                }
+            })?;
+            options.port = listener
+                .local_addr()
+                .map_err(|source| DaemonError::Network {
+                    address: format!("{}:0", options.host),
+                    detail: format!("read automatic daemon fallback port: {source}"),
+                })?
+                .port();
+            listener
+        }
+        Err(source) => {
+            return Err(DaemonError::Network {
+                address: format!("{}:{requested_port}", options.host),
+                detail: format!("bind daemon control listener: {source}"),
+            });
+        }
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| DaemonError::Network {
+            address: format!("{}:{}", options.host, options.port),
+            detail: format!("prepare daemon control listener: {source}"),
+        })?;
+    Ok(PreparedDaemonControlListener {
+        fallback_from_port: (options.port != requested_port).then_some(requested_port),
+        options,
+        listener,
+    })
+}
+
+fn daemon_port_bind_conflict(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::AddrInUse
+        || cfg!(windows) && error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(test)]
+mod port_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn automatic_port_fallback_holds_an_os_selected_listener() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupy preferred port");
+        let preferred = occupied.local_addr().expect("occupied address").port();
+        let prepared = prepare_daemon_control_listener(DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port: preferred,
+            port_fallback: true,
+        })
+        .expect("fallback listener");
+
+        assert_eq!(prepared.fallback_from_port(), Some(preferred));
+        assert_ne!(prepared.options().port, preferred);
+        assert!(TcpListener::bind(("127.0.0.1", prepared.options().port)).is_err());
+    }
+
+    #[test]
+    fn strict_port_conflict_fails_without_fallback() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).expect("occupy strict port");
+        let preferred = occupied.local_addr().expect("occupied address").port();
+        let error = prepare_daemon_control_listener(DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port: preferred,
+            port_fallback: false,
+        })
+        .expect_err("strict port must fail");
+
+        assert!(error.to_string().contains("bind daemon control listener"));
+    }
+}
 
 /// Resource shape for a daemon runtime. This is intentionally separate from
 /// [`DaemonRunOptions`], which describes the network-visible listener and is
@@ -220,13 +326,9 @@ pub fn spawn_main_daemon_process_with_env(
 ) -> Result<Child, DaemonError> {
     let mut command = Command::new(binary);
     prepare_background_command(&mut command);
+    command.arg("daemon").arg("run");
+    append_daemon_endpoint_args(&mut command, options);
     command
-        .arg("daemon")
-        .arg("run")
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
         .stdin(Stdio::null())
         .stdout(supervised_main_daemon_log_stdio("main.stdout.log"))
         .stderr(supervised_main_daemon_log_stdio("main.stderr.log"));
@@ -263,13 +365,9 @@ pub fn spawn_candidate_main_daemon_process(
     })?;
     let mut command = Command::new(binary);
     prepare_background_command(&mut command);
+    command.arg("daemon").arg("run");
+    append_daemon_endpoint_args(&mut command, options);
     let child = command
-        .arg("daemon")
-        .arg("run")
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -507,11 +605,8 @@ pub fn start_daemon_command_process(
         command.env(key, value);
     }
     prepare_background_command(&mut command);
+    append_daemon_endpoint_args(&mut command, options);
     let child = command
-        .arg("--host")
-        .arg(&options.host)
-        .arg("--port")
-        .arg(options.port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -533,6 +628,13 @@ pub fn start_daemon_command_process(
         address: daemon_connect_address(&options.host, options.port),
         detail: format!("daemon process {} did not become ready", child.id()),
     })
+}
+
+fn append_daemon_endpoint_args(command: &mut Command, options: &DaemonRunOptions) {
+    command.arg("--host").arg(&options.host);
+    if !options.port_fallback {
+        command.arg("--port").arg(options.port.to_string());
+    }
 }
 
 fn daemon_start_executable_for_command(invoked_exe: &Path, command_prefix: &[&str]) -> PathBuf {

@@ -51,6 +51,10 @@ fn daemon_cli_spec() -> CliCommandSpec {
                 CliValueSpec::new("host", "host"),
             ),
             CliOptionSpec::value("--port", "daemon port", CliValueSpec::new("port", "port")),
+            CliOptionSpec::flag(
+                "--no-port-fallback",
+                "fail instead of selecting another port when the preferred port is unavailable",
+            ),
         ])
     };
     CliCommandSpec::new("daemon", "control local Sinomo daemons")
@@ -87,6 +91,10 @@ fn daemon_options_from_matches(
         options.port = port.parse::<u16>().map_err(|source| CliParseError::Parse {
             detail: format!("invalid daemon port `{port}`: {source}"),
         })?;
+        options.port_fallback = false;
+    }
+    if matches.contains("--no-port-fallback") {
+        options.port_fallback = false;
     }
     Ok(options)
 }
@@ -108,11 +116,26 @@ fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand,
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    let main = || daemon_options_from_matches(matches, DaemonRunOptions::default());
-    let shadow = || daemon_options_from_matches(matches, DaemonRunOptions::shadow_default());
-    let main_status = || daemon_status_options_from_matches(matches, DaemonRunOptions::default());
-    let shadow_status =
-        || daemon_status_options_from_matches(matches, DaemonRunOptions::shadow_default());
+    let main = || {
+        DaemonRunOptions::main_from_environment()
+            .map_err(|detail| CliParseError::Parse { detail })
+            .and_then(|options| daemon_options_from_matches(matches, options))
+    };
+    let shadow = || {
+        DaemonRunOptions::shadow_from_environment()
+            .map_err(|detail| CliParseError::Parse { detail })
+            .and_then(|options| daemon_options_from_matches(matches, options))
+    };
+    let main_status = || {
+        DaemonRunOptions::main_from_environment()
+            .map_err(|detail| CliParseError::Parse { detail })
+            .and_then(|options| daemon_status_options_from_matches(matches, options))
+    };
+    let shadow_status = || {
+        DaemonRunOptions::shadow_from_environment()
+            .map_err(|detail| CliParseError::Parse { detail })
+            .and_then(|options| daemon_status_options_from_matches(matches, options))
+    };
     match path.as_slice() {
         ["daemon", "run"] => main().map(DaemonCliCommand::Run),
         ["daemon", "start"] => main().map(DaemonCliCommand::Start),
@@ -283,6 +306,12 @@ pub(crate) fn run_shadow_daemon_with_paths(
     main_binary: PathBuf,
     registration: Option<DaemonClusterRegistration>,
 ) -> Result<(), CliError> {
+    let listener = daemon_prepare_daemon_control_listener(options)?;
+    let options = listener.options().clone();
+    let registration = registration.map(|mut registration| {
+        registration.shadow_options = options.clone();
+        registration
+    });
     let cluster = registration
         .as_ref()
         .map(|registration| {
@@ -290,8 +319,8 @@ pub(crate) fn run_shadow_daemon_with_paths(
         })
         .transpose()?
         .flatten();
-    daemon_run_shadow_daemon_supervision_loop(
-        options,
+    daemon_run_shadow_daemon_supervision_loop_with_prepared_listener(
+        listener,
         shadow_paths,
         main_paths,
         rollout_paths,
@@ -346,6 +375,15 @@ fn run_daemon_with_paths_and_profile(
     registration: Option<DaemonClusterRegistration>,
     product_profile: impl FnOnce(bool) -> sinomo_product_profile::ProductComponentProfile,
 ) -> Result<(), CliError> {
+    let listener = daemon_prepare_daemon_control_listener(options)?;
+    let options = listener.options().clone();
+    let registration = registration.map(|mut registration| {
+        match registration.process {
+            DaemonClusterProcess::Main => registration.main_options = options.clone(),
+            DaemonClusterProcess::Shadow => registration.shadow_options = options.clone(),
+        }
+        registration
+    });
     let cluster = registration
         .map(|registration| register_daemon_cluster_node(&registration))
         .transpose()?;
@@ -379,8 +417,15 @@ fn run_daemon_with_paths_and_profile(
                 detail: format!("extend daemon product component profile: {error}"),
             },
         )?;
-    daemon_run_daemon_control_loop_with_catalog(options, paths, label, cluster, component_catalog)
-        .map_err(Into::into)
+    daemon_run_daemon_control_loop_with_prepared_listener(
+        listener,
+        paths,
+        label,
+        cluster,
+        component_catalog,
+        sinomo_runtime::daemon::DaemonRuntimeConfig::default(),
+    )
+    .map_err(Into::into)
 }
 
 fn cli_agent_component_factory(
@@ -424,10 +469,14 @@ pub(crate) fn start_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliEr
         detail: source.to_string(),
     })?;
     let main_binary = daemon_main_binary_for_shadow_start(&invoked_exe);
+    let main_options = default_main_daemon_status()?
+        .as_ref()
+        .map(daemon_options_from_status)
+        .unwrap_or_default();
     let extra_env = vec![
         (SHADOW_MAIN_BINARY_ENV, main_binary.display().to_string()),
-        (SHADOW_MAIN_HOST_ENV, options.host.clone()),
-        (SHADOW_MAIN_PORT_ENV, SINOMO_DAEMON_DEFAULT_PORT.to_string()),
+        (SHADOW_MAIN_HOST_ENV, main_options.host),
+        (SHADOW_MAIN_PORT_ENV, main_options.port.to_string()),
     ];
     start_daemon_with_paths_with_env(
         options,
@@ -1486,6 +1535,7 @@ mod tests {
         let options = DaemonRunOptions {
             host: "10.14.5.15".to_string(),
             port: 21_354,
+            port_fallback: false,
         };
         let root = sinomo_testdir::TestDir::new("sinomo-cli-explicit-shadow-stop-status");
         let data_dir = SinomoDataDir::new(&root);
@@ -1493,6 +1543,7 @@ mod tests {
             &DaemonRunOptions {
                 host: "0.0.0.0".to_string(),
                 port: 21_354,
+                port_fallback: false,
             },
             &DaemonPaths::for_shadow(&data_dir),
             Some(DaemonClusterStatus {

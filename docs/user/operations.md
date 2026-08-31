@@ -45,6 +45,19 @@ Use `sinomo daemon run` or `sinomo daemon shadow run` for a foreground process
 whose logs should remain attached to the terminal. Do not run two main daemons
 against one data directory; its lock exists to prevent split ownership.
 
+The default main and shadow ports (`21353` and `21354`) are preferred ports.
+When an automatic start cannot bind one because it is occupied or reserved by
+the operating system, the daemon selects an OS-assigned port, logs a warning,
+writes the actual address to its status file, and advertises that endpoint to
+the cluster. CLI and graphical-app clients discover the local address from the
+same status path; they must not assume the preferred port after startup.
+
+Use `--no-port-fallback` to make a default-port start strict. Supplying
+`--port` is always strict as well. `SINOMO_DAEMON_PORT` and
+`SINOMO_SHADOW_DAEMON_PORT` provide strict environment-selected ports;
+`SINOMO_DAEMON_PORT_FALLBACK` and `SINOMO_SHADOW_DAEMON_PORT_FALLBACK` accept
+`true` or `false` to control fallback when no explicit port is supplied.
+
 `sinomo uninstall` removes boot entries and stops daemons but retains the data
 directory. Read its current help before using `--no-stop`.
 

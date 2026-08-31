@@ -866,12 +866,44 @@ pub fn run_shadow_daemon_supervision_loop(
     shadow_paths: DaemonPaths,
     main_paths: DaemonPaths,
     rollout_paths: SelfRolloutPaths,
+    main_options: crate::DaemonRunOptions,
+    main_binary: PathBuf,
+    cluster: Option<DaemonClusterStatus>,
+    finalize_timeout: Duration,
+    probe_timeout: Duration,
+) -> Result<(), DaemonError> {
+    let listener = crate::prepare_daemon_control_listener(options)?;
+    run_shadow_daemon_supervision_loop_with_prepared_listener(
+        listener,
+        shadow_paths,
+        main_paths,
+        rollout_paths,
+        main_options,
+        main_binary,
+        cluster,
+        finalize_timeout,
+        probe_timeout,
+    )
+}
+
+pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
+    listener: crate::PreparedDaemonControlListener,
+    shadow_paths: DaemonPaths,
+    main_paths: DaemonPaths,
+    rollout_paths: SelfRolloutPaths,
     mut main_options: crate::DaemonRunOptions,
     mut main_binary: PathBuf,
     cluster: Option<DaemonClusterStatus>,
     finalize_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
+    let (options, listener, fallback_from_port) = listener.into_parts();
+    if let Some(requested_port) = fallback_from_port {
+        eprintln!(
+            "warning: sinomo shadow daemon port {requested_port} is unavailable; listening on automatic fallback port {}",
+            options.port
+        );
+    }
     crate::cluster::deny_shadow_daemon_local_raft_access(&shadow_paths)?;
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     recover_native_loader_intents_before_registry_load(&shadow_paths)?;
@@ -879,12 +911,37 @@ pub fn run_shadow_daemon_supervision_loop(
     let daemon_runtime = crate::build_daemon_async_runtime("shadow-daemon")?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
     let listener = daemon_runtime.block_on(
-        sinomo_core::network::AsyncDaemonControlListener::bind(&bind_address),
+        sinomo_core::network::AsyncDaemonControlListener::from_std(listener, &bind_address),
     )?;
     let mut shadow_runtime_tasks = Vec::new();
     let (control_shutdown_tx, control_shutdown_rx) = tokio::sync::watch::channel(false);
     let control_shutdown_signal = control_shutdown_tx.clone();
     tracing::info!("sinomo shadow daemon listening on {bind_address}");
+    if let Some(requested_port) = fallback_from_port {
+        tracing::warn!(
+            requested_port,
+            fallback_port = options.port,
+            "sinomo shadow daemon preferred port unavailable; using automatic fallback"
+        );
+        crate::append_operational_event_best_effort(
+            &shadow_paths,
+            crate::OperationalSeverity::Warn,
+            "shadow-daemon",
+            "daemon.lifecycle.port-fallback",
+            format!(
+                "sinomo shadow daemon preferred port {requested_port} was unavailable; listening on fallback port {}",
+                options.port
+            ),
+            None,
+            serde_json::json!({
+                "label": "shadow-daemon",
+                "requested_port": requested_port,
+                "fallback_port": options.port,
+                "address": bind_address,
+                "pid": std::process::id(),
+            }),
+        );
+    }
     crate::append_operational_event_best_effort(
         &shadow_paths,
         crate::OperationalSeverity::Info,
@@ -895,6 +952,7 @@ pub fn run_shadow_daemon_supervision_loop(
         serde_json::json!({
             "label": "shadow-daemon",
             "address": bind_address,
+            "fallback_from_port": fallback_from_port,
             "pid": std::process::id(),
             "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
             "main_binary": main_binary.display().to_string(),
@@ -1534,6 +1592,7 @@ pub fn shadow_main_options_from_env() -> Result<crate::DaemonRunOptions, DaemonE
         options.port = port.parse::<u16>().map_err(|source| DaemonError::Parse {
             detail: format!("invalid {SHADOW_MAIN_PORT_ENV} `{port}`: {source}"),
         })?;
+        options.port_fallback = false;
     }
     Ok(options)
 }
@@ -3341,6 +3400,7 @@ pub fn start_shadow_main_if_needed(
         let activation_main_options = crate::DaemonRunOptions {
             host: activation.main_host.clone(),
             port: activation.main_port,
+            port_fallback: false,
         };
         if let Some(staged_main) = activation
             .staged_main_binary
@@ -4431,6 +4491,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
+                port_fallback: false,
             },
             None,
         )
@@ -4866,6 +4927,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: activation.main_host.clone(),
                 port: activation.main_port,
+                port_fallback: false,
             },
             previous_main_binary: activation.main_binary.clone(),
             previous_shadow_binary,
@@ -4913,6 +4975,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: "0.0.0.0".to_string(),
                 port: 21353,
+                port_fallback: false,
             },
             previous_main_binary: rollout_paths.main_binary.clone(),
             previous_shadow_binary: root.join("previous-shadow"),
@@ -4932,6 +4995,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
+                port_fallback: false,
             },
         )
         .expect_err("loopback shadow must not finalize an explicit wildcard rollout");
@@ -4976,6 +5040,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
+                port_fallback: false,
             },
             previous_main_binary: rollout_paths.main_binary.clone(),
             previous_shadow_binary,
@@ -4999,6 +5064,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
+                port_fallback: false,
             },
         )
         .expect_err("old installed shadow must not finalize staged replacement");
@@ -5057,6 +5123,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
+                port_fallback: false,
             },
             previous_main_binary: rollout_paths.main_binary.clone(),
             previous_shadow_binary,
@@ -5076,6 +5143,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
+                port_fallback: false,
             },
         )
         .expect("complete pending shadow");
@@ -5115,6 +5183,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
+                port_fallback: false,
             },
             previous_main_binary: rollout_paths.main_binary.clone(),
             previous_shadow_binary,
@@ -5135,6 +5204,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
+                port_fallback: false,
             },
         )
         .expect("complete pending shadow");
@@ -5241,6 +5311,7 @@ mod tests {
             main_options: crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
+                port_fallback: false,
             },
             previous_main_binary,
             previous_shadow_binary: root.join("bin/shadow.previous"),

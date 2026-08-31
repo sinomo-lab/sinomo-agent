@@ -6538,6 +6538,8 @@ fn install_parser_accepts_custom_daemon_ports() {
             host: "127.0.0.1".to_string(),
             port: 21400,
             shadow_port: 21401,
+            port_fallback: false,
+            shadow_port_fallback: false,
             start: false,
         }
     );
@@ -7066,6 +7068,7 @@ fn daemon_advertised_endpoints_use_route_addresses_for_known_peers() {
         &DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 21353,
+            port_fallback: false,
         },
         0,
         &["198.51.100.154".parse().expect("lan ip")],
@@ -7181,6 +7184,8 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
             host: "127.0.0.1".to_string(),
             port: 21400,
             shadow_port: 21401,
+            port_fallback: false,
+            shadow_port_fallback: false,
             start: false,
         },
         &layout,
@@ -7359,6 +7364,8 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
             host: "127.0.0.1".to_string(),
             port: 21410,
             shadow_port: 21411,
+            port_fallback: false,
+            shadow_port_fallback: false,
             start: false,
         },
         &layout,
@@ -15175,6 +15182,7 @@ fn daemon_rollout_build_test_paths(data_dir: &std::path::Path) -> DaemonPaths {
         &DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_353,
+            port_fallback: false,
         },
         &daemon_paths,
         None,
@@ -15723,6 +15731,7 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
         DaemonCliCommand::ShadowRun(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_354,
+            port_fallback: true,
         })
     );
     assert_eq!(
@@ -15732,6 +15741,7 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
             endpoint: DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21_354,
+                port_fallback: true,
             },
             explicit_address: false,
         })
@@ -15743,6 +15753,7 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
             endpoint: DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21_354,
+                port_fallback: true,
             },
             explicit_address: false,
         })
@@ -15761,6 +15772,7 @@ fn daemon_parser_supports_shadow_daemon_on_separate_default_port() {
             endpoint: DaemonRunOptions {
                 host: "10.14.5.15".to_string(),
                 port: 21_354,
+                port_fallback: false,
             },
             explicit_address: true,
         })
@@ -15791,6 +15803,16 @@ fn daemon_parser_uses_port_21353_by_default() {
         DaemonCliCommand::Run(DaemonRunOptions {
             host: "127.0.0.1".to_string(),
             port: 21_353,
+            port_fallback: true,
+        })
+    );
+    assert_eq!(
+        parse_daemon_schema_for_test(&["run".to_string(), "--no-port-fallback".to_string(),])
+            .expect("strict default daemon port"),
+        DaemonCliCommand::Run(DaemonRunOptions {
+            host: "127.0.0.1".to_string(),
+            port: 21_353,
+            port_fallback: false,
         })
     );
     assert_eq!(
@@ -15799,6 +15821,7 @@ fn daemon_parser_uses_port_21353_by_default() {
             endpoint: DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21_353,
+                port_fallback: true,
             },
             explicit_address: false,
         })
@@ -15816,6 +15839,7 @@ fn daemon_parser_uses_port_21353_by_default() {
             endpoint: DaemonRunOptions {
                 host: "10.14.5.15".to_string(),
                 port: 21_354,
+                port_fallback: false,
             },
             explicit_address: true,
         })
@@ -15832,6 +15856,7 @@ fn daemon_parser_uses_port_21353_by_default() {
         DaemonCliCommand::Run(DaemonRunOptions {
             host: "0.0.0.0".to_string(),
             port: 21_354,
+            port_fallback: false,
         })
     );
 }

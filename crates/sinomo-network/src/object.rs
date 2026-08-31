@@ -216,6 +216,36 @@ impl AsyncDaemonControlListener {
         })
     }
 
+    pub async fn from_std(
+        listener: std::net::TcpListener,
+        bind_address: impl Into<String>,
+    ) -> Result<Self, NetworkError> {
+        let bind_address = bind_address.into();
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| NetworkError::Io {
+                operation: format!("prepare daemon control listener {bind_address}"),
+                detail: source.to_string(),
+            })?;
+        let listener =
+            tokio::net::TcpListener::from_std(listener).map_err(|source| NetworkError::Io {
+                operation: format!("adopt daemon control listener {bind_address}"),
+                detail: source.to_string(),
+            })?;
+        mark_daemon_control_listener_non_inheritable(&listener).map_err(|source| {
+            NetworkError::Io {
+                operation: format!(
+                    "mark async daemon control listener {bind_address} non-inheritable"
+                ),
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(Self {
+            bind_address,
+            listener,
+        })
+    }
+
     pub fn local_addr_string(&self) -> Result<String, NetworkError> {
         self.listener
             .local_addr()

@@ -8,6 +8,8 @@ pub(crate) struct InstallOptions {
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) shadow_port: u16,
+    pub(crate) port_fallback: bool,
+    pub(crate) shadow_port_fallback: bool,
     pub(crate) start: bool,
 }
 
@@ -17,6 +19,8 @@ impl Default for InstallOptions {
             host: INSTALL_DEFAULT_HOST.to_string(),
             port: SINOMO_DAEMON_DEFAULT_PORT,
             shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
+            port_fallback: true,
+            shadow_port_fallback: true,
             start: true,
         }
     }
@@ -70,6 +74,14 @@ fn install_cli_spec() -> CliCommandSpec {
             "shadow daemon port",
             CliValueSpec::new("port", "port"),
         ),
+        CliOptionSpec::flag(
+            "--no-port-fallback",
+            "require the preferred main daemon port",
+        ),
+        CliOptionSpec::flag(
+            "--no-shadow-port-fallback",
+            "require the preferred shadow daemon port",
+        ),
         CliOptionSpec::flag("--no-start", "install without starting daemons"),
     ])
 }
@@ -85,16 +97,21 @@ fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, 
     if let Some(host) = matches.value("--host") {
         options.host = host.to_string();
     }
-    options.port = matches
-        .value("--port")
-        .map(|value| parse_port("install port", value).map_err(semantic_parse_error))
-        .transpose()?
-        .unwrap_or(options.port);
-    options.shadow_port = matches
-        .value("--shadow-port")
-        .map(|value| parse_port("install shadow port", value).map_err(semantic_parse_error))
-        .transpose()?
-        .unwrap_or(options.shadow_port);
+    if let Some(value) = matches.value("--port") {
+        options.port = parse_port("install port", value).map_err(semantic_parse_error)?;
+        options.port_fallback = false;
+    }
+    if let Some(value) = matches.value("--shadow-port") {
+        options.shadow_port =
+            parse_port("install shadow port", value).map_err(semantic_parse_error)?;
+        options.shadow_port_fallback = false;
+    }
+    if matches.contains("--no-port-fallback") {
+        options.port_fallback = false;
+    }
+    if matches.contains("--no-shadow-port-fallback") {
+        options.shadow_port_fallback = false;
+    }
     options.start = !matches.contains("--no-start");
     Ok(options)
 }
@@ -215,6 +232,8 @@ pub(crate) fn install_with_layout(
             host: options.host.clone(),
             port: options.port,
             shadow_port: options.shadow_port,
+            port_fallback: options.port_fallback,
+            shadow_port_fallback: options.shadow_port_fallback,
             start: options.start,
         },
         DAEMON_PROBE_TIMEOUT,
@@ -396,8 +415,15 @@ pub(crate) fn write_boot_entries(
     layout: &InstallLayout,
     options: &InstallOptions,
 ) -> Result<(), CliError> {
-    daemon_write_install_boot_entries(layout, &options.host, options.port, options.shadow_port)
-        .map_err(Into::into)
+    daemon_write_install_boot_entries(
+        layout,
+        &options.host,
+        options.port,
+        options.shadow_port,
+        options.port_fallback,
+        options.shadow_port_fallback,
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn remove_boot_entry(path: &Path) -> Result<(), CliError> {

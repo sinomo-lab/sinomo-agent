@@ -51,6 +51,12 @@ A stale lock, listener failure, and process crash are different conditions.
 Do not remove a lock file until the status output and process inspection prove
 that no owner remains.
 
+If the preferred port is occupied, an automatic start should report a warning
+and publish a different control address in `sinomo daemon status`. An explicit
+`--port` or `SINOMO_DAEMON_PORT` remains fail-closed. If automatic fallback also
+fails, inspect OS listeners and reserved/excluded port ranges rather than
+deleting daemon state.
+
 ## Cluster Writes Fail but Reads Still Work
 
 Likely cause: the node has local committed state but cannot establish current

@@ -51,7 +51,7 @@ fn install_build_info() {
 }
 
 fn parse_options(args: impl IntoIterator<Item = String>) -> Result<DaemonRunOptions, String> {
-    let mut options = DaemonRunOptions::default();
+    let mut options = DaemonRunOptions::main_from_environment()?;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -67,7 +67,9 @@ fn parse_options(args: impl IntoIterator<Item = String>) -> Result<DaemonRunOpti
                 options.port = port
                     .parse::<u16>()
                     .map_err(|error| format!("invalid --port `{port}`: {error}"))?;
+                options.port_fallback = false;
             }
+            "--no-port-fallback" => options.port_fallback = false,
             value => return Err(format!("unknown argument `{value}`")),
         }
     }
@@ -145,6 +147,7 @@ mod tests {
         .expect("options");
         assert_eq!(options.host, "127.0.0.2");
         assert_eq!(options.port, 32100);
+        assert!(!options.port_fallback);
         assert!(parse_options(["--detach".to_string()]).is_err());
     }
 }

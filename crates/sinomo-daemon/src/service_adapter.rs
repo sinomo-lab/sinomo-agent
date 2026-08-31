@@ -3941,6 +3941,7 @@ mod tests {
             &crate::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port,
+                port_fallback: false,
             },
             &main_paths,
             Some(cluster),
