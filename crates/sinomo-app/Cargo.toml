@@ -13,7 +13,7 @@ ring = "application"
 
 [features]
 default = ["desktop", "native-devices"]
-gui = ["dep:sui"]
+gui = ["dep:sui", "dep:sui-lucide"]
 desktop = [
     "gui",
     "dep:rfd",
@@ -45,6 +45,7 @@ image = { workspace = true, features = ["jpeg", "png", "webp"] }
 # the exact reviewed commit used by normal and `--locked` builds, while an
 # intentional `cargo update` advances joint development to a newer main tip.
 sui = { package = "sinomo-ui", git = "https://github.com/sinomo-lab/sui.git", branch = "main", optional = true, default-features = false, features = ["wgpu"] }
+sui-lucide = { workspace = true, optional = true }
 
 # Application/R2 service crates used directly (allowed by trust-ring rules).
 sinomo-client = { path = "../sinomo-client" }

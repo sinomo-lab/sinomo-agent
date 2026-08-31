@@ -28,6 +28,7 @@ use sui::{
     WidgetPodMutVisitor, WidgetPodVisitor, WindowEvent, WindowRenderOptions,
     containers::Padding as WidgetPadding,
 };
+use sui_lucide::LucideIcon;
 
 #[cfg(test)]
 use crate::state::ShellStatus;
@@ -188,6 +189,9 @@ const TAB_VIEWPORT_PADDING: f32 = 4.0;
 const TAB_SEG_HEIGHT: f32 = TAB_HEIGHT + (TAB_VIEWPORT_PADDING * 2.0);
 const TAB_GAP: f32 = 6.0;
 const COMPACT_TAB_GAP: f32 = 2.0;
+const TAB_ICON_SIZE: f32 = 16.0;
+const TAB_ICON_LABEL_GAP: f32 = 4.0;
+const TAB_ICON_LANE_WIDTH: f32 = TAB_ICON_SIZE + TAB_ICON_LABEL_GAP;
 const STATUS_GAP: f32 = 12.0;
 const STATUS_PILL_H: f32 = 24.0;
 const STATUS_PILL_W: f32 = 150.0;
@@ -516,7 +520,7 @@ fn build_wordmark(shared: &Shared) -> RebuildOnChange<sui::DefaultTheme> {
 /// Build the tab strip `TabBar`, bound to the active tab and writing the selection back to
 /// `shared.active_tab` on change. Threads the theme reader so it restyles on theme switch.
 fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
-    let labels = Tab::ALL.iter().map(|tab| tab_label(*tab, compact));
+    let labels = Tab::ALL.map(|tab| tab_label(tab, compact).to_string());
     let on_change = {
         let s = shared.clone();
         move |index: usize, _label: String| {
@@ -529,12 +533,14 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
         .signals()
         .active_tab
         .select_named("shell tab selection", |tab| Some(tab.index()));
+    let gap = if compact { COMPACT_TAB_GAP } else { TAB_GAP };
     let tabs = TabBar::new("shell-tabs")
-        .tabs(labels)
+        .tabs(labels.clone())
         .selected_from(selected)
-        .gap(if compact { COMPACT_TAB_GAP } else { TAB_GAP })
+        .gap(gap)
         .theme_when(tab_bar_theme(shared, compact))
         .on_change(on_change);
+    let tabs = IconTabBar::new(tabs, shared.clone(), compact, labels, gap);
     // Match the SUI demo shell: scroll clips remain strict, while an inner safe area owns the
     // standard outward focus overlay on every side of the first, last, and selected tabs.
     ScrollView::horizontal(WidgetPadding::all(TAB_VIEWPORT_PADDING, tabs))
@@ -548,20 +554,23 @@ fn build_tab_bar(shared: &Shared, compact: bool) -> ScrollView {
 
 fn tab_bar_theme(shared: &Shared, compact: bool) -> impl Fn() -> sui::DefaultTheme + 'static {
     let s = shared.clone();
-    move || {
-        let mut theme = s.theme();
-        if compact {
-            theme.metrics.tab_min_width = 54.0;
-            theme.metrics.tab_padding = Insets {
-                left: 10.0,
-                top: 4.0,
-                right: 10.0,
-                bottom: 4.0,
-            };
-            theme.metrics.tab_gap = COMPACT_TAB_GAP;
-        }
-        theme
+    move || resolved_tab_bar_theme(&s, compact)
+}
+
+fn resolved_tab_bar_theme(shared: &Shared, compact: bool) -> sui::DefaultTheme {
+    let mut theme = shared.theme();
+    if compact {
+        theme.metrics.tab_min_width = 54.0;
+        theme.metrics.tab_padding = Insets {
+            left: 10.0,
+            top: 4.0,
+            right: 10.0,
+            bottom: 4.0,
+        };
+        theme.metrics.tab_gap = COMPACT_TAB_GAP;
     }
+    theme.metrics.tab_padding.left += TAB_ICON_LANE_WIDTH;
+    theme
 }
 
 fn tab_label(tab: Tab, compact: bool) -> &'static str {
@@ -574,6 +583,133 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
         }
     } else {
         tab.title()
+    }
+}
+
+fn tab_icon(tab: Tab) -> LucideIcon {
+    match tab {
+        Tab::Sinomo => LucideIcon::MessagesSquare,
+        Tab::Cluster => LucideIcon::Cloudy,
+        Tab::Files => LucideIcon::Folders,
+        Tab::Settings => LucideIcon::Settings,
+    }
+}
+
+/// Adds Lucide marks to the stock [`TabBar`]'s reserved leading label space. Keeping the
+/// `TabBar` as the interactive child preserves its selection animation, focus ring, keyboard
+/// navigation, semantics, and hit testing while the decoration scrolls in the same viewport.
+struct IconTabBar {
+    child: WidgetPod,
+    shared: Shared,
+    compact: bool,
+    labels: Vec<String>,
+    gap: f32,
+    tab_widths: Vec<f32>,
+}
+
+impl IconTabBar {
+    fn new(
+        child: TabBar,
+        shared: Shared,
+        compact: bool,
+        labels: impl IntoIterator<Item = String>,
+        gap: f32,
+    ) -> Self {
+        Self {
+            child: WidgetPod::new(child),
+            shared,
+            compact,
+            labels: labels.into_iter().collect(),
+            gap,
+            tab_widths: Vec::new(),
+        }
+    }
+
+    fn tab_rect(&self, bounds: Rect, index: usize) -> Option<Rect> {
+        if index >= self.tab_widths.len() || self.tab_widths.len() != self.labels.len() {
+            return None;
+        }
+        let base_width = self.tab_widths.iter().sum::<f32>()
+            + self.gap * self.tab_widths.len().saturating_sub(1) as f32;
+        let extra_per_tab = if bounds.width() > base_width && !self.tab_widths.is_empty() {
+            (bounds.width() - base_width) / self.tab_widths.len() as f32
+        } else {
+            0.0
+        };
+        let theme = resolved_tab_bar_theme(&self.shared, self.compact);
+        let height = theme.metrics.tab_height.min(bounds.height()).max(0.0);
+        let y = bounds.y() + ((bounds.height() - height) * 0.5).max(0.0);
+        let mut x = bounds.x();
+        for (current, width) in self.tab_widths.iter().copied().enumerate() {
+            let width = width + extra_per_tab;
+            if current == index {
+                return Some(Rect::new(x, y, width, height));
+            }
+            x += width + self.gap;
+        }
+        None
+    }
+}
+
+impl Widget for IconTabBar {
+    fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        let theme = resolved_tab_bar_theme(&self.shared, self.compact);
+        let style = theme.text_style(theme.palette.text);
+        self.tab_widths = self
+            .labels
+            .iter()
+            .map(|label| {
+                let width = ctx
+                    .layout()
+                    .measure_text(label.clone(), style.clone())
+                    .map(|measurement| measurement.width)
+                    .unwrap_or_default();
+                (width + theme.metrics.tab_padding.left + theme.metrics.tab_padding.right)
+                    .max(theme.metrics.tab_min_width)
+            })
+            .collect();
+        self.child.measure(ctx, constraints)
+    }
+
+    fn arrange(&mut self, ctx: &mut ArrangeCtx, bounds: Rect) {
+        self.child.arrange(ctx, bounds);
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        self.child.paint(ctx);
+        let theme = resolved_tab_bar_theme(&self.shared, self.compact);
+        let selected = self.shared.active_tab().index();
+        for (index, tab) in Tab::ALL.iter().copied().enumerate() {
+            let Some(rect) = self.tab_rect(ctx.bounds(), index) else {
+                continue;
+            };
+            let padding = theme.metrics.tab_padding;
+            let icon_x = rect.x() + padding.left - TAB_ICON_LANE_WIDTH;
+            let icon_rect = Rect::new(
+                icon_x,
+                rect.y() + (rect.height() - TAB_ICON_SIZE) * 0.5,
+                TAB_ICON_SIZE,
+                TAB_ICON_SIZE,
+            );
+            let color = if index == selected {
+                theme.palette.text
+            } else {
+                theme.palette.text_muted
+            };
+            tab_icon(tab).paint(ctx, icon_rect, color);
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        self.child.semantics(ctx);
+    }
+
+    fn visit_children(&self, visitor: &mut dyn WidgetPodVisitor) {
+        visitor.visit(&self.child);
+    }
+
+    fn visit_children_mut(&mut self, visitor: &mut dyn WidgetPodMutVisitor) {
+        visitor.visit(&mut self.child);
     }
 }
 
@@ -2120,6 +2256,10 @@ mod tests {
             Tab::ALL.map(Tab::title),
             ["Chat", "Cluster", "Files", "Settings"]
         );
+        assert_eq!(tab_icon(Tab::Sinomo).name(), "messages-square");
+        assert_eq!(tab_icon(Tab::Cluster).name(), "cloudy");
+        assert_eq!(tab_icon(Tab::Files).name(), "folders");
+        assert_eq!(tab_icon(Tab::Settings).name(), "settings");
     }
 
     #[test]
