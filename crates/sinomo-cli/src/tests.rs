@@ -27,7 +27,8 @@ use super::{
     build_cluster_raft_append_request_from_next_index,
     cli_cluster_state_authority_reachability_options, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_default_main_daemon_status, cli_invocation_force_local_mode, cluster_has_local_quorum,
+    cli_default_main_daemon_status, cli_invocation_force_local_mode,
+    cli_invocation_supports_explicit_dfs_perf_tracing, cluster_has_local_quorum,
     cluster_init_with_paths, cluster_invite_has_remote_usable_introducer,
     cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
     cluster_leave, cluster_leave_with_paths, cluster_migration_plan_with_paths,
@@ -752,6 +753,24 @@ fn top_level_cli_parser_rejects_removed_local_flag() {
     assert!(
         matches!(error, CliError::Parse { detail } if detail.contains("`--local` has been removed"))
     );
+}
+
+#[test]
+fn explicit_dfs_perf_tracing_is_limited_to_test_run_processes() {
+    assert!(cli_invocation_supports_explicit_dfs_perf_tracing(&[
+        "test".to_string(),
+        "run".to_string(),
+        "cluster.dfs.large-write".to_string(),
+    ]));
+    assert!(!cli_invocation_supports_explicit_dfs_perf_tracing(&[
+        "daemon".to_string(),
+        "run".to_string(),
+    ]));
+    assert!(!cli_invocation_supports_explicit_dfs_perf_tracing(&[
+        "daemon".to_string(),
+        "shadow".to_string(),
+        "run".to_string(),
+    ]));
 }
 
 #[test]
@@ -7368,6 +7387,9 @@ fn doctor_storage_contract_covers_cli_and_app_sessions() {
     std::fs::create_dir_all(root.join("app/sessions/session-1")).expect("create app session");
     std::fs::write(root.join("app/sessions/session-1/meta.json"), b"{}")
         .expect("write app session");
+    std::fs::create_dir_all(root.join("logs")).expect("create app logs");
+    std::fs::write(root.join("logs/app.log"), b"current\n").expect("write app log");
+    std::fs::write(root.join("logs/app.log.1"), b"rotated\n").expect("write rotated app log");
     std::fs::create_dir_all(root.join("cluster")).expect("create cluster");
     std::fs::write(root.join("cluster/.kv-snapshot.sobj.tmp-1-2"), b"partial")
         .expect("write leftover temp file");
@@ -7378,7 +7400,7 @@ fn doctor_storage_contract_covers_cli_and_app_sessions() {
         findings
             .iter()
             .all(|finding| finding.code != "storage-unregistered-paths"),
-        "owned session paths and durable-write temp files should not create storage findings: {findings:?}"
+        "owned app/CLI paths and durable-write temp files should not create storage findings: {findings:?}"
     );
 }
 

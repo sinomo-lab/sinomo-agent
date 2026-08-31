@@ -175,6 +175,13 @@ fn cli_data_dir_layout()
 fn register_cli_application_storage_paths(
     layout: &mut sinomo_runtime::storage::StorageLayout,
 ) -> Result<(), sinomo_runtime::storage::StorageContractError> {
+    for relative_path in ["logs/app.log", "logs/app.log.1"] {
+        layout.register_human_text(
+            "sinomo-app",
+            sinomo_runtime::storage::StorageRing::Application,
+            relative_path,
+        )?;
+    }
     layout.register_escape_path(
         "sinomo-cli",
         sinomo_runtime::storage::StorageRing::Application,

@@ -216,6 +216,15 @@ arrives. Once at least one main-daemon endpoint has active unreachable evidence
 and no observed main route is healthy or degraded, unobserved alternate
 endpoints do not preserve stale leader preference; an eligible candidate may
 campaign, but still becomes leader only with the committed voter quorum.
+A routed call has no single direct endpoint to blame when every candidate or
+relay path is exhausted. A target-bound RPC which consumes its complete
+route/response budget therefore records one bounded, process-local liveness
+failure for that exact cluster, caller, and target. That transient evidence is
+the reactive election-timeout edge for a stale leader: it permits the same
+authority operation to campaign, but cannot grant leadership without the
+committed voter quorum. Any authenticated response clears the failure
+immediately; otherwise it expires after a short bound. This evidence is never
+persisted and creates no polling or idle filesystem writes.
 Status and telemetry views normally use local reads. Membership changes,
 invitations, migration, authority changes, cluster configuration, and rollout
 decisions use authoritative reads or fail with structured quorum diagnostics.

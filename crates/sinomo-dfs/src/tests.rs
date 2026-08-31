@@ -34751,6 +34751,115 @@ fn sifs_posix_write_at_from_reader_uses_extent_patch_manifest() {
 }
 
 #[test]
+fn sifs_posix_write_at_from_reader_streams_sparse_extension_as_extent_patch() {
+    let root = temp_root("sifs-posix-write-at-reader-sparse-extent-patch");
+    let node_id = NodeId::from_legacy_named("node_sifs_write_at_reader_sparse").expect("node");
+    let work = "/services/sandbox/instances/sandbox_write_at_reader_sparse/work";
+    let file = "/services/sandbox/instances/sandbox_write_at_reader_sparse/work/file.bin";
+
+    let initial = (0..192 * 1024 + 29)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let initial_hash = content_hash(&initial);
+    let patch = (0..96 * 1024 + 23)
+        .map(|index| (index % 241) as u8)
+        .collect::<Vec<_>>();
+    let gap_size = 80 * 1024 + 11;
+    let patch_offset = initial.len() + gap_size;
+    let mut sparse_patch = vec![0_u8; gap_size];
+    sparse_patch.extend_from_slice(&patch);
+    let sparse_patch_hash = content_hash(&sparse_patch);
+    let mut expected = initial.clone();
+    expected.extend_from_slice(&sparse_patch);
+    let expected_hash = content_hash(&expected);
+
+    struct StreamingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        bulk_reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl std::io::Read for StreamingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == 0 {
+                assert_eq!(buffer.len(), 1, "POSIX write_at should only peek one byte");
+            } else {
+                assert_eq!(
+                    buffer.len(),
+                    64 * 1024,
+                    "content ingest should retain its bounded streaming buffer"
+                );
+                self.bulk_reads.set(self.bulk_reads.get() + 1);
+            }
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let len = buffer.len().min(self.bytes.len() - self.offset);
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(work).expect("mkdir");
+    dfs.posix_write_file(
+        file,
+        &initial,
+        DfsWriteOptions::replicated_eventual(vec![node_id.clone()]),
+    )
+    .expect("write initial");
+
+    let bulk_reads = std::rc::Rc::new(std::cell::Cell::new(0));
+    let stat = dfs
+        .posix_write_file_at_from_reader(
+            file,
+            patch_offset as u64,
+            StreamingReader {
+                bytes: patch,
+                offset: 0,
+                bulk_reads: bulk_reads.clone(),
+            },
+            DfsWriteOptions::replicated_eventual(vec![node_id]),
+        )
+        .expect("stream sparse write_at");
+
+    assert!(bulk_reads.get() > 1, "patch input should be streamed");
+    assert_eq!(stat.size_bytes, Some(expected.len() as u64));
+    assert_eq!(stat.content_hash.as_deref(), Some(expected_hash.as_str()));
+    let manifest = dfs
+        .content()
+        .read_manifest(stat.object_id.as_str(), stat.version.as_str())
+        .expect("sparse patch manifest");
+    assert!(
+        manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == initial_hash),
+        "the unchanged base should remain an extent"
+    );
+    assert!(
+        manifest
+            .extents
+            .iter()
+            .any(|extent| extent.content_hash == sparse_patch_hash),
+        "the generated zero gap and caller stream should share one patch extent"
+    );
+    assert!(
+        !dfs.content()
+            .has_blob(&manifest.content_hash)
+            .expect("logical blob check"),
+        "sparse write_at should not materialize the full logical object"
+    );
+    assert_eq!(
+        dfs.posix_read_file(file).expect("read sparse file"),
+        expected
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_posix_write_at_replicates_extent_patch_without_full_blob() {
     let root = temp_root("sifs-posix-write-at-replicated-extent-patch");
     let owner = NodeId::from_legacy_named("node_sifs_write_at_patch_owner").expect("owner");
@@ -40457,6 +40566,96 @@ fn sifs_cluster_posix_write_at_beyond_eof_reads_back_zero_filled_hole() {
     // The primary agrees on the patched content.
     let read = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
     assert_eq!(read, expected);
+
+    std::fs::remove_dir_all(&cluster.root).ok();
+}
+
+#[test]
+fn sifs_cluster_routed_posix_write_at_from_reader_streams_fallback_overlay() {
+    let mut cluster = sifs_posix_cluster("sifs-cluster-routed-reader-overlay");
+    let path = "/users/routed-reader-overlay.bin";
+    let base = (0..256 * 1024 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let patch = (0..2 * 1024 * 1024 + 192 * 1024 + 31)
+        .map(|index| (index % 239) as u8)
+        .collect::<Vec<_>>();
+    let patch_offset = base.len() + 64 * 1024 + 9;
+    let mut expected = base.clone();
+    expected.resize(patch_offset, 0);
+    expected.extend_from_slice(&patch);
+    let expected_hash = content_hash(&expected);
+
+    sifs_cluster_routed_posix_write(&mut cluster, path, &base);
+
+    struct RoutedStreamingReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        bulk_reads: Arc<AtomicUsize>,
+    }
+
+    impl std::io::Read for RoutedStreamingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.offset == 0 {
+                assert_eq!(buffer.len(), 1, "POSIX write_at should only peek one byte");
+            } else {
+                assert!(
+                    buffer.len() <= 1024 * 1024,
+                    "the routed fallback read buffer must remain bounded, got {} bytes",
+                    buffer.len()
+                );
+                self.bulk_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            if self.offset >= self.bytes.len() {
+                return Ok(0);
+            }
+            let len = buffer.len().min(self.bytes.len() - self.offset);
+            buffer[..len].copy_from_slice(&self.bytes[self.offset..self.offset + len]);
+            self.offset += len;
+            Ok(len)
+        }
+    }
+
+    let bulk_reads = Arc::new(AtomicUsize::new(0));
+    let options = sifs_cluster_write_options(&cluster.writer_node.clone());
+    let write =
+        sifs_cluster_writer_call_with_pump(&mut cluster, "routed reader overlay write_at", {
+            let bulk_reads = Arc::clone(&bulk_reads);
+            move |writer| {
+                writer.posix_write_file_at_from_reader(
+                    path,
+                    patch_offset as u64,
+                    RoutedStreamingReader {
+                        bytes: patch,
+                        offset: 0,
+                        bulk_reads,
+                    },
+                    options,
+                )
+            }
+        });
+    match write {
+        Ok(_) | Err(DfsPosixError::PendingWrite { .. }) => {}
+        Err(error) => panic!("routed reader overlay write_at failed: {error}"),
+    }
+    sifs_posix_cluster_pump_until(&mut cluster, "routed reader overlay commit", |cluster| {
+        sifs_routed_writes_settled(&cluster.writer)
+            && cluster
+                .writer
+                .posix_stat(path)
+                .is_ok_and(|stat| stat.content_hash.as_deref() == Some(expected_hash.as_str()))
+    });
+
+    assert!(
+        bulk_reads.load(Ordering::SeqCst) > 2,
+        "the caller's ranged-write input should be consumed incrementally"
+    );
+    assert_eq!(
+        cluster.writer.posix_read_file(path).expect("writer read"),
+        expected
+    );
+    let primary = sifs_cluster_fetch_for_local_read(&mut cluster, |c| &mut c.primary, path);
+    assert_eq!(primary, expected);
 
     std::fs::remove_dir_all(&cluster.root).ok();
 }

@@ -171,6 +171,54 @@ by a remote update. Gaps, startup, notification overflow, and explicitly
 authorized recovery use bounded authoritative scans. The durable manifest is a
 reconciliation index, not a competing DFS namespace authority.
 
+A path-local conflict does not advance that path's manifest identity. This
+retains the last successfully projected object/version as bounded ownership
+evidence while unrelated scan entries and cursors continue. Older conflicts
+which were persisted after prematurely removing that entry may recover it from
+the checksummed live manifest journal; that replay history is usable only while
+the matching durable conflict remains present.
+
+The preserved-registration rollout includes one explicitly versioned cleanup
+for older verification history. On its first successful startup only, the
+worker collapses terminal conflict records with the same operation kind,
+source, and destination, retaining the newest non-test diagnostic. Terminal
+delete conflicts beneath narrowly recognized test paths are retired without
+replaying the delete. A full authoritative scan follows, and retired records no
+longer protect paths from current projection. Historical test upsert conflicts
+are acknowledged only when the current scan still contains the path and the
+Windows adapter proves the ordinary local entry against the conflict's exact
+type, size, and complete content hash while excluding writers. Any failed
+proof, user path, pending operation, or conflict created after the durable
+one-shot migration fence remains visible and actionable.
+
+The v2 fence adds the previously omitted
+`/services/real-cluster/` verification subtree. It does not widen cleanup to
+`sinomo-agent`, sandbox-instance, service, node, or user paths. A node that
+already completed v1 runs only the v2 delta; a fresh node persists both fences
+with the same complete-scan boundary.
+
+V4 corrects a separate sparse-projection bug. The old startup audit treated
+prior manifest paths missing from NTFS as local deletes even though absence
+after downtime has no causal deletion evidence. Startup no longer synthesizes
+deletes from absence; live `ReadDirectoryChangesW` removals remain the delete
+authority, while identity-backed startup state can still recover creates,
+replacements, and renames. The v4 migration consumes authoritative scan deltas
+incrementally, retires only deterministic `startup-delete` conflicts already
+durable before the fence, and clears matching legacy
+absence/raced-generation diagnostics. V3 introduced the first fence but could
+see only the terminal bounded scan page; v4 completes the entire pre-fence
+cohort before committing its fence.
+The exact legacy raced-generation/absence diagnostic is also discarded before
+projection because the corrected scanner has no path which can create it; any
+current ordinary or dirty local entry is immediately reclassified with its
+actual evidence by the same scan.
+
+Authoritative scan deltas also recheck terminal delete conflicts without using
+the historical classifier. They retire one only when an explicit removal delta
+proves the path absent or Windows proves an exact in-sync placeholder for the
+current authoritative identity. Failed, dirty, ordinary-file, or incomplete
+proofs retain the original conflict and do not block unrelated paths.
+
 ## Reactive-at-Rest Contract
 
 Once startup, earlier retries, and crash recovery are settled, the Cloud Files
@@ -227,6 +275,23 @@ live under
 `$SINOMO_DATA_DIR/module/runtime/module.dfs.cloud-files/`. Exact filenames and
 schemas stay registered beside their owner. Neither subtree is a user-editable
 configuration surface.
+
+Routine daemon shutdown, rollout replacement, transient worker failure, and a
+same-root provider restart disconnect the active CFAPI callback connection but
+leave the sync root registered. `CfUnregisterSyncRoot` is not a stronger form
+of disconnect: Windows converts fully hydrated placeholders into ordinary
+files while traversing an unregistered tree. The supervisor therefore invokes
+state-preserving unregister only for an explicit disable or configured
+mount/root identity change that intentionally relinquishes that registration.
+Re-enable may recover those ordinary files only when their type and complete
+content still match the provider's prior durable manifest; retained local
+operations and mismatches remain conflicts.
+
+Activation compensation follows the same ownership rule. If an activation
+created a fresh registration and then failed before `Ready`, it removes that
+registration. If the registration predated the attempt, a transient DFS,
+network, or worker startup failure verifies and retains it in `StateOwned` for
+retry; it must not call unregister as rollback.
 
 ## Disable, Re-enable, and Cursor Recovery
 

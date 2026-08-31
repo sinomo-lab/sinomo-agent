@@ -62,6 +62,18 @@ catalog. The current supervisor accepts one mount mapping per node.
   that idempotent effect.
 - Remote namespace intent is durable before the NTFS effect; the cursor advances
   only after the effect and manifest/no-echo state are durable.
+- Historical test-conflict cleanup is a versioned one-shot migration. It may
+  deduplicate terminal evidence and abandon an old test delete only before an
+  authoritative rescan; it never replays that delete, consumes user paths, or
+  applies to conflicts created after the migration fence is durable.
+  The v2 fence includes the older `/services/real-cluster/` verification
+  subtree without treating adjacent service or sandbox namespaces as tests.
+- Startup absence is never deletion evidence; only a live directory-change
+  removal owns that causal action. The v4 fence retires older deterministic
+  startup-delete conflicts across all bounded authoritative scan pages. Later
+  notification deletes are outside the migration, and ordinary scan deltas
+  clear a terminal delete only after exact local/authoritative convergence or
+  an explicit authoritative removal.
 - Writable state opens only after exact registration ownership is durable.
 - Registration, cursor recovery, and preserve/re-enable accept only finite,
   causal current/temporary cuts. Do not add generic repair or “latest wins”
@@ -71,6 +83,11 @@ catalog. The current supervisor accepts one mount mapping per node.
   and cancel before ordinary writeback is released.
 - A durable staged provider owns provider selection. Loader drift is not
   permission to replace it, and missing/tampered pins fail without fallback.
+- Routine provider retirement disconnects callbacks and retains the persistent
+  sync-root registration. Do not use state-preserving unregister as a daemon
+  restart or retry primitive: Windows strips hydrated placeholder identities.
+- Failed activation unregisters only a registration created by that attempt;
+  pre-existing registration and durable state ownership remain for retry.
 - Settled idle workers block on explicit notifications or an outstanding retry
   deadline. Do not add polling, periodic heartbeats, or idle status writes.
 - File Explorer custom status is push-only and ancillary. Explorer must not

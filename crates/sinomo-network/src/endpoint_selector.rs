@@ -881,6 +881,9 @@ pub fn cluster_node_blocks_leader_preference(
     {
         return true;
     }
+    if crate::route::cluster_target_rpc_failure_blocks_leader_preference(paths, state, node_id) {
+        return true;
+    }
     state
         .members
         .iter()
@@ -2420,6 +2423,68 @@ mod tests {
         assert!(
             cluster_node_blocks_leader_preference(&paths, &state, &remote),
             "active main-route failure must permit the voter quorum to replace a stale leader"
+        );
+    }
+
+    #[test]
+    fn exhausted_target_rpc_budget_reactively_unblocks_leader_election() {
+        let root = sinomo_testdir::TestDir::new("sinomo-leader-target-rpc-timeout");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("root layout");
+        let paths = ClusterPaths::new(&data_dir);
+        let now = OffsetDateTime::now_utc();
+        let cluster_id =
+            ClusterId::from_legacy_named("cluster_leader_target_rpc_timeout").expect("cluster id");
+        let local =
+            NodeId::from_legacy_named("node_leader_target_rpc_timeout_local").expect("local");
+        let remote =
+            NodeId::from_legacy_named("node_leader_target_rpc_timeout_remote").expect("remote");
+        let mut state = ClusterBootstrapState::initialized_locally(
+            cluster_id.clone(),
+            "leader target RPC timeout",
+            local,
+            "local",
+            "pk-local",
+            now,
+        );
+        let mut member = ClusterMemberRecord::local_voter(
+            cluster_id,
+            remote.clone(),
+            "remote",
+            "pk-remote",
+            now,
+        );
+        member.capabilities = sinomo_node::main_daemon_capabilities(&member.role);
+        member.endpoints.push(selector_test_endpoint(
+            &remote,
+            "remote.example.test:21353",
+            ClusterEndpointPrivacy::Lan,
+            0,
+        ));
+        state.members.push(member);
+
+        assert!(!cluster_node_blocks_leader_preference(
+            &paths, &state, &remote
+        ));
+        let exhausted = Err(crate::NetworkError::RetryExhausted {
+            operation: "establish routed session to exhausted leader".to_string(),
+            attempts: 4,
+            delivery_state: crate::NetworkDeliveryState::DefinitelyNotSent,
+            detail: "every candidate route failed".to_string(),
+        });
+        crate::route::record_cluster_target_rpc_outcome(&paths, &state, &remote, &exhausted);
+        assert!(
+            cluster_node_blocks_leader_preference(&paths, &state, &remote),
+            "one exhausted target-wide response budget is the reactive election-timeout edge"
+        );
+
+        let success = Ok(crate::ObjectRpcResult::value(
+            crate::ObjectRpcResponse::from_encoded_body("/test/leader-recovered", Vec::new()),
+        ));
+        crate::route::record_cluster_target_rpc_outcome(&paths, &state, &remote, &success);
+        assert!(
+            !cluster_node_blocks_leader_preference(&paths, &state, &remote),
+            "an authenticated target response must immediately clear transient failure evidence"
         );
     }
 

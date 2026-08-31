@@ -29,6 +29,7 @@ use crate::local_change_queue::{
     CloudFilesLocalOperationKind, CloudFilesLocalOperationPreconditions,
     CloudFilesLocalOperationRequest, CloudFilesLocalOperationStatus,
     CloudFilesRemoteMutationEvidence, CloudFilesStagedContent, fresh_local_change_scope_is_absent,
+    stable_capture_label,
 };
 use crate::namespace_reconciler::{
     CloudFilesLocalPathState, CloudFilesMaterializationAuditIntentStore, CloudFilesNamespaceAction,
@@ -60,6 +61,104 @@ const CLOUD_FILES_SERVICE_LOCK_RETRY: Duration = Duration::from_millis(5);
 const CLOUD_FILES_MOUNT_OPEN_OPERATION: &str = "cloud-files.mount-open";
 const CLOUD_FILES_MOUNT_OPEN_ERROR: &str = "cloud-files-mount-open-error";
 const CLOUD_FILES_MOUNT_OPEN_CAPTURE_INVALID: &str = "cloud-files-mount-open-capture-invalid";
+
+fn historical_test_path(path: &str) -> bool {
+    path.starts_with("/cluster-tests/")
+        || path.starts_with("/services/cluster-tests/")
+        || path.starts_with("/dfs-smoke/")
+        || path.starts_with("/services/dfs-smoke/")
+        || path.starts_with("/services/real-cluster/")
+        || path.starts_with("/services/real-cluster-verification/")
+        || path.contains("/mount-acceptance-")
+        || path.strip_prefix('/').is_some_and(|relative| {
+            !relative.contains('/')
+                && (relative.starts_with("cloud-files-") || relative.starts_with("reactive-local-"))
+        })
+}
+
+fn historical_operation_kind_key(kind: &CloudFilesLocalOperationKind) -> u8 {
+    match kind {
+        CloudFilesLocalOperationKind::CreateFile => 0,
+        CloudFilesLocalOperationKind::ReplaceFile => 1,
+        CloudFilesLocalOperationKind::CreateDirectory => 2,
+        CloudFilesLocalOperationKind::Rename => 3,
+        CloudFilesLocalOperationKind::DeleteFile => 4,
+        CloudFilesLocalOperationKind::DeleteDirectory => 5,
+    }
+}
+
+fn historical_conflict_retirements<'a>(
+    operations: impl IntoIterator<Item = &'a CloudFilesLocalOperation>,
+) -> BTreeSet<String> {
+    let mut newest_by_semantic_operation = BTreeMap::new();
+    let mut retirements = BTreeSet::new();
+    for operation in operations {
+        if operation.status != CloudFilesLocalOperationStatus::Conflict {
+            continue;
+        }
+        let operation_id = operation.request.operation_id.clone();
+        let key = (
+            historical_operation_kind_key(&operation.request.kind),
+            operation.request.source_path.clone(),
+            operation.request.destination_path.clone(),
+        );
+        match newest_by_semantic_operation.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(operation_id.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if operation_id > *entry.get() {
+                    retirements.insert(entry.insert(operation_id.clone()));
+                } else {
+                    retirements.insert(operation_id.clone());
+                }
+            }
+        }
+        if matches!(
+            operation.request.kind,
+            CloudFilesLocalOperationKind::DeleteFile
+                | CloudFilesLocalOperationKind::DeleteDirectory
+        ) && historical_test_path(&operation.request.source_path)
+        {
+            retirements.insert(operation_id);
+        }
+    }
+    retirements
+}
+
+fn is_historical_sparse_startup_delete(operation: &CloudFilesLocalOperation) -> bool {
+    if operation.status != CloudFilesLocalOperationStatus::Conflict
+        || operation.request.kind != CloudFilesLocalOperationKind::DeleteDirectory
+        || !operation.conflict.as_ref().is_some_and(|conflict| {
+            conflict.code == "namespace-directory-not-empty"
+                || conflict.detail.contains("directory is not empty:")
+        })
+    {
+        return false;
+    }
+    let Some(capture_id) = operation.request.capture_id.as_deref() else {
+        return false;
+    };
+    let Some(expected) = operation.request.preconditions.source.as_ref() else {
+        return false;
+    };
+    capture_id
+        == stable_capture_label(&[
+            "startup-delete",
+            &operation.request.source_path,
+            &expected.object_id,
+            &expected.version,
+        ])
+}
+
+fn historical_namespace_conflict_path(conflict: &CloudFilesNamespaceConflict) -> Option<&str> {
+    match &conflict.action {
+        CloudFilesNamespaceAction::Upsert { path, .. } if historical_test_path(path) => Some(path),
+        CloudFilesNamespaceAction::Upsert { .. }
+        | CloudFilesNamespaceAction::Remove { .. }
+        | CloudFilesNamespaceAction::Rename { .. } => None,
+    }
+}
 
 /// Strictly read-only admission for a Fresh v3 registration. The mutable store
 /// constructors are deliberately not called until a nonce journal owns their
@@ -876,7 +975,7 @@ fn sync_error(code: &'static str, detail: impl Into<String>) -> CloudFilesWindow
     }
 }
 
-fn sifs_parent_path(path: &str) -> Option<String> {
+pub(crate) fn sifs_parent_path(path: &str) -> Option<String> {
     if path == "/" {
         return None;
     }
@@ -1338,6 +1437,11 @@ pub struct CloudFilesFullScanSnapshot {
 pub struct CloudFilesFullScanEffectOutcome {
     pub conflicts: Vec<CloudFilesStartupConflictEvidence>,
     pub resolved_paths: Vec<String>,
+    /// Authoritative entries whose local projection is blocked only by an
+    /// ancestor for which this path has no manifest or queue ownership. They
+    /// do not advance the child manifest and do not become one conflict per
+    /// descendant; the owned ancestor remains the actionable issue.
+    pub deferred_paths: Vec<String>,
 }
 
 /// Concrete Windows implementations obtain batches from the routed,
@@ -1395,11 +1499,22 @@ pub trait CloudFilesNamespaceSource {
 pub trait CloudFilesWindowsPlaceholderEffect:
     CloudFilesNamespaceEffectAdapter + CloudFilesLocalCompletionEffect
 {
+    /// Read-only proof that the local entry is an in-sync placeholder carrying
+    /// the exact current authoritative identity.
+    fn local_entry_matches_authoritative(
+        &mut self,
+        _entry: &CloudFilesReconciledManifestEntry,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Must be idempotent. A crash after this effect but before durable cursor
     /// installation repeats the same full reconciliation on restart.
     fn apply_full_scan(
         &mut self,
         snapshot: &CloudFilesFullScanSnapshot,
+        previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        protected_local_paths: &BTreeSet<String>,
     ) -> Result<CloudFilesFullScanEffectOutcome, String>;
 
     /// Local completion computes suppression before its idempotent Windows
@@ -1408,6 +1523,17 @@ pub trait CloudFilesWindowsPlaceholderEffect:
     /// must recognize its already-applied exact identity.
     fn drain_namespace_suppressions(&mut self) -> Vec<CloudFilesNamespaceSuppression> {
         Vec::new()
+    }
+
+    /// Prepare one old namespace conflict for retirement and projection by a
+    /// newer authoritative full scan. Implementations must return `true` only
+    /// when an existing local entry is clean or has been proven to match the
+    /// durable conflict identity without allowing a concurrent writer.
+    fn recover_historical_namespace_conflict(
+        &mut self,
+        _conflict: &CloudFilesNamespaceConflict,
+    ) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
@@ -3121,6 +3247,7 @@ pub struct CloudFilesWritableSyncWorker<C, D, F, E> {
     cursor_recovery: Option<CloudFilesCursorRecoveryControl>,
     full_scan_pending: bool,
     startup_scan_baseline: Option<BTreeMap<String, CloudFilesReconciledManifestEntry>>,
+    historical_conflict_reconciliation_pending: bool,
 }
 
 impl<C, D, F, E> CloudFilesWritableSyncWorker<C, D, F, E>
@@ -3140,6 +3267,9 @@ where
         let cursor_recovery = state
             .authorized_cursor_recovery
             .then(CloudFilesCursorRecoveryControl::new);
+        let historical_conflict_reconciliation_pending = !state
+            .reconciler
+            .historical_startup_absence_reconciliation_v4_completed();
         Self {
             state,
             capture,
@@ -3149,6 +3279,7 @@ where
             cursor_recovery,
             full_scan_pending: false,
             startup_scan_baseline: None,
+            historical_conflict_reconciliation_pending,
         }
     }
 
@@ -3265,9 +3396,12 @@ where
             mutation_progress: self.execute_mutations()?,
             ..CloudFilesWritableSyncProgress::default()
         };
+        if self.historical_conflict_reconciliation_pending {
+            self.reconcile_historical_queue_conflicts()?;
+        }
         let previous_manifest = self.state.reconciler.manifest().clone();
         let snapshot = self.full_scan_snapshot(cancelled)?;
-        let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+        let scan_complete = self.apply_ordinary_full_scan_snapshot(cancelled, snapshot)?;
         progress.full_scan_applied = true;
         if scan_complete {
             if self.finish_startup_local_scan(cancelled, &previous_manifest, &mut progress)? {
@@ -3286,6 +3420,151 @@ where
         // registration deadline for large owned roots.
         self.state.mark_ready();
         Ok(progress)
+    }
+
+    fn reconcile_historical_queue_conflicts(&mut self) -> Result<u64, CloudFilesWindowsSyncError> {
+        let operation_ids = historical_conflict_retirements(self.state.queue.operations())
+            .into_iter()
+            .collect::<Vec<_>>();
+        self.state
+            .queue
+            .retire_terminal_operations(&operation_ids)
+            .map_err(queue_error)
+    }
+
+    fn reconcile_historical_namespace_conflicts(
+        &mut self,
+        cancelled: &AtomicBool,
+        snapshot: &CloudFilesFullScanSnapshot,
+    ) -> Result<u64, CloudFilesWindowsSyncError> {
+        let conflicts = self
+            .state
+            .reconciler
+            .conflicts()
+            .values()
+            .filter(|conflict| {
+                historical_namespace_conflict_path(conflict)
+                    .is_some_and(|path| snapshot.manifest.contains_key(path))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut rechecked = Vec::new();
+        for conflict in conflicts {
+            check_cancelled(cancelled)?;
+            // A path-local inability to prove an old entry is itself useful
+            // retained conflict evidence; it must not fail the whole mount.
+            if self
+                .effects
+                .recover_historical_namespace_conflict(&conflict)
+                .unwrap_or(false)
+            {
+                rechecked.push(conflict.event_id);
+            }
+        }
+        self.state
+            .reconciler
+            .acknowledge_authoritatively_rechecked_conflicts(&rechecked)
+            .map_err(reconcile_error)
+    }
+
+    fn reconcile_authoritative_queue_conflicts(
+        &mut self,
+        cancelled: &AtomicBool,
+        snapshot: &CloudFilesFullScanSnapshot,
+    ) -> Result<u64, CloudFilesWindowsSyncError> {
+        let removed_paths = snapshot.removed_paths.iter().collect::<BTreeSet<_>>();
+        let conflicts = self
+            .state
+            .queue
+            .operations()
+            .filter(|operation| {
+                operation.status == CloudFilesLocalOperationStatus::Conflict
+                    && matches!(
+                        operation.request.kind,
+                        CloudFilesLocalOperationKind::DeleteFile
+                            | CloudFilesLocalOperationKind::DeleteDirectory
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut retirements = Vec::new();
+        for operation in conflicts {
+            check_cancelled(cancelled)?;
+            let path = &operation.request.source_path;
+            let Some(authoritative) = snapshot.manifest.get(path) else {
+                if removed_paths.contains(path) {
+                    retirements.push(operation.request.operation_id);
+                }
+                continue;
+            };
+
+            if self.historical_conflict_reconciliation_pending
+                && is_historical_sparse_startup_delete(&operation)
+            {
+                // This terminal operation predates the v3 fence. The old
+                // startup audit had no causal materialization proof; preserve
+                // authoritative content and retire its inferred deletion.
+                retirements.push(operation.request.operation_id);
+                continue;
+            }
+
+            // A path-local failure to establish exact in-sync identity keeps
+            // the original terminal conflict. Revalidation never blocks the
+            // rest of the mount and never overwrites an ordinary local entry.
+            if self
+                .effects
+                .local_entry_matches_authoritative(authoritative)
+                .unwrap_or(false)
+            {
+                retirements.push(operation.request.operation_id);
+            }
+        }
+        self.state
+            .queue
+            .retire_terminal_operations(&retirements)
+            .map_err(queue_error)
+    }
+
+    fn reconcile_legacy_startup_absence_conflicts(
+        &mut self,
+    ) -> Result<u64, CloudFilesWindowsSyncError> {
+        let paths = self
+            .state
+            .reconciler
+            .startup_conflicts()
+            .values()
+            .filter(|conflict| {
+                conflict.detail
+                    == "local absence races a remote generation change; delete is blocked"
+            })
+            .map(|conflict| conflict.path.clone())
+            .collect::<Vec<_>>();
+        let mut resolved = 0_u64;
+        for path in paths {
+            if self
+                .state
+                .reconciler
+                .resolve_startup_conflict(&path)
+                .map_err(reconcile_error)?
+            {
+                resolved = resolved.saturating_add(1);
+            }
+        }
+        Ok(resolved)
+    }
+
+    fn finish_historical_conflict_reconciliation(
+        &mut self,
+        scan_complete: bool,
+    ) -> Result<(), CloudFilesWindowsSyncError> {
+        if self.historical_conflict_reconciliation_pending && scan_complete {
+            self.state
+                .reconciler
+                .complete_historical_startup_absence_reconciliation_v4()
+                .map_err(reconcile_error)?;
+            self.historical_conflict_reconciliation_pending = false;
+        }
+        Ok(())
     }
 
     pub fn run_once(
@@ -3361,7 +3640,7 @@ where
                 progress.mutation_progress = self.execute_mutations()?;
             }
             let snapshot = self.full_scan_snapshot(cancelled)?;
-            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            let scan_complete = self.apply_ordinary_full_scan_snapshot(cancelled, snapshot)?;
             progress.full_scan_applied = true;
             if scan_complete {
                 self.full_scan_pending = false;
@@ -3396,7 +3675,7 @@ where
         if materialization_audit_pending {
             let mut progress = CloudFilesWritableSyncProgress::default();
             let snapshot = self.full_scan_snapshot(cancelled)?;
-            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            let scan_complete = self.apply_ordinary_full_scan_snapshot(cancelled, snapshot)?;
             progress.full_scan_applied = true;
             if scan_complete {
                 self.poll_namespace(cancelled, &mut progress)?;
@@ -3414,7 +3693,7 @@ where
         let mut maintenance_needed = if captures.overflowed {
             let previous_manifest = self.state.reconciler.manifest().clone();
             let snapshot = self.full_scan_snapshot(cancelled)?;
-            let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+            let scan_complete = self.apply_ordinary_full_scan_snapshot(cancelled, snapshot)?;
             progress.full_scan_applied = true;
             if scan_complete {
                 if !self.finish_startup_local_scan(cancelled, &previous_manifest, &mut progress)? {
@@ -4103,7 +4382,22 @@ where
         cancelled: &AtomicBool,
     ) -> Result<bool, CloudFilesWindowsSyncError> {
         let snapshot = self.full_scan_snapshot(cancelled)?;
-        self.apply_full_scan_snapshot(cancelled, snapshot)
+        self.apply_ordinary_full_scan_snapshot(cancelled, snapshot)
+    }
+
+    fn apply_ordinary_full_scan_snapshot(
+        &mut self,
+        cancelled: &AtomicBool,
+        snapshot: CloudFilesFullScanSnapshot,
+    ) -> Result<bool, CloudFilesWindowsSyncError> {
+        self.reconcile_authoritative_queue_conflicts(cancelled, &snapshot)?;
+        self.reconcile_legacy_startup_absence_conflicts()?;
+        if self.historical_conflict_reconciliation_pending {
+            self.reconcile_historical_namespace_conflicts(cancelled, &snapshot)?;
+        }
+        let scan_complete = self.apply_full_scan_snapshot(cancelled, snapshot)?;
+        self.finish_historical_conflict_reconciliation(scan_complete)?;
+        Ok(scan_complete)
     }
 
     fn full_scan_snapshot(
@@ -4136,29 +4430,102 @@ where
         check_cancelled(cancelled)?;
         let scan_complete = snapshot.scan_complete;
         let materialized_directories = snapshot.materialized_directories.clone();
+        // Any retained local operation is stronger evidence than a manifest
+        // match. In particular, a conflict or retry must never be mistaken for
+        // a regular file whose placeholder identity was stripped by an older
+        // provider shutdown.
+        let protected_local_paths = self
+            .state
+            .queue
+            .operations()
+            .filter(|operation| {
+                !matches!(
+                    operation.status,
+                    CloudFilesLocalOperationStatus::Completed
+                        | CloudFilesLocalOperationStatus::Superseded
+                )
+            })
+            .flat_map(|operation| {
+                std::iter::once(operation.request.source_path.clone())
+                    .chain(operation.request.destination_path.clone())
+            })
+            .collect::<BTreeSet<_>>();
+        let recovery_manifest = snapshot
+            .manifest
+            .keys()
+            .chain(snapshot.removed_paths.iter())
+            .filter_map(|path| {
+                self.state
+                    .reconciler
+                    .full_scan_recovery_entry(path)
+                    .cloned()
+                    .map(|entry| (path.clone(), entry))
+            })
+            .collect::<BTreeMap<_, _>>();
         let effect_outcome = self
             .effects
-            .apply_full_scan(&snapshot)
+            .apply_full_scan(&snapshot, &recovery_manifest, &protected_local_paths)
             .map_err(|detail| sync_error("full-reconciliation-effect", detail))?;
-        for conflict in effect_outcome.conflicts {
+        let CloudFilesFullScanEffectOutcome {
+            conflicts,
+            resolved_paths,
+            deferred_paths,
+        } = effect_outcome;
+        let conflicted_paths = conflicts
+            .iter()
+            .map(|conflict| conflict.path.clone())
+            .collect::<BTreeSet<_>>();
+        let mut resolved_paths = resolved_paths.into_iter().collect::<BTreeSet<_>>();
+        let deferred_paths = deferred_paths.into_iter().collect::<BTreeSet<_>>();
+        for path in &deferred_paths {
+            if conflicted_paths.contains(path) || recovery_manifest.contains_key(path) {
+                continue;
+            }
+            if self
+                .state
+                .reconciler
+                .startup_conflicts()
+                .get(path)
+                .is_some_and(|conflict| {
+                    startup_conflict_reason_code(&conflict.detail)
+                        == "local-dirty-entry-blocks-authoritative-projection"
+                })
+            {
+                // This is a descendant-only conflict produced by the first
+                // lost-placeholder repair rollout. With no manifest or queue
+                // ownership for the child, retain the ordinary ancestor as the
+                // single actionable blocker instead of multiplying it across
+                // every authoritative descendant.
+                resolved_paths.insert(path.clone());
+            }
+        }
+        for conflict in conflicts {
             self.state
                 .reconciler
                 .record_startup_conflict(conflict.path, conflict.detail)
                 .map_err(reconcile_error)?;
         }
         check_cancelled(cancelled)?;
+        let mut manifest = snapshot.manifest;
+        manifest
+            .retain(|path, _| !conflicted_paths.contains(path) && !deferred_paths.contains(path));
+        let removed_paths = snapshot
+            .removed_paths
+            .into_iter()
+            .filter(|path| !conflicted_paths.contains(path) && !deferred_paths.contains(path))
+            .collect();
         let reconciled_local_operation_ids = self
             .state
             .reconciler
             .install_full_scan_delta(
-                snapshot.manifest,
-                snapshot.removed_paths,
+                manifest,
+                removed_paths,
                 materialized_directories.clone(),
                 snapshot.cursors,
                 snapshot.scan_complete,
             )
             .map_err(reconcile_error)?;
-        for path in effect_outcome.resolved_paths {
+        for path in resolved_paths {
             self.state
                 .reconciler
                 .resolve_startup_conflict(&path)
@@ -4229,8 +4596,8 @@ pub(crate) fn retryable_namespace_read_error(error: &CloudFilesWindowsSyncError)
 
 /// A namespace feed poll and an authoritative full scan are read-only remote
 /// observations. Losing their response is safe to retry in the same connected
-/// provider; tearing the worker down instead unregisters the sync root and can
-/// strand its still-present placeholders behind a disconnected filter.
+/// provider; tearing the worker down needlessly drops hydration availability
+/// and forces the supervisor to reconstruct the connection.
 pub(crate) fn run_retrying_namespace_read_pass<S>(
     cancelled: &AtomicBool,
     mut run_once: impl FnMut() -> Result<S, CloudFilesWindowsSyncError>,
@@ -6324,6 +6691,28 @@ mod tests {
         }
     }
 
+    fn startup_directory_delete_capture(
+        path: &str,
+        object_id: &str,
+        version: &str,
+    ) -> CloudFilesCapturedLocalChange {
+        CloudFilesCapturedLocalChange {
+            capture_id: stable_capture_label(&["startup-delete", path, object_id, version]),
+            kind: CloudFilesLocalOperationKind::DeleteDirectory,
+            source_path: path.to_string(),
+            destination_path: None,
+            preconditions: CloudFilesLocalOperationPreconditions {
+                source: Some(CloudFilesExpectedObjectState {
+                    object_id: object_id.to_string(),
+                    version: version.to_string(),
+                    content_hash: None,
+                }),
+                destination: CloudFilesDestinationPrecondition::Unspecified,
+            },
+            captured_content: None,
+        }
+    }
+
     fn cursor(sequence: u64) -> CloudFilesNamespaceCursor {
         CloudFilesNamespaceCursor {
             file_system_id: "filesystem-a".to_string(),
@@ -6699,7 +7088,12 @@ mod tests {
         actions: Vec<CloudFilesNamespaceAction>,
         completions: usize,
         full_scan_effects: Arc<Mutex<Vec<CloudFilesFullScanSnapshot>>>,
+        full_scan_contexts: Arc<Mutex<Vec<BTreeMap<String, CloudFilesReconciledManifestEntry>>>>,
+        full_scan_protected_paths: Arc<Mutex<Vec<BTreeSet<String>>>>,
         full_scan_outcomes: VecDeque<CloudFilesFullScanEffectOutcome>,
+        historical_recoverable_paths: BTreeSet<String>,
+        historical_recovery_calls: Arc<Mutex<Vec<String>>>,
+        authoritative_local_matches: BTreeSet<String>,
         fail_full_scan: bool,
         apply_results: VecDeque<Result<(), String>>,
     }
@@ -6745,20 +7139,757 @@ mod tests {
     }
 
     impl CloudFilesWindowsPlaceholderEffect for FakeEffects {
+        fn local_entry_matches_authoritative(
+            &mut self,
+            entry: &CloudFilesReconciledManifestEntry,
+        ) -> Result<bool, String> {
+            Ok(self.authoritative_local_matches.contains(&entry.path))
+        }
+
         fn apply_full_scan(
             &mut self,
             snapshot: &CloudFilesFullScanSnapshot,
+            previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            protected_local_paths: &BTreeSet<String>,
         ) -> Result<CloudFilesFullScanEffectOutcome, String> {
             self.full_scan_effects
                 .lock()
                 .expect("full-scan log")
                 .push(snapshot.clone());
+            self.full_scan_contexts
+                .lock()
+                .expect("full-scan context log")
+                .push(previous_manifest.clone());
+            self.full_scan_protected_paths
+                .lock()
+                .expect("full-scan protected path log")
+                .push(protected_local_paths.clone());
             if self.fail_full_scan {
                 Err("simulated crash after idempotent placeholder effect".to_string())
             } else {
                 Ok(self.full_scan_outcomes.pop_front().unwrap_or_default())
             }
         }
+
+        fn recover_historical_namespace_conflict(
+            &mut self,
+            conflict: &CloudFilesNamespaceConflict,
+        ) -> Result<bool, String> {
+            let path = historical_namespace_conflict_path(conflict)
+                .expect("worker calls historical recovery only for a test upsert");
+            self.historical_recovery_calls
+                .lock()
+                .expect("historical recovery log")
+                .push(path.to_string());
+            Ok(self.historical_recoverable_paths.contains(path))
+        }
+    }
+
+    #[test]
+    fn historical_path_classification_is_narrow() {
+        for path in [
+            "/cluster-tests/cloud-files.txt",
+            "/services/cluster-tests/remote-shard",
+            "/dfs-smoke/round-trip.txt",
+            "/services/real-cluster/20260706-2135",
+            "/services/real-cluster-verification/probe.txt",
+            "/sinomo/agents/main/home/mount-acceptance-20260810/from-carbon.txt",
+            "/cloud-files-root-check.txt",
+            "/reactive-local-20260814T1118Z.txt",
+        ] {
+            assert!(historical_test_path(path), "expected test path: {path}");
+        }
+        for path in [
+            "/users/human",
+            "/services/sinomo-agent/channels/01channel",
+            "/services/sandbox/session",
+            "/services/real-cluster",
+            "/services/cloud-files-user-document.txt",
+        ] {
+            assert!(!historical_test_path(path), "expected user path: {path}");
+        }
+    }
+
+    #[test]
+    fn historical_startup_delete_identity_matches_live_queue_evidence() {
+        assert_eq!(
+            stable_capture_label(&[
+                "startup-delete",
+                "/services/sinomo-agent/channels/01kw3nkhh2tnqrft82jbqdp87e",
+                "4er3x3r1jr8gas7herh89sxcps",
+                "01kw3nkn5rtn13yef2rkagahrw",
+            ]),
+            "windows:17c19d901500ecd89fc90d925808560f167524e5423b2b155fc8800ae44928ab"
+        );
+    }
+
+    #[test]
+    fn v4_retires_prefence_startup_deletes_across_scan_pages() {
+        let root = TestRoot::new("historical-sparse-delete-v3");
+        let sparse_path = "/services/sinomo-agent/channels/01sparse";
+        let generation_race_path = "/services/sinomo-agent/channels/01generation";
+        let observed_path = "/services/sandbox/instances/01observed";
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        state
+            .reconciler
+            .complete_historical_sparse_delete_reconciliation_v3()
+            .expect("simulate deployed v3 fence");
+        let evidence = CloudFilesConflictEvidence {
+            code: "namespace-directory-not-empty".to_string(),
+            detail: "directory is not empty".to_string(),
+            observed_object_id: None,
+            observed_version: None,
+            observed_content_hash: None,
+        };
+        let sparse_operation = state
+            .enqueue_capture(startup_directory_delete_capture(
+                sparse_path,
+                "sparse-object",
+                "sparse-version",
+            ))
+            .expect("enqueue sparse startup delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(&sparse_operation, evidence.clone())
+            .expect("settle sparse startup conflict");
+        let observed_operation = state
+            .enqueue_capture(delete_capture("notify-delete-observed", observed_path))
+            .expect("enqueue notification delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(&observed_operation, evidence)
+            .expect("settle observed startup conflict");
+        state
+            .reconciler
+            .record_startup_conflict(
+                generation_race_path,
+                "local absence races a remote generation change; delete is blocked",
+            )
+            .expect("record historical startup absence conflict");
+        let mut manifest = [
+            (sparse_path, "sparse-object", "sparse-version"),
+            (observed_path, "observed-object", "observed-version"),
+        ]
+        .into_iter()
+        .map(|(path, object_id, version)| {
+            (
+                path.to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: path.to_string(),
+                    object_id: object_id.to_string(),
+                    version: version.to_string(),
+                    content_hash: None,
+                    content_size_bytes: None,
+                    kind: "directory".to_string(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+        let observed_entry = manifest
+            .remove(observed_path)
+            .expect("observed entry is in fixture manifest");
+        let first_snapshot = CloudFilesFullScanSnapshot {
+            manifest,
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services/sinomo-agent/channels".to_string()],
+            scan_complete: false,
+            cursors: BTreeMap::new(),
+        };
+        let final_snapshot = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(observed_path.to_string(), observed_entry)]),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services/sandbox/instances".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::new(),
+        };
+        let effects = FakeEffects::default();
+        let protected_paths = Arc::clone(&effects.full_scan_protected_paths);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([first_snapshot, final_snapshot]),
+            effects,
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("run first v4 scan page");
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&sparse_operation)
+                .expect("retained sparse evidence")
+                .status,
+            CloudFilesLocalOperationStatus::Superseded
+        );
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&observed_operation)
+                .expect("retained observed evidence")
+                .status,
+            CloudFilesLocalOperationStatus::Conflict
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .historical_startup_absence_reconciliation_v4_completed()
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .startup_conflicts()
+                .contains_key(generation_race_path)
+        );
+        worker
+            .run_once_for_wake(&AtomicBool::new(false), false)
+            .expect("finish v4 scan pages");
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .historical_startup_absence_reconciliation_v4_completed()
+        );
+        let protected = protected_paths.lock().expect("protected paths");
+        assert!(!protected[0].contains(sparse_path));
+        assert!(protected[0].contains(observed_path));
+    }
+
+    #[test]
+    fn full_scan_retires_delete_conflicts_after_exact_convergence_or_absence() {
+        let root = TestRoot::new("authoritative-delete-conflict-recheck");
+        let converged_path = "/services/sandbox/locks";
+        let absent_path = "/services/sandbox/obsolete";
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        state
+            .reconciler
+            .complete_historical_startup_absence_reconciliation_v4()
+            .expect("disable historical migration");
+        let evidence = CloudFilesConflictEvidence {
+            code: "namespace-directory-not-empty".to_string(),
+            detail: "directory is not empty".to_string(),
+            observed_object_id: None,
+            observed_version: None,
+            observed_content_hash: None,
+        };
+        let converged_operation = state
+            .enqueue_capture(delete_capture("notify-converged", converged_path))
+            .expect("enqueue converged delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(&converged_operation, evidence.clone())
+            .expect("settle converged conflict");
+        let absent_operation = state
+            .enqueue_capture(delete_capture("notify-absent", absent_path))
+            .expect("enqueue absent delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(&absent_operation, evidence)
+            .expect("settle absent conflict");
+        let snapshot = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(
+                converged_path.to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: converged_path.to_string(),
+                    object_id: "current-locks".to_string(),
+                    version: "current-version".to_string(),
+                    content_hash: None,
+                    content_size_bytes: None,
+                    kind: "directory".to_string(),
+                },
+            )]),
+            removed_paths: vec![absent_path.to_string()],
+            materialized_directories: vec!["/services/sandbox".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::new(),
+        };
+        let effects = FakeEffects {
+            authoritative_local_matches: BTreeSet::from([converged_path.to_string()]),
+            ..FakeEffects::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot]),
+            effects,
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("recheck terminal delete conflicts");
+        for operation_id in [converged_operation, absent_operation] {
+            assert_eq!(
+                worker
+                    .state()
+                    .queue()
+                    .operation(&operation_id)
+                    .expect("retained terminal evidence")
+                    .status,
+                CloudFilesLocalOperationStatus::Superseded
+            );
+        }
+        assert_eq!(worker.state().status().conflict_count, 0);
+    }
+
+    #[test]
+    fn v2_cleanup_rechecks_real_cluster_history_after_v1_completed() {
+        let root = TestRoot::new("historical-conflict-v2-real-cluster");
+        let path = "/services/real-cluster/20260706-2135";
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        state
+            .reconciler
+            .complete_historical_test_conflict_reconciliation_v1()
+            .expect("simulate deployed v1 fence");
+        assert!(
+            !state
+                .reconciler
+                .historical_test_conflict_reconciliation_v2_completed()
+        );
+        let operation_id = state
+            .enqueue_capture(delete_capture("v2-real-cluster-delete", path))
+            .expect("enqueue historical real-cluster delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(
+                &operation_id,
+                CloudFilesConflictEvidence {
+                    code: "namespace-directory-not-empty".to_string(),
+                    detail: "historical real-cluster directory is not empty".to_string(),
+                    observed_object_id: None,
+                    observed_version: None,
+                    observed_content_hash: None,
+                },
+            )
+            .expect("settle historical real-cluster conflict");
+        let current_cursor = cursor(2);
+        let snapshot = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(
+                path.to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: path.to_string(),
+                    object_id: "current-real-cluster-object".to_string(),
+                    version: "current-real-cluster-version".to_string(),
+                    content_hash: None,
+                    content_size_bytes: None,
+                    kind: "directory".to_string(),
+                },
+            )]),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services/real-cluster".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                current_cursor.shard_key().expect("cursor key"),
+                current_cursor,
+            )]),
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot]),
+            FakeEffects::default(),
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("run v2 cleanup");
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&operation_id)
+                .expect("retained operation evidence")
+                .status,
+            CloudFilesLocalOperationStatus::Superseded
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .historical_test_conflict_reconciliation_v2_completed()
+        );
+    }
+
+    #[test]
+    fn startup_deduplicates_test_history_and_preserves_user_conflicts() {
+        let root = TestRoot::new("historical-conflict-cleanup");
+        let test_path = "/services/cluster-tests/historical.txt";
+        let user_path = "/services/sinomo-agent/channels/user-channel";
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        let evidence = CloudFilesConflictEvidence {
+            code: "namespace-directory-not-empty".to_string(),
+            detail: "historical terminal delete conflict".to_string(),
+            observed_object_id: None,
+            observed_version: None,
+            observed_content_hash: None,
+        };
+        let test_operation = state
+            .enqueue_capture(delete_capture("history-test-delete", test_path))
+            .expect("enqueue historical test delete")
+            .request
+            .operation_id;
+        state
+            .queue
+            .mark_conflict(&test_operation, evidence.clone())
+            .expect("settle test delete as conflict");
+        let mut user_operations = Vec::new();
+        for capture_id in ["history-user-delete-a", "history-user-delete-b"] {
+            let operation_id = state
+                .enqueue_capture(delete_capture(capture_id, user_path))
+                .expect("enqueue duplicate user delete")
+                .request
+                .operation_id;
+            state
+                .queue
+                .mark_conflict(&operation_id, evidence.clone())
+                .expect("settle user delete as conflict");
+            user_operations.push(operation_id);
+        }
+        user_operations.sort();
+
+        let mut conflict_effects = FakeEffects {
+            path_states: BTreeMap::from([
+                (
+                    test_path.to_string(),
+                    CloudFilesLocalPathState::Dirty {
+                        detail: "old test file lost placeholder identity".to_string(),
+                    },
+                ),
+                (
+                    user_path.to_string(),
+                    CloudFilesLocalPathState::Dirty {
+                        detail: "user file lost placeholder identity".to_string(),
+                    },
+                ),
+            ]),
+            ..FakeEffects::default()
+        };
+        state
+            .reconciler
+            .reconcile_batch(
+                CloudFilesNamespaceFeedBatch {
+                    input_cursor: cursor(0),
+                    next_cursor: cursor(1),
+                    events: vec![
+                        feed_upsert(1, 0, "cluster-tests/historical.txt"),
+                        feed_upsert(1, 1, "sinomo-agent/channels/user-channel"),
+                    ],
+                    journal_head_sequence: 1,
+                    has_more: false,
+                },
+                &mut conflict_effects,
+            )
+            .expect("record old namespace conflicts");
+        assert_eq!(state.reconciler.conflicts().len(), 2);
+
+        let manifest = [
+            (test_path, "current-test-object"),
+            (user_path, "current-user-object"),
+        ]
+        .into_iter()
+        .map(|(path, object_id)| {
+            (
+                path.to_string(),
+                CloudFilesReconciledManifestEntry {
+                    path: path.to_string(),
+                    object_id: object_id.to_string(),
+                    version: "current-version".to_string(),
+                    content_hash: Some("blake3:current".to_string()),
+                    content_size_bytes: Some(7),
+                    kind: "file".to_string(),
+                },
+            )
+        })
+        .collect();
+        let current_cursor = cursor(2);
+        let snapshot = CloudFilesFullScanSnapshot {
+            manifest,
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                current_cursor.shard_key().expect("cursor key"),
+                current_cursor,
+            )]),
+        };
+        let effects = FakeEffects {
+            historical_recoverable_paths: BTreeSet::from([test_path.to_string()]),
+            ..FakeEffects::default()
+        };
+        let protected_paths = Arc::clone(&effects.full_scan_protected_paths);
+        let recovery_calls = Arc::clone(&effects.historical_recovery_calls);
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([snapshot]),
+            effects,
+        );
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("historical cleanup startup");
+
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&test_operation)
+                .expect("retained test operation evidence")
+                .status,
+            CloudFilesLocalOperationStatus::Superseded
+        );
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&user_operations[0])
+                .expect("older duplicate user evidence")
+                .status,
+            CloudFilesLocalOperationStatus::Superseded
+        );
+        assert_eq!(
+            worker
+                .state()
+                .queue()
+                .operation(&user_operations[1])
+                .expect("newest user conflict")
+                .status,
+            CloudFilesLocalOperationStatus::Conflict
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .conflicts()
+                .contains_key("event-1-0")
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .conflicts()
+                .contains_key("event-1-1")
+        );
+        assert_eq!(
+            &*recovery_calls.lock().expect("historical recovery calls"),
+            &[test_path.to_string()]
+        );
+        let protected = protected_paths.lock().expect("protected paths");
+        assert_eq!(protected.len(), 1);
+        assert!(!protected[0].contains(test_path));
+        assert!(protected[0].contains(user_path));
+        assert_eq!(worker.state().status().conflict_count, 2);
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .historical_test_conflict_reconciliation_v1_completed()
+        );
+        drop(protected);
+        drop(worker);
+
+        let mut reopened =
+            CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+                .expect("reopen after one-shot migration");
+        let later_test_operation = reopened
+            .enqueue_capture(delete_capture("later-test-delete", test_path))
+            .expect("enqueue a later test failure")
+            .request
+            .operation_id;
+        reopened
+            .queue
+            .mark_conflict(&later_test_operation, evidence)
+            .expect("settle later test failure");
+        let current_cursor = cursor(3);
+        let later_snapshot = CloudFilesFullScanSnapshot {
+            manifest: [
+                (test_path, "later-test-object"),
+                (user_path, "later-user-object"),
+            ]
+            .into_iter()
+            .map(|(path, object_id)| {
+                (
+                    path.to_string(),
+                    CloudFilesReconciledManifestEntry {
+                        path: path.to_string(),
+                        object_id: object_id.to_string(),
+                        version: "later-version".to_string(),
+                        content_hash: Some("blake3:later".to_string()),
+                        content_size_bytes: Some(5),
+                        kind: "file".to_string(),
+                    },
+                )
+            })
+            .collect(),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                current_cursor.shard_key().expect("later cursor key"),
+                current_cursor,
+            )]),
+        };
+        let later_effects = FakeEffects::default();
+        let later_protected_paths = Arc::clone(&later_effects.full_scan_protected_paths);
+        let mut restarted = CloudFilesWritableSyncWorker::new(
+            reopened,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([later_snapshot]),
+            later_effects,
+        );
+        restarted
+            .startup(&AtomicBool::new(false))
+            .expect("ordinary restart after migration");
+        assert_eq!(
+            restarted
+                .state()
+                .queue()
+                .operation(&later_test_operation)
+                .expect("later conflict remains actionable")
+                .status,
+            CloudFilesLocalOperationStatus::Conflict,
+            "the migration must never consume conflicts created after it completed"
+        );
+        assert!(
+            later_protected_paths.lock().expect("later protected paths")[0].contains(test_path)
+        );
+    }
+
+    #[test]
+    fn historical_cleanup_fence_waits_for_the_complete_scan_boundary() {
+        let root = TestRoot::new("historical-conflict-paged-cleanup");
+        let first_path = "/services/cluster-tests/page-a.txt";
+        let second_path = "/services/cluster-tests/page-b.txt";
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open writable state");
+        let mut conflict_effects = FakeEffects {
+            path_states: BTreeMap::from([
+                (
+                    first_path.to_string(),
+                    CloudFilesLocalPathState::Dirty {
+                        detail: "old first page bytes".to_string(),
+                    },
+                ),
+                (
+                    second_path.to_string(),
+                    CloudFilesLocalPathState::Dirty {
+                        detail: "old second page bytes".to_string(),
+                    },
+                ),
+            ]),
+            ..FakeEffects::default()
+        };
+        state
+            .reconciler
+            .reconcile_batch(
+                CloudFilesNamespaceFeedBatch {
+                    input_cursor: cursor(0),
+                    next_cursor: cursor(1),
+                    events: vec![
+                        feed_upsert(1, 0, "cluster-tests/page-a.txt"),
+                        feed_upsert(1, 1, "cluster-tests/page-b.txt"),
+                    ],
+                    journal_head_sequence: 1,
+                    has_more: false,
+                },
+                &mut conflict_effects,
+            )
+            .expect("record paged historical conflicts");
+        let entry = |path: &str| CloudFilesReconciledManifestEntry {
+            path: path.to_string(),
+            object_id: format!("current-{path}"),
+            version: "current-version".to_string(),
+            content_hash: Some("blake3:current".to_string()),
+            content_size_bytes: Some(7),
+            kind: "file".to_string(),
+        };
+        let first_snapshot = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([(first_path.to_string(), entry(first_path))]),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: false,
+            cursors: BTreeMap::new(),
+        };
+        let final_cursor = cursor(2);
+        let final_snapshot = CloudFilesFullScanSnapshot {
+            manifest: BTreeMap::from([
+                (first_path.to_string(), entry(first_path)),
+                (second_path.to_string(), entry(second_path)),
+            ]),
+            removed_paths: Vec::new(),
+            materialized_directories: vec!["/services".to_string()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(
+                final_cursor.shard_key().expect("final cursor key"),
+                final_cursor,
+            )]),
+        };
+        let effects = FakeEffects {
+            historical_recoverable_paths: BTreeSet::from([
+                first_path.to_string(),
+                second_path.to_string(),
+            ]),
+            ..FakeEffects::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([first_snapshot, final_snapshot]),
+            effects,
+        );
+        let cancelled = AtomicBool::new(false);
+        worker.startup(&cancelled).expect("first partial scan");
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .conflicts()
+                .contains_key("event-1-1")
+        );
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .historical_test_conflict_reconciliation_v1_completed(),
+            "a partial page cannot close the migration"
+        );
+
+        worker.run_once(&cancelled).expect("complete scan page");
+        assert!(
+            worker.state().reconciler().conflicts().is_empty(),
+            "remaining conflicts: {:?}",
+            worker
+                .state()
+                .reconciler()
+                .conflicts()
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            worker
+                .state()
+                .reconciler()
+                .historical_test_conflict_reconciliation_v1_completed()
+        );
     }
 
     fn cursor_recovery_snapshot(sequence: u64, scan_complete: bool) -> CloudFilesFullScanSnapshot {
@@ -7843,6 +8974,7 @@ mod tests {
             full_scan_outcomes: VecDeque::from([CloudFilesFullScanEffectOutcome {
                 conflicts: vec![conflict.clone()],
                 resolved_paths: Vec::new(),
+                ..CloudFilesFullScanEffectOutcome::default()
             }]),
             ..FakeEffects::default()
         };
@@ -7879,6 +9011,119 @@ mod tests {
         assert_eq!(
             status.attention[0].safe_next_action,
             CloudFilesSyncAttentionNextAction::PreserveLocalCopyAndRescan
+        );
+    }
+
+    #[test]
+    fn full_scan_conflict_retains_prior_manifest_identity_for_safe_retry() {
+        let root = TestRoot::new("path-local-full-scan-manifest-retention");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let initial = snapshot(1);
+        let (path, entry) = initial
+            .manifest
+            .iter()
+            .next()
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .expect("snapshot entry");
+        state
+            .reconciler
+            .install_full_scan(initial.manifest, initial.cursors)
+            .expect("install prior manifest");
+
+        let conflict = CloudFilesStartupConflictEvidence {
+            path: path.clone(),
+            detail: "local-non-placeholder-blocks-remote-delete: local copy preserved".to_string(),
+        };
+        let contexts = Arc::new(Mutex::new(Vec::new()));
+        let effects = FakeEffects {
+            full_scan_contexts: Arc::clone(&contexts),
+            full_scan_outcomes: VecDeque::from([CloudFilesFullScanEffectOutcome {
+                conflicts: vec![conflict],
+                resolved_paths: Vec::new(),
+                ..CloudFilesFullScanEffectOutcome::default()
+            }]),
+            ..FakeEffects::default()
+        };
+        let removal = CloudFilesFullScanSnapshot {
+            removed_paths: vec![path.clone()],
+            scan_complete: true,
+            cursors: BTreeMap::from([(cursor(2).shard_key().expect("cursor key"), cursor(2))]),
+            ..CloudFilesFullScanSnapshot::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([removal]),
+            effects,
+        );
+
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("path conflict remains mount-local");
+
+        assert_eq!(
+            worker.state().reconciler().manifest().get(&path),
+            Some(&entry)
+        );
+        assert_eq!(
+            contexts
+                .lock()
+                .expect("full-scan context")
+                .first()
+                .and_then(|manifest| manifest.get(&path)),
+            Some(&entry),
+            "the effect receives bounded prior identity evidence before deciding recovery"
+        );
+    }
+
+    #[test]
+    fn unowned_blocked_descendant_is_deferred_without_manifest_or_conflict_fanout() {
+        let root = TestRoot::new("blocked-descendant-conflict-fanout");
+        let mut state = CloudFilesWritableSyncState::open(&root.data_dir(), "mount-a", "/services")
+            .expect("open state");
+        let authoritative = snapshot(1);
+        let path = authoritative
+            .manifest
+            .keys()
+            .next()
+            .cloned()
+            .expect("snapshot path");
+        state
+            .reconciler
+            .record_startup_conflict(
+                &path,
+                "local-dirty-entry-blocks-authoritative-projection: local ancestor is not a Cloud Files placeholder",
+            )
+            .expect("persist descendant conflict from first repair rollout");
+        let effects = FakeEffects {
+            full_scan_outcomes: VecDeque::from([CloudFilesFullScanEffectOutcome {
+                deferred_paths: vec![path.clone()],
+                ..CloudFilesFullScanEffectOutcome::default()
+            }]),
+            ..FakeEffects::default()
+        };
+        let mut worker = CloudFilesWritableSyncWorker::new(
+            state,
+            FakeCapture::default(),
+            CloudFilesConcreteDfsAdapter::new(FakeBackend::default()),
+            FakeNamespace::with_scans([authoritative]),
+            effects,
+        );
+
+        worker
+            .startup(&AtomicBool::new(false))
+            .expect("ancestor-only blocker remains mount-local");
+
+        assert!(!worker.state().reconciler().manifest().contains_key(&path));
+        assert!(
+            !worker
+                .state()
+                .reconciler()
+                .startup_conflicts()
+                .contains_key(&path),
+            "the descendant-only rollout conflict is cleared while its ancestor remains authoritative"
         );
     }
 

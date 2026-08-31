@@ -552,7 +552,15 @@ pub fn observe_metric_descriptors() -> Vec<ObserveMetricDescriptor> {
 }
 
 pub fn init_observe_runtime(config: ObserveRuntimeConfig) -> Result<(), ObserveError> {
-    init_observe_runtime_inner(config, None)
+    init_observe_runtime_inner(config, None, false)
+}
+
+/// Initialize the observe runtime with formatted trace output on stderr.
+///
+/// One-shot CLI commands use this when explicitly asked for DFS performance
+/// tracing so machine-readable stdout remains valid.
+pub fn init_observe_runtime_with_stderr(config: ObserveRuntimeConfig) -> Result<(), ObserveError> {
+    init_observe_runtime_inner(config, None, true)
 }
 
 /// Initialize the observe runtime with formatted trace output additionally copied to
@@ -575,12 +583,13 @@ pub fn init_observe_runtime_with_log_file(
                 log_file.display()
             ),
         })?;
-    init_observe_runtime_inner(config, Some(Arc::new(file)))
+    init_observe_runtime_inner(config, Some(Arc::new(file)), false)
 }
 
 fn init_observe_runtime_inner(
     config: ObserveRuntimeConfig,
     log_file: Option<Arc<std::fs::File>>,
+    stderr: bool,
 ) -> Result<(), ObserveError> {
     if OBSERVE_RUNTIME.get().is_some() {
         return Ok(());
@@ -624,6 +633,8 @@ fn init_observe_runtime_inner(
             .with_ansi(false)
             .with_writer(file)
     });
+    let stdout_layer = (!stderr).then(|| fmt::layer().with_target(true));
+    let stderr_layer = stderr.then(|| fmt::layer().with_target(true).with_writer(std::io::stderr));
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(ObserveTraceLayer {
@@ -631,7 +642,8 @@ fn init_observe_runtime_inner(
             dropped_traces,
             capture,
         })
-        .with(fmt::layer().with_target(true))
+        .with(stdout_layer)
+        .with(stderr_layer)
         .with(file_layer)
         .try_init()
         .map_err(|source| ObserveError::Runtime {

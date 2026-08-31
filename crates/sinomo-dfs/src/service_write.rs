@@ -987,7 +987,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if object.policy == DfsObjectPolicy::ReplicatedEventual
                     && distributed_error_is_stale_or_concurrent_write(&error) =>
             {
-                return Ok(None);
+                // The reader has already been consumed into the immutable
+                // patch blob. Returning `None` would ask the POSIX caller to
+                // replay a source that is now at EOF and could silently turn
+                // a racing ranged write into an empty fallback write.
+                return Err(error.into());
             }
             Err(error) => return Err(error.into()),
         };
@@ -2515,6 +2519,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replay_response_journal: bool,
         operation_id: Option<String>,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
+        let trace_started = Instant::now();
+        let trace_requester = request.requesting_node_id.clone();
+        let trace_object_id = request.object_id.clone();
+        let trace_version = request.target_version.clone();
+        let trace_bytes = bytes.len() as u64;
+        let trace_desired_count = desired_replica_nodes.len();
+        let trace_policy_min = policy.min_commit_replicas;
+        let trace_policy_desired = policy.desired_replicas;
         let request_id = match operation_id {
             Some(operation_id) => {
                 crate::service_routed_write::validate_write_operation_id(&operation_id)?;
@@ -2523,11 +2535,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             None => self.next_request_id(),
         };
         let shard_id = DfsMetadataShardId::new(shard.shard_id.clone());
+        let metadata_sequence_started = Instant::now();
         let metadata_journal_after_sequence = if !detach_request && replay_response_journal {
             self.local_metadata_journal_after_sequence_for_shard(&shard_id)?
         } else {
             None
         };
+        let metadata_sequence_elapsed = metadata_sequence_started.elapsed();
         let primary_node_id = shard.primary_node_id.clone();
         // An empty object has a real canonical content identity, but it has no
         // semantic attachment. Sending a zero-length `ObjectRpcBodySource`
@@ -2575,11 +2589,31 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // Dispatch it before returning even for a logically detached metadata
         // request; queueing it would require persisting or cloning the complete
         // payload on the requester, defeating direct streamed ingest.
+        let send_started = Instant::now();
         let sent = match self.transport.send_routed_call(&primary_node_id, call) {
             Ok(()) => true,
             Err(NetworkError::UnknownNode { .. }) => false,
             Err(error) => return Err(DfsError::from_network(error)),
         };
+        let send_elapsed = send_started.elapsed();
+        dfs_perf_trace(format_args!(
+            "routed-write-send node={} requester={} primary={} request={} object={} version={} bytes={} reader_attachment=false owned_attachment={} desired={} policy_min={} policy_desired={} capture_ms=0 metadata_seq_ms={} send_ms={} total_ms={} sent={}",
+            self.node_id,
+            trace_requester,
+            primary_node_id,
+            request_id,
+            trace_object_id,
+            trace_version,
+            trace_bytes,
+            trace_bytes > 0,
+            trace_desired_count,
+            trace_policy_min,
+            trace_policy_desired,
+            metadata_sequence_elapsed.as_millis(),
+            send_elapsed.as_millis(),
+            trace_started.elapsed().as_millis(),
+            sent
+        ));
         if !sent {
             return Err(Self::metadata_primary_unroutable_error(
                 &shard,

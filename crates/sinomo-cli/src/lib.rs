@@ -5961,6 +5961,7 @@ pub(crate) fn ensure_cluster_directory_installed() {
 }
 
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
+    init_explicit_cli_dfs_perf_tracing(&args);
     run_parsed_cli_invocation(parse_cli_invocation(&args)?)
 }
 
@@ -5970,6 +5971,29 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
 pub fn run_app_owned_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
     ensure_cluster_directory_installed();
     commands::run_app_owned_daemon_host(options)
+}
+
+fn init_explicit_cli_dfs_perf_tracing(args: &[String]) {
+    if !cli_invocation_supports_explicit_dfs_perf_tracing(args) {
+        return;
+    }
+    let requested = std::env::var("SINOMO_DFS_PERF_TRACE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+    if requested {
+        let _ = sinomo_runtime::observe::init_observe_runtime_with_stderr(
+            sinomo_runtime::observe::ObserveRuntimeConfig::process("cli", None),
+        );
+    }
+}
+
+fn cli_invocation_supports_explicit_dfs_perf_tracing(args: &[String]) -> bool {
+    matches!(args, [test, run, ..] if test == "test" && run == "run")
 }
 
 fn run_cli_command(args: &[String]) -> Result<(), CliError> {

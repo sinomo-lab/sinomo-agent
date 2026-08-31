@@ -320,6 +320,24 @@ struct CloudFilesNamespaceReconciliationState {
     inflight_effect: Option<CloudFilesPendingNamespaceEffect>,
     #[serde(default)]
     applied_events: BTreeMap<String, CloudFilesAppliedNamespaceEvent>,
+    /// One-shot migration fence for terminal conflict records created by the
+    /// pre-preserved-registration Windows provider. New conflicts, including
+    /// later test failures, must never be mistaken for rollout history.
+    #[serde(default)]
+    historical_test_conflict_reconciliation_v1_completed: bool,
+    /// V2 extends the one-shot cleanup to the older `/services/real-cluster`
+    /// verification namespace which was omitted from the original classifier.
+    #[serde(default)]
+    historical_test_conflict_reconciliation_v2_completed: bool,
+    /// V3 repairs terminal deletes inferred by the pre-materialization-proof
+    /// startup audit. The fence is committed before the corrected startup scan
+    /// can enqueue new work, so later genuine deletes cannot enter this set.
+    #[serde(default)]
+    historical_sparse_delete_reconciliation_v3_completed: bool,
+    /// V4 completes the startup-absence migration across bounded full-scan
+    /// pages after v3 proved that a terminal page is not a full manifest.
+    #[serde(default)]
+    historical_startup_absence_reconciliation_v4_completed: bool,
 }
 
 /// Raw owner-validated snapshot accepted by the explicit recovery. The bytes
@@ -841,6 +859,10 @@ pub(crate) fn cursor_recovery_plan_fixture(
         full_scan_request: None,
         inflight_effect: None,
         applied_events: BTreeMap::new(),
+        historical_test_conflict_reconciliation_v1_completed: false,
+        historical_test_conflict_reconciliation_v2_completed: false,
+        historical_sparse_delete_reconciliation_v3_completed: false,
+        historical_startup_absence_reconciliation_v4_completed: false,
     };
     let mut expected = original.clone();
     expected.cursors.clear();
@@ -1292,6 +1314,7 @@ impl CloudFilesManifestStore {
         (
             Self,
             BTreeMap<String, CloudFilesReconciledManifestEntry>,
+            BTreeMap<String, CloudFilesReconciledManifestEntry>,
             bool,
         ),
         CloudFilesNamespaceReconcileError,
@@ -1321,14 +1344,15 @@ impl CloudFilesManifestStore {
             index,
             usable: true,
         };
-        store.replay_and_repair_torn_tail(&mut manifest)?;
+        let mut replay_removed_entries = BTreeMap::new();
+        store.replay_and_repair_torn_tail(&mut manifest, &mut replay_removed_entries)?;
         let migrated_legacy = !legacy_manifest.is_empty();
         if !index_exists {
             store.install_compacted_manifest(&manifest)?;
         } else {
             store.remove_unreferenced_chunks()?;
         }
-        Ok((store, manifest, migrated_legacy))
+        Ok((store, manifest, replay_removed_entries, migrated_legacy))
     }
 
     /// Opens an already-owned manifest without creating, compacting, pruning,
@@ -1758,6 +1782,7 @@ impl CloudFilesManifestStore {
     fn replay_and_repair_torn_tail(
         &mut self,
         manifest: &mut BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        replay_removed_entries: &mut BTreeMap<String, CloudFilesReconciledManifestEntry>,
     ) -> Result<(), CloudFilesNamespaceReconcileError> {
         let mut journal = self.journal.take().ok_or_else(|| {
             reconcile_error(
@@ -1843,7 +1868,11 @@ impl CloudFilesManifestStore {
                         ),
                     ));
                 }
-                apply_manifest_mutations(manifest, &decoded.body.mutations);
+                apply_manifest_mutations_recording_removals(
+                    manifest,
+                    &decoded.body.mutations,
+                    replay_removed_entries,
+                );
                 expected_live_sequence = expected_live_sequence.saturating_add(1);
             }
             last_sequence = Some(sequence);
@@ -2071,6 +2100,26 @@ fn apply_manifest_mutations(
             }
             CloudFilesManifestMutation::Remove { path } => {
                 manifest.remove(path);
+            }
+        }
+    }
+}
+
+fn apply_manifest_mutations_recording_removals(
+    manifest: &mut BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    mutations: &[CloudFilesManifestMutation],
+    removed: &mut BTreeMap<String, CloudFilesReconciledManifestEntry>,
+) {
+    for mutation in mutations {
+        match mutation {
+            CloudFilesManifestMutation::Upsert { entry } => {
+                removed.remove(&entry.path);
+                manifest.insert(entry.path.clone(), entry.clone());
+            }
+            CloudFilesManifestMutation::Remove { path } => {
+                if let Some(entry) = manifest.remove(path) {
+                    removed.insert(path.clone(), entry);
+                }
             }
         }
     }
@@ -2849,6 +2898,11 @@ pub struct CloudFilesNamespaceReconciler {
     cursor_recovery_plan: Option<CloudFilesCursorRecoveryReconciliationPlan>,
     manifest_store: CloudFilesManifestStore,
     manifest: BTreeMap<String, CloudFilesReconciledManifestEntry>,
+    /// Prior entries removed by the live manifest journal after its compacted
+    /// base. This is bounded by that journal and is used only to migrate
+    /// conflicts created by the former shutdown-unregister behavior. New
+    /// conflicts keep their prior entry in the active manifest instead.
+    replay_removed_manifest: BTreeMap<String, CloudFilesReconciledManifestEntry>,
     state: CloudFilesNamespaceReconciliationState,
     usable: bool,
 }
@@ -3082,6 +3136,10 @@ impl CloudFilesNamespaceReconciler {
                 full_scan_request: None,
                 inflight_effect: None,
                 applied_events: BTreeMap::new(),
+                historical_test_conflict_reconciliation_v1_completed: false,
+                historical_test_conflict_reconciliation_v2_completed: false,
+                historical_sparse_delete_reconciliation_v3_completed: false,
+                historical_startup_absence_reconciliation_v4_completed: false,
             }
         });
         if state.schema_version != RECONCILIATION_SCHEMA_VERSION
@@ -3093,10 +3151,16 @@ impl CloudFilesNamespaceReconciler {
                 "persisted namespace state has a different schema, mount, or root",
             ));
         }
+        let startup_conflicts_before_migration = state.startup_conflicts.len();
+        state
+            .startup_conflicts
+            .retain(|_, conflict| !legacy_ancestor_conflict_fanout(&conflict.detail));
+        let migrated_ancestor_conflict_fanout =
+            state.startup_conflicts.len() != startup_conflicts_before_migration;
         let legacy_manifest = std::mem::take(&mut state.legacy_manifest);
-        let (manifest_store, manifest, migrated_legacy_manifest) =
+        let (manifest_store, manifest, replay_removed_manifest, migrated_legacy_manifest) =
             CloudFilesManifestStore::open(&reconciliation_dir, legacy_manifest)?;
-        for (path, entry) in &manifest {
+        for (path, entry) in manifest.iter().chain(replay_removed_manifest.iter()) {
             if path != &entry.path || canonical_sifs_path(path)? != *path {
                 return Err(reconcile_error(
                     "invalid-manifest-chunk",
@@ -3128,10 +3192,14 @@ impl CloudFilesNamespaceReconciler {
             cursor_recovery_plan: None,
             manifest_store,
             manifest,
+            replay_removed_manifest,
             state,
             usable: true,
         };
-        if !reconciler.state_path.exists() || migrated_legacy_manifest || projection_summary_changed
+        if !reconciler.state_path.exists()
+            || migrated_legacy_manifest
+            || migrated_ancestor_conflict_fanout
+            || projection_summary_changed
         {
             reconciler.persist()?;
         }
@@ -3173,6 +3241,23 @@ impl CloudFilesNamespaceReconciler {
 
     pub fn manifest(&self) -> &BTreeMap<String, CloudFilesReconciledManifestEntry> {
         &self.manifest
+    }
+
+    /// Return prior ownership evidence for a bounded full-scan path. Active
+    /// manifest state is authoritative. The replay-only fallback exists solely
+    /// for an already-durable startup conflict produced before conflicting
+    /// remote deletes stopped removing their prior manifest entry.
+    pub(crate) fn full_scan_recovery_entry(
+        &self,
+        path: &str,
+    ) -> Option<&CloudFilesReconciledManifestEntry> {
+        if let Some(entry) = self.manifest.get(path) {
+            return Some(entry);
+        }
+        if !self.state.startup_conflicts.contains_key(path) {
+            return None;
+        }
+        self.replay_removed_manifest.get(path)
     }
 
     pub fn materialized_directories(&self) -> &BTreeSet<String> {
@@ -3435,6 +3520,108 @@ impl CloudFilesNamespaceReconciler {
         &self.state.conflicts
     }
 
+    pub(crate) fn historical_test_conflict_reconciliation_v1_completed(&self) -> bool {
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed
+    }
+
+    pub(crate) fn complete_historical_test_conflict_reconciliation_v1(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_test_conflict_reconciliation_v1_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
+    pub(crate) fn historical_test_conflict_reconciliation_v2_completed(&self) -> bool {
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed
+    }
+
+    pub(crate) fn complete_historical_test_conflict_reconciliation_v2(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_test_conflict_reconciliation_v2_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        // A fresh scope crosses both migrations with one durable state write;
+        // an upgraded v1 scope advances only the new fence.
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
+    pub(crate) fn historical_sparse_delete_reconciliation_v3_completed(&self) -> bool {
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed
+    }
+
+    pub(crate) fn complete_historical_sparse_delete_reconciliation_v3(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_sparse_delete_reconciliation_v3_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed = true;
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
+    pub(crate) fn historical_startup_absence_reconciliation_v4_completed(&self) -> bool {
+        self.state
+            .historical_startup_absence_reconciliation_v4_completed
+    }
+
+    pub(crate) fn complete_historical_startup_absence_reconciliation_v4(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_startup_absence_reconciliation_v4_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed = true;
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed = true;
+        self.state
+            .historical_startup_absence_reconciliation_v4_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
     pub fn startup_conflicts(&self) -> &BTreeMap<String, CloudFilesNamespaceStartupConflict> {
         &self.state.startup_conflicts
     }
@@ -3530,6 +3717,36 @@ impl CloudFilesNamespaceReconciler {
         self.state.startup_conflicts.remove(&path);
         self.persist_or_restore(previous)?;
         Ok(true)
+    }
+
+    /// Remove historical feed conflicts after the caller has rechecked their
+    /// paths against a newer authoritative scan. The caller must first make
+    /// any preserved local entry safe for ordinary full-scan projection. One
+    /// state replacement avoids an fsync burst when an older provider left
+    /// many duplicate diagnostic records for the same test workload.
+    pub fn acknowledge_authoritatively_rechecked_conflicts(
+        &mut self,
+        event_ids: &[String],
+    ) -> Result<u64, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let unique = event_ids.iter().collect::<BTreeSet<_>>();
+        for event_id in &unique {
+            if !self.state.conflicts.contains_key(*event_id) {
+                return Err(reconcile_error(
+                    "conflict-not-found",
+                    format!("conflict `{event_id}` is not durable"),
+                ));
+            }
+        }
+        let previous = self.state.clone();
+        for event_id in &unique {
+            self.state.conflicts.remove(*event_id);
+        }
+        self.persist_or_restore(previous)?;
+        Ok(u64::try_from(unique.len()).unwrap_or(u64::MAX))
     }
 
     /// Atomically records the no-echo token for a completed local mutation and
@@ -4414,6 +4631,12 @@ impl CloudFilesNamespaceReconciler {
     }
 }
 
+fn legacy_ancestor_conflict_fanout(detail: &str) -> bool {
+    detail.starts_with("local-dirty-entry-blocks-authoritative-projection:")
+        && detail.contains("because local ancestor ")
+        && detail.ends_with(" is not a Cloud Files placeholder")
+}
+
 #[cfg(test)]
 std::thread_local! {
     static CURSOR_RECOVERY_PAGE_CRASH_CUT: std::cell::Cell<u8> =
@@ -5111,6 +5334,7 @@ pub(crate) fn acquire_authorized_cursor_recovery_terminal_successor(
             cursor_recovery_plan: Some(plan.clone()),
             manifest_store,
             manifest,
+            replay_removed_manifest: BTreeMap::new(),
             state,
             usable: true,
         },
@@ -5243,7 +5467,7 @@ fn open_authorized_cursor_recovery_progress_inner(
         ));
     }
     load_required_cursor_recovery_audit(&reconciliation_dir, &mount, &root)?;
-    let (manifest_store, manifest, migrated) =
+    let (manifest_store, manifest, replay_removed_manifest, migrated) =
         CloudFilesManifestStore::open(&reconciliation_dir, BTreeMap::new())?;
     if migrated {
         return Err(reconcile_error(
@@ -5305,6 +5529,7 @@ fn open_authorized_cursor_recovery_progress_inner(
             cursor_recovery_plan: Some(plan.clone()),
             manifest_store,
             manifest,
+            replay_removed_manifest,
             state,
             usable: true,
         },
@@ -6545,6 +6770,77 @@ mod tests {
             .expect("open reconciler")
     }
 
+    #[test]
+    fn journal_replay_recovers_prior_identity_for_legacy_remote_delete_conflict() {
+        let root = TestRoot::new("legacy-remote-delete-conflict-evidence");
+        let path = "/services/channel-index.json";
+        let entry = CloudFilesReconciledManifestEntry {
+            path: path.to_string(),
+            object_id: "object-channel-index".to_string(),
+            version: "version-channel-index".to_string(),
+            content_hash: Some("blake3:channel-index".to_string()),
+            content_size_bytes: Some(33_047),
+            kind: "file".to_string(),
+        };
+        let mut reconciler = open_reconciler(&root);
+        reconciler
+            .install_full_scan(
+                BTreeMap::from([(path.to_string(), entry.clone())]),
+                BTreeMap::from([(cursor(1).shard_key().expect("cursor key"), cursor(1))]),
+            )
+            .expect("install prior managed identity");
+        reconciler
+            .record_startup_conflict(
+                path,
+                "local-non-placeholder-blocks-remote-delete: local copy preserved",
+            )
+            .expect("persist legacy conflict");
+        reconciler
+            .install_full_scan(
+                BTreeMap::new(),
+                BTreeMap::from([(cursor(2).shard_key().expect("cursor key"), cursor(2))]),
+            )
+            .expect("reproduce legacy manifest removal");
+        assert!(!reconciler.manifest().contains_key(path));
+        drop(reconciler);
+
+        let mut reopened = open_reconciler(&root);
+        assert_eq!(reopened.full_scan_recovery_entry(path), Some(&entry));
+        reopened
+            .resolve_startup_conflict(path)
+            .expect("resolve repaired conflict");
+        assert_eq!(
+            reopened.full_scan_recovery_entry(path),
+            None,
+            "replay history is never authority after its durable conflict is gone"
+        );
+    }
+
+    #[test]
+    fn open_prunes_only_legacy_ancestor_conflict_fanout() {
+        let root = TestRoot::new("legacy-ancestor-conflict-fanout");
+        let descendant = "/services/cluster-tests/old-child";
+        let owned_path = "/services/owned.txt";
+        let mut reconciler = open_reconciler(&root);
+        reconciler
+            .record_startup_conflict(
+                descendant,
+                "local-dirty-entry-blocks-authoritative-projection: the authoritative entry was not projected because local ancestor D:\\sinomo\\services\\cluster-tests is not a Cloud Files placeholder",
+            )
+            .expect("persist rollout-generated descendant conflict");
+        reconciler
+            .record_startup_conflict(
+                owned_path,
+                "local-dirty-entry-blocks-authoritative-projection: the authoritative entry was not projected because local path is not a Cloud Files placeholder",
+            )
+            .expect("persist path-owned conflict");
+        drop(reconciler);
+
+        let reopened = open_reconciler(&root);
+        assert!(!reopened.startup_conflicts().contains_key(descendant));
+        assert!(reopened.startup_conflicts().contains_key(owned_path));
+    }
+
     fn snapshot_tree(root: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
         fn visit(root: &Path, directory: &Path, snapshot: &mut BTreeMap<String, Option<Vec<u8>>>) {
             let mut entries = fs::read_dir(directory)
@@ -6565,7 +6861,15 @@ mod tests {
                     snapshot.insert(format!("{relative}/"), None);
                     visit(root, &path, snapshot);
                 } else {
-                    snapshot.insert(relative, Some(fs::read(&path).expect("snapshot file")));
+                    let bytes = if path.file_name().and_then(|name| name.to_str())
+                        == Some(RECONCILIATION_LOCK_FILE)
+                        && metadata.len() == 0
+                    {
+                        Vec::new()
+                    } else {
+                        fs::read(&path).expect("snapshot file")
+                    };
+                    snapshot.insert(relative, Some(bytes));
                 }
             }
         }
@@ -8074,6 +8378,62 @@ mod tests {
             .expect("record dirty conflict");
         assert!(reconciler.conflicts().contains_key("event-dirty"));
         assert_eq!(effects.conflicts.len(), 2);
+    }
+
+    #[test]
+    fn authoritative_recheck_acknowledges_conflicts_atomically_and_durably() {
+        let root = TestRoot::new("authoritative-conflict-recheck");
+        let mut reconciler = open_reconciler(&root);
+        let mut effects = FakeEffects {
+            states: BTreeMap::from([(
+                "/services/report.txt".to_string(),
+                CloudFilesLocalPathState::Dirty {
+                    detail: "preserved historical bytes".to_string(),
+                },
+            )]),
+            ..FakeEffects::default()
+        };
+        reconciler
+            .reconcile_batch(
+                batch(
+                    0,
+                    2,
+                    vec![
+                        upsert("event-recheck-a", 1, None),
+                        upsert("event-recheck-b", 2, None),
+                    ],
+                ),
+                &mut effects,
+            )
+            .expect("record historical conflicts");
+
+        let error = reconciler
+            .acknowledge_authoritatively_rechecked_conflicts(&[
+                "event-recheck-a".to_string(),
+                "event-missing".to_string(),
+            ])
+            .expect_err("unknown event rejects the whole acknowledgement");
+        assert_eq!(error.code, "conflict-not-found");
+        assert!(reconciler.conflicts().contains_key("event-recheck-a"));
+        assert!(reconciler.conflicts().contains_key("event-recheck-b"));
+
+        assert_eq!(
+            reconciler
+                .acknowledge_authoritatively_rechecked_conflicts(&[
+                    "event-recheck-a".to_string(),
+                    "event-recheck-b".to_string(),
+                    "event-recheck-a".to_string(),
+                ])
+                .expect("acknowledge rechecked conflicts"),
+            2
+        );
+        assert!(reconciler.conflicts().is_empty());
+        drop(reconciler);
+
+        assert!(
+            open_reconciler(&root).conflicts().is_empty(),
+            "one persisted replacement survives restart"
+        );
     }
 
     #[test]

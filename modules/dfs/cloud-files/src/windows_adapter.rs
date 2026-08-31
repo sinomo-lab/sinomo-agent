@@ -71,6 +71,7 @@ use crate::local_change_queue::{
     CloudFilesContentStager, CloudFilesDestinationPrecondition, CloudFilesExpectedObjectState,
     CloudFilesLocalOperationKind, CloudFilesLocalOperationPreconditions,
     CloudFilesLocalOperationRequest, CloudFilesRemoteMutationEvidence, CloudFilesStagedContent,
+    stable_capture_label,
 };
 use crate::namespace_reconciler::{
     CloudFilesFullScanRequest, CloudFilesLocalPathState, CloudFilesMaterializationAuditIntentStore,
@@ -2526,7 +2527,6 @@ struct LocalStartupScan {
 enum LocalStartupScanPhase {
     Enumerate,
     Classify,
-    Missing,
     Complete,
 }
 
@@ -2536,7 +2536,6 @@ struct WindowsLocalStartupScanPlan {
     local: BTreeMap<String, LocalPlaceholderState>,
     blocked_paths: BTreeSet<String>,
     phase_paths: VecDeque<String>,
-    renamed_from: BTreeSet<String>,
     phase: LocalStartupScanPhase,
 }
 
@@ -2553,7 +2552,6 @@ impl WindowsLocalStartupScanPlan {
             local: BTreeMap::new(),
             blocked_paths: BTreeSet::new(),
             phase_paths: VecDeque::new(),
-            renamed_from: BTreeSet::new(),
             phase: LocalStartupScanPhase::Enumerate,
         }
     }
@@ -2663,8 +2661,11 @@ impl WindowsLocalStartupScanPlan {
                 }
                 LocalStartupScanPhase::Classify => {
                     let Some(path) = self.phase_paths.pop_front() else {
-                        self.phase_paths = previous_manifest.keys().cloned().collect();
-                        self.phase = LocalStartupScanPhase::Missing;
+                        // Absence after downtime has no causal delete evidence.
+                        // Live ReadDirectoryChangesW removals remain writable;
+                        // startup lets the authoritative scan reproject any
+                        // missing path instead of manufacturing a delete.
+                        self.phase = LocalStartupScanPhase::Complete;
                         continue;
                     };
                     work += 1;
@@ -2686,11 +2687,6 @@ impl WindowsLocalStartupScanPlan {
                     };
                     let classified =
                         classify_local_divergence(&context, &BTreeMap::from([(path, entry)]))?;
-                    for capture in &classified.captures {
-                        if capture.kind == CloudFilesLocalOperationKind::Rename {
-                            self.renamed_from.insert(capture.source_path.clone());
-                        }
-                    }
                     output.captures.extend(classified.captures);
                     output.conflicts.extend(classified.conflicts);
                     output.deferred_upserts.extend(classified.deferred_upserts);
@@ -2702,32 +2698,6 @@ impl WindowsLocalStartupScanPlan {
                         // Do not classify later paths against the stale sparse
                         // manifest before that boundary commits.
                         break;
-                    }
-                }
-                LocalStartupScanPhase::Missing => {
-                    let Some(path) = self.phase_paths.pop_front() else {
-                        self.phase = LocalStartupScanPhase::Complete;
-                        continue;
-                    };
-                    work += 1;
-                    if self.renamed_from.contains(&path) || self.local.contains_key(&path) {
-                        continue;
-                    }
-                    let previous = previous_manifest
-                        .get(&path)
-                        .expect("missing-audit path came from prior manifest");
-                    let Some(remote) = remote_manifest.get(&path) else {
-                        continue;
-                    };
-                    if !manifest_generations_match(previous, remote) {
-                        output.conflicts.push(startup_conflict(
-                            &path,
-                            "local absence races a remote generation change; delete is blocked",
-                        ));
-                    } else {
-                        output
-                            .captures
-                            .push(delete_capture("startup-delete", &path, previous));
                     }
                 }
                 LocalStartupScanPhase::Complete => break,
@@ -4138,15 +4108,6 @@ fn exact_destination_precondition(
     CloudFilesDestinationPrecondition::Exact(expected_state(entry))
 }
 
-fn stable_capture_label(parts: &[&str]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for part in parts {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
-    format!("windows:{}", hasher.finalize().to_hex())
-}
-
 fn local_relative_to_sifs(root_path: &str, relative: &Path) -> Result<String, String> {
     let mut result = normalize_sifs_root(root_path).map_err(|error| error.to_string())?;
     for component in relative.components() {
@@ -4402,6 +4363,139 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
         )
     }
 
+    fn manifest_identity(
+        &self,
+        entry: &CloudFilesReconciledManifestEntry,
+    ) -> CloudFilesPlaceholderIdentity {
+        CloudFilesPlaceholderIdentity::new(
+            self.mount_identity.clone(),
+            self.root_path.clone(),
+            entry.path.clone(),
+            entry.object_id.clone(),
+            entry.version.clone(),
+            entry.content_hash.clone(),
+        )
+    }
+
+    /// Recover a provider-owned entry whose CFAPI identity was stripped by an
+    /// earlier `CfUnregisterSyncRoot`. Files are adopted only while one handle
+    /// excludes writers and their complete bytes match the prior durable
+    /// manifest. Directories carry no content; converting a manifest-owned
+    /// directory is non-destructive and its children are still classified
+    /// independently.
+    fn recover_manifest_owned_placeholder(
+        &self,
+        path: &str,
+        previous: Option<&CloudFilesReconciledManifestEntry>,
+    ) -> Result<bool, String> {
+        let Some(previous) = previous else {
+            return Ok(false);
+        };
+        let local = self.local_path(path)?;
+        let metadata = match fs::symlink_metadata(&local) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(format!("stat local path {}: {error}", local.display())),
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Ok(false);
+        }
+        let expected_directory = matches!(previous.kind.as_str(), "directory" | "mount");
+        if metadata.is_dir() != expected_directory
+            || (!expected_directory && (!metadata.is_file() || previous.kind != "file"))
+        {
+            return Ok(false);
+        }
+
+        let wide = wide_path(&local);
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                if expected_directory {
+                    (FILE_READ_ATTRIBUTES | FILE_WRITE_DATA).0
+                } else {
+                    GENERIC_READ.0 | FILE_WRITE_DATA.0
+                },
+                // Excluding write and delete sharing keeps both the verified
+                // file image and its path identity stable through conversion.
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | if expected_directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        Default::default()
+                    },
+                None,
+            )
+        }
+        .map(OwnedWin32Handle)
+        .map_err(|error| {
+            format!(
+                "open manifest-owned local path {} for placeholder recovery: {error}",
+                local.display()
+            )
+        })?;
+        let mut handle_info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(handle.0, &mut handle_info) }.map_err(|error| {
+            format!(
+                "read manifest-owned local identity {}: {error}",
+                local.display()
+            )
+        })?;
+        if handle_info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || (handle_info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0)
+                != expected_directory
+        {
+            return Ok(false);
+        }
+        if !expected_directory {
+            let observed = hash_cursor_recovery_file_handle(handle.0, &local, &self.cancelled)?;
+            if !staged_content_matches_manifest_entry(&observed, previous) {
+                return Ok(false);
+            }
+        }
+
+        let identity = self.manifest_identity(previous);
+        let identity_bytes =
+            encode_placeholder_identity(&identity).map_err(|error| error.to_string())?;
+        self.suppress_local_path(&local)?;
+        self.check_cancelled()?;
+        unsafe {
+            CfConvertToPlaceholder(
+                handle.0,
+                Some(identity_bytes.as_ptr().cast::<c_void>()),
+                identity_bytes.len() as u32,
+                CF_CONVERT_FLAG_MARK_IN_SYNC,
+                None,
+                None,
+            )
+        }
+        .map_err(|error| {
+            format!(
+                "restore manifest-owned placeholder identity for {}: {error}",
+                local.display()
+            )
+        })?;
+        let recovered = query_placeholder_state_handle(handle.0, &local)?.ok_or_else(|| {
+            format!(
+                "converted manifest-owned path {} has no Cloud Files identity",
+                local.display()
+            )
+        })?;
+        if !recovered.in_sync || recovered.identity.as_ref() != Some(&identity) {
+            return Err(format!(
+                "converted manifest-owned path {} does not retain its expected in-sync identity",
+                local.display()
+            ));
+        }
+        super::host_log(&format!(
+            "Cloud Files restored placeholder identity stripped from manifest-owned `{path}`"
+        ));
+        Ok(true)
+    }
+
     fn ensure_remote_placeholder(&self, path: &str, dehydrate_clean: bool) -> Result<(), String> {
         self.check_cancelled()?;
         let stat = self.authoritative_stat(path)?;
@@ -4472,7 +4566,7 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
     }
 
     fn remove_local_path(&self, path: &str) -> Result<(), String> {
-        match self.remove_local_path_for_full_scan(path)? {
+        match self.remove_local_path_for_full_scan(path, None, false)? {
             CloudFilesLocalRemovalOutcome::RemovedOrAbsent => Ok(()),
             CloudFilesLocalRemovalOutcome::Preserved(conflict) => Err(conflict.detail),
         }
@@ -4481,14 +4575,42 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
     fn remove_local_path_for_full_scan(
         &self,
         path: &str,
+        previous: Option<&CloudFilesReconciledManifestEntry>,
+        protected_by_local_operation: bool,
     ) -> Result<CloudFilesLocalRemovalOutcome, String> {
         self.check_cancelled()?;
         let local = self.local_path(path)?;
         if !local.exists() {
             return Ok(CloudFilesLocalRemovalOutcome::RemovedOrAbsent);
         }
-        let metadata = fs::symlink_metadata(&local)
+        let mut metadata = fs::symlink_metadata(&local)
             .map_err(|error| format!("stat local path {}: {error}", local.display()))?;
+        if protected_by_local_operation {
+            return Ok(self.preserve_remote_delete_conflict(
+                path,
+                &local,
+                "local-operation-blocks-remote-delete",
+                "a retained local writeback operation still owns this path",
+            ));
+        }
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+            match self.recover_manifest_owned_placeholder(path, previous) {
+                Ok(true) => {
+                    metadata = fs::symlink_metadata(&local).map_err(|error| {
+                        format!("restat recovered placeholder {}: {error}", local.display())
+                    })?;
+                }
+                Ok(false) => {}
+                Err(detail) => {
+                    return Ok(self.preserve_remote_delete_conflict(
+                        path,
+                        &local,
+                        "lost-placeholder-recovery-failed",
+                        &detail,
+                    ));
+                }
+            }
+        }
         let Some((in_sync, _identity)) = query_placeholder_state(&local)? else {
             return Ok(self.preserve_remote_delete_conflict(
                 path,
@@ -4506,18 +4628,22 @@ impl<T: DfsMessageTransport> WindowsPlaceholderEffects<T> {
             ));
         }
         self.suppress_local_path(&local)?;
-        if metadata.is_dir() {
+        let removal = if metadata.is_dir() {
             fs::remove_dir(&local)
         } else {
             fs::remove_file(&local)
+        };
+        match removal {
+            Ok(()) => Ok(CloudFilesLocalRemovalOutcome::RemovedOrAbsent),
+            Err(error) => Ok(self.preserve_remote_delete_conflict(
+                path,
+                &local,
+                "local-remove-failed",
+                &format!(
+                    "the verified placeholder could not be removed for the authoritative delete: {error}"
+                ),
+            )),
         }
-        .map_err(|error| {
-            format!(
-                "remove remote-deleted placeholder {}: {error}",
-                local.display()
-            )
-        })?;
-        Ok(CloudFilesLocalRemovalOutcome::RemovedOrAbsent)
     }
 
     fn preserve_remote_delete_conflict(
@@ -4821,9 +4947,22 @@ impl<T: DfsMessageTransport> CloudFilesLocalCompletionEffect for WindowsPlacehol
 }
 
 impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlaceholderEffects<T> {
+    fn local_entry_matches_authoritative(
+        &mut self,
+        entry: &CloudFilesReconciledManifestEntry,
+    ) -> Result<bool, String> {
+        let local = self.local_path(&entry.path)?;
+        let Some((in_sync, identity)) = query_placeholder_state(&local)? else {
+            return Ok(false);
+        };
+        Ok(in_sync && identity.as_ref() == Some(&self.manifest_identity(entry)))
+    }
+
     fn apply_full_scan(
         &mut self,
         snapshot: &CloudFilesFullScanSnapshot,
+        previous_manifest: &BTreeMap<String, CloudFilesReconciledManifestEntry>,
+        protected_local_paths: &BTreeSet<String>,
     ) -> Result<CloudFilesFullScanEffectOutcome, String> {
         let mut outcome = CloudFilesFullScanEffectOutcome::default();
         let mut entries = snapshot.manifest.values().collect::<Vec<_>>();
@@ -4841,7 +4980,11 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
                         record_local_removal_outcome(
                             &mut outcome,
                             &entry.path,
-                            self.remove_local_path_for_full_scan(&entry.path)?,
+                            self.remove_local_path_for_full_scan(
+                                &entry.path,
+                                previous_manifest.get(&entry.path),
+                                protected_local_paths.contains(&entry.path),
+                            )?,
                         );
                     }
                     CloudFilesLocalPathState::Dirty { detail } => {
@@ -4865,13 +5008,55 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
                 }
                 continue;
             }
-            if matches!(
-                self.local_path_state(&entry.path)?,
-                CloudFilesLocalPathState::Dirty { .. }
-            ) {
-                // Startup scanning has already queued this local generation;
-                // never replace it with the remote snapshot.
-                continue;
+            if !protected_local_paths.contains(&entry.path) {
+                match self.recover_manifest_owned_placeholder(
+                    &entry.path,
+                    previous_manifest.get(&entry.path),
+                ) {
+                    Ok(true) => outcome.resolved_paths.push(entry.path.clone()),
+                    Ok(false) => {}
+                    Err(detail) => {
+                        outcome.conflicts.push(startup_conflict(
+                            &entry.path,
+                            format!("lost-placeholder-recovery-failed: {detail}"),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            match self.local_path_state(&entry.path)? {
+                CloudFilesLocalPathState::Clean => {}
+                CloudFilesLocalPathState::Dirty { detail } => {
+                    if detail.starts_with("local ancestor ")
+                        && detail.ends_with(" is not a Cloud Files placeholder")
+                    {
+                        // The child itself is absent. Keep any prior manifest
+                        // identity for a later parent repair, but surface only
+                        // the ordinary ancestor as the actionable conflict.
+                        outcome.deferred_paths.push(entry.path.clone());
+                    } else if previous_manifest.contains_key(&entry.path)
+                        || protected_local_paths.contains(&entry.path)
+                    {
+                        outcome.conflicts.push(startup_conflict(
+                            &entry.path,
+                            format!(
+                                "local-dirty-entry-blocks-authoritative-projection: the authoritative entry was not projected because {detail}"
+                                ),
+                            ));
+                    } else {
+                        outcome.deferred_paths.push(entry.path.clone());
+                    }
+                    continue;
+                }
+                CloudFilesLocalPathState::Pending { operation_id } => {
+                    outcome.conflicts.push(startup_conflict(
+                        &entry.path,
+                        format!(
+                            "local-operation-blocks-authoritative-projection: operation `{operation_id}` must settle before the authoritative entry can be projected"
+                        ),
+                    ));
+                    continue;
+                }
             }
             self.ensure_remote_placeholder(&entry.path, true)?;
         }
@@ -4879,7 +5064,11 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
             record_local_removal_outcome(
                 &mut outcome,
                 path,
-                self.remove_local_path_for_full_scan(path)?,
+                self.remove_local_path_for_full_scan(
+                    path,
+                    previous_manifest.get(path),
+                    protected_local_paths.contains(path),
+                )?,
             );
         }
         Ok(outcome)
@@ -4889,6 +5078,38 @@ impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlace
         std::mem::take(&mut self.namespace_suppressions)
             .into_values()
             .collect()
+    }
+
+    fn recover_historical_namespace_conflict(
+        &mut self,
+        conflict: &CloudFilesNamespaceConflict,
+    ) -> Result<bool, String> {
+        let CloudFilesNamespaceAction::Upsert {
+            path,
+            object_id,
+            version,
+            content_hash,
+            content_size_bytes,
+            kind,
+        } = &conflict.action
+        else {
+            return Ok(false);
+        };
+        let previous = CloudFilesReconciledManifestEntry {
+            path: path.clone(),
+            object_id: object_id.clone(),
+            version: version.clone(),
+            content_hash: content_hash.clone(),
+            content_size_bytes: *content_size_bytes,
+            kind: kind.clone(),
+        };
+        match self.local_path_state(path)? {
+            CloudFilesLocalPathState::Clean => Ok(true),
+            CloudFilesLocalPathState::Dirty { .. } => {
+                self.recover_manifest_owned_placeholder(path, Some(&previous))
+            }
+            CloudFilesLocalPathState::Pending { .. } => Ok(false),
+        }
     }
 }
 
