@@ -197,6 +197,28 @@ The v2 fence adds the previously omitted
 already completed v1 runs only the v2 delta; a fresh node persists both fences
 with the same complete-scan boundary.
 
+V4 corrects a separate sparse-projection bug. The old startup audit treated
+prior manifest paths missing from NTFS as local deletes even though absence
+after downtime has no causal deletion evidence. Startup no longer synthesizes
+deletes from absence; live `ReadDirectoryChangesW` removals remain the delete
+authority, while identity-backed startup state can still recover creates,
+replacements, and renames. The v4 migration consumes authoritative scan deltas
+incrementally, retires only deterministic `startup-delete` conflicts already
+durable before the fence, and clears matching legacy
+absence/raced-generation diagnostics. V3 introduced the first fence but could
+see only the terminal bounded scan page; v4 completes the entire pre-fence
+cohort before committing its fence.
+The exact legacy raced-generation/absence diagnostic is also discarded before
+projection because the corrected scanner has no path which can create it; any
+current ordinary or dirty local entry is immediately reclassified with its
+actual evidence by the same scan.
+
+Authoritative scan deltas also recheck terminal delete conflicts without using
+the historical classifier. They retire one only when an explicit removal delta
+proves the path absent or Windows proves an exact in-sync placeholder for the
+current authoritative identity. Failed, dirty, ordinary-file, or incomplete
+proofs retain the original conflict and do not block unrelated paths.
+
 ## Reactive-at-Rest Contract
 
 Once startup, earlier retries, and crash recovery are settled, the Cloud Files

@@ -329,6 +329,15 @@ struct CloudFilesNamespaceReconciliationState {
     /// verification namespace which was omitted from the original classifier.
     #[serde(default)]
     historical_test_conflict_reconciliation_v2_completed: bool,
+    /// V3 repairs terminal deletes inferred by the pre-materialization-proof
+    /// startup audit. The fence is committed before the corrected startup scan
+    /// can enqueue new work, so later genuine deletes cannot enter this set.
+    #[serde(default)]
+    historical_sparse_delete_reconciliation_v3_completed: bool,
+    /// V4 completes the startup-absence migration across bounded full-scan
+    /// pages after v3 proved that a terminal page is not a full manifest.
+    #[serde(default)]
+    historical_startup_absence_reconciliation_v4_completed: bool,
 }
 
 /// Raw owner-validated snapshot accepted by the explicit recovery. The bytes
@@ -852,6 +861,8 @@ pub(crate) fn cursor_recovery_plan_fixture(
         applied_events: BTreeMap::new(),
         historical_test_conflict_reconciliation_v1_completed: false,
         historical_test_conflict_reconciliation_v2_completed: false,
+        historical_sparse_delete_reconciliation_v3_completed: false,
+        historical_startup_absence_reconciliation_v4_completed: false,
     };
     let mut expected = original.clone();
     expected.cursors.clear();
@@ -3127,6 +3138,8 @@ impl CloudFilesNamespaceReconciler {
                 applied_events: BTreeMap::new(),
                 historical_test_conflict_reconciliation_v1_completed: false,
                 historical_test_conflict_reconciliation_v2_completed: false,
+                historical_sparse_delete_reconciliation_v3_completed: false,
+                historical_startup_absence_reconciliation_v4_completed: false,
             }
         });
         if state.schema_version != RECONCILIATION_SCHEMA_VERSION
@@ -3551,6 +3564,60 @@ impl CloudFilesNamespaceReconciler {
             .historical_test_conflict_reconciliation_v1_completed = true;
         self.state
             .historical_test_conflict_reconciliation_v2_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
+    pub(crate) fn historical_sparse_delete_reconciliation_v3_completed(&self) -> bool {
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed
+    }
+
+    pub(crate) fn complete_historical_sparse_delete_reconciliation_v3(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_sparse_delete_reconciliation_v3_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed = true;
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed = true;
+        self.persist_or_restore(previous)?;
+        Ok(true)
+    }
+
+    pub(crate) fn historical_startup_absence_reconciliation_v4_completed(&self) -> bool {
+        self.state
+            .historical_startup_absence_reconciliation_v4_completed
+    }
+
+    pub(crate) fn complete_historical_startup_absence_reconciliation_v4(
+        &mut self,
+    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
+        self.ensure_usable()?;
+        if self
+            .state
+            .historical_startup_absence_reconciliation_v4_completed
+        {
+            return Ok(false);
+        }
+        let previous = self.state.clone();
+        self.state
+            .historical_test_conflict_reconciliation_v1_completed = true;
+        self.state
+            .historical_test_conflict_reconciliation_v2_completed = true;
+        self.state
+            .historical_sparse_delete_reconciliation_v3_completed = true;
+        self.state
+            .historical_startup_absence_reconciliation_v4_completed = true;
         self.persist_or_restore(previous)?;
         Ok(true)
     }

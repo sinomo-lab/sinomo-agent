@@ -71,6 +71,7 @@ use crate::local_change_queue::{
     CloudFilesContentStager, CloudFilesDestinationPrecondition, CloudFilesExpectedObjectState,
     CloudFilesLocalOperationKind, CloudFilesLocalOperationPreconditions,
     CloudFilesLocalOperationRequest, CloudFilesRemoteMutationEvidence, CloudFilesStagedContent,
+    stable_capture_label,
 };
 use crate::namespace_reconciler::{
     CloudFilesFullScanRequest, CloudFilesLocalPathState, CloudFilesMaterializationAuditIntentStore,
@@ -2526,7 +2527,6 @@ struct LocalStartupScan {
 enum LocalStartupScanPhase {
     Enumerate,
     Classify,
-    Missing,
     Complete,
 }
 
@@ -2536,7 +2536,6 @@ struct WindowsLocalStartupScanPlan {
     local: BTreeMap<String, LocalPlaceholderState>,
     blocked_paths: BTreeSet<String>,
     phase_paths: VecDeque<String>,
-    renamed_from: BTreeSet<String>,
     phase: LocalStartupScanPhase,
 }
 
@@ -2553,7 +2552,6 @@ impl WindowsLocalStartupScanPlan {
             local: BTreeMap::new(),
             blocked_paths: BTreeSet::new(),
             phase_paths: VecDeque::new(),
-            renamed_from: BTreeSet::new(),
             phase: LocalStartupScanPhase::Enumerate,
         }
     }
@@ -2663,8 +2661,11 @@ impl WindowsLocalStartupScanPlan {
                 }
                 LocalStartupScanPhase::Classify => {
                     let Some(path) = self.phase_paths.pop_front() else {
-                        self.phase_paths = previous_manifest.keys().cloned().collect();
-                        self.phase = LocalStartupScanPhase::Missing;
+                        // Absence after downtime has no causal delete evidence.
+                        // Live ReadDirectoryChangesW removals remain writable;
+                        // startup lets the authoritative scan reproject any
+                        // missing path instead of manufacturing a delete.
+                        self.phase = LocalStartupScanPhase::Complete;
                         continue;
                     };
                     work += 1;
@@ -2686,11 +2687,6 @@ impl WindowsLocalStartupScanPlan {
                     };
                     let classified =
                         classify_local_divergence(&context, &BTreeMap::from([(path, entry)]))?;
-                    for capture in &classified.captures {
-                        if capture.kind == CloudFilesLocalOperationKind::Rename {
-                            self.renamed_from.insert(capture.source_path.clone());
-                        }
-                    }
                     output.captures.extend(classified.captures);
                     output.conflicts.extend(classified.conflicts);
                     output.deferred_upserts.extend(classified.deferred_upserts);
@@ -2702,32 +2698,6 @@ impl WindowsLocalStartupScanPlan {
                         // Do not classify later paths against the stale sparse
                         // manifest before that boundary commits.
                         break;
-                    }
-                }
-                LocalStartupScanPhase::Missing => {
-                    let Some(path) = self.phase_paths.pop_front() else {
-                        self.phase = LocalStartupScanPhase::Complete;
-                        continue;
-                    };
-                    work += 1;
-                    if self.renamed_from.contains(&path) || self.local.contains_key(&path) {
-                        continue;
-                    }
-                    let previous = previous_manifest
-                        .get(&path)
-                        .expect("missing-audit path came from prior manifest");
-                    let Some(remote) = remote_manifest.get(&path) else {
-                        continue;
-                    };
-                    if !manifest_generations_match(previous, remote) {
-                        output.conflicts.push(startup_conflict(
-                            &path,
-                            "local absence races a remote generation change; delete is blocked",
-                        ));
-                    } else {
-                        output
-                            .captures
-                            .push(delete_capture("startup-delete", &path, previous));
                     }
                 }
                 LocalStartupScanPhase::Complete => break,
@@ -4138,15 +4108,6 @@ fn exact_destination_precondition(
     CloudFilesDestinationPrecondition::Exact(expected_state(entry))
 }
 
-fn stable_capture_label(parts: &[&str]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for part in parts {
-        hasher.update(&(part.len() as u64).to_le_bytes());
-        hasher.update(part.as_bytes());
-    }
-    format!("windows:{}", hasher.finalize().to_hex())
-}
-
 fn local_relative_to_sifs(root_path: &str, relative: &Path) -> Result<String, String> {
     let mut result = normalize_sifs_root(root_path).map_err(|error| error.to_string())?;
     for component in relative.components() {
@@ -4986,6 +4947,17 @@ impl<T: DfsMessageTransport> CloudFilesLocalCompletionEffect for WindowsPlacehol
 }
 
 impl<T: DfsMessageTransport> CloudFilesWindowsPlaceholderEffect for WindowsPlaceholderEffects<T> {
+    fn local_entry_matches_authoritative(
+        &mut self,
+        entry: &CloudFilesReconciledManifestEntry,
+    ) -> Result<bool, String> {
+        let local = self.local_path(&entry.path)?;
+        let Some((in_sync, identity)) = query_placeholder_state(&local)? else {
+            return Ok(false);
+        };
+        Ok(in_sync && identity.as_ref() == Some(&self.manifest_identity(entry)))
+    }
+
     fn apply_full_scan(
         &mut self,
         snapshot: &CloudFilesFullScanSnapshot,

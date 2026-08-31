@@ -54,6 +54,15 @@ const MOUNT_SCOPE_DOMAIN: &[u8] = b"sinomo.dfs.cloud-files.mount-state.v1\0";
 
 static STAGED_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn stable_capture_label(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("windows:{}", hasher.finalize().to_hex())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CloudFilesLocalOperationKind {

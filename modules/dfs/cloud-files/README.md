@@ -68,6 +68,12 @@ catalog. The current supervisor accepts one mount mapping per node.
   applies to conflicts created after the migration fence is durable.
   The v2 fence includes the older `/services/real-cluster/` verification
   subtree without treating adjacent service or sandbox namespaces as tests.
+- Startup absence is never deletion evidence; only a live directory-change
+  removal owns that causal action. The v4 fence retires older deterministic
+  startup-delete conflicts across all bounded authoritative scan pages. Later
+  notification deletes are outside the migration, and ordinary scan deltas
+  clear a terminal delete only after exact local/authoritative convergence or
+  an explicit authoritative removal.
 - Writable state opens only after exact registration ownership is durable.
 - Registration, cursor recovery, and preserve/re-enable accept only finite,
   causal current/temporary cuts. Do not add generic repair or “latest wins”
