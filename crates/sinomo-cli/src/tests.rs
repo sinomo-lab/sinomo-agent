@@ -7387,6 +7387,9 @@ fn doctor_storage_contract_covers_cli_and_app_sessions() {
     std::fs::create_dir_all(root.join("app/sessions/session-1")).expect("create app session");
     std::fs::write(root.join("app/sessions/session-1/meta.json"), b"{}")
         .expect("write app session");
+    std::fs::create_dir_all(root.join("logs")).expect("create app logs");
+    std::fs::write(root.join("logs/app.log"), b"current\n").expect("write app log");
+    std::fs::write(root.join("logs/app.log.1"), b"rotated\n").expect("write rotated app log");
     std::fs::create_dir_all(root.join("cluster")).expect("create cluster");
     std::fs::write(root.join("cluster/.kv-snapshot.sobj.tmp-1-2"), b"partial")
         .expect("write leftover temp file");
@@ -7397,7 +7400,7 @@ fn doctor_storage_contract_covers_cli_and_app_sessions() {
         findings
             .iter()
             .all(|finding| finding.code != "storage-unregistered-paths"),
-        "owned session paths and durable-write temp files should not create storage findings: {findings:?}"
+        "owned app/CLI paths and durable-write temp files should not create storage findings: {findings:?}"
     );
 }
 
