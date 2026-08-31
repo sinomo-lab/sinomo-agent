@@ -11734,7 +11734,7 @@ fn slow_session_load_actions(shared: &Shared, reader: &ThemeReader) -> Option<im
     )
 }
 
-fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+fn session_edit_dialog_body(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     let (
         session,
         draft,
@@ -11832,11 +11832,6 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
         }
     } else {
         Vec::new()
-    };
-    let title = if is_channel {
-        "Edit channel"
-    } else {
-        "Edit chat"
     };
     let placeholder = if is_channel {
         "Channel title"
@@ -12073,20 +12068,40 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             );
     }
 
-    let s = shared.clone();
     let body = SizedBox::new().height(520.0).with_child(
         ScrollView::vertical(body)
             .name("chat-session-editor-scroll")
             .state(ScrollState::new())
             .theme(reader()),
     );
+    Some(WidgetPod::new(body))
+}
+
+fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
+    let title = {
+        let chat = shared.chat();
+        let edit_id = chat.session_edit_id.as_deref()?;
+        let session = chat.sessions.iter().find(|session| session.id == edit_id)?;
+        match session.kind {
+            ConversationKind::Channel => "Edit channel",
+            ConversationKind::Chat => "Edit chat",
+        }
+    };
+    let source = shared.signals().chat_structure.clone();
+    let content_shared = shared.clone();
+    let content_reader = Rc::clone(reader);
+    let body = RebuildOnChange::new_observable(source, move |_structure| {
+        session_edit_dialog_body(&content_shared, &content_reader)
+            .unwrap_or_else(|| WidgetPod::new(SizedBox::new()))
+    });
+    let dismiss_shared = shared.clone();
     Some(WidgetPod::new(
         sui::Dialog::new(title, body)
             .theme(shared.theme())
             .max_width(760.0)
             .dismiss_on_scrim(true)
             .on_dismiss(move || {
-                s.chat_mut().close_session_edit();
+                dismiss_shared.chat_mut().close_session_edit();
             }),
     ))
 }
@@ -12389,12 +12404,44 @@ fn chat_overlay(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPod> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ChatOverlayKey {
+    Hidden,
+    /// Retain the dialog while its body changes. Theme changes intentionally replace the outer
+    /// dialog so its non-reactive frame tokens stay current.
+    SessionEdit {
+        session_id: String,
+        theme: (AppThemeMode, AppTextScale),
+    },
+    /// The compact drawer still follows the complete chat structure because its body is not a
+    /// separately retained rebuild boundary.
+    CompactDrawer(ChatStructureKey),
+}
+
+impl ChatOverlayKey {
+    fn from_structure(structure: &ChatStructureKey) -> Self {
+        let Some(snapshot) = structure.0.as_deref() else {
+            return Self::Hidden;
+        };
+        if let Some(session_id) = snapshot.session_edit_id.clone() {
+            Self::SessionEdit {
+                session_id,
+                theme: snapshot.theme,
+            }
+        } else if snapshot.compact_drawer_open {
+            Self::CompactDrawer(structure.clone())
+        } else {
+            Self::Hidden
+        }
+    }
+}
+
 struct ChatDialogHost {
     shared: Shared,
     reader: ThemeReader,
     body: WidgetPod,
     dialog: Option<WidgetPod>,
-    dialog_key: ChatStructureKey,
+    dialog_key: ChatOverlayKey,
 }
 
 impl ChatDialogHost {
@@ -12402,7 +12449,8 @@ impl ChatDialogHost {
     where
         W: Widget + 'static,
     {
-        let dialog_key = shared.signals().chat_structure.get();
+        let structure = shared.signals().chat_structure.get();
+        let dialog_key = ChatOverlayKey::from_structure(&structure);
         let dialog = chat_overlay(&shared, &reader);
         Self {
             shared,
@@ -12413,7 +12461,8 @@ impl ChatDialogHost {
         }
     }
 
-    fn sync_dialog(&mut self, key: ChatStructureKey) {
+    fn sync_dialog(&mut self, structure: ChatStructureKey) {
+        let key = ChatOverlayKey::from_structure(&structure);
         if key == self.dialog_key {
             return;
         }
@@ -12425,8 +12474,8 @@ impl ChatDialogHost {
 impl Widget for ChatDialogHost {
     fn measure(&mut self, ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
         let source = self.shared.signals().chat_structure.clone();
-        let key = ctx.observe(&source);
-        self.sync_dialog(key);
+        let structure = ctx.observe(&source);
+        self.sync_dialog(structure);
         let size = constraints.clamp(Size::new(
             if constraints.max.width.is_finite() {
                 constraints.max.width
@@ -21211,6 +21260,17 @@ mod tests {
             Some(session_id.as_str()),
             "row edit button should open the edit dialog"
         );
+        app.run_until_idle()?;
+        let collapsed = window.snapshot()?;
+        let dialog_id = collapsed
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Dialog && node.name.as_deref() == Some("Edit chat")
+            })
+            .expect("mounted edit chat dialog")
+            .id;
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Show details")
@@ -21239,6 +21299,41 @@ mod tests {
             }),
             "expanded details should expose the session id"
         );
+        let expanded_dialog_id = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Dialog && node.name.as_deref() == Some("Edit chat")
+            })
+            .expect("expanded edit chat dialog")
+            .id;
+        assert_eq!(
+            expanded_dialog_id, dialog_id,
+            "expanding details must retain the outer dialog instead of restarting its entrance"
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Hide details")
+            .click()?;
+        app.run_until_idle()?;
+        let collapsed_again = window.snapshot()?;
+        let collapsed_dialog_id = collapsed_again
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Dialog && node.name.as_deref() == Some("Edit chat")
+            })
+            .expect("collapsed edit chat dialog")
+            .id;
+        assert_eq!(
+            collapsed_dialog_id, dialog_id,
+            "hiding details must retain the outer dialog instead of restarting its entrance"
+        );
+        assert!(collapsed_again.accessibility.nodes.iter().any(|node| {
+            node.role == SemanticsRole::Button && node.name.as_deref() == Some("Show details")
+        }));
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Done")
