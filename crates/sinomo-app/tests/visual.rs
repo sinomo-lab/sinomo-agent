@@ -176,7 +176,6 @@ fn capture_tabs() {
 
     for (tab, name) in [
         (Tab::Sinomo, "sinomo"),
-        (Tab::Evolution, "evolution"),
         (Tab::Cluster, "cluster"),
         (Tab::Files, "files"),
         (Tab::Settings, "settings"),
@@ -189,7 +188,6 @@ fn capture_tabs() {
     // Light-theme variants to validate the light palette.
     for (tab, name) in [
         (Tab::Sinomo, "sinomo-light"),
-        (Tab::Evolution, "evolution-light"),
         (Tab::Cluster, "cluster-light"),
         (Tab::Settings, "settings-light"),
     ] {
@@ -201,7 +199,6 @@ fn capture_tabs() {
     // Void (true-black OLED) variants to validate the border-only elevation.
     for (tab, name) in [
         (Tab::Sinomo, "sinomo-void"),
-        (Tab::Evolution, "evolution-void"),
         (Tab::Cluster, "cluster-void"),
         (Tab::Settings, "settings-void"),
     ] {
@@ -209,157 +206,6 @@ fn capture_tabs() {
         shared.borrow_mut().theme_mode = AppThemeMode::Void;
         capture(shared, name);
     }
-}
-
-#[test]
-#[ignore = "dev screenshot capture; run explicitly with --ignored --nocapture"]
-fn capture_evolution_seeded() {
-    use sinomo_app::backend::evolution::{
-        EvolutionDashboard, EvolutionDecisionSummary, EvolutionJobSummary, EvolutionPhase,
-    };
-
-    let dir = shots_dir();
-    std::fs::create_dir_all(&dir).expect("create shots dir");
-
-    let shared = boot(Tab::Evolution);
-    {
-        let mut evolution = shared.evolution_mut();
-        evolution.objective_draft = "Improve DFS performance".to_string();
-        evolution.scope_draft = "crates/sinomo-dfs/**".to_string();
-        evolution.target_ring_index = 1;
-        evolution.dashboard = EvolutionDashboard {
-            source: "/home/ix/.sinomo/evolution".to_string(),
-            jobs: vec![
-                EvolutionJobSummary {
-                    id: "01j9candidate-ready-for-review".to_string(),
-                    short_id: "01j9candidate".to_string(),
-                    objective: "Tighten compaction resume evidence for long-running coding turns"
-                        .to_string(),
-                    status_key: "awaiting-approval".to_string(),
-                    status_label: "awaiting approval".to_string(),
-                    phase: EvolutionPhase::AwaitingDecision,
-                    target_ring: "R2".to_string(),
-                    created_at: "2026-06-15T11:34:20Z".to_string(),
-                    workspace_root: "/home/ix/.sinomo/source/sinomo".to_string(),
-                    candidate_workspace:
-                        "/home/ix/.sinomo/evolution/worktrees/01j9candidate-ready-for-review"
-                            .to_string(),
-                    candidate_branch: "evolution/compaction-resume-evidence".to_string(),
-                    source_revision: Some("7f4d2c05".to_string()),
-                    verification_outcome: Some("passed".to_string()),
-                    required_gate_count: 4,
-                    verification_command_count: 3,
-                    module_replay_count: 1,
-                    changed_files: vec![
-                        "crates/sinomo-agent/src/compaction.rs".to_string(),
-                        "crates/sinomo-agent/tests/compaction_resume.rs".to_string(),
-                        "docs/agent-system-architecture.md".to_string(),
-                    ],
-                    allowed_paths: vec![
-                        "crates/sinomo-agent".to_string(),
-                        "docs/agent-system-architecture.md".to_string(),
-                    ],
-                    forbidden_paths: vec!["crates/sinomo-dfs".to_string()],
-                    recovery_strategy: "git branch reset".to_string(),
-                    recovery_note: "Reset the candidate worktree and preserve scorecard evidence"
-                        .to_string(),
-                    rollback_policy: "Manual".to_string(),
-                    bundle_path:
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review"
-                            .to_string(),
-                    mutation_packet_path:
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/mutation-packet.json"
-                            .to_string(),
-                    diff_path: Some(
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/diff.patch"
-                            .to_string(),
-                    ),
-                    scorecard_path: Some(
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/scorecard.json"
-                            .to_string(),
-                    ),
-                    candidate_summary_path: Some(
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-ready-for-review/candidate-summary.md"
-                            .to_string(),
-                    ),
-                    artifact_ref_count: 7,
-                    command_log_count: 3,
-                    ..EvolutionJobSummary::default()
-                },
-                EvolutionJobSummary {
-                    id: "01j9candidate-failed".to_string(),
-                    short_id: "01j9failed".to_string(),
-                    objective: "Move rollout prompt overflow classification into sinomo-lm"
-                        .to_string(),
-                    status_key: "eval-failed".to_string(),
-                    status_label: "eval failed".to_string(),
-                    phase: EvolutionPhase::Failed,
-                    target_ring: "R2".to_string(),
-                    created_at: "2026-06-14T22:18:04Z".to_string(),
-                    required_gate_count: 5,
-                    verification_command_count: 4,
-                    changed_files: vec!["crates/sinomo-lm/src/providers.rs".to_string()],
-                    bundle_path: "/home/ix/.sinomo/evolution/candidates/01j9candidate-failed"
-                        .to_string(),
-                    mutation_packet_path:
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-failed/mutation-packet.json"
-                            .to_string(),
-                    ..EvolutionJobSummary::default()
-                },
-                EvolutionJobSummary {
-                    id: "01j9candidate-promoted".to_string(),
-                    short_id: "01j9promoted".to_string(),
-                    objective: "Expose Hermes-style skill disclosure in agent package inspection"
-                        .to_string(),
-                    status_key: "promoted".to_string(),
-                    status_label: "promoted".to_string(),
-                    phase: EvolutionPhase::Passed,
-                    target_ring: "R2".to_string(),
-                    created_at: "2026-06-13T16:05:48Z".to_string(),
-                    decision: Some(EvolutionDecisionSummary {
-                        outcome: "approved".to_string(),
-                        decided_at: "2026-06-13T18:12:02Z".to_string(),
-                        decided_by: "operator".to_string(),
-                        note: "Promoted after shadow evidence stayed clean".to_string(),
-                        preflight_passed: Some(true),
-                    }),
-                    bundle_path:
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-promoted"
-                            .to_string(),
-                    mutation_packet_path:
-                        "/home/ix/.sinomo/evolution/candidates/01j9candidate-promoted/mutation-packet.json"
-                            .to_string(),
-                    ..EvolutionJobSummary::default()
-                },
-            ],
-            error: None,
-        };
-        evolution.selected = Some(0);
-    }
-    capture(shared.clone(), "evolution-seeded");
-
-    // Keep a compact capture alongside the desktop one so the sticky decision
-    // bar and the wrapped start controls are covered by the same seeded state.
-    let runtime = build_runtime(shared).expect("build narrow evolution runtime");
-    let app = TestApp::from_runtime(runtime).expect("headless narrow evolution app");
-    let window = app.main_window().expect("narrow evolution window");
-    app.run_until_idle().expect("settle wide evolution layout");
-    window
-        .root()
-        .dispatch_event(sui::Event::Window(sui::WindowEvent::Resized(
-            sui::Size::new(720.0, 820.0),
-        )))
-        .expect("resize seeded evolution narrow");
-    app.run_until_idle()
-        .expect("settle narrow evolution layout");
-    let screenshot = window
-        .capture_screenshot()
-        .expect("capture narrow evolution screenshot");
-    let path = dir.join("sinomo-app-evolution-seeded-narrow.png");
-    screenshot
-        .write_png(&path)
-        .expect("write narrow evolution png");
-    println!("wrote {}", path.display());
 }
 
 #[test]
@@ -594,20 +440,6 @@ fn capture_contextual_size_matrix() {
     app.run_until_idle()
         .expect("finish contextual narrow animation frame");
     capture("contextual-sizes-settings-narrow", &window);
-
-    shared.borrow_mut().active_tab = Tab::Evolution;
-    root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(
-        1280.0, 720.0,
-    ))))
-    .expect("resize scaled Evolution");
-    root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
-        .expect("show scaled Evolution");
-    app.run_until_idle().expect("settle large Evolution layout");
-    app.advance_time(0.5)
-        .expect("settle large Evolution entrance animations");
-    app.run_until_idle()
-        .expect("finish large Evolution animation frame");
-    capture("contextual-sizes-evolution", &window);
 
     shared.borrow_mut().active_tab = Tab::Sinomo;
     root.dispatch_event(Event::Window(WindowEvent::RedrawRequested))
@@ -905,61 +737,6 @@ fn shell_tab_focus_ring_is_not_clipped_by_horizontal_scrolling() {
         changed_pixels > 8,
         "focused TabBar must paint above the horizontal ScrollView viewport; \
          changed_pixels={changed_pixels}, tab_bounds={tab_bounds:?}"
-    );
-}
-
-#[test]
-fn shell_tabs_remain_painted_while_evolution_select_is_open() {
-    use sui::SemanticsRole;
-
-    let (shared, _cleanup) = boot_with_visual_data_dir(Tab::Evolution, "evolution-select-tabs");
-    let runtime = build_runtime(shared).expect("build runtime");
-    let app = TestApp::from_runtime(runtime).expect("headless test app");
-    let window = app.main_window().expect("main window");
-    app.run_until_idle().expect("settle evolution shell");
-
-    window
-        .get_by_role(SemanticsRole::Button)
-        .with_name("Options")
-        .click()
-        .expect("show advanced evolution options");
-    app.run_until_idle().expect("settle evolution options");
-
-    let snapshot = window.snapshot_now().expect("snapshot evolution options");
-    let tab_bar = snapshot
-        .accessibility
-        .nodes
-        .iter()
-        .find(|node| {
-            node.role == SemanticsRole::TabBar && node.name.as_deref() == Some("shell-tabs")
-        })
-        .expect("shell tab bar semantics");
-    let tab_region = tab_bar.bounds.inflate(4.0, 4.0);
-    let before = window
-        .capture_screenshot_now()
-        .expect("capture closed target-ring select");
-
-    window
-        .get_by_role(SemanticsRole::ComboBox)
-        .with_name("evolution-target-ring")
-        .click()
-        .expect("open target-ring select");
-    app.advance_time(0.5).expect("finish select animation");
-    app.run_until_idle().expect("paint target-ring select");
-    let expanded = window.snapshot_now().expect("snapshot target-ring select");
-    assert!(expanded.accessibility.nodes.iter().any(|node| {
-        node.role == SemanticsRole::ComboBox
-            && node.name.as_deref() == Some("evolution-target-ring")
-            && node.state.expanded == Some(true)
-    }));
-    let after = window
-        .capture_screenshot_now()
-        .expect("capture open target-ring select");
-    let changed_pixels = pixel_diff_in_rect(&before, &after, tab_region);
-
-    assert_eq!(
-        changed_pixels, 0,
-        "opening a Select must not clear or repaint the shell tab strip"
     );
 }
 

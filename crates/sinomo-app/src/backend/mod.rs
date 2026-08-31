@@ -12,7 +12,6 @@ pub mod app_config;
 pub mod chat_engine;
 pub mod cluster;
 pub mod config;
-pub mod evolution;
 pub mod modules;
 pub mod mounts;
 pub mod observe;

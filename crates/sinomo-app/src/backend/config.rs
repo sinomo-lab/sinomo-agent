@@ -108,6 +108,7 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
         .map_err(|e| format!("built-in module config: {e}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
+    #[cfg(target_os = "android")]
     let builder = sinomo_evolution::register_config_definitions(builder)
         .map_err(|e| format!("evolution config: {e:?}"))?;
     Ok(ConfigStore::new(builder.build()))
@@ -259,21 +260,6 @@ mod tests {
         let data_dir = SinomoDataDir::new(root.clone());
         let store = Arc::new(build_config_store().expect("config store"));
         (LocalConfigClient::new(store, data_dir, None), root)
-    }
-
-    #[test]
-    fn app_config_store_includes_evolution_schema() {
-        let store = build_config_store().expect("config store");
-        let definition = store
-            .registry()
-            .get(sinomo_evolution::EVOLUTION_CONFIG_KEY)
-            .expect("evolution config definition");
-        let expected_module_id = sinomo_evolution::evolution_module_id().to_string();
-        assert!(definition.schema.is_some());
-        assert_eq!(
-            definition.module_id.as_deref(),
-            Some(expected_module_id.as_str())
-        );
     }
 
     #[test]

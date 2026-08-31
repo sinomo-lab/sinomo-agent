@@ -75,7 +75,6 @@ android-build = "0.1.4"
 [dev-dependencies]
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
 sinomo-testdir = { path = "../sinomo-testdir" }
 # Headless rendering harness for visual verification of the widget tree.

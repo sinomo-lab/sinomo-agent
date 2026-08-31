@@ -33,7 +33,7 @@ use sui::{
 use crate::state::ShellStatus;
 use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurface, Shared, Tab};
 use crate::theme::Palette;
-use crate::ui::{chat, cluster, evolution, files, settings, widgets};
+use crate::ui::{chat, cluster, files, settings, widgets};
 
 pub const TOPBAR_HEIGHT: f32 = 44.0;
 
@@ -60,9 +60,6 @@ impl BackgroundWorkController {
             self.shared
                 .settings_mut()
                 .begin_initial_load(backend.clone(), waker.clone());
-            self.shared
-                .evolution_mut()
-                .begin_dashboard_load(backend.data_dir.clone(), waker.clone());
             {
                 let mut chat = self.shared.chat_mut();
                 chat.start_provider_list_load(backend.config.clone(), waker.clone());
@@ -88,7 +85,6 @@ impl BackgroundWorkController {
         let settings_changed = initial_settings.changed;
         let settings_operations_changed =
             ready && settings::pump_background_operations(&self.shared);
-        let evolution_changed = ready && self.shared.evolution_mut().pump_dashboard_load();
         let files_changed = ready && self.shared.files_mut().pump_load();
         let files_attachment_changed = ready && drain_files_chat_attachment(&self.shared);
         let connection_changed = self.shared.pump_connection_probe();
@@ -137,8 +133,7 @@ impl BackgroundWorkController {
             || cluster_observation_changed
             || chat_layout_changed
             || settings_changed
-            || settings_operations_changed
-            || evolution_changed;
+            || settings_operations_changed;
         if layout_changed {
             ctx.request_measure();
             ctx.request_arrange();
@@ -573,7 +568,6 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
     if compact {
         match tab {
             Tab::Sinomo => "Chat",
-            Tab::Evolution => "Evolve",
             Tab::Cluster => Tab::Cluster.title(),
             Tab::Files => Tab::Files.title(),
             Tab::Settings => "Prefs",
@@ -596,7 +590,6 @@ fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
         SwitchView::new()
             .selected_from(selected)
             .with_child(chat::view(shared.clone()))
-            .with_child(evolution::view(shared.clone()))
             .with_child(cluster::view(shared.clone()))
             .with_child(files::view(shared.clone()))
             .with_child(settings::view(shared)),
@@ -1492,26 +1485,6 @@ fn health_actions_for_issue(shared: &Shared, issue: &HealthIssue) -> Vec<HealthA
         HealthSurface::Chat => retry_and_open_actions(HealthSurface::Chat, "Chat"),
         HealthSurface::Files => retry_and_open_actions(HealthSurface::Files, "Files"),
         HealthSurface::Cluster => retry_and_open_actions(HealthSurface::Cluster, "Cluster"),
-        HealthSurface::Evolution => {
-            let pending = shared.evolution().dashboard_refresh_pending();
-            vec![
-                HealthActionItem {
-                    kind: HealthActionKind::Retry(HealthSurface::Evolution),
-                    label: if pending {
-                        "Retrying Evolution…"
-                    } else {
-                        "Retry Evolution"
-                    }
-                    .to_string(),
-                    enabled: !pending,
-                },
-                HealthActionItem {
-                    kind: HealthActionKind::Open(HealthSurface::Evolution),
-                    label: "Open Evolution".to_string(),
-                    enabled: true,
-                },
-            ]
-        }
         HealthSurface::Settings(section) => vec![HealthActionItem {
             kind: HealthActionKind::Open(HealthSurface::Settings(section)),
             label: format!("Open {}", section.title()),
@@ -1524,7 +1497,6 @@ fn health_actions_for_issue(shared: &Shared, issue: &HealthIssue) -> Vec<HealthA
             HealthSurface::Chat => "Authorize Chat".to_string(),
             HealthSurface::Files => "Authorize Files".to_string(),
             HealthSurface::Cluster => "Authorize Cluster".to_string(),
-            HealthSurface::Evolution => "Authorize Evolution".to_string(),
             HealthSurface::Settings(settings::SettingsSection::Providers) => {
                 "Authorize Provider".to_string()
             }
@@ -1765,7 +1737,6 @@ fn open_health_surface(shared: &Shared, surface: HealthSurface) {
         HealthSurface::Chat => Tab::Sinomo,
         HealthSurface::Files => Tab::Files,
         HealthSurface::Cluster => Tab::Cluster,
-        HealthSurface::Evolution => Tab::Evolution,
         HealthSurface::Settings(section) => {
             if shared.is_ready() {
                 shared.settings_mut().open(section);
@@ -1791,18 +1762,6 @@ fn retry_health_surface(shared: &Shared, surface: HealthSurface) {
         }
         HealthSurface::Cluster => {
             cluster::request_refresh(shared);
-        }
-        HealthSurface::Evolution => {
-            let (data_dir, waker) = {
-                let app = shared.borrow();
-                let Some(ready) = app.ready.as_ref() else {
-                    return;
-                };
-                (ready.backend.data_dir.clone(), app.waker.clone())
-            };
-            shared
-                .evolution_mut()
-                .retry_dashboard_refresh(data_dir, waker);
         }
         HealthSurface::Settings(_) => open_health_surface(shared, surface),
     }
@@ -2157,6 +2116,10 @@ mod tests {
         assert_eq!(Tab::Sinomo.title(), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, false), "Chat");
         assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
+        assert_eq!(
+            Tab::ALL.map(Tab::title),
+            ["Chat", "Cluster", "Files", "Settings"]
+        );
     }
 
     #[test]
@@ -2707,7 +2670,9 @@ mod tests {
             status.bounds
         );
 
-        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(360.0, 720.0))))?;
+        // With four destinations the strip fits at 360 px, so exercise a phone-width viewport
+        // where the natural tab row still needs horizontal scrolling.
+        root.dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 720.0))))?;
         app.run_until_idle()?;
         let narrow = window.snapshot()?;
         let navigation = narrow
@@ -2803,34 +2768,6 @@ mod tests {
             "ArrowDown should move the recovery action cursor"
         );
 
-        Ok(())
-    }
-
-    #[test]
-    fn health_center_exposes_evolution_retry_and_deep_link() -> sui::Result<()> {
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        shared.evolution_mut().dashboard.error =
-            Some("Evolution dashboard refresh failed: worker stopped".to_string());
-
-        let runtime = crate::build_runtime(shared)?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
-        let window = app.main_window()?;
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Needs attention")
-            .click()?;
-
-        for action in ["Retry Evolution", "Open Evolution"] {
-            assert_eq!(
-                window
-                    .get_by_role(SemanticsRole::Button)
-                    .with_name(action)
-                    .count()?,
-                1,
-                "missing {action}"
-            );
-        }
         Ok(())
     }
 
