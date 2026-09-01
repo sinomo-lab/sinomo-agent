@@ -1323,6 +1323,26 @@ where
     scheduler.request_publish_async_on_runtime(runtime, options, publish, on_report, on_error)
 }
 
+pub(crate) fn schedule_dfs_metadata_publish_async_on_runtime_owned<P, Fut, R, E>(
+    scheduler: Arc<DfsMetadataPublishScheduler>,
+    runtime: tokio::runtime::Handle,
+    options: DfsMetadataPublishScheduleOptions,
+    publish: P,
+    on_report: R,
+    on_error: E,
+) -> (
+    DfsMetadataPublishScheduleStart,
+    Option<tokio::task::JoinHandle<()>>,
+)
+where
+    P: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<DfsMetadataJournalReplicationReport, String>> + Send + 'static,
+    R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+    E: FnMut(String) + Send + 'static,
+{
+    scheduler.request_publish_async_on_runtime_owned(runtime, options, publish, on_report, on_error)
+}
+
 pub fn schedule_dfs_metadata_publish_after_events_async_on_runtime<P, Fut, R, E>(
     scheduler: Arc<DfsMetadataPublishScheduler>,
     runtime: tokio::runtime::Handle,
@@ -1612,15 +1632,38 @@ impl DfsMetadataPublishScheduler {
         R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
         E: FnMut(String) + Send + 'static,
     {
+        self.request_publish_async_on_runtime_owned(runtime, options, publish, on_report, on_error)
+            .0
+    }
+
+    pub(crate) fn request_publish_async_on_runtime_owned<P, Fut, R, E>(
+        self: Arc<Self>,
+        runtime: tokio::runtime::Handle,
+        options: DfsMetadataPublishScheduleOptions,
+        publish: P,
+        on_report: R,
+        on_error: E,
+    ) -> (
+        DfsMetadataPublishScheduleStart,
+        Option<tokio::task::JoinHandle<()>>,
+    )
+    where
+        P: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<DfsMetadataJournalReplicationReport, String>> + Send + 'static,
+        R: FnMut(DfsMetadataJournalReplicationReport) + Send + 'static,
+        E: FnMut(String) + Send + 'static,
+    {
         let start = self.claim_publish_start();
-        if start == DfsMetadataPublishScheduleStart::Started {
+        let task = if start == DfsMetadataPublishScheduleStart::Started {
             let run_guard = DfsMetadataPublishRunGuard::new(Arc::clone(&self));
-            runtime.spawn(async move {
+            Some(runtime.spawn(async move {
                 self.run_publish_loop_async(options, publish, on_report, on_error, run_guard)
                     .await;
-            });
-        }
-        start
+            }))
+        } else {
+            None
+        };
+        (start, task)
     }
 
     async fn run_publish_loop_async<P, Fut, R, E>(
@@ -7001,7 +7044,7 @@ pub fn process_cluster_dfs_metadata_journal_batch(
 /// authority projection; this helper exists only so cross-crate tests exercise
 /// the same validation and durable apply path without falling back to the
 /// deliberately fail-closed host-agnostic entry point above.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test(
     data_dir: &SinomoDataDir,

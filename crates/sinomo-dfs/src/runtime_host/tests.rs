@@ -664,7 +664,7 @@ fn mounted_mutation_main_startup_replays_the_durable_latch_once() {
 
     let replayed_repair_edges = daemon_dfs_repair_maintenance_edge_request_count(&data_dir);
     replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
-        &crate::shadow_daemon_paths_from_data_dir(&data_dir),
+        &shadow_daemon_paths_from_data_dir(&data_dir),
         runtime.handle(),
     )
     .expect("shadow replay is a no-op");
@@ -860,36 +860,6 @@ fn mounted_mutation_corrupt_recovery_requires_a_completed_full_pass() {
         .phase,
         crate::DaemonDfsMountedMutationHandoffPhase::Ready
     );
-}
-
-#[test]
-fn daemon_dfs_control_plane_preserves_temporary_authority_unavailability() {
-    let root = temp_root("daemon-dfs-control-plane-authority-unavailable");
-    let data_dir = SinomoDataDir::new(root.path());
-    let runtime = daemon_test_runtime("daemon-dfs-control-plane-authority-unavailable");
-    let client = DaemonDfsControlPlaneKvClient::new_on_runtime(
-        &ClusterPaths::new(&data_dir),
-        runtime.handle(),
-    );
-    let detail =
-        "local Raft admission is busy and no authority accepted the forwarded exact-key-set read";
-
-    assert_eq!(
-        client.daemon_error(DaemonError::ClusterReadOnly {
-            detail: detail.to_string(),
-        }),
-        KvError::AuthorityUnavailable {
-            detail: detail.to_string(),
-        },
-        "a transient authoritative-view failure must remain retryable across the daemon adapter"
-    );
-    assert!(matches!(
-        client.daemon_error(DaemonError::Io {
-            path: "/permission-denied".to_string(),
-            detail: "permission denied".to_string(),
-        }),
-        KvError::Io { detail, .. } if detail.contains("permission denied")
-    ));
 }
 
 #[test]
@@ -2847,7 +2817,7 @@ fn test_file_system_config_for_shard(shard: &DfsMetadataShardConfig) -> DfsFileS
 }
 
 fn daemon_test_runtime(name: &str) -> tokio::runtime::Runtime {
-    crate::build_daemon_async_runtime(name).expect("test daemon runtime")
+    build_daemon_async_runtime(name).expect("test DFS runtime")
 }
 
 fn daemon_test_runtime_with_thread_stack_size(

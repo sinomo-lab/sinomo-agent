@@ -4,7 +4,7 @@ use super::*;
 pub(crate) struct DaemonDfsDataPlaneHost {
     pub(super) paths: DaemonPaths,
     pub(super) runtime: tokio::runtime::Handle,
-    pub(super) event_hub: Option<Arc<sinomo_api::DaemonEventHub>>,
+    pub(super) event_client: Option<ComponentEventClient>,
 }
 
 impl DaemonDfsDataPlaneHost {
@@ -13,19 +13,19 @@ impl DaemonDfsDataPlaneHost {
         Self {
             paths,
             runtime: runtime.clone(),
-            event_hub: None,
+            event_client: None,
         }
     }
 
-    pub(crate) fn new_on_runtime_with_event_hub(
+    pub(crate) fn new_on_runtime_with_event_client(
         paths: DaemonPaths,
         runtime: &tokio::runtime::Handle,
-        event_hub: Arc<sinomo_api::DaemonEventHub>,
+        event_client: ComponentEventClient,
     ) -> Self {
         Self {
             paths,
             runtime: runtime.clone(),
-            event_hub: Some(event_hub),
+            event_client: Some(event_client),
         }
     }
 
@@ -513,7 +513,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let validation = self.validate_data_dir(data_dir.as_ref());
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
-        let event_hub = self.event_hub.clone();
+        let event_client = self.event_client.clone();
         Box::pin(async move {
             let _data_owner = data_owner?;
             validation?;
@@ -617,13 +617,15 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
             if namespace_changed
                 && response.applied_entries > 0
                 && response.result == sinomo_dfs::DfsMetadataJournalBatchResult::Applied
-                && let Some(event_hub) = event_hub
+                && let Some(event_client) = event_client
             {
-                event_hub.publish_dfs_namespace_change(
+                publish_dfs_namespace_change(
+                    &event_client,
                     event_origin_node_id,
                     "metadata-journal-applied",
                     namespace_paths.into_iter().collect(),
-                );
+                )
+                .await;
             }
             Ok(response)
         })
@@ -713,7 +715,7 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
         let data_owner = self.require_data_owner();
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
-        let event_hub = self.event_hub.clone();
+        let event_client = self.event_client.clone();
         let namespace_event = daemon_dfs_visible_mutation_event(&command);
         Box::pin(async move {
             let _data_owner = data_owner?;
@@ -722,13 +724,15 @@ impl DfsDataPlaneHost for DaemonDfsDataPlaneHost {
                     .await
                     .map_err(daemon_dfs_data_plane_error)?;
             if daemon_dfs_response_committed_visible_mutation(&response)
-                && let (Some(event_hub), Some(namespace_event)) = (event_hub, namespace_event)
+                && let (Some(event_client), Some(namespace_event)) = (event_client, namespace_event)
             {
-                event_hub.publish_dfs_namespace_change(
+                publish_dfs_namespace_change(
+                    &event_client,
                     namespace_event.origin_node_id,
                     namespace_event.operation,
                     namespace_event.paths,
-                );
+                )
+                .await;
             }
             Ok(response)
         })
@@ -868,10 +872,9 @@ pub(crate) fn daemon_dfs_node_transport_on_runtime(
     )
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct DaemonDfsPeerTransport {
-    pub(super) paths: DaemonPaths,
-    pub(super) runtime: tokio::runtime::Handle,
+    pub(super) host: Arc<DfsRuntimeHost>,
 }
 
 #[derive(Clone, Debug)]
@@ -913,15 +916,15 @@ impl DfsPeerTransport for DaemonDfsPeerTransport {
         call: ObjectRpcCall,
         options: DfsObjectRpcSendOptions,
     ) -> Result<ObjectRpcResult, DfsPeerTransportError> {
-        send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_options(
-            &self.paths,
-            target_node_id,
-            call,
-            options.cluster_rpc_options(),
-            &self.runtime,
-            options.observe_connectivity,
-        )
-        .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+        self.host
+            .object_rpc
+            .call(
+                target_node_id,
+                call,
+                options.cluster_rpc_options(),
+                options.observe_connectivity,
+            )
+            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
     }
 }
 
@@ -933,34 +936,35 @@ impl sinomo_dfs::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
         options: DfsObjectRpcSendOptions,
     ) -> sinomo_dfs::DfsPeerTransportFuture<'a, Result<ObjectRpcResult, DfsPeerTransportError>>
     {
-        let runtime = self.runtime.clone();
-        let paths = self.paths.clone();
         Box::pin(async move {
-            send_object_rpc_call_to_target_async_with_daemon_paths_and_options(
-                &paths,
-                target_node_id,
-                call,
-                options.cluster_rpc_options(),
-                &runtime,
-                options.observe_connectivity,
-            )
-            .await
-            .map_err(|source| DfsPeerTransportError::new(source.to_string()))
+            self.host
+                .object_rpc
+                .call_async(
+                    target_node_id,
+                    call,
+                    options.cluster_rpc_options(),
+                    options.observe_connectivity,
+                )
+                .await
+                .map_err(|source| DfsPeerTransportError::new(source.to_string()))
         })
     }
 }
 
 pub(crate) fn daemon_dfs_peer_transports_on_runtime(
     data_dir: &SinomoDataDir,
-    runtime: &tokio::runtime::Handle,
+    _runtime: &tokio::runtime::Handle,
 ) -> (
     Arc<dyn DfsPeerTransport>,
     Arc<dyn sinomo_dfs::AsyncDfsPeerTransport>,
 ) {
-    let transport = Arc::new(DaemonDfsPeerTransport {
-        paths: DaemonPaths::new(data_dir),
-        runtime: runtime.clone(),
-    });
+    let Ok(host) = dfs_runtime_host(data_dir) else {
+        let transport = Arc::new(DaemonDfsUnavailablePeerTransport);
+        let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
+        let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
+        return (peer_transport, async_peer_transport);
+    };
+    let transport = Arc::new(DaemonDfsPeerTransport { host });
     let peer_transport: Arc<dyn DfsPeerTransport> = transport.clone();
     let async_peer_transport: Arc<dyn sinomo_dfs::AsyncDfsPeerTransport> = transport;
     (peer_transport, async_peer_transport)

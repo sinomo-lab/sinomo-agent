@@ -82,12 +82,10 @@ pub const DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE: &str = "/daemon/cluster/main
 /// The versioned route fails closed during a rolling upgrade: an older daemon
 /// cannot acknowledge an arm or commit while silently discarding its durable
 /// outbox preconditions.
-pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE: &str =
-    "/daemon/dfs/mounted-mutation/handoff-v1";
-/// Maximum encoded request accepted by the mounted-mutation handoff client.
-/// Keep this no larger than the durable outbox state which receives it.
-pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES: usize =
-    sinomo_dfs::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES;
+pub use sinomo_dfs::{
+    DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+    DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+};
 pub const DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE: &str =
     "/daemon/cluster/local-connectivity-reload";
 pub const DAEMON_NETWORK_CHUNK_METRICS_ROUTE: &str = "/daemon/network/chunk-metrics";
@@ -101,8 +99,6 @@ pub const DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE: &str = "/daemon/object-rpc/forwa
 /// so the DFS proxy retains its independent body and route-policy surface.
 pub const DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE: &str = "/daemon/dfs/object-rpc/forward-main";
 pub const DAEMON_EVENT_SUBSCRIBE_ROUTE: &str = "/daemon/events/subscribe";
-pub const DFS_NAMESPACE_CHANGED_EVENT_KIND: &str = "dfs.namespace.changed";
-pub const DFS_PLACEMENT_CHANGED_EVENT_KIND: &str = "dfs.placement.changed";
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
 pub struct DaemonEventSubscribeRequest {

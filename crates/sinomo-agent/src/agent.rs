@@ -15693,6 +15693,7 @@ mod tests {
                         request_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         response_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         required_local_permissions: Vec::new(),
+                        exact_member_identity: false,
                     },
                     sinomo_runtime::module_api::NativeModuleObjectRpcRoute {
                         route: "/dynamic-native/apply".to_string(),
@@ -15702,6 +15703,7 @@ mod tests {
                         request_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         response_body_mode: sinomo_runtime::module_api::NativeModuleBodyMode::None,
                         required_local_permissions: Vec::new(),
+                        exact_member_identity: false,
                     },
                 ],
                 capability_exports: vec![

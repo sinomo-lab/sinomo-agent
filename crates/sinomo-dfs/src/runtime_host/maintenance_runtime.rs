@@ -23,7 +23,7 @@ pub(crate) fn replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<(), DaemonError> {
-    if crate::daemon_paths_are_shadow(paths) {
+    if paths.is_shadow() {
         return Ok(());
     }
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
@@ -303,8 +303,10 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // broad writable generation will decode the same tables. Release it first
     // so accumulated metadata does not double peak RSS during recovery.
     sinomo_dfs::evict_cluster_aware_dfs_metadata_inspection_cache(&data_dir);
-    if let Some(stats) = crate::process_idle_stats() {
-        stats.incr_disk_reads_dfs_metadata();
+    if let Ok(host) = dfs_runtime_host(&data_dir)
+        && let Some(activity) = host.activity.as_ref()
+    {
+        activity.increment(sinomo_module::COMPONENT_ACTIVITY_DISK_READ_DFS_METADATA, 1);
     }
     let (_peer_transport, async_peer_transport) =
         daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
@@ -316,6 +318,20 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
     // identity. Topology comes from the retained proof-bearing generation
     // below; maintenance must never refresh or materialize the complete KV
     // store while foreground lanes own the resident Raft node.
+    metadata_authority_preflight
+        .authority
+        .ensure_complete_prefix_for_generation_async(metadata_authority_preflight.generation)
+        .await
+        .filter(|_| {
+            metadata_authority_preflight.authority.generation()
+                == metadata_authority_preflight.generation
+        })
+        .ok_or_else(|| sinomo_dfs::DfsError::Network {
+            message: format!(
+                "DFS metadata authority generation {} changed or remained incomplete before maintenance admission",
+                metadata_authority_preflight.generation
+            ),
+        })?;
     let retained_lane = take_daemon_dfs_message_mutation_service_for_maintenance(
         &data_dir,
         &cluster_paths,
@@ -583,10 +599,13 @@ pub(super) async fn run_daemon_dfs_maintenance_tick_with_admission(
         bounded_continuation = reached_limit,
         "DFS maintenance tick completed"
     );
-    if let Some(stats) = crate::process_idle_stats() {
-        for _ in 0..observations.metadata_replications_sent {
-            stats.incr_dfs_metadata_replications_sent();
-        }
+    if let Ok(host) = dfs_runtime_host(&data_dir)
+        && let Some(activity) = host.activity.as_ref()
+    {
+        activity.increment(
+            sinomo_module::COMPONENT_ACTIVITY_DFS_METADATA_REPLICATION_SENT,
+            observations.metadata_replications_sent as u64,
+        );
     }
     for line in observations.notice_lines {
         tracing::warn!("sinomo daemon {line}");
@@ -618,16 +637,25 @@ pub(crate) async fn run_daemon_dfs_maintenance_tick_in_blocking_task(
     paths: DaemonPaths,
     runtime: tokio::runtime::Handle,
     node_resources: sinomo_device::NodeResourceSnapshot,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<DaemonDfsMaintenanceTickOutcome, DaemonError> {
     let tick_runtime = runtime.clone();
     let data_owner_lock = daemon_dfs_data_owner_lock(&paths)?;
     tokio::task::spawn_blocking(move || {
         let _data_owner_lock = data_owner_lock;
-        runtime.block_on(run_daemon_dfs_maintenance_tick_on_runtime(
-            &paths,
-            &tick_runtime,
-            node_resources,
-        ))
+        runtime.block_on(async move {
+            if *shutdown.borrow() {
+                return Ok(DaemonDfsMaintenanceTickOutcome::Deferred);
+            }
+            tokio::select! {
+                result = run_daemon_dfs_maintenance_tick_on_runtime(
+                    &paths,
+                    &tick_runtime,
+                    node_resources,
+                ) => result,
+                _ = shutdown.changed() => Ok(DaemonDfsMaintenanceTickOutcome::Deferred),
+            }
+        })
     })
     .await
     .map_err(|source| DaemonError::Network {

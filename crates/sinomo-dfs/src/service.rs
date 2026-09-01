@@ -44,6 +44,125 @@ use sinomo_core::service::{
 
 const DFS_DEFAULT_ROUTE_CONCURRENCY_LIMIT: usize = 8;
 const DFS_DATA_PLANE_ROUTE_CONCURRENCY_LIMIT: usize = 64;
+const DFS_METRIC_EXPORT_ROUTE: &str = "/dfs/metrics/export";
+
+struct DfsMetricExporterService;
+
+struct DfsMountedMutationHandoffService {
+    paths: crate::runtime_host::DfsRuntimePaths,
+    runtime: tokio::runtime::Handle,
+}
+
+impl Service for DfsMountedMutationHandoffService {
+    fn name(&self) -> &'static str {
+        "dfs-mounted-mutation-handoff"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![
+            ServiceRoute::new(
+                crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+                crate::DFS_MOUNTED_MUTATION_RPC_CATEGORY,
+            )
+            .with_auth_scope("local-command")
+            .require_capability("dfs.mounted-mutation.handoff")
+            .with_timeout(Duration::from_secs(30)),
+        ]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let handoff: crate::MountedSifsMutationHandoffRequest = ctx
+                .decode_request_body_bounded(
+                    &request,
+                    crate::DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+                )
+                .await?;
+            handoff.validate().map_err(ServiceError::Service)?;
+            let traceparent = request.traceparent().map(ToString::to_string);
+            let response = tokio::task::spawn_blocking(move || {
+                crate::runtime_host::handle_dfs_mounted_mutation_handoff(
+                    &paths.data_dir()?,
+                    &runtime,
+                    traceparent,
+                    handoff,
+                )
+            })
+            .await
+            .map_err(|error| {
+                ServiceError::Service(format!("DFS mounted-mutation handoff task failed: {error}"))
+            })?
+            .map_err(|error| ServiceError::Service(error.to_string()))?;
+            ctx.respond_value(crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, response)?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
+
+impl Service for DfsMetricExporterService {
+    fn name(&self) -> &'static str {
+        "dfs-metric-exporter"
+    }
+
+    fn routes(&self) -> &'static [&'static str] {
+        &[DFS_METRIC_EXPORT_ROUTE]
+    }
+
+    fn route_categories(&self) -> Vec<ServiceRoute> {
+        vec![ServiceRoute::from_route_metadata(
+            DFS_METRIC_EXPORT_ROUTE,
+            sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_CATEGORY,
+            "component",
+            [sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION],
+        )]
+    }
+
+    fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
+        Box::pin(async move {
+            let export: sinomo_observe_contract::ObserveMetricExportRequest =
+                ctx.decode_request_body(&request).await?;
+            let metrics = crate::runtime_host::resident_dfs_observe_metrics(ctx.data_dir.as_ref())
+                .or_else(|_| {
+                    let cluster_paths = ClusterPaths::new(ctx.data_dir.as_ref());
+                    crate::inspect_cluster_aware_dfs_status(ctx.data_dir.as_ref(), &cluster_paths)
+                        .map(crate::dfs_status_observe_metrics)
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(ServiceError::Service)?;
+            let limit = if export.limit == 0 {
+                sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_MAX_RECORDS
+            } else {
+                export
+                    .limit
+                    .min(sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_MAX_RECORDS)
+            };
+            let metrics = metrics
+                .into_iter()
+                .filter(|metric| {
+                    export
+                        .name_prefix
+                        .as_ref()
+                        .is_none_or(|prefix| metric.name.starts_with(prefix))
+                })
+                .take(limit)
+                .collect();
+            ctx.respond_value(
+                request.route,
+                sinomo_observe_contract::ObserveMetricExportResponse {
+                    descriptors: Vec::new(),
+                    metrics,
+                },
+            )?;
+            Ok(ServiceDisposition::Continue)
+        })
+    }
+}
 
 fn dfs_service_perf_trace(args: std::fmt::Arguments<'_>) {
     tracing::trace!(target: "sinomo.dfs.perf", detail = %args, "dfs service perf");
@@ -70,7 +189,8 @@ pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuil
     builder.register(DfsService::new())
 }
 
-pub fn register_data_plane_services(
+#[cfg(test)]
+pub(crate) fn register_data_plane_services(
     builder: ServiceRegistryBuilder,
     host: Arc<dyn DfsDataPlaneHost>,
 ) -> ServiceRegistryBuilder {
@@ -81,7 +201,7 @@ pub fn register_data_plane_services(
 ///
 /// Sharing the host lets control-plane status reuse the daemon's resident
 /// metadata generation instead of opening a parallel inspection backend.
-pub fn register_services_with_data_plane_host(
+pub(crate) fn register_services_with_data_plane_host(
     builder: ServiceRegistryBuilder,
     host: Arc<dyn DfsDataPlaneHost>,
 ) -> ServiceRegistryBuilder {
@@ -90,29 +210,133 @@ pub fn register_services_with_data_plane_host(
         .register(DfsDataPlaneService::new(host))
 }
 
-pub fn component_factory_with_hosts(
-    data_plane_host: Option<Arc<dyn DfsDataPlaneHost>>,
-    browser_host: Option<Arc<dyn crate::DfsBrowserServiceHost>>,
-) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
-    let mut descriptor =
-        sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?;
-    if browser_host.is_some() {
-        descriptor = descriptor.with_offer(sifs_path_access_service_offer());
-    }
+/// Materialize the complete built-in DFS component from generic host
+/// mechanisms exposed by [`sinomo_module::ComponentContext`].
+///
+/// The embedding daemon does not construct DFS-specific service adapters. The
+/// component owns its data lock, resident runtime host, data plane, browser
+/// control surface, events, and lifecycle resources.
+pub fn component_factory()
+-> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor =
+        sinomo_module::component_descriptor_from_registration(&crate::dfs_module_registration())?
+            .with_offer(sifs_path_access_service_offer())
+            .with_offer(dfs_metric_exporter_offer())
+            .publish_event(crate::runtime_host::dfs_namespace_event_publication())
+            .publish_event(crate::runtime_host::dfs_placement_event_publication())
+            .subscribe_event(crate::runtime_host::host_cluster_control_subscription())
+            .subscribe_event(crate::runtime_host::host_connectivity_subscription());
+    let caller = descriptor.clone();
     Ok(
         sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
             let mut builder = ServiceRegistryBuilder::default();
-            builder = match data_plane_host.as_ref() {
-                Some(host) => register_services_with_data_plane_host(builder, Arc::clone(host)),
-                None => register_services(builder),
-            };
-            if let Some(host) = browser_host.as_ref() {
+            let active_runtime = context
+                .runtime()
+                .cloned()
+                .zip(context.cluster_access())
+                .zip(context.object_rpc_transport());
+            if context.host_role() != sinomo_module::ComponentHostRole::Shadow
+                && let Some(((runtime, cluster), object_rpc)) = active_runtime
+            {
+                let data_dir = context.data_dir().clone();
+                let paths = crate::runtime_host::DfsRuntimePaths::for_host_role(
+                    &data_dir,
+                    context.host_role(),
+                );
+                let data_owner = Arc::new(
+                    crate::runtime_host::DfsDataOwnerLock::acquire(&paths).map_err(|error| {
+                        sinomo_module::ComponentError::Component {
+                            component_id: caller.component_id.clone(),
+                            detail: error.to_string(),
+                        }
+                    })?,
+                );
+                crate::runtime_host::register_daemon_dfs_data_owner_lock(&paths, &data_owner)
+                    .map_err(|error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    })?;
+                let events = context.event_client(&caller)?;
+                let host_event_receivers = vec![
+                    events
+                        .subscribe(&crate::runtime_host::host_cluster_control_subscription())
+                        .map_err(|error| sinomo_module::ComponentError::Component {
+                            component_id: caller.component_id.clone(),
+                            detail: error.to_string(),
+                        })?,
+                    events
+                        .subscribe(&crate::runtime_host::host_connectivity_subscription())
+                        .map_err(|error| sinomo_module::ComponentError::Component {
+                            component_id: caller.component_id.clone(),
+                            detail: error.to_string(),
+                        })?,
+                ];
+                let host = Arc::new(crate::runtime_host::DfsRuntimeHost::new(
+                    cluster,
+                    object_rpc,
+                    context.activity_observer(),
+                ));
+                crate::runtime_host::register_dfs_runtime_host(&data_dir, &host).map_err(
+                    |error| sinomo_module::ComponentError::Component {
+                        component_id: caller.component_id.clone(),
+                        detail: error.to_string(),
+                    },
+                )?;
+                crate::runtime_host::replay_daemon_dfs_mounted_mutation_committed_work_on_runtime(
+                    &paths, &runtime,
+                )
+                .map_err(|error| sinomo_module::ComponentError::Component {
+                    component_id: caller.component_id.clone(),
+                    detail: error.to_string(),
+                })?;
+                crate::runtime_host::mount_dfs_runtime_tasks(
+                    context,
+                    scope,
+                    paths.clone(),
+                    runtime.clone(),
+                    host_event_receivers,
+                )?;
+                let data_plane: Arc<dyn DfsDataPlaneHost> = Arc::new(
+                    crate::runtime_host::DaemonDfsDataPlaneHost::new_on_runtime_with_event_client(
+                        paths.clone(),
+                        &runtime,
+                        events.clone(),
+                    ),
+                );
+                builder = register_services_with_data_plane_host(builder, data_plane);
+                let browser: Arc<dyn crate::DfsBrowserServiceHost> =
+                    Arc::new(crate::runtime_host::RuntimeDfsBrowserServiceHost::new(
+                        paths,
+                        runtime,
+                        events,
+                        Arc::clone(&host),
+                    ));
                 builder = crate::register_dfs_browser_services(
                     builder,
                     context.runtime().cloned(),
-                    Arc::clone(host),
+                    browser,
                 );
+                builder = builder.register(DfsMountedMutationHandoffService {
+                    paths: crate::runtime_host::DfsRuntimePaths::for_host_role(
+                        &data_dir,
+                        context.host_role(),
+                    ),
+                    runtime: context
+                        .runtime()
+                        .cloned()
+                        .expect("active DFS runtime was already resolved"),
+                });
+                let data_dir_for_drop = data_dir.clone();
+                scope.defer(move || {
+                    host.shutdown();
+                    crate::runtime_host::unregister_dfs_runtime_host(&data_dir_for_drop);
+                    drop(host);
+                    drop(data_owner);
+                });
+            } else {
+                builder = register_services(builder);
             }
+            builder = builder.register(DfsMetricExporterService);
             scope.set_services(builder.build());
             Ok(())
         })?
@@ -121,10 +345,23 @@ pub fn component_factory_with_hosts(
     )
 }
 
-/// The hosted browser routes are supplied by the daemon rather than the
-/// host-agnostic DFS module surface. Declare their provider capability on the
-/// component that actually mounts them so service-catalog discovery can select
-/// only nodes with an active path-access provider.
+fn dfs_metric_exporter_offer() -> sinomo_module::ServiceOffer {
+    sinomo_module::ServiceOffer::new(
+        "dfs-metrics",
+        sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
+        sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION,
+    )
+    .with_operation(
+        sinomo_module::ServiceOperationOffer::new(
+            sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION,
+        )
+        .at_route(DFS_METRIC_EXPORT_ROUTE)
+        .require_caller_capability(sinomo_observe_contract::OBSERVE_METRIC_EXPORTER_OPERATION),
+    )
+}
+
+/// Declare the DFS-owned browser provider capability so service-catalog
+/// discovery selects only nodes with an active path-access component.
 fn sifs_path_access_service_offer() -> sinomo_module::ServiceOffer {
     let mut offer = sinomo_module::ServiceOffer::new(
         crate::SIFS_PATH_ACCESS_CAPABILITY,
@@ -1003,6 +1240,45 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
 
+    struct UnavailableComponentObjectRpc;
+
+    impl sinomo_module::ComponentObjectRpcTransport for UnavailableComponentObjectRpc {
+        fn call(
+            &self,
+            _target_node_id: &NodeId,
+            _call: sinomo_core::network::ObjectRpcCall,
+            _options: sinomo_core::network::ClusterObjectRpcOptions,
+            _observe_connectivity: bool,
+        ) -> Result<sinomo_core::network::ObjectRpcResult, sinomo_core::network::NetworkError>
+        {
+            Err(sinomo_core::network::NetworkError::delivery_failed(
+                "test component object RPC",
+                sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+                "unavailable",
+            ))
+        }
+
+        fn call_async<'a>(
+            &'a self,
+            target_node_id: &'a NodeId,
+            call: sinomo_core::network::ObjectRpcCall,
+            options: sinomo_core::network::ClusterObjectRpcOptions,
+            observe_connectivity: bool,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            sinomo_core::network::ObjectRpcResult,
+                            sinomo_core::network::NetworkError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move { self.call(target_node_id, call, options, observe_connectivity) })
+        }
+    }
+
     #[derive(Clone, Default)]
     struct VecSink {
         frames: Arc<Mutex<Vec<sinomo_core::network::ObjectRpcOutgoingResponse>>>,
@@ -1248,6 +1524,63 @@ mod tests {
         let root = sinomo_testdir::TestDir::new("sinomo-service-dfs");
         let data_dir = Arc::new(SinomoDataDir::new(&root));
         (root, data_dir)
+    }
+
+    #[test]
+    fn component_factory_owns_complete_dfs_runtime_surface() {
+        use sinomo_module::ComponentFactory as _;
+
+        let (_root, data_dir) = temp_data_dir();
+        data_dir.ensure_root_layout().expect("data layout");
+        let cluster_paths = ClusterPaths::new(data_dir.as_ref());
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_dfs_component_factory")
+                .expect("cluster id"),
+            "DFS component factory",
+            NodeId::from_legacy_named("node_dfs_component_factory").expect("node id"),
+            "DFS component node",
+            "dfs-component-public-key",
+            OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let cluster: Arc<dyn ClusterAccess> = Arc::new(ExactSetMetadataAuthority::new(
+            KvRevision::default(),
+            BTreeMap::new(),
+            None,
+        ));
+        let context = sinomo_module::ComponentContext::new(Arc::clone(&data_dir))
+            .with_runtime(runtime.handle().clone())
+            .with_cluster_access(cluster)
+            .with_object_rpc_transport(Arc::new(UnavailableComponentObjectRpc))
+            .with_event_bus(sinomo_module::ComponentEventBus::default());
+        let factory = component_factory().expect("DFS component factory");
+        let scope = factory.mount(&context).expect("mount DFS component");
+
+        for route in [
+            crate::DFS_STATUS_ROUTE,
+            crate::DFS_DATA_READ_ROUTE,
+            crate::DAEMON_DFS_BROWSER_STATUS_ROUTE,
+            crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            DFS_METRIC_EXPORT_ROUTE,
+        ] {
+            assert!(
+                scope.services().owns(route),
+                "missing DFS-owned route {route}"
+            );
+        }
+        assert_eq!(factory.descriptor().event_publications.len(), 2);
+        assert_eq!(factory.descriptor().event_subscriptions.len(), 2);
+        drop(scope);
+        runtime.shutdown_timeout(Duration::from_secs(1));
+
+        let paths = crate::runtime_host::DfsRuntimePaths::new(data_dir.as_ref());
+        crate::runtime_host::DfsDataOwnerLock::acquire(&paths)
+            .expect("component drop releases DFS data ownership");
     }
 
     struct ExactSetMetadataAuthorityState {

@@ -18,6 +18,7 @@ pub struct ComponentCatalog {
     modules: ModuleRegistry,
     storage_contributors: BTreeMap<String, ComponentStorageContributor>,
     native_request_preparers: BTreeMap<String, Arc<dyn crate::NativeModuleRequestPreparer>>,
+    native_rust_control_targets: BTreeMap<String, crate::NativeRustModuleServiceTarget>,
 }
 
 impl std::fmt::Debug for ComponentCatalog {
@@ -41,6 +42,10 @@ impl std::fmt::Debug for ComponentCatalog {
                 "native_request_preparers",
                 &self.native_request_preparers.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "native_rust_control_targets",
+                &self.native_rust_control_targets.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -62,6 +67,7 @@ impl ComponentCatalog {
                 .collect(),
             storage_contributors: self.storage_contributors.clone(),
             native_request_preparers: self.native_request_preparers.clone(),
+            native_rust_control_targets: self.native_rust_control_targets.clone(),
         }
     }
 
@@ -82,6 +88,10 @@ impl ComponentCatalog {
 
     pub fn has_native_request_preparer(&self, id: &str) -> bool {
         self.native_request_preparers.contains_key(id)
+    }
+
+    pub fn native_rust_control_targets(&self) -> Vec<crate::NativeRustModuleServiceTarget> {
+        self.native_rust_control_targets.values().cloned().collect()
     }
 
     pub fn register_config_definitions(
@@ -167,6 +177,7 @@ pub struct ComponentCatalogBuilder {
     module_ids: BTreeSet<ModuleId>,
     storage_contributors: BTreeMap<String, ComponentStorageContributor>,
     native_request_preparers: BTreeMap<String, Arc<dyn crate::NativeModuleRequestPreparer>>,
+    native_rust_control_targets: BTreeMap<String, crate::NativeRustModuleServiceTarget>,
 }
 
 pub type ComponentStorageContributor = fn(
@@ -264,6 +275,21 @@ impl ComponentCatalogBuilder {
         Ok(self)
     }
 
+    pub fn register_native_rust_control_target(
+        mut self,
+        target: crate::NativeRustModuleServiceTarget,
+    ) -> Result<Self, ComponentCatalogError> {
+        let legacy_id = target.legacy_id.clone();
+        if self
+            .native_rust_control_targets
+            .insert(legacy_id.clone(), target)
+            .is_some()
+        {
+            return Err(ComponentCatalogError::DuplicateNativeRustControlTarget { legacy_id });
+        }
+        Ok(self)
+    }
+
     pub fn extend(mut self, catalog: &ComponentCatalog) -> Result<Self, ComponentCatalogError> {
         for registration in catalog.modules.registrations() {
             self = self.register_module(registration.clone())?;
@@ -277,6 +303,9 @@ impl ComponentCatalogBuilder {
         for preparer in catalog.native_request_preparers.values() {
             self = self.register_native_request_preparer(Arc::clone(preparer))?;
         }
+        for target in catalog.native_rust_control_targets.values() {
+            self = self.register_native_rust_control_target(target.clone())?;
+        }
         Ok(self)
     }
 
@@ -288,6 +317,7 @@ impl ComponentCatalogBuilder {
             modules,
             storage_contributors: self.storage_contributors,
             native_request_preparers: self.native_request_preparers,
+            native_rust_control_targets: self.native_rust_control_targets,
         })
     }
 }
@@ -302,6 +332,8 @@ pub enum ComponentCatalogError {
     DuplicateStorageContributor { component_id: String },
     #[error("component catalog repeats native request preparer `{id}`")]
     DuplicateNativeRequestPreparer { id: String },
+    #[error("component catalog repeats native Rust control target `{legacy_id}`")]
+    DuplicateNativeRustControlTarget { legacy_id: String },
     #[error("invalid component `{component_id}`: {detail}")]
     InvalidComponent {
         component_id: String,

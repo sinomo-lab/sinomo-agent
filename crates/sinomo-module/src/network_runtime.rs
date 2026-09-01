@@ -28,6 +28,9 @@ pub fn module_object_rpc_route_descriptor_to_service(
     for permission in &descriptor.required_local_permissions {
         route = route.require_local_permission(permission);
     }
+    if descriptor.exact_member_identity {
+        route = route.require_exact_member_identity();
+    }
     route.request_body_mode = native_module_body_mode_to_service(descriptor.request_body_mode);
     route.response_body_mode = native_module_body_mode_to_service(descriptor.response_body_mode);
     route
@@ -627,6 +630,7 @@ mod tests {
             request_body_mode: sinomo_module_api::NativeModuleBodyMode::Required,
             response_body_mode: sinomo_module_api::NativeModuleBodyMode::Optional,
             required_local_permissions: vec!["network.manage".to_string()],
+            exact_member_identity: true,
         }
         .descriptor()
         .expect("valid descriptor");
@@ -637,6 +641,7 @@ mod tests {
         assert_eq!(route.auth_scope.as_deref(), Some("admin"));
         assert_eq!(route.required_capabilities, vec!["network.push"]);
         assert_eq!(route.required_local_permissions, vec!["network.manage"]);
+        assert!(route.exact_member_identity);
         assert_eq!(
             route.request_body_mode,
             sinomo_core::service::ServiceBodyMode::Required

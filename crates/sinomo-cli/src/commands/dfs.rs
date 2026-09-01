@@ -1556,11 +1556,11 @@ fn run_dfs_placement_authority_command(
     match command {
         DfsPlacementAuthorityCliCommand::Inspect(options) => {
             let response = send_dfs_placement_authority_admin_request(
-                &sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::Inspect {
+                &sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminRequest::Inspect {
                     file_system_id: options.file_system_id.clone(),
                 },
             )?;
-            let sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse::Inspection {
+            let sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminResponse::Inspection {
                 permit,
             } = &response
             else {
@@ -1579,14 +1579,14 @@ fn run_dfs_placement_authority_command(
         DfsPlacementAuthorityCliCommand::Clear(options) => {
             let request = match &options.recovery {
                 DfsPlacementAuthorityRecovery::RemovedNode => {
-                    sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::RecoverRemovedNode {
+                    sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminRequest::RecoverRemovedNode {
                         file_system_id: options.file_system_id.clone(),
                         expected_recovery_token: options.expected_recovery_token.clone(),
                         acknowledge_owner_stopped: true,
                     }
                 }
                 DfsPlacementAuthorityRecovery::BreakGlass { acknowledgement } => {
-                    sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest::BreakGlassRecover {
+                    sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminRequest::BreakGlassRecover {
                         file_system_id: options.file_system_id.clone(),
                         expected_recovery_token: options.expected_recovery_token.clone(),
                         acknowledgement: acknowledgement.clone(),
@@ -1594,9 +1594,8 @@ fn run_dfs_placement_authority_command(
                 }
             };
             let response = send_dfs_placement_authority_admin_request(&request)?;
-            let sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse::Recovery {
-                outcome,
-            } = &response
+            let sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminResponse::Recovery { outcome } =
+                &response
             else {
                 return Err(CliError::Parse {
                     detail: "main daemon returned an unexpected DFS placement-authority response"
@@ -1614,13 +1613,13 @@ fn run_dfs_placement_authority_command(
 }
 
 fn send_dfs_placement_authority_admin_request(
-    request: &sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminRequest,
-) -> Result<sinomo_runtime::daemon::DaemonDfsPlacementAuthorityAdminResponse, CliError> {
+    request: &sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminRequest,
+) -> Result<sinomo_runtime::dfs::DaemonDfsPlacementAuthorityAdminResponse, CliError> {
     let status = default_main_daemon_status()?.ok_or_else(|| CliError::DaemonNotRunning {
         detail: "DFS placement-authority administration requires the local main daemon".to_string(),
     })?;
     let rpc_request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-        sinomo_runtime::daemon::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+        sinomo_runtime::dfs::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
         sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
         request,
     )?;
@@ -2191,9 +2190,9 @@ fn read_dfs_object_version_content(
 ) -> Result<Vec<u8>, CliError> {
     if let Some(status) = default_main_daemon_status()? {
         let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_READ_OBJECT_VERSION_ROUTE,
             sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
-            &sinomo_runtime::daemon::DaemonDfsBrowserReadObjectVersionRequest {
+            &sinomo_runtime::dfs::DaemonDfsBrowserReadObjectVersionRequest {
                 object_id: object_id.to_string(),
                 version: version.to_string(),
                 content_hash: content_hash.to_string(),
@@ -2205,7 +2204,7 @@ fn read_dfs_object_version_content(
             &request,
             std::time::Duration::from_secs(30),
         )?;
-        let response: sinomo_runtime::daemon::DaemonDfsBrowserReadObjectVersionResponse =
+        let response: sinomo_runtime::dfs::DaemonDfsBrowserReadObjectVersionResponse =
             response.decode_body()?;
         return Ok(response.bytes);
     }
@@ -2222,9 +2221,9 @@ fn read_dfs_object_version_content(
 fn write_dfs_file_for_conflict_version(path: &str, bytes: &[u8]) -> Result<(), CliError> {
     if let Some(status) = default_main_daemon_status()? {
         let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE,
             sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
-            &sinomo_runtime::daemon::DaemonDfsBrowserWriteFileRequest {
+            &sinomo_runtime::dfs::DaemonDfsBrowserWriteFileRequest {
                 path: path.to_string(),
                 bytes: bytes.to_vec(),
             },
@@ -2234,8 +2233,7 @@ fn write_dfs_file_for_conflict_version(path: &str, bytes: &[u8]) -> Result<(), C
             &request,
             std::time::Duration::from_secs(30),
         )?;
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserWriteFileResponse =
-            response.decode_body()?;
+        let _: sinomo_runtime::dfs::DaemonDfsBrowserWriteFileResponse = response.decode_body()?;
         return Ok(());
     }
 
@@ -2276,9 +2274,9 @@ fn dfs_parent_path(path: &str) -> Option<String> {
 fn delete_dfs_file_for_conflict_resolution(path: &str) -> Result<(), CliError> {
     if let Some(status) = default_main_daemon_status()? {
         let request = sinomo_runtime::network::ObjectRpcRequest::encode_body(
-            sinomo_runtime::daemon::DAEMON_DFS_BROWSER_DELETE_ROUTE,
+            sinomo_runtime::dfs::DAEMON_DFS_BROWSER_DELETE_ROUTE,
             sinomo_runtime::daemon::DAEMON_RPC_CATEGORY,
-            &sinomo_runtime::daemon::DaemonDfsBrowserDeleteRequest {
+            &sinomo_runtime::dfs::DaemonDfsBrowserDeleteRequest {
                 path: path.to_string(),
                 directory: false,
             },
@@ -2288,7 +2286,7 @@ fn delete_dfs_file_for_conflict_resolution(path: &str) -> Result<(), CliError> {
             &request,
             std::time::Duration::from_secs(10),
         )?;
-        let _: sinomo_runtime::daemon::DaemonDfsBrowserDeleteResponse = response.decode_body()?;
+        let _: sinomo_runtime::dfs::DaemonDfsBrowserDeleteResponse = response.decode_body()?;
         return Ok(());
     }
 

@@ -118,83 +118,10 @@ impl DaemonLock {
     }
 }
 
-#[derive(Debug)]
-pub struct DaemonDataOwnerLock {
-    file: File,
-}
-
-impl DaemonDataOwnerLock {
-    pub fn acquire(paths: &DaemonPaths) -> Result<Self, DaemonError> {
-        paths.ensure()?;
-        let path = paths.data_owner_lock.clone();
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        FileExt::try_lock_exclusive(&file).map_err(|source| DaemonError::AlreadyRunning {
-            lock_file: path.display().to_string(),
-            detail: format!(
-                "main daemon data directory is already owned by another process: {source}"
-            ),
-        })?;
-        file.set_len(0).map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        (&file)
-            .seek(SeekFrom::Start(0))
-            .map_err(|source| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        (&file)
-            .write_all(format!("pid={}\n", std::process::id()).as_bytes())
-            .map_err(|source| DaemonError::Io {
-                path: path.display().to_string(),
-                detail: source.to_string(),
-            })?;
-        (&file).flush().map_err(|source| DaemonError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        Ok(Self { file })
-    }
-}
-
-impl Drop for DaemonDataOwnerLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-        // Keep the lock inode stable. Unlinking after unlock races a new owner
-        // which can acquire the old inode before removal, allowing a third
-        // process to create and lock a different inode at the same path.
-    }
-}
-
 impl Drop for DaemonLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.paths.status);
         let _ = FileExt::unlock(&self.file);
         let _ = fs::remove_file(&self.paths.lock);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn daemon_data_owner_lock_excludes_second_owner() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-data-owner-lock");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        let owner = DaemonDataOwnerLock::acquire(&paths).expect("owner lock");
-        assert!(DaemonDataOwnerLock::acquire(&paths).is_err());
-        drop(owner);
-        DaemonDataOwnerLock::acquire(&paths).expect("lock released");
     }
 }

@@ -523,8 +523,6 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     runtime: tokio::runtime::Handle,
     foreground_preemptible: bool,
 ) -> Result<DaemonDefaultDfsLifecycleOutcome, DaemonError> {
-    #[cfg(test)]
-    record_daemon_default_dfs_reconciliation_run(paths);
     let data_dir = daemon_data_dir(paths)?;
     let lifecycle_data_dir = SinomoDataDir::new(data_dir);
     let lifecycle_cluster_paths = ClusterPaths::new(&lifecycle_data_dir);
@@ -600,7 +598,7 @@ async fn ensure_default_distributed_dfs_outcome_async_on_runtime(
     // future. Dropping the JoinHandle cannot cancel a running blocking task, so
     // neither guard can be released while backend-bearing DFS work still runs.
     let task_paths = paths.clone();
-    let task_options = options.clone();
+    let task_options = *options;
     let task_runtime = runtime.clone();
     let task_data_dir = lifecycle_data_dir;
     let task_cluster_paths = lifecycle_cluster_paths;
@@ -690,7 +688,7 @@ async fn ensure_default_distributed_dfs_lifecycle_inner(
     let data_dir = SinomoDataDir::new(data_dir);
     let cluster_paths = ClusterPaths::new(&data_dir);
     // The shadow shares the data root but never owns a second device sampler.
-    let local_content_advertisement = (!crate::daemon_paths_are_shadow(paths))
+    let local_content_advertisement = (!paths.is_shadow())
         .then(|| {
             sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
                 .ok()

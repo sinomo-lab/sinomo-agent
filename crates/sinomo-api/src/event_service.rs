@@ -10,17 +10,20 @@ use sinomo_core::service::{
     Service, ServiceBodyMode, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
+#[cfg(test)]
 use sinomo_core::{
-    Confidence, EventEnvelope, EventKind, Id, LatencyClass, PrivacyClass, RoutingMetadata,
-    RoutingScope, Salience, Source,
+    Confidence, EventKind, LatencyClass, PrivacyClass, RoutingMetadata, RoutingScope, Salience,
+    Source,
 };
+use sinomo_core::{EventEnvelope, Id};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::broadcast;
 
+#[cfg(test)]
+use crate::DFS_NAMESPACE_CHANGED_EVENT_KIND;
 use crate::{
-    DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DFS_NAMESPACE_CHANGED_EVENT_KIND,
-    DFS_PLACEMENT_CHANGED_EVENT_KIND, DaemonEventStreamItem, DaemonEventSubscribeRequest,
-    DaemonEventSubscribeResponse,
+    DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonEventStreamItem,
+    DaemonEventSubscribeRequest, DaemonEventSubscribeResponse,
 };
 
 const DAEMON_EVENT_BUFFER_CAPACITY: usize = 1_024;
@@ -82,62 +85,6 @@ impl DaemonEventHub {
         if let Ok(mut installed) = self.mirror.write() {
             *installed = Some(mirror);
         }
-    }
-
-    pub fn publish_dfs_namespace_change(
-        &self,
-        origin_node_id: Id,
-        operation: &str,
-        paths: Vec<String>,
-    ) {
-        self.publish(
-            EventEnvelope::new(
-                Id::generate(),
-                time::OffsetDateTime::now_utc(),
-                origin_node_id,
-                Source::new("daemon.dfs").expect("static event source"),
-                EventKind::new(DFS_NAMESPACE_CHANGED_EVENT_KIND).expect("static event kind"),
-                Salience::new(0.35).expect("static event salience"),
-                Confidence::new(1.0).expect("static event confidence"),
-                RoutingMetadata::new(
-                    RoutingScope::Local,
-                    LatencyClass::Reactive,
-                    PrivacyClass::Derived,
-                ),
-            )
-            .with_payload(serde_json::json!({
-                "operation": operation,
-                "paths": paths,
-            })),
-        );
-    }
-
-    pub fn publish_dfs_placement_change(
-        &self,
-        origin_node_id: Id,
-        operation: &str,
-        paths: Vec<String>,
-    ) {
-        self.publish(
-            EventEnvelope::new(
-                Id::generate(),
-                time::OffsetDateTime::now_utc(),
-                origin_node_id,
-                Source::new("daemon.dfs").expect("static event source"),
-                EventKind::new(DFS_PLACEMENT_CHANGED_EVENT_KIND).expect("static event kind"),
-                Salience::new(0.3).expect("static event salience"),
-                Confidence::new(1.0).expect("static event confidence"),
-                RoutingMetadata::new(
-                    RoutingScope::Local,
-                    LatencyClass::Reactive,
-                    PrivacyClass::Derived,
-                ),
-            )
-            .with_payload(serde_json::json!({
-                "operation": operation,
-                "paths": paths,
-            })),
-        );
     }
 }
 
@@ -385,45 +332,6 @@ mod tests {
         hub.set_mirror(mirror.clone());
         hub.publish(namespace_event("/services/example"));
         assert_eq!(mirror.0.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn namespace_publication_preserves_event_routing_metadata() {
-        let hub = DaemonEventHub::new();
-        let mut receiver = hub.subscribe();
-        let origin_node_id = Id::generate();
-        hub.publish_dfs_namespace_change(
-            origin_node_id.clone(),
-            "write-file",
-            vec!["/services/sinomo-agent/channels/chat/snapshot.json".to_string()],
-        );
-
-        let event = receiver.recv().await.expect("published event");
-        assert_eq!(event.origin_node_id, origin_node_id);
-        assert_eq!(event.kind.as_str(), DFS_NAMESPACE_CHANGED_EVENT_KIND);
-        assert_eq!(event.routing.scope, RoutingScope::Local);
-        assert_eq!(event.payload["operation"], "write-file");
-    }
-
-    #[tokio::test]
-    async fn placement_publication_is_visible_to_dfs_subscribers() {
-        let hub = DaemonEventHub::new();
-        let mut receiver = hub.subscribe();
-        let origin_node_id = Id::generate();
-        hub.publish_dfs_placement_change(
-            origin_node_id.clone(),
-            "pin-content",
-            vec!["/users/project/artifact.bin".to_string()],
-        );
-
-        let event = receiver.recv().await.expect("published placement event");
-        assert_eq!(event.origin_node_id, origin_node_id);
-        assert_eq!(event.kind.as_str(), DFS_PLACEMENT_CHANGED_EVENT_KIND);
-        assert_eq!(event.payload["operation"], "pin-content");
-        assert!(event_matches(
-            &DaemonEventSubscribeRequest::for_dfs_path_prefix("/users/project"),
-            &event
-        ));
     }
 
     #[tokio::test]

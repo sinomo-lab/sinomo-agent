@@ -504,6 +504,11 @@ pub struct NativeModuleObjectRpcRoute {
     /// node's policy layer decides what they mean and whether they are granted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_local_permissions: Vec<String>,
+    /// Require the signed node id and public key to match one current member
+    /// record exactly. Use for authority-sensitive data-plane operations where
+    /// accepting a same-key legacy alias would weaken source binding.
+    #[serde(default)]
+    pub exact_member_identity: bool,
 }
 
 impl NativeModuleObjectRpcRoute {
@@ -521,6 +526,7 @@ impl NativeModuleObjectRpcRoute {
             request_body_mode: NativeModuleBodyMode::None,
             response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
+            exact_member_identity: false,
         }
     }
 
@@ -546,6 +552,11 @@ impl NativeModuleObjectRpcRoute {
     {
         self.required_local_permissions
             .extend(permissions.into_iter().map(Into::into));
+        self
+    }
+
+    pub fn require_exact_member_identity(mut self) -> Self {
+        self.exact_member_identity = true;
         self
     }
 }

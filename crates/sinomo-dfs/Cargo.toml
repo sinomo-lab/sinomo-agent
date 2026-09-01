@@ -29,7 +29,9 @@ tokio = { workspace = true, features = ["rt", "time"] }
 tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
+sinomo-device = { path = "../sinomo-device" }
 sinomo-module = { path = "../sinomo-module" }
+sinomo-observe-contract = { path = "../sinomo-observe-contract" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

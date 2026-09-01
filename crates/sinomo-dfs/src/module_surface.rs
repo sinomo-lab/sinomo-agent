@@ -20,6 +20,24 @@ pub const SINOMO_DFS_NATIVE_REGISTRATION_KEY: &str = "sinomo-dfs";
 pub const SIFS_PATH_ACCESS_CAPABILITY: &str = "sifs.path.access";
 pub const DFS_POLICY_VIOLATION_EVENT_KIND: &str = "dfs.policy.violation";
 
+pub struct DfsMigrationQuarantinePlan {
+    pub moves: Vec<(PathBuf, PathBuf)>,
+    pub import_namespace: String,
+}
+
+pub fn dfs_migration_quarantine_plan(
+    data_dir: &sinomo_core::local::SinomoDataDir,
+    source_cluster_id: &sinomo_core::node::ClusterId,
+) -> DfsMigrationQuarantinePlan {
+    DfsMigrationQuarantinePlan {
+        moves: vec![(
+            crate::default_dfs_metadata_shards_root(data_dir),
+            crate::dfs_import_metadata_root(data_dir, source_cluster_id),
+        )],
+        import_namespace: crate::dfs_import_namespace_root(source_cluster_id),
+    }
+}
+
 pub fn register_storage_paths(
     layout: &mut sinomo_core::storage::StorageLayout,
 ) -> Result<(), sinomo_core::storage::StorageContractError> {
@@ -157,6 +175,12 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
 
     let mut surfaces = ModuleSurfaces::default()
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            crate::DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            crate::DFS_MOUNTED_MUTATION_RPC_CATEGORY,
+            "dfs.mounted-mutation.handoff",
+            ModuleRouteAuth::LocalCommand,
+        ))
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_STATUS_ROUTE,
             DFS_RPC_CATEGORY,
             "dfs.status.read",
@@ -168,18 +192,24 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
             "dfs.inspection.read",
             ModuleRouteAuth::LocalOrClusterMember,
         ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.metadata.replicate",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
-        .with_object_rpc_route(ModuleObjectRpcRoute::new(
-            DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-            DFS_RPC_CATEGORY,
-            "dfs.metadata.repair",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ))
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                DFS_METADATA_JOURNAL_BATCH_ROUTE,
+                DFS_RPC_CATEGORY,
+                "dfs.metadata.replicate",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .require_exact_member_identity(),
+        )
+        .with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
+                DFS_RPC_CATEGORY,
+                "dfs.metadata.repair",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .require_exact_member_identity(),
+        )
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             DFS_SMOKE_ROUTE,
             DFS_RPC_CATEGORY,
@@ -195,12 +225,15 @@ pub fn dfs_module_surfaces() -> sinomo_module::ModuleSurfaces {
         .with_event_kind_name(DFS_POLICY_VIOLATION_EVENT_KIND)
         .with_storage_owner(SINOMO_DFS_MODULE_OWNER);
     for route in DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied() {
-        surfaces = surfaces.with_object_rpc_route(ModuleObjectRpcRoute::new(
-            route,
-            DFS_RPC_CATEGORY,
-            "dfs.object.transfer",
-            ModuleRouteAuth::LocalOrClusterMember,
-        ));
+        surfaces = surfaces.with_object_rpc_route(
+            ModuleObjectRpcRoute::new(
+                route,
+                DFS_RPC_CATEGORY,
+                "dfs.object.transfer",
+                ModuleRouteAuth::LocalOrClusterMember,
+            )
+            .require_exact_member_identity(),
+        );
     }
     // Unix hosts mount SIFS through the built-in FUSE adapter, so the DFS
     // registration owns the shared mount settings there. Windows delegates
@@ -248,6 +281,7 @@ pub fn dfs_module_capabilities() -> ModuleCapabilities {
             dfs_capability("cluster.kv.read"),
         ],
         exports: vec![
+            dfs_capability("dfs.mounted-mutation.handoff"),
             dfs_capability("dfs.status.read"),
             dfs_capability("dfs.inspection.read"),
             dfs_capability("dfs.metadata.replicate"),
@@ -318,9 +352,19 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "dfs.object.transfer")
         );
+        for route in &registration.surfaces.object_rpc_routes {
+            let expected_exact = route.route == crate::DFS_METADATA_JOURNAL_BATCH_ROUTE
+                || route.route == crate::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
+                || crate::dfs_route_is_message_data_plane(&route.route);
+            assert_eq!(
+                route.exact_member_identity, expected_exact,
+                "exact-member policy drift for {}",
+                route.route
+            );
+        }
         assert_eq!(
             registration.surfaces.object_rpc_routes.len(),
-            DFS_OBJECT_RPC_ROUTES.len()
+            DFS_OBJECT_RPC_ROUTES.len() + 1
         );
         assert!(
             registration

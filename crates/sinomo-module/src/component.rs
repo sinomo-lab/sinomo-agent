@@ -1,10 +1,15 @@
 //! Backend-neutral component activation and lifecycle-owned runtime effects.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ClusterObjectRpcOptions, NetworkError, ObjectRpcCall, ObjectRpcResult};
+use sinomo_core::node::NodeId;
+use sinomo_core::service::ClusterAccess;
 use sinomo_core::service::{ServiceRegistry, ServiceRegistrySnapshotStore};
 pub use sinomo_module_api::{
     ComponentDescriptor, ComponentEventDurability, ComponentEventLocality,
@@ -14,6 +19,41 @@ pub use sinomo_module_api::{
 use thiserror::Error;
 
 use crate::{ModuleBackendRegistration, ModuleRegistration};
+
+/// Host-owned, target-addressed object-RPC transport available to components.
+///
+/// The interface exposes only the generic cluster transport mechanism. Domain
+/// modules retain ownership of route selection, request and response types,
+/// retry policy, authority validation, and delivery-state interpretation.
+pub trait ComponentObjectRpcTransport: Send + Sync {
+    fn call(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: ClusterObjectRpcOptions,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResult, NetworkError>;
+
+    fn call_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcCall,
+        options: ClusterObjectRpcOptions,
+        observe_connectivity: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<ObjectRpcResult, NetworkError>> + Send + 'a>>;
+}
+
+/// Optional process-level activity counters supplied by the embedding host.
+///
+/// Counter names are stable contract strings. Components may also publish
+/// ordinary `metrics` records; this observer exists for the daemon's compact
+/// idle-I/O status projection without coupling modules to `sinomo-observe`.
+pub trait ComponentActivityObserver: Send + Sync {
+    fn increment(&self, counter: &'static str, amount: u64);
+}
+
+pub const COMPONENT_ACTIVITY_DISK_READ_DFS_METADATA: &str = "disk-read.dfs-metadata";
+pub const COMPONENT_ACTIVITY_DFS_METADATA_REPLICATION_SENT: &str = "dfs.metadata-replication-sent";
 
 /// Project an existing module registration into the component dependency
 /// model. Explicit typed interfaces remain explicit; legacy object-RPC module
@@ -109,6 +149,10 @@ pub struct ComponentContext {
     data_dir: Arc<SinomoDataDir>,
     runtime: Option<tokio::runtime::Handle>,
     host_role: ComponentHostRole,
+    cluster: Option<Arc<dyn ClusterAccess>>,
+    object_rpc: Option<Arc<dyn ComponentObjectRpcTransport>>,
+    node_resources: Option<sinomo_device::NodeResourceMonitor>,
+    activity_observer: Option<Arc<dyn ComponentActivityObserver>>,
     service_registry: Option<ServiceRegistrySnapshotStore>,
     event_bus: Option<crate::ComponentEventBus>,
 }
@@ -119,6 +163,10 @@ impl ComponentContext {
             data_dir,
             runtime: None,
             host_role: ComponentHostRole::Main,
+            cluster: None,
+            object_rpc: None,
+            node_resources: None,
+            activity_observer: None,
             service_registry: None,
             event_bus: None,
         }
@@ -131,6 +179,35 @@ impl ComponentContext {
 
     pub fn with_host_role(mut self, host_role: ComponentHostRole) -> Self {
         self.host_role = host_role;
+        self
+    }
+
+    pub fn with_cluster_access(mut self, cluster: Arc<dyn ClusterAccess>) -> Self {
+        self.cluster = Some(cluster);
+        self
+    }
+
+    pub fn with_object_rpc_transport(
+        mut self,
+        object_rpc: Arc<dyn ComponentObjectRpcTransport>,
+    ) -> Self {
+        self.object_rpc = Some(object_rpc);
+        self
+    }
+
+    pub fn with_node_resources(
+        mut self,
+        node_resources: sinomo_device::NodeResourceMonitor,
+    ) -> Self {
+        self.node_resources = Some(node_resources);
+        self
+    }
+
+    pub fn with_activity_observer(
+        mut self,
+        activity_observer: Arc<dyn ComponentActivityObserver>,
+    ) -> Self {
+        self.activity_observer = Some(activity_observer);
         self
     }
 
@@ -199,6 +276,22 @@ impl ComponentContext {
         self.runtime.as_ref()
     }
 
+    pub fn cluster_access(&self) -> Option<Arc<dyn ClusterAccess>> {
+        self.cluster.clone()
+    }
+
+    pub fn object_rpc_transport(&self) -> Option<Arc<dyn ComponentObjectRpcTransport>> {
+        self.object_rpc.clone()
+    }
+
+    pub fn node_resources(&self) -> Option<sinomo_device::NodeResourceMonitor> {
+        self.node_resources.clone()
+    }
+
+    pub fn activity_observer(&self) -> Option<Arc<dyn ComponentActivityObserver>> {
+        self.activity_observer.clone()
+    }
+
     pub fn host_role(&self) -> ComponentHostRole {
         self.host_role
     }
@@ -224,6 +317,7 @@ pub struct ComponentScope {
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     tasks: Vec<ScopedComponentTask>,
     disposers: Vec<Box<dyn FnOnce() + Send + 'static>>,
+    host_prepare: Vec<ComponentHostPrepare>,
     host_start: Vec<Arc<dyn Fn() + Send + Sync + 'static>>,
     host_ready: Vec<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
@@ -250,6 +344,7 @@ impl ComponentScope {
             shutdown_tx,
             tasks: Vec::new(),
             disposers: Vec::new(),
+            host_prepare: Vec::new(),
             host_start: Vec::new(),
             host_ready: Vec::new(),
         }
@@ -282,6 +377,18 @@ impl ComponentScope {
         self.disposers.push(Box::new(dispose));
     }
 
+    /// Register asynchronous preparation that must complete before the host
+    /// begins serving requests. Components use this for authoritative startup
+    /// recovery that cannot safely race their first request.
+    pub fn on_host_prepare<F, Fut>(&mut self, prepare: F)
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.host_prepare
+            .push(Arc::new(move || Box::pin(prepare())));
+    }
+
     pub fn on_host_start(&mut self, callback: impl Fn() + Send + Sync + 'static) {
         self.host_start.push(Arc::new(callback));
     }
@@ -294,6 +401,18 @@ impl ComponentScope {
         for callback in &self.host_start {
             callback();
         }
+    }
+
+    async fn prepare_host(&self) -> Result<(), ComponentError> {
+        for prepare in &self.host_prepare {
+            prepare()
+                .await
+                .map_err(|detail| ComponentError::Component {
+                    component_id: self.descriptor.component_id.clone(),
+                    detail,
+                })?;
+        }
+        Ok(())
     }
 
     fn notify_host_ready(&self) {
@@ -324,6 +443,13 @@ struct ScopedComponentTask {
     label: String,
     task: tokio::task::JoinHandle<()>,
 }
+
+type ComponentHostPrepare = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'static>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// A backend-specific materializer for one component descriptor.
 pub trait ComponentFactory: Send + Sync {
@@ -507,6 +633,57 @@ impl ComponentReconciler {
         for scope in self.active.values() {
             scope.notify_host_start();
         }
+    }
+
+    pub async fn prepare_host(&self) -> Result<(), ComponentError> {
+        for scope in self.active.values() {
+            scope.prepare_host().await?;
+        }
+        Ok(())
+    }
+
+    pub fn shutdown(&mut self) -> Result<(), ComponentError> {
+        self.service_registry
+            .replace_registry(self.base_registry.clone())
+            .map_err(|error| ComponentError::Registry {
+                detail: error.to_string(),
+            })?;
+        self.active.clear();
+        Ok(())
+    }
+
+    /// Synchronous host bridge for embedders whose registry assembly API is
+    /// synchronous. No runtime is needed when no component registered a
+    /// preparation barrier.
+    pub fn prepare_host_on_runtime(
+        &self,
+        runtime: Option<&tokio::runtime::Handle>,
+    ) -> Result<(), ComponentError> {
+        if self
+            .active
+            .values()
+            .all(|scope| scope.host_prepare.is_empty())
+        {
+            return Ok(());
+        }
+        let runtime = runtime.ok_or_else(|| ComponentError::RuntimeUnavailable {
+            component_id: "component-host".to_string(),
+        })?;
+        let future = self.prepare_host();
+        if let Ok(current) = tokio::runtime::Handle::try_current() {
+            if matches!(
+                current.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) {
+                return tokio::task::block_in_place(|| runtime.block_on(future));
+            }
+            return Err(ComponentError::Component {
+                component_id: "component-host".to_string(),
+                detail: "component preparation cannot synchronously bridge a current-thread Tokio runtime"
+                    .to_string(),
+            });
+        }
+        runtime.block_on(future)
     }
 
     pub fn notify_host_ready(&self) {

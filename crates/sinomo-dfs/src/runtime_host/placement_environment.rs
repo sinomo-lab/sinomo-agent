@@ -292,7 +292,7 @@ fn prepare_daemon_dfs_storage_environment_refresh(
     node_resources: Option<sinomo_device::NodeResourceSnapshot>,
     sample_storage: bool,
 ) -> Result<Option<PreparedDaemonDfsStorageEnvironmentRefresh>, DaemonError> {
-    if crate::daemon_paths_are_shadow(paths) {
+    if paths.is_shadow() {
         return Ok(None);
     }
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);
@@ -417,7 +417,7 @@ async fn refresh_daemon_dfs_storage_environment_inner_on_runtime(
 fn prepare_daemon_dfs_remote_placement_subscription(
     paths: &DaemonPaths,
 ) -> Result<Option<(SinomoDataDir, ClusterPaths, NodeId)>, DaemonError> {
-    if crate::daemon_paths_are_shadow(paths) {
+    if paths.is_shadow() {
         return Ok(None);
     }
     let data_dir = SinomoDataDir::new(daemon_data_dir(paths)?);

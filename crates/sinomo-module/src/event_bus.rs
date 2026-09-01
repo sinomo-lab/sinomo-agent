@@ -26,6 +26,11 @@ const DEFAULT_COMPONENT_EVENT_CAPACITY: usize = 1_024;
 pub const COMPONENT_EVENT_INGRESS_ROUTE: &str = "/component/events/ingest";
 pub const COMPONENT_EVENT_RPC_CATEGORY: &str = "component.events";
 pub const COMPONENT_EVENT_INGRESS_CAPABILITY: &str = "component.events.ingest";
+pub const COMPONENT_HOST_CLUSTER_CONTROL_CHANGED_EVENT_KIND: &str = "host.cluster.control.changed";
+pub const COMPONENT_HOST_CONNECTIVITY_CHANGED_EVENT_KIND: &str =
+    "host.network.connectivity.changed";
+pub const COMPONENT_HOST_EVENT_SCHEMA_ID: &str = "sinomo.component-host.change";
+pub const COMPONENT_HOST_EVENT_SCHEMA_VERSION: &str = "1.0.0";
 const COMPONENT_EVENT_INGRESS_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

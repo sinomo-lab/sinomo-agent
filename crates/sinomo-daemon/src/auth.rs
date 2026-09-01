@@ -127,7 +127,7 @@ pub fn authenticate_daemon_control_request(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, true, true)
+    authenticate_daemon_control_request_inner(paths, request, true, true, None)
 }
 
 /// Authenticates the signed request and its signer without applying the static
@@ -136,18 +136,33 @@ pub fn authenticate_daemon_control_request(
 /// Dynamic routes must use this only when their live catalog descriptor is
 /// authorized separately. Keeping this entry point crate-private prevents a
 /// caller from accidentally treating signature verification as route authority.
+#[cfg(test)]
 pub(crate) fn authenticate_daemon_control_request_without_route_authorization(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, true, false)
+    authenticate_daemon_control_request_inner(paths, request, true, false, None)
+}
+
+pub(crate) fn authenticate_daemon_control_request_for_service(
+    paths: &DaemonPaths,
+    request: &sinomo_core::network::DaemonControlRequest,
+    exact_member_identity: bool,
+) -> Result<AuthenticatedDaemonCommand, DaemonError> {
+    authenticate_daemon_control_request_inner(
+        paths,
+        request,
+        true,
+        false,
+        Some(exact_member_identity),
+    )
 }
 
 pub(crate) fn authenticate_daemon_control_request_without_nonce(
     paths: &DaemonPaths,
     request: &sinomo_core::network::DaemonControlRequest,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
-    authenticate_daemon_control_request_inner(paths, request, false, true)
+    authenticate_daemon_control_request_inner(paths, request, false, true, None)
 }
 
 #[inline]
@@ -194,12 +209,18 @@ fn authenticate_daemon_control_request_inner(
     request: &sinomo_core::network::DaemonControlRequest,
     remember_nonce: bool,
     authorize_route: bool,
+    exact_member_identity: Option<bool>,
 ) -> Result<AuthenticatedDaemonCommand, DaemonError> {
     let auth = request.auth.as_deref().ok_or(DaemonError::AuthDenied)?;
     let envelope: SignedDaemonCommand =
         sinomo_core::network::SinomoObjectCodec::default().decode(auth)?;
     verify_daemon_rpc_body_binding(&envelope, request)?;
-    let signer = verify_signed_daemon_command(paths, &envelope, request)?;
+    let signer = verify_signed_daemon_command(
+        paths,
+        &envelope,
+        request,
+        exact_member_identity.unwrap_or(false),
+    )?;
     if remember_nonce {
         remember_daemon_auth_nonce(paths, &envelope)?;
     }
@@ -367,62 +388,7 @@ pub fn authorize_authenticated_daemon_command(
         {
             authenticated.signer.can_run_admin_command()
         }
-        route if route == crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE => {
-            authenticated.signer.can_run_admin_command()
-        }
-        route if crate::DAEMON_DFS_BROWSER_ROUTES.contains(&route) => {
-            authenticated.signer.can_run_local_command()
-        }
         route if is_config_rpc_route(route) => authenticated.signer.can_run_local_command(),
-        route if route == sinomo_dfs::DFS_STATUS_ROUTE => matches!(
-            authenticated.signer,
-            DaemonSignerAuthority::Local
-                | DaemonSignerAuthority::Voter
-                | DaemonSignerAuthority::Member
-        ),
-        route if route == sinomo_dfs::DFS_INSPECTION_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route if route == sinomo_dfs::DFS_SMOKE_ROUTE => {
-            authenticated.signer.can_run_local_command()
-        }
-        route if route == sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route if route == sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route if sinomo_dfs::dfs_route_is_message_data_plane(route) => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
-        route if route == sinomo_dfs::DFS_DIRECT_READ_ROUTE => {
-            matches!(
-                authenticated.signer,
-                DaemonSignerAuthority::Local
-                    | DaemonSignerAuthority::Voter
-                    | DaemonSignerAuthority::Member
-            )
-        }
         route if is_agent_session_rpc_route(route) => {
             matches!(
                 authenticated.signer,
@@ -545,9 +511,10 @@ fn verify_signed_daemon_command(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
     request: &sinomo_core::network::ObjectRpcRequest,
+    require_exact_member_identity: bool,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
     verify_signed_daemon_command_signature(envelope, request)?;
-    authorize_daemon_signer(paths, envelope, request)
+    authorize_daemon_signer(paths, envelope, request, require_exact_member_identity)
 }
 
 fn verify_signed_daemon_command_signature(
@@ -614,9 +581,8 @@ fn authorize_daemon_signer(
     paths: &DaemonPaths,
     envelope: &SignedDaemonCommand,
     request: &sinomo_core::network::ObjectRpcRequest,
+    require_exact_member_identity: bool,
 ) -> Result<DaemonSignerAuthority, DaemonError> {
-    let require_exact_member_identity =
-        daemon_route_requires_exact_member_identity(request.route.as_str());
     let envelope_public_key =
         sinomo_core::network::daemon_auth_encode_public_key(&envelope.public_key);
     let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
@@ -717,12 +683,6 @@ fn authorize_connectivity_signer_from_locally_accepted_state(
                 && member.node_public_key == envelope_public_key
         })
         .map(signer_authority_for_member)
-}
-
-fn daemon_route_requires_exact_member_identity(route: &str) -> bool {
-    route == sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE
-        || route == sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE
-        || sinomo_dfs::dfs_route_is_message_data_plane(route)
 }
 
 fn verifier_authority_for_signer(
@@ -2119,7 +2079,7 @@ mod tests {
     }
 
     #[test]
-    fn authorized_same_key_member_survives_node_id_drift_only_on_non_authority_routes() {
+    fn exact_member_service_policy_rejects_same_key_node_id_drift() {
         let data_root = unique_auth_test_root("sinomo-daemon-auth-same-key-drift");
         let data_dir = SinomoDataDir::new(&data_root);
         let daemon_paths = DaemonPaths::with_root(data_root.join("daemon"));
@@ -2176,7 +2136,7 @@ mod tests {
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write pending state");
         assert!(matches!(
-            authorize_daemon_signer(&daemon_paths, &envelope, &request),
+            authorize_daemon_signer(&daemon_paths, &envelope, &request, false),
             Err(DaemonError::AuthDenied)
         ));
 
@@ -2185,24 +2145,20 @@ mod tests {
         sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
             .expect("write accepted state");
         assert_eq!(
-            authorize_daemon_signer(&daemon_paths, &envelope, &request)
+            authorize_daemon_signer(&daemon_paths, &envelope, &request, false)
                 .expect("authorize accepted same-key member"),
             DaemonSignerAuthority::Member
         );
 
-        for route in [
-            sinomo_dfs::DFS_DATA_WRITE_ROUTE,
-            sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE,
-            sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE,
-        ] {
+        for route in ["/test/exact-authority-a", "/test/exact-authority-b"] {
             let authority_request = sinomo_core::network::ObjectRpcRequest::encode_body(
                 route,
-                sinomo_dfs::DFS_RPC_CATEGORY,
+                "test.exact-authority",
                 &(),
             )
             .expect("authority rpc request");
             assert!(matches!(
-                authorize_daemon_signer(&daemon_paths, &envelope, &authority_request),
+                authorize_daemon_signer(&daemon_paths, &envelope, &authority_request, true),
                 Err(DaemonError::AuthDenied)
             ));
 
@@ -2211,15 +2167,15 @@ mod tests {
                 ..envelope.clone()
             };
             assert_eq!(
-                authorize_daemon_signer(&daemon_paths, &exact_envelope, &authority_request,)
+                authorize_daemon_signer(&daemon_paths, &exact_envelope, &authority_request, true,)
                     .expect("authorize exact member identity"),
                 DaemonSignerAuthority::Member
             );
         }
 
         let authority_request = sinomo_core::network::ObjectRpcRequest::encode_body(
-            sinomo_dfs::DFS_DATA_WRITE_ROUTE,
-            sinomo_dfs::DFS_RPC_CATEGORY,
+            "/test/exact-local-authority",
+            "test.exact-authority",
             &(),
         )
         .expect("local authority rpc request");
@@ -2229,7 +2185,12 @@ mod tests {
             ..envelope.clone()
         };
         assert!(matches!(
-            authorize_daemon_signer(&daemon_paths, &local_drift_envelope, &authority_request),
+            authorize_daemon_signer(
+                &daemon_paths,
+                &local_drift_envelope,
+                &authority_request,
+                true,
+            ),
             Err(DaemonError::AuthDenied)
         ));
         let exact_local_envelope = SignedDaemonCommand {
@@ -2237,92 +2198,15 @@ mod tests {
             ..local_drift_envelope
         };
         assert_eq!(
-            authorize_daemon_signer(&daemon_paths, &exact_local_envelope, &authority_request)
-                .expect("authorize exact local member identity"),
+            authorize_daemon_signer(
+                &daemon_paths,
+                &exact_local_envelope,
+                &authority_request,
+                true,
+            )
+            .expect("authorize exact local member identity"),
             DaemonSignerAuthority::Local
         );
-    }
-
-    #[test]
-    fn signed_dfs_status_rpc_authenticates_cluster_member() {
-        let target_root = unique_auth_test_root("sinomo-daemon-auth-dfs-status-target");
-        let target_data_dir = SinomoDataDir::new(&target_root);
-        let target_daemon_paths = DaemonPaths::with_root(target_root.join("daemon"));
-        let target_identity =
-            load_or_create_main_node_identity(&target_root).expect("target identity");
-        let peer_root = unique_auth_test_root("sinomo-daemon-auth-dfs-status-peer");
-        let peer_data_dir = SinomoDataDir::new(&peer_root);
-        let peer_identity = load_or_create_main_node_identity(&peer_root).expect("peer identity");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_auth_dfs_status")
-                .expect("cluster id");
-        let target_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_dfs_status_target")
-            .expect("target node");
-        let peer_node = sinomo_core::Id::from_legacy_named("node_daemon_auth_dfs_status_peer")
-            .expect("peer node");
-        let now = OffsetDateTime::now_utc();
-
-        let mut target_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "auth-dfs-status",
-            target_node.clone(),
-            "target",
-            target_identity.public_key.clone(),
-            now,
-        );
-        target_state
-            .members
-            .push(ClusterMemberRecord::local_non_voting(
-                cluster_id.clone(),
-                peer_node.clone(),
-                "peer",
-                peer_identity.public_key.clone(),
-                now,
-            ));
-        sinomo_core::cluster::write_cluster_state(
-            &ClusterPaths::new(&target_data_dir),
-            &target_state,
-        )
-        .expect("write target state");
-
-        let mut peer_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "auth-dfs-status",
-            peer_node.clone(),
-            "peer",
-            peer_identity.public_key.clone(),
-            now,
-        );
-        peer_state.members.push(ClusterMemberRecord::local_voter(
-            cluster_id,
-            target_node,
-            "target",
-            target_identity.public_key,
-            now,
-        ));
-        sinomo_core::cluster::write_cluster_state(&ClusterPaths::new(&peer_data_dir), &peer_state)
-            .expect("write peer state");
-
-        let request = sinomo_dfs::dfs_status_rpc_request()
-            .expect("dfs status request")
-            .with_trace_context_if_missing();
-        let signed =
-            sign_daemon_rpc_request_from_data_dir(&peer_data_dir, &request).expect("signed rpc");
-        let signed_envelope: SignedDaemonCommand =
-            sinomo_core::network::SinomoObjectCodec::default()
-                .decode(&signed)
-                .expect("decode signed envelope");
-        assert_eq!(signed_envelope.node_id, peer_node.to_string());
-
-        let authenticated = authenticate_daemon_control_request(
-            &target_daemon_paths,
-            &request.clone().with_auth(signed),
-        )
-        .expect("dfs status member auth");
-        assert_eq!(authenticated.route, sinomo_dfs::DFS_STATUS_ROUTE);
-        assert_eq!(authenticated.signer, DaemonSignerAuthority::Member);
-        assert_eq!(authenticated.signer_node_id, peer_node.to_string());
-        assert_eq!(authenticated.signer_public_key, peer_identity.public_key);
     }
 
     #[test]
@@ -2482,126 +2366,6 @@ mod tests {
     }
 
     #[test]
-    fn dfs_metadata_journal_batch_authorizes_cluster_members() {
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-        ] {
-            let authenticated = authenticated_command(
-                sinomo_dfs::DFS_METADATA_JOURNAL_BATCH_ROUTE.to_string(),
-                signer,
-            );
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to replicate DFS metadata journals");
-        }
-    }
-
-    #[test]
-    fn dfs_metadata_snapshot_install_authorizes_cluster_members() {
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-        ] {
-            let authenticated = authenticated_command(
-                sinomo_dfs::DFS_METADATA_SNAPSHOT_INSTALL_ROUTE.to_string(),
-                signer,
-            );
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to repair DFS metadata replicas");
-        }
-    }
-
-    #[test]
-    fn dfs_status_authorizes_cluster_members() {
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-        ] {
-            let authenticated =
-                authenticated_command(sinomo_dfs::DFS_STATUS_ROUTE.to_string(), signer);
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to inspect local DFS metadata status");
-        }
-    }
-
-    #[test]
-    fn dfs_inspection_authorizes_cluster_members() {
-        for signer in [
-            DaemonSignerAuthority::Local,
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-        ] {
-            let authenticated =
-                authenticated_command(sinomo_dfs::DFS_INSPECTION_ROUTE.to_string(), signer);
-            authorize_authenticated_daemon_command(&authenticated)
-                .expect("cluster members must be able to inspect local DFS metadata");
-        }
-    }
-
-    #[test]
-    fn dfs_smoke_authorizes_only_local_signer() {
-        authorize_authenticated_daemon_command(&authenticated_command(
-            sinomo_dfs::DFS_SMOKE_ROUTE.to_string(),
-            DaemonSignerAuthority::Local,
-        ))
-        .expect("local operators must be able to run DFS smoke through the daemon");
-        for signer in [
-            DaemonSignerAuthority::Voter,
-            DaemonSignerAuthority::Member,
-            DaemonSignerAuthority::JoinCandidate,
-        ] {
-            let authenticated =
-                authenticated_command(sinomo_dfs::DFS_SMOKE_ROUTE.to_string(), signer);
-            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
-        }
-    }
-
-    #[test]
-    fn dfs_placement_authority_admin_authorizes_only_local_or_voter() {
-        for signer in [DaemonSignerAuthority::Local, DaemonSignerAuthority::Voter] {
-            authorize_authenticated_daemon_command(&authenticated_command(
-                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
-                signer,
-            ))
-            .expect("local operators and state authorities may inspect placement authority");
-        }
-        for signer in [
-            DaemonSignerAuthority::Member,
-            DaemonSignerAuthority::JoinCandidate,
-            DaemonSignerAuthority::StatusProbe,
-        ] {
-            let authenticated = authenticated_command(
-                crate::DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE.to_string(),
-                signer,
-            );
-            assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
-        }
-    }
-
-    #[test]
-    fn daemon_dfs_browser_routes_authorize_only_local_signer() {
-        for route in crate::DAEMON_DFS_BROWSER_ROUTES {
-            authorize_authenticated_daemon_command(&authenticated_command(
-                (*route).to_string(),
-                DaemonSignerAuthority::Local,
-            ))
-            .expect("local app clients must be able to use daemon DFS browser routes");
-            for signer in [
-                DaemonSignerAuthority::Voter,
-                DaemonSignerAuthority::Member,
-                DaemonSignerAuthority::JoinCandidate,
-                DaemonSignerAuthority::StatusProbe,
-            ] {
-                let authenticated = authenticated_command((*route).to_string(), signer);
-                assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
-            }
-        }
-    }
-
-    #[test]
     fn daemon_object_rpc_forward_authorizes_only_local_signer() {
         for route in [
             crate::DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -2624,23 +2388,6 @@ mod tests {
             ] {
                 let authenticated = authenticated_command(route.to_string(), signer);
                 assert!(authorize_authenticated_daemon_command(&authenticated).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn dfs_object_transfer_routes_authorize_cluster_members() {
-        for route in std::iter::once(sinomo_dfs::DFS_DIRECT_READ_ROUTE)
-            .chain(sinomo_dfs::DFS_MESSAGE_DATA_PLANE_ROUTES.iter().copied())
-        {
-            for signer in [
-                DaemonSignerAuthority::Local,
-                DaemonSignerAuthority::Voter,
-                DaemonSignerAuthority::Member,
-            ] {
-                let authenticated = authenticated_command(route.to_string(), signer);
-                authorize_authenticated_daemon_command(&authenticated)
-                    .expect("cluster members must be able to exchange DFS object data");
             }
         }
     }

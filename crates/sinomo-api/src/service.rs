@@ -1,15 +1,12 @@
 //! Hosted service adapters for daemon lifecycle and process-operation APIs.
 
 use crate::{
-    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
-    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+    DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
     DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE, DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_NETWORK_CHUNK_METRICS_ROUTE, DAEMON_OBJECT_RPC_FORWARD_MAIN_ROUTE,
     DAEMON_OBJECT_RPC_FORWARD_ROUTE, DAEMON_REMOTE_SHADOW_SHUTDOWN_ROUTE, DAEMON_RPC_CATEGORY,
     DAEMON_SHUTDOWN_ROUTE, DAEMON_STATUS_ROUTE, DaemonClusterMaintenanceRefreshRequest,
-    DaemonClusterMaintenanceRefreshResponse, DaemonDfsMountedMutationHandoffRequest,
-    DaemonDfsMountedMutationHandoffResponse, DaemonLocalConnectivityReloadRequest,
+    DaemonClusterMaintenanceRefreshResponse, DaemonLocalConnectivityReloadRequest,
     DaemonLocalConnectivityReloadResponse, DaemonNetworkChunkMetricsResponse,
     DaemonObjectRpcDestinationProcessAffinity, DaemonObjectRpcForwardRequest,
     DaemonObjectRpcForwardResponse, DaemonStatus,
@@ -127,7 +124,6 @@ pub fn register_hosted_daemon_lifecycle_service(
 
 const MAIN_OPERATIONS_ROUTES: &[&str] = &[
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
-    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
     DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE,
     DAEMON_NETWORK_CHUNK_METRICS_ROUTE,
     DAEMON_OBJECT_RPC_FORWARD_ROUTE,
@@ -165,12 +161,6 @@ pub trait DaemonOperationsHost: Send + Sync + 'static {
 
     fn cluster_maintenance_refresh_requested(&self, traceparent: Option<String>);
 
-    fn handoff_dfs_mounted_mutation(
-        &self,
-        traceparent: Option<String>,
-        request: DaemonDfsMountedMutationHandoffRequest,
-    ) -> DaemonOperationsFuture<'_, Result<DaemonDfsMountedMutationHandoffResponse, ServiceError>>;
-
     fn reload_local_connectivity(&self) -> Result<(), ServiceError>;
 }
 
@@ -204,12 +194,6 @@ impl Service for HostedDaemonOperationsService {
             .map(|route| {
                 let mut descriptor = ServiceRoute::new(route, DAEMON_RPC_CATEGORY);
                 descriptor.auth_scope = Some("local-command".to_string());
-                if route == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE {
-                    descriptor
-                        .required_capabilities
-                        .push("daemon.dfs.mounted-mutation".to_string());
-                    descriptor.timeout_ms = Some(30_000);
-                }
                 if is_daemon_object_rpc_forward_route(route) {
                     descriptor.request_body_mode = ServiceBodyMode::Optional;
                     descriptor.response_body_mode = ServiceBodyMode::Optional;
@@ -226,7 +210,6 @@ impl Service for HostedDaemonOperationsService {
                 && matches!(
                     request.route.as_str(),
                     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE
-                        | DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
                 )
             {
                 return Err(ServiceError::UnknownRoute(request.route));
@@ -257,22 +240,6 @@ impl Service for HostedDaemonOperationsService {
                         DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE,
                         DaemonClusterMaintenanceRefreshResponse,
                     )?;
-                }
-                DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE => {
-                    let handoff: DaemonDfsMountedMutationHandoffRequest = ctx
-                        .decode_request_body_bounded(
-                            &request,
-                            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
-                        )
-                        .await?;
-                    handoff.validate().map_err(ServiceError::Service)?;
-                    let response = host
-                        .handoff_dfs_mounted_mutation(
-                            request.traceparent().map(ToString::to_string),
-                            handoff,
-                        )
-                        .await?;
-                    ctx.respond_value(DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE, response)?;
                 }
                 DAEMON_LOCAL_CONNECTIVITY_RELOAD_ROUTE => {
                     let _: DaemonLocalConnectivityReloadRequest =
@@ -476,15 +443,6 @@ mod tests {
 
         fn cluster_maintenance_refresh_requested(&self, _traceparent: Option<String>) {}
 
-        fn handoff_dfs_mounted_mutation(
-            &self,
-            _traceparent: Option<String>,
-            _request: DaemonDfsMountedMutationHandoffRequest,
-        ) -> DaemonOperationsFuture<'_, Result<DaemonDfsMountedMutationHandoffResponse, ServiceError>>
-        {
-            Box::pin(async { Err(ServiceError::Service("unused test handoff".to_string())) })
-        }
-
         fn reload_local_connectivity(&self) -> Result<(), ServiceError> {
             Ok(())
         }
@@ -527,16 +485,6 @@ mod tests {
         assert_eq!(forward.auth_scope.as_deref(), Some("local-command"));
         assert_eq!(forward.request_body_mode, ServiceBodyMode::Optional);
         assert_eq!(forward.response_body_mode, ServiceBodyMode::Optional);
-        let handoff = routes
-            .iter()
-            .find(|route| route.route == DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE)
-            .expect("mounted mutation handoff route");
-        assert_eq!(handoff.timeout_ms, Some(30_000));
-        assert_eq!(
-            handoff.required_capabilities,
-            vec!["daemon.dfs.mounted-mutation".to_string()]
-        );
-
         let shadow =
             HostedDaemonOperationsService::new(Arc::new(TestOperationsHost { shadow: true }));
         assert_eq!(shadow.routes(), SHADOW_OPERATIONS_ROUTES);

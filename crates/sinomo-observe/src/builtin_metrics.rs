@@ -753,84 +753,7 @@ fn dfs_observe_metrics(
 pub fn dfs_status_observe_metrics(
     status: sinomo_dfs::DfsOperatorStatus,
 ) -> Vec<crate::ObserveMetricRecord> {
-    let mut metrics = vec![
-        gauge("sinomo.dfs.filesystems", status.file_system_count),
-        gauge("sinomo.dfs.objects", status.object_count),
-        gauge("sinomo.dfs.versions", status.version_count),
-        gauge("sinomo.dfs.receipts", status.receipt_count),
-        gauge("sinomo.dfs.intents", status.intent_count),
-        gauge("sinomo.dfs.pending_writes", status.pending_write_count),
-        gauge("sinomo.dfs.open_conflicts", status.open_conflict_count),
-        gauge("sinomo.dfs.pending_repairs", status.pending_repair_count),
-        gauge(
-            "sinomo.dfs.pending_namespace_jobs",
-            status.pending_namespace_job_count,
-        ),
-        gauge(
-            "sinomo.dfs.failed_namespace_jobs",
-            status.failed_namespace_job_count,
-        ),
-    ];
-    for shard in status.metadata_shards {
-        let shard_labels = labels([
-            ("shard_id", shard.shard_id.0.clone()),
-            (
-                "file_system_id",
-                shard
-                    .file_system_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-            ),
-            (
-                "primary_node_id",
-                shard
-                    .primary_node_id
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-            ),
-        ]);
-        metrics.push(crate::ObserveMetricRecord::gauge(
-            "sinomo.dfs.metadata_shard.journal_next_sequence",
-            shard_labels.clone(),
-            shard.journal_next_sequence as f64,
-        ));
-        metrics.push(crate::ObserveMetricRecord::gauge(
-            "sinomo.dfs.metadata_shard.journal_last_sequence",
-            shard_labels.clone(),
-            shard.journal_last_sequence as f64,
-        ));
-        metrics.push(crate::ObserveMetricRecord::gauge(
-            "sinomo.dfs.metadata_shard.replicas",
-            shard_labels.clone(),
-            shard.replica_node_ids.len() as f64,
-        ));
-        for lag in shard.replica_lag {
-            let mut lag_labels = shard_labels.clone();
-            lag_labels.insert("target_node_id".to_string(), lag.target_node_id.to_string());
-            metrics.push(crate::ObserveMetricRecord::gauge(
-                "sinomo.dfs.metadata_shard.replica_lag_entries",
-                lag_labels.clone(),
-                lag.lag_entries as f64,
-            ));
-            metrics.push(crate::ObserveMetricRecord::gauge(
-                "sinomo.dfs.metadata_shard.replica_replicated_through_sequence",
-                lag_labels,
-                lag.replicated_through_sequence as f64,
-            ));
-        }
-        for cursor in shard.replay_cursors {
-            let mut cursor_labels = shard_labels.clone();
-            cursor_labels.insert("source_shard_id".to_string(), cursor.source_shard_id.0);
-            metrics.push(crate::ObserveMetricRecord::gauge(
-                "sinomo.dfs.metadata_shard.replay_replayed_through_sequence",
-                cursor_labels,
-                cursor.replayed_through_sequence as f64,
-            ));
-        }
-    }
-    metrics
+    sinomo_dfs::dfs_status_observe_metrics(status)
 }
 
 fn kv_observe_metrics(
@@ -999,10 +922,6 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path)
         .map(|metadata| metadata.len())
         .unwrap_or(0)
-}
-
-fn gauge(name: impl Into<String>, value: usize) -> crate::ObserveMetricRecord {
-    crate::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
 }
 
 fn labels<const N: usize>(labels: [(&str, String); N]) -> BTreeMap<String, String> {

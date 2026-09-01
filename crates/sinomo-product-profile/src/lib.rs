@@ -86,10 +86,46 @@ pub fn base_component_catalog(
         builder.register_module(sinomo_runtime::network_module::network_module_registration())?;
     builder = builder.register_module(sinomo_runtime::rollout::rollout_module_registration())?;
 
-    builder = builder.register_module(sinomo_runtime::dfs::dfs_module_registration())?;
-    builder = builder.register_module(sinomo_runtime::dfs_nfs::nfs_module_registration())?;
+    if matches!(
+        profile.host_role,
+        ComponentHostRole::Main | ComponentHostRole::Embedded
+    ) {
+        let dfs_registration = sinomo_runtime::dfs::dfs_module_registration();
+        let dfs_active = sinomo_runtime::dfs::dfs_module_enabled(data_dir.root()).unwrap_or(true);
+        if dfs_active {
+            builder = register_module_factory(
+                builder,
+                dfs_registration,
+                sinomo_runtime::dfs::component_factory()
+                    .expect("DFS product component descriptor must be valid"),
+            )?;
+        } else {
+            builder = builder.register_module(dfs_registration)?;
+        }
+        builder = builder.register_module(sinomo_runtime::dfs_nfs::nfs_module_registration())?;
+        builder = builder.register_native_rust_control_target(
+            sinomo_runtime::module::NativeRustModuleServiceTarget::new(
+                sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+                dfs_active,
+                true,
+                "distributed filesystem provider module",
+            ),
+        )?;
+        builder = builder.register_native_rust_control_target(
+            sinomo_runtime::module::NativeRustModuleServiceTarget::new(
+                sinomo_runtime::dfs_nfs::SINOMO_DFS_NFS_MODULE_LEGACY_ID,
+                profile.hosts_native_filesystem_projection()
+                    && profile.cluster_initialized
+                    && sinomo_runtime::dfs_nfs::nfs_module_enabled(data_dir).unwrap_or(false),
+                true,
+                "direct SIFS NFS mount module",
+            ),
+        )?;
+    }
 
-    if sinomo_runtime::observe::observe_module_enabled(data_dir.root()).unwrap_or(true) {
+    let observe_active =
+        sinomo_runtime::observe::observe_module_enabled(data_dir.root()).unwrap_or(true);
+    if observe_active {
         builder = register_module_factory(
             builder,
             sinomo_runtime::observe::observe_module_registration(),
@@ -97,6 +133,14 @@ pub fn base_component_catalog(
                 .expect("observe product component descriptor must be valid"),
         )?;
     }
+    builder = builder.register_native_rust_control_target(
+        sinomo_runtime::module::NativeRustModuleServiceTarget::new(
+            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+            observe_active,
+            true,
+            "operational observation module",
+        ),
+    )?;
 
     if profile.hosts_native_build_worker() {
         #[cfg(feature = "native-workers")]
@@ -201,6 +245,33 @@ fn register_module_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_profile_owns_dfs_factory_and_shadow_profile_does_not() {
+        let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
+            "sinomo-product-dfs-profile-{}",
+            sinomo_runtime::core::Id::generate()
+        )));
+        let main = base_component_catalog(&data_dir, ProductComponentProfile::main(true))
+            .expect("main profile");
+        let shadow = base_component_catalog(&data_dir, ProductComponentProfile::shadow(true))
+            .expect("shadow profile");
+        let dfs_id = sinomo_runtime::dfs::dfs_module_id();
+
+        assert!(main.modules().get(&dfs_id).is_some());
+        assert!(
+            main.factories()
+                .iter()
+                .any(|factory| factory.descriptor().component_id == dfs_id.as_str())
+        );
+        assert!(shadow.modules().get(&dfs_id).is_none());
+        assert!(
+            !shadow
+                .factories()
+                .iter()
+                .any(|factory| factory.descriptor().component_id == dfs_id.as_str())
+        );
+    }
 
     #[cfg(feature = "native-workers")]
     #[test]

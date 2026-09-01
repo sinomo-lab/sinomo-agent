@@ -235,6 +235,7 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
                 request_body_mode: NativeModuleBodyMode::None,
                 response_body_mode: NativeModuleBodyMode::None,
                 required_local_permissions: Vec::new(),
+                exact_member_identity: false,
             }],
             capability_exports: vec![
                 SINOMO_BENCHMARKS_OPERATION.to_string(),
