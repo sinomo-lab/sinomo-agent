@@ -1367,6 +1367,13 @@ struct PendingAttachmentPicker {
     draft_generation: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingWorkspacePicker {
+    request_id: u64,
+    session_id: String,
+    generation: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalAttachmentIngress {
     NativePicker,
@@ -1408,6 +1415,7 @@ struct LocalAttachmentValidationResult {
 enum ComposerPopup {
     Model,
     Context,
+    Workspace,
     Attachments,
     Activity,
 }
@@ -1648,6 +1656,9 @@ pub struct ChatState {
     pub tool_runtime: ChatToolRuntimeSelection,
     workspace_path_input: String,
     workspace_error: Option<String>,
+    workspace_picker_generation: u64,
+    workspace_picker: NativePickerLane,
+    pending_workspace_picker: Option<PendingWorkspacePicker>,
     pub messages: Vec<ChatMessage>,
     pub input: String,
     pub cursor: usize,
@@ -1760,6 +1771,9 @@ struct ChatStructureSnapshot {
     effort_visible: bool,
     streaming: bool,
     draft_revision: u64,
+    workspace_path: String,
+    workspace_error: Option<String>,
+    workspace_picker_pending: bool,
     attachments: Vec<(String, u64)>,
     attachment_path_empty: bool,
     attachment_manual_path_open: bool,
@@ -2009,6 +2023,10 @@ struct ComposerBarStructure {
     theme: (AppThemeMode, AppTextScale),
     streaming: bool,
     media_active: bool,
+    workspace_label: String,
+    workspace_description: String,
+    workspace_selected: bool,
+    workspace_picker_pending: bool,
     model_label: String,
     context_label: String,
     activity_label: String,
@@ -2022,6 +2040,10 @@ struct ComposerBarLayoutStructure {
     theme: (AppThemeMode, AppTextScale),
     streaming: bool,
     media_active: bool,
+    workspace_label: String,
+    workspace_description: String,
+    workspace_selected: bool,
+    workspace_picker_pending: bool,
     voice_link_hint: Option<String>,
     can_reuse_latest_answer: bool,
 }
@@ -2032,6 +2054,10 @@ impl From<&ComposerBarStructure> for ComposerBarLayoutStructure {
             theme: structure.theme,
             streaming: structure.streaming,
             media_active: structure.media_active,
+            workspace_label: structure.workspace_label.clone(),
+            workspace_description: structure.workspace_description.clone(),
+            workspace_selected: structure.workspace_selected,
+            workspace_picker_pending: structure.workspace_picker_pending,
             voice_link_hint: structure.voice_link_hint.clone(),
             can_reuse_latest_answer: structure.can_reuse_latest_answer,
         }
@@ -2075,6 +2101,9 @@ impl ChatStructureKey {
             effort_visible: chat.effort_visible(),
             streaming: chat.streaming,
             draft_revision: chat.draft_revision,
+            workspace_path: chat.workspace_path_input.clone(),
+            workspace_error: chat.workspace_error.clone(),
+            workspace_picker_pending: chat.workspace_picker_lane_pending(),
             attachments: chat
                 .attachments
                 .iter()
@@ -2195,6 +2224,10 @@ impl ChatStructureKey {
                 theme: (theme_mode, text_scale),
                 streaming: chat.streaming,
                 media_active: chat.media_call.active,
+                workspace_label: workspace_button_label(chat),
+                workspace_description: workspace_button_description(chat),
+                workspace_selected: !chat.workspace_path_input.is_empty(),
+                workspace_picker_pending: chat.workspace_picker_lane_pending(),
                 model_label: model_button_label(chat),
                 context_label: context_overview_summary(chat),
                 activity_label: activity_button_label(chat).to_string(),
@@ -2376,6 +2409,9 @@ impl ChatState {
             tool_runtime: ChatToolRuntimeSelection::default(),
             workspace_path_input: String::new(),
             workspace_error: None,
+            workspace_picker_generation: 0,
+            workspace_picker: NativePickerLane::new(),
+            pending_workspace_picker: None,
             messages: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -2523,6 +2559,7 @@ impl ChatState {
         });
 
         self.handle = handle;
+        self.advance_workspace_picker_generation();
         self.daemon_address = daemon_address.clone();
         #[cfg(test)]
         {
@@ -3865,6 +3902,7 @@ impl ChatState {
         self.messages.clear();
         self.input.clear();
         self.cursor = 0;
+        self.advance_workspace_picker_generation();
         self.advance_attachment_draft_generation();
         self.attachment_path_input.clear();
         self.attachment_manual_path_open = false;
@@ -4589,6 +4627,7 @@ impl ChatState {
         // A native picker belongs to the visible chat/draft that opened it. The text and any
         // already-queued attachments intentionally remain available while navigating stored
         // chats, but a late OS-dialog result must not leak into the newly visible chat.
+        self.advance_workspace_picker_generation();
         self.advance_attachment_draft_generation();
         self.session_id = session.id.clone();
         self.messages = vec![transcript_loading_message(&session)];
@@ -5668,6 +5707,12 @@ impl ChatState {
                 self.sync_selection_from_info();
             }
             ChatEvent::ToolRuntime(selection) => {
+                let workspace_change_pending = self.notice.as_deref().is_some_and(|notice| {
+                    matches!(
+                        notice,
+                        "attaching workspace…" | "removing workspace access…"
+                    )
+                });
                 self.workspace_path_input = selection
                     .workspace_root
                     .as_ref()
@@ -5675,8 +5720,16 @@ impl ChatState {
                     .unwrap_or_default();
                 self.tool_runtime = selection;
                 self.workspace_error = None;
+                if workspace_change_pending {
+                    self.notice = Some(if self.workspace_path_input.is_empty() {
+                        "workspace access removed".to_string()
+                    } else {
+                        "workspace ready".to_string()
+                    });
+                }
             }
             ChatEvent::SessionReset { session_id } => {
+                self.advance_workspace_picker_generation();
                 let acknowledged_pending =
                     self.pending_session_reset.as_deref() == Some(session_id.as_str());
                 if acknowledged_pending {
@@ -6284,6 +6337,96 @@ impl ChatState {
         self.attachment_picker.is_pending()
     }
 
+    fn workspace_picker_lane_pending(&self) -> bool {
+        self.workspace_picker.is_pending()
+    }
+
+    fn advance_workspace_picker_generation(&mut self) {
+        self.workspace_picker_generation = self.workspace_picker_generation.wrapping_add(1);
+        self.pending_workspace_picker = None;
+        self.workspace_error = None;
+    }
+
+    fn request_workspace_picker(&mut self) {
+        if self.streaming || self.control.active_turn {
+            self.workspace_error =
+                Some("finish or stop the active turn before changing workspace".to_string());
+            return;
+        }
+        self.workspace_error = None;
+        let session_id = self.ensure_visible_session_id();
+        let generation = self.workspace_picker_generation;
+        match self.workspace_picker.request(
+            NativePickerKind::OneFolder,
+            "Choose an agent workspace",
+            generation,
+            self.ui_waker.clone(),
+        ) {
+            Ok(request_id) => {
+                self.pending_workspace_picker = Some(PendingWorkspacePicker {
+                    request_id,
+                    session_id,
+                    generation,
+                });
+                self.notice = Some("choosing workspace…".to_string());
+            }
+            Err(error) => {
+                self.workspace_error = Some(error);
+            }
+        }
+    }
+
+    fn clear_workspace(&mut self) {
+        if self.streaming || self.control.active_turn {
+            self.workspace_error =
+                Some("finish or stop the active turn before changing workspace".to_string());
+            return;
+        }
+        let session_id = self.ensure_visible_session_id();
+        self.workspace_error = None;
+        self.notice = Some("removing workspace access…".to_string());
+        self.handle.send_command(ChatCommand::SetWorkspace {
+            session_id,
+            workspace_root: None,
+        });
+    }
+
+    fn apply_workspace_picker_result(&mut self, result: NativePickerResult) {
+        let Some(pending) = self.pending_workspace_picker.take() else {
+            return;
+        };
+        if pending.request_id != result.request_id
+            || pending.session_id != self.session_id
+            || pending.generation != self.workspace_picker_generation
+            || result.context_generation != self.workspace_picker_generation
+        {
+            return;
+        }
+        match result.outcome {
+            NativePickerOutcome::Selected(mut paths) => {
+                let Some(workspace_root) = paths.drain(..).next() else {
+                    self.workspace_error = Some("the folder picker returned no folder".to_string());
+                    return;
+                };
+                self.workspace_path_input = workspace_root.display().to_string();
+                self.workspace_error = None;
+                self.notice = Some("attaching workspace…".to_string());
+                self.handle.send_command(ChatCommand::SetWorkspace {
+                    session_id: pending.session_id,
+                    workspace_root: Some(workspace_root),
+                });
+            }
+            NativePickerOutcome::Cancelled => {
+                self.notice = None;
+                self.workspace_error = None;
+            }
+            NativePickerOutcome::Failed(error) => {
+                self.workspace_error = Some(error);
+                self.notice = Some("workspace picker failed".to_string());
+            }
+        }
+    }
+
     fn attachment_operation_pending(&self) -> bool {
         self.attachment_picker_pending() || !self.pending_attachment_validations.is_empty()
     }
@@ -6325,6 +6468,10 @@ impl ChatState {
     /// the lane when it is visible.
     pub(crate) fn pump_attachment_lanes(&mut self) -> bool {
         let mut changed = false;
+        if let Some(result) = self.workspace_picker.poll() {
+            self.apply_workspace_picker_result(result);
+            changed = true;
+        }
         if let Some(result) = self.attachment_picker.poll() {
             self.apply_attachment_picker_result(result);
             changed = true;
@@ -16858,6 +17005,31 @@ fn model_button_label(chat: &ChatState) -> String {
     "Model".to_string()
 }
 
+fn workspace_button_label(chat: &ChatState) -> String {
+    if chat.workspace_picker_lane_pending() {
+        return "Choosing workspace…".to_string();
+    }
+    if chat.workspace_path_input.is_empty() {
+        return "Workspace".to_string();
+    }
+    FsPath::new(&chat.workspace_path_input)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| compact_line(name, 28))
+        .unwrap_or_else(|| compact_line(&chat.workspace_path_input, 28))
+}
+
+fn workspace_button_description(chat: &ChatState) -> String {
+    if chat.workspace_picker_lane_pending() {
+        "A system folder picker is open".to_string()
+    } else if chat.workspace_path_input.is_empty() {
+        "Choose the folder the coding agent may read, edit, and run commands in".to_string()
+    } else {
+        format!("Agent workspace: {}", chat.workspace_path_input)
+    }
+}
+
 /// The live-voice hint beside the mic toggle (`voice link · MM:SS`), present
 /// only while the full-duplex call is running.
 fn voice_link_hint(chat: &ChatState) -> Option<String> {
@@ -17054,6 +17226,82 @@ fn composer_attachments_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPo
     )
 }
 
+fn composer_workspace_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
+    let picker_pending = shared.chat().workspace_picker_lane_pending();
+    let has_workspace = !shared.chat().workspace_path_input.is_empty();
+    let turn_active = shared.chat().streaming || shared.chat().control.active_turn;
+    let current = if has_workspace {
+        shared.chat().workspace_path_input.clone()
+    } else {
+        "No workspace selected. Coding tools remain unavailable until you choose one.".to_string()
+    };
+    let choose = {
+        let s = shared.clone();
+        sui::Button::new(if picker_pending {
+            "Folder picker open…"
+        } else if has_workspace {
+            "Replace folder"
+        } else {
+            "Choose folder"
+        })
+        .icon(IconGlyph::Folder)
+        .min_height(30.0)
+        .theme_when(clone_reader(reader))
+        .enabled(!picker_pending && !turn_active)
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().request_workspace_picker();
+            request_chat_window_relayout(ctx);
+        })
+    };
+    let clear = {
+        let s = shared.clone();
+        sui::Button::new("Remove access")
+            .icon(IconGlyph::Close)
+            .min_height(30.0)
+            .theme_when(clone_reader(reader))
+            .appearance(sui::ButtonAppearance::Tonal)
+            .tone(SemanticTone::Neutral)
+            .enabled(has_workspace && !picker_pending && !turn_active)
+            .on_press_with_ctx(move |ctx| {
+                s.chat_mut().clear_workspace();
+                request_chat_window_relayout(ctx);
+            })
+    };
+    let actions = Flex::horizontal()
+        .gap(8.0)
+        .align_items(Alignment::Center)
+        .with_child(choose)
+        .with_child(clear)
+        .spacer();
+    let mut body = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(popup_header(
+            shared,
+            reader,
+            "Workspace",
+            "Close workspace settings",
+        ))
+        .with_child(muted_label(shared, compact_line(&current, 110)))
+        .with_child(actions);
+    if turn_active {
+        body = body.with_child(muted_label(
+            shared,
+            "Finish or stop the active turn before changing workspace access.",
+        ));
+    } else if let Some(error) = shared.chat().workspace_error.clone() {
+        body = body.with_child(muted_label(shared, format!("Workspace error: {error}")));
+    }
+    WidgetPod::new(
+        Surface::new(
+            SurfaceRole::Titlebar,
+            WidgetPadding::horizontal(PAD, body).fill_child_height(),
+        )
+        .fill()
+        .theme_when(clone_reader(reader)),
+    )
+}
+
 fn composer_activity_popup(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     if shared.chat().runtime_recovery_target().is_some() {
         let health = shared.chat().runtime_health();
@@ -17152,6 +17400,7 @@ fn composer_popup_panel(shared: &Shared, reader: &ThemeReader) -> WidgetPod {
     match shared.chat().composer_popup() {
         Some(ComposerPopup::Model) => composer_model_popup(shared, reader),
         Some(ComposerPopup::Context) => composer_context_popup(shared, reader),
+        Some(ComposerPopup::Workspace) => composer_workspace_popup(shared, reader),
         Some(ComposerPopup::Attachments) => composer_attachments_popup(shared, reader),
         Some(ComposerPopup::Activity) => composer_activity_popup(shared, reader),
         None => WidgetPod::new(SizedBox::new().height(0.0)),
@@ -17164,9 +17413,17 @@ fn composer_popup_host(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
             .signals()
             .chat_structure
             .select_named("chat composer popup structure", |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.composer_popup))
+                key.0.as_deref().map(|snapshot| {
+                    (
+                        snapshot.theme,
+                        snapshot.composer_popup,
+                        snapshot.workspace_path.clone(),
+                        snapshot.workspace_error.clone(),
+                        snapshot.workspace_picker_pending,
+                        snapshot.streaming,
+                        snapshot.active_turn,
+                    )
+                })
             });
     let s = shared.clone();
     let r = Rc::clone(reader);
@@ -17360,6 +17617,10 @@ fn composer_bar(
 ) -> WidgetPod {
     let streaming = structure.streaming;
     let media_active = structure.media_active;
+    let workspace_label = structure.workspace_label.clone();
+    let workspace_description = structure.workspace_description.clone();
+    let workspace_selected = structure.workspace_selected;
+    let workspace_picker_pending = structure.workspace_picker_pending;
     let hint = structure.voice_link_hint.clone();
     let can_reuse = structure.can_reuse_latest_answer;
 
@@ -17376,6 +17637,27 @@ fn composer_bar(
                     .toggle_composer_popup(ComposerPopup::Attachments);
                 request_chat_window_relayout(ctx);
             })
+    };
+
+    let workspace = {
+        let s = shared.clone();
+        Tooltip::new(
+            workspace_description,
+            IconButton::new(IconGlyph::Folder, workspace_label)
+                .size(COMPOSER_GHOST_BUTTON_SIZE)
+                .icon_size(14.0)
+                .theme_when(composer_control_reader(reader))
+                .appearance(sui::ButtonAppearance::Ghost)
+                .tone(SemanticTone::Neutral)
+                .selected_when(move || workspace_selected)
+                .enabled(!workspace_picker_pending)
+                .on_press_with_ctx(move |ctx| {
+                    s.chat_mut().toggle_composer_popup(ComposerPopup::Workspace);
+                    request_chat_window_relayout(ctx);
+                }),
+        )
+        .placement(TooltipPlacement::Above)
+        .theme(reader())
     };
 
     let mic = {
@@ -17539,6 +17821,7 @@ fn composer_bar(
         .gap(COMPOSER_BAR_GAP)
         .align_items(Alignment::Center)
         .with_child(attach)
+        .with_child(workspace)
         .with_child(mic);
 
     if let Some(hint_text) = hint {
@@ -20263,6 +20546,8 @@ mod tests {
         assert_eq!(state.tool_runtime.workspace_root.as_ref(), Some(&workspace));
         assert_eq!(state.workspace_path_input, workspace.display().to_string());
         assert!(state.workspace_error.is_none());
+        assert_eq!(workspace_button_label(&state), "sinomo-selected-workspace");
+        assert!(workspace_button_description(&state).contains("Agent workspace:"));
 
         state.apply_event(ChatEvent::Error {
             session_id: Some(state.session_id.clone()),
@@ -20278,6 +20563,44 @@ mod tests {
             state.notice.as_deref(),
             Some("Workspace directory needs attention.")
         );
+    }
+
+    #[test]
+    fn workspace_picker_applies_only_to_the_session_that_opened_it() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        state.session_id = SessionId::generate().to_string();
+        state.workspace_picker_generation = 4;
+        state.pending_workspace_picker = Some(PendingWorkspacePicker {
+            request_id: 9,
+            session_id: state.session_id.clone(),
+            generation: 4,
+        });
+        let selected = PathBuf::from("D:\\Workspace\\todo-app");
+
+        state.apply_workspace_picker_result(NativePickerResult {
+            request_id: 9,
+            context_generation: 4,
+            outcome: NativePickerOutcome::Selected(vec![selected.clone()]),
+        });
+
+        assert_eq!(state.workspace_path_input, selected.display().to_string());
+        assert_eq!(state.notice.as_deref(), Some("attaching workspace…"));
+        assert!(state.pending_workspace_picker.is_none());
+
+        state.pending_workspace_picker = Some(PendingWorkspacePicker {
+            request_id: 10,
+            session_id: SessionId::generate().to_string(),
+            generation: 4,
+        });
+        state.apply_workspace_picker_result(NativePickerResult {
+            request_id: 10,
+            context_generation: 4,
+            outcome: NativePickerOutcome::Selected(vec![PathBuf::from(
+                "D:\\Workspace\\wrong-session",
+            )]),
+        });
+        assert_eq!(state.workspace_path_input, selected.display().to_string());
     }
 
     #[test]
@@ -21763,6 +22086,30 @@ mod tests {
             window.get_by_text("Context").count()?,
             1,
             "context bar should open context details"
+        );
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Close context details")
+            .click()?;
+        window
+            .get_by_role(SemanticsRole::Button)
+            .with_name("Workspace")
+            .click()?;
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Choose folder")
+                .count()?,
+            1,
+            "workspace control should expose the native folder picker"
+        );
+        assert_eq!(
+            window
+                .get_by_role(SemanticsRole::Button)
+                .with_name("Remove access")
+                .count()?,
+            1,
+            "workspace control should expose explicit grant revocation"
         );
 
         Ok(())
