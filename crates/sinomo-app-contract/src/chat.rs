@@ -701,6 +701,10 @@ pub enum ChatSessionCommand {
     SetToolRuntime {
         selection: ChatToolRuntimeSelection,
     },
+    SetWorkspace {
+        session_id: String,
+        workspace_root: Option<PathBuf>,
+    },
     SetToolRuntimeNode {
         sandbox_node_id: Option<String>,
     },
@@ -916,6 +920,15 @@ mod tests {
         let encoded = serde_json::to_vec(&command).expect("encode command");
         let decoded: ChatSessionCommand = serde_json::from_slice(&encoded).expect("decode command");
         assert_eq!(decoded, command);
+
+        let workspace = ChatSessionCommand::SetWorkspace {
+            session_id: "session-a".to_string(),
+            workspace_root: Some(PathBuf::from("C:/work/todo")),
+        };
+        let encoded = serde_json::to_vec(&workspace).expect("encode workspace command");
+        let decoded: ChatSessionCommand =
+            serde_json::from_slice(&encoded).expect("decode workspace command");
+        assert_eq!(decoded, workspace);
 
         let event = ChatEvent::ReasoningDelta {
             session_id: "session-a".to_string(),

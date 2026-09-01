@@ -654,6 +654,19 @@ fn run_worker_command(
                 }),
             }
         }
+        wire::ChatSessionCommand::SetWorkspace {
+            session_id,
+            workspace_root,
+        } => match ensure_session(chat, session_id.clone()).and_then(|_| {
+            chat.replace_workspace_root(workspace_root)
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(selection) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(selection))),
+            Err(error) => events.push(wire::ChatEvent::Error {
+                session_id: Some(session_id),
+                error: format!("workspace switch failed: {error}"),
+            }),
+        },
         wire::ChatSessionCommand::SetToolRuntimeNode { sandbox_node_id } => {
             match chat.set_tool_runtime_node(sandbox_node_id) {
                 Ok(selection) => events.push(wire::ChatEvent::ToolRuntime(tool_runtime(selection))),
