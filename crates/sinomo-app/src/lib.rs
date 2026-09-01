@@ -21,7 +21,7 @@ use crate::state::{AppState, Shared, Tab};
 #[cfg(any(feature = "desktop", all(target_os = "android", feature = "mobile")))]
 use crate::state::{ConnectEvent, ReadyState};
 use crate::ui::Shell;
-use crate::ui::shell::logo_image_handle;
+use crate::ui::shell::{logo_image_handle, tab_icons};
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
 const ANDROID_SAFE_AREA_CHANGED: sui::CommandKey<sui::Insets> =
@@ -64,6 +64,9 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
     App::new()
         .render_options(shared.render_options())
         .with_resources(|resources| {
+            for icon in tab_icons() {
+                resources.image(icon.handle(), icon.registered_mask_image()?)?;
+            }
             let logo = default_sui_logo_image(96)?;
             resources.image(logo_image_handle(), logo)
         })
