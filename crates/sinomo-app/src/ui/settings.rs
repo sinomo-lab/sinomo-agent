@@ -17426,10 +17426,11 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = SettingsState::new(&backend);
         let Some(idx) = state.config_items.iter().position(|item| {
-            matches!(
-                item.edit_kind,
-                ConfigEditKind::Number | ConfigEditKind::Json
-            )
+            !item.read_only
+                && matches!(
+                    item.edit_kind,
+                    ConfigEditKind::Number | ConfigEditKind::Json
+                )
         }) else {
             return; // no typed key in this environment
         };

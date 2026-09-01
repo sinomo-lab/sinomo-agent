@@ -2389,7 +2389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.3",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6860,15 +6860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ordered-float"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
-dependencies = [
- "num-traits",
-]
-
-[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9563,6 +9554,7 @@ dependencies = [
  "sinomo-runtime",
  "sinomo-testdir",
  "sinomo-ui",
+ "sinomo-ui-lucide",
  "sinomo-ui-testing",
  "sinomo-video",
  "syntect",
@@ -9817,7 +9809,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
- "windows",
 ]
 
 [[package]]
@@ -9869,6 +9860,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
@@ -10511,7 +10503,7 @@ version = "0.1.0"
 [[package]]
 name = "sinomo-ui"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -10527,7 +10519,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-animation"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "sinomo-ui-core",
 ]
@@ -10535,7 +10527,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-avif"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "avif-serialize",
  "rav1e",
@@ -10544,12 +10536,12 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-core"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 
 [[package]]
 name = "sinomo-ui-layout"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-scene",
@@ -10559,7 +10551,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-lucide"
 version = "1.17.2"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "roxmltree 0.21.1",
  "sinomo-ui-core",
@@ -10571,7 +10563,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-platform"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -10596,12 +10588,12 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-reactive"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 
 [[package]]
 name = "sinomo-ui-render-wgpu"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "bytemuck",
  "fontdb",
@@ -10625,7 +10617,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-runtime"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "sinomo-ui-core",
  "sinomo-ui-layout",
@@ -10638,7 +10630,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-scene"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "resvg",
  "sinomo-ui-core",
@@ -10648,7 +10640,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-testing"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "exr",
  "png",
@@ -10666,7 +10658,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-text"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "cosmic-text",
  "fontdb",
@@ -10678,7 +10670,7 @@ dependencies = [
 [[package]]
 name = "sinomo-ui-widgets"
 version = "0.2.1"
-source = "git+https://github.com/sinomo-lab/sui.git?branch=main#97c15b244db2c56120eb2265a42d91fef47aa83b"
+source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 dependencies = [
  "palette",
  "pulldown-cmark 0.13.4",
@@ -11287,7 +11279,7 @@ dependencies = [
  "nix 0.29.0",
  "num-derive",
  "num-traits",
- "ordered-float 4.6.0",
+ "ordered-float",
  "pest",
  "pest_derive",
  "phf 0.11.3",
@@ -13274,7 +13266,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f2ab60e120fd6eaa68d9567f3226e876684639d22a4219b313ff69ec0ccd5ac"
 dependencies = [
  "log",
- "ordered-float 4.6.0",
+ "ordered-float",
  "strsim",
  "thiserror 1.0.69",
  "wezterm-dynamic-derive",
@@ -13429,7 +13421,7 @@ dependencies = [
  "objc2-metal 0.3.2",
  "objc2-quartz-core 0.3.2",
  "once_cell",
- "ordered-float 5.3.0",
+ "ordered-float",
  "parking_lot",
  "portable-atomic",
  "portable-atomic-util",

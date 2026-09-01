@@ -2046,6 +2046,46 @@ impl DfsControlPlaneKvClient for FailingMetadataOperationFloorReadKvClient {
     }
 }
 
+#[derive(Clone, Debug)]
+struct FailingFileSystemConfigReadKvClient {
+    inner: SharedDfsControlPlaneKvClient<InProcessKvStore>,
+    fail_reads: Arc<AtomicBool>,
+}
+
+impl DfsControlPlaneKvClient for FailingFileSystemConfigReadKvClient {
+    fn refresh_latest(&mut self) -> Result<(), KvError> {
+        self.inner.with_client(|kv| kv.refresh_latest())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<KvEntry>, KvError> {
+        if self.fail_reads.load(Ordering::SeqCst)
+            && key == file_system_config_key(&sifs_file_system_id())
+        {
+            return Err(KvError::AuthorityUnavailable {
+                detail: "daemon DFS retained metadata authority generation 1 is not ready"
+                    .to_string(),
+            });
+        }
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::get(kv, key))
+    }
+
+    fn range_prefix(&self, prefix: &str) -> Result<Vec<KvEntry>, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::range_prefix(kv, prefix))
+    }
+
+    fn put(&mut self, key: String, value: Vec<u8>) -> Result<KvRevision, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::put(kv, key, value))
+    }
+
+    fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
+        self.inner
+            .with_client(|kv| DfsControlPlaneKvClient::txn(kv, txn))
+    }
+}
+
 #[derive(Clone)]
 struct CountingEmptyTransport {
     local_node_id: NodeId,
@@ -7279,6 +7319,76 @@ fn networked_sifs_with_backend(
         .expect("metadata backend");
     dfs.bootstrap_distributed_sifs().expect("bootstrap sifs");
     dfs
+}
+
+#[test]
+fn posix_create_cleans_transient_metadata_when_placement_authority_is_not_ready() {
+    let root = temp_root("posix-create-authority-not-ready-cleanup");
+    let node_id = NodeId::from_legacy_named("node_posix_create_authority_not_ready").expect("node");
+    let parent = "/authority-not-ready-cleanup";
+    let path = "/authority-not-ready-cleanup/record.json";
+    let payload = b"immutable chat metadata";
+    let mut dfs = networked_sifs_with_backend(&root, node_id.clone());
+    dfs.posix_mkdir_all(parent).expect("fixture parent");
+
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let file_system = distributed_sifs(node_id.clone());
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&file_system))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: file_system.file_system_id,
+                shard_id: "root".to_string(),
+                primary_node_id: node_id.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("root metadata shard");
+    });
+    let fail_reads = Arc::new(AtomicBool::new(true));
+    dfs = dfs.with_control_plane(FailingFileSystemConfigReadKvClient {
+        inner: shared_kv,
+        fail_reads: Arc::clone(&fail_reads),
+    });
+
+    let options = DfsWriteOptions::replicated_eventual(vec![node_id]);
+    let error = dfs
+        .posix_write_file(path, payload, options.clone())
+        .expect_err("unready placement authority must reject the create");
+    assert!(
+        error
+            .to_string()
+            .contains("daemon DFS retained metadata authority generation 1 is not ready"),
+        "unexpected authority error: {error}"
+    );
+    assert!(
+        dfs.lookup_sifs_path(path)
+            .expect("lookup after rejected create")
+            .is_none(),
+        "a rejected create must not remain visible as contentless transient metadata"
+    );
+    assert!(
+        dfs.transient_metadata_object_ids.is_empty(),
+        "a rejected create must release its transient namespace overlay"
+    );
+
+    fail_reads.store(false, Ordering::SeqCst);
+    let committed = dfs
+        .posix_write_file(path, payload, options)
+        .expect("retry after authority recovery");
+    assert_eq!(committed.path, path);
+    assert_eq!(
+        dfs.posix_read_file(path).expect("read recovered write"),
+        payload
+    );
+
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[test]

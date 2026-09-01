@@ -1,8 +1,7 @@
 //! Sinomo's graphical client app, built on the SUI toolkit.
 //!
-//! Five tabs sit under a brand title bar: **Chat** (agent chat), **Evolution**
-//! (self-evolution jobs and evidence), **Cluster** (network topology graph), **Files**
-//! (the SIFS distributed file browser) and **Settings** (app + cluster config).
+//! Four tabs sit under a brand title bar: **Chat** (agent chat), **Cluster** (network topology
+//! graph), **Files** (the SIFS distributed file browser), and **Settings** (app + cluster config).
 //! The app probes for a local daemon and, if none is found, starts an app-owned sibling daemon
 //! process on desktop so the UI stays daemon-backed without linking the daemon host into the GUI.
 
@@ -16,13 +15,14 @@ pub mod theme;
 pub mod ui;
 
 use sui::{App, Window, default_sui_logo_image};
+use sui_lucide::LucideIcon;
 
 use crate::backend::Backend;
 use crate::state::{AppState, Shared, Tab};
 #[cfg(any(feature = "desktop", all(target_os = "android", feature = "mobile")))]
 use crate::state::{ConnectEvent, ReadyState};
 use crate::ui::Shell;
-use crate::ui::shell::logo_image_handle;
+use crate::ui::shell::{logo_image_handle, tab_icons};
 
 #[cfg(all(target_os = "android", feature = "mobile"))]
 const ANDROID_SAFE_AREA_CHANGED: sui::CommandKey<sui::Insets> =
@@ -65,6 +65,9 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
     App::new()
         .render_options(shared.render_options())
         .with_resources(|resources| {
+            for icon in tab_icons().into_iter().chain([LucideIcon::User]) {
+                resources.image(icon.handle(), icon.registered_mask_image()?)?;
+            }
             let logo = default_sui_logo_image(96)?;
             resources.image(logo_image_handle(), logo)
         })
@@ -74,7 +77,10 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
                     .controller(crate::ui::shell::BackgroundWorkController::new(
                         shared.clone(),
                     ))
-                    .root(Shell::new(shared)),
+                    // Shell is a custom composite with flattened title chrome and descendant
+                    // overlays. A zero-duration retained boundary keeps that normal chrome alive
+                    // while Select/ContextMenu overlays update in their independent stack layer.
+                    .root(sui::LayoutTransition::new(Shell::new(shared)).duration(0.0)),
             )
         })
 }

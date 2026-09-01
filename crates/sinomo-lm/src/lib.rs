@@ -2384,6 +2384,20 @@ pub fn provider_capabilities(provider: &str) -> LanguageModelProviderCapabilitie
     }
 }
 
+/// Return the provider-owned catalog for realtime audio/video sessions. Unlike ordinary model
+/// discovery this is protocol-specific and does not mix response-only models into live-call UI.
+pub fn provider_realtime_model_ids(provider: &str) -> Vec<String> {
+    RealtimeAudioProvider::from_id(provider)
+        .map(|provider| {
+            provider
+                .model_ids()
+                .iter()
+                .map(|model| (*model).to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
     &[
         CODEX_PROVIDER_ID,

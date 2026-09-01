@@ -92,9 +92,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
-        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
+        if let Err(error) =
+            self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())
+        {
+            self.remove_transient_object_metadata(&object.object_id);
+            return Err(error.into());
+        }
         let target_version = next_version(&object.version);
-        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
+        let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                self.remove_transient_object_metadata(&object.object_id);
+                return Err(error.into());
+            }
+        };
         let outcome = self.write_distributed_eventual_with_candidates_and_parent_touch(
             DfsWriteRequest {
                 file_system_id: object.file_system_id.clone(),

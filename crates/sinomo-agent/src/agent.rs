@@ -3880,7 +3880,18 @@ fn coding_state_from_items(items: &[AgentItem]) -> CodingRunState {
                 ..
             } => {
                 match status {
-                    AgentToolStatus::Succeeded => state.patch_status = CodingPatchStatus::Applied,
+                    AgentToolStatus::Succeeded => {
+                        state.patch_status = CodingPatchStatus::Applied;
+                        if !changed_files.is_empty() {
+                            // A successful command before the edit can prove
+                            // toolchain availability, but it cannot validate
+                            // bytes that did not exist yet. Keep that evidence
+                            // in the durable transcript while resetting the
+                            // current-patch validation projection.
+                            state.validation_attempts.clear();
+                            state.validation_status = CodingValidationStatus::NotRun;
+                        }
+                    }
                     AgentToolStatus::Blocked => state.patch_status = CodingPatchStatus::Blocked,
                     AgentToolStatus::Failed | AgentToolStatus::Cancelled => {
                         state.patch_status = CodingPatchStatus::Failed
@@ -16459,6 +16470,41 @@ mod tests {
             network_classification.failure_kind,
             Some(CodingCommandFailureKind::NetworkUnavailable)
         );
+    }
+
+    #[test]
+    fn coding_state_requires_validation_after_the_latest_patch() {
+        let state = coding_state_from_items(&[
+            AgentItem::VerificationResult {
+                item_id: TaskId::generate(),
+                step_index: 0,
+                call_id: TaskId::generate(),
+                command: "python --version && node --version".to_string(),
+                status: AgentVerificationState::Passed,
+                summary: "toolchains are installed".to_string(),
+            },
+            AgentItem::PatchSnapshot {
+                item_id: TaskId::generate(),
+                step_index: 1,
+                call_id: TaskId::generate(),
+                status: AgentToolStatus::Succeeded,
+                summary: "created frontend/package.json".to_string(),
+                patch_ref: None,
+                changed_files: vec!["frontend/package.json".to_string()],
+            },
+        ]);
+
+        assert_eq!(state.patch_status, CodingPatchStatus::Applied);
+        assert_eq!(state.validation_status, CodingValidationStatus::NotRun);
+        assert!(state.validation_attempts.is_empty());
+        assert_eq!(state.stop_recommendation, CodingStopDecision::Continue);
+        assert!(
+            state
+                .outstanding_evidence
+                .iter()
+                .any(|evidence| evidence.contains("current patch"))
+        );
+        assert!(!coding_state_should_stop_loop(&state));
     }
 
     #[test]

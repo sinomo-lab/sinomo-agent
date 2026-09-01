@@ -73,6 +73,13 @@ The local conversation/runtime boundary now follows the ownership model:
   host-absolute cwd used by the `simple_sandbox` compatibility runtime.
   Reconfiguring an automatically attached local sandbox uses this update path
   instead of silently retaining stale mounts.
+- The graphical Chat composer exposes the conversation workspace as a native
+  folder selection. Replacing a folder replaces the complete ordered grant set
+  rather than retaining hidden prior roots, and removal is an explicit
+  revocation. Picker results are fenced to the session and UI generation that
+  opened them. The provider-neutral app contract carries only the selected
+  path; daemon-hosted chat execution resolves and persists the authoritative
+  `WorkspaceRef` and reconciles the attached sandbox before acknowledging it.
 
 This is deliberately a foundation, not completion of remote execution: local
 CLI orchestration still provisions through `LocalSandboxBackend`, and the

@@ -2167,13 +2167,38 @@ mod windows {
                 detail: "simple-native command argv must include argv[0]".to_string(),
             });
         }
+        if argv.iter().any(|arg| arg.contains('\0')) {
+            return Err(SandboxWasiError::InvalidRequest {
+                detail: "simple-native Windows argv contains NUL byte".to_string(),
+            });
+        }
+
+        let is_cmd = Path::new(&argv[0])
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| matches!(name.to_ascii_lowercase().as_str(), "cmd" | "cmd.exe"));
+        let command_index = argv
+            .iter()
+            .position(|arg| arg.eq_ignore_ascii_case("/C") || arg.eq_ignore_ascii_case("/K"));
+        if is_cmd
+            && let Some(command_index) = command_index
+            && command_index + 1 == argv.len().saturating_sub(1)
+        {
+            // `cmd.exe` consumes the remainder after /C or /K as shell source,
+            // not as one C-runtime argv value. Applying backslash/quote argv
+            // escaping to that source changes nested quotes (for example
+            // `python -c "..."`) into literal text. Quote only the executable
+            // and flags, then append the already-formed shell command verbatim.
+            let mut pieces = argv[..=command_index]
+                .iter()
+                .map(|arg| quote_windows_arg(arg))
+                .collect::<Vec<_>>();
+            pieces.push(argv[command_index + 1].clone());
+            return Ok(wide_null(&pieces.join(" ")));
+        }
+
         let mut pieces = Vec::with_capacity(argv.len());
         for arg in argv {
-            if arg.contains('\0') {
-                return Err(SandboxWasiError::InvalidRequest {
-                    detail: "simple-native Windows argv contains NUL byte".to_string(),
-                });
-            }
             pieces.push(quote_windows_arg(arg));
         }
         Ok(wide_null(&pieces.join(" ")))
@@ -3081,6 +3106,53 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("ok")
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn simple_native_windows_preserves_nested_cmd_quotes_and_exit_status() {
+        let (_dir, store, sandbox_id) = create_store();
+        let (mut manifest, _) = store.load(&sandbox_id).expect("load manifest");
+        for name in ["PATH", "SYSTEMROOT"] {
+            if let Ok(value) = std::env::var(name) {
+                manifest.env.insert(name.to_string(), value);
+            }
+        }
+        store
+            .save_manifest(&manifest)
+            .expect("save host environment");
+        let node_id = NodeId::from_legacy_named("sandbox_simple_windows_quotes").expect("node");
+        let toolchain_store = sinomo_sandbox::LocalSandboxToolchainStore::new(std::env::temp_dir());
+
+        let outcome = runner()
+            .run_toolchain_command_with_stdin_policy_and_output_sink(
+                &store,
+                &toolchain_store,
+                &sandbox_id,
+                "cmd.exe",
+                vec![
+                    "cmd.exe".to_string(),
+                    "/C".to_string(),
+                    "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('abcdef'); [Console]::Error.Write('uvwxyz'); exit 2\""
+                        .to_string(),
+                ],
+                None,
+                5000,
+                &node_id,
+                &SandboxPolicy::default(),
+                None,
+            )
+            .expect("simple-native Windows nested-quote command");
+
+        assert_eq!(
+            outcome.response.exit_status,
+            2,
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&outcome.stdout),
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        assert_eq!(outcome.stdout, b"abcdef");
+        assert_eq!(outcome.stderr, b"uvwxyz");
     }
 
     #[test]

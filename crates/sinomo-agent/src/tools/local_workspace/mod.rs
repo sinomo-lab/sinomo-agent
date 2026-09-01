@@ -35,8 +35,8 @@ use sinomo_runtime::sandbox::{
     SandboxLocalExecutionLease, SandboxMount, SandboxPath, SandboxPolicy, SandboxRuntimeBinding,
     SandboxStoreError, SandboxTempPolicy, SandboxToolchainId, SandboxTrackedProcess,
     SandboxTrackedProcessStatus, SandboxUpdateInstanceRequest, SandboxWasiError,
-    recover_sandbox_local_execution_journal_with_lease, sandbox_execution_placement_for_node,
-    try_acquire_sandbox_local_execution_lease,
+    recover_sandbox_local_execution_journal_with_lease, sandbox_env_name_is_valid,
+    sandbox_execution_placement_for_node, try_acquire_sandbox_local_execution_lease,
 };
 use sinomo_runtime::sandbox_simple::{SandboxSimpleNativeCommandRunner, SandboxSimpleNativeConfig};
 use std::collections::BTreeMap;
@@ -1632,7 +1632,11 @@ fn sandbox_environment(
     // runner owns. Environment entries that cannot cross the string-based
     // sandbox request ABI are omitted.
     let mut envs = env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            let value = value.into_string().ok()?;
+            sandbox_env_name_is_valid(&name).then_some((name, value))
+        })
         .collect::<BTreeMap<_, _>>();
     if let Some(path) = sandbox_path_env(path_prefixes) {
         envs.insert("PATH".to_string(), path);

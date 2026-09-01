@@ -83,6 +83,7 @@ const SIFS_AGENT_SESSION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const SIFS_BROWSER_READ_RETRY_BUDGET: Duration = Duration::from_secs(3);
 const SIFS_BROWSER_READ_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(25);
 const SIFS_BROWSER_READ_RETRY_MAX_DELAY: Duration = Duration::from_millis(250);
+const SIFS_IMMUTABLE_WRITE_RECONCILIATION_BUDGET: Duration = Duration::from_secs(5);
 
 fn sifs_agent_channel_dir_at(channels_root: &str, channel_id: &SessionId) -> String {
     format!("{channels_root}/{}", channel_id.as_str())
@@ -1217,6 +1218,72 @@ impl SifsAgentChannelStore {
             .map_err(|detail| channel_store_io(path, detail))
     }
 
+    fn reconcile_immutable_write(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        original_detail: String,
+    ) -> Result<(), AgentChannelStoreError> {
+        let started = Instant::now();
+        let mut delay = SIFS_BROWSER_READ_RETRY_INITIAL_DELAY;
+        let mut last_detail = original_detail.clone();
+        loop {
+            match self.browser.read_file(path) {
+                Ok(existing) if existing == bytes => return Ok(()),
+                Ok(_) => {
+                    return Err(channel_store_io(
+                        path,
+                        format!(
+                            "immutable channel record differs after an ambiguous write: {original_detail}"
+                        ),
+                    ));
+                }
+                Err(detail) if sifs_error_is_not_found(&detail) => {}
+                Err(detail) if sifs_immutable_write_should_reconcile(&detail) => {
+                    last_detail = detail;
+                }
+                Err(detail) => {
+                    return Err(channel_store_io(
+                        path,
+                        format!(
+                            "cannot verify an ambiguous immutable channel write ({original_detail}); read-back failed: {detail}"
+                        ),
+                    ));
+                }
+            }
+
+            if started.elapsed() >= SIFS_IMMUTABLE_WRITE_RECONCILIATION_BUDGET {
+                return Err(channel_store_io(
+                    path,
+                    format!(
+                        "immutable channel write outcome remained unknown after byte-for-byte reconciliation: {original_detail}; last observation: {last_detail}"
+                    ),
+                ));
+            }
+
+            thread::sleep(delay);
+            delay = (delay * 2).min(SIFS_BROWSER_READ_RETRY_MAX_DELAY);
+            if let Err(error) = self.ensure_parent(path) {
+                match error {
+                    AgentChannelStoreError::Io { detail, .. }
+                        if sifs_immutable_write_should_reconcile(&detail) =>
+                    {
+                        last_detail = detail;
+                        continue;
+                    }
+                    error => return Err(error),
+                }
+            }
+            match self.browser.write_file(path, bytes) {
+                Ok(()) => return Ok(()),
+                Err(detail) if sifs_immutable_write_should_reconcile(&detail) => {
+                    last_detail = detail;
+                }
+                Err(detail) => return Err(channel_store_io(path, detail)),
+            }
+        }
+    }
+
     /// Best-effort materialization over immutable channel records.
     ///
     /// Concurrent writers may race the optimistic DFS version check. The
@@ -1229,9 +1296,12 @@ impl SifsAgentChannelStore {
         bytes: &[u8],
     ) -> Result<(), AgentChannelStoreError> {
         match self.write_file(path, bytes) {
-            Err(AgentChannelStoreError::Io { detail, .. })
-                if detail.contains("metadata transaction conflict") =>
-            {
+            Err(AgentChannelStoreError::Io { path, detail }) => {
+                tracing::warn!(
+                    %path,
+                    %detail,
+                    "repairable SIFS channel cache write deferred"
+                );
                 Ok(())
             }
             result => result,
@@ -1260,7 +1330,15 @@ impl SifsAgentChannelStore {
             Err(detail) if sifs_error_is_not_found(&detail) => {}
             Err(detail) => return Err(channel_store_io(path, detail)),
         }
-        self.write_file(path, &bytes)
+        match self.write_file(path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(AgentChannelStoreError::Io { detail, .. })
+                if sifs_immutable_write_should_reconcile(&detail) =>
+            {
+                self.reconcile_immutable_write(path, &bytes, detail)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn append_message_record(
@@ -4346,6 +4424,23 @@ impl AgentChat {
     /// session's sandbox attachment and other tool-runtime placement settings.
     pub fn clear_workspaces(&mut self) -> Result<ChatToolRuntimeSelection, CliError> {
         self.replace_workspaces(Vec::new())
+    }
+
+    /// Replace the conversation's complete workspace grant set with one
+    /// user-selected folder, or revoke all workspace access when absent.
+    pub fn replace_workspace_root(
+        &mut self,
+        workspace_root: Option<PathBuf>,
+    ) -> Result<ChatToolRuntimeSelection, CliError> {
+        let workspaces = workspace_root
+            .map(|root| {
+                workspace_ref_for_selected_root(&self.data_dir, &root)
+                    .map(|workspace| workspace.binding().clone())
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+        self.replace_workspaces(workspaces)
     }
 
     fn set_tool_runtime_with_workspace_replacement(
@@ -8927,6 +9022,15 @@ fn sifs_browser_read_should_retry(error: &str) -> bool {
             && error.contains(" is saturated:"))
 }
 
+fn sifs_immutable_write_should_reconcile(error: &str) -> bool {
+    error.contains("PossiblyApplied")
+        || error.contains("delivery state is possibly-applied")
+        || (error.contains("retained metadata authority generation")
+            && error.contains("is not ready"))
+        || error.contains("content is unavailable from every eligible replica")
+        || sifs_browser_read_should_retry(error)
+}
+
 fn reconcile_conditional_replace_bytes(
     receipt: SifsWriteReceipt,
     current_bytes: &[u8],
@@ -12017,6 +12121,79 @@ mod tests {
     }
 
     #[test]
+    fn app_chat_workspace_tools_execute_through_the_attached_simple_sandbox() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-simple-sandbox-workspace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).expect("create workspace");
+        let workspace = fs::canonicalize(workspace).expect("canonical workspace");
+        let mut permissions = sinomo_runtime::node::LocalNodePermissions::new();
+        permissions.set_remote_management_enabled(true);
+        sinomo_runtime::node::LocalNodePermissionStore::new(data_dir.root())
+            .save(&permissions)
+            .expect("grant local command execution for the fixture");
+
+        let mut chat = AgentChat::new(data_dir.clone(), false).expect("chat runtime");
+        chat.set_agent("coding-agent").expect("select coding agent");
+        chat.replace_workspace_root(Some(workspace.clone()))
+            .expect("select workspace");
+        let session = chat.runtime.session().clone();
+
+        let structured_write = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &session,
+            0,
+            "write_file",
+            serde_json::json!({
+                "path": "structured.txt",
+                "content": "structured workspace write\n",
+            }),
+        );
+        assert_eq!(
+            structured_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded
+        );
+
+        let command = if cfg!(windows) {
+            "echo sandbox-ok>command.txt"
+        } else {
+            "printf sandbox-ok > command.txt"
+        };
+        let command_write = tui::execute_tui_workspace_tool(
+            chat.runtime.handler(),
+            &session,
+            1,
+            "run_command",
+            serde_json::json!({ "command": command, "timeout_ms": 5_000 }),
+        );
+        assert_eq!(
+            command_write.status,
+            sinomo_agent::AgentToolStatus::Succeeded,
+            "simple-sandbox command failed: {}",
+            command_write.summary
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("structured.txt"))
+                .expect("structured workspace output"),
+            "structured workspace write\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("command.txt"))
+                .expect("sandbox command workspace output")
+                .trim(),
+            "sandbox-ok"
+        );
+        assert_eq!(
+            command_write
+                .evidence
+                .metadata
+                .pointer("/sandbox/runtime")
+                .and_then(serde_json::Value::as_str),
+            Some("simple_sandbox")
+        );
+    }
+
+    #[test]
     fn app_chat_explicit_workspace_clear_revokes_durable_and_runtime_authority() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-clear");
         let data_dir = SinomoDataDir::new(root.join("data"));
@@ -12096,6 +12273,42 @@ mod tests {
             mount.mount_path.as_str() != "/work"
                 && !mount.mount_path.as_str().starts_with("/workspaces/")
         }));
+    }
+
+    #[test]
+    fn app_chat_folder_selection_replaces_the_complete_workspace_grant() {
+        let root = sinomo_testdir::TestDir::new("sinomo-app-chat-workspace-replace");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let first = root.join("first-workspace");
+        let second = root.join("second-workspace");
+        fs::create_dir_all(&first).expect("create first workspace");
+        fs::create_dir_all(&second).expect("create second workspace");
+        let first = fs::canonicalize(first).expect("canonical first workspace");
+        let second = fs::canonicalize(second).expect("canonical second workspace");
+
+        let mut chat = AgentChat::new(data_dir, false).expect("chat runtime");
+        chat.set_agent("coding-agent").expect("select coding agent");
+        let selected = chat
+            .replace_workspace_root(Some(first.clone()))
+            .expect("select first workspace");
+        assert_eq!(selected.workspace_root.as_deref(), Some(first.as_path()));
+        assert_eq!(chat.workspaces().len(), 1);
+
+        let replaced = chat
+            .replace_workspace_root(Some(second.clone()))
+            .expect("replace workspace");
+        assert_eq!(replaced.workspace_root.as_deref(), Some(second.as_path()));
+        assert_eq!(chat.workspaces().len(), 1);
+        assert_eq!(
+            chat.workspaces()[0].local_root.as_deref(),
+            Some(second.as_path()),
+            "folder selection must not silently retain the previous workspace as an additional grant"
+        );
+
+        let revoked = chat.replace_workspace_root(None).expect("revoke workspace");
+        assert_eq!(revoked.workspace_root, None);
+        assert!(chat.workspaces().is_empty());
+        assert!(chat.channel.has_authoritative_workspace_projection());
     }
 
     #[test]

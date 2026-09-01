@@ -24,7 +24,6 @@ use crate::rendering::{AppRenderMode, resolve_render_options};
 use crate::theme::{AppTextScale, AppThemeMode, resolve_theme_with_preferences};
 use crate::ui::chat::{ChatState, ChatStructureKey};
 use crate::ui::cluster::{ClusterState, ClusterStructureKey};
-use crate::ui::evolution::{EvolutionState, EvolutionStructureKey};
 use crate::ui::files::{FilesState, FilesStructureKey};
 use crate::ui::settings::{
     SettingsSection, SettingsState, SettingsStructureKey, settings_structure_key,
@@ -35,8 +34,6 @@ use crate::ui::settings::{
 pub enum Tab {
     /// AI chat with the Sinomo agent.
     Sinomo,
-    /// Self-evolution jobs, candidate bundles, and rollout evidence.
-    Evolution,
     /// Cluster topology graph.
     Cluster,
     /// SIFS distributed file browser.
@@ -46,28 +43,20 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
-        Tab::Sinomo,
-        Tab::Evolution,
-        Tab::Cluster,
-        Tab::Files,
-        Tab::Settings,
-    ];
+    pub const ALL: [Tab; 4] = [Tab::Sinomo, Tab::Cluster, Tab::Files, Tab::Settings];
 
     pub fn index(self) -> usize {
         match self {
             Tab::Sinomo => 0,
-            Tab::Evolution => 1,
-            Tab::Cluster => 2,
-            Tab::Files => 3,
-            Tab::Settings => 4,
+            Tab::Cluster => 1,
+            Tab::Files => 2,
+            Tab::Settings => 3,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Tab::Sinomo => "Chat",
-            Tab::Evolution => "Evolution",
             Tab::Cluster => "Cluster",
             Tab::Files => "Files",
             Tab::Settings => "Settings",
@@ -185,7 +174,6 @@ pub enum HealthSurface {
     Chat,
     Files,
     Cluster,
-    Evolution,
     Settings(SettingsSection),
 }
 
@@ -196,7 +184,6 @@ impl HealthSurface {
             Self::Chat => "Chat".to_string(),
             Self::Files => "Files · SIFS".to_string(),
             Self::Cluster => "Cluster".to_string(),
-            Self::Evolution => "Evolution".to_string(),
             Self::Settings(section) => format!("Settings · {}", section.title()),
         }
     }
@@ -240,7 +227,6 @@ impl HealthIssue {
 pub struct ReadyState {
     pub backend: Backend,
     pub chat: ChatState,
-    pub evolution: EvolutionState,
     pub cluster: ClusterState,
     pub files: FilesState,
     pub settings: SettingsState,
@@ -280,12 +266,6 @@ impl ReadyState {
         }
         progress("Starting the chat engine…");
         let chat = ChatState::new_with_waker(&backend, waker);
-        progress("Preparing self-evolution…");
-        let evolution = if interactive {
-            EvolutionState::new_lightweight(&backend)
-        } else {
-            EvolutionState::new(&backend)
-        };
         progress("Reading cluster status…");
         let cluster = ClusterState::new(&backend);
         progress("Preparing the file browser…");
@@ -299,7 +279,6 @@ impl ReadyState {
         Self {
             backend,
             chat,
-            evolution,
             cluster,
             files,
             settings,
@@ -417,9 +396,6 @@ pub struct AppSignals {
     pub health_structure: Signal<HealthStructureKey>,
     pub loading_stall_lines: Signal<[Option<String>; 2]>,
     pub cluster_structure: Signal<ClusterStructureKey>,
-    pub evolution_structure: Signal<EvolutionStructureKey>,
-    pub evolution_objective_revision: Signal<u64>,
-    pub evolution_scope_revision: Signal<u64>,
     pub files_structure: Signal<FilesStructureKey>,
     pub files_thumbnail_revision: Signal<u64>,
     pub settings_structure: Signal<SettingsStructureKey>,
@@ -448,30 +424,6 @@ impl AppSignals {
                     state.theme(),
                     state.ready.as_ref().map(|ready| &ready.cluster),
                 ),
-            ),
-            evolution_structure: Signal::named(
-                "evolution structure",
-                EvolutionStructureKey::new(
-                    state.theme_mode,
-                    state.text_scale,
-                    state.ready.as_ref().map(|ready| &ready.evolution),
-                ),
-            ),
-            evolution_objective_revision: Signal::named(
-                "evolution objective replacement",
-                state
-                    .ready
-                    .as_ref()
-                    .map(|ready| ready.evolution.editor_revisions().0)
-                    .unwrap_or_default(),
-            ),
-            evolution_scope_revision: Signal::named(
-                "evolution scope replacement",
-                state
-                    .ready
-                    .as_ref()
-                    .map(|ready| ready.evolution.editor_revisions().1)
-                    .unwrap_or_default(),
             ),
             files_structure: Signal::named(
                 "files structure",
@@ -529,7 +481,6 @@ pub struct HealthStructureKey {
     pub connection_detail: String,
     pub connection_phase: ConnectionPhase,
     pub connection_pending: bool,
-    pub evolution_pending: bool,
     pub action_error: Option<String>,
     pub ready: bool,
 }
@@ -555,7 +506,6 @@ impl HealthStructureKey {
             connection_detail: health.detail.clone(),
             connection_phase: health.phase,
             connection_pending: health.is_pending(),
-            evolution_pending: false,
             action_error: None,
             ready,
         }
@@ -710,28 +660,6 @@ impl Shared {
         )
     }
 
-    pub fn evolution(&self) -> Ref<'_, EvolutionState> {
-        Ref::map(self.state.borrow(), |s| {
-            &s.ready.as_ref().expect("app is ready").evolution
-        })
-    }
-
-    pub fn evolution_mut(&self) -> PublishedRefMut<'_, EvolutionState> {
-        let shared = self.clone();
-        PublishedRefMut::new(
-            RefMut::map(self.state.borrow_mut(), |s| {
-                &mut s.ready.as_mut().expect("app is ready").evolution
-            }),
-            move || shared.publish_evolution_signals(),
-        )
-    }
-
-    pub(crate) fn evolution_mut_unpublished(&self) -> RefMut<'_, EvolutionState> {
-        RefMut::map(self.state.borrow_mut(), |state| {
-            &mut state.ready.as_mut().expect("app is ready").evolution
-        })
-    }
-
     pub fn files(&self) -> Ref<'_, FilesState> {
         Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").files
@@ -838,33 +766,6 @@ impl Shared {
         }
     }
 
-    pub fn publish_evolution_signals(&self) {
-        let (objective_revision, scope_revision, structure) = {
-            let state = self.state.borrow();
-            let revisions = state
-                .ready
-                .as_ref()
-                .map(|ready| ready.evolution.editor_revisions())
-                .unwrap_or_default();
-            (
-                revisions.0,
-                revisions.1,
-                EvolutionStructureKey::new(
-                    state.theme_mode,
-                    state.text_scale,
-                    state.ready.as_ref().map(|ready| &ready.evolution),
-                ),
-            )
-        };
-        self.signals
-            .evolution_objective_revision
-            .set(objective_revision);
-        self.signals.evolution_scope_revision.set(scope_revision);
-        if self.signals.evolution_structure.set(structure) {
-            self.publish_health_signals();
-        }
-    }
-
     pub fn publish_files_signals(&self) {
         let (structure, thumbnail_revision) = {
             let state = self.state.borrow();
@@ -928,7 +829,6 @@ impl Shared {
             connection_detail,
             connection_phase,
             connection_pending,
-            evolution_pending,
             status,
         ) = {
             let state = self.state.borrow();
@@ -940,10 +840,6 @@ impl Shared {
                 health.detail.clone(),
                 health.phase,
                 health.is_pending(),
-                state
-                    .ready
-                    .as_ref()
-                    .is_some_and(|ready| ready.evolution.dashboard_refresh_pending()),
                 shell_status_for(&state, &issues),
             )
         };
@@ -955,7 +851,6 @@ impl Shared {
             connection_detail,
             connection_phase,
             connection_pending,
-            evolution_pending,
             action_error,
             ready,
         });
@@ -966,7 +861,6 @@ impl Shared {
             return;
         }
         self.publish_cluster_signals();
-        self.publish_evolution_signals();
         self.publish_files_signals();
         self.publish_settings_signals();
         self.publish_chat_signals();
@@ -1276,15 +1170,6 @@ impl Shared {
         {
             issues.push(HealthIssue::new(HealthSurface::Cluster, detail.clone()));
         }
-        if let Some(detail) = ready
-            .evolution
-            .dashboard_refresh_error()
-            .or(ready.evolution.dashboard.error.as_deref())
-            .filter(|detail| !is_loading_placeholder(detail))
-        {
-            issues.push(HealthIssue::new(HealthSurface::Evolution, detail));
-        }
-
         let settings = &ready.settings;
         let settings_errors = [
             (

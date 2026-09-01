@@ -195,7 +195,7 @@ pub const AGENT_HUES: [Color; 6] = [
 ];
 
 /// The Mesh semantic palette used by the bespoke chrome (title bar, sidebars,
-/// transcript, cluster graph, evolution cards) so it stays coherent with the
+/// transcript, and cluster graph) so it stays coherent with the
 /// composed sui widgets across all three themes.
 #[derive(Clone, Copy)]
 pub struct Palette {

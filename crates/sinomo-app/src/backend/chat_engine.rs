@@ -78,6 +78,10 @@ pub enum ChatCommand {
     SetToolRuntime {
         selection: ChatToolRuntimeSelection,
     },
+    SetWorkspace {
+        session_id: String,
+        workspace_root: Option<std::path::PathBuf>,
+    },
     SetToolRuntimeNode {
         sandbox_node_id: Option<String>,
     },
@@ -351,6 +355,13 @@ fn wire_command(
         ChatCommand::SetToolRuntime { selection } => {
             wire::ChatSessionCommand::SetToolRuntime { selection }
         }
+        ChatCommand::SetWorkspace {
+            session_id,
+            workspace_root,
+        } => wire::ChatSessionCommand::SetWorkspace {
+            session_id,
+            workspace_root,
+        },
         ChatCommand::SetToolRuntimeNode { sandbox_node_id } => {
             wire::ChatSessionCommand::SetToolRuntimeNode { sandbox_node_id }
         }
