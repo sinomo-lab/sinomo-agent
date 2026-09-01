@@ -74,6 +74,15 @@ impl RealtimeAudioProvider {
         }
     }
 
+    /// Models this provider exposes through the realtime session API. This catalog is separate
+    /// from ordinary response/chat models because the protocols and model families differ.
+    pub fn model_ids(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenAi | Self::Codex => &[OPENAI_REALTIME_DEFAULT_MODEL],
+            Self::MiniCpmO => &[MINICPM_REALTIME_DEFAULT_MODEL],
+        }
+    }
+
     pub fn default_base_url(self) -> &'static str {
         match self {
             Self::OpenAi | Self::Codex => OPENAI_DEFAULT_REALTIME_BASE_URL,
@@ -2839,6 +2848,23 @@ mod tests {
         assert!(capabilities.realtime_webrtc);
         assert!(capabilities.realtime_websocket);
         assert_eq!(capabilities, crate::provider_capabilities("codex"));
+    }
+
+    #[test]
+    fn realtime_model_catalog_is_protocol_specific_and_shared_by_codex() {
+        assert_eq!(
+            RealtimeAudioProvider::OpenAi.model_ids(),
+            &[OPENAI_REALTIME_DEFAULT_MODEL]
+        );
+        assert_eq!(
+            RealtimeAudioProvider::Codex.model_ids(),
+            RealtimeAudioProvider::OpenAi.model_ids()
+        );
+        assert_eq!(
+            crate::provider_realtime_model_ids("codex"),
+            vec![OPENAI_REALTIME_DEFAULT_MODEL.to_string()]
+        );
+        assert!(crate::provider_realtime_model_ids("anthropic").is_empty());
     }
 
     #[test]
