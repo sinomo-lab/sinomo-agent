@@ -6636,11 +6636,16 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
     config.max_command_output_bytes = 4;
     let registry = fixed_command_readiness_registry(config);
     let session = readiness_session();
+    let success_command = if cfg!(windows) {
+        "set /p x=ok<nul&set /p x=er<nul 1>&2&exit /B 0"
+    } else {
+        "printf ok; printf er >&2"
+    };
     let success_call = AgentToolCall {
         call_id: None,
         tool: "run_command".to_string(),
         input: serde_json::json!({
-            "command": "printf ok; printf er >&2",
+            "command": success_command,
             "timeout_ms": 5000,
         }),
         r#async: false,
@@ -6668,11 +6673,16 @@ fn check_local_command_evidence_smoke(workspace_root: &Path) -> AgentReadinessCh
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true);
 
+    let failed_command = if cfg!(windows) {
+        "set /p x=abcdef<nul&set /p x=uvwxyz<nul 1>&2&exit /B 2"
+    } else {
+        "printf abcdef; printf uvwxyz >&2; exit 2"
+    };
     let failed_call = AgentToolCall {
         call_id: None,
         tool: "run_command".to_string(),
         input: serde_json::json!({
-            "command": "printf abcdef; printf uvwxyz >&2; exit 2",
+            "command": failed_command,
             "timeout_ms": 5000,
         }),
         r#async: false,

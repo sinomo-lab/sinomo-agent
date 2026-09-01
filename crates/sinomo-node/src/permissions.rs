@@ -212,9 +212,12 @@ pub struct LocalNodePermissionStore {
 
 impl LocalNodePermissionStore {
     pub fn new(data_dir: impl AsRef<Path>) -> Self {
-        Self {
-            path: data_dir.as_ref().join(LOCAL_NODE_PERMISSIONS_RELATIVE_PATH),
-        }
+        let path = LOCAL_NODE_PERMISSIONS_RELATIVE_PATH
+            .split('/')
+            .fold(data_dir.as_ref().to_path_buf(), |path, component| {
+                path.join(component)
+            });
+        Self { path }
     }
 
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
