@@ -3215,7 +3215,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
-        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
+        if let Err(error) =
+            self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())
+        {
+            if transient_create {
+                self.remove_transient_object_metadata(&object.object_id);
+            }
+            return Err(error.into());
+        }
         let target_version = operation_id
             .map(|operation_id| {
                 stable_write_target_version(&self.node_id, &object.object_id, operation_id)
@@ -3241,7 +3248,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
+        let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(error.into());
+            }
+        };
         let committed_locations = candidates.clone();
         let remote_metadata_primary = match self.select_metadata_shard_for_object(&object) {
             Ok(Some(shard)) => shard.primary_node_id != self.node_id,
@@ -3648,7 +3663,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 object
             }
         };
-        self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())?;
+        if let Err(error) =
+            self.apply_managed_policy_to_new_object(&mut object, options.replica_candidates.len())
+        {
+            if transient_create {
+                self.remove_transient_object_metadata(&object.object_id);
+            }
+            return Err(error.into());
+        }
         let target_version = operation_id
             .as_deref()
             .map(|operation_id| {
@@ -3676,7 +3698,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             }
         }
-        let candidates = self.posix_replica_candidates_for_write(&object, &options)?;
+        let candidates = match self.posix_replica_candidates_for_write(&object, &options) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                if transient_create {
+                    self.remove_transient_object_metadata(&object.object_id);
+                }
+                return Err(error.into());
+            }
+        };
         let committed_locations = candidates.clone();
         let request = DfsWriteRequest {
             file_system_id: object.file_system_id.clone(),
