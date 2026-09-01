@@ -136,7 +136,7 @@ fn internal_storage_component_catalog() -> sinomo_module::ComponentCatalog {
         ))
         .expect("register build storage component")
         .register_factory(Arc::new(
-            sinomo_dfs::component_factory_with_hosts(None, None).expect("DFS component descriptor"),
+            sinomo_dfs::component_factory().expect("DFS component descriptor"),
         ))
         .expect("register DFS storage component")
         .register_factory(Arc::new(

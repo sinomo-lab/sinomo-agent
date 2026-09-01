@@ -216,6 +216,7 @@ impl AsyncDaemonControlListener {
         })
     }
 
+    /// Adopt a listener reserved by the process host before component startup.
     pub async fn from_std(
         listener: std::net::TcpListener,
         bind_address: impl Into<String>,

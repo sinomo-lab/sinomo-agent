@@ -1,5 +1,15 @@
 use super::*;
 
+fn own_dfs_publish_task(data_dir: &SinomoDataDir, task: Option<tokio::task::JoinHandle<()>>) {
+    let Some(task) = task else {
+        return;
+    };
+    match dfs_runtime_host(data_dir) {
+        Ok(host) => host.own_task(task),
+        Err(_) => task.abort(),
+    }
+}
+
 pub(super) fn daemon_dfs_metadata_replication_options() -> DfsMetadataJournalReplicationOptions {
     sinomo_dfs::dfs_resident_metadata_replication_options()
 }
@@ -106,7 +116,8 @@ pub(super) fn schedule_daemon_dfs_allocator_cleanup_on_runtime(
     let run_scheduler = Arc::clone(&cleanup_scheduler);
     let report_data_root = data_dir.root();
     let error_data_root = report_data_root.clone();
-    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+    let owner_data_dir = data_dir.clone();
+    let (_, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         Arc::clone(&cleanup_scheduler),
         runtime.clone(),
         DfsMetadataPublishScheduleOptions {
@@ -179,6 +190,7 @@ pub(super) fn schedule_daemon_dfs_allocator_cleanup_on_runtime(
             );
         },
     );
+    own_dfs_publish_task(&owner_data_dir, task);
 }
 
 pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
@@ -205,6 +217,7 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
             return;
         }
     };
+    let owner_data_dir = data_dir.clone();
     let lane = Arc::new(DaemonDfsReplicaMaterializationLane {
         data_dir,
         runtime: runtime.clone(),
@@ -217,7 +230,7 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
     let report_shard_id = shard_id.clone();
     let error_file_system_id = file_system_id;
     let error_shard_id = shard_id;
-    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+    let (_, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         Arc::clone(&scheduler),
         runtime.clone(),
         DfsMetadataPublishScheduleOptions {
@@ -299,6 +312,7 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
             );
         },
     );
+    own_dfs_publish_task(&owner_data_dir, task);
 }
 
 /// Resolve a retained global publish edge without polling a synchronous cold
@@ -433,12 +447,13 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
             return DfsMetadataPublishScheduleStart::AlreadyRunning;
         }
     };
+    let owner_data_dir = data_dir.clone();
     let publish_data_dir = data_dir;
     let publish_cluster_paths = cluster_paths;
     let publish_runtime = runtime.clone();
     let report_traceparent = traceparent.clone();
     let error_traceparent = traceparent;
-    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+    let (start, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         scheduler,
         runtime.clone(),
         daemon_dfs_metadata_publish_discovery_schedule_options(),
@@ -488,7 +503,9 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
             );
             tracing::warn!("sinomo daemon DFS metadata lane discovery failed: {error}");
         },
-    )
+    );
+    own_dfs_publish_task(&owner_data_dir, task);
+    start
 }
 
 /// Re-dirty only publisher lanes that are currently retained by durable
@@ -571,6 +588,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
     };
     let (_peer_transport, async_peer_transport) =
         daemon_dfs_peer_transports_on_runtime(&data_dir, runtime);
+    let owner_data_dir = data_dir.clone();
     let publish_data_dir = data_dir;
     let publish_cluster_paths = cluster_paths;
     let publish_file_system_id = lane.file_system_id.clone();
@@ -580,7 +598,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
     let error_lane = lane;
     let report_traceparent = traceparent.clone();
     let error_traceparent = traceparent;
-    sinomo_dfs::schedule_dfs_metadata_publish_async_on_runtime(
+    let (start, task) = crate::schedule_dfs_metadata_publish_async_on_runtime_owned(
         scheduler,
         runtime.clone(),
         daemon_dfs_metadata_publish_schedule_options(),
@@ -755,7 +773,9 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_lane_on_runtime(
                 "sinomo daemon DFS scheduled metadata publish failed: {error}"
             );
         },
-    )
+    );
+    own_dfs_publish_task(&owner_data_dir, task);
+    start
 }
 
 #[cfg(test)]

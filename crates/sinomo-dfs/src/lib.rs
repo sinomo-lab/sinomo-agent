@@ -6,6 +6,8 @@
 //! interface is intentionally exported from this crate root so callers do not
 //! couple to the internal module layout.
 
+extern crate self as sinomo_dfs;
+
 mod advisory_lock;
 mod body_rpc;
 pub mod browser_api;
@@ -85,6 +87,7 @@ mod repair_queue_store;
 mod routes;
 mod runtime_admission;
 mod runtime_authority;
+pub mod runtime_host;
 mod runtime_message;
 mod runtime_mounted_mutation;
 mod runtime_probe;
@@ -146,6 +149,7 @@ pub use metadata_authority_runtime::{
     DfsMetadataAuthorityReadFuture, DfsMetadataAuthorityRuntime,
     DfsMetadataAuthorityRuntimeRegistry, DfsMetadataAuthorityState, DfsMetadataAuthorityTask,
 };
+pub use performance_metrics::dfs_status_observe_metrics;
 pub use runtime_admission::{
     DFS_MUTATION_SHARD_GATE_LIMIT, DfsMaintenanceForegroundPreemption,
     DfsMaintenancePreemptionOutcome, DfsMetadataLaneKey, DfsMetadataSchedulerRegistry,
@@ -177,12 +181,18 @@ pub use runtime_message::{
     test_clear_dfs_runtime_peer_discovery_cache, test_expire_dfs_runtime_peer_discovery_cache,
 };
 pub use runtime_mounted_mutation::{
-    MOUNTED_SIFS_MUTATION_REPROBE_INTERVAL, MountedSifsMutationHandoffHost,
-    MountedSifsMutationHandoffPhase, MountedSifsMutationHandoffRequest,
-    MountedSifsMutationHandoffResponse, MountedSifsMutationRecoveryBatch,
-    all_mounted_sifs_mutation_committed_work, handle_mounted_sifs_mutation_handoff,
-    mounted_sifs_mutation_pending_maintenance_work, mounted_sifs_mutation_startup_committed_work,
-    persist_default_dfs_repair_queue_records,
+    DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES, DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+    DFS_MOUNTED_MUTATION_RPC_CATEGORY, MOUNTED_SIFS_MUTATION_REPROBE_INTERVAL,
+    MountedSifsMutationHandoffHost, MountedSifsMutationHandoffPhase,
+    MountedSifsMutationHandoffRequest, MountedSifsMutationHandoffResponse,
+    MountedSifsMutationRecoveryBatch, all_mounted_sifs_mutation_committed_work,
+    handle_mounted_sifs_mutation_handoff, mounted_sifs_mutation_pending_maintenance_work,
+    mounted_sifs_mutation_startup_committed_work, persist_default_dfs_repair_queue_records,
+};
+pub use runtime_mounted_mutation::{
+    MountedSifsMutationHandoffPhase as DaemonDfsMountedMutationHandoffPhase,
+    MountedSifsMutationHandoffRequest as DaemonDfsMountedMutationHandoffRequest,
+    MountedSifsMutationHandoffResponse as DaemonDfsMountedMutationHandoffResponse,
 };
 pub use runtime_probe::{
     DfsContentVersionGcRuntimeProbeOptions, DfsContentVersionGcRuntimeProbeReport,
@@ -266,7 +276,7 @@ pub use control_plane::{
 };
 #[cfg(test)]
 pub(crate) use default_cluster::run_default_cluster_dfs_smoke;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use default_cluster::test_establish_default_cluster_dfs_replica_progress_subscription;
 pub use default_cluster::{
@@ -470,7 +480,7 @@ pub(crate) use metadata_records::{
     put_visible_version_record_if_changed, read_conflicts_reason,
     remote_read_rejection_prunes_location,
 };
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
 pub use metadata_replication::{
@@ -519,6 +529,7 @@ pub(crate) use metadata_replication::{
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport,
     metadata_journal_rejection_allows_snapshot_repair,
+    schedule_dfs_metadata_publish_async_on_runtime_owned,
 };
 #[cfg(test)]
 pub(crate) use metadata_replication::{
@@ -539,10 +550,11 @@ pub use model::{
 };
 pub(crate) use model::{normalize_current_locations, path_index_key};
 pub use module_surface::{
-    DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, SIFS_PATH_ACCESS_CAPABILITY,
-    SINOMO_DFS_MODULE_LEGACY_ID, SINOMO_DFS_MODULE_OWNER, SINOMO_DFS_NATIVE_REGISTRATION_KEY,
-    dfs_module_capabilities, dfs_module_enabled, dfs_module_id, dfs_module_registration,
-    dfs_module_surfaces, register_storage_paths, set_dfs_module_enabled,
+    DFS_POLICY_VIOLATION_EVENT_KIND, DFS_PROTOCOL, DfsMigrationQuarantinePlan,
+    SIFS_PATH_ACCESS_CAPABILITY, SINOMO_DFS_MODULE_LEGACY_ID, SINOMO_DFS_MODULE_OWNER,
+    SINOMO_DFS_NATIVE_REGISTRATION_KEY, dfs_migration_quarantine_plan, dfs_module_capabilities,
+    dfs_module_enabled, dfs_module_id, dfs_module_registration, dfs_module_surfaces,
+    register_storage_paths, set_dfs_module_enabled,
 };
 pub use mount_config::{
     SIFS_MOUNT_CONFIG_KEY, SIFS_MOUNT_CURSOR_ONLY_RECOVERY_ROUTE, SIFS_MOUNT_STATUS_CONFIG_KEY,
@@ -769,8 +781,7 @@ pub use metadata_authority_projection::{
 
 pub use service::{
     DfsDataPlaneHost, DfsDataPlaneHostError, DfsDataPlaneHostFuture, DfsDataPlaneResponse,
-    DfsDataPlaneService, DfsInboundAttachment, DfsService, component_factory_with_hosts,
-    register_data_plane_services, register_services, register_services_with_data_plane_host,
+    DfsDataPlaneService, DfsInboundAttachment, DfsService, component_factory, register_services,
 };
 pub(crate) use service_state::{
     ActiveReplicaStage, DFS_CONFLICT_SCAN_PAGE_SIZE, DFS_DATA_PLANE_MESSAGE_DRAIN_MAX_PASSES,

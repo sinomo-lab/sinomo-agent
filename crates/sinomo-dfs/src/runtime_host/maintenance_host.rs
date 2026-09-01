@@ -344,9 +344,9 @@ pub(crate) fn handle_daemon_dfs_mounted_mutation_handoff_on_runtime(
     paths: &DaemonPaths,
     runtime: &tokio::runtime::Handle,
     traceparent: Option<String>,
-    request: crate::DaemonDfsMountedMutationHandoffRequest,
-) -> Result<crate::DaemonDfsMountedMutationHandoffResponse, DaemonError> {
-    if crate::daemon_paths_are_shadow(paths) {
+    request: DaemonDfsMountedMutationHandoffRequest,
+) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonError> {
+    if paths.is_shadow() {
         return Err(DaemonError::Parse {
             detail: "mounted-mutation durability handoff is owned only by the main daemon"
                 .to_string(),

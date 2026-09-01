@@ -14,6 +14,11 @@ use crate::{
     MountedSifsMutationRecoveryReceipt, default_dfs_repair_attempt_snapshot_path,
     dfs_now_unix_nanos,
 };
+
+pub const DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE: &str = "/daemon/dfs/mounted-mutation/handoff-v1";
+pub const DFS_MOUNTED_MUTATION_RPC_CATEGORY: &str = "daemon";
+pub const DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES: usize =
+    crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES;
 use sinomo_core::local::SinomoDataDir;
 use std::time::Duration;
 

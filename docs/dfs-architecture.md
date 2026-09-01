@@ -20,6 +20,22 @@ The design separates:
 - policy-driven replication, caching, and repair;
 - bounded network transfer for content and metadata catch-up.
 
+## Runtime Ownership
+
+`sinomo-dfs` owns the full in-process DFS implementation, including the
+resident authority cache, data-owner lock, services, bootstrap barrier,
+maintenance scheduling, placement observers, events, and metrics. Its
+component factory consumes only generic host capabilities from
+`sinomo-module::ComponentContext`: cluster reads and commits, target-addressed
+object RPC, runtime execution, node-resource observations, activity counters,
+and component events. The host does not provide DFS-specific callbacks.
+
+The shared product profile selects the DFS component for main and embedded
+products. Shadow and disabled profiles omit the component and therefore expose
+no DFS routes or background work. Component-scope teardown is the sole
+process-lifetime boundary for resident DFS workers and the exclusive data-root
+lease.
+
 ## Non-Goals
 
 - Replacing the host filesystem or Git.
@@ -125,7 +141,7 @@ eligible for prompt rediscovery and retry. Missing desired replicas catch up
 through normal replica maintenance after activation; missing retiring-only
 replicas remain fenced by the committed successor epoch when they return.
 
-Daemon maintenance discovery includes a pending handoff only on its retiring
+DFS component maintenance discovery includes a pending handoff only on its retiring
 primary. This allows a handoff committed immediately after one maintenance pass
 to request the prompt maintenance cadence instead of idling until the long
 periodic tick. A pending handoff owned by another node does not schedule a local
@@ -930,7 +946,7 @@ metering re-probes the durable queue. Local write/namespace/conflict/handoff
 recovery continues, while an explicit operator disaster-recovery request
 bypasses this advisory background policy.
 
-The storage sampler is event-driven on every daemon, not only mobile hosts. It
+The storage sampler is event-driven in every active DFS component, not only mobile hosts. It
 samples physical capacity once at startup and after a short coalescing delay for
 committed DFS mutations or completed lifecycle maintenance. Idle time and
 advertisement lease age never sample storage or publish a heartbeat. Exact

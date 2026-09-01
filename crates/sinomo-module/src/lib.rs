@@ -1783,6 +1783,8 @@ pub struct ModuleObjectRpcRoute {
     pub response_body_mode: NativeModuleBodyMode,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_local_permissions: Vec<String>,
+    #[serde(default)]
+    pub exact_member_identity: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1793,6 +1795,7 @@ pub struct ModuleObjectRpcRouteDescriptor {
     pub auth_scope: String,
     pub required_capabilities: Vec<CapabilityName>,
     pub required_local_permissions: Vec<String>,
+    pub exact_member_identity: bool,
     pub request_body_mode: NativeModuleBodyMode,
     pub response_body_mode: NativeModuleBodyMode,
 }
@@ -1816,6 +1819,7 @@ impl ModuleObjectRpcRoute {
             request_body_mode: NativeModuleBodyMode::None,
             response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
+            exact_member_identity: false,
         }
     }
 
@@ -1831,6 +1835,11 @@ impl ModuleObjectRpcRoute {
 
     pub fn require_local_permission(mut self, permission: impl Into<String>) -> Self {
         self.required_local_permissions.push(permission.into());
+        self
+    }
+
+    pub fn require_exact_member_identity(mut self) -> Self {
+        self.exact_member_identity = true;
         self
     }
 
@@ -1901,6 +1910,7 @@ impl ModuleObjectRpcRoute {
             auth_scope: self.auth_scope().to_string(),
             required_capabilities: vec![operation],
             required_local_permissions: self.required_local_permissions.clone(),
+            exact_member_identity: self.exact_member_identity,
             request_body_mode: self.request_body_mode,
             response_body_mode: self.response_body_mode,
         })
@@ -3581,7 +3591,7 @@ fn native_descriptor_surfaces_to_module_surfaces(
 fn native_descriptor_route_to_module_route(
     route: &NativeModuleObjectRpcRoute,
 ) -> Result<ModuleObjectRpcRoute, NativeDylibModuleInstallError> {
-    Ok(ModuleObjectRpcRoute::new(
+    let route_descriptor = ModuleObjectRpcRoute::new(
         route.route.clone(),
         route.category.clone(),
         route.operation.clone(),
@@ -3589,7 +3599,12 @@ fn native_descriptor_route_to_module_route(
     )
     .with_request_body_mode(route.request_body_mode)
     .with_response_body_mode(route.response_body_mode)
-    .require_local_permissions(route.required_local_permissions.clone()))
+    .require_local_permissions(route.required_local_permissions.clone());
+    Ok(if route.exact_member_identity {
+        route_descriptor.require_exact_member_identity()
+    } else {
+        route_descriptor
+    })
 }
 
 fn native_descriptor_route_auth(
@@ -6247,6 +6262,7 @@ mod tests {
                     request_body_mode: sinomo_module_api::NativeModuleBodyMode::Optional,
                     response_body_mode: sinomo_module_api::NativeModuleBodyMode::Required,
                     required_local_permissions: vec!["remote-management".to_string()],
+                    exact_member_identity: false,
                 }],
                 declarative_resources: vec![NativeModuleDeclarativeResource {
                     id: "skill.dynamic-native".to_string(),

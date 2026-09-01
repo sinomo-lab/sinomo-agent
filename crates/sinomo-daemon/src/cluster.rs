@@ -1065,25 +1065,6 @@ pub(crate) async fn read_cluster_kv_authoritative_range_prefix_with_cluster_path
     }
 }
 
-pub(crate) fn read_cluster_kv_authoritative_range_prefix_with_cluster_paths_on_runtime(
-    cluster_paths: &ClusterPaths,
-    prefix: String,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<sinomo_core::kv::KvEntry>>, DaemonError> {
-    block_on_daemon_cluster_future_on_owner_runtime(
-        runtime,
-        Box::pin(
-            read_cluster_kv_authoritative_range_prefix_with_cluster_paths_async_on_runtime(
-                cluster_paths,
-                prefix,
-                allow_forwarding,
-                runtime,
-            ),
-        ),
-    )
-}
-
 pub(crate) async fn handle_daemon_cluster_kv_authoritative_entry_request_async_on_runtime(
     paths: &DaemonPaths,
     key: String,
@@ -1164,9 +1145,10 @@ pub(crate) async fn read_cluster_kv_authoritative_entries_with_cluster_paths_asy
     .await
 }
 
-/// Deadline-preserving exact-key authority read used by DFS operation-bound
-/// revalidation. The inherited deadline is also capped by the daemon's normal
+/// Deadline-preserving exact-key authority read used by focused control-plane
+/// tests. The inherited deadline is also capped by the daemon's normal
 /// Raft authority budget, and is never restarted by a retrying caller.
+#[cfg(test)]
 pub(crate) async fn read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
     cluster_paths: &ClusterPaths,
     keys: Vec<String>,
@@ -1295,48 +1277,6 @@ async fn read_daemon_cluster_state_for_authority_before_deadline(
     }
 }
 
-pub(crate) fn read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime(
-    cluster_paths: &ClusterPaths,
-    keys: Vec<String>,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
-{
-    block_on_daemon_cluster_future_on_owner_runtime(
-        runtime,
-        Box::pin(
-            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime(
-                cluster_paths,
-                keys,
-                allow_forwarding,
-                runtime,
-            ),
-        ),
-    )
-}
-
-pub(crate) fn read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime_before_deadline(
-    cluster_paths: &ClusterPaths,
-    keys: Vec<String>,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-    deadline: Instant,
-) -> Result<sinomo_core::kv::KvAuthoritativeRead<Vec<Option<sinomo_core::kv::KvEntry>>>, DaemonError>
-{
-    block_on_daemon_cluster_future_on_owner_runtime(
-        runtime,
-        Box::pin(
-            read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
-                cluster_paths,
-                keys,
-                allow_forwarding,
-                runtime,
-                deadline,
-            ),
-        ),
-    )
-}
-
 pub(crate) async fn handle_daemon_cluster_kv_request_outcome_request_async_on_runtime(
     paths: &DaemonPaths,
     body: &[u8],
@@ -1420,42 +1360,6 @@ async fn handle_daemon_cluster_kv_request_async_with_forwarding_and_timeouts(
     })?
 }
 
-pub(crate) fn handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
-    cluster_paths: &ClusterPaths,
-    txn: KvTxn,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    block_on_daemon_cluster_future_on_owner_runtime(
-        runtime,
-        Box::pin(
-            handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
-                cluster_paths,
-                txn,
-                allow_forwarding,
-                runtime,
-            ),
-        ),
-    )
-}
-
-pub(crate) async fn handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
-    cluster_paths: &ClusterPaths,
-    txn: KvTxn,
-    allow_forwarding: bool,
-    runtime: &tokio::runtime::Handle,
-) -> Result<KvTxnResponse, DaemonError> {
-    handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
-        cluster_paths,
-        sinomo_core::kv::KvTxnRequest::generated(txn),
-        allow_forwarding,
-        runtime,
-        cluster_control_plane_timeouts(),
-    )
-    .await
-    .and_then(cluster_kv_txn_response_from_commit)
-}
-
 async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_timeouts(
     cluster_paths: &ClusterPaths,
     request: sinomo_core::kv::KvTxnRequest,
@@ -1476,14 +1380,6 @@ async fn handle_cluster_kv_request_with_cluster_paths_async_on_runtime_with_time
     )
     .await
     .map_err(Into::into)
-}
-
-fn cluster_kv_txn_response_from_commit(
-    result: sinomo_core::kv::ClusterKvTxnCommitResult,
-) -> Result<KvTxnResponse, DaemonError> {
-    result.txn_response.ok_or_else(|| DaemonError::Parse {
-        detail: "cluster KV transaction commit omitted its transaction response".to_string(),
-    })
 }
 
 pub(crate) struct DaemonClusterJoinRegistrationHost<'a> {
@@ -2079,51 +1975,6 @@ pub(crate) async fn publish_local_members_to_quorum_if_needed_async(
     .map_err(Into::into)
 }
 
-/// Refreshes this process's local capability advertisement and commits the
-/// matching member/capability-policy records before a solo default-DFS
-/// bootstrap can select a new on-disk codec.
-pub(crate) async fn publish_startup_local_daemon_capabilities_async(
-    daemon_paths: &DaemonPaths,
-    main_options: &DaemonRunOptions,
-    runtime: &tokio::runtime::Handle,
-) -> Result<bool, DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(daemon_paths)?;
-    let mut state =
-        sinomo_core::cluster::read_cluster_state_without_kv_async(runtime, &cluster_paths).await?;
-    let data_dir = cluster_paths.root.parent().ok_or_else(|| DaemonError::Io {
-        path: cluster_paths.root.display().to_string(),
-        detail: "cluster paths have no data directory parent".to_string(),
-    })?;
-    let shadow_options = current_shadow_daemon_options_for_cluster_async(
-        data_dir,
-        DAEMON_CLUSTER_JOIN_STATUS_TIMEOUT,
-        runtime,
-    )
-    .await;
-    let refreshed = refresh_local_daemon_membership_async(
-        runtime,
-        &cluster_paths,
-        &mut state,
-        main_options,
-        &shadow_options,
-        OffsetDateTime::now_utc(),
-    )
-    .await?;
-    let published = publish_local_members_to_quorum_if_needed_async(
-        &cluster_paths,
-        &state,
-        false,
-        runtime.clone(),
-        cluster_control_plane_timeouts(),
-    )
-    .await?;
-    Ok(refreshed.changed() || published.is_some())
-}
-
-/// Installs the KV-backed cluster directory provider exactly once per process
-/// so routing, endpoint selection, and cache invalidation read cluster state.
-/// Idempotent; called from daemon startup and defensively from the
-/// maintenance tick (tests drive ticks without the full startup path).
 pub(crate) fn ensure_cluster_directory_installed() {
     static INSTALL: std::sync::Once = std::sync::Once::new();
     INSTALL.call_once(sinomo_core::cluster::install_kv_cluster_directory);
@@ -2868,9 +2719,9 @@ impl ClusterNetworkMaintenance {
 
         if publish_due {
             self.last_publish = now;
-            // Default DFS is derived control-plane state owned by its
-            // committed-snapshot reactor. A generic network publication tick
-            // must never poll or republish DFS state.
+            // Component-derived control-plane state remains component-owned.
+            // A generic network publication tick must never poll or republish
+            // module state.
             if !cluster_is_solo {
                 self.idle_stats.incr_kv_publish_member();
                 pending_work
@@ -6080,31 +5931,28 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
         &migration,
         &mut source_host,
     )?;
-    // The DFS metadata shards ride along into the import namespace; this r1
-    // layout knowledge stays out of the r0 quarantine helper.
-    let dfs_moves: Vec<(std::path::PathBuf, std::path::PathBuf)> = paths
-        .root
-        .parent()
-        .map(|data_dir_root| {
-            let data_dir = SinomoDataDir::new(data_dir_root);
-            vec![(
-                sinomo_dfs::default_dfs_metadata_shards_root(&data_dir),
-                sinomo_dfs::dfs_import_metadata_root(&data_dir, &migration.source_cluster_id),
-            )]
-        })
-        .unwrap_or_default();
+    let dfs_quarantine = paths.root.parent().map(|data_dir_root| {
+        let data_dir = SinomoDataDir::new(data_dir_root);
+        sinomo_dfs::dfs_migration_quarantine_plan(&data_dir, &migration.source_cluster_id)
+    });
     let quarantine = sinomo_core::cluster::quarantine_cluster_storage_for_migration(
-        paths, &migration, &dfs_moves,
+        paths,
+        &migration,
+        dfs_quarantine
+            .as_ref()
+            .map(|plan| plan.moves.as_slice())
+            .unwrap_or_default(),
     )?;
     migration.phase = sinomo_core::ClusterMigrationPhase::SourceFrozen;
     migration.updated_at = OffsetDateTime::now_utc();
     migration
         .evidence_refs
         .push(format!("source-quarantine:{}", quarantine.root.display()));
-    migration.evidence_refs.push(format!(
-        "dfs-import-namespace:{}",
-        sinomo_dfs::dfs_import_namespace_root(&migration.source_cluster_id)
-    ));
+    if let Some(plan) = dfs_quarantine {
+        migration
+            .evidence_refs
+            .push(format!("dfs-import-namespace:{}", plan.import_namespace));
+    }
     sinomo_core::cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
 
     match daemon_cluster_control_join_fresh_on_runtime(
@@ -10054,62 +9902,6 @@ mod tests {
         sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&paths, &state)
             .expect("sync state to raft");
         (root, paths, state)
-    }
-
-    #[test]
-    fn generic_network_publish_tick_does_not_run_default_dfs_reconciliation() {
-        let (_root, cluster_paths, mut state) =
-            seeded_single_node_cluster_for_publish_cache_test("network_tick_no_default_dfs");
-        let remote = NodeId::from_legacy_named("node_network_tick_no_default_dfs_remote")
-            .expect("remote node");
-        state
-            .members
-            .push(sinomo_core::ClusterMemberRecord::local_non_voting(
-                state.cluster_id.clone(),
-                remote,
-                "remote",
-                "pk-remote",
-                OffsetDateTime::now_utc(),
-            ));
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write multi-member cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("sync multi-member cluster state");
-
-        let data_dir =
-            SinomoDataDir::new(cluster_paths.root.parent().expect("cluster data directory"));
-        let daemon_paths = DaemonPaths::with_root(data_dir.root().join("daemon"));
-        daemon_paths.ensure().expect("daemon paths");
-        let runtime = daemon_cluster_test_runtime();
-        let mut maintenance = runtime.block_on(ClusterNetworkMaintenance::with_idle_stats(
-            Arc::new(IdleStatsAtomics::new()),
-            false,
-        ));
-        maintenance.discovery = None;
-        maintenance.connectivity_converged = true;
-        maintenance.startup_settle_until = None;
-        maintenance.last_publish = Instant::now()
-            .checked_sub(DAEMON_CLUSTER_PUBLISH_INTERVAL)
-            .expect("due publish timestamp");
-        maintenance.last_probe = Instant::now();
-        maintenance.last_discovery = Instant::now();
-
-        assert_eq!(
-            crate::dfs::daemon_default_dfs_reconciliation_run_count(&daemon_paths),
-            0
-        );
-        run_cluster_network_maintenance_tick_for_test(
-            &mut maintenance,
-            &daemon_paths,
-            &DaemonRunOptions::default(),
-            &runtime,
-        )
-        .expect("network publish tick");
-        assert_eq!(
-            crate::dfs::daemon_default_dfs_reconciliation_run_count(&daemon_paths),
-            0,
-            "network publication owns transport state, not default DFS reconciliation"
-        );
     }
 
     #[test]
@@ -18652,73 +18444,6 @@ mod tests {
         let runtime = daemon_cluster_test_runtime();
         publish_local_members_to_quorum_if_needed_on_runtime(&paths, &state, runtime.handle())
             .expect("stable local members should not be republished");
-    }
-
-    #[test]
-    fn startup_capability_publish_repairs_stale_local_policy_before_dfs_bootstrap() {
-        let root = unique_cluster_test_root("sinomo-daemon-startup-capability-publish");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("data dir");
-        let cluster_paths = ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let daemon_paths = DaemonPaths::new(&data_dir);
-        daemon_paths.ensure().expect("daemon paths");
-        let options = DaemonRunOptions::default();
-        write_daemon_status(
-            &daemon_paths,
-            &crate::DaemonStatus::new(&options, &daemon_paths, None),
-        )
-        .expect("write daemon status");
-        let local_public_key = load_or_create_main_node_identity(&data_dir.root())
-            .expect("create local identity")
-            .public_key;
-
-        let now = OffsetDateTime::now_utc();
-        let mut state = ClusterBootstrapState::initialized_locally(
-            ClusterId::from_legacy_named("cluster_startup_capability_publish").expect("cluster"),
-            "startup capability publish".to_string(),
-            NodeId::from_legacy_named("node_startup_capability_publish").expect("node"),
-            "local".to_string(),
-            local_public_key,
-            now,
-        );
-        let local_node_id = state.local_node_id.clone();
-        state
-            .members
-            .iter_mut()
-            .find(|member| member.node_id == local_node_id)
-            .expect("local member")
-            .capabilities
-            .clear();
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state)
-            .expect("write stale cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(&cluster_paths, &state)
-            .expect("seed stale capability policy");
-
-        let runtime = daemon_cluster_test_runtime();
-        assert!(
-            runtime
-                .block_on(publish_startup_local_daemon_capabilities_async(
-                    &daemon_paths,
-                    &options,
-                    runtime.handle(),
-                ))
-                .expect("publish current capabilities")
-        );
-
-        let snapshot = sinomo_core::cluster::read_cluster_kv_current_snapshot(&cluster_paths)
-            .expect("read authoritative snapshot");
-        let policy = snapshot
-            .get(&sinomo_core::node::cluster_capability_policy_key(
-                &local_node_id,
-            ))
-            .expect("local capability policy")
-            .decode::<sinomo_core::node::ClusterCapabilityPolicyRecord>()
-            .expect("decode capability policy");
-        assert!(policy.capabilities.iter().any(|capability| {
-            capability.as_str()
-                == sinomo_core::node::DFS_METADATA_PACKED_NAMESPACE_PREPARE_V2_CAPABILITY
-        }));
     }
 
     #[test]

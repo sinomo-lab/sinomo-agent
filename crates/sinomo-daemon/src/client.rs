@@ -21,10 +21,6 @@ use sinomo_core::kv::{
 };
 use sinomo_core::network::{NetworkError, ObjectRpcCall, ObjectRpcRequest, ObjectRpcResult};
 use sinomo_core::node::NodeId;
-use sinomo_dfs::{
-    DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse,
-};
 use sinomo_rollout::{
     ClusterRolloutBinaryRequest, ClusterRolloutBinaryResponse, ClusterRolloutBuildRequest,
     ClusterRolloutNativeDylibModuleRequest, ROLLOUT_CLEAR_STATUS_ROUTE, ROLLOUT_DIAGNOSTICS_ROUTE,
@@ -775,26 +771,6 @@ pub async fn send_object_rpc_call_to_target_async_with_cluster_paths_and_options
         .map_err(Into::into)
 }
 
-pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_options(
-    daemon_paths: &DaemonPaths,
-    target_node_id: &NodeId,
-    call: ObjectRpcCall,
-    options: sinomo_core::network::ClusterObjectRpcOptions,
-    runtime: &tokio::runtime::Handle,
-    observe_connectivity: bool,
-) -> Result<ObjectRpcResult, DaemonError> {
-    send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
-        daemon_paths,
-        target_node_id,
-        call,
-        options,
-        runtime,
-        observe_connectivity,
-    )
-    .await
-    .map_err(DaemonError::from)
-}
-
 pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,
@@ -806,9 +782,10 @@ pub(crate) async fn send_object_rpc_call_to_target_async_with_daemon_paths_and_n
     let data_dir = daemon_data_dir_from_paths(daemon_paths)?;
     let paths = sinomo_core::network::ClusterPaths::new(&data_dir);
     let state = sinomo_core::cluster::read_cluster_state_cached_shared(&paths)?;
-    // Same-node DFS authority still crosses the main-daemon service boundary,
-    // but the routed client intentionally rejects local targets. Resolve that
-    // process explicitly; remote targets continue through the routed carrier.
+    // Same-node process-affine component calls still cross the main-daemon
+    // service boundary, but the routed client intentionally rejects local
+    // targets. Resolve that process explicitly; remote targets continue
+    // through the routed carrier.
     if target_node_id == &state.local_node_id {
         let status = crate::read_daemon_status(daemon_paths).map_err(|source| {
             sinomo_core::network::NetworkError::delivery_failed(
@@ -1579,52 +1556,6 @@ pub async fn fetch_daemon_status_from_endpoint_async(
     .await
 }
 
-pub async fn send_dfs_metadata_journal_batch_to_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMetadataJournalBatchCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsMetadataJournalBatchResponse, DaemonError> {
-    let call = sinomo_dfs::dfs_metadata_journal_batch_rpc_call(request)?;
-    send_daemon_rpc_call_to_endpoint_with_options_and_connectivity_async(
-        endpoint,
-        call,
-        sinomo_core::network::ClusterObjectRpcOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::default()
-                .with_connect_timeout(Some(connect_timeout)),
-        ),
-        runtime,
-        true,
-    )
-    .await?
-    .decode_body()
-    .await
-    .map_err(Into::into)
-}
-
-pub async fn send_dfs_metadata_snapshot_install_to_endpoint_async(
-    endpoint: &ClusterEndpointRecord,
-    request: &DfsMetadataSnapshotInstallCommand,
-    connect_timeout: Duration,
-    runtime: &tokio::runtime::Handle,
-) -> Result<DfsMetadataSnapshotInstallResponse, DaemonError> {
-    let call = sinomo_dfs::dfs_metadata_snapshot_install_rpc_call(request)?;
-    send_daemon_rpc_call_to_endpoint_with_options_and_connectivity_async(
-        endpoint,
-        call,
-        sinomo_core::network::ClusterObjectRpcOptions::new(
-            sinomo_core::network::DaemonRpcTimeouts::default()
-                .with_connect_timeout(Some(connect_timeout)),
-        ),
-        runtime,
-        true,
-    )
-    .await?
-    .decode_body()
-    .await
-    .map_err(Into::into)
-}
-
 pub fn send_object_rpc_to_target(
     target_node_id: &NodeId,
     request: &ObjectRpcRequest,
@@ -1703,19 +1634,19 @@ pub fn send_object_rpc_call_to_target_with_options(
     )
 }
 
-pub(crate) fn send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_options(
+pub(crate) fn send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_network_error(
     daemon_paths: &DaemonPaths,
     target_node_id: &NodeId,
     call: ObjectRpcCall,
     options: sinomo_core::network::ClusterObjectRpcOptions,
     runtime: &tokio::runtime::Handle,
     observe_connectivity: bool,
-) -> Result<ObjectRpcResult, DaemonError> {
+) -> Result<ObjectRpcResult, sinomo_core::network::NetworkError> {
     let daemon_paths = daemon_paths.clone();
     let target_node_id = target_node_id.clone();
     let runtime_for_future = runtime.clone();
-    block_on_daemon_client_on_owner_runtime(runtime, async move {
-        send_object_rpc_call_to_target_async_with_daemon_paths_and_options(
+    let future = Box::pin(async move {
+        send_object_rpc_call_to_target_async_with_daemon_paths_and_network_error(
             &daemon_paths,
             &target_node_id,
             call,
@@ -1724,7 +1655,21 @@ pub(crate) fn send_object_rpc_call_to_target_on_runtime_with_daemon_paths_and_op
             observe_connectivity,
         )
         .await
-    })
+    });
+    if let Ok(current) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            current.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return tokio::task::block_in_place(|| runtime.block_on(future));
+        }
+        return Err(sinomo_core::network::NetworkError::delivery_failed(
+            "component object-RPC owner-runtime bridge",
+            sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent,
+            "synchronous component object RPC cannot run inside a current-thread Tokio runtime",
+        ));
+    }
+    runtime.block_on(future)
 }
 
 pub(crate) fn send_object_rpc_to_target_with_options_on_runtime(

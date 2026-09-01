@@ -245,6 +245,17 @@ re-authorizes every selected route. The node-local toggle is
 exposes the same enable/disable override for a selected node. A change is
 applied when that node's daemon next constructs its active registry.
 
+The DFS component owns its complete resident runtime: exclusive data-root
+lease, bootstrap barrier, authority projection, data-plane and browser
+services, metadata publication, storage sampling, placement observation,
+repair and maintenance workers, event publication, and metric export. The
+process host supplies only generic component mechanisms—runtime execution,
+cluster access, target-addressed object RPC, resource observations, activity
+counters, and the component event bus. Route-specific exact-member checks are
+declared by the module and enforced from generic service metadata. The daemon
+does not construct DFS adapters, enumerate DFS routes, or schedule DFS work.
+Dropping the component scope cancels its workers and releases its data lease.
+
 The cluster KV stores compact filesystem configuration and shard placement.
 DFS metadata shards own paths, versions, intents, receipts, namespace
 transactions, journals, and repair state. Content stores own immutable bytes

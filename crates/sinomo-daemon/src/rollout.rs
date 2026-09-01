@@ -4216,7 +4216,10 @@ mod tests {
         let paths = DaemonPaths::with_root(root.join("daemon"));
 
         assert!(main_data_owner_lock_released(&paths));
-        let owner = crate::DaemonDataOwnerLock::acquire(&paths).expect("owner lock");
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&root);
+        let dfs_paths = sinomo_dfs::runtime_host::DfsRuntimePaths::new(&data_dir);
+        let owner =
+            sinomo_dfs::runtime_host::DfsDataOwnerLock::acquire(&dfs_paths).expect("owner lock");
         assert!(!main_data_owner_lock_released(&paths));
         drop(owner);
         assert!(main_data_owner_lock_released(&paths));

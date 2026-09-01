@@ -28,6 +28,7 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-core = { path = "../sinomo-core" }
+sinomo-device = { path = "../sinomo-device" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 
 [dev-dependencies]

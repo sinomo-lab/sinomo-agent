@@ -217,8 +217,6 @@ mod tests {
         let _ = daemon::send_daemon_rpc_to_endpoint_async;
         let _ = daemon::fetch_daemon_status_from_endpoint_async;
         let _ = daemon::send_object_rpc_to_target_async;
-        let _ = daemon::send_dfs_metadata_journal_batch_to_endpoint_async;
-        let _ = daemon::send_dfs_metadata_snapshot_install_to_endpoint_async;
         let request =
             network::ObjectRpcRequest::encode_body("/test/stream", "test", &()).expect("request");
         let _future = daemon::send_daemon_rpc_stream_async(

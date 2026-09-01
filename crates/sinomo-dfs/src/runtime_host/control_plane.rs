@@ -280,19 +280,12 @@ impl DaemonDfsControlPlaneKvClient {
         self.data_owner_lock.as_ref().and_then(Weak::upgrade)
     }
 
-    pub(super) fn daemon_error(&self, source: DaemonError) -> KvError {
-        match source {
-            // ClusterReadOnly is the daemon boundary for a temporarily
-            // unavailable authoritative Raft view (including local admission
-            // busy with no accepted forwarding target). Preserve that typed
-            // classification so DFS can retry an exact authority read without
-            // also retrying unrelated filesystem I/O.
-            DaemonError::ClusterReadOnly { detail } => KvError::AuthorityUnavailable { detail },
-            source => KvError::Io {
-                path: self.cluster_paths.root.display().to_string(),
-                detail: source.to_string(),
-            },
-        }
+    fn cluster_access(&self) -> Result<Arc<dyn sinomo_core::service::ClusterAccess>, KvError> {
+        dfs_runtime_host_for_cluster_paths(&self.cluster_paths)
+            .map(|host| Arc::clone(&host.cluster))
+            .map_err(|error| KvError::AuthorityUnavailable {
+                detail: error.to_string(),
+            })
     }
 
     pub(super) fn projection_lock_error(&self) -> KvError {
@@ -519,13 +512,11 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime(
-            &self.cluster_paths,
-            keys.to_vec(),
-            true,
+        let cluster = self.cluster_access()?;
+        block_on_dfs_cluster_future(
             &self.runtime,
+            cluster.kv_get_authoritative_exact_set_async(keys.to_vec()),
         )
-        .map_err(|source| self.daemon_error(source))
     }
 
     pub(super) fn fetch_authoritative_entries_before(
@@ -539,14 +530,19 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_on_runtime_before_deadline(
-            &self.cluster_paths,
-            keys.to_vec(),
-            true,
-            &self.runtime,
-            deadline,
-        )
-        .map_err(|source| self.daemon_error(source))
+        let cluster = self.cluster_access()?;
+        block_on_dfs_cluster_future(&self.runtime, async move {
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(deadline),
+                cluster.kv_get_authoritative_exact_set_async(keys.to_vec()),
+            )
+            .await
+            .map_err(|_| {
+                sinomo_core::service::ServiceError::Service(
+                    "DFS authoritative exact-set read exceeded its deadline".to_string(),
+                )
+            })?
+        })
     }
 
     pub(super) fn fetch_authoritative_prefix(
@@ -559,13 +555,11 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_range_prefix_with_cluster_paths_on_runtime(
-            &self.cluster_paths,
-            prefix.to_string(),
-            true,
+        let cluster = self.cluster_access()?;
+        block_on_dfs_cluster_future(
             &self.runtime,
+            cluster.kv_range_prefix_authoritative_async(prefix.to_string()),
         )
-        .map_err(|source| self.daemon_error(source))
     }
 
     async fn fetch_authoritative_entries_async(
@@ -578,14 +572,10 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime(
-            &self.cluster_paths,
-            keys,
-            true,
-            &self.runtime,
-        )
-        .await
-        .map_err(|source| self.daemon_error(source))
+        self.cluster_access()?
+            .kv_get_authoritative_exact_set_async(keys)
+            .await
+            .map_err(dfs_cluster_service_error)
     }
 
     async fn fetch_authoritative_entries_before_async(
@@ -599,15 +589,16 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_exact_set_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_entries_with_cluster_paths_async_on_runtime_before_deadline(
-            &self.cluster_paths,
-            keys,
-            true,
-            &self.runtime,
-            deadline,
+        let cluster = self.cluster_access()?;
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            cluster.kv_get_authoritative_exact_set_async(keys),
         )
         .await
-        .map_err(|source| self.daemon_error(source))
+        .map_err(|_| KvError::AuthorityUnavailable {
+            detail: "DFS authoritative exact-set read exceeded its deadline".to_string(),
+        })?
+        .map_err(dfs_cluster_service_error)
     }
 
     async fn fetch_authoritative_prefix_async(
@@ -620,14 +611,10 @@ impl DaemonDfsControlPlaneKvClient {
                 .fetch_add(1, Ordering::SeqCst);
             record_daemon_dfs_test_authoritative_prefix_call(&self.cluster_paths);
         }
-        crate::cluster::read_cluster_kv_authoritative_range_prefix_with_cluster_paths_async_on_runtime(
-            &self.cluster_paths,
-            prefix,
-            true,
-            &self.runtime,
-        )
-        .await
-        .map_err(|source| self.daemon_error(source))
+        self.cluster_access()?
+            .kv_range_prefix_authoritative_async(prefix)
+            .await
+            .map_err(dfs_cluster_service_error)
     }
 
     pub(super) fn superseded_authority_error(&self, scope: &str) -> KvError {
@@ -1032,13 +1019,15 @@ impl sinomo_dfs::DfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient {
     fn txn(&mut self, txn: KvTxn) -> Result<KvTxnResponse, KvError> {
         let notify_handoff =
             daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
-        let response = crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths_on_runtime(
-            &self.cluster_paths,
-            txn,
-            true,
+        let cluster = self.cluster_access()?;
+        let response = block_on_dfs_cluster_future(
             &self.runtime,
-        )
-        .map_err(|source| self.daemon_error(source))?;
+            cluster.kv_commit_async(sinomo_core::kv::KvTxnRequest::generated(txn)),
+        )?
+        .txn_response
+        .ok_or_else(|| KvError::Serialization {
+            detail: "component cluster commit returned no transaction response".to_string(),
+        })?;
         if response.succeeded && notify_handoff {
             notify_daemon_dfs_maintenance_work();
         }
@@ -1251,15 +1240,15 @@ impl sinomo_dfs::AsyncDfsControlPlaneKvClient for DaemonDfsControlPlaneKvClient 
         Box::pin(async move {
             let notify_handoff =
                 daemon_dfs_txn_puts_local_membership_handoff(&self.cluster_paths, &txn);
-            let response =
-                crate::cluster::handle_cluster_kv_txn_request_with_cluster_paths_async_on_runtime(
-                    &self.cluster_paths,
-                    txn,
-                    true,
-                    &self.runtime,
-                )
+            let response = self
+                .cluster_access()?
+                .kv_commit_async(sinomo_core::kv::KvTxnRequest::generated(txn))
                 .await
-                .map_err(|source| self.daemon_error(source))?;
+                .map_err(dfs_cluster_service_error)?
+                .txn_response
+                .ok_or_else(|| KvError::Serialization {
+                    detail: "component cluster commit returned no transaction response".to_string(),
+                })?;
             if response.succeeded && notify_handoff {
                 notify_daemon_dfs_maintenance_work();
             }

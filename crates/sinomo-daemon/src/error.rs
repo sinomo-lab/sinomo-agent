@@ -192,6 +192,22 @@ impl From<sinomo_dfs::DfsError> for DaemonError {
     }
 }
 
+impl From<sinomo_dfs::runtime_host::DfsRuntimeError> for DaemonError {
+    fn from(error: sinomo_dfs::runtime_host::DfsRuntimeError) -> Self {
+        use sinomo_dfs::runtime_host::DfsRuntimeError;
+        match error {
+            DfsRuntimeError::Io { path, detail } => Self::Io { path, detail },
+            DfsRuntimeError::Network { address, detail } => Self::Network { address, detail },
+            DfsRuntimeError::AlreadyRunning { lock_file, detail } => {
+                Self::AlreadyRunning { lock_file, detail }
+            }
+            DfsRuntimeError::ClusterOrphan => Self::ClusterOrphan,
+            DfsRuntimeError::ClusterReadOnly { detail } => Self::ClusterReadOnly { detail },
+            DfsRuntimeError::Parse { detail } => Self::Parse { detail },
+        }
+    }
+}
+
 impl From<sinomo_dfs::DfsDistributedError> for DaemonError {
     fn from(error: sinomo_dfs::DfsDistributedError) -> Self {
         Self::Parse {

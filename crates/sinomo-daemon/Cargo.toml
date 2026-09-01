@@ -48,12 +48,6 @@ tower-layer = "0.3.3"
 tower-service = "0.3.3"
 tracing.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = [
-    "Networking_Connectivity",
-    "Win32_System_WinRT",
-] }
-
 [dev-dependencies]
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
 sinomo-dfs = { path = "../sinomo-dfs", features = ["test-support"] }

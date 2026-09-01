@@ -256,7 +256,7 @@ fn default_cluster_dfs_materialization_awaits_replica_progress(data_dir: &Sinomo
 /// tests. This is compiled only when a consumer explicitly enables the
 /// `test-support` feature; production callers establish the same state solely
 /// through a completed materialization pass.
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn test_establish_default_cluster_dfs_replica_progress_subscription(data_dir: &SinomoDataDir) {
     let local_node_id =

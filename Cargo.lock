@@ -9799,7 +9799,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
- "windows",
 ]
 
 [[package]]
@@ -9842,13 +9841,16 @@ dependencies = [
  "serde_json",
  "sinomo-config",
  "sinomo-core",
+ "sinomo-device",
  "sinomo-module",
+ "sinomo-observe-contract",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows",
  "windows-sys 0.61.2",
 ]
 
@@ -10074,6 +10076,7 @@ dependencies = [
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
+ "sinomo-device",
  "sinomo-module-api",
  "sinomo-observe-contract",
  "sinomo-testdir",

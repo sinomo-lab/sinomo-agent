@@ -1,4 +1,87 @@
+use std::collections::BTreeMap;
 use std::time::Instant;
+
+/// Convert a bounded DFS status image into the external metric-export
+/// contract without depending on the observation runtime implementation.
+pub fn dfs_status_observe_metrics(
+    status: crate::DfsOperatorStatus,
+) -> Vec<sinomo_observe_contract::ObserveMetricRecord> {
+    let gauge = |name, value| {
+        sinomo_observe_contract::ObserveMetricRecord::gauge(name, BTreeMap::new(), value as f64)
+    };
+    let mut metrics = vec![
+        gauge("sinomo.dfs.filesystems", status.file_system_count),
+        gauge("sinomo.dfs.objects", status.object_count),
+        gauge("sinomo.dfs.versions", status.version_count),
+        gauge("sinomo.dfs.receipts", status.receipt_count),
+        gauge("sinomo.dfs.intents", status.intent_count),
+        gauge("sinomo.dfs.pending_writes", status.pending_write_count),
+        gauge("sinomo.dfs.open_conflicts", status.open_conflict_count),
+        gauge("sinomo.dfs.pending_repairs", status.pending_repair_count),
+        gauge(
+            "sinomo.dfs.pending_namespace_jobs",
+            status.pending_namespace_job_count,
+        ),
+        gauge(
+            "sinomo.dfs.failed_namespace_jobs",
+            status.failed_namespace_job_count,
+        ),
+    ];
+    for shard in status.metadata_shards {
+        let mut shard_labels = BTreeMap::new();
+        shard_labels.insert("shard_id".to_string(), shard.shard_id.0.clone());
+        if let Some(file_system_id) = shard.file_system_id.as_ref() {
+            shard_labels.insert("file_system_id".to_string(), file_system_id.to_string());
+        }
+        if let Some(primary_node_id) = shard.primary_node_id.as_ref() {
+            shard_labels.insert("primary_node_id".to_string(), primary_node_id.to_string());
+        }
+        for (name, value) in [
+            (
+                "sinomo.dfs.metadata_shard.journal_next_sequence",
+                shard.journal_next_sequence as f64,
+            ),
+            (
+                "sinomo.dfs.metadata_shard.journal_last_sequence",
+                shard.journal_last_sequence as f64,
+            ),
+            (
+                "sinomo.dfs.metadata_shard.replicas",
+                shard.replica_node_ids.len() as f64,
+            ),
+        ] {
+            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+                name,
+                shard_labels.clone(),
+                value,
+            ));
+        }
+        for lag in shard.replica_lag {
+            let mut labels = shard_labels.clone();
+            labels.insert("target_node_id".to_string(), lag.target_node_id.to_string());
+            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+                "sinomo.dfs.metadata_shard.replica_lag_entries",
+                labels.clone(),
+                lag.lag_entries as f64,
+            ));
+            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+                "sinomo.dfs.metadata_shard.replica_replicated_through_sequence",
+                labels,
+                lag.replicated_through_sequence as f64,
+            ));
+        }
+        for cursor in shard.replay_cursors {
+            let mut labels = shard_labels.clone();
+            labels.insert("source_shard_id".to_string(), cursor.source_shard_id.0);
+            metrics.push(sinomo_observe_contract::ObserveMetricRecord::gauge(
+                "sinomo.dfs.metadata_shard.replay_replayed_through_sequence",
+                labels,
+                cursor.replayed_through_sequence as f64,
+            ));
+        }
+    }
+    metrics
+}
 
 pub(crate) struct DfsOperationMetricGuard {
     operation: &'static str,

@@ -35,45 +35,27 @@ pub(crate) fn daemon_dfs_bounded_status_resident(
     entry.bounded_status_resident(peer_snapshot)
 }
 
-pub(crate) fn register_daemon_dfs_observe_metric_exporter() {
-    sinomo_observe::register_observe_metric_exporter_with_prefixes(
-        "sinomo-dfs",
-        ["sinomo.dfs."],
-        |data_dir| {
-            let (resident, local_node_id) = {
-                let cache = daemon_dfs_message_service_cache().try_lock().map_err(|error| {
-                    sinomo_observe::ObserveError::Runtime {
-                        detail: format!(
-                            "resident DFS observe exporter could not borrow its generation cache: {error}"
-                        ),
-                    }
-                })?;
-                let entry = cache.get(&data_dir.root()).ok_or_else(|| {
-                    sinomo_observe::ObserveError::Runtime {
-                        detail:
-                            "resident DFS observe exporter has no published metadata generation"
-                                .to_string(),
-                    }
-                })?;
-                let resident = entry.bounded_status_resident_current().map_err(|error| {
-                    sinomo_observe::ObserveError::Runtime {
-                        detail: format!("resident DFS observe exporter is unavailable: {error}"),
-                    }
-                })?;
-                (resident, entry.signature.local_node_id.clone())
-            };
-            let snapshot = resident.bounded_status_snapshot().map_err(|error| {
-                sinomo_observe::ObserveError::Runtime {
-                    detail: format!("resident DFS observe snapshot is unavailable: {error}"),
-                }
-            })?;
-            let status = sinomo_dfs::project_dfs_status_from_resident_snapshot(
-                Some(&local_node_id),
-                snapshot,
-            );
-            Ok(sinomo_observe::dfs_status_observe_metrics(status))
-        },
-    );
+pub(crate) fn resident_dfs_observe_metrics(
+    data_dir: &SinomoDataDir,
+) -> Result<Vec<sinomo_observe_contract::ObserveMetricRecord>, String> {
+    let (resident, local_node_id) = {
+        let cache = daemon_dfs_message_service_cache()
+            .try_lock()
+            .map_err(|error| format!("resident DFS metric exporter cache is busy: {error}"))?;
+        let entry = cache.get(&data_dir.root()).ok_or_else(|| {
+            "resident DFS metric exporter has no published metadata generation".to_string()
+        })?;
+        let resident = entry
+            .bounded_status_resident_current()
+            .map_err(|error| format!("resident DFS metric exporter is unavailable: {error}"))?;
+        (resident, entry.signature.local_node_id.clone())
+    };
+    let snapshot = resident
+        .bounded_status_snapshot()
+        .map_err(|error| format!("resident DFS metric snapshot is unavailable: {error}"))?;
+    let status =
+        sinomo_dfs::project_dfs_status_from_resident_snapshot(Some(&local_node_id), snapshot);
+    Ok(crate::dfs_status_observe_metrics(status))
 }
 
 #[cfg(test)]
@@ -881,26 +863,47 @@ pub(crate) fn schedule_daemon_dfs_message_deferred_work(
             // detached work must never be discarded because a local status
             // projection is temporarily unavailable.
             .unwrap_or_default();
-    schedule_daemon_dfs_message_deferred_work_with_policy(
+    schedule_daemon_dfs_message_deferred_work_with_policy_and_owner(
         tokio_runtime,
         runtime,
         worker,
         deferred_target_node_ids,
+        dfs_runtime_host_for_cluster_paths(cluster_paths).ok(),
     );
 }
 
+#[cfg(test)]
 pub(crate) fn schedule_daemon_dfs_message_deferred_work_with_policy(
     tokio_runtime: &tokio::runtime::Handle,
     runtime: Arc<DaemonDfsDetachedSendRuntime>,
     worker: DfsNodeDetachedSendWorker,
     deferred_target_node_ids: BTreeSet<NodeId>,
 ) {
+    schedule_daemon_dfs_message_deferred_work_with_policy_and_owner(
+        tokio_runtime,
+        runtime,
+        worker,
+        deferred_target_node_ids,
+        None,
+    );
+}
+
+fn schedule_daemon_dfs_message_deferred_work_with_policy_and_owner(
+    tokio_runtime: &tokio::runtime::Handle,
+    runtime: Arc<DaemonDfsDetachedSendRuntime>,
+    worker: DfsNodeDetachedSendWorker,
+    deferred_target_node_ids: BTreeSet<NodeId>,
+    task_owner: Option<Arc<DfsRuntimeHost>>,
+) {
     runtime.schedule_deferred_work(
         worker,
         deferred_target_node_ids,
         DAEMON_DFS_PROMOTION_RETRY_DELAY,
-        |task| {
-            let _deferred_work = tokio_runtime.spawn(task);
+        move |task| {
+            let task = tokio_runtime.spawn(task);
+            if let Some(owner) = task_owner.as_ref() {
+                owner.own_task(task);
+            }
         },
     );
 }

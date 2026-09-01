@@ -1,5 +1,10 @@
 //! DFS browser and placement-authority wire contracts.
 
+pub const DFS_NAMESPACE_CHANGED_EVENT_KIND: &str = "dfs.namespace.changed";
+pub const DFS_PLACEMENT_CHANGED_EVENT_KIND: &str = "dfs.placement.changed";
+pub const DFS_EVENT_SCHEMA_ID: &str = "sinomo.dfs.change";
+pub const DFS_EVENT_SCHEMA_VERSION: &str = "1.0.0";
+
 pub const DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE: &str = "/daemon/dfs/placement-authority";
 pub const DAEMON_DFS_BROWSER_STATUS_ROUTE: &str = "/daemon/dfs/browser/status";
 pub const DAEMON_DFS_BROWSER_STAT_ROUTE: &str = "/daemon/dfs/browser/stat";

@@ -150,6 +150,27 @@ pub trait ClusterAccess: Send + Sync {
             )))
         })
     }
+    /// Read one prefix at a single current-term quorum-confirmed revision.
+    ///
+    /// Prefix consumers such as placement and topology modules must not
+    /// reconstruct this from point reads. The compatibility default fails
+    /// closed so hosts explicitly opt into a native bounded ReadIndex path.
+    fn kv_range_prefix_authoritative_async<'a>(
+        &'a self,
+        prefix: String,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<KvAuthoritativeRead<Vec<KvEntry>>, ServiceError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            Err(ServiceError::Service(format!(
+                "authoritative prefix reads are unavailable for this service host ({prefix:?})"
+            )))
+        })
+    }
     /// Commit a stable-ID cluster-KV request through the host-owned async
     /// runtime. The ID must be preserved through forwarding and retries.
     fn kv_commit_async<'a>(
@@ -537,6 +558,7 @@ pub struct ServiceRoute {
     pub auth_scope: Option<String>,
     pub required_capabilities: Vec<String>,
     pub required_local_permissions: Vec<String>,
+    pub exact_member_identity: bool,
     pub concurrency_limit: Option<usize>,
     pub timeout_ms: Option<u64>,
     pub request_body_mode: ServiceBodyMode,
@@ -557,6 +579,7 @@ impl ServiceRoute {
             auth_scope: None,
             required_capabilities: Vec::new(),
             required_local_permissions: Vec::new(),
+            exact_member_identity: false,
             concurrency_limit: None,
             timeout_ms: None,
             request_body_mode: ServiceBodyMode::None,
@@ -636,6 +659,11 @@ impl ServiceRoute {
         self
     }
 
+    pub fn require_exact_member_identity(mut self) -> Self {
+        self.exact_member_identity = true;
+        self
+    }
+
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = Some(limit);
         self
@@ -689,6 +717,7 @@ struct RouteOwner {
     auth_scope: Option<String>,
     required_capabilities: Vec<String>,
     required_local_permissions: Vec<String>,
+    exact_member_identity: bool,
     concurrency_limit: Option<usize>,
     timeout_ms: Option<u64>,
     request_body_mode: ServiceBodyMode,
@@ -814,6 +843,7 @@ impl ServiceRegistry {
                 auth_scope: owner.auth_scope.clone(),
                 required_capabilities: owner.required_capabilities.clone(),
                 required_local_permissions: owner.required_local_permissions.clone(),
+                exact_member_identity: owner.exact_member_identity,
                 concurrency_limit: owner.concurrency_limit,
                 timeout_ms: owner.timeout_ms,
                 request_body_mode: owner.request_body_mode,
@@ -836,6 +866,7 @@ impl ServiceRegistry {
             auth_scope: owner.auth_scope.clone(),
             required_capabilities: owner.required_capabilities.clone(),
             required_local_permissions: owner.required_local_permissions.clone(),
+            exact_member_identity: owner.exact_member_identity,
             concurrency_limit: owner.concurrency_limit,
             timeout_ms: owner.timeout_ms,
             request_body_mode: owner.request_body_mode,
@@ -900,6 +931,7 @@ impl ServiceRegistry {
                                 required_local_permissions: owner
                                     .required_local_permissions
                                     .clone(),
+                                exact_member_identity: owner.exact_member_identity,
                                 concurrency_limit: owner.concurrency_limit,
                                 timeout_ms: owner.timeout_ms,
                                 request_body_mode: owner.request_body_mode,
@@ -1082,6 +1114,7 @@ impl ServiceRegistryBuilder {
                         auth_scope: owner.auth_scope.clone(),
                         required_capabilities: owner.required_capabilities.clone(),
                         required_local_permissions: owner.required_local_permissions.clone(),
+                        exact_member_identity: owner.exact_member_identity,
                         concurrency_limit: owner.concurrency_limit,
                         timeout_ms: owner.timeout_ms,
                         request_body_mode: owner.request_body_mode,
@@ -1202,6 +1235,7 @@ impl ServiceRegistryBuilder {
                             auth_scope: metadata.auth_scope,
                             required_capabilities: metadata.required_capabilities,
                             required_local_permissions: metadata.required_local_permissions,
+                            exact_member_identity: metadata.exact_member_identity,
                             concurrency_limit: metadata.concurrency_limit,
                             timeout_ms: metadata.timeout_ms,
                             request_body_mode: metadata.request_body_mode,
