@@ -310,7 +310,9 @@ impl MediaSetupState {
             inventory_issues: Vec::new(),
             preference_error: None,
             microphone_enabled: true,
-            camera_enabled: true,
+            // Inventory may discover cameras, but capture starts only after an explicit UI
+            // toggle. This also leaves room for screen sharing as a peer video source.
+            camera_enabled: false,
             running: false,
             runtime: None,
         }

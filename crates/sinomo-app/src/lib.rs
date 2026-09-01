@@ -15,6 +15,7 @@ pub mod theme;
 pub mod ui;
 
 use sui::{App, Window, default_sui_logo_image};
+use sui_lucide::LucideIcon;
 
 use crate::backend::Backend;
 use crate::state::{AppState, Shared, Tab};
@@ -64,7 +65,7 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
     App::new()
         .render_options(shared.render_options())
         .with_resources(|resources| {
-            for icon in tab_icons() {
+            for icon in tab_icons().into_iter().chain([LucideIcon::User]) {
                 resources.image(icon.handle(), icon.registered_mask_image()?)?;
             }
             let logo = default_sui_logo_image(96)?;

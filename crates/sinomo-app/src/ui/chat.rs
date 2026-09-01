@@ -54,15 +54,15 @@ use sui::{
     RichDocumentViewState, RichText, ScrollBar, ScrollDelta, ScrollState, ScrollView, SectionLabel,
     SegmentedControl, SegmentedControlItem, SelectionScope, SemanticRegion, SemanticTone,
     SemanticsAction, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
-    SideSheet, SideSheetPlacement, Signal, SignalMeter, Size, SizedBox, SplitView, Stack,
-    StackHostOptions, StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole,
-    SwitchView, TEXT_COMMAND, TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextInput,
-    TextStyle, Tooltip, TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod,
-    WidgetPodMutVisitor, WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph,
-    paint_action_tile, paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel,
-    paint_rounded_rect, paint_section_label_detail, paint_text_block, paint_text_cell,
-    wrap_text_lines,
+    SideSheet, SideSheetPlacement, Signal, Size, SizedBox, SplitView, Stack, StackHostOptions,
+    StatusBadge, Surface, SurfaceAppearance, SurfaceBorder, SurfaceRole, SwitchView, TEXT_COMMAND,
+    TextArea, TextBlockPaint, TextCellPaint, TextCommand, TextInput, TextStyle, Tooltip,
+    TooltipAlignment, TooltipPlacement, TrailingSlotRow, Widget, WidgetPod, WidgetPodMutVisitor,
+    WidgetPodVisitor, containers::Padding as WidgetPadding, draw_glyph, paint_action_tile,
+    paint_callout, paint_code_lines, paint_code_panel, paint_rounded_panel, paint_rounded_rect,
+    paint_section_label_detail, paint_text_block, paint_text_cell, wrap_text_lines,
 };
+use sui_lucide::LucideIcon;
 
 #[cfg(test)]
 use sinomo_agent::{
@@ -139,9 +139,8 @@ const SIDEBAR_INITIAL_RATIO: f32 = 0.20;
 const SIDEBAR_MIN_W: f32 = 220.0;
 const CHAT_PANE_MIN_W: f32 = 320.0;
 const COMPACT_HEADER_H: f32 = 54.0;
-// Small media instruments preserve the useful 16:9 preview without consuming transcript space.
-const MEDIA_CALL_H: f32 = 352.0;
-const MEDIA_CALL_COMPACT_H: f32 = 46.0;
+// The call surface is one compact row: agent video, user video, then source/call controls.
+const MEDIA_CALL_H: f32 = 304.0;
 const CHAT_MEDIA_DEVICE_OPEN_TIMEOUT: Duration = Duration::from_secs(65);
 #[cfg(not(test))]
 static CHAT_MEDIA_CAMERA_OPEN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -494,6 +493,8 @@ pub struct ChatMediaCallState {
     pub active: bool,
     pub mic_enabled: bool,
     pub camera_enabled: bool,
+    /// Selection within the current provider's realtime-only model catalog.
+    pub model_idx: usize,
     pub provider: String,
     pub model: String,
     pub started_at: Option<Instant>,
@@ -1174,7 +1175,10 @@ impl Default for ChatMediaCallState {
         Self {
             active: false,
             mic_enabled: true,
-            camera_enabled: true,
+            // Camera and future screen-sharing sources are explicit user actions. Opening the
+            // call panel or starting an audio call must not activate video capture.
+            camera_enabled: false,
+            model_idx: 0,
             provider: String::new(),
             model: String::new(),
             started_at: None,
@@ -4929,18 +4933,45 @@ impl ChatState {
             .filter(|provider| !provider.trim().is_empty())
             .or_else(|| (!self.info.provider.trim().is_empty()).then(|| self.info.provider.clone()))
             .unwrap_or_else(|| "provider pending".to_string());
-        let model = self.current_model();
-        let model = if model.trim().is_empty() {
-            self.info.model.clone()
-        } else {
-            model
-        };
+        let model = self.current_realtime_model();
         let model = if model.trim().is_empty() {
             "model pending".to_string()
         } else {
             model
         };
         (provider, model)
+    }
+
+    fn current_realtime_models(&self) -> Vec<String> {
+        let provider = self
+            .current_provider()
+            .map(|provider| provider.id.as_str())
+            .unwrap_or(self.info.provider.as_str());
+        sinomo_lm::provider_realtime_model_ids(provider)
+    }
+
+    fn current_realtime_model(&self) -> String {
+        self.current_realtime_models()
+            .get(self.media_call.model_idx)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_media_call_model(&mut self, index: usize) {
+        if self.media_call.active {
+            return;
+        }
+        if index < self.current_realtime_models().len() {
+            self.media_call.model_idx = index;
+            self.media_call.notice = Some("realtime model selected".to_string());
+        }
+    }
+
+    fn media_call_start_ready(&self) -> bool {
+        self.current_provider().is_some_and(|provider| {
+            provider.capabilities.realtime_websocket || provider.capabilities.realtime_webrtc
+        }) && !self.current_realtime_model().is_empty()
+            && self.media_setup.access_check_complete()
     }
 
     pub fn toggle_media_call(&mut self) {
@@ -5340,23 +5371,12 @@ impl ChatState {
             };
         }
         let detail = if self.media_call.camera_enabled {
-            "camera enabled"
+            "video enabled"
         } else {
-            "camera paused"
+            "video stopped"
         };
         self.media_call.notice = Some(detail.to_string());
         self.push_activity("media call", detail, ActivityTone::Neutral);
-    }
-
-    pub fn toggle_media_call_details(&mut self) {
-        self.media_call_details_open = !self.media_call_details_open;
-        if !self.media_call.active {
-            if self.media_call_details_open {
-                self.media_setup.start();
-            } else {
-                self.media_setup.stop();
-            }
-        }
     }
 
     pub(crate) fn sync_media_setup_visibility(&mut self, chat_visible: bool) -> bool {
@@ -5382,18 +5402,14 @@ impl ChatState {
             self.toggle_media_call();
         } else {
             self.media_call_details_open = true;
-            self.media_call.notice = Some("choose devices, check levels, then start".to_string());
+            self.media_call.notice =
+                Some("choose audio and video sources, then start the call".to_string());
             self.media_setup.start();
         }
     }
 
     fn media_call_details_visible(&self) -> bool {
         self.media_call_details_open
-    }
-
-    #[cfg(test)]
-    fn media_call_panel_visible(&self) -> bool {
-        self.media_call.active || self.media_call_details_open
     }
 
     fn media_call_elapsed_label(&self) -> String {
@@ -5407,7 +5423,7 @@ impl ChatState {
     fn media_call_status_summary(&self) -> String {
         if self.media_call.active {
             return format!(
-                "{} · mic {} · camera {}",
+                "{} · mic {} · video {}",
                 self.media_call_elapsed_label(),
                 if self.media_call.mic_enabled {
                     "on"
@@ -5417,7 +5433,7 @@ impl ChatState {
                 if self.media_call.camera_enabled {
                     "on"
                 } else {
-                    "paused"
+                    "off"
                 }
             );
         }
@@ -6015,6 +6031,7 @@ impl ChatState {
         if self.providers.is_empty() {
             self.provider_idx = 0;
             self.model_idx = 0;
+            self.media_call.model_idx = 0;
             return;
         }
         self.provider_idx = previous
@@ -6027,6 +6044,9 @@ impl ChatState {
         let model_len = self.current_provider().map(|p| p.models.len()).unwrap_or(0);
         if self.model_idx >= model_len {
             self.model_idx = 0;
+        }
+        if self.media_call.model_idx >= self.current_realtime_models().len() {
+            self.media_call.model_idx = 0;
         }
         self.maybe_fetch_models();
         if !self.current_model().is_empty() {
@@ -7164,6 +7184,7 @@ impl ChatState {
         }
         self.provider_idx = index;
         self.model_idx = 0;
+        self.media_call.model_idx = 0;
         self.maybe_fetch_models();
         self.push_model_selection();
     }
@@ -8875,15 +8896,16 @@ async fn run_chat_media_call_async(
     } = start_config;
     let provider = sinomo_lm::RealtimeAudioProvider::from_id(&provider_id)
         .ok_or_else(|| format!("unsupported realtime provider `{provider_id}`"))?;
-    let model = match provider {
-        sinomo_lm::RealtimeAudioProvider::OpenAi
-            if !model.to_ascii_lowercase().contains("realtime") =>
-        {
-            provider.default_model().to_string()
-        }
-        _ if model.trim().is_empty() => provider.default_model().to_string(),
-        _ => model,
+    let model = if model.trim().is_empty() {
+        provider.default_model().to_string()
+    } else {
+        model
     };
+    if !provider.model_ids().contains(&model.as_str()) {
+        return Err(format!(
+            "realtime model `{model}` is not available for provider `{provider_id}`"
+        ));
+    }
     let mut config = sinomo_lm::RealtimeAudioSessionConfig::new(provider, model);
     config.turn_detection = sinomo_lm::RealtimeAudioTurnDetection::SemanticVad;
     authorize_chat_media_realtime_config(&data_dir, &mut config)?;
@@ -12538,12 +12560,13 @@ impl Widget for ChatDialogHost {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MediaCallPanelSignature {
-    details_open: bool,
+    open: bool,
     active: bool,
     mic_enabled: bool,
     camera_enabled: bool,
-    provider: String,
-    model: String,
+    agent_name: String,
+    realtime_models: Vec<String>,
+    realtime_model_idx: usize,
     microphones: Vec<String>,
     speakers: Vec<String>,
     cameras: Vec<String>,
@@ -12563,12 +12586,6 @@ struct MediaSpeakerTestSignature {
     state: SpeakerTestState,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MediaCallTile {
-    Remote,
-    Local,
-}
-
 #[cfg(test)]
 fn media_call_panel_signature(shared: &Shared) -> MediaCallPanelSignature {
     let chat = shared.chat();
@@ -12576,25 +12593,28 @@ fn media_call_panel_signature(shared: &Shared) -> MediaCallPanelSignature {
 }
 
 fn media_call_panel_signature_for(chat: &ChatState) -> MediaCallPanelSignature {
-    let (selected_provider, selected_model) = chat.current_media_provider_model();
     let call = &chat.media_call;
-    let provider = if call.active && !call.provider.trim().is_empty() {
-        call.provider.clone()
-    } else {
-        selected_provider
-    };
-    let model = if call.active && !call.model.trim().is_empty() {
-        call.model.clone()
-    } else {
-        selected_model
-    };
+    let agent_name = chat
+        .agents
+        .iter()
+        .enumerate()
+        .find(|(index, _)| chat.is_active_agent(*index))
+        .map(|(_, agent)| agent.name.trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| chat.info.agent.trim())
+        .to_string();
     MediaCallPanelSignature {
-        details_open: chat.media_call_details_visible(),
+        open: chat.media_call_details_visible(),
         active: call.active,
         mic_enabled: call.mic_enabled,
         camera_enabled: call.camera_enabled,
-        provider,
-        model,
+        agent_name: if agent_name.is_empty() {
+            "Sinomo agent".to_string()
+        } else {
+            agent_name
+        },
+        realtime_models: chat.current_realtime_models(),
+        realtime_model_idx: call.model_idx,
         microphones: chat.media_setup.microphone_labels(),
         speakers: chat.media_setup.speaker_labels(),
         cameras: chat.media_setup.camera_labels(),
@@ -12626,19 +12646,11 @@ fn media_call_panel_body(
     reader: &ThemeReader,
     signature: &MediaCallPanelSignature,
 ) -> WidgetPod {
-    if signature.details_open {
-        media_call_panel_frame(
-            shared,
-            reader,
-            media_call_expanded_body(shared, reader, signature),
-        )
-    } else {
-        media_call_panel_frame(
-            shared,
-            reader,
-            media_call_compact_body(shared, reader, signature),
-        )
-    }
+    media_call_panel_frame(
+        shared,
+        reader,
+        media_call_three_column_body(shared, reader, signature),
+    )
 }
 
 fn media_call_panel_frame<W>(shared: &Shared, reader: &ThemeReader, body: W) -> WidgetPod
@@ -12659,251 +12671,185 @@ where
     )
 }
 
-fn media_call_compact_body(
+fn media_call_three_column_body(
     shared: &Shared,
     reader: &ThemeReader,
     signature: &MediaCallPanelSignature,
 ) -> impl Widget + use<> {
-    let details = media_call_details_button(shared, reader, signature.details_open);
-    // Keep the compact panel to one reflow-safe title row; provider/model detail remains in the
-    // panel's accessibility summary.
-    let row = TrailingSlotRow::new(media_call_title_line(shared, reader), details)
-        .trailing_width(100.0)
-        .trailing_height(30.0)
-        .gap(10.0);
-    WidgetPadding::symmetric(PAD, 5.0, row).fill_child()
-}
-
-fn media_call_expanded_body(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
-    let header = TrailingSlotRow::new(
-        media_call_title_line(shared, reader),
-        media_call_details_button(shared, reader, signature.details_open),
-    )
-    .trailing_width(78.0)
-    .trailing_height(30.0)
-    .gap(10.0);
-
-    let tiles = Flex::horizontal()
-        .gap(8.0)
+    let columns = Flex::horizontal()
+        .gap(10.0)
         .align_items(Alignment::Stretch)
         .with_item(
-            media_call_video_tile(shared, reader, signature, MediaCallTile::Remote),
-            FlexItem::flex(1.0).min_width(84.0).min_height(145.0),
+            media_call_agent_video_column(shared, reader, signature),
+            FlexItem::fixed(196.0).min_height(276.0),
         )
         .with_item(
-            media_call_video_tile(shared, reader, signature, MediaCallTile::Local),
-            FlexItem::fixed(168.0).min_height(145.0),
+            media_call_user_video_column(shared, reader, signature),
+            FlexItem::fixed(196.0).min_height(276.0),
+        )
+        .with_item(
+            media_call_control_column(shared, reader, signature),
+            FlexItem::fixed(274.0).min_height(276.0),
         );
-
-    let body = Stack::vertical()
-        .spacing(3.0)
-        .alignment(Alignment::Stretch)
-        .with_child(SizedBox::new().height(30.0).with_child(header))
-        .with_child(SizedBox::new().height(145.0).with_child(tiles))
-        .with_child(
-            SizedBox::new()
-                .height(30.0)
-                .with_child(media_setup_access_row(shared, reader)),
-        )
-        .with_child(
-            SizedBox::new()
-                .height(34.0)
-                .with_child(media_setup_device_selectors(shared, reader, signature)),
-        )
-        .with_child(
-            SizedBox::new()
-                .height(30.0)
-                .with_child(media_setup_test_row(shared, reader)),
-        )
-        .with_child(
-            SizedBox::new()
-                .height(24.0)
-                .with_child(media_setup_recovery_row(shared, reader)),
-        );
-    let body = Dock::new(body).bottom(34.0, media_call_controls_row(shared, reader, signature));
-
-    WidgetPadding::symmetric(PAD, 7.0, body).fill_child()
+    let columns = ScrollView::horizontal(columns)
+        .name("Media call columns")
+        .theme_when(clone_reader(reader))
+        .overlay_scroll_bars(false);
+    WidgetPadding::symmetric(PAD, 8.0, columns).fill_child()
 }
 
-fn media_call_title_line(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let icon_shared = shared.clone();
-    Flex::horizontal()
-        .gap(7.0)
-        .align_items(Alignment::Center)
-        .with_child(
-            Icon::new(IconGlyph::AudioLines)
-                .size(15.0)
-                .color_when(move || {
-                    if icon_shared.chat().media_call.active {
-                        palette(&icon_shared).accent
-                    } else {
-                        palette(&icon_shared).text_muted
-                    }
-                }),
-        )
-        .with_child(small_label(shared, "Media call").color_when({
-            let s = shared.clone();
-            move || palette(&s).text
-        }))
-        .with_child(media_call_status_badge(shared, reader))
-}
-
-fn media_call_status_badge(shared: &Shared, reader: &ThemeReader) -> StatusBadge {
-    let label_shared = shared.clone();
-    let tone_shared = shared.clone();
-    StatusBadge::dynamic(media_call_status_label(&shared.chat()), move || {
-        media_call_status_label(&label_shared.chat()).to_string()
-    })
-    .icon(IconGlyph::AudioLines)
-    .tone_when(move || media_call_status_tone(&tone_shared.chat()))
-    .min_width(54.0)
-    .theme_when(clone_reader(reader))
-}
-
-fn media_call_status_label(chat: &ChatState) -> &'static str {
-    if chat.media_call.active {
-        "LIVE"
-    } else {
-        "READY"
-    }
-}
-
-fn media_call_status_tone(chat: &ChatState) -> SemanticTone {
-    if chat.media_call.active {
-        SemanticTone::Success
-    } else if chat.media_call.notice.is_some() {
-        SemanticTone::Warning
-    } else {
-        SemanticTone::Neutral
-    }
-}
-
-fn media_call_video_tile(
+fn media_call_agent_video_column(
     shared: &Shared,
     reader: &ThemeReader,
     signature: &MediaCallPanelSignature,
-    tile: MediaCallTile,
 ) -> impl Widget + use<> {
-    let (icon, title, _subtitle, status, tone, signal_active, signal_name, signal_description) =
-        match tile {
-            MediaCallTile::Remote => (
-                if signature.active {
-                    IconGlyph::Video
-                } else {
-                    IconGlyph::VideoOff
-                },
-                compact_line(&signature.model, 36),
-                compact_line(&signature.provider, 32),
-                if signature.active {
-                    "realtime response audio"
-                } else {
-                    "standby"
-                },
-                if signature.active {
-                    SemanticTone::Success
-                } else {
-                    SemanticTone::Neutral
-                },
-                signature.active,
-                "Remote media signal",
-                if signature.active {
-                    "Remote realtime response audio is active"
-                } else {
-                    "Remote realtime media is standing by"
-                },
-            ),
-            MediaCallTile::Local => (
-                if signature.camera_enabled {
-                    IconGlyph::Camera
-                } else {
-                    IconGlyph::CameraOff
-                },
-                if signature.camera_enabled {
-                    "Local".to_string()
-                } else {
-                    "Camera".to_string()
-                },
-                if signature.camera_enabled {
-                    "preview".to_string()
-                } else {
-                    "paused".to_string()
-                },
-                if signature.mic_enabled {
-                    "mic on"
-                } else {
-                    "mic muted"
-                },
-                if signature.camera_enabled && signature.mic_enabled {
-                    SemanticTone::Success
-                } else {
-                    SemanticTone::Warning
-                },
-                signature.camera_enabled || signature.mic_enabled,
-                "Local capture signal",
-                if signature.camera_enabled && signature.mic_enabled {
-                    "Local microphone and camera are enabled"
-                } else if signature.mic_enabled {
-                    "Local microphone is enabled and camera is paused"
-                } else if signature.camera_enabled {
-                    "Local camera is enabled and microphone is muted"
-                } else {
-                    "Local microphone and camera are paused"
-                },
-            ),
-        };
-    let signal = SwitchView::new()
-        .selected(match tile {
-            MediaCallTile::Remote => 0,
-            MediaCallTile::Local => 1,
-        })
-        .with_child(
-            SignalMeter::new(signal_name)
-                .description(signal_description)
-                .active(signal_active)
-                .tone(tone)
-                .bars(12)
-                .size(Size::new(1024.0, 20.0))
-                .theme_when(clone_reader(reader)),
-        )
-        .with_child(
-            SizedBox::new()
-                .height(82.0)
-                .with_child(MediaCameraPreviewWidget::new(shared.clone())),
-        );
-    let icon_shared = shared.clone();
-    let title_shared = shared.clone();
-    let status = StatusBadge::new(status)
-        .tone(tone)
-        .min_width(70.0)
-        .theme_when(clone_reader(reader));
-    let content = Flex::vertical()
-        .gap(2.0)
-        .with_child(
-            Flex::horizontal()
-                .gap(6.0)
-                .align_items(Alignment::Center)
-                .with_child(Icon::new(icon).size(15.0).color_when(move || {
-                    if tone == SemanticTone::Success {
-                        palette(&icon_shared).accent
-                    } else {
-                        palette(&icon_shared).text_faint
-                    }
-                }))
-                .with_child(
-                    small_label(shared, title).color_when(move || palette(&title_shared).text),
-                ),
-        )
-        .with_child(signal)
-        .spacer()
-        .with_child(status);
+    let avatar = Align::center(MediaAvatarWidget::new(
+        crate::ui::shell::logo_image_handle(),
+        format!("{} avatar", signature.agent_name),
+        Size::new(92.0, 92.0),
+        IconGlyph::Sparkles,
+        shared.theme().palette.text_muted,
+    ));
+    media_call_participant_column(
+        shared,
+        reader,
+        "Agent video",
+        signature.agent_name.clone(),
+        "Avatar shown until the agent publishes video.",
+        avatar,
+    )
+}
 
-    Surface::field(WidgetPadding::symmetric(8.0, 6.0, content).fill_child())
-        .fill()
-        .theme_when(clone_reader(reader))
+fn media_call_user_video_column(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaCallPanelSignature,
+) -> impl Widget + use<> {
+    let placeholder = Align::center(
+        MediaAvatarWidget::new(
+            LucideIcon::User.handle(),
+            "User avatar placeholder",
+            Size::new(58.0, 58.0),
+            IconGlyph::Chat,
+            shared.theme().palette.text_muted,
+        )
+        .tint(shared.theme().palette.text_muted),
+    );
+    let visual = SwitchView::new()
+        .selected(signature.camera_enabled as usize)
+        .with_child(placeholder)
+        .with_child(MediaCameraPreviewWidget::new(shared.clone()));
+    media_call_participant_column(
+        shared,
+        reader,
+        "Your video",
+        if signature.camera_enabled {
+            "Camera preview".to_string()
+        } else {
+            "Video off".to_string()
+        },
+        if signature.camera_enabled {
+            "Preview from the selected video source."
+        } else {
+            "Enable video when you want to share the camera."
+        },
+        visual,
+    )
+}
+
+fn media_call_participant_column<W>(
+    shared: &Shared,
+    reader: &ThemeReader,
+    semantic_name: &'static str,
+    title: String,
+    description: &'static str,
+    visual: W,
+) -> impl Widget + use<W>
+where
+    W: Widget + 'static,
+{
+    let title_shared = shared.clone();
+    let description_shared = shared.clone();
+    let content = Stack::vertical()
+        .spacing(4.0)
+        .alignment(Alignment::Stretch)
+        .with_child(small_label(shared, title).color_when(move || palette(&title_shared).text))
+        .with_child(
+            Label::new(description)
+                .style(small_theme_text_style(&reader()))
+                .color_when(move || palette(&description_shared).text_faint),
+        )
+        .with_child(SizedBox::new().height(160.0).with_child(visual));
+    SemanticRegion::new(
+        semantic_name,
+        Surface::field(WidgetPadding::symmetric(9.0, 7.0, content).fill_child())
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+    .role(SemanticsRole::GenericContainer)
+}
+
+struct MediaAvatarWidget {
+    handle: ImageHandle,
+    label: String,
+    size: Size,
+    tint: Option<Color>,
+    fallback: IconGlyph,
+    fallback_color: Color,
+}
+
+impl MediaAvatarWidget {
+    fn new(
+        handle: ImageHandle,
+        label: impl Into<String>,
+        size: Size,
+        fallback: IconGlyph,
+        fallback_color: Color,
+    ) -> Self {
+        Self {
+            handle,
+            label: label.into(),
+            size,
+            tint: None,
+            fallback,
+            fallback_color,
+        }
+    }
+
+    fn tint(mut self, tint: Color) -> Self {
+        self.tint = Some(tint);
+        self
+    }
+}
+
+impl Widget for MediaAvatarWidget {
+    fn measure(&mut self, _ctx: &mut MeasureCtx, constraints: Constraints) -> Size {
+        constraints.clamp(self.size)
+    }
+
+    fn paint(&self, ctx: &mut PaintCtx) {
+        let rect = centered_rect(ctx.bounds(), self.size);
+        if ctx.image_registered(self.handle) {
+            let mut source = ImageSource::new(self.handle);
+            if let Some(tint) = self.tint {
+                source = source.with_tint(tint);
+            }
+            ctx.draw_image_source(rect, source);
+        } else {
+            draw_glyph(
+                ctx,
+                self.fallback,
+                centered_rect(rect, Size::new(28.0, 28.0)),
+                self.tint.unwrap_or(self.fallback_color),
+            );
+        }
+    }
+
+    fn semantics(&self, ctx: &mut SemanticsCtx) {
+        let mut node = SemanticsNode::new(ctx.widget_id(), SemanticsRole::Image, ctx.bounds());
+        node.name = Some(self.label.clone());
+        ctx.push(node);
+    }
 }
 
 #[derive(Default)]
@@ -13054,412 +13000,167 @@ fn centered_rect(bounds: Rect, size: Size) -> Rect {
     )
 }
 
-fn media_setup_access_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source =
-        shared
-            .signals()
-            .chat_structure
-            .select_named("chat media access structure", |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.media_access.clone()))
-            });
-    let build_shared = shared.clone();
-    let build_reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |signature| {
-        let signature = &signature
-            .as_ref()
-            .expect("media access is built only after chat is ready")
-            .1;
-        WidgetPod::new(media_setup_access_row_body(
-            &build_shared,
-            &build_reader,
-            signature,
-        ))
-    })
-}
-
-fn media_setup_access_row_body(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaSetupAccessSignature,
-) -> impl Widget + use<> {
-    let retry_shared = shared.clone();
-    let retry = IconButton::new(IconGlyph::History, "Retry media device access")
-        .description("Check devices again after allowing microphone or camera access")
-        .size(26.0)
-        .icon_size(14.0)
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .enabled_when({
-            let enabled_shared = shared.clone();
-            move || {
-                let chat = enabled_shared.chat();
-                !chat.media_call.active && !chat.media_setup.inventory_loading
-            }
-        })
-        .on_press(move || retry_shared.chat_mut().media_setup.retry_access());
-    Flex::horizontal()
-        .gap(4.0)
-        .align_items(Alignment::Center)
-        .with_item(
-            media_setup_access_badge("Mic", &signature.microphone, reader),
-            FlexItem::fixed(68.0).min_height(24.0),
-        )
-        .with_item(
-            media_setup_access_badge("Out", &signature.speaker, reader),
-            FlexItem::fixed(68.0).min_height(24.0),
-        )
-        .with_item(
-            media_setup_access_badge("Cam", &signature.camera, reader),
-            FlexItem::fixed(68.0).min_height(24.0),
-        )
-        .spacer()
-        .with_item(retry, FlexItem::fixed(26.0).min_height(26.0))
-}
-
-fn media_setup_access_badge(
-    prefix: &str,
-    state: &MediaAccessState,
-    reader: &ThemeReader,
-) -> StatusBadge {
-    StatusBadge::new(format!(
-        "{prefix} {}",
-        media_setup_access_compact_label(state)
-    ))
-    .tone(media_setup_access_tone(state))
-    .min_width(68.0)
-    .theme_when(clone_reader(reader))
-}
-
-fn media_setup_access_compact_label(state: &MediaAccessState) -> &'static str {
-    match state {
-        MediaAccessState::Idle => "Idle",
-        MediaAccessState::Checking => "Check",
-        MediaAccessState::Ready => "Ready",
-        MediaAccessState::PermissionDenied(_) => "Allow",
-        MediaAccessState::Busy(_) => "Busy",
-        MediaAccessState::Unavailable(_) => "Error",
-        MediaAccessState::Unsupported(_) => "N/A",
-    }
-}
-
-fn media_setup_access_tone(state: &MediaAccessState) -> SemanticTone {
-    match state {
-        MediaAccessState::Ready => SemanticTone::Success,
-        MediaAccessState::Checking => SemanticTone::Accent,
-        MediaAccessState::PermissionDenied(_)
-        | MediaAccessState::Busy(_)
-        | MediaAccessState::Unavailable(_) => SemanticTone::Warning,
-        MediaAccessState::Idle | MediaAccessState::Unsupported(_) => SemanticTone::Neutral,
-    }
-}
-
-fn media_setup_device_selectors(
+fn media_call_control_column(
     shared: &Shared,
     reader: &ThemeReader,
     signature: &MediaCallPanelSignature,
 ) -> impl Widget + use<> {
-    let microphone = {
-        let selected_shared = shared.clone();
-        let change_shared = shared.clone();
-        media_setup_device_selector(
-            "Microphone",
-            "Microphone device",
-            signature.microphones.clone(),
-            move || Some(selected_shared.chat().media_setup.microphone_index),
-            move |index, _| {
-                change_shared
-                    .chat_mut()
-                    .media_setup
-                    .select_microphone(index)
-            },
-            reader,
-        )
-    };
-    let speaker = {
-        let selected_shared = shared.clone();
-        let change_shared = shared.clone();
-        media_setup_device_selector(
-            "Speaker",
-            "Speaker device",
-            signature.speakers.clone(),
-            move || Some(selected_shared.chat().media_setup.speaker_index),
-            move |index, _| change_shared.chat_mut().media_setup.select_speaker(index),
-            reader,
-        )
-    };
-    let camera = {
-        let selected_shared = shared.clone();
-        let change_shared = shared.clone();
-        media_setup_device_selector(
-            "Camera",
-            "Camera device",
-            signature.cameras.clone(),
-            move || Some(selected_shared.chat().media_setup.camera_index),
-            move |index, _| change_shared.chat_mut().media_setup.select_camera(index),
-            reader,
-        )
-    };
-    Flex::horizontal()
-        .gap(8.0)
-        .align_items(Alignment::Stretch)
-        .with_item(microphone, FlexItem::flex(1.0).min_width(84.0))
-        .with_item(speaker, FlexItem::flex(1.0).min_width(84.0))
-        .with_item(camera, FlexItem::flex(1.0).min_width(84.0))
+    let content = Stack::vertical()
+        .spacing(8.0)
+        .alignment(Alignment::Stretch)
+        .with_child(media_call_video_source_control(shared, reader, signature))
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(media_call_audio_source_control(shared, reader, signature))
+        .with_child(Separator::horizontal().theme_when(clone_reader(reader)))
+        .with_child(media_call_model_control(shared, reader, signature))
+        .with_child(
+            SizedBox::new()
+                .height(36.0)
+                .with_child(media_call_toggle_button(shared, reader, signature.active)),
+        );
+    SemanticRegion::new(
+        "Call controls",
+        Surface::field(WidgetPadding::symmetric(10.0, 8.0, content).fill_child())
+            .fill()
+            .theme_when(clone_reader(reader)),
+    )
+    .role(SemanticsRole::GenericContainer)
 }
 
-fn media_setup_device_selector<S, C>(
-    label: &'static str,
+fn media_call_video_source_control(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaCallPanelSignature,
+) -> impl Widget + use<> {
+    let selected_shared = shared.clone();
+    let change_shared = shared.clone();
+    let selector = media_call_device_selector(
+        "Video device",
+        signature.cameras.clone(),
+        move || Some(selected_shared.chat().media_setup.camera_index),
+        move |index, _| change_shared.chat_mut().media_setup.select_camera(index),
+        reader,
+    );
+    Stack::vertical()
+        .spacing(3.0)
+        .alignment(Alignment::Stretch)
+        .with_child(small_label(shared, "Video source").color_when({
+            let s = shared.clone();
+            move || palette(&s).text_muted
+        }))
+        .with_child(
+            SizedBox::new().height(42.0).with_child(
+                Flex::horizontal()
+                    .gap(6.0)
+                    .align_items(Alignment::Stretch)
+                    .with_item(selector, FlexItem::flex(1.0).min_width(90.0))
+                    .with_item(
+                        media_call_camera_button(shared, reader, signature.camera_enabled),
+                        FlexItem::fixed(108.0).min_height(30.0),
+                    ),
+            ),
+        )
+}
+
+fn media_call_audio_source_control(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaCallPanelSignature,
+) -> impl Widget + use<> {
+    let selected_shared = shared.clone();
+    let change_shared = shared.clone();
+    let selector = media_call_device_selector(
+        "Audio device",
+        signature.microphones.clone(),
+        move || Some(selected_shared.chat().media_setup.microphone_index),
+        move |index, _| {
+            change_shared
+                .chat_mut()
+                .media_setup
+                .select_microphone(index)
+        },
+        reader,
+    );
+    let label_shared = shared.clone();
+    Stack::vertical()
+        .spacing(3.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            small_label(shared, "Audio input")
+                .color_when(move || palette(&label_shared).text_muted),
+        )
+        .with_child(
+            SizedBox::new().height(42.0).with_child(
+                Flex::horizontal()
+                    .gap(6.0)
+                    .align_items(Alignment::Stretch)
+                    .with_item(selector, FlexItem::flex(1.0).min_width(90.0))
+                    .with_item(
+                        media_call_mic_button(shared, reader, signature.mic_enabled),
+                        FlexItem::fixed(108.0).min_height(30.0),
+                    ),
+            ),
+        )
+}
+
+fn media_call_model_control(
+    shared: &Shared,
+    reader: &ThemeReader,
+    signature: &MediaCallPanelSignature,
+) -> impl Widget + use<> {
+    let selected_shared = shared.clone();
+    let change_shared = shared.clone();
+    let selector = sui::Select::new("Realtime model")
+        .options(signature.realtime_models.clone())
+        .placeholder("No realtime models")
+        .selected_when(move || {
+            let chat = selected_shared.chat();
+            (!chat.current_realtime_models().is_empty()).then_some(chat.media_call.model_idx)
+        })
+        .theme_when(clone_reader(reader))
+        .on_change(move |index, _| change_shared.chat_mut().set_media_call_model(index));
+    let label_shared = shared.clone();
+    Stack::vertical()
+        .spacing(3.0)
+        .alignment(Alignment::Stretch)
+        .with_child(
+            small_label(shared, "Model").color_when(move || palette(&label_shared).text_muted),
+        )
+        .with_child(SizedBox::new().height(36.0).with_child(selector))
+}
+
+fn media_call_device_selector<S, C>(
     name: &'static str,
     options: Vec<String>,
     selected_when: S,
     on_change: C,
     reader: &ThemeReader,
-) -> impl Widget + use<S, C>
+) -> sui::Select
 where
     S: Fn() -> Option<usize> + 'static,
     C: FnMut(usize, String) + 'static,
 {
-    let label_reader = Rc::clone(reader);
-    let label_style = small_theme_text_style(&reader());
-    Stack::vertical()
-        .spacing(2.0)
-        .alignment(Alignment::Stretch)
-        .with_child(
-            Label::new(label)
-                .style(label_style)
-                .color_when(move || label_reader().palette.text_muted),
-        )
-        .with_child(
-            SizedBox::new().height(28.0).with_child(
-                sui::Select::new(name)
-                    .options(options)
-                    .selected_when(selected_when)
-                    .theme_when(clone_reader(reader))
-                    .on_change(on_change),
-            ),
-        )
-}
-
-fn media_setup_test_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let meter_shared = shared.clone();
-    let active_shared = shared.clone();
-    Flex::horizontal()
-        .gap(8.0)
-        .align_items(Alignment::Center)
-        .with_item(
-            SignalMeter::new("Microphone input level")
-                .description("Live microphone input level")
-                .active_when(move || {
-                    let chat = active_shared.chat();
-                    if chat.media_call.active {
-                        chat.media_call.mic_enabled
-                    } else {
-                        matches!(chat.media_setup.microphone_access, MediaAccessState::Ready)
-                    }
-                })
-                .level_when(move || {
-                    let chat = meter_shared.chat();
-                    if chat.media_call.active {
-                        chat.media_call.microphone_level
-                    } else {
-                        chat.media_setup.microphone_level
-                    }
-                })
-                .bars(18)
-                .size(Size::new(1024.0, 14.0))
-                .theme_when(clone_reader(reader)),
-            FlexItem::flex(1.0).min_width(120.0).min_height(20.0),
-        )
-        .with_item(
-            media_setup_speaker_test_button(shared, reader),
-            FlexItem::fixed(118.0).min_height(26.0),
-        )
-}
-
-fn media_setup_speaker_test_button(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let source =
-        shared
-            .signals()
-            .chat_structure
-            .select_named("chat speaker test structure", |key| {
-                key.0
-                    .as_deref()
-                    .map(|snapshot| (snapshot.theme, snapshot.speaker_test.clone()))
-            });
-    let build_shared = shared.clone();
-    let build_reader = Rc::clone(reader);
-    RebuildOnChange::new_observable(source, move |signature| {
-        let signature = &signature
-            .as_ref()
-            .expect("speaker test is built only after chat is ready")
-            .1;
-        let press_shared = build_shared.clone();
-        let detail = match &signature.state {
-            SpeakerTestState::Failed(detail) => {
-                format!("Speaker test failed: {detail}. Activate to try again.")
-            }
-            SpeakerTestState::Passed => "The selected speaker played the test tone.".to_string(),
-            SpeakerTestState::Testing => {
-                "The test tone is playing through the selected speaker.".to_string()
-            }
-            SpeakerTestState::Idle => "Play a short tone through the selected speaker.".to_string(),
-        };
-        WidgetPod::new(
-            sui::Button::new(signature.state.label())
-                .semantic_name("Test selected speaker")
-                .description(detail)
-                .icon(IconGlyph::AudioLines)
-                .min_height(26.0)
-                .theme_when(clone_reader(&build_reader))
-                .appearance(sui::ButtonAppearance::Tonal)
-                .tone(SemanticTone::Neutral)
-                .enabled(
-                    !signature.active
-                        && matches!(signature.access, MediaAccessState::Ready)
-                        && !matches!(signature.state, SpeakerTestState::Testing),
-                )
-                .on_press(move || press_shared.chat_mut().media_setup.test_speaker()),
-        )
-    })
-}
-
-fn media_setup_recovery_row(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
-    let text_shared = shared.clone();
-    let color_shared = shared.clone();
-    let label = Label::dynamic("Saved on this node.", move || {
-        media_setup_recovery_label(&text_shared.chat()).to_string()
-    })
-    .style(small_text_style(shared))
-    .color_when(move || palette(&color_shared).text_faint);
-    let settings_shared = shared.clone();
-    let enabled_shared = shared.clone();
-    let settings = sui::Button::new("Privacy")
-        .semantic_name("Open media privacy settings")
-        .description("Open operating system microphone and camera privacy settings")
-        .icon(IconGlyph::Lock)
-        .min_height(22.0)
+    sui::Select::new(name)
+        .options(options)
+        .selected_when(selected_when)
         .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .enabled_when(move || {
-            let chat = enabled_shared.chat();
-            !chat.media_call.active && chat.media_setup.permission_settings_available()
-        })
-        .on_press(move || {
-            settings_shared
-                .chat_mut()
-                .media_setup
-                .open_permission_settings()
-        });
-    TrailingSlotRow::new(label, settings)
-        .trailing_width(88.0)
-        .trailing_height(22.0)
-        .gap(8.0)
-}
-
-fn media_setup_recovery_label(chat: &ChatState) -> &'static str {
-    if chat.media_call.active {
-        return "Changes apply next call.";
-    }
-    let states = [
-        &chat.media_setup.microphone_access,
-        &chat.media_setup.speaker_access,
-        &chat.media_setup.camera_access,
-    ];
-    if states
-        .iter()
-        .any(|state| matches!(state, MediaAccessState::PermissionDenied(_)))
-    {
-        "Allow access, then retry."
-    } else if states
-        .iter()
-        .any(|state| matches!(state, MediaAccessState::Busy(_)))
-    {
-        "Device busy; close other apps."
-    } else if states
-        .iter()
-        .any(|state| matches!(state, MediaAccessState::Unavailable(_)))
-    {
-        "Choose or reconnect a device."
-    } else if states
-        .iter()
-        .any(|state| matches!(state, MediaAccessState::Unsupported(_)))
-    {
-        "Unsupported on this node."
-    } else if chat.media_setup.recovery_detail().is_some() {
-        "Review device status, then retry."
-    } else {
-        "Saved on this node."
-    }
-}
-
-fn media_call_controls_row(
-    shared: &Shared,
-    reader: &ThemeReader,
-    signature: &MediaCallPanelSignature,
-) -> impl Widget + use<> {
-    Flex::horizontal()
-        .gap(8.0)
-        .align_items(Alignment::Center)
-        .with_item(
-            media_call_mic_button(shared, reader, signature.mic_enabled),
-            FlexItem::flex(1.0).min_width(0.0).min_height(28.0),
-        )
-        .with_item(
-            media_call_toggle_button(shared, reader, signature.active),
-            FlexItem::flex(1.0).min_width(0.0).min_height(28.0),
-        )
-        .with_item(
-            media_call_camera_button(shared, reader, signature.camera_enabled),
-            FlexItem::flex(1.0).min_width(0.0).min_height(28.0),
-        )
-}
-
-fn media_call_details_button(
-    shared: &Shared,
-    reader: &ThemeReader,
-    details_open: bool,
-) -> sui::Button {
-    let s = shared.clone();
-    let (label, semantic_name, icon) = if details_open {
-        ("Hide", "Hide media controls", IconGlyph::ChevronUp)
-    } else {
-        ("Controls", "Show media controls", IconGlyph::Video)
-    };
-    sui::Button::new(label)
-        .semantic_name(semantic_name)
-        .description("Toggle realtime media controls")
-        .icon(icon)
-        .icon_size(13.0)
-        .min_width(0.0)
-        .min_height(26.0)
-        .padding(media_call_button_padding())
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_media_call_details();
-            request_chat_window_relayout(ctx);
-        })
+        .on_change(on_change)
 }
 
 fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -> sui::Button {
     let s = shared.clone();
     let (label, semantic_name, icon) = if enabled {
-        ("Mic", "Mute microphone", IconGlyph::Mic)
+        ("Mute", "Mute microphone", IconGlyph::Mic)
     } else {
-        ("Muted", "Enable microphone", IconGlyph::MicOff)
+        ("Unmute", "Unmute microphone", IconGlyph::MicOff)
     };
     sui::Button::new(label)
         .semantic_name(semantic_name)
-        .description("Toggle microphone input for the media call")
+        .description("Toggle audio input for the call")
         .icon(icon)
-        .icon_size(13.0)
+        .icon_size(14.0)
         .min_width(0.0)
-        .min_height(28.0)
+        .min_height(30.0)
         .padding(media_call_button_padding())
         .theme_when(clone_reader(reader))
         .appearance(sui::ButtonAppearance::Tonal)
@@ -13470,22 +13171,43 @@ fn media_call_mic_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -
         })
 }
 
+fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -> sui::Button {
+    let s = shared.clone();
+    let (label, semantic_name, icon) = if enabled {
+        ("Stop video", "Stop video", IconGlyph::Camera)
+    } else {
+        ("Start video", "Start video", IconGlyph::CameraOff)
+    };
+    sui::Button::new(label)
+        .semantic_name(semantic_name)
+        .description("Explicitly start or stop the selected video source")
+        .icon(icon)
+        .icon_size(14.0)
+        .min_width(0.0)
+        .min_height(30.0)
+        .padding(media_call_button_padding())
+        .theme_when(clone_reader(reader))
+        .appearance(sui::ButtonAppearance::Tonal)
+        .tone(SemanticTone::Neutral)
+        .on_press_with_ctx(move |ctx| {
+            s.chat_mut().toggle_media_call_camera();
+            request_chat_window_relayout(ctx);
+        })
+}
+
 fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool) -> sui::Button {
     let s = shared.clone();
     let enabled_shared = shared.clone();
     let (label, semantic_name, icon) = if active {
-        ("End", "End media call", IconGlyph::PhoneOff)
+        ("End call", "End media call", IconGlyph::PhoneOff)
     } else {
-        ("Start", "Start media call", IconGlyph::Phone)
+        ("Start call", "Start media call", IconGlyph::Phone)
     };
     let button = sui::Button::new(label)
         .semantic_name(semantic_name)
-        .description("Start or end the realtime media call")
+        .description("Start or end the realtime call")
         .icon(icon)
-        .icon_size(13.0)
-        .min_width(0.0)
-        .min_height(28.0)
-        .padding(media_call_button_padding());
+        .min_height(36.0);
     let button = if active {
         button
             .theme_when(clone_reader(reader))
@@ -13495,33 +13217,9 @@ fn media_call_toggle_button(shared: &Shared, reader: &ThemeReader, active: bool)
         button.theme_when(clone_reader(reader))
     };
     button
-        .enabled_when(move || active || enabled_shared.chat().media_setup.access_check_complete())
+        .enabled_when(move || active || enabled_shared.chat().media_call_start_ready())
         .on_press_with_ctx(move |ctx| {
             s.chat_mut().toggle_media_call();
-            request_chat_window_relayout(ctx);
-        })
-}
-
-fn media_call_camera_button(shared: &Shared, reader: &ThemeReader, enabled: bool) -> sui::Button {
-    let s = shared.clone();
-    let (label, semantic_name, icon) = if enabled {
-        ("Cam", "Pause camera", IconGlyph::Camera)
-    } else {
-        ("Paused", "Enable camera", IconGlyph::CameraOff)
-    };
-    sui::Button::new(label)
-        .semantic_name(semantic_name)
-        .description("Toggle camera input for the media call")
-        .icon(icon)
-        .icon_size(13.0)
-        .min_width(0.0)
-        .min_height(28.0)
-        .padding(media_call_button_padding())
-        .theme_when(clone_reader(reader))
-        .appearance(sui::ButtonAppearance::Tonal)
-        .tone(SemanticTone::Neutral)
-        .on_press_with_ctx(move |ctx| {
-            s.chat_mut().toggle_media_call_camera();
             request_chat_window_relayout(ctx);
         })
 }
@@ -18218,18 +17916,17 @@ fn main_column(
                     .map(|snapshot| {
                         (
                             snapshot.theme,
-                            snapshot.media_panel.active || snapshot.media_panel.details_open,
-                            snapshot.media_panel.details_open,
+                            snapshot.media_panel.active || snapshot.media_panel.open,
                         )
                     })
-                    .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), false, false))
+                    .unwrap_or(((AppThemeMode::System, AppTextScale::Standard), false))
             },
         );
         let build_shared = shared.clone();
         let build_reader = Rc::clone(reader);
         let build_selection = selection.clone();
         RebuildOnChange::new_observable(source, move |media_sig| {
-            let (_theme, panel_visible, details_open) = *media_sig;
+            let (_theme, panel_visible) = *media_sig;
             let transcript = transcript_with_context_menu(
                 &build_shared,
                 &build_reader,
@@ -18239,13 +17936,9 @@ fn main_column(
             if !panel_visible {
                 return WidgetPod::new(transcript);
             }
-            let height = if details_open {
-                MEDIA_CALL_H
-            } else {
-                MEDIA_CALL_COMPACT_H
-            };
             WidgetPod::new(
-                Dock::new(transcript).top(height, media_call_panel(&build_shared, &build_reader)),
+                Dock::new(transcript)
+                    .top(MEDIA_CALL_H, media_call_panel(&build_shared, &build_reader)),
             )
         })
     };
@@ -24326,13 +24019,14 @@ mod tests {
         state.models_loading = false;
 
         assert!(!state.media_call_details_visible());
+        assert!(!state.media_call.camera_enabled);
         state.toggle_media_call();
         assert!(state.media_call.active);
         assert!(state.media_call_details_visible());
         assert_eq!(state.media_call.provider, "OpenAI");
-        assert_eq!(state.media_call.model, "gpt-5");
+        assert_eq!(state.media_call.model, "gpt-realtime-2");
         assert!(state.media_call_status_summary().contains("mic on"));
-        assert!(state.media_call_status_summary().contains("camera on"));
+        assert!(state.media_call_status_summary().contains("video off"));
 
         state.media_setup.microphone_access = MediaAccessState::Ready;
         state.media_setup.camera_access = MediaAccessState::Ready;
@@ -24341,18 +24035,41 @@ mod tests {
         state.toggle_media_call_mic();
         state.toggle_media_call_camera();
         assert!(!state.media_call.mic_enabled);
-        assert!(!state.media_call.camera_enabled);
+        assert!(state.media_call.camera_enabled);
         assert_eq!(state.media_call.microphone_level, 0.0);
-        assert!(state.media_setup.camera_surface.latest().is_none());
         assert_eq!(state.media_setup.microphone_access, MediaAccessState::Idle);
-        assert_eq!(state.media_setup.camera_access, MediaAccessState::Idle);
         assert!(state.media_call_status_summary().contains("mic muted"));
-        assert!(state.media_call_status_summary().contains("camera paused"));
+        assert!(state.media_call_status_summary().contains("video on"));
+
+        state.toggle_media_call_camera();
+        assert!(!state.media_call.camera_enabled);
+        assert!(state.media_setup.camera_surface.latest().is_none());
+        assert_eq!(state.media_setup.camera_access, MediaAccessState::Idle);
 
         state.toggle_media_call();
         assert!(!state.media_call.active);
         assert!(!state.media_call_details_visible());
         assert_eq!(state.media_call.notice.as_deref(), Some("call ended"));
+    }
+
+    #[test]
+    fn media_call_uses_realtime_catalog_instead_of_chat_models() {
+        let backend = Backend::local_fallback();
+        let mut state = ChatState::new(&backend);
+        seed_default_provider(&mut state);
+
+        assert_eq!(state.current_models(), vec!["gpt-5".to_string()]);
+        assert_eq!(
+            state.current_realtime_models(),
+            vec!["gpt-realtime-2".to_string()]
+        );
+        assert_eq!(state.current_media_provider_model().1, "gpt-realtime-2");
+
+        state.providers[0].id = "anthropic".to_string();
+        state.providers[0].capabilities = Default::default();
+        assert!(state.current_realtime_models().is_empty());
+        assert_eq!(state.current_media_provider_model().1, "model pending");
+        assert!(!state.media_call_start_ready());
     }
 
     #[test]
@@ -25050,6 +24767,8 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         state.media_call_details_open = true;
+        state.media_call.camera_enabled = true;
+        state.media_setup.set_camera_enabled(true);
         state.media_setup.start();
         assert!(state.media_setup.is_running());
 
@@ -25069,6 +24788,8 @@ mod tests {
         let backend = Backend::local_fallback();
         let mut state = ChatState::new(&backend);
         state.media_call_details_open = true;
+        state.media_call.camera_enabled = true;
+        state.media_setup.set_camera_enabled(true);
         state.media_setup.start();
         state.media_setup.microphone_level = 0.8;
         publish_test_camera_frame(&state, 4, 1, 1, [0, 0, 0, 255]);
@@ -25094,30 +24815,6 @@ mod tests {
     }
 
     #[test]
-    fn media_setup_recovery_copy_stays_compact_and_keeps_detail_accessible() {
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        let detail = "microphone permission denied by operating system privacy settings";
-        shared.chat_mut().media_setup.microphone_access =
-            MediaAccessState::PermissionDenied(detail.to_string());
-
-        assert_eq!(
-            media_setup_recovery_label(&shared.chat()),
-            "Allow access, then retry."
-        );
-        assert!(media_setup_recovery_label(&shared.chat()).chars().count() <= 30);
-        assert!(media_call_accessibility_summary(&shared).contains(detail));
-
-        shared.chat_mut().media_setup.microphone_access = MediaAccessState::Ready;
-        shared.chat_mut().media_setup.camera_access =
-            MediaAccessState::Busy("camera is in use".to_string());
-        assert_eq!(
-            media_setup_recovery_label(&shared.chat()),
-            "Device busy; close other apps."
-        );
-    }
-
-    #[test]
     fn device_selection_index_does_not_replace_the_media_panel_tree() {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
@@ -25138,7 +24835,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_voice_link_button_opens_setup_before_starting_media_call() -> sui::Result<()> {
+    fn rendered_voice_link_uses_three_columns_and_keeps_video_manual() -> sui::Result<()> {
         let backend = Backend::local_fallback();
         let shared = Shared::new(AppState::ready(backend));
         {
@@ -25149,227 +24846,147 @@ mod tests {
             chat.models_loading = false;
         }
 
-        let runtime = sui::Application::new()
-            .window(
-                sui::WindowBuilder::new()
-                    .title("Chat media controls")
-                    .root(view(shared.clone())),
-            )
-            .build()?;
+        let runtime = crate::build_runtime(shared.clone())?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
-
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Set up voice link")
-                .count()?,
-            1
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Show media controls")
-                .count()?,
-            0,
-            "idle media controls should not consume a transcript row"
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Start media call")
-                .count()?,
-            0,
-            "idle media controls should be hidden until the voice link opens"
-        );
 
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Set up voice link")
             .click()?;
+        app.run_until_idle()?;
+        if let Some(path) = std::env::var_os("SINOMO_MEDIA_LAYOUT_SHOT") {
+            let path = std::path::PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create media layout screenshot directory");
+            }
+            window
+                .capture_screenshot()?
+                .write_png(&path)
+                .expect("write media layout screenshot");
+        }
         assert!(!shared.chat().media_call.active);
-        assert!(shared.chat().media_call_details_visible());
+        assert!(!shared.chat().media_call.camera_enabled);
+        assert!(!shared.chat().media_setup.camera_enabled());
+
+        let snapshot = window.snapshot()?;
+        let named_region = |name: &str| {
+            snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::GenericContainer
+                        && node.name.as_deref() == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing media column {name}"))
+        };
+        let agent = named_region("Agent video");
+        let user = named_region("Your video");
+        let controls = named_region("Call controls");
+        assert!(agent.bounds.max_x() <= user.bounds.x() + 0.5);
+        assert!(user.bounds.max_x() <= controls.bounds.x() + 0.5);
+        let start_call = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Start media call")
+            })
+            .expect("start call button");
+        assert!(start_call.bounds.height() >= 34.0);
+        assert!(start_call.bounds.y() >= controls.bounds.y() - 0.5);
+        assert!(start_call.bounds.max_y() <= controls.bounds.max_y() + 0.5);
         assert_eq!(
             window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Hide media controls")
+                .get_by_role(SemanticsRole::Image)
+                .with_name("User avatar placeholder")
                 .count()?,
             1
         );
         assert_eq!(
             window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Start media call")
+                .get_by_role(SemanticsRole::Image)
+                .with_name("Camera preview")
                 .count()?,
-            1
+            0,
+            "opening call controls must not start camera capture"
         );
-        for name in ["Microphone device", "Speaker device", "Camera device"] {
+        for name in ["Video device", "Audio device", "Realtime model"] {
             assert_eq!(
                 window
                     .get_by_role(SemanticsRole::ComboBox)
                     .with_name(name)
                     .count()?,
                 1,
-                "setup should expose the {name} selector"
+                "missing {name} selector"
             );
         }
+        let model_selector = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ComboBox
+                    && node.name.as_deref() == Some("Realtime model")
+            })
+            .expect("realtime model selector");
         assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Retry media device access")
-                .count()?,
-            1
+            model_selector.value,
+            Some(SemanticsValue::Text("gpt-realtime-2".to_string()))
         );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Open media privacy settings")
-                .count()?,
-            1
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Test selected speaker")
-                .count()?,
-            1
-        );
+        let audio_selector = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| {
+                node.role == SemanticsRole::ComboBox && node.name.as_deref() == Some("Audio device")
+            })
+            .expect("audio selector");
+        assert!(audio_selector.bounds.max_y() <= model_selector.bounds.y() + 0.5);
+        assert!(model_selector.bounds.max_y() <= start_call.bounds.y() + 0.5);
+        for name in ["Start video", "Mute microphone", "Start media call"] {
+            assert_eq!(
+                window
+                    .get_by_role(SemanticsRole::Button)
+                    .with_name(name)
+                    .count()?,
+                1,
+                "missing {name} control"
+            );
+        }
 
         window
             .get_by_role(SemanticsRole::Button)
             .with_name("Start media call")
             .click()?;
+        assert!(shared.chat().media_call.active);
+        assert_eq!(shared.chat().media_call.model, "gpt-realtime-2");
         assert!(
-            shared.chat().media_call.active,
-            "start button should activate the call; notice={:?}",
-            shared.chat().media_call.notice
+            !shared.chat().media_call.camera_enabled,
+            "starting the call must preserve the explicit video-off intent"
         );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("End media call")
-                .count()?,
-            1
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Mute microphone")
-                .count()?,
-            1
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Pause camera")
-                .count()?,
-            1
-        );
-
         window
             .get_by_role(SemanticsRole::Button)
-            .with_name("Hide media controls")
+            .with_name("Start video")
             .click()?;
-        assert!(!shared.chat().media_call_details_visible());
-        assert!(
-            shared.chat().media_call_panel_visible(),
-            "hiding active controls should keep the compact media row visible"
-        );
-        assert_eq!(
-            window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Show media controls")
-                .count()?,
-            1
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn rendered_active_media_call_keeps_compact_status_after_hiding_controls() -> sui::Result<()> {
-        use sui::{Event, WindowEvent};
-
-        let backend = Backend::local_fallback();
-        let shared = Shared::new(AppState::ready(backend));
-        {
-            let mut chat = shared.chat_mut();
-            seed_default_provider(&mut chat);
-            chat.info.provider = "openai".to_string();
-            chat.info.model = "gpt-5".to_string();
-            chat.models_loading = false;
-            chat.media_call.active = true;
-            chat.media_call.provider = "OpenAI".to_string();
-            chat.media_call.model = "gpt-5".to_string();
-            chat.media_call.started_at = Some(Instant::now());
-            chat.media_call_details_open = false;
-        }
-
-        let runtime = sui::Application::new()
-            .window(
-                sui::WindowBuilder::new()
-                    .title("Active chat media controls")
-                    .root(view(shared.clone())),
-            )
-            .build()?;
-        let app = sui_testing::TestApp::from_runtime(runtime)?;
-        let window = app.main_window()?;
-        window
-            .root()
-            .dispatch_event(Event::Window(WindowEvent::Resized(Size::new(320.0, 480.0))))?;
         app.run_until_idle()?;
-
-        assert!(shared.chat().media_call_panel_visible());
+        assert!(shared.chat().media_call.camera_enabled);
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
-                .with_name("Show media controls")
+                .with_name("Stop video")
                 .count()?,
-            1,
-            "active calls should keep a compact media status row available"
+            1
         );
-        let compact_snapshot = window.snapshot()?;
-        let media = compact_snapshot
-            .accessibility
-            .nodes
-            .iter()
-            .find(|node| {
-                node.role == SemanticsRole::GenericContainer
-                    && node.name.as_deref() == Some("Media call")
-            })
-            .expect("compact media region");
-        assert!(media.bounds.height() <= MEDIA_CALL_COMPACT_H + 0.5);
-        let contains = |outer: Rect, inner: Rect| {
-            inner.x() >= outer.x() - 0.5
-                && inner.y() >= outer.y() - 0.5
-                && inner.max_x() <= outer.max_x() + 0.5
-                && inner.max_y() <= outer.max_y() + 0.5
-        };
-        for node in compact_snapshot.accessibility.nodes.iter().filter(|node| {
-            matches!(
-                node.name.as_deref(),
-                Some("Show media controls" | "Media call" | "LIVE")
-            )
-        }) {
-            assert!(
-                contains(media.bounds, node.bounds),
-                "compact media child must stay inside its row: {:?}",
-                node.bounds
-            );
-        }
         assert_eq!(
             window
-                .get_by_role(SemanticsRole::Button)
-                .with_name("Start media call")
+                .get_by_role(SemanticsRole::Image)
+                .with_name("Camera preview")
                 .count()?,
-            0
+            1
         );
-
-        window
-            .get_by_role(SemanticsRole::Button)
-            .with_name("Show media controls")
-            .click()?;
-        assert!(shared.chat().media_call_details_visible());
         assert_eq!(
             window
                 .get_by_role(SemanticsRole::Button)
@@ -25382,8 +24999,7 @@ mod tests {
     }
 
     #[test]
-    fn rendered_media_setup_stays_separated_at_320px_and_bad_preview_falls_back() -> sui::Result<()>
-    {
+    fn rendered_media_columns_scroll_horizontally_at_phone_width() -> sui::Result<()> {
         use sui::{Event, WindowEvent};
 
         let backend = Backend::local_fallback();
@@ -25394,13 +25010,12 @@ mod tests {
             chat.models_loading = false;
             chat.media_call_details_open = true;
             chat.media_setup.start();
-            publish_test_camera_frame(&chat, 7, 2, 2, Arc::<[u8]>::from(vec![255; 3]));
         }
 
         let runtime = sui::Application::new()
             .window(
                 sui::WindowBuilder::new()
-                    .title("Compact media setup")
+                    .title("Narrow media columns")
                     .root(view(shared)),
             )
             .build()?;
@@ -25431,104 +25046,37 @@ mod tests {
                 node.role == SemanticsRole::GenericContainer
                     && node.name.as_deref() == Some("Media call")
             })
-            .expect("expanded media region");
-        assert!(
-            (MEDIA_CALL_H - 1.0..=MEDIA_CALL_H + 0.5).contains(&media.bounds.height()),
-            "expanded media panel should reserve only its fixed layout height: {:?}",
-            media.bounds
-        );
-        let combos = snapshot
-            .accessibility
-            .nodes
-            .iter()
-            .filter(|node| node.role == SemanticsRole::ComboBox)
-            .filter(|node| {
-                matches!(
-                    node.name.as_deref(),
-                    Some("Microphone device" | "Speaker device" | "Camera device")
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(combos.len(), 3);
-        assert!(combos.iter().all(|node| {
-            node.bounds.x() >= 0.0 && node.bounds.max_x() <= 320.0 && node.bounds.width() > 0.0
-        }));
-        let selector_y = combos
-            .iter()
-            .map(|node| node.bounds.y())
-            .fold(f32::INFINITY, f32::min);
-        let retry = snapshot
+            .expect("media region");
+        assert!((MEDIA_CALL_H - 1.0..=MEDIA_CALL_H + 0.5).contains(&media.bounds.height()));
+        let scroller = snapshot
             .accessibility
             .nodes
             .iter()
             .find(|node| {
-                node.role == SemanticsRole::Button
-                    && node.name.as_deref() == Some("Retry media device access")
+                node.role == SemanticsRole::ScrollView
+                    && node.name.as_deref() == Some("Media call columns")
             })
-            .expect("retry access button");
-        assert!(
-            retry.bounds.max_y() <= selector_y + 0.5,
-            "access controls must not overlap selectors: retry={:?}, selector_y={selector_y}",
-            retry.bounds
-        );
-        let preview = snapshot
-            .accessibility
-            .nodes
-            .iter()
-            .find(|node| {
-                node.role == SemanticsRole::Image && node.name.as_deref() == Some("Camera preview")
-            })
-            .expect("camera preview semantics");
-        assert!(
-            preview.bounds.height() >= 80.0,
-            "camera preview should remain useful at narrow widths: {:?}",
-            preview.bounds
-        );
-        assert!((1.6..=2.0).contains(&(preview.bounds.width() / preview.bounds.height())));
-
-        let named = |name: &str| {
+            .expect("media column scroller");
+        assert!(scroller.bounds.width() <= 320.0);
+        let column = |name: &str| {
             snapshot
                 .accessibility
                 .nodes
                 .iter()
-                .find(|node| node.name.as_deref() == Some(name))
-                .unwrap_or_else(|| panic!("missing media control {name}"))
+                .find(|node| {
+                    node.role == SemanticsRole::GenericContainer
+                        && node.name.as_deref() == Some(name)
+                })
+                .unwrap_or_else(|| panic!("missing {name} column"))
         };
-        let contains = |outer: Rect, inner: Rect| {
-            inner.x() >= outer.x() - 0.5
-                && inner.y() >= outer.y() - 0.5
-                && inner.max_x() <= outer.max_x() + 0.5
-                && inner.max_y() <= outer.max_y() + 0.5
-        };
-        for name in [
-            "Hide media controls",
-            "Retry media device access",
-            "Test selected speaker",
-            "Open media privacy settings",
-            "Mute microphone",
-            "Start media call",
-            "Pause camera",
-        ] {
-            let child = named(name);
-            assert!(
-                contains(media.bounds, child.bounds),
-                "{name} must stay inside the expanded media panel: {:?}",
-                child.bounds
-            );
-        }
-        let meter = named("Microphone input level");
-        let speaker_test = named("Test selected speaker");
-        let privacy = named("Open media privacy settings");
-        let start = named("Start media call");
-        let selector_bottom = combos
-            .iter()
-            .map(|node| node.bounds.max_y())
-            .fold(f32::NEG_INFINITY, f32::max);
-        assert!(selector_bottom <= meter.bounds.y() + 0.5);
-        assert!(selector_bottom <= speaker_test.bounds.y() + 0.5);
-        assert!(meter.bounds.max_y() <= privacy.bounds.y() + 0.5);
-        assert!(speaker_test.bounds.max_y() <= privacy.bounds.y() + 0.5);
-        assert!(privacy.bounds.max_y() <= start.bounds.y() + 0.5);
+        let agent = column("Agent video");
+        let user = column("Your video");
+        let controls = column("Call controls");
+        assert!(agent.bounds.width() >= 190.0);
+        assert!(user.bounds.width() >= 190.0);
+        assert!(controls.bounds.width() >= 268.0);
+        assert!(agent.bounds.max_x() <= user.bounds.x() + 0.5);
+        assert!(user.bounds.max_x() <= controls.bounds.x() + 0.5);
 
         Ok(())
     }
@@ -25543,6 +25091,8 @@ mod tests {
         let first = {
             let mut chat = shared.chat_mut();
             chat.media_call_details_open = true;
+            chat.media_call.camera_enabled = true;
+            chat.media_setup.set_camera_enabled(true);
             chat.media_setup.start();
             publish_test_camera_frame(&chat, 0, 2, 1, [255, 0, 0, 255, 255, 0, 0, 255])
         };
@@ -25602,6 +25152,8 @@ mod tests {
         {
             let mut chat = shared.chat_mut();
             chat.media_call_details_open = true;
+            chat.media_call.camera_enabled = true;
+            chat.media_setup.set_camera_enabled(true);
             chat.media_setup.start();
             publish_test_camera_frame(&chat, 11, 2, 1, [255, 0, 0, 255, 0, 255, 0, 255]);
         }
@@ -28209,9 +27761,14 @@ mod tests {
             return; // environment without multiple configured providers
         }
         state.model_idx = 3;
+        state.media_call.model_idx = 3;
         state.set_provider(1);
         assert_eq!(state.provider_idx, 1);
         assert_eq!(state.model_idx, 0, "switching providers resets the model");
+        assert_eq!(
+            state.media_call.model_idx, 0,
+            "switching providers resets the realtime model"
+        );
     }
 
     /// Issue 2: the default/initial provider's full model list must be fetched eagerly at
