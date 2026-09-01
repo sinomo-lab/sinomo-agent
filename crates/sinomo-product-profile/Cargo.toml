@@ -18,3 +18,4 @@ native-workers = []
 
 [dependencies]
 sinomo-runtime = { path = "../sinomo-runtime" }
+tracing.workspace = true

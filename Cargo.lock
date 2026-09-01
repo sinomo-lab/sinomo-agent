@@ -9517,6 +9517,7 @@ dependencies = [
  "serde_yaml",
  "sinomo-lm",
  "sinomo-memory",
+ "sinomo-product-profile",
  "sinomo-runtime",
  "sinomo-testdir",
  "thiserror 2.0.20",
@@ -9660,6 +9661,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-build-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sinomo-build",
+ "sinomo-core",
+ "sinomo-daemon",
+ "tokio",
+]
+
+[[package]]
 name = "sinomo-cli"
 version = "0.1.0"
 dependencies = [
@@ -9782,7 +9794,6 @@ dependencies = [
  "metrics",
  "netwatcher",
  "notify",
- "reqwest",
  "ring",
  "serde",
  "serde_bytes",
@@ -9797,7 +9808,6 @@ dependencies = [
  "sinomo-module",
  "sinomo-module-api",
  "sinomo-observe",
- "sinomo-registry",
  "sinomo-rollout",
  "sinomo-sandbox",
  "sinomo-testdir",
@@ -10223,6 +10233,7 @@ name = "sinomo-product-profile"
 version = "0.1.0"
 dependencies = [
  "sinomo-runtime",
+ "tracing",
 ]
 
 [[package]]
@@ -10307,11 +10318,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "sinomo-rollout-client"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "sinomo-core",
+ "sinomo-daemon",
+ "sinomo-rollout",
+ "sinomo-testdir",
+ "tokio",
+]
+
+[[package]]
+name = "sinomo-rollout-host"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde_json",
+ "sinomo-api",
+ "sinomo-config",
+ "sinomo-core",
+ "sinomo-daemon",
+ "sinomo-dfs",
+ "sinomo-module",
+ "sinomo-rollout",
+ "sinomo-testdir",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "sinomo-runtime"
 version = "0.1.0"
 dependencies = [
  "sinomo-api",
  "sinomo-build",
+ "sinomo-build-client",
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
@@ -10328,6 +10373,8 @@ dependencies = [
  "sinomo-registry",
  "sinomo-remote-management",
  "sinomo-rollout",
+ "sinomo-rollout-client",
+ "sinomo-rollout-host",
  "sinomo-sandbox",
  "sinomo-sandbox-simple",
  "sinomo-supervision",
@@ -10344,13 +10391,16 @@ dependencies = [
  "fs2",
  "getrandom 0.4.3",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
+ "sinomo-api",
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",
+ "sinomo-module-api",
  "sinomo-registry",
  "sinomo-testdir",
  "tar",

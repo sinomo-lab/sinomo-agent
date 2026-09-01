@@ -535,3 +535,22 @@ impl std::fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+impl From<sinomo_runtime::rollout_host::RolloutHostError> for CliError {
+    fn from(error: sinomo_runtime::rollout_host::RolloutHostError) -> Self {
+        match error {
+            sinomo_runtime::rollout_host::RolloutHostError::Io { path, detail } => {
+                Self::Io { path, detail }
+            }
+            sinomo_runtime::rollout_host::RolloutHostError::Network { address, detail } => {
+                Self::Network { address, detail }
+            }
+            sinomo_runtime::rollout_host::RolloutHostError::NotRunning { detail } => {
+                Self::DaemonNotRunning { detail }
+            }
+            other => Self::Parse {
+                detail: other.to_string(),
+            },
+        }
+    }
+}

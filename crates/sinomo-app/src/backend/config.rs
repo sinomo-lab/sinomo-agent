@@ -100,12 +100,19 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
     let builder = sinomo_runtime::module::register_config_definitions(builder)
         .map_err(|e| format!("module config: {e}"))?;
-    let builder = sinomo_runtime::rollout::register_config_definitions(builder)
-        .map_err(|e| format!("rollout config: {e:?}"))?;
-    let builder = sinomo_runtime::sandbox::register_config_definitions(builder)
-        .map_err(|e| format!("sandbox config: {e:?}"))?;
-    let builder = sinomo_runtime::modules::register_internal_module_config_definitions(builder)
-        .map_err(|e| format!("built-in module config: {e}"))?;
+    let data_dir = sinomo_runtime::local::SinomoDataDir::from_env_or_home()
+        .map_err(|e| format!("resolve product data directory: {e}"))?;
+    let cluster_initialized = sinomo_runtime::network::ClusterPaths::new(&data_dir)
+        .state
+        .exists();
+    let catalog = sinomo_product_profile::base_component_catalog(
+        &data_dir,
+        sinomo_product_profile::ProductComponentProfile::embedded(cluster_initialized),
+    )
+    .map_err(|e| format!("build embedded product component catalog: {e}"))?;
+    let builder = catalog
+        .register_config_definitions(builder)
+        .map_err(|e| format!("product component config: {e}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
     let builder = sinomo_evolution::register_config_definitions(builder)

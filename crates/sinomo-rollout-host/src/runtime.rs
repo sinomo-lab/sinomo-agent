@@ -1,16 +1,17 @@
-use crate::cluster::CLUSTER_HEALTH_PROBE_TIMEOUT;
+use crate::RolloutHostError as DaemonError;
+use fs2::FileExt;
+use sinomo_daemon::CLUSTER_HEALTH_PROBE_TIMEOUT;
 #[cfg(windows)]
-use crate::prepare_noninteractive_command;
+use sinomo_daemon::prepare_noninteractive_command;
 #[cfg(not(unix))]
-use crate::spawn_shadow_rollout_completion_helper_process;
-use crate::{
-    CandidateMainDiagnostics, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
-    DaemonProbeStatus, DaemonStatus, daemon_connect_address, prepare_background_command,
-    probe_daemon_status, read_daemon_endpoint_advertisement_config, read_daemon_status,
-    send_daemon_shutdown_request, spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+use sinomo_daemon::spawn_shadow_rollout_completion_helper_process;
+use sinomo_daemon::{
+    CandidateMainDiagnostics, DaemonClusterStatus, DaemonLock, DaemonPaths, DaemonProbeStatus,
+    DaemonStatus, daemon_connect_address, prepare_background_command, probe_daemon_status,
+    read_daemon_endpoint_advertisement_config, read_daemon_status, send_daemon_shutdown_request,
+    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
     spawn_shadow_rollout_recovery_helper_process,
 };
-use fs2::FileExt;
 #[cfg(test)]
 use sinomo_rollout::read_rollout_status;
 use sinomo_rollout::{
@@ -65,6 +66,16 @@ const SHADOW_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PENDING_MAIN_ACTIVATION_FORCE_TERMINATE_AFTER: Duration = Duration::from_secs(10);
 const PENDING_MAIN_ACTIVATION_TERMINATE_WAIT: Duration = Duration::from_secs(5);
 const ROLLOUT_DAEMON_TERMINATE_WAIT: Duration = Duration::from_secs(5);
+
+fn main_exit_observation_from_status(status: ExitStatus) -> MainExitObservation {
+    #[cfg(unix)]
+    {
+        if let Some(signal) = status.signal() {
+            return MainExitObservation::signal(signal);
+        }
+    }
+    MainExitObservation::exit_code(status.code().unwrap_or(1))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RolloutTerminationMode {
@@ -192,11 +203,11 @@ fn write_cluster_rollout_progress_inner(
         _ => "rollout.stage.progress",
     };
     let severity = if status_label == "failed" {
-        crate::OperationalSeverity::Error
+        sinomo_daemon::OperationalSeverity::Error
     } else {
-        crate::OperationalSeverity::Info
+        sinomo_daemon::OperationalSeverity::Info
     };
-    crate::append_operational_event_best_effort(
+    sinomo_daemon::append_operational_event_best_effort(
         daemon_paths,
         severity,
         "rollout",
@@ -257,7 +268,7 @@ fn publish_rollout_progress_to_cluster(daemon_paths: &DaemonPaths) {
     if let Err(error) = thread::Builder::new()
         .name("sinomo-rollout-progress-publish".to_string())
         .spawn(move || {
-            if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(&daemon_paths) {
+            if let Err(error) = sinomo_daemon::refresh_daemon_node_status_in_kv(&daemon_paths) {
                 tracing::warn!("sinomo daemon rollout progress publish failed: {error}");
             }
         })
@@ -305,7 +316,7 @@ fn start_cluster_rollout_build_heartbeat(
 #[derive(Clone, Debug)]
 pub struct ShadowMainRolloutMonitor {
     pub activation: RolloutMainActivation,
-    pub main_options: crate::DaemonRunOptions,
+    pub main_options: sinomo_daemon::DaemonRunOptions,
     pub previous_main_binary: PathBuf,
     pub previous_shadow_binary: PathBuf,
     pub diagnostics: CandidateMainDiagnostics,
@@ -334,7 +345,7 @@ pub enum ShadowMainStart {
     Recovered {
         child: Option<Child>,
         main_binary: PathBuf,
-        main_options: crate::DaemonRunOptions,
+        main_options: sinomo_daemon::DaemonRunOptions,
     },
 }
 
@@ -349,7 +360,7 @@ pub enum ShadowMainExit {
 pub enum PendingShadowMainExit {
     Promoted {
         main_binary: PathBuf,
-        main_options: crate::DaemonRunOptions,
+        main_options: sinomo_daemon::DaemonRunOptions,
         main_probe_status: DaemonProbeStatus,
     },
     RetryCandidate {
@@ -359,7 +370,7 @@ pub enum PendingShadowMainExit {
     Recovered {
         child: Option<Child>,
         main_binary: PathBuf,
-        main_options: crate::DaemonRunOptions,
+        main_options: sinomo_daemon::DaemonRunOptions,
     },
 }
 
@@ -367,26 +378,6 @@ fn supervised_main_restart_request_path(rollout_paths: &SelfRolloutPaths) -> Pat
     rollout_paths
         .root
         .join(SUPERVISED_MAIN_RESTART_REQUEST_FILE)
-}
-
-/// Mark a clean main-daemon exit as an intentional identity/runtime restart.
-/// The requesting PID prevents a stale marker from changing the meaning of a
-/// later operator-requested shutdown.
-pub(crate) fn request_supervised_main_restart(paths: &DaemonPaths) -> Result<(), DaemonError> {
-    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
-        path: paths.root.display().to_string(),
-        detail: "daemon paths have no data directory parent".to_string(),
-    })?;
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    fs::create_dir_all(&rollout_paths.root).map_err(|source| DaemonError::Io {
-        path: rollout_paths.root.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let marker = supervised_main_restart_request_path(&rollout_paths);
-    fs::write(&marker, format!("{}\n", std::process::id())).map_err(|source| DaemonError::Io {
-        path: marker.display().to_string(),
-        detail: source.to_string(),
-    })
 }
 
 fn take_supervised_main_restart_request(
@@ -642,7 +633,7 @@ fn restore_rollout_binary_from_backup_with_retry(
 fn complete_pending_shadow_rollout_after_start(
     paths: &DaemonPaths,
     rollout_paths: &SelfRolloutPaths,
-    shadow_options: &crate::DaemonRunOptions,
+    shadow_options: &sinomo_daemon::DaemonRunOptions,
 ) -> Result<(), DaemonError> {
     let Some(finalize) = read_pending_shadow_rollout(rollout_paths)? else {
         return Ok(());
@@ -693,9 +684,9 @@ fn complete_pending_shadow_rollout_after_start(
     }
     remove_main_activation(rollout_paths);
     remove_shadow_finalize(rollout_paths);
-    crate::append_operational_event_best_effort(
+    sinomo_daemon::append_operational_event_best_effort(
         paths,
-        crate::OperationalSeverity::Info,
+        sinomo_daemon::OperationalSeverity::Info,
         "rollout",
         "rollout.stage.accepted",
         "shadow rollout finalized",
@@ -769,9 +760,9 @@ fn rehydrate_main_activation_if_staged_main_is_pending(
 #[cfg(unix)]
 fn reexec_shadow_supervisor(
     target: &Path,
-    shadow_options: &crate::DaemonRunOptions,
+    shadow_options: &sinomo_daemon::DaemonRunOptions,
     main_binary: &Path,
-    main_options: &crate::DaemonRunOptions,
+    main_options: &sinomo_daemon::DaemonRunOptions,
 ) -> DaemonError {
     use std::os::unix::process::CommandExt;
     let error = Command::new(target)
@@ -848,7 +839,7 @@ fn shutdown_shadow_runtime_after_task_shutdown(runtime: tokio::runtime::Runtime)
 pub(crate) fn recover_native_loader_intents_before_registry_load(
     paths: &DaemonPaths,
 ) -> Result<Vec<String>, DaemonError> {
-    let data_dir = crate::control::daemon_data_dir_path(paths)?;
+    let data_dir = sinomo_daemon::daemon_data_dir_path(paths)?;
     let rollout_paths = SelfRolloutPaths::new(&data_dir);
     let recovered =
         recover_unresolved_native_dylib_loader_rollback_intents(&data_dir, &rollout_paths)?;
@@ -862,19 +853,21 @@ pub(crate) fn recover_native_loader_intents_before_registry_load(
 }
 
 pub fn run_shadow_daemon_supervision_loop(
-    options: crate::DaemonRunOptions,
+    options: sinomo_daemon::DaemonRunOptions,
+    component_catalog: sinomo_module::ComponentCatalog,
     shadow_paths: DaemonPaths,
     main_paths: DaemonPaths,
     rollout_paths: SelfRolloutPaths,
-    main_options: crate::DaemonRunOptions,
+    main_options: sinomo_daemon::DaemonRunOptions,
     main_binary: PathBuf,
     cluster: Option<DaemonClusterStatus>,
     finalize_timeout: Duration,
     probe_timeout: Duration,
 ) -> Result<(), DaemonError> {
-    let listener = crate::prepare_daemon_control_listener(options)?;
+    let listener = sinomo_daemon::prepare_daemon_control_listener(options)?;
     run_shadow_daemon_supervision_loop_with_prepared_listener(
         listener,
+        component_catalog,
         shadow_paths,
         main_paths,
         rollout_paths,
@@ -887,11 +880,12 @@ pub fn run_shadow_daemon_supervision_loop(
 }
 
 pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
-    listener: crate::PreparedDaemonControlListener,
+    listener: sinomo_daemon::PreparedDaemonControlListener,
+    component_catalog: sinomo_module::ComponentCatalog,
     shadow_paths: DaemonPaths,
     main_paths: DaemonPaths,
     rollout_paths: SelfRolloutPaths,
-    mut main_options: crate::DaemonRunOptions,
+    mut main_options: sinomo_daemon::DaemonRunOptions,
     mut main_binary: PathBuf,
     cluster: Option<DaemonClusterStatus>,
     finalize_timeout: Duration,
@@ -904,11 +898,11 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
             options.port
         );
     }
-    crate::cluster::deny_shadow_daemon_local_raft_access(&shadow_paths)?;
+    sinomo_daemon::deny_shadow_daemon_local_raft_access(&shadow_paths)?;
     let _lock = DaemonLock::acquire(&shadow_paths, &options, cluster.clone())?;
     recover_native_loader_intents_before_registry_load(&shadow_paths)?;
     let bind_address = format!("{}:{}", options.host, options.port);
-    let daemon_runtime = crate::build_daemon_async_runtime("shadow-daemon")?;
+    let daemon_runtime = sinomo_daemon::build_daemon_async_runtime("shadow-daemon")?;
     let daemon_runtime_handle = daemon_runtime.handle().clone();
     let listener = daemon_runtime.block_on(
         sinomo_core::network::AsyncDaemonControlListener::from_std(listener, &bind_address),
@@ -923,9 +917,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
             fallback_port = options.port,
             "sinomo shadow daemon preferred port unavailable; using automatic fallback"
         );
-        crate::append_operational_event_best_effort(
+        sinomo_daemon::append_operational_event_best_effort(
             &shadow_paths,
-            crate::OperationalSeverity::Warn,
+            sinomo_daemon::OperationalSeverity::Warn,
             "shadow-daemon",
             "daemon.lifecycle.port-fallback",
             format!(
@@ -942,9 +936,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
             }),
         );
     }
-    crate::append_operational_event_best_effort(
+    sinomo_daemon::append_operational_event_best_effort(
         &shadow_paths,
-        crate::OperationalSeverity::Info,
+        sinomo_daemon::OperationalSeverity::Info,
         "shadow-daemon",
         "daemon.lifecycle.started",
         format!("sinomo shadow daemon listening on {bind_address}"),
@@ -958,7 +952,7 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
             "main_binary": main_binary.display().to_string(),
         }),
     );
-    if let Some(task) = crate::cluster::start_daemon_network_module_context_task(
+    if let Some(task) = sinomo_daemon::start_daemon_network_module_context_task(
         &shadow_paths,
         &options,
         cluster.as_ref(),
@@ -975,9 +969,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
         complete_pending_shadow_rollout_after_start(&shadow_paths, &rollout_paths, &options)
     {
         tracing::warn!("sinomo shadow daemon rollout finalization publish failed: {error}");
-        crate::append_operational_log_best_effort(
+        sinomo_daemon::append_operational_log_best_effort(
             &shadow_paths,
-            crate::OperationalSeverity::Warn,
+            sinomo_daemon::OperationalSeverity::Warn,
             "shadow-daemon",
             "sinomo shadow daemon rollout finalization publish failed",
             None,
@@ -1001,15 +995,16 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
     let control_paths = shadow_paths.clone();
     let control_bind_address = bind_address.clone();
     let control_service_runtime = daemon_runtime_handle.clone();
+    let control_component_catalog = component_catalog;
     let shadow_control_accept_task = daemon_runtime_handle.spawn(async move {
-        let result = match crate::service_adapter::DaemonServiceRegistryHost::new_on_runtime(
+        let result = match sinomo_daemon::service_adapter::DaemonServiceRegistryHost::new_on_runtime_with_catalog(
             control_paths.clone(),
             control_service_runtime.clone(),
-        )
-        .await
+            control_component_catalog,
+        ).await
         {
             Ok(service_host) => {
-                crate::control::run_daemon_control_accept_loop(
+                sinomo_daemon::run_daemon_control_accept_loop(
                     listener,
                     control_paths,
                     "shadow daemon".to_string(),
@@ -1020,8 +1015,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     control_shutdown_rx,
                 )
                 .await
+                .map_err(Into::into)
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         };
         let _ = control_loop_tx.send(result);
     });
@@ -1107,9 +1103,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         main_probe_status = DaemonProbeStatus::NotRunning;
                         last_main_probe = Instant::now();
                         pending_activation_shutdown_started_at = None;
-                        crate::append_operational_event_best_effort(
+                        sinomo_daemon::append_operational_event_best_effort(
                             &shadow_paths,
-                            crate::OperationalSeverity::Warn,
+                            sinomo_daemon::OperationalSeverity::Warn,
                             "shadow-daemon",
                             "rollout.stage.main_terminated",
                             "shadow daemon terminated unresponsive main for pending rollout activation",
@@ -1125,9 +1121,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         tracing::warn!(
                             "sinomo shadow daemon could not terminate unresponsive main for pending activation: {error}"
                         );
-                        crate::append_operational_event_best_effort(
+                        sinomo_daemon::append_operational_event_best_effort(
                             &shadow_paths,
-                            crate::OperationalSeverity::Warn,
+                            sinomo_daemon::OperationalSeverity::Warn,
                             "shadow-daemon",
                             "rollout.stage.main_terminate_failed",
                             "shadow daemon could not terminate unresponsive main for pending rollout activation",
@@ -1157,9 +1153,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     &options.host,
                     options.port,
                 )?;
-                crate::append_operational_event_best_effort(
+                sinomo_daemon::append_operational_event_best_effort(
                     &shadow_paths,
-                    crate::OperationalSeverity::Info,
+                    sinomo_daemon::OperationalSeverity::Info,
                     "shadow-daemon",
                     "rollout.stage.accepted",
                     "candidate main became healthy; promoting shadow main rollout",
@@ -1190,9 +1186,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     recover_failed_shadow_main_rollout(&rollout_paths, pending, detail, None)?;
                 main_options = pending.main_options.clone();
                 supervised_main = spawn_main_daemon_process(&main_binary, &main_options).ok();
-                crate::append_operational_event_best_effort(
+                sinomo_daemon::append_operational_event_best_effort(
                     &shadow_paths,
-                    crate::OperationalSeverity::Error,
+                    sinomo_daemon::OperationalSeverity::Error,
                     "shadow-daemon",
                     "rollout.stage.failed",
                     detail,
@@ -1228,9 +1224,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     supervised_main = Some(child);
                     supervised_main_started_at = Some(Instant::now());
                     main_restart_backoff.clear_schedule();
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Info,
+                        sinomo_daemon::OperationalSeverity::Info,
                         "shadow-daemon",
                         "daemon.supervision.main_started",
                         "shadow daemon started supervised main",
@@ -1248,9 +1244,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         "sinomo shadow daemon could not start supervised main: {detail}; retrying in {}ms",
                         delay.as_millis()
                     );
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Warn,
+                        sinomo_daemon::OperationalSeverity::Warn,
                         "shadow-daemon",
                         "daemon.supervision.main_start_failed",
                         "shadow daemon could not start supervised main",
@@ -1274,9 +1270,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     pending_rollout = Some(monitor);
                     main_probe_status = DaemonProbeStatus::NotRunning;
                     last_main_probe = Instant::now() - shadow_main_probe_interval(true);
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Info,
+                        sinomo_daemon::OperationalSeverity::Info,
                         "shadow-daemon",
                         "rollout.stage.progress",
                         "shadow daemon started candidate main",
@@ -1300,9 +1296,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     supervised_main = child;
                     supervised_main_started_at = supervised_main.as_ref().map(|_| Instant::now());
                     main_restart_backoff.clear_schedule();
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Warn,
+                        sinomo_daemon::OperationalSeverity::Warn,
                         "shadow-daemon",
                         "daemon.supervision.main_recovered",
                         "shadow daemon recovered supervised main after failed activation",
@@ -1347,9 +1343,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         supervised_main = None;
                         supervised_main_started_at = None;
                         main_restart_backoff.reset();
-                        crate::append_operational_event_best_effort(
+                        sinomo_daemon::append_operational_event_best_effort(
                             &shadow_paths,
-                            crate::OperationalSeverity::Info,
+                            sinomo_daemon::OperationalSeverity::Info,
                             "shadow-daemon",
                             "rollout.stage.accepted",
                             "candidate main was promoted after exit observation",
@@ -1368,9 +1364,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         main_probe_status = DaemonProbeStatus::NotRunning;
                         last_main_probe = Instant::now() - shadow_main_probe_interval(true);
                         main_restart_backoff.clear_schedule();
-                        crate::append_operational_event_best_effort(
+                        sinomo_daemon::append_operational_event_best_effort(
                             &shadow_paths,
-                            crate::OperationalSeverity::Warn,
+                            sinomo_daemon::OperationalSeverity::Warn,
                             "shadow-daemon",
                             "rollout.stage.retry",
                             "candidate main exited cleanly before health; retrying within activation deadline",
@@ -1394,9 +1390,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         supervised_main_started_at =
                             supervised_main.as_ref().map(|_| Instant::now());
                         main_restart_backoff.clear_schedule();
-                        crate::append_operational_event_best_effort(
+                        sinomo_daemon::append_operational_event_best_effort(
                             &shadow_paths,
-                            crate::OperationalSeverity::Error,
+                            sinomo_daemon::OperationalSeverity::Error,
                             "shadow-daemon",
                             "rollout.stage.failed",
                             "candidate main exited during shadow rollout; recovered previous main",
@@ -1429,9 +1425,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     supervised_main_started_at = None;
                     main_restart_suppressed = false;
                     main_restart_backoff.clear_schedule();
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Info,
+                        sinomo_daemon::OperationalSeverity::Info,
                         "shadow-daemon",
                         "daemon.supervision.pending_activation",
                         "supervised main exited for pending activation",
@@ -1450,9 +1446,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     main_restart_backoff.reset();
                     main_probe_status = DaemonProbeStatus::NotRunning;
                     last_main_probe = Instant::now();
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Info,
+                        sinomo_daemon::OperationalSeverity::Info,
                         "shadow-daemon",
                         "daemon.supervision.restart_immediate",
                         "supervised main exited for an explicit clean restart",
@@ -1475,9 +1471,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                         "sinomo shadow daemon supervised main exited with restart requested; retrying in {}ms",
                         delay.as_millis()
                     );
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Warn,
+                        sinomo_daemon::OperationalSeverity::Warn,
                         "shadow-daemon",
                         "daemon.supervision.restart_scheduled",
                         "supervised main exited; restart scheduled",
@@ -1493,9 +1489,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
                     supervised_main_started_at = None;
                     main_restart_suppressed = true;
                     main_restart_backoff.reset();
-                    crate::append_operational_event_best_effort(
+                    sinomo_daemon::append_operational_event_best_effort(
                         &shadow_paths,
-                        crate::OperationalSeverity::Error,
+                        sinomo_daemon::OperationalSeverity::Error,
                         "shadow-daemon",
                         "daemon.supervision.restart_suppressed",
                         "supervised main exited too many times; restart suppressed",
@@ -1554,9 +1550,9 @@ pub fn run_shadow_daemon_supervision_loop_with_prepared_listener(
         }
     }
 
-    crate::append_operational_event_best_effort(
+    sinomo_daemon::append_operational_event_best_effort(
         &shadow_paths,
-        crate::OperationalSeverity::Info,
+        sinomo_daemon::OperationalSeverity::Info,
         "shadow-daemon",
         "daemon.lifecycle.stopped",
         "sinomo shadow daemon stopped",
@@ -1583,8 +1579,8 @@ pub fn sleep_for_shadow_start_delay() -> Result<(), DaemonError> {
     Ok(())
 }
 
-pub fn shadow_main_options_from_env() -> Result<crate::DaemonRunOptions, DaemonError> {
-    let mut options = crate::DaemonRunOptions::default();
+pub fn shadow_main_options_from_env() -> Result<sinomo_daemon::DaemonRunOptions, DaemonError> {
+    let mut options = sinomo_daemon::DaemonRunOptions::default();
     if let Ok(host) = env::var(SHADOW_MAIN_HOST_ENV) {
         options.host = host;
     }
@@ -1974,7 +1970,7 @@ fn module_rollout_response_detail(response: &ClusterRolloutNativeDylibModuleResp
     )
 }
 
-pub(crate) fn activate_daemon_rollout_binary_manifest(
+pub fn activate_daemon_rollout_binary_manifest(
     paths: &DaemonPaths,
     manifest: ClusterRolloutBinaryManifest,
 ) -> Result<ClusterRolloutBinaryResponse, DaemonError> {
@@ -2528,7 +2524,7 @@ fn preflight_cluster_rollout_main_bind(
     ] {
         for manual in endpoints {
             let Some(endpoint_address) =
-                crate::status::normalize_manual_daemon_tcp_endpoint_address(&manual.address, port)
+                sinomo_api::normalize_manual_daemon_tcp_endpoint_address(&manual.address, port)
             else {
                 continue;
             };
@@ -3060,7 +3056,7 @@ pub fn handle_daemon_clear_rollout_status(paths: &DaemonPaths) -> Result<String,
     let data_dir = daemon_data_dir(paths)?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     let cleared = clear_rollout_status(&rollout_paths)?;
-    if let Err(error) = crate::cluster::refresh_daemon_node_status_in_kv(paths) {
+    if let Err(error) = sinomo_daemon::refresh_daemon_node_status_in_kv(paths) {
         tracing::warn!("sinomo daemon rollout status clear publish failed: {error}");
     }
     if cleared {
@@ -3331,7 +3327,7 @@ pub fn promote_shadow_main_rollout(
     pending: &ShadowMainRolloutMonitor,
     shadow_host: &str,
     shadow_port: u16,
-) -> Result<crate::DaemonRunOptions, DaemonError> {
+) -> Result<sinomo_daemon::DaemonRunOptions, DaemonError> {
     let (desired_shadow_host, desired_shadow_port) = pending
         .activation
         .shadow_host
@@ -3389,7 +3385,7 @@ pub fn recover_failed_shadow_main_rollout(
 pub fn start_shadow_main_if_needed(
     rollout_paths: &SelfRolloutPaths,
     main_binary: &Path,
-    main_options: &crate::DaemonRunOptions,
+    main_options: &sinomo_daemon::DaemonRunOptions,
     candidate_timeout: Duration,
 ) -> Result<ShadowMainStart, DaemonError> {
     if let Some(activation) = read_rollout_main_activation(rollout_paths)? {
@@ -3397,7 +3393,7 @@ pub fn start_shadow_main_if_needed(
             .previous_main_binary
             .clone()
             .unwrap_or_else(|| rollout_previous_binary_path(&activation.main_binary));
-        let activation_main_options = crate::DaemonRunOptions {
+        let activation_main_options = sinomo_daemon::DaemonRunOptions {
             host: activation.main_host.clone(),
             port: activation.main_port,
             port_fallback: false,
@@ -3418,7 +3414,7 @@ pub fn start_shadow_main_if_needed(
         match spawn_candidate_main_daemon_process(
             &activation.main_binary,
             &activation_main_options,
-            rollout_paths,
+            &rollout_paths.root,
         ) {
             Ok((child, diagnostics)) => {
                 let main_binary = activation.main_binary.clone();
@@ -3484,7 +3480,7 @@ pub fn start_shadow_main_if_needed(
 pub fn handle_shadow_main_process_exit(
     rollout_paths: &SelfRolloutPaths,
     _main_binary: &Path,
-    _main_options: &crate::DaemonRunOptions,
+    _main_options: &sinomo_daemon::DaemonRunOptions,
     exited_pid: u32,
     status: ExitStatus,
 ) -> Result<ShadowMainExit, DaemonError> {
@@ -3493,7 +3489,7 @@ pub fn handle_shadow_main_process_exit(
     if read_rollout_main_activation(rollout_paths)?.is_some() {
         return Ok(ShadowMainExit::PendingActivation);
     }
-    let observation = crate::main_exit_observation_from_status(status);
+    let observation = main_exit_observation_from_status(status);
     let kind = classify_main_exit(observation);
     record_rollout_main_exit(rollout_paths, observation, kind)?;
     Ok(classify_shadow_main_exit(
@@ -3523,7 +3519,7 @@ pub fn handle_pending_shadow_main_process_exit(
     shadow_port: u16,
     probe_timeout: Duration,
 ) -> Result<PendingShadowMainExit, DaemonError> {
-    let observation = crate::main_exit_observation_from_status(status);
+    let observation = main_exit_observation_from_status(status);
     let probe_status = probe_daemon_status(main_paths, probe_timeout);
     match pending_shadow_candidate_exit_action(
         pending_rollout_probe_matches_candidate(
@@ -3548,7 +3544,7 @@ pub fn handle_pending_shadow_main_process_exit(
             match spawn_candidate_main_daemon_process(
                 &pending.activation.main_binary,
                 &pending.main_options,
-                rollout_paths,
+                &rollout_paths.root,
             ) {
                 Ok((child, diagnostics)) => {
                     let mut monitor = pending.clone();
@@ -4180,7 +4176,7 @@ mod tests {
     fn pending_main_activation_treats_locked_main_as_stop_target() {
         let root = temp_rollout_test_root("activation-locked-main");
         let paths = DaemonPaths::with_root(root.join("daemon"));
-        let status = DaemonStatus::new(&crate::DaemonRunOptions::default(), &paths, None);
+        let status = DaemonStatus::new(&sinomo_daemon::DaemonRunOptions::default(), &paths, None);
 
         assert!(pending_main_activation_stop_target(
             &DaemonProbeStatus::Running(status.clone())
@@ -4491,7 +4487,7 @@ mod tests {
         let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
         let _shadow_lock = DaemonLock::acquire(
             &shadow_paths,
-            &crate::DaemonRunOptions {
+            &sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
                 port_fallback: false,
@@ -4696,7 +4692,7 @@ mod tests {
         status.data_dir = root.to_path_buf();
         status.lock_file = main_paths.lock.clone();
         status.executable = Some(rollout_paths.main_binary.clone());
-        crate::write_daemon_status(&main_paths, &status).expect("main status");
+        sinomo_daemon::write_daemon_status(&main_paths, &status).expect("main status");
 
         let plan = prepare_cluster_rollout_main_activation(
             &main_paths,
@@ -4773,18 +4769,18 @@ mod tests {
         let mut status = test_daemon_status(42);
         status.data_dir = root.to_path_buf();
         status.lock_file = main_paths.lock.clone();
-        crate::write_daemon_status(&main_paths, &status).expect("main status");
-        let config_path = crate::daemon_endpoint_advertisement_config_file(&root);
+        sinomo_daemon::write_daemon_status(&main_paths, &status).expect("main status");
+        let config_path = sinomo_daemon::daemon_endpoint_advertisement_config_file(&root);
         fs::create_dir_all(config_path.parent().expect("config parent")).expect("config parent");
         fs::write(
             &config_path,
-            serde_json::to_vec(&crate::DaemonEndpointAdvertisementConfig {
-                main_endpoints: vec![crate::DaemonManualEndpointConfig {
+            serde_json::to_vec(&sinomo_daemon::DaemonEndpointAdvertisementConfig {
+                main_endpoints: vec![sinomo_daemon::DaemonManualEndpointConfig {
                     address: "tcp://10.14.1.11:21353".to_string(),
                     scope: None,
                     priority: None,
                 }],
-                shadow_endpoints: vec![crate::DaemonManualEndpointConfig {
+                shadow_endpoints: vec![sinomo_daemon::DaemonManualEndpointConfig {
                     address: "tcp://10.14.1.11:21354".to_string(),
                     scope: None,
                     priority: None,
@@ -4817,9 +4813,9 @@ mod tests {
 
         fs::write(
             &config_path,
-            serde_json::to_vec(&crate::DaemonEndpointAdvertisementConfig {
+            serde_json::to_vec(&sinomo_daemon::DaemonEndpointAdvertisementConfig {
                 main_endpoints: Vec::new(),
-                shadow_endpoints: vec![crate::DaemonManualEndpointConfig {
+                shadow_endpoints: vec![sinomo_daemon::DaemonManualEndpointConfig {
                     address: "tcp://10.14.1.11:21354".to_string(),
                     scope: None,
                     priority: None,
@@ -4927,7 +4923,7 @@ mod tests {
         write_main_activation(&rollout_paths, &activation).expect("main activation");
         let monitor = ShadowMainRolloutMonitor {
             activation: activation.clone(),
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: activation.main_host.clone(),
                 port: activation.main_port,
                 port_fallback: false,
@@ -4975,7 +4971,7 @@ mod tests {
         activation.shadow_binary = current_exe;
         let monitor = ShadowMainRolloutMonitor {
             activation,
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: "0.0.0.0".to_string(),
                 port: 21353,
                 port_fallback: false,
@@ -4995,7 +4991,7 @@ mod tests {
         let error = complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
-            &crate::DaemonRunOptions {
+            &sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
                 port_fallback: false,
@@ -5040,7 +5036,7 @@ mod tests {
         write_test_executable(&previous_shadow_binary);
         let monitor = ShadowMainRolloutMonitor {
             activation: activation.clone(),
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
                 port_fallback: false,
@@ -5064,7 +5060,7 @@ mod tests {
         let error = complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
-            &crate::DaemonRunOptions {
+            &sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
                 port_fallback: false,
@@ -5123,7 +5119,7 @@ mod tests {
         write_test_executable(&previous_shadow_binary);
         let monitor = ShadowMainRolloutMonitor {
             activation,
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
                 port_fallback: false,
@@ -5143,7 +5139,7 @@ mod tests {
         complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
-            &crate::DaemonRunOptions {
+            &sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
                 port_fallback: false,
@@ -5183,7 +5179,7 @@ mod tests {
         write_test_executable(&previous_shadow_binary);
         let monitor = ShadowMainRolloutMonitor {
             activation,
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
                 port_fallback: false,
@@ -5204,7 +5200,7 @@ mod tests {
         complete_pending_shadow_rollout_after_start(
             &DaemonPaths::with_root(root.join("shadow-daemon")),
             &rollout_paths,
-            &crate::DaemonRunOptions {
+            &sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21354,
                 port_fallback: false,
@@ -5311,7 +5307,7 @@ mod tests {
         fs::write(&diagnostics.stderr_log, b"forced candidate failure").expect("stderr log");
         let monitor = ShadowMainRolloutMonitor {
             activation,
-            main_options: crate::DaemonRunOptions {
+            main_options: sinomo_daemon::DaemonRunOptions {
                 host: "127.0.0.1".to_string(),
                 port: 21353,
                 port_fallback: false,
@@ -5512,14 +5508,16 @@ mod tests {
         let rollout_paths = SelfRolloutPaths::new(&root);
         let pid = std::process::id();
 
-        request_supervised_main_restart(&daemon_paths).expect("write restart request");
+        sinomo_daemon::request_supervised_main_restart(&daemon_paths)
+            .expect("write restart request");
         assert!(
             !take_supervised_main_restart_request(&rollout_paths, pid.saturating_add(1))
                 .expect("consume stale restart request")
         );
         assert!(!supervised_main_restart_request_path(&rollout_paths).exists());
 
-        request_supervised_main_restart(&daemon_paths).expect("rewrite restart request");
+        sinomo_daemon::request_supervised_main_restart(&daemon_paths)
+            .expect("rewrite restart request");
         assert!(
             take_supervised_main_restart_request(&rollout_paths, pid)
                 .expect("consume matching restart request")
@@ -5599,6 +5597,7 @@ mod tests {
             hostname: None,
             executable: None,
             rollout: None,
+            component_status: Default::default(),
             started_at: "2026-05-08T00:00:00Z".to_string(),
             data_dir: PathBuf::from("/tmp/sinomo-test"),
             lock_file: PathBuf::from("/tmp/sinomo-test/daemon.lock"),

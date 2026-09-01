@@ -6106,6 +6106,7 @@ mod rollout_authority_readiness_tests {
                 stdout_tail: None,
                 stderr_tail: None,
             }),
+            component_status: Default::default(),
             started_at: "2026-08-04T00:00:00Z".to_string(),
             data_dir: PathBuf::from("/tmp/sinomo-rollout-authority-test"),
             lock_file: PathBuf::from("/tmp/sinomo-rollout-authority-test/daemon.lock"),

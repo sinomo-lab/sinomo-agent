@@ -24,6 +24,13 @@ use std::time::Instant;
 pub const INSTALL_MAIN_BOOT_NAME: &str = "Sinomo Daemon";
 pub const INSTALL_SHADOW_BOOT_NAME: &str = "Sinomo Shadow Daemon";
 
+fn rollout_error(error: sinomo_rollout::RolloutError) -> DaemonError {
+    DaemonError::Io {
+        path: "sinomo rollout".to_string(),
+        detail: error.to_string(),
+    }
+}
+
 #[cfg(not(windows))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalBinSymlinkStatus {
@@ -220,8 +227,9 @@ pub fn prepare_installed_daemon_install_plan(
     probe_timeout: Duration,
 ) -> Result<InstalledDaemonInstallPlan, DaemonError> {
     let daemon_paths = installed_daemon_paths(layout);
-    let updating_binary = current_executable_should_update(&layout.binary)?
-        || current_executable_should_update(&layout.shadow_binary)?;
+    let updating_binary = current_executable_should_update(&layout.binary)
+        .map_err(rollout_error)?
+        || current_executable_should_update(&layout.shadow_binary).map_err(rollout_error)?;
     let restarting_for_options = request.start
         && installed_daemons_need_restart(
             &request.host,
@@ -295,11 +303,11 @@ pub fn install_managed_source_repo(
     layout: &InstallLayout,
 ) -> Result<ManagedSourceRepoInstallStatus, DaemonError> {
     let rollout_paths = SelfRolloutPaths::new(&layout.data_dir);
-    ensure_rollout_layout(&rollout_paths)?;
-    let Some(source_repo) = discover_current_git_repo()? else {
+    ensure_rollout_layout(&rollout_paths).map_err(rollout_error)?;
+    let Some(source_repo) = discover_current_git_repo().map_err(rollout_error)? else {
         return Ok(ManagedSourceRepoInstallStatus::CurrentDirectoryNotInGitCheckout);
     };
-    deploy_managed_source_repo(&rollout_paths, &source_repo)?;
+    deploy_managed_source_repo(&rollout_paths, &source_repo).map_err(rollout_error)?;
     Ok(ManagedSourceRepoInstallStatus::Updated)
 }
 

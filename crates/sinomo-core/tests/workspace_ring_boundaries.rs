@@ -296,6 +296,29 @@ fn network_and_kv_stay_decoupled_through_the_cluster_crate() {
 }
 
 #[test]
+fn daemon_has_no_production_dependency_on_product_components() {
+    let packages = read_workspace_packages();
+    let daemon = packages
+        .get("sinomo-daemon")
+        .expect("sinomo-daemon package should exist");
+
+    for forbidden in [
+        "sinomo-build",
+        "sinomo-dfs",
+        "sinomo-dfs-nfs",
+        "sinomo-observe",
+        "sinomo-registry",
+        "sinomo-rollout",
+        "sinomo-sandbox",
+    ] {
+        assert!(
+            !daemon.dependencies.contains(&forbidden.to_string()),
+            "sinomo-daemon must consume {forbidden} through the product ComponentCatalog, not a production dependency"
+        );
+    }
+}
+
+#[test]
 fn native_dylib_modules_are_not_default_workspace_build_members() {
     let default_members = read_workspace_default_members();
 

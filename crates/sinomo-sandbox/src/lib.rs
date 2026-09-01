@@ -2,6 +2,7 @@
 
 mod backend;
 mod cli;
+mod clustered_backend;
 mod clustered_lifecycle;
 mod clustered_toolchain;
 mod commands;
@@ -16,6 +17,7 @@ mod http;
 mod internal;
 mod lifecycle_recovery;
 mod model;
+mod module;
 mod module_artifact;
 mod paths;
 mod policy;
@@ -28,6 +30,7 @@ mod toolchain;
 
 pub use backend::*;
 pub use cli::*;
+pub use clustered_backend::*;
 pub use clustered_lifecycle::*;
 pub use clustered_toolchain::*;
 pub use commands::*;
@@ -41,6 +44,7 @@ pub use harness::*;
 pub use http::*;
 pub use lifecycle_recovery::*;
 pub use model::*;
+pub use module::*;
 pub use module_artifact::*;
 pub use paths::*;
 pub use policy::*;
@@ -55,7 +59,7 @@ pub use runtime::{
     sandbox_runtime_supports_mvp_virtual_devices,
 };
 pub use service::{
-    LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService,
+    LocalSandboxBackendFactory, SandboxBackendFactory, SandboxService, component_factory,
     component_factory_with_backend, register_services, register_services_with_factory,
 };
 pub use storage::register_storage_paths;

@@ -319,8 +319,21 @@ pub(crate) fn run_shadow_daemon_with_paths(
         })
         .transpose()?
         .flatten();
+    let data_dir_root = shadow_paths.root.parent().ok_or_else(|| CliError::Io {
+        path: shadow_paths.root.display().to_string(),
+        detail: "shadow daemon paths have no data directory parent".to_string(),
+    })?;
+    let data_dir = SinomoDataDir::new(data_dir_root);
+    let component_catalog = sinomo_product_profile::base_component_catalog(
+        &data_dir,
+        sinomo_product_profile::ProductComponentProfile::shadow(cluster.is_some()),
+    )
+    .map_err(|error| CliError::Parse {
+        detail: format!("build shadow product component profile: {error}"),
+    })?;
     daemon_run_shadow_daemon_supervision_loop_with_prepared_listener(
         listener,
+        component_catalog,
         shadow_paths,
         main_paths,
         rollout_paths,

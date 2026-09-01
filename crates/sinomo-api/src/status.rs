@@ -10,6 +10,7 @@ use sinomo_core::{
     ClusterMemberRole, ClusterMemberState, ClusterNodeAvailability, ClusterNodeRolloutStatus,
     ClusterNodeStatusRecord,
 };
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -206,6 +207,8 @@ pub struct DaemonStatus {
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<ClusterNodeRolloutStatus>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub component_status: BTreeMap<String, serde_json::Value>,
     pub started_at: String,
     pub data_dir: PathBuf,
     pub lock_file: PathBuf,
@@ -238,6 +241,7 @@ impl DaemonStatus {
             hostname: daemon_hostname(),
             executable: std::env::current_exe().ok(),
             rollout: None,
+            component_status: BTreeMap::new(),
             started_at: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .unwrap_or_else(|_| "unknown".to_string()),
@@ -246,6 +250,22 @@ impl DaemonStatus {
             cluster,
             idle_stats: None,
         }
+    }
+
+    pub fn apply_component_status_projection(
+        &mut self,
+        key: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let key = key.into();
+        if key == "sinomo.rollout" {
+            self.rollout = Some(
+                serde_json::from_value(value.clone())
+                    .map_err(|error| format!("decode rollout status projection: {error}"))?,
+            );
+        }
+        self.component_status.insert(key, value);
+        Ok(())
     }
 }
 

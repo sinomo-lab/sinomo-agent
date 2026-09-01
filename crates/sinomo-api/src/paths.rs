@@ -35,6 +35,13 @@ impl DaemonPaths {
             detail: source.to_string(),
         })
     }
+
+    pub fn is_shadow(&self) -> bool {
+        self.root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "shadow-daemon")
+    }
 }
 
 pub fn daemon_paths_from_data_dir(data_dir: &SinomoDataDir) -> DaemonPaths {

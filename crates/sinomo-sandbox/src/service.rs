@@ -1,12 +1,10 @@
 //! Host-agnostic sandbox service.
 //!
-//! [`SandboxService`] dispatches the sandbox control routes to a [`SandboxBackend`] that a
-//! host-provided [`SandboxBackendFactory`] opens per request. The factory selects the
-//! backing store from the request context — a local filesystem store when there is no
-//! cluster, the daemon's clustered SIFS-over-DFS store otherwise — so a single service
-//! serves both daemonless and clustered sandboxes. (The clustered backend needs
-//! host-specific networking, so it cannot be constructed inside this crate; the daemon
-//! supplies it through the factory.)
+//! [`SandboxService`] dispatches the sandbox control routes to a [`SandboxBackend`] opened
+//! per request. The component-owned default factory selects the backing store from the
+//! request context: a local filesystem store without cluster identity and the clustered
+//! SIFS-over-DFS backend otherwise. Embedders may still supply a specialized factory for
+//! focused tests or alternate local runtimes.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -15,8 +13,9 @@ use crate::{
     LocalSandboxBackend, SANDBOX_CHECKPOINT_ROUTE, SANDBOX_CREATE_ROUTE, SANDBOX_DESTROY_ROUTE,
     SANDBOX_HTTP_FETCH_ROUTE, SANDBOX_HTTP_FETCH_TO_FILE_ROUTE, SANDBOX_IMPORT_BUSYBOX_ROUTE,
     SANDBOX_LIST_ROUTE, SANDBOX_READ_ROUTE, SANDBOX_REBOOT_ROUTE, SANDBOX_RESUME_ROUTE,
-    SANDBOX_RUN_CANCEL_ROUTE, SANDBOX_RUN_PROCESS_PLAN_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE,
-    SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
+    SANDBOX_RUN_CANCEL_ROUTE, SANDBOX_RUN_PROCESS_PLAN_ROUTE,
+    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_ROUTE,
+    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, SANDBOX_STATUS_ROUTE, SANDBOX_TOOLCHAIN_ADD_ARTIFACT_ROUTE,
     SANDBOX_TOOLCHAIN_ADD_COMMAND_ROUTE, SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_FROM_PATH_ROUTE,
     SANDBOX_TOOLCHAIN_IMPORT_PACKAGE_ROUTE, SANDBOX_UPDATE_ROUTE, SANDBOX_WRITE_ROUTE,
     SandboxBackend, SandboxBackendError, SandboxCancellationToken, SandboxId,
@@ -35,9 +34,9 @@ impl From<SandboxBackendError> for ServiceError {
     }
 }
 
-/// Opens the [`SandboxBackend`] for a request. Hosts implement this to choose the backing
-/// store from the [`ServiceContext`] (e.g. local filesystem when `ctx.cluster` is `None`,
-/// clustered SIFS otherwise).
+/// Opens the [`SandboxBackend`] for a request. The default component uses
+/// [`crate::ComponentSandboxBackendFactory`]; alternate hosts may replace it
+/// without moving Sandbox policy or lifecycle operations out of this crate.
 pub trait SandboxBackendFactory: Send + Sync {
     fn open(&self, ctx: &ServiceContext) -> Result<Box<dyn SandboxBackend>, ServiceError>;
 }
@@ -157,7 +156,9 @@ pub fn component_factory_with_backend(
     backend: Arc<dyn SandboxBackendFactory>,
 ) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     Ok(sinomo_module::StaticComponentFactory::new(
-        sinomo_module::ComponentDescriptor::new("sinomo-sandbox", env!("CARGO_PKG_VERSION")),
+        sinomo_module::component_descriptor_from_registration(
+            &crate::sandbox_module_registration(),
+        )?,
         move |_, scope| {
             scope.set_services(
                 register_services_with_factory(
@@ -171,6 +172,78 @@ pub fn component_factory_with_backend(
     )?
     .with_config_definitions(register_component_config_definitions)
     .with_storage_paths(crate::register_storage_paths))
+}
+
+/// Materialize the complete Sandbox component from generic component context.
+/// Clustered requests bind to the DFS-owned runtime; clusterless requests use
+/// the local filesystem backend.
+pub fn component_factory()
+-> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
+    let descriptor = sinomo_module::component_descriptor_from_registration(
+        &crate::sandbox_module_registration(),
+    )?
+    .require(
+        sinomo_module::ServiceRequirement::new("sinomo.sifs.path-access", sinomo_dfs::DFS_PROTOCOL)
+            .from_service(sinomo_dfs::SIFS_PATH_ACCESS_CAPABILITY),
+    );
+    Ok(
+        sinomo_module::StaticComponentFactory::new(descriptor, |context, scope| {
+            let backend: Arc<dyn SandboxBackendFactory> = Arc::new(
+                crate::ComponentSandboxBackendFactory::new(context.runtime().cloned()),
+            );
+            scope.set_services(
+                register_services_with_factory(ServiceRegistryBuilder::default(), backend).build(),
+            );
+            if let (Some(runtime), Some(cluster)) =
+                (context.runtime().cloned(), context.cluster_access())
+            {
+                let recovery = crate::ClusteredSandboxBackend::new(
+                    context.data_dir().clone().into(),
+                    cluster,
+                    Some(runtime.clone()),
+                );
+                let mut shutdown = scope.shutdown_receiver();
+                scope.own_task(
+                    "Sandbox lifecycle recovery",
+                    runtime.spawn(async move {
+                        loop {
+                            let recovery = recovery.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                recovery.run_lifecycle_recovery_tick()
+                            })
+                            .await
+                            {
+                                Ok(Ok(recovered)) if recovered > 0 => tracing::info!(
+                                    recovered,
+                                    "recovered pending Sandbox lifecycle operations"
+                                ),
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => tracing::warn!(
+                                    %error,
+                                    "Sandbox lifecycle maintenance failed"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    %error,
+                                    "Sandbox lifecycle maintenance task failed"
+                                ),
+                            }
+                            tokio::select! {
+                                _ = tokio::time::sleep(crate::SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL) => {}
+                                changed = shutdown.changed() => {
+                                    if changed.is_err() || *shutdown.borrow() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }),
+                );
+            }
+            Ok(())
+        })?
+        .with_config_definitions(register_component_config_definitions)
+        .with_storage_paths(crate::register_storage_paths),
+    )
 }
 
 fn register_component_config_definitions(
@@ -585,14 +658,29 @@ impl Service for SandboxService {
             SANDBOX_RUN_TOOLCHAIN_ROUTE,
             SANDBOX_RUN_PROCESS_PLAN_ROUTE,
             SANDBOX_RUN_CANCEL_ROUTE,
+            SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+            SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
         ]
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
+        let surfaces = crate::sandbox_module_surfaces();
         self.routes()
             .iter()
             .copied()
-            .map(|route| ServiceRoute::new(route, self.name()).with_concurrency_limit(8))
+            .map(|route| {
+                let descriptor = surfaces
+                    .object_rpc_routes
+                    .iter()
+                    .find(|descriptor| descriptor.route == route)
+                    .expect("sandbox service route must have module metadata");
+                sinomo_module::module_object_rpc_route_descriptor_to_service(
+                    &descriptor
+                        .descriptor()
+                        .expect("sandbox module route descriptor must be valid"),
+                )
+                .with_concurrency_limit(8)
+            })
             .collect()
     }
 
@@ -601,6 +689,44 @@ impl Service for SandboxService {
         let active_run_cancellations = Arc::clone(&self.active_run_cancellations);
         let active_sandbox_operations = Arc::clone(&self.active_sandbox_operations);
         Box::pin(async move {
+            if matches!(
+                request.route.as_str(),
+                SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE | SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
+            ) {
+                if ctx.has_request_attachment() {
+                    return Err(ServiceError::Service(
+                        "Sandbox stream session does not accept an attached request body"
+                            .to_string(),
+                    ));
+                }
+                let operation_id = request.operation_id().map(str::to_string);
+                let backend = factory.open(&ctx)?;
+                let response = match request.route.as_str() {
+                    SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE => {
+                        let payload = ctx.decode_request_body(&request).await?;
+                        sandbox_toolchain_stream_response(
+                            backend,
+                            payload,
+                            operation_id,
+                            active_run_cancellations,
+                            active_sandbox_operations,
+                        )?
+                    }
+                    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE => {
+                        let payload = ctx.decode_request_body(&request).await?;
+                        sandbox_process_plan_stream_response(
+                            backend,
+                            payload,
+                            operation_id,
+                            active_run_cancellations,
+                            active_sandbox_operations,
+                        )?
+                    }
+                    _ => unreachable!(),
+                };
+                ctx.respond_with_body(response.response, response.body)?;
+                return Ok(ServiceDisposition::Continue);
+            }
             if request.route == SANDBOX_RUN_CANCEL_ROUTE {
                 let metadata_operation_id = request.cancels_operation_id().map(str::to_string);
                 let payload = ctx.decode_request_body(&request).await?;
@@ -632,6 +758,247 @@ impl Service for SandboxService {
             Ok(ServiceDisposition::Continue)
         })
     }
+}
+
+const SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
+const SANDBOX_STREAM_BODY_BUFFER_BYTES: usize = 256 * 1024;
+
+enum SandboxToolchainStreamMessage {
+    Output(crate::SandboxOutputChunk),
+    Complete(Result<crate::SandboxLocalCommandOutcome, String>),
+}
+
+enum SandboxProcessPlanStreamMessage {
+    Output(crate::SandboxOutputChunk),
+    Complete(Result<crate::SandboxProcessPlanOutcome, String>),
+}
+
+fn sandbox_toolchain_stream_response(
+    mut backend: Box<dyn SandboxBackend>,
+    payload: crate::SandboxRunToolchainRequest,
+    operation_id: Option<String>,
+    active_run_cancellations: Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    active_sandbox_operations: Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+) -> Result<sinomo_core::network::ObjectRpcOutgoingResponse, ServiceError> {
+    let guard = begin_sandbox_operation(
+        &active_sandbox_operations,
+        &payload.sandbox_id,
+        SandboxOperationKind::Run,
+    )?;
+    let cancellation =
+        register_sandbox_run_cancellation(&active_run_cancellations, operation_id.as_deref())?;
+    let worker_cancellation = cancellation.clone();
+    let producer_cancellation = cancellation.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(SANDBOX_STREAM_CHANNEL_CAPACITY);
+    let output_sender = sender.clone();
+    let operation_id_for_worker = operation_id.clone();
+    let cancellations_for_worker = Arc::clone(&active_run_cancellations);
+    let worker = tokio::task::spawn_blocking(move || {
+        let output_sink: Arc<dyn crate::SandboxOutputSink> =
+            Arc::new(move |chunk: crate::SandboxOutputChunk| {
+                let _ = output_sender.blocking_send(SandboxToolchainStreamMessage::Output(chunk));
+            });
+        let result = backend
+            .run_toolchain_with_output_sink_and_cancellation(
+                payload,
+                Some(output_sink),
+                worker_cancellation,
+            )
+            .map_err(|error| error.to_string());
+        unregister_sandbox_run_cancellation(
+            &cancellations_for_worker,
+            operation_id_for_worker.as_deref(),
+        );
+        drop(guard);
+        let _ = sender.blocking_send(SandboxToolchainStreamMessage::Complete(result));
+    });
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+        &(),
+    )?;
+    let (reader, mut writer) = tokio::io::duplex(SANDBOX_STREAM_BODY_BUFFER_BYTES);
+    let producer = tokio::spawn(async move {
+        let mut sent = std::collections::BTreeSet::new();
+        while let Some(message) = receiver.recv().await {
+            let result = match message {
+                SandboxToolchainStreamMessage::Output(chunk) => {
+                    sent.insert(crate::sandbox_output_chunk_stream_key(&chunk));
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+                        &crate::SandboxRunToolchainStreamFrame::Output { chunk },
+                    )
+                    .await
+                }
+                SandboxToolchainStreamMessage::Complete(Ok(outcome)) => {
+                    for chunk in &outcome.output_chunks {
+                        if sent.insert(crate::sandbox_output_chunk_stream_key(chunk))
+                            && write_sandbox_stream_frame(
+                                &mut writer,
+                                SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+                                &crate::SandboxRunToolchainStreamFrame::Output {
+                                    chunk: chunk.clone(),
+                                },
+                            )
+                            .await
+                            .is_err()
+                        {
+                            let _ = producer_cancellation.cancel();
+                            break;
+                        }
+                    }
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+                        &crate::SandboxRunToolchainStreamFrame::Complete { outcome },
+                    )
+                    .await
+                }
+                SandboxToolchainStreamMessage::Complete(Err(detail)) => {
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
+                        &crate::SandboxRunToolchainStreamFrame::Error { detail },
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = result {
+                let _ = producer_cancellation.cancel();
+                tracing::debug!(%error, "Sandbox toolchain stream consumer disconnected");
+                break;
+            }
+        }
+        let _ = worker.await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    let body = sinomo_core::network::ObjectRpcBodySource::async_reader(reader, None)
+        .with_lifetime_guard(producer)?;
+    Ok(sinomo_core::network::ObjectRpcOutgoingResponse::new(
+        response, body,
+    ))
+}
+
+fn sandbox_process_plan_stream_response(
+    mut backend: Box<dyn SandboxBackend>,
+    payload: crate::SandboxRunProcessPlanRequest,
+    operation_id: Option<String>,
+    active_run_cancellations: Arc<Mutex<BTreeMap<String, SandboxCancellationToken>>>,
+    active_sandbox_operations: Arc<Mutex<BTreeMap<SandboxId, SandboxOperationState>>>,
+) -> Result<sinomo_core::network::ObjectRpcOutgoingResponse, ServiceError> {
+    let guard = begin_sandbox_operation(
+        &active_sandbox_operations,
+        &payload.sandbox_id,
+        SandboxOperationKind::Run,
+    )?;
+    let cancellation =
+        register_sandbox_run_cancellation(&active_run_cancellations, operation_id.as_deref())?;
+    let worker_cancellation = cancellation.clone();
+    let producer_cancellation = cancellation.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(SANDBOX_STREAM_CHANNEL_CAPACITY);
+    let output_sender = sender.clone();
+    let operation_id_for_worker = operation_id.clone();
+    let cancellations_for_worker = Arc::clone(&active_run_cancellations);
+    let worker = tokio::task::spawn_blocking(move || {
+        let output_sink: Arc<dyn crate::SandboxOutputSink> =
+            Arc::new(move |chunk: crate::SandboxOutputChunk| {
+                let _ = output_sender.blocking_send(SandboxProcessPlanStreamMessage::Output(chunk));
+            });
+        let result = backend
+            .run_process_plan_with_output_sink_and_cancellation(
+                payload,
+                Some(output_sink),
+                worker_cancellation,
+            )
+            .map_err(|error| error.to_string());
+        unregister_sandbox_run_cancellation(
+            &cancellations_for_worker,
+            operation_id_for_worker.as_deref(),
+        );
+        drop(guard);
+        let _ = sender.blocking_send(SandboxProcessPlanStreamMessage::Complete(result));
+    });
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
+        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+        &(),
+    )?;
+    let (reader, mut writer) = tokio::io::duplex(SANDBOX_STREAM_BODY_BUFFER_BYTES);
+    let producer = tokio::spawn(async move {
+        let mut sent = std::collections::BTreeSet::new();
+        while let Some(message) = receiver.recv().await {
+            let result = match message {
+                SandboxProcessPlanStreamMessage::Output(chunk) => {
+                    sent.insert(crate::sandbox_output_chunk_stream_key(&chunk));
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+                        &crate::SandboxRunProcessPlanStreamFrame::Output { chunk },
+                    )
+                    .await
+                }
+                SandboxProcessPlanStreamMessage::Complete(Ok(outcome)) => {
+                    for step in &outcome.step_outcomes {
+                        for chunk in &step.output_chunks {
+                            if sent.insert(crate::sandbox_output_chunk_stream_key(chunk))
+                                && write_sandbox_stream_frame(
+                                    &mut writer,
+                                    SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+                                    &crate::SandboxRunProcessPlanStreamFrame::Output {
+                                        chunk: chunk.clone(),
+                                    },
+                                )
+                                .await
+                                .is_err()
+                            {
+                                let _ = producer_cancellation.cancel();
+                                break;
+                            }
+                        }
+                    }
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+                        &crate::SandboxRunProcessPlanStreamFrame::Complete { outcome },
+                    )
+                    .await
+                }
+                SandboxProcessPlanStreamMessage::Complete(Err(detail)) => {
+                    write_sandbox_stream_frame(
+                        &mut writer,
+                        SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
+                        &crate::SandboxRunProcessPlanStreamFrame::Error { detail },
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = result {
+                let _ = producer_cancellation.cancel();
+                tracing::debug!(%error, "Sandbox process-plan stream consumer disconnected");
+                break;
+            }
+        }
+        let _ = worker.await;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut writer).await;
+    });
+    let body = sinomo_core::network::ObjectRpcBodySource::async_reader(reader, None)
+        .with_lifetime_guard(producer)?;
+    Ok(sinomo_core::network::ObjectRpcOutgoingResponse::new(
+        response, body,
+    ))
+}
+
+async fn write_sandbox_stream_frame<T: serde::Serialize>(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    route: &str,
+    frame: &T,
+) -> Result<(), sinomo_core::network::NetworkError> {
+    let response = sinomo_core::network::ObjectRpcResponse::encode_body(route, frame)?;
+    sinomo_core::network::write_object_frame_async(
+        writer,
+        &response,
+        sinomo_core::network::ObjectFrameIoOptions::none(),
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -698,13 +1065,49 @@ mod tests {
         let service = SandboxService::new(Arc::new(UnavailableFactory));
         assert_eq!(service.name(), "sandbox");
         assert!(service.routes().contains(&SANDBOX_STATUS_ROUTE));
-        assert_eq!(service.routes().len(), 20);
+        assert_eq!(service.routes().len(), 22);
         let routes = service.route_categories();
         assert_eq!(routes.len(), service.routes().len());
         assert!(
             routes
                 .iter()
                 .all(|route| route.concurrency_limit == Some(8))
+        );
+        assert!(
+            routes
+                .iter()
+                .all(|route| route.auth_scope.as_deref() == Some("local-command"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_body_uses_standard_object_frames() {
+        let expected_detail = "sandbox stream test".to_string();
+        let frame = crate::SandboxRunToolchainStreamFrame::Error {
+            detail: expected_detail.clone(),
+        };
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+
+        write_sandbox_stream_frame(&mut writer, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE, &frame)
+            .await
+            .expect("write Sandbox response frame");
+        drop(writer);
+
+        let response: sinomo_core::network::ObjectRpcResponse =
+            sinomo_core::network::read_object_frame_async(
+                &mut reader,
+                sinomo_core::network::ObjectFrameIoOptions::none(),
+            )
+            .await
+            .expect("read standard object frame");
+        assert_eq!(response.route, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE);
+        let decoded: crate::SandboxRunToolchainStreamFrame =
+            response.decode_body().expect("decode Sandbox frame");
+        assert_eq!(
+            decoded,
+            crate::SandboxRunToolchainStreamFrame::Error {
+                detail: expected_detail
+            }
         );
     }
 

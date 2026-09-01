@@ -23,16 +23,19 @@ blake3.workspace = true
 fs2.workspace = true
 getrandom = "0.4.3"
 libc = "0.2.186"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_json.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-cli-registry = { path = "../sinomo-cli-registry" }
+sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
+sinomo-module-api = { path = "../sinomo-module-api" }
 sinomo-registry = { path = "../sinomo-registry" }
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true

@@ -2,18 +2,35 @@ use crate::{
     DaemonError, DaemonPaths, DaemonProbeStatus, DaemonRunOptions, DaemonStatus,
     daemon_connect_address, probe_daemon_status,
 };
-use sinomo_rollout::{SelfRolloutPaths, rollout_artifact_suffix};
 use std::env;
 use std::fs::{self, File};
 use std::net::TcpListener;
-#[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SHADOW_ROLLOUT_RECOVERY_HELPER_ARGS: &[&str] = &["daemon", "__complete-shadow-rollout"];
+
+/// Mark a clean main-daemon exit as an intentional supervisor restart. The
+/// marker is process mechanism shared by cluster identity changes and Rollout;
+/// it does not require service assembly to know about Rollout routes.
+pub fn request_supervised_main_restart(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
+        path: paths.root.display().to_string(),
+        detail: "daemon paths have no data directory parent".to_string(),
+    })?;
+    let root = data_dir.join("rollout");
+    fs::create_dir_all(&root).map_err(|source| DaemonError::Io {
+        path: root.display().to_string(),
+        detail: source.to_string(),
+    })?;
+    let marker = root.join("supervised-main-restart.request");
+    fs::write(&marker, format!("{}\n", std::process::id())).map_err(|source| DaemonError::Io {
+        path: marker.display().to_string(),
+        detail: source.to_string(),
+    })
+}
 
 #[derive(Debug)]
 pub struct PreparedDaemonControlListener {
@@ -31,7 +48,7 @@ impl PreparedDaemonControlListener {
         self.fallback_from_port
     }
 
-    pub(crate) fn into_parts(self) -> (DaemonRunOptions, TcpListener, Option<u16>) {
+    pub fn into_parts(self) -> (DaemonRunOptions, TcpListener, Option<u16>) {
         (self.options, self.listener, self.fallback_from_port)
     }
 }
@@ -226,9 +243,7 @@ pub fn prepare_noninteractive_command(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
-pub(crate) fn build_daemon_async_runtime(
-    label: &str,
-) -> Result<tokio::runtime::Runtime, DaemonError> {
+pub fn build_daemon_async_runtime(label: &str) -> Result<tokio::runtime::Runtime, DaemonError> {
     build_daemon_async_runtime_with_profile(label, DaemonExecutionProfile::Standard)
 }
 
@@ -344,14 +359,14 @@ pub fn spawn_main_daemon_process_with_env(
 pub fn spawn_candidate_main_daemon_process(
     binary: &Path,
     options: &DaemonRunOptions,
-    rollout_paths: &SelfRolloutPaths,
+    rollout_root: &Path,
 ) -> Result<(Child, CandidateMainDiagnostics), DaemonError> {
-    let logs_dir = rollout_paths.root.join("logs");
+    let logs_dir = rollout_root.join("logs");
     fs::create_dir_all(&logs_dir).map_err(|source| DaemonError::Io {
         path: logs_dir.display().to_string(),
         detail: source.to_string(),
     })?;
-    let suffix = rollout_artifact_suffix();
+    let suffix = sinomo_core::Id::generate();
     let stdout_log = logs_dir.join(format!("candidate-main-{suffix}.stdout.log"));
     let stderr_log = logs_dir.join(format!("candidate-main-{suffix}.stderr.log"));
     let diagnostics_path = logs_dir.join(format!("candidate-main-{suffix}.diagnostics.json"));
@@ -553,18 +568,6 @@ fn windows_quote_arg(arg: &str) -> String {
     quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
     quoted.push('"');
     quoted
-}
-
-pub fn main_exit_observation_from_status(
-    status: ExitStatus,
-) -> sinomo_rollout::MainExitObservation {
-    #[cfg(unix)]
-    {
-        if let Some(signal) = status.signal() {
-            return sinomo_rollout::MainExitObservation::signal(signal);
-        }
-    }
-    sinomo_rollout::MainExitObservation::exit_code(status.code().unwrap_or(1))
 }
 
 pub fn daemon_main_binary_for_shadow_start(invoked_exe: &Path) -> PathBuf {

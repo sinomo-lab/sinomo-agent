@@ -36,6 +36,7 @@ mod kv_snapshot_observer;
 mod kv_txn_quorum;
 mod local_membership;
 mod local_state_store;
+mod maintenance_reactor;
 mod member_mutation;
 mod member_publish;
 mod member_store;
@@ -233,6 +234,10 @@ pub use local_state_store::{
     read_cluster_state_cached_shared, read_cluster_state_without_kv,
     read_cluster_state_without_kv_async, read_cluster_state_without_kv_cached_shared,
     write_cluster_state, write_cluster_state_async,
+};
+pub use maintenance_reactor::{
+    ClusterMaintenanceFuture, ClusterMaintenanceReactorConfig, ClusterMaintenanceReactorHost,
+    run_cluster_maintenance_reactor,
 };
 pub use member_mutation::{
     ClusterMemberMutationAsyncHost, ClusterMemberMutationDriver, ClusterMemberMutationHost,

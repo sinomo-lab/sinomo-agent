@@ -25,22 +25,14 @@ metrics.workspace = true
 netwatcher.workspace = true
 notify.workspace = true
 ring = "0.17.14"
-reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls"] }
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
 sinomo-api = { path = "../sinomo-api" }
-sinomo-build = { path = "../sinomo-build" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-config = { path = "../sinomo-config" }
-sinomo-dfs = { path = "../sinomo-dfs" }
-sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
 sinomo-device = { path = "../sinomo-device" }
 sinomo-module = { path = "../sinomo-module" }
-sinomo-observe = { path = "../sinomo-observe", features = ["cpu-profiler"] }
-sinomo-registry = { path = "../sinomo-registry" }
-sinomo-rollout = { path = "../sinomo-rollout" }
-sinomo-sandbox = { path = "../sinomo-sandbox" }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
@@ -55,8 +47,13 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+sinomo-build = { path = "../sinomo-build" }
 sinomo-core = { path = "../sinomo-core", features = ["cluster-test-support", "network-test-support"] }
 sinomo-dfs = { path = "../sinomo-dfs", features = ["test-support"] }
+sinomo-dfs-nfs = { path = "../sinomo-dfs-nfs" }
 sinomo-module-api = { path = "../sinomo-module-api" }
+sinomo-observe = { path = "../sinomo-observe", features = ["cpu-profiler"] }
+sinomo-rollout = { path = "../sinomo-rollout" }
+sinomo-sandbox = { path = "../sinomo-sandbox" }
 sinomo-testdir = { path = "../sinomo-testdir" }
 tokio = { workspace = true, features = ["test-util"] }

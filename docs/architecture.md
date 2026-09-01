@@ -550,6 +550,37 @@ authority, and placement-sensitive operations retain their typed host and peer
 transport contracts; generic component events are never substituted for these
 correctness- or throughput-critical paths.
 
+The Sandbox component owns local/clustered backend selection, SIFS lifecycle
+leases, toolchain mutations, mediated HTTP, framed execution streams, and the
+durable recovery worker. The daemon does not decode Sandbox requests, enumerate
+Sandbox routes, or schedule Sandbox maintenance; it supplies the same generic
+cluster/runtime context used by other components.
+
+`ComponentCatalog` is the sole product-composition input. Besides module
+registrations and factories, it carries storage-only fallbacks for disabled
+components, startup recovery hooks, daemon-status projections, cluster
+maintenance inhibitors, and migration quarantine contributions. The daemon
+executes these generic contracts; it does not rediscover built-ins, append
+fallback factories, or maintain parallel config/storage/module lists.
+
+Rollout routes, telemetry, desired-state watching, shadow finalization, process
+activation/recovery, and status projection live in the `sinomo-rollout` crate
+family. `sinomo-rollout-host` is the trusted daemon-process adapter selected by
+the product profile, while `sinomo-rollout-client` and `sinomo-build-client`
+contain caller-side typed clients. `sinomo-daemon::client` retains only generic
+daemon and foundational cluster transport.
+
+Observe owns runtime initialization, metric-exporter registration, component
+event recording, and timeline shutdown persistence in its component scope.
+Daemon-originated operational records flow through the component event bus;
+the daemon never writes Observe-owned files directly. Process idle counters
+are lightweight daemon API mechanism and do not require linking Observe.
+
+The timeout, shutdown, wake, inhibition, and external-change loop for cluster
+network maintenance is the generic `sinomo-cluster` maintenance reactor. The
+daemon implements only the host operations that touch its listener, process
+identity, and transport-specific maintenance work.
+
 `sinomo-module::ActiveNativeComponent` owns the common native-provider binding:
 it resolves exactly one active component from a `ServiceRequirement`, verifies
 and loads its content-addressed artifact, and invokes typed SOBJ operations.

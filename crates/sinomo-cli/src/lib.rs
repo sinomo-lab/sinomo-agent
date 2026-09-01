@@ -111,6 +111,8 @@ use sinomo_runtime::core::{
     ClusterTransportKind, EvaluationScorecard, EventEnvelope, Id, RollbackTrigger,
 };
 #[cfg(test)]
+use sinomo_runtime::daemon::DaemonLock;
+#[cfg(test)]
 use sinomo_runtime::daemon::{
     AuthenticatedDaemonCommand, DaemonError, DaemonSignerAuthority,
     authenticate_daemon_control_request, authorize_authenticated_daemon_command,
@@ -122,13 +124,10 @@ use sinomo_runtime::daemon::{
     daemon_cluster_status, daemon_main_binary_for_shadow_start,
     fetch_daemon_status_from_address as daemon_fetch_daemon_status_from_address,
     fetch_daemon_status_from_endpoint as daemon_fetch_daemon_status_from_endpoint,
-    handle_deferred_shadow_rollout_completion as daemon_handle_deferred_shadow_rollout_completion,
     invite_introducers_from_daemon_status,
     prepare_daemon_control_listener as daemon_prepare_daemon_control_listener,
-    prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
     read_daemon_endpoint_advertisement_config,
     run_daemon_control_loop_with_prepared_listener as daemon_run_daemon_control_loop_with_prepared_listener,
-    run_shadow_daemon_supervision_loop_with_prepared_listener as daemon_run_shadow_daemon_supervision_loop_with_prepared_listener,
     send_daemon_cluster_maintenance_refresh as daemon_send_daemon_cluster_maintenance_refresh,
     send_daemon_cluster_maintenance_refresh_to_endpoint as daemon_send_daemon_cluster_maintenance_refresh_to_endpoint,
     send_daemon_remote_shadow_shutdown_request,
@@ -150,33 +149,11 @@ use sinomo_runtime::daemon::{
     send_daemon_rpc_to_endpoint as daemon_send_daemon_rpc_to_endpoint,
     send_daemon_rpc_with_timeouts as daemon_send_daemon_rpc_with_timeouts,
     send_daemon_shutdown_request,
-    shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
-    shadow_main_options_from_env as daemon_shadow_main_options_from_env,
-    sleep_for_shadow_start_delay as daemon_sleep_for_shadow_start_delay,
-    stage_rollout_main_activation as daemon_stage_rollout_main_activation,
     start_daemon_command_process as daemon_start_daemon_command_process,
-    wait_for_local_shadow_rollout_completion as daemon_wait_for_local_shadow_rollout_completion,
-    wait_for_main_daemon_health as daemon_wait_for_main_daemon_health,
-};
-#[cfg(test)]
-use sinomo_runtime::daemon::{
-    DaemonLock, handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request,
-    handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch,
 };
 #[cfg(test)]
 use sinomo_runtime::daemon::{
     daemon_advertised_endpoints_for_state, daemon_endpoint_advertisement_config_file,
-};
-#[cfg(all(test, feature = "sandbox"))]
-use sinomo_runtime::daemon::{
-    handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
-    handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
-    handle_daemon_sandbox_read as daemon_handle_daemon_sandbox_read,
-    handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
-    handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
-    handle_daemon_sandbox_toolchain_import_package as daemon_handle_daemon_sandbox_toolchain_import_package,
-    handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
-    open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
 use sinomo_runtime::dfs::{DaemonDfsInspectionRequest, DaemonDfsInspectionResponse};
 use sinomo_runtime::dfs::{
@@ -265,6 +242,32 @@ use sinomo_runtime::rollout::{
 use sinomo_runtime::rollout::{
     SHADOW_MAIN_BINARY_ENV, SHADOW_MAIN_HOST_ENV, SHADOW_MAIN_PORT_ENV,
     cluster_rollout_should_use_remote_build as daemon_cluster_rollout_should_use_remote_build,
+};
+#[cfg(test)]
+use sinomo_runtime::rollout_host::handle_daemon_rollout_build_request as daemon_handle_daemon_rollout_build_request;
+use sinomo_runtime::rollout_host::{
+    handle_deferred_shadow_rollout_completion as daemon_handle_deferred_shadow_rollout_completion,
+    prepare_local_rollout_main_activation as daemon_prepare_local_rollout_main_activation,
+    run_shadow_daemon_supervision_loop_with_prepared_listener as daemon_run_shadow_daemon_supervision_loop_with_prepared_listener,
+    shadow_main_binary_from_env as daemon_shadow_main_binary_from_env,
+    shadow_main_options_from_env as daemon_shadow_main_options_from_env,
+    sleep_for_shadow_start_delay as daemon_sleep_for_shadow_start_delay,
+    stage_rollout_main_activation as daemon_stage_rollout_main_activation,
+    wait_for_local_shadow_rollout_completion as daemon_wait_for_local_shadow_rollout_completion,
+    wait_for_main_daemon_health as daemon_wait_for_main_daemon_health,
+};
+#[cfg(test)]
+use sinomo_runtime::sandbox::handle_daemon_sandbox_http_fetch as daemon_handle_daemon_sandbox_http_fetch;
+#[cfg(all(test, feature = "sandbox"))]
+use sinomo_runtime::sandbox::{
+    handle_daemon_sandbox_http_fetch_to_file as daemon_handle_daemon_sandbox_http_fetch_to_file,
+    handle_daemon_sandbox_import_busybox as daemon_handle_daemon_sandbox_import_busybox,
+    handle_daemon_sandbox_read as daemon_handle_daemon_sandbox_read,
+    handle_daemon_sandbox_toolchain_add_artifact as daemon_handle_daemon_sandbox_toolchain_add_artifact,
+    handle_daemon_sandbox_toolchain_add_command as daemon_handle_daemon_sandbox_toolchain_add_command,
+    handle_daemon_sandbox_toolchain_import_package as daemon_handle_daemon_sandbox_toolchain_import_package,
+    handle_daemon_sandbox_write as daemon_handle_daemon_sandbox_write,
+    open_daemon_sandbox_dfs_service as daemon_open_daemon_sandbox_dfs_service,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};

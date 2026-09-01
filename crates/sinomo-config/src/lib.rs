@@ -1046,10 +1046,14 @@ impl Service for ConfigService {
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
         vec![
-            ServiceRoute::new(CONFIG_CATALOG_ROUTE, CONFIG_RPC_CATEGORY),
-            ServiceRoute::new(CONFIG_SEARCH_ROUTE, CONFIG_RPC_CATEGORY),
-            ServiceRoute::new(CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY).with_concurrency_limit(8),
-            ServiceRoute::new(CONFIG_SET_ROUTE, CONFIG_RPC_CATEGORY).with_concurrency_limit(8),
+            ServiceRoute::new(CONFIG_CATALOG_ROUTE, CONFIG_RPC_CATEGORY).with_auth_scope("admin"),
+            ServiceRoute::new(CONFIG_SEARCH_ROUTE, CONFIG_RPC_CATEGORY).with_auth_scope("admin"),
+            ServiceRoute::new(CONFIG_GET_ROUTE, CONFIG_RPC_CATEGORY)
+                .with_auth_scope("admin")
+                .with_concurrency_limit(8),
+            ServiceRoute::new(CONFIG_SET_ROUTE, CONFIG_RPC_CATEGORY)
+                .with_auth_scope("admin")
+                .with_concurrency_limit(8),
         ]
     }
 

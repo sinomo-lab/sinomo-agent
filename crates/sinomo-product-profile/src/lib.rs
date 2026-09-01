@@ -81,15 +81,77 @@ pub fn base_component_catalog(
     profile: ProductComponentProfile,
 ) -> Result<ComponentCatalog, ComponentCatalogError> {
     let mut builder = ComponentCatalog::builder()
-        .register_native_request_preparer(Arc::new(RemoteManagementRequestPreparer))?;
+        .register_native_request_preparer(Arc::new(RemoteManagementRequestPreparer))?
+        .register_storage_contributor(
+            sinomo_runtime::build::SINOMO_BUILD_MODULE_LEGACY_ID,
+            sinomo_runtime::build::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+            sinomo_runtime::dfs::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+            sinomo_runtime::observe::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            sinomo_runtime::rollout::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            sinomo_runtime::sandbox::SINOMO_SANDBOX_MODULE_LEGACY_ID,
+            sinomo_runtime::sandbox::register_storage_paths,
+        )?
+        .register_storage_contributor(
+            "sinomo-registry",
+            sinomo_runtime::registry::register_storage_paths,
+        )?
+        .register_status_contributor(
+            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            sinomo_runtime::rollout_host::daemon_status_projection,
+        )?
+        .register_startup_contributor(
+            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            sinomo_runtime::rollout_host::recover_startup_state,
+        )?
+        .register_maintenance_inhibitor(
+            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            sinomo_runtime::rollout_host::maintenance_inhibited,
+        )?
+        .register_migration_contributor(
+            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+            dfs_migration_contribution,
+        )?;
     builder =
         builder.register_module(sinomo_runtime::network_module::network_module_registration())?;
-    builder = builder.register_module(sinomo_runtime::rollout::rollout_module_registration())?;
+    builder = register_module_factory(
+        builder,
+        sinomo_runtime::rollout::rollout_module_registration(),
+        sinomo_runtime::rollout_host::component_factory(data_dir, profile.host_role)
+            .expect("rollout host component descriptor must be valid"),
+    )?;
+    if profile.cluster_initialized
+        && matches!(
+            profile.host_role,
+            ComponentHostRole::Main | ComponentHostRole::Embedded
+        )
+    {
+        builder = builder.register_factory(Arc::new(
+            sinomo_runtime::module::cluster_service_catalog_publisher_component_factory()
+                .expect("service catalog publisher descriptor must be valid"),
+        ))?;
+    }
 
     if matches!(
         profile.host_role,
         ComponentHostRole::Main | ComponentHostRole::Embedded
     ) {
+        builder = register_module_factory(
+            builder,
+            sinomo_runtime::sandbox::sandbox_module_registration(),
+            sinomo_runtime::sandbox::component_factory()
+                .expect("Sandbox product component descriptor must be valid"),
+        )?;
         let dfs_registration = sinomo_runtime::dfs::dfs_module_registration();
         let dfs_active = sinomo_runtime::dfs::dfs_module_enabled(data_dir.root()).unwrap_or(true);
         if dfs_active {
@@ -166,7 +228,67 @@ pub fn base_component_catalog(
         }
     }
 
+    builder = register_installed_native_dylib_modules(builder, &data_dir.root())?;
+
     builder.build()
+}
+
+fn dfs_migration_contribution(
+    data_dir_root: &std::path::Path,
+    source_cluster_id: &sinomo_runtime::node::ClusterId,
+) -> Result<sinomo_runtime::module::ComponentMigrationContribution, String> {
+    let data_dir = SinomoDataDir::new(data_dir_root);
+    let plan = sinomo_runtime::dfs::dfs_migration_quarantine_plan(&data_dir, source_cluster_id);
+    Ok(sinomo_runtime::module::ComponentMigrationContribution {
+        moves: plan.moves,
+        evidence_refs: vec![format!("dfs-import-namespace:{}", plan.import_namespace)],
+    })
+}
+
+/// Materialize installed native modules into the product catalog. Persisted
+/// loader state is product composition input, so the daemon must not rediscover
+/// or append these registrations behind the caller's catalog.
+fn register_installed_native_dylib_modules(
+    mut builder: ComponentCatalogBuilder,
+    data_dir_root: &std::path::Path,
+) -> Result<ComponentCatalogBuilder, ComponentCatalogError> {
+    let states = match sinomo_runtime::module::read_native_dylib_module_loader_states(data_dir_root)
+    {
+        Ok(states) => states,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "native-dylib module loader states are unreadable; installed modules are omitted"
+            );
+            return Ok(builder);
+        }
+    };
+    for state in states {
+        if !sinomo_runtime::module::native_dylib_loader_state_is_host_compatible(&state) {
+            tracing::warn!(
+                module_id = %state.module_id,
+                "installed native-dylib module is incompatible with this host and was omitted"
+            );
+            continue;
+        }
+        let registration =
+            match sinomo_runtime::module::native_dylib_module_registration_from_loader_state(
+                data_dir_root,
+                &state,
+            ) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    tracing::warn!(
+                        module_id = %state.module_id,
+                        error = %error,
+                        "installed native-dylib module could not be materialized"
+                    );
+                    continue;
+                }
+            };
+        builder = builder.register_module(registration)?;
+    }
+    Ok(builder)
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +369,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn main_profile_owns_dfs_factory_and_shadow_profile_does_not() {
+    fn main_profile_owns_dfs_and_sandbox_factories_while_shadow_owns_neither() {
         let data_dir = SinomoDataDir::new(std::env::temp_dir().join(format!(
             "sinomo-product-dfs-profile-{}",
             sinomo_runtime::core::Id::generate()
@@ -257,6 +379,7 @@ mod tests {
         let shadow = base_component_catalog(&data_dir, ProductComponentProfile::shadow(true))
             .expect("shadow profile");
         let dfs_id = sinomo_runtime::dfs::dfs_module_id();
+        let sandbox_id = sinomo_runtime::sandbox::sandbox_module_id();
 
         assert!(main.modules().get(&dfs_id).is_some());
         assert!(
@@ -271,6 +394,60 @@ mod tests {
                 .iter()
                 .any(|factory| factory.descriptor().component_id == dfs_id.as_str())
         );
+        assert!(main.modules().get(&sandbox_id).is_some());
+        assert!(
+            main.factories()
+                .iter()
+                .any(|factory| factory.descriptor().component_id == sandbox_id.as_str())
+        );
+        assert!(shadow.modules().get(&sandbox_id).is_none());
+        assert!(
+            !shadow
+                .factories()
+                .iter()
+                .any(|factory| factory.descriptor().component_id == sandbox_id.as_str())
+        );
+        assert_eq!(main.status_contributors().len(), 1);
+        assert_eq!(main.maintenance_inhibitors().len(), 1);
+        assert_eq!(main.migration_contributors().len(), 1);
+    }
+
+    #[test]
+    fn observe_enablement_is_resolved_by_the_product_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-product-observe-profile-{}",
+            sinomo_runtime::core::Id::generate()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let observe_id = sinomo_runtime::observe::observe_module_id();
+
+        let enabled = base_component_catalog(&data_dir, ProductComponentProfile::main(false))
+            .expect("enabled profile");
+        assert!(enabled.modules().get(&observe_id).is_some());
+        assert!(
+            enabled
+                .factories()
+                .iter()
+                .any(|factory| { factory.descriptor().component_id == observe_id.as_str() })
+        );
+
+        sinomo_runtime::observe::set_observe_module_enabled(
+            &root,
+            false,
+            "test",
+            "disable observe",
+        )
+        .expect("disable observe");
+        let disabled = base_component_catalog(&data_dir, ProductComponentProfile::main(false))
+            .expect("disabled profile");
+        assert!(disabled.modules().get(&observe_id).is_none());
+        assert!(
+            !disabled
+                .factories()
+                .iter()
+                .any(|factory| { factory.descriptor().component_id == observe_id.as_str() })
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[cfg(feature = "native-workers")]
@@ -303,6 +480,25 @@ mod tests {
                 .modules()
                 .get(&sinomo_runtime::rollout::rollout_module_id())
                 .is_some()
+        );
+        let clustered_main = base_component_catalog(&data_dir, ProductComponentProfile::main(true))
+            .expect("clustered main profile");
+        let clustered_shadow =
+            base_component_catalog(&data_dir, ProductComponentProfile::shadow(true))
+                .expect("clustered shadow profile");
+        assert!(
+            clustered_main
+                .factory(sinomo_runtime::module::SERVICE_CATALOG_PUBLISHER_COMPONENT_ID)
+                .is_some()
+        );
+        assert!(
+            clustered_shadow
+                .factory(sinomo_runtime::module::SERVICE_CATALOG_PUBLISHER_COMPONENT_ID)
+                .is_none()
+        );
+        assert!(
+            main.factory(sinomo_runtime::module::SERVICE_CATALOG_PUBLISHER_COMPONENT_ID)
+                .is_none()
         );
     }
 

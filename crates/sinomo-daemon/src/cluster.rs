@@ -1,24 +1,18 @@
-use crate::client::{
-    cancel_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_async,
-    fetch_cluster_kv_local_snapshot_from_endpoint_async,
-    materialize_daemon_client_value_call_with_options,
-    start_cluster_kv_authoritative_watch_from_endpoint_async,
-};
+use crate::client::materialize_daemon_client_value_call_with_options;
 #[cfg(test)]
 use crate::status::ensure_daemon_cluster_members;
 #[cfg(test)]
 use crate::{AuthenticatedDaemonCommand, DaemonClusterRegistration};
 use crate::{
     DaemonClusterStatus, DaemonError, DaemonObjectRpcAsyncHost, DaemonPaths, DaemonProbeStatus,
-    DaemonRunOptions, IdleStatsAtomics, SINOMO_DAEMON_DEFAULT_HOST, SINOMO_DAEMON_DEFAULT_PORT,
-    SINOMO_SHADOW_DAEMON_DEFAULT_PORT, cluster_node_status_from_daemon_status,
+    DaemonRunOptions, IdleStatsAtomics, cluster_node_status_from_daemon_status,
     cluster_paths_from_env, current_daemon_cluster_options,
     current_shadow_daemon_options_on_runtime, daemon_cluster_options_from_status,
     daemon_cluster_process_from_paths, daemon_cluster_status, daemon_cluster_status_matches,
     daemon_connect_address, daemon_options_from_status, daemon_paths_are_shadow,
     fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
-    fetch_daemon_status_from_endpoint_on_runtime, handle_daemon_rollout_build_request,
-    read_daemon_status, send_cluster_member_publish_async, send_cluster_raft_append_on_runtime,
+    fetch_daemon_status_from_endpoint_on_runtime, read_daemon_status,
+    send_cluster_member_publish_async, send_cluster_raft_append_on_runtime,
     send_cluster_raft_vote_on_runtime, write_daemon_status,
 };
 #[cfg(test)]
@@ -46,13 +40,12 @@ use sinomo_core::kv::InProcessKvStore;
 use sinomo_core::kv::{
     ClusterKvRaftAppendReplicationOutcome, ClusterKvReplicationRequest,
     ClusterKvReplicationResponse, ClusterKvStateAuthorityVoteRequest,
-    ClusterKvStateAuthorityVoteResponse, ClusterKvWatchCancelRequest, ClusterKvWatchDrainRequest,
-    ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse, ClusterKvWatchRegistration,
+    ClusterKvStateAuthorityVoteResponse, ClusterKvWatchEventsRequest, ClusterKvWatchEventsResponse,
     ClusterRaftAppendRequest, ClusterRaftAppendResponse, ClusterRaftVoteRequest,
     ClusterRaftVoteResponse,
 };
 #[cfg(test)]
-use sinomo_core::kv::{KvCommand, KvEventKind, KvOp, KvRevision};
+use sinomo_core::kv::{KvCommand, KvOp};
 use sinomo_core::kv::{KvEvent, KvSnapshot, KvTxn, KvTxnResponse};
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::__connectivity_store::LocalClusterConnectivityStoreSnapshot;
@@ -81,15 +74,15 @@ use sinomo_core::{
     ClusterEndpointPrivacy, ClusterEndpointSource, ClusterJoinInvite, ClusterMemberRole,
     ClusterMemberState, ClusterNodeRolloutStatus, TrustDomain,
 };
-use sinomo_rollout::{
-    ClusterRolloutBuildRequest, DesiredRolloutReconcileDecision, SelfRolloutPaths,
-    desired_rollout_reconcile_decision, read_rollout_status,
-    record_desired_rollout_stale_handoff_failure_if_needed,
-};
 #[cfg(test)]
 use sinomo_rollout::{
     DESIRED_ROLLOUT_STALE_PROGRESS_AFTER_SECONDS, desired_rollout_failure_is_hard,
     desired_rollout_stale_handoff_failure_status, write_rollout_status,
+};
+#[cfg(test)]
+use sinomo_rollout::{
+    DesiredRolloutReconcileDecision, SelfRolloutPaths, desired_rollout_reconcile_decision,
+    read_rollout_status, record_desired_rollout_stale_handoff_failure_if_needed,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, LazyLock};
@@ -725,7 +718,7 @@ pub(crate) fn cluster_paths_from_daemon_paths(
 /// Returns `None` when there is nothing to wait for: no registry, no
 /// registered modules, or every enabled module already started at load time
 /// (the daemon booted with a cluster identity).
-pub(crate) fn start_daemon_network_module_context_task(
+pub fn start_daemon_network_module_context_task(
     paths: &DaemonPaths,
     options: &DaemonRunOptions,
     cluster: Option<&DaemonClusterStatus>,
@@ -883,14 +876,6 @@ pub(crate) fn daemon_network_module_context_now(
     }))
 }
 
-pub(crate) fn handle_daemon_cluster_kv_snapshot(
-    paths: &DaemonPaths,
-) -> Result<KvSnapshot, DaemonError> {
-    let cluster_paths = cluster_paths_from_daemon_paths(paths)?;
-    sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
-        .map_err(Into::into)
-}
-
 pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     paths: &DaemonPaths,
 ) -> Result<bool, DaemonError> {
@@ -910,7 +895,7 @@ pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
 
 /// Installs the process-wide storage backstop for the shadow role before any
 /// routing, authentication, service, or maintenance component can touch KV.
-pub(crate) fn deny_shadow_daemon_local_raft_access(paths: &DaemonPaths) -> Result<(), DaemonError> {
+pub fn deny_shadow_daemon_local_raft_access(paths: &DaemonPaths) -> Result<(), DaemonError> {
     if !crate::daemon_paths_are_shadow(paths) {
         return Ok(());
     }
@@ -1980,159 +1965,7 @@ pub(crate) fn ensure_cluster_directory_installed() {
     INSTALL.call_once(sinomo_core::cluster::install_kv_cluster_directory);
 }
 
-struct DaemonDesiredRolloutHost<'a> {
-    paths: &'a DaemonPaths,
-    cluster_paths: &'a ClusterPaths,
-    runtime: &'a tokio::runtime::Handle,
-}
-
-impl sinomo_rollout::DesiredRolloutReactorHost for DaemonDesiredRolloutHost<'_> {
-    type Error = DaemonError;
-
-    fn protocol_error(&self, detail: String) -> Self::Error {
-        DaemonError::Parse { detail }
-    }
-
-    fn unavailable_error(&self, detail: String) -> Self::Error {
-        DaemonError::Network {
-            address: "cluster rollout desired watch".to_string(),
-            detail,
-        }
-    }
-
-    fn watch_targets(&self) -> Result<Vec<ClusterEndpointRecord>, Self::Error> {
-        daemon_desired_rollout_watch_targets(self.cluster_paths)
-    }
-
-    fn start_watch<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        prefix: &'a str,
-        timeout: Duration,
-    ) -> sinomo_rollout::DesiredRolloutReactorFuture<
-        'a,
-        sinomo_core::kv::KvAuthoritativeRead<ClusterKvWatchRegistration>,
-        Self::Error,
-    > {
-        Box::pin(start_cluster_kv_authoritative_watch_from_endpoint_async(
-            endpoint,
-            prefix,
-            timeout,
-            self.runtime,
-        ))
-    }
-
-    fn read_local_snapshot<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        timeout: Duration,
-    ) -> sinomo_rollout::DesiredRolloutReactorFuture<
-        'a,
-        sinomo_core::kv::KvLocalRead<KvSnapshot>,
-        Self::Error,
-    > {
-        Box::pin(fetch_cluster_kv_local_snapshot_from_endpoint_async(
-            endpoint,
-            timeout,
-            self.runtime,
-        ))
-    }
-
-    fn drain_watch<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ClusterKvWatchDrainRequest,
-        timeout: Duration,
-    ) -> sinomo_rollout::DesiredRolloutReactorFuture<
-        'a,
-        sinomo_core::kv::ClusterKvWatchDrainResponse,
-        Self::Error,
-    > {
-        Box::pin(drain_cluster_kv_watch_from_endpoint_async(
-            endpoint,
-            request,
-            timeout,
-            self.runtime,
-        ))
-    }
-
-    fn cancel_watch<'a>(
-        &'a self,
-        endpoint: &'a ClusterEndpointRecord,
-        request: &'a ClusterKvWatchCancelRequest,
-        timeout: Duration,
-    ) -> sinomo_rollout::DesiredRolloutReactorFuture<
-        'a,
-        sinomo_core::kv::ClusterKvWatchCancelResponse,
-        Self::Error,
-    > {
-        Box::pin(cancel_cluster_kv_watch_from_endpoint_async(
-            endpoint,
-            request,
-            timeout,
-            self.runtime,
-        ))
-    }
-
-    fn reconcile_desired(
-        &self,
-        desired: Option<sinomo_core::ClusterRolloutDesiredRecord>,
-    ) -> Result<(), Self::Error> {
-        reconcile_desired_rollout_record(self.paths, desired)
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct DaemonDesiredRolloutReactor {
-    owner: sinomo_rollout::DesiredRolloutReactor,
-}
-
-impl DaemonDesiredRolloutReactor {
-    pub(crate) fn new(_cluster_paths: &ClusterPaths) -> Result<Self, DaemonError> {
-        Ok(Self {
-            owner: sinomo_rollout::DesiredRolloutReactor::new(),
-        })
-    }
-
-    pub(crate) async fn run_until_stopped_async(
-        self,
-        paths: DaemonPaths,
-        cluster_paths: ClusterPaths,
-        runtime: tokio::runtime::Handle,
-        stop_rx: tokio::sync::watch::Receiver<bool>,
-    ) {
-        let host = DaemonDesiredRolloutHost {
-            paths: &paths,
-            cluster_paths: &cluster_paths,
-            runtime: &runtime,
-        };
-        self.owner.run_until_stopped_async(&host, stop_rx).await;
-    }
-
-    #[cfg(test)]
-    fn pending_reconcile_work_for_test(
-        &self,
-    ) -> Result<Option<sinomo_rollout::DesiredRolloutReconcileWork>, DaemonError> {
-        self.owner.pending_reconcile_work().map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    fn mark_reconciled_for_test(&mut self, generation: u64) {
-        self.owner.mark_reconciled(generation);
-    }
-
-    #[cfg(test)]
-    fn observe_authoritative_snapshot(&mut self, snapshot: &KvSnapshot) -> bool {
-        self.owner.observe_authoritative_snapshot(snapshot)
-    }
-
-    #[cfg(test)]
-    fn observe_watch_events(&mut self, events: &[KvEvent]) -> bool {
-        self.owner.observe_watch_events(events)
-    }
-}
-
-fn daemon_desired_rollout_watch_targets(
+pub fn cluster_state_authority_watch_targets(
     cluster_paths: &ClusterPaths,
 ) -> Result<Vec<ClusterEndpointRecord>, DaemonError> {
     // This reactor runs in the shadow process. Select authority endpoints from
@@ -2169,7 +2002,7 @@ fn daemon_desired_rollout_watch_targets(
     }
     if targets.is_empty() {
         return Err(DaemonError::Network {
-            address: "cluster rollout desired watch".to_string(),
+            address: "cluster state authority watch".to_string(),
             detail: "no KV voter endpoint is currently known".to_string(),
         });
     }
@@ -2300,7 +2133,6 @@ enum DaemonNodeStatusPublishPhase {
     DaemonStatusRead,
     ClusterStatusEnsure,
     ClusterStateRead,
-    RolloutStatusRead,
     PresenceMatch,
     NodeStatusCommit,
     NetworkInfoCommit,
@@ -2311,7 +2143,6 @@ fn daemon_node_status_publish_phase_name(phase: DaemonNodeStatusPublishPhase) ->
         DaemonNodeStatusPublishPhase::DaemonStatusRead => "daemon_status_read",
         DaemonNodeStatusPublishPhase::ClusterStatusEnsure => "cluster_status_ensure",
         DaemonNodeStatusPublishPhase::ClusterStateRead => "cluster_state_read",
-        DaemonNodeStatusPublishPhase::RolloutStatusRead => "rollout_status_read",
         DaemonNodeStatusPublishPhase::PresenceMatch => "presence_match",
         DaemonNodeStatusPublishPhase::NodeStatusCommit => "node_status_commit",
         DaemonNodeStatusPublishPhase::NetworkInfoCommit => "network_info_commit",
@@ -2956,90 +2787,6 @@ impl ClusterNetworkMaintenance {
             self.record_connectivity_publish_success();
         }
     }
-}
-
-fn reconcile_desired_rollout_record(
-    paths: &DaemonPaths,
-    desired: Option<sinomo_core::ClusterRolloutDesiredRecord>,
-) -> Result<(), DaemonError> {
-    let Some(desired) = desired else {
-        return Ok(());
-    };
-    if desired.state != "active"
-        || desired.mode.as_deref() != Some("cluster-remote-build")
-        || (desired.source_bundle.is_none() && desired.remote_repo.is_none())
-    {
-        return Ok(());
-    }
-    let data_dir = paths.root.parent().ok_or_else(|| DaemonError::Io {
-        path: paths.root.display().to_string(),
-        detail: "daemon paths have no data directory parent".to_string(),
-    })?;
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    let current_status = read_rollout_status(&rollout_paths)?;
-    let now = OffsetDateTime::now_utc();
-    if let Some(status) = current_status.as_ref()
-        && record_desired_rollout_stale_handoff_failure_if_needed(
-            &rollout_paths,
-            status,
-            desired.mode.as_deref(),
-            desired.requested_at.as_deref(),
-            now,
-        )?
-    {
-        return Ok(());
-    }
-    match desired_rollout_reconcile_decision(
-        current_status.as_ref(),
-        desired.mode.as_deref(),
-        desired.requested_at.as_deref(),
-        now,
-    ) {
-        DesiredRolloutReconcileDecision::Complete
-        | DesiredRolloutReconcileDecision::TerminalFailure
-        | DesiredRolloutReconcileDecision::Wait => return Ok(()),
-        DesiredRolloutReconcileDecision::Retry => {}
-    }
-
-    let requested_at = desired.requested_at.clone().unwrap_or_else(|| {
-        OffsetDateTime::now_utc()
-            .format(&Rfc3339)
-            .unwrap_or_else(|_| "unknown".to_string())
-    });
-    let response = handle_daemon_rollout_build_request(
-        paths,
-        ClusterRolloutBuildRequest {
-            source: desired
-                .source
-                .unwrap_or_else(|| "cluster desired rollout".to_string()),
-            remote_repo: desired.remote_repo,
-            source_bundle: desired.source_bundle,
-            source_head: desired.source_head,
-            force_source_overwrite: desired.force_source_overwrite,
-            host: desired
-                .host
-                .unwrap_or_else(|| SINOMO_DAEMON_DEFAULT_HOST.to_string()),
-            host_override: None,
-            port: desired.port.unwrap_or(SINOMO_DAEMON_DEFAULT_PORT),
-            shadow_port: desired
-                .shadow_port
-                .unwrap_or(SINOMO_SHADOW_DAEMON_DEFAULT_PORT),
-            requested_at,
-        },
-    )?;
-    if response.status == "accepted" {
-        tracing::warn!(
-            "sinomo daemon desired rollout accepted: {}",
-            response.detail
-        );
-    } else {
-        tracing::warn!(
-            "sinomo daemon desired rollout {}: {}",
-            response.status,
-            response.detail
-        );
-    }
-    Ok(())
 }
 
 impl ClusterNetworkMaintenance {
@@ -4504,13 +4251,13 @@ async fn fetch_daemon_status_from_endpoint_direct_async(
 /// Records which of the two heartbeat records `refresh_daemon_node_status_in_kv`
 /// actually wrote to cluster KV, so callers can account real publishes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct NodeStatusPublishOutcome {
+pub struct NodeStatusPublishOutcome {
     pub network_info_published: bool,
     pub node_status_published: bool,
     pub network_info_deferred: bool,
 }
 
-pub(crate) fn refresh_daemon_node_status_in_kv(
+pub fn refresh_daemon_node_status_in_kv(
     paths: &DaemonPaths,
 ) -> Result<NodeStatusPublishOutcome, DaemonError> {
     refresh_daemon_node_status_in_kv_on_runtime(paths, None)
@@ -4521,6 +4268,8 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
     runtime: Option<&tokio::runtime::Handle>,
 ) -> Result<NodeStatusPublishOutcome, DaemonError> {
     let mut status = read_daemon_status(paths)?;
+    crate::service_adapter::apply_component_status_contributors(paths, &mut status)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     ensure_daemon_status_cluster_on_runtime(paths, &mut status, runtime)?;
     let Some(cluster) = status.cluster.as_ref() else {
         return Ok(NodeStatusPublishOutcome::default());
@@ -4530,7 +4279,6 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
     let state = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?;
     let network_info = sinomo_core::network::build_cluster_network_info_record(
         &state,
@@ -4541,7 +4289,7 @@ pub(crate) fn refresh_daemon_node_status_in_kv_on_runtime(
     let record = cluster_node_status_from_daemon_status(
         &status,
         cluster,
-        read_rollout_status(&rollout_paths)?,
+        None,
         time::OffsetDateTime::now_utc(),
     );
     let Some(runtime) = runtime else {
@@ -4601,6 +4349,8 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         path: read_path,
         detail: format!("daemon status read task failed: {source}"),
     })??;
+    crate::service_adapter::apply_component_status_contributors(paths, &mut status)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     let ensure_result = {
         let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
             DaemonNodeStatusPublishPhase::ClusterStatusEnsure,
@@ -4619,7 +4369,6 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         detail: "daemon paths have no data directory parent".to_string(),
     })?;
     let cluster_paths = ClusterPaths::new(&SinomoDataDir::new(data_dir));
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
     let state_paths = cluster_paths.clone();
     let state_path = state_paths.root.display().to_string();
     let state_result = {
@@ -4646,24 +4395,10 @@ async fn refresh_daemon_node_status_in_kv_async_with_timeouts(
         time::OffsetDateTime::now_utc(),
         CLUSTER_NETWORK_INFO_TTL_SECONDS,
     );
-    let rollout_path = rollout_paths.root.display().to_string();
-    let rollout_result = {
-        let mut phase = DaemonNodeStatusPublishPhaseObservation::start(
-            DaemonNodeStatusPublishPhase::RolloutStatusRead,
-            operation_budget,
-        );
-        let result = tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths)).await;
-        phase.complete();
-        result
-    };
-    let rollout_status = rollout_result.map_err(|source| DaemonError::Io {
-        path: rollout_path,
-        detail: format!("rollout status read task failed: {source}"),
-    })??;
     let record = cluster_node_status_from_daemon_status(
         &status,
         &cluster,
-        rollout_status,
+        None,
         time::OffsetDateTime::now_utc(),
     );
     let mut publish_match_host = DaemonClusterControlPlaneTransport::with_mode_and_timeouts(
@@ -5931,28 +5666,24 @@ fn handle_daemon_cluster_control_join_single_node_migration_on_runtime(
         &migration,
         &mut source_host,
     )?;
-    let dfs_quarantine = paths.root.parent().map(|data_dir_root| {
-        let data_dir = SinomoDataDir::new(data_dir_root);
-        sinomo_dfs::dfs_migration_quarantine_plan(&data_dir, &migration.source_cluster_id)
-    });
+    let component_quarantine = crate::service_adapter::component_migration_contributions(
+        daemon_paths,
+        &migration.source_cluster_id,
+    )
+    .map_err(|detail| DaemonError::Parse { detail })?;
     let quarantine = sinomo_core::cluster::quarantine_cluster_storage_for_migration(
         paths,
         &migration,
-        dfs_quarantine
-            .as_ref()
-            .map(|plan| plan.moves.as_slice())
-            .unwrap_or_default(),
+        &component_quarantine.moves,
     )?;
     migration.phase = sinomo_core::ClusterMigrationPhase::SourceFrozen;
     migration.updated_at = OffsetDateTime::now_utc();
     migration
         .evidence_refs
         .push(format!("source-quarantine:{}", quarantine.root.display()));
-    if let Some(plan) = dfs_quarantine {
-        migration
-            .evidence_refs
-            .push(format!("dfs-import-namespace:{}", plan.import_namespace));
-    }
+    migration
+        .evidence_refs
+        .extend(component_quarantine.evidence_refs);
     sinomo_core::cluster::write_local_cluster_migration_record(&quarantine.root, &migration)?;
 
     match daemon_cluster_control_join_fresh_on_runtime(
@@ -8822,7 +8553,6 @@ mod tests {
             DaemonNodeStatusPublishPhase::DaemonStatusRead,
             DaemonNodeStatusPublishPhase::ClusterStatusEnsure,
             DaemonNodeStatusPublishPhase::ClusterStateRead,
-            DaemonNodeStatusPublishPhase::RolloutStatusRead,
             DaemonNodeStatusPublishPhase::PresenceMatch,
             DaemonNodeStatusPublishPhase::NodeStatusCommit,
             DaemonNodeStatusPublishPhase::NetworkInfoCommit,
@@ -8833,7 +8563,6 @@ mod tests {
                 "daemon_status_read",
                 "cluster_status_ensure",
                 "cluster_state_read",
-                "rollout_status_read",
                 "presence_match",
                 "node_status_commit",
                 "network_info_commit",
@@ -9945,151 +9674,6 @@ mod tests {
                 "a generic shadow network publication tick must not append an authoritative rollout barrier"
             );
         }
-    }
-
-    #[test]
-    fn committed_desired_rollout_change_reaches_shadow_reactor() {
-        let (_root, cluster_paths, state) =
-            seeded_single_node_cluster_for_publish_cache_test("shadow_rollout_reactor_change");
-        let mut reactor =
-            DaemonDesiredRolloutReactor::new(&cluster_paths).expect("rollout reactor");
-        assert_eq!(
-            reactor
-                .pending_reconcile_work_for_test()
-                .expect("pre-catch-up work"),
-            None,
-            "startup is not complete, or consumed, before an authoritative snapshot arrives"
-        );
-
-        let desired = sinomo_core::ClusterRolloutDesiredRecord {
-            cluster_id: state.cluster_id.clone(),
-            state: "active".to_string(),
-            source: Some("test".to_string()),
-            mode: Some("cluster-remote-build".to_string()),
-            source_head: Some("abc123".to_string()),
-            source_bundle: Some(vec![1, 2, 3]),
-            force_source_overwrite: false,
-            remote_repo: None,
-            host: Some("127.0.0.1".to_string()),
-            port: Some(21_353),
-            shadow_port: Some(21_354),
-            requested_at: Some("2026-07-20T00:00:00Z".to_string()),
-            updated_at: OffsetDateTime::now_utc(),
-        };
-        let snapshot =
-            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
-                .expect("current snapshot");
-        let mut store = InProcessKvStore::restore(snapshot).expect("restore snapshot");
-        store
-            .apply_command(KvCommand::Op(
-                sinomo_rollout::build_cluster_rollout_desired_put_op(&desired)
-                    .expect("desired rollout put"),
-            ))
-            .expect("apply desired rollout");
-        let authoritative = store.snapshot().expect("updated snapshot");
-        assert!(reactor.observe_authoritative_snapshot(&authoritative));
-
-        let committed = reactor
-            .pending_reconcile_work_for_test()
-            .expect("committed work")
-            .expect("desired reconciliation");
-        assert_eq!(
-            committed.desired,
-            Some(desired.clone()),
-            "the exact committed desired-key transition must reach rollout reconciliation"
-        );
-        assert_eq!(
-            reactor
-                .pending_reconcile_work_for_test()
-                .expect("unacknowledged work"),
-            Some(committed.clone()),
-            "failed reconciliation must remain pending until successful completion"
-        );
-        reactor.mark_reconciled_for_test(committed.generation);
-
-        assert!(!reactor.observe_watch_events(&[KvEvent {
-            revision: authoritative.revision.next(),
-            key: "/cluster/unrelated".to_string(),
-            kind: KvEventKind::Put { value: vec![9] },
-        }]));
-        assert_eq!(
-            reactor
-                .pending_reconcile_work_for_test()
-                .expect("stable work"),
-            None,
-            "an unrelated committed event must not retrigger rollout reconciliation"
-        );
-
-        assert!(reactor.observe_watch_events(&[KvEvent {
-            revision: KvRevision(authoritative.revision.0.saturating_add(2)),
-            key: sinomo_core::cluster_rollout_desired_key(),
-            kind: KvEventKind::Delete,
-        }]));
-        let deletion = reactor
-            .pending_reconcile_work_for_test()
-            .expect("desired deletion work")
-            .expect("deletion reconciliation");
-        assert_eq!(
-            deletion.desired, None,
-            "deleting durable rollout intent must also reach the reactor"
-        );
-    }
-
-    #[test]
-    fn desired_change_arriving_before_reconcile_completion_remains_pending() {
-        let (_root, cluster_paths, state) =
-            seeded_single_node_cluster_for_publish_cache_test("shadow_rollout_reactor_race");
-        let mut reactor =
-            DaemonDesiredRolloutReactor::new(&cluster_paths).expect("rollout reactor");
-        let desired = sinomo_core::ClusterRolloutDesiredRecord {
-            cluster_id: state.cluster_id,
-            state: "active".to_string(),
-            source: Some("first".to_string()),
-            mode: Some("cluster-remote-build".to_string()),
-            source_head: Some("abc123".to_string()),
-            source_bundle: None,
-            force_source_overwrite: false,
-            remote_repo: None,
-            host: None,
-            port: None,
-            shadow_port: None,
-            requested_at: None,
-            updated_at: OffsetDateTime::now_utc(),
-        };
-        let snapshot =
-            sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot(&cluster_paths)
-                .expect("current snapshot");
-        let mut store = InProcessKvStore::restore(snapshot).expect("restore snapshot");
-        store
-            .apply_command(KvCommand::Op(
-                sinomo_rollout::build_cluster_rollout_desired_put_op(&desired)
-                    .expect("initial desired put"),
-            ))
-            .expect("apply initial desired");
-        let initial_snapshot = store.snapshot().expect("initial desired snapshot");
-        reactor.observe_authoritative_snapshot(&initial_snapshot);
-        let first = reactor
-            .pending_reconcile_work_for_test()
-            .expect("first work")
-            .expect("first desired");
-
-        let mut updated = desired;
-        updated.source = Some("second".to_string());
-        assert!(reactor.observe_watch_events(&[KvEvent {
-            revision: initial_snapshot.revision.next(),
-            key: sinomo_core::cluster_rollout_desired_key(),
-            kind: KvEventKind::Put {
-                value: sinomo_core::kv::encode_kv_value(&updated).expect("encode updated desired"),
-            },
-        }]));
-        reactor.mark_reconciled_for_test(first.generation);
-
-        let next = reactor
-            .pending_reconcile_work_for_test()
-            .expect("next work")
-            .expect("newer desired remains pending");
-        assert!(next.generation > first.generation);
-        assert_eq!(next.desired, Some(updated));
     }
 
     #[test]

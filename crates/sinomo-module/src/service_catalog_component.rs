@@ -49,6 +49,77 @@ pub fn service_catalog_publisher_component_factory(
     )
 }
 
+/// Product-selectable cluster service-catalog component. It derives all host
+/// mechanism from [`crate::ComponentContext`], so the daemon neither knows
+/// about this component nor appends a fallback factory.
+pub fn cluster_service_catalog_publisher_component_factory()
+-> Result<StaticComponentFactory, ComponentError> {
+    StaticComponentFactory::new(
+        ComponentDescriptor::new(
+            SERVICE_CATALOG_PUBLISHER_COMPONENT_ID,
+            env!("CARGO_PKG_VERSION"),
+        ),
+        move |context, scope| {
+            let runtime = context
+                .runtime()
+                .ok_or_else(|| ComponentError::RuntimeUnavailable {
+                    component_id: SERVICE_CATALOG_PUBLISHER_COMPONENT_ID.to_string(),
+                })?;
+            let cluster = context.cluster_access().ok_or_else(|| {
+                ComponentError::component(
+                    SERVICE_CATALOG_PUBLISHER_COMPONENT_ID,
+                    "cluster access is unavailable",
+                )
+            })?;
+            let cluster_paths = sinomo_core::network::ClusterPaths::new(context.data_dir());
+            let state =
+                sinomo_core::cluster::read_cluster_state(&cluster_paths).map_err(|error| {
+                    ComponentError::component(SERVICE_CATALOG_PUBLISHER_COMPONENT_ID, error)
+                })?;
+            let registry = context.service_registry_snapshot_store()?;
+            let host: Arc<dyn ServiceCatalogPublisherHost> =
+                Arc::new(ComponentServiceCatalogPublisherHost {
+                    cluster,
+                    local_node_id: state.local_node_id,
+                });
+            scope.own_task(
+                "cluster service catalog publisher",
+                runtime.spawn(run_service_catalog_publisher(
+                    host,
+                    registry,
+                    scope.shutdown_receiver(),
+                )),
+            );
+            Ok(())
+        },
+    )
+}
+
+struct ComponentServiceCatalogPublisherHost {
+    cluster: Arc<dyn sinomo_core::service::ClusterAccess>,
+    local_node_id: sinomo_core::node::NodeId,
+}
+
+impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
+    fn publish<'a>(
+        &'a self,
+        snapshot: Arc<ServiceRegistrySnapshot>,
+    ) -> ServiceCatalogPublishFuture<'a> {
+        Box::pin(async move {
+            sinomo_core::service::publish_local_service_instances(
+                self.cluster.as_ref(),
+                snapshot.registry(),
+                &self.local_node_id,
+                snapshot.version(),
+                time::OffsetDateTime::now_utc(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        })
+    }
+}
+
 async fn run_service_catalog_publisher(
     host: Arc<dyn ServiceCatalogPublisherHost>,
     registry: sinomo_core::service::ServiceRegistrySnapshotStore,

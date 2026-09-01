@@ -8,11 +8,8 @@ mod observe;
 mod paths;
 mod process;
 pub mod registry;
-mod rollout;
-mod service_adapter;
+pub mod service_adapter;
 mod status;
-
-pub(crate) const DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR: &str = "sandbox-lifecycle-recovery";
 
 pub use sinomo_api::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
@@ -63,88 +60,73 @@ pub use auth::{
     daemon_rpc_body_sha256, sign_daemon_rpc_request_digest_for_local_node,
     sign_daemon_rpc_request_for_local_node, sign_daemon_rpc_request_from_data_dir,
 };
-pub(crate) use client::{
-    DaemonObjectRpcAsyncHost, cluster_paths_from_env,
-    fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
-    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
-    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
-};
 pub use client::{
-    RemoteConfigClient, cancel_cluster_kv_watch_from_endpoint_on_runtime,
-    drain_cluster_kv_watch_from_endpoint_on_runtime,
+    DaemonObjectRpcAsyncHost, RemoteConfigClient, block_on_daemon_client_on_owner_runtime,
+    block_on_daemon_client_on_process_runtime, block_on_daemon_client_session,
+    cancel_cluster_kv_watch_from_endpoint_async, cancel_cluster_kv_watch_from_endpoint_on_runtime,
+    drain_cluster_kv_watch_from_endpoint_async, drain_cluster_kv_watch_from_endpoint_on_runtime,
     fetch_cluster_kv_authoritative_range_prefix_from_endpoint_on_runtime,
-    fetch_daemon_status_from_address, fetch_daemon_status_from_endpoint,
-    fetch_daemon_status_from_endpoint_async, send_daemon_build_artifact,
-    send_daemon_build_artifact_to_endpoint, send_daemon_build_artifact_to_target,
-    send_daemon_build_capabilities, send_daemon_build_capabilities_to_endpoint,
-    send_daemon_build_capabilities_to_target, send_daemon_build_status,
-    send_daemon_build_status_to_endpoint, send_daemon_build_status_to_target,
-    send_daemon_build_submit, send_daemon_build_submit_to_endpoint,
-    send_daemon_build_submit_to_target, send_daemon_cluster_maintenance_refresh,
+    fetch_cluster_kv_local_snapshot_from_endpoint_async, fetch_daemon_status_from_address,
+    fetch_daemon_status_from_endpoint, fetch_daemon_status_from_endpoint_async,
+    local_session_cluster_state, local_session_data_dir, local_session_endpoint_for_address,
+    object_rpc_transfer_timeouts, send_daemon_cluster_maintenance_refresh,
     send_daemon_cluster_maintenance_refresh_to_endpoint,
-    send_daemon_remote_shadow_shutdown_request, send_daemon_rollout_binary,
-    send_daemon_rollout_binary_to_endpoint, send_daemon_rollout_binary_to_target,
-    send_daemon_rollout_build, send_daemon_rollout_build_to_endpoint,
-    send_daemon_rollout_build_to_target, send_daemon_rollout_clear_status,
-    send_daemon_rollout_clear_status_to_endpoint, send_daemon_rollout_diagnostics,
-    send_daemon_rollout_diagnostics_to_endpoint, send_daemon_rollout_native_dylib_module,
-    send_daemon_rollout_native_dylib_module_to_endpoint,
-    send_daemon_rollout_native_dylib_module_to_target, send_daemon_rpc, send_daemon_rpc_async,
-    send_daemon_rpc_call_async, send_daemon_rpc_stream, send_daemon_rpc_stream_async,
-    send_daemon_rpc_to_endpoint, send_daemon_rpc_to_endpoint_async,
-    send_daemon_rpc_to_endpoint_with_options, send_daemon_rpc_to_endpoint_with_timeouts,
-    send_daemon_rpc_with_options, send_daemon_rpc_with_timeouts, send_daemon_shutdown_request,
+    send_daemon_remote_shadow_shutdown_request, send_daemon_rpc, send_daemon_rpc_async,
+    send_daemon_rpc_call_async, send_daemon_rpc_shared_value,
+    send_daemon_rpc_shared_value_to_endpoint, send_daemon_rpc_shared_value_to_target,
+    send_daemon_rpc_stream, send_daemon_rpc_stream_async, send_daemon_rpc_to_endpoint,
+    send_daemon_rpc_to_endpoint_async, send_daemon_rpc_to_endpoint_with_options,
+    send_daemon_rpc_to_endpoint_with_timeouts, send_daemon_rpc_value,
+    send_daemon_rpc_value_to_endpoint, send_daemon_rpc_with_options, send_daemon_rpc_with_timeouts,
+    send_daemon_shutdown_request,
     send_object_rpc_call_to_target_async_with_cluster_paths_and_options,
     send_object_rpc_call_to_target_async_with_options, send_object_rpc_call_to_target_with_options,
     send_object_rpc_to_target, send_object_rpc_to_target_async,
     send_object_rpc_to_target_async_with_options, send_object_rpc_to_target_with_options,
     send_object_rpc_to_target_with_timeouts,
+    start_cluster_kv_authoritative_watch_from_endpoint_async,
     start_cluster_kv_authoritative_watch_from_endpoint_on_runtime,
 };
-pub use cluster::commit_cluster_kv_txn_with_quorum;
+pub(crate) use client::{
+    cluster_paths_from_env, fetch_cluster_kv_local_snapshot_from_endpoint_on_runtime,
+    fetch_daemon_status_from_endpoint_on_runtime, send_cluster_member_publish_async,
+    send_cluster_raft_append_on_runtime, send_cluster_raft_vote_on_runtime,
+};
+pub use cluster::{
+    CLUSTER_HEALTH_PROBE_TIMEOUT, cluster_state_authority_watch_targets,
+    commit_cluster_kv_txn_with_quorum, deny_shadow_daemon_local_raft_access,
+    refresh_daemon_node_status_in_kv, start_daemon_network_module_context_task,
+};
 pub use control::{
-    handle_daemon_sandbox_checkpoint, handle_daemon_sandbox_create, handle_daemon_sandbox_destroy,
-    handle_daemon_sandbox_http_fetch, handle_daemon_sandbox_http_fetch_to_file,
-    handle_daemon_sandbox_import_busybox, handle_daemon_sandbox_list, handle_daemon_sandbox_read,
-    handle_daemon_sandbox_reboot, handle_daemon_sandbox_resume,
-    handle_daemon_sandbox_run_process_plan, handle_daemon_sandbox_run_toolchain,
-    handle_daemon_sandbox_status, handle_daemon_sandbox_toolchain_add_artifact,
-    handle_daemon_sandbox_toolchain_add_command, handle_daemon_sandbox_toolchain_import_package,
-    handle_daemon_sandbox_update, handle_daemon_sandbox_write, open_daemon_sandbox_dfs_service,
-    run_daemon_control_loop, run_daemon_control_loop_with_catalog,
-    run_daemon_control_loop_with_catalog_and_profile,
+    daemon_data_dir_path, run_daemon_control_accept_loop, run_daemon_control_loop,
+    run_daemon_control_loop_with_catalog, run_daemon_control_loop_with_catalog_and_profile,
     run_daemon_control_loop_with_catalog_and_runtime, run_daemon_control_loop_with_components,
     run_daemon_control_loop_with_components_and_profile,
     run_daemon_control_loop_with_prepared_listener,
 };
 pub use error::DaemonError;
-pub(crate) use observe::{
+pub use observe::{
     OperationalSeverity, append_operational_event_best_effort, append_operational_log_best_effort,
 };
+pub(crate) use process::build_daemon_async_runtime_with_profile;
 #[cfg(windows)]
 pub use process::prepare_noninteractive_command;
 #[cfg(not(unix))]
-pub(crate) use process::spawn_shadow_rollout_completion_helper_process;
-pub(crate) use process::{
-    CandidateMainDiagnostics, build_daemon_async_runtime, build_daemon_async_runtime_with_profile,
-    main_exit_observation_from_status, spawn_candidate_main_daemon_process,
-    spawn_main_daemon_process, spawn_shadow_rollout_recovery_helper_process,
+pub use process::spawn_shadow_rollout_completion_helper_process;
+pub use process::{
+    CandidateMainDiagnostics, build_daemon_async_runtime, request_supervised_main_restart,
+    spawn_candidate_main_daemon_process, spawn_main_daemon_process,
+    spawn_shadow_rollout_recovery_helper_process,
 };
 pub use process::{
     DaemonExecutionProfile, DaemonRuntimeConfig, PreparedDaemonControlListener,
     daemon_main_binary_for_shadow_start, prepare_background_command,
     prepare_daemon_control_listener, start_daemon_command_process,
 };
-pub use rollout::{
-    LocalRolloutMainActivationPlan, handle_daemon_rollout_build_request,
-    handle_daemon_rollout_native_dylib_module_request, handle_deferred_shadow_rollout_completion,
-    prepare_local_rollout_main_activation, run_shadow_daemon_supervision_loop,
-    run_shadow_daemon_supervision_loop_with_prepared_listener, shadow_main_binary_from_env,
-    shadow_main_options_from_env, sleep_for_shadow_start_delay, stage_rollout_main_activation,
-    wait_for_local_shadow_rollout_completion, wait_for_main_daemon_health,
-};
-pub(crate) use rollout::{daemon_paths_are_shadow, handle_daemon_finalize_shadow_rollout};
-pub(crate) use sinomo_observe::{
+pub fn daemon_paths_are_shadow(paths: &DaemonPaths) -> bool {
+    paths.is_shadow()
+}
+pub(crate) use sinomo_api::{
     IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
 };
 pub use status::{
@@ -208,14 +190,6 @@ pub fn register_storage_paths(
     }
     for relative_path in ["daemon/main.stdout.log", "daemon/main.stderr.log"] {
         layout.register_human_text("sinomo-daemon", StorageRing::R1, relative_path)?;
-    }
-    for daemon_root in ["daemon", "shadow-daemon"] {
-        layout.register_escape_path(
-            "sinomo-daemon",
-            StorageRing::R1,
-            format!("{daemon_root}/{DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR}"),
-            "durable sandbox lifecycle recovery markers and sweep state",
-        )?;
     }
     layout.register_escape_path(
         "sinomo-daemon",

@@ -2,7 +2,7 @@
 //!
 //! A [`SandboxBackend`] serves the sandbox control routes against some concrete store:
 //! the local filesystem store ([`LocalSandboxBackend`], used when running daemonless) or
-//! the clustered SIFS-over-DFS store (the daemon's backend). The seam's `SandboxService`
+//! the clustered SIFS-over-DFS store. The seam's `SandboxService`
 //! (in `sinomo-service`) dispatches each route to whichever backend the host/context
 //! selects, so there is a single sandbox code path regardless of whether a cluster exists.
 //!
@@ -30,8 +30,38 @@ pub enum SandboxBackendError {
     Other(String),
 }
 
+impl From<sinomo_dfs::DfsPosixError> for SandboxBackendError {
+    fn from(error: sinomo_dfs::DfsPosixError) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
+impl From<crate::ClusteredSandboxLeaseError> for SandboxBackendError {
+    fn from(error: crate::ClusteredSandboxLeaseError) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
+impl From<crate::SandboxRecordedHttpFetchError> for SandboxBackendError {
+    fn from(error: crate::SandboxRecordedHttpFetchError) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
+impl From<crate::SandboxEventEmissionError> for SandboxBackendError {
+    fn from(error: crate::SandboxEventEmissionError) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
+impl From<crate::SandboxToolchainError> for SandboxBackendError {
+    fn from(error: crate::SandboxToolchainError) -> Self {
+        Self::Other(error.to_string())
+    }
+}
+
 /// Serves the sandbox control routes against a concrete store. Implemented by the
-/// host-agnostic [`LocalSandboxBackend`] and by the daemon's clustered SIFS backend.
+/// host-agnostic [`LocalSandboxBackend`] and by the component-owned clustered SIFS backend.
 ///
 /// Execution (`run/*`) and mediated HTTP (`http/*`) routes are served separately and are
 /// not part of this trait.
@@ -135,6 +165,21 @@ pub trait SandboxBackend: Send {
         self.run_toolchain(request)
     }
 
+    fn run_toolchain_with_output_sink_and_cancellation(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+        output_sink: Option<std::sync::Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        let outcome = self.run_toolchain_with_cancellation(request, cancellation_token)?;
+        if let Some(output_sink) = output_sink {
+            for chunk in &outcome.output_chunks {
+                output_sink.output_chunk(chunk.clone());
+            }
+        }
+        Ok(outcome)
+    }
+
     fn run_process_plan(
         &mut self,
         request: SandboxRunProcessPlanRequest,
@@ -147,6 +192,23 @@ pub trait SandboxBackend: Send {
     ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
         let _ = cancellation_token;
         self.run_process_plan(request)
+    }
+
+    fn run_process_plan_with_output_sink_and_cancellation(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+        output_sink: Option<std::sync::Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        let outcome = self.run_process_plan_with_cancellation(request, cancellation_token)?;
+        if let Some(output_sink) = output_sink {
+            for step in &outcome.step_outcomes {
+                for chunk in &step.output_chunks {
+                    output_sink.output_chunk(chunk.clone());
+                }
+            }
+        }
+        Ok(outcome)
     }
 }
 
@@ -549,6 +611,29 @@ impl SandboxBackend for LocalSandboxBackend {
             .map_err(|error| SandboxBackendError::Other(error.to_string()))
     }
 
+    fn run_toolchain_with_output_sink_and_cancellation(
+        &mut self,
+        request: SandboxRunToolchainRequest,
+        output_sink: Option<std::sync::Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
+        let Some(runner) = &self.container_runner else {
+            return Err(local_mode_unsupported("toolchain execution"));
+        };
+        runner
+            .run_toolchain_command_with_stdin_and_output_sink_and_cancellation(
+                &self.store,
+                &request.sandbox_id,
+                &request.command_name,
+                request.argv,
+                request.stdin,
+                request.timeout_ms,
+                output_sink,
+                cancellation_token,
+            )
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
+    }
+
     fn run_process_plan(
         &mut self,
         request: SandboxRunProcessPlanRequest,
@@ -571,6 +656,27 @@ impl SandboxBackend for LocalSandboxBackend {
                 &request.plan,
                 request.timeout_ms,
                 None,
+                cancellation_token,
+            )
+            .map_err(|error| SandboxBackendError::Other(error.to_string()))
+    }
+
+    fn run_process_plan_with_output_sink_and_cancellation(
+        &mut self,
+        request: SandboxRunProcessPlanRequest,
+        output_sink: Option<std::sync::Arc<dyn SandboxOutputSink>>,
+        cancellation_token: SandboxCancellationToken,
+    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
+        let Some(runner) = &self.container_runner else {
+            return Err(local_mode_unsupported("process-plan execution"));
+        };
+        runner
+            .run_process_plan_with_output_sink_and_cancellation(
+                &self.store,
+                &request.sandbox_id,
+                &request.plan,
+                request.timeout_ms,
+                output_sink,
                 cancellation_token,
             )
             .map_err(|error| SandboxBackendError::Other(error.to_string()))

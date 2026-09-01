@@ -1,4 +1,4 @@
-//! Daemon composition hooks for the observation owner crate.
+//! Daemon-originated component events.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,22 @@ use sinomo_core::{
 
 use crate::{DaemonError, DaemonPaths, read_daemon_status};
 
-pub use sinomo_observe::OperationalSeverity;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalSeverity {
+    Info,
+    Warn,
+    Error,
+}
+
+impl OperationalSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn append_operational_event_best_effort(
@@ -22,35 +37,15 @@ pub fn append_operational_event_best_effort(
     fields: serde_json::Value,
 ) {
     let message = message.into();
-    if publish_operational_component_event(
+    let _ = publish_operational_component_event(
         paths,
         severity,
         component,
         kind,
         &message,
         operation_id,
-        fields.clone(),
-    ) {
-        return;
-    }
-    let result = (|| {
-        let data_dir = daemon_data_dir_path(paths)?;
-        sinomo_observe::append_operational_event_if_enabled(
-            &data_dir,
-            Some(operational_origin_node_id(paths, &data_dir)),
-            severity,
-            component,
-            kind,
-            message,
-            operation_id,
-            fields,
-        )
-        .map(|_| ())
-        .map_err(DaemonError::from)
-    })();
-    if let Err(error) = result {
-        tracing::warn!("sinomo daemon operational event append failed: {error}");
-    }
+        fields,
+    );
 }
 
 pub fn append_operational_log_best_effort(
@@ -62,33 +57,15 @@ pub fn append_operational_log_best_effort(
     fields: serde_json::Value,
 ) {
     let message = message.into();
-    if publish_operational_component_event(
+    let _ = publish_operational_component_event(
         paths,
         severity,
         component,
         "daemon.log.recorded",
         &message,
         operation_id,
-        fields.clone(),
-    ) {
-        return;
-    }
-    let result = (|| {
-        let data_dir = daemon_data_dir_path(paths)?;
-        sinomo_observe::append_operational_log_if_enabled(
-            &data_dir,
-            severity,
-            component,
-            message,
-            operation_id,
-            fields,
-        )
-        .map(|_| ())
-        .map_err(DaemonError::from)
-    })();
-    if let Err(error) = result {
-        tracing::warn!("sinomo daemon operational log append failed: {error}");
-    }
+        fields,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,8 +93,6 @@ fn publish_operational_component_event(
         payload.insert("fields".to_string(), fields);
     }
     let salience = match severity {
-        OperationalSeverity::Trace => 0.1,
-        OperationalSeverity::Debug => 0.2,
         OperationalSeverity::Info => 0.4,
         OperationalSeverity::Warn => 0.75,
         OperationalSeverity::Error => 0.95,
@@ -161,7 +136,7 @@ fn publish_operational_component_event(
     ) {
         Ok(published) => published,
         Err(error) => {
-            tracing::warn!(%error, "daemon component event publish failed; using observe fallback");
+            tracing::warn!(%error, "daemon component event publish failed");
             false
         }
     }

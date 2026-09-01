@@ -31,6 +31,7 @@ dfs-nfs-client = ["module-client", "dep:sinomo-dfs-nfs"]
 host = [
     "client",
     "dep:sinomo-build",
+    "dep:sinomo-build-client",
     "sinomo-core/host",
     "dep:sinomo-cli-registry",
     "dep:sinomo-daemon",
@@ -44,6 +45,8 @@ host = [
     "dep:sinomo-registry",
     "dep:sinomo-remote-management",
     "dep:sinomo-rollout",
+    "dep:sinomo-rollout-client",
+    "dep:sinomo-rollout-host",
     "dep:sinomo-sandbox",
     "dep:sinomo-sandbox-simple",
     "dep:sinomo-supervision",
@@ -61,6 +64,7 @@ cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
 [dependencies]
 sinomo-api = { path = "../sinomo-api", optional = true }
 sinomo-build = { path = "../sinomo-build", optional = true }
+sinomo-build-client = { path = "../sinomo-build-client", optional = true }
 sinomo-cli-registry = { path = "../sinomo-cli-registry", optional = true }
 sinomo-config = { path = "../sinomo-config", optional = true }
 sinomo-core = { path = "../sinomo-core", default-features = false, optional = true }
@@ -77,6 +81,8 @@ sinomo-policy = { path = "../sinomo-policy", optional = true }
 sinomo-registry = { path = "../sinomo-registry", optional = true }
 sinomo-remote-management = { path = "../sinomo-remote-management", optional = true }
 sinomo-rollout = { path = "../sinomo-rollout", optional = true }
+sinomo-rollout-client = { path = "../sinomo-rollout-client", optional = true }
+sinomo-rollout-host = { path = "../sinomo-rollout-host", optional = true }
 sinomo-sandbox = { path = "../sinomo-sandbox", optional = true }
 sinomo-sandbox-simple = { path = "../sinomo-sandbox-simple", optional = true }
 sinomo-supervision = { path = "../sinomo-supervision", optional = true }

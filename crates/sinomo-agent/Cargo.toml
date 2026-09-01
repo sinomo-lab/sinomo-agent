@@ -25,6 +25,7 @@ tokio.workspace = true
 tracing.workspace = true
 sinomo-lm = { path = "../sinomo-lm" }
 sinomo-memory = { path = "../sinomo-memory" }
+sinomo-product-profile = { path = "../sinomo-product-profile" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]

@@ -27,7 +27,7 @@ use super::{
     build_cluster_raft_append_request_from_next_index,
     cli_cluster_state_authority_reachability_options, cli_command_is_help,
     cli_command_requires_cluster_state, cli_command_supports_degraded_local_mode,
-    cli_default_main_daemon_status, cli_invocation_force_local_mode,
+    cli_data_dir_layout, cli_default_main_daemon_status, cli_invocation_force_local_mode,
     cli_invocation_supports_explicit_dfs_perf_tracing, cluster_has_local_quorum,
     cluster_init_with_paths, cluster_invite_has_remote_usable_introducer,
     cluster_invite_with_paths, cluster_join_with_paths, cluster_kv_state_authority_id,
@@ -7209,7 +7209,9 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
     assert!(main_entry.contains("21400"));
     assert!(shadow_entry.contains("21401"));
 
-    let storage_report = sinomo_runtime::storage::verify_sinomo_data_dir(&layout.data_dir)
+    let storage_report = cli_data_dir_layout(&layout.data_dir)
+        .expect("storage layout")
+        .verify_data_dir(&layout.data_dir)
         .expect("storage verifier");
     assert!(
         storage_report.is_complete(),
@@ -7442,6 +7444,7 @@ fn install_detects_daemon_option_mismatch() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-05-04T00:00:00Z".to_string(),
         data_dir: PathBuf::from("data"),
         lock_file: PathBuf::from("data/daemon/daemon.lock"),
@@ -7653,6 +7656,7 @@ fn cli_invocation_daemon_status_cache_is_scoped_and_nested() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-07-22T00:00:00Z".to_string(),
         data_dir: PathBuf::from("data"),
         lock_file: PathBuf::from("data/daemon/daemon.lock"),
@@ -7691,6 +7695,7 @@ fn read_only_catalog_vfs_uses_resident_daemon_without_opening_local_dfs() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-08-09T00:00:00Z".to_string(),
         data_dir: root.path().to_path_buf(),
         lock_file: root.join("daemon/daemon.lock"),
@@ -7726,6 +7731,7 @@ fn tui_agent_catalog_uses_a_supplied_transport_without_opening_local_dfs() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-08-09T00:00:00Z".to_string(),
         data_dir: root.path().to_path_buf(),
         lock_file: root.join("daemon/daemon.lock"),
@@ -7903,6 +7909,7 @@ fn daemon_preflight_retries_locked_listener_transition_but_not_absence() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-07-22T00:00:00Z".to_string(),
         data_dir: PathBuf::from("data"),
         lock_file: PathBuf::from("data/daemon/daemon.lock"),
@@ -12426,6 +12433,7 @@ fn daemon_node_status_publishes_version_and_rollout_to_kv() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-05-04T00:00:00Z".to_string(),
         data_dir: root.to_path_buf(),
         lock_file: daemon_paths.lock.clone(),
@@ -16619,6 +16627,7 @@ fn cui_loop_uses_connected_daemon_cluster_node_when_available() {
         hostname: None,
         executable: None,
         rollout: None,
+        component_status: Default::default(),
         started_at: "2026-05-04T00:00:00Z".to_string(),
         data_dir: PathBuf::from("data"),
         lock_file: PathBuf::from("data/daemon/daemon.lock"),

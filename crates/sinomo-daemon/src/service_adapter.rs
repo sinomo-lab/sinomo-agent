@@ -40,33 +40,11 @@ use crate::cluster::{
     handle_daemon_cluster_kv_request_outcome_request_async_on_runtime,
     handle_daemon_cluster_kv_txn_rpc_request_compact_async_on_runtime,
 };
-use crate::control::{
-    accepted_rollout_should_stop_current_daemon, daemon_data_dir_path,
-    daemon_status_response_async, handle_daemon_sandbox_checkpoint_on_runtime,
-    handle_daemon_sandbox_create_on_runtime, handle_daemon_sandbox_destroy_on_runtime,
-    handle_daemon_sandbox_http_fetch, handle_daemon_sandbox_http_fetch_to_file_on_runtime,
-    handle_daemon_sandbox_import_busybox_on_runtime, handle_daemon_sandbox_list_on_runtime,
-    handle_daemon_sandbox_read_on_runtime, handle_daemon_sandbox_reboot_on_runtime,
-    handle_daemon_sandbox_resume_on_runtime, handle_daemon_sandbox_run_process_plan_on_runtime,
-    handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime,
-    handle_daemon_sandbox_run_toolchain_on_runtime,
-    handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime,
-    handle_daemon_sandbox_status_on_runtime,
-    handle_daemon_sandbox_toolchain_add_artifact_on_runtime,
-    handle_daemon_sandbox_toolchain_add_command_on_runtime,
-    handle_daemon_sandbox_toolchain_import_package_from_path_on_runtime,
-    handle_daemon_sandbox_toolchain_import_package_on_runtime,
-    handle_daemon_sandbox_update_on_runtime, handle_daemon_sandbox_write_on_runtime,
-};
+use crate::control::{daemon_data_dir_path, daemon_status_response_async};
 use crate::error::DaemonError;
 use crate::paths::DaemonPaths;
 #[cfg(test)]
 use crate::registry::network_module_surfaces;
-use crate::rollout::{
-    activate_daemon_rollout_binary_manifest, handle_daemon_clear_rollout_status,
-    handle_daemon_finalize_shadow_rollout, handle_daemon_rollout_build_request,
-    handle_daemon_rollout_native_dylib_module_request,
-};
 #[cfg(test)]
 use crate::{
     DAEMON_CLUSTER_MAINTENANCE_REFRESH_ROUTE, DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
@@ -133,28 +111,10 @@ use sinomo_module::{
     validate_native_module_response_body as validate_native_dylib_response_body,
     validate_native_module_staged_request_body as validate_native_dylib_staged_request_body,
 };
-use sinomo_rollout::ClusterRolloutBinaryResponse;
 #[cfg(test)]
 use sinomo_rollout::{
     ROLLOUT_BINARY_ROUTE, ROLLOUT_BUILD_ROUTE, ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     rollout_module_surfaces,
-};
-use sinomo_sandbox::{
-    LocalSandboxBackend, SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE, SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-    SandboxAddToolchainArtifactRequest, SandboxAddToolchainArtifactResponse,
-    SandboxAddToolchainCommandRequest, SandboxAddToolchainCommandResponse, SandboxBackend,
-    SandboxBackendError, SandboxBackendFactory, SandboxCancellationToken, SandboxCheckpointRequest,
-    SandboxCheckpointResponse, SandboxCreateInstanceRequest, SandboxCreateInstanceResponse,
-    SandboxDestroyRequest, SandboxDestroyResponse, SandboxHttpFetchFileResult,
-    SandboxHttpFetchToFileRequest, SandboxHttpRequest, SandboxHttpResponse,
-    SandboxImportBusyBoxToolchainRequest, SandboxImportBusyBoxToolchainResponse,
-    SandboxImportToolchainPackageFromPathRequest, SandboxImportToolchainPackageRequest,
-    SandboxImportToolchainPackageResponse, SandboxListRequest, SandboxListResponse,
-    SandboxLocalCommandOutcome, SandboxProcessPlanOutcome, SandboxReadRequest, SandboxReadResponse,
-    SandboxRebootRequest, SandboxRebootResponse, SandboxResumeRequest, SandboxResumeResponse,
-    SandboxRunProcessPlanRequest, SandboxRunToolchainRequest, SandboxStatusRequest,
-    SandboxStatusResponse, SandboxUpdateInstanceRequest, SandboxUpdateInstanceResponse,
-    SandboxWriteRequest, SandboxWriteResponse,
 };
 
 static DAEMON_CLUSTER_NETWORK_PING_NODE_IDS: OnceLock<
@@ -645,6 +605,7 @@ fn service_route_categories(
 struct DaemonLifecycleServiceHost {
     paths: DaemonPaths,
     runtime: Option<tokio::runtime::Handle>,
+    status_contributors: Vec<sinomo_module::ComponentStatusContributor>,
 }
 
 impl sinomo_api::DaemonLifecycleHost for DaemonLifecycleServiceHost {
@@ -657,10 +618,28 @@ impl sinomo_api::DaemonLifecycleHost for DaemonLifecycleServiceHost {
     ) -> sinomo_api::DaemonLifecycleFuture<'_, Result<sinomo_api::DaemonStatus, String>> {
         let paths = self.paths.clone();
         let runtime = self.runtime.clone();
+        let contributors = self.status_contributors.clone();
         Box::pin(async move {
-            daemon_status_response_async(&paths, runtime.as_ref())
+            let mut status = daemon_status_response_async(&paths, runtime.as_ref())
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            let data_dir = paths.root.parent().unwrap_or(paths.root.as_path());
+            for contribute in contributors {
+                match contribute(data_dir) {
+                    Ok(Some(projection)) => {
+                        if let Err(error) = status
+                            .apply_component_status_projection(projection.key, projection.value)
+                        {
+                            tracing::warn!(%error, "component daemon-status projection was invalid");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "component daemon-status contribution failed");
+                    }
+                }
+            }
+            Ok(status)
         })
     }
 
@@ -1502,7 +1481,7 @@ pub(crate) fn mark_cluster_identity_restart_after_response(
     if stop
         && sinomo_core::cluster::cluster_control_route_requires_runtime_restart(route)
         && let Some(paths) = paths
-        && let Err(error) = crate::rollout::request_supervised_main_restart(paths)
+        && let Err(error) = crate::request_supervised_main_restart(paths)
     {
         tracing::error!(%error, "could not mark cluster identity restart for the shadow supervisor");
     }
@@ -1570,315 +1549,6 @@ impl sinomo_module::NetworkModulesServiceHost for DaemonNetworkModulesServiceHos
     }
 }
 
-/// Process-specific rollout effects. `sinomo-rollout` owns the service routes,
-/// request/body decoding, and disposition policy; the daemon supplies only the
-/// path-bound activation and recovery operations.
-struct DaemonRolloutServiceHost {
-    paths: DaemonPaths,
-}
-
-impl sinomo_rollout::RolloutServiceHost for DaemonRolloutServiceHost {
-    fn activate_binary<'a>(
-        &'a self,
-        manifest: sinomo_rollout::ClusterRolloutBinaryManifest,
-    ) -> sinomo_rollout::RolloutHostFuture<'a, Result<ClusterRolloutBinaryResponse, String>> {
-        let paths = self.paths.clone();
-        Box::pin(async move {
-            reject_persistent_rollout_from_app_owned_daemon()?;
-            tokio::task::spawn_blocking(move || {
-                activate_daemon_rollout_binary_manifest(&paths, manifest)
-            })
-            .await
-            .map_err(|error| format!("rollout binary activation task failed: {error}"))?
-            .map_err(|error| error.to_string())
-        })
-    }
-
-    fn activate_native_dylib(
-        &self,
-        request: sinomo_rollout::ClusterRolloutNativeDylibModuleRequest,
-    ) -> Result<ClusterRolloutBinaryResponse, String> {
-        handle_daemon_rollout_native_dylib_module_request(&self.paths, request)
-            .map_err(|error| error.to_string())
-    }
-
-    fn build(
-        &self,
-        request: sinomo_rollout::ClusterRolloutBuildRequest,
-    ) -> Result<ClusterRolloutBinaryResponse, String> {
-        reject_persistent_rollout_from_app_owned_daemon()?;
-        handle_daemon_rollout_build_request(&self.paths, request).map_err(|error| error.to_string())
-    }
-
-    fn finalize_shadow(&self) -> Result<String, String> {
-        reject_persistent_rollout_from_app_owned_daemon()?;
-        handle_daemon_finalize_shadow_rollout(&self.paths).map_err(|error| error.to_string())
-    }
-
-    fn clear_status(&self) -> Result<String, String> {
-        handle_daemon_clear_rollout_status(&self.paths).map_err(|error| error.to_string())
-    }
-
-    fn should_stop_after(&self, response: &ClusterRolloutBinaryResponse) -> bool {
-        std::env::var_os(sinomo_api::SINOMO_APP_DAEMON_LAUNCH_ID_ENV).is_none()
-            && accepted_rollout_should_stop_current_daemon(&self.paths, response)
-    }
-}
-
-fn reject_persistent_rollout_from_app_owned_daemon() -> Result<(), String> {
-    if std::env::var_os(sinomo_api::SINOMO_APP_DAEMON_LAUNCH_ID_ENV).is_some() {
-        return Err(
-            "binary rollout is unavailable in an app-owned daemon because no detached shadow or recovery process may outlive the app"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Maps a daemon error from a wrapped sandbox handler into the host-agnostic backend
-/// error (the message is preserved; the seam re-maps it to `DaemonError` on the way out).
-fn daemon_sandbox_error(error: DaemonError) -> SandboxBackendError {
-    SandboxBackendError::Other(error.to_string())
-}
-
-/// Clustered sandbox backend: serves the sandbox routes against the daemon's SIFS-over-DFS
-/// store by delegating to the existing daemon handlers (which evaluate cluster policy, emit
-/// events, and require cluster state).
-struct DaemonSandboxBackend {
-    paths: DaemonPaths,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl SandboxBackend for DaemonSandboxBackend {
-    fn create(
-        &mut self,
-        request: SandboxCreateInstanceRequest,
-    ) -> Result<SandboxCreateInstanceResponse, SandboxBackendError> {
-        handle_daemon_sandbox_create_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn status(
-        &mut self,
-        request: SandboxStatusRequest,
-    ) -> Result<SandboxStatusResponse, SandboxBackendError> {
-        handle_daemon_sandbox_status_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn update(
-        &mut self,
-        request: SandboxUpdateInstanceRequest,
-    ) -> Result<SandboxUpdateInstanceResponse, SandboxBackendError> {
-        handle_daemon_sandbox_update_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn checkpoint(
-        &mut self,
-        request: SandboxCheckpointRequest,
-    ) -> Result<SandboxCheckpointResponse, SandboxBackendError> {
-        handle_daemon_sandbox_checkpoint_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn resume(
-        &mut self,
-        request: SandboxResumeRequest,
-    ) -> Result<SandboxResumeResponse, SandboxBackendError> {
-        handle_daemon_sandbox_resume_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn reboot(
-        &mut self,
-        request: SandboxRebootRequest,
-    ) -> Result<SandboxRebootResponse, SandboxBackendError> {
-        handle_daemon_sandbox_reboot_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn destroy(
-        &mut self,
-        request: SandboxDestroyRequest,
-    ) -> Result<SandboxDestroyResponse, SandboxBackendError> {
-        handle_daemon_sandbox_destroy_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn list(
-        &mut self,
-        request: SandboxListRequest,
-    ) -> Result<SandboxListResponse, SandboxBackendError> {
-        handle_daemon_sandbox_list_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn read(
-        &mut self,
-        request: SandboxReadRequest,
-    ) -> Result<SandboxReadResponse, SandboxBackendError> {
-        handle_daemon_sandbox_read_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn write(
-        &mut self,
-        request: SandboxWriteRequest,
-    ) -> Result<SandboxWriteResponse, SandboxBackendError> {
-        handle_daemon_sandbox_write_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn http_fetch(
-        &mut self,
-        request: SandboxHttpRequest,
-    ) -> Result<SandboxHttpResponse, SandboxBackendError> {
-        handle_daemon_sandbox_http_fetch(&self.paths, request).map_err(daemon_sandbox_error)
-    }
-
-    fn http_fetch_to_file(
-        &mut self,
-        request: SandboxHttpFetchToFileRequest,
-    ) -> Result<SandboxHttpFetchFileResult, SandboxBackendError> {
-        handle_daemon_sandbox_http_fetch_to_file_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn import_busybox(
-        &mut self,
-        request: SandboxImportBusyBoxToolchainRequest,
-    ) -> Result<SandboxImportBusyBoxToolchainResponse, SandboxBackendError> {
-        handle_daemon_sandbox_import_busybox_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn toolchain_add_command(
-        &mut self,
-        request: SandboxAddToolchainCommandRequest,
-    ) -> Result<SandboxAddToolchainCommandResponse, SandboxBackendError> {
-        handle_daemon_sandbox_toolchain_add_command_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn toolchain_add_artifact(
-        &mut self,
-        request: SandboxAddToolchainArtifactRequest,
-    ) -> Result<SandboxAddToolchainArtifactResponse, SandboxBackendError> {
-        handle_daemon_sandbox_toolchain_add_artifact_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn import_toolchain_package(
-        &mut self,
-        request: SandboxImportToolchainPackageRequest,
-    ) -> Result<SandboxImportToolchainPackageResponse, SandboxBackendError> {
-        handle_daemon_sandbox_toolchain_import_package_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn import_toolchain_package_from_path(
-        &mut self,
-        request: SandboxImportToolchainPackageFromPathRequest,
-    ) -> Result<SandboxImportToolchainPackageResponse, SandboxBackendError> {
-        handle_daemon_sandbox_toolchain_import_package_from_path_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn run_toolchain(
-        &mut self,
-        request: SandboxRunToolchainRequest,
-    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
-        handle_daemon_sandbox_run_toolchain_on_runtime(&self.paths, request, self.runtime.as_ref())
-            .map_err(daemon_sandbox_error)
-    }
-
-    fn run_toolchain_with_cancellation(
-        &mut self,
-        request: SandboxRunToolchainRequest,
-        cancellation_token: SandboxCancellationToken,
-    ) -> Result<SandboxLocalCommandOutcome, SandboxBackendError> {
-        handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-            cancellation_token,
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn run_process_plan(
-        &mut self,
-        request: SandboxRunProcessPlanRequest,
-    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
-        handle_daemon_sandbox_run_process_plan_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-        )
-        .map_err(daemon_sandbox_error)
-    }
-
-    fn run_process_plan_with_cancellation(
-        &mut self,
-        request: SandboxRunProcessPlanRequest,
-        cancellation_token: SandboxCancellationToken,
-    ) -> Result<SandboxProcessPlanOutcome, SandboxBackendError> {
-        handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime(
-            &self.paths,
-            request,
-            self.runtime.as_ref(),
-            cancellation_token,
-        )
-        .map_err(daemon_sandbox_error)
-    }
-}
-
-/// Selects the sandbox backend by context: the daemon's clustered SIFS-over-DFS store when
-/// a cluster is initialized, else the host-agnostic local filesystem store — so sandbox
-/// works on this node even without a cluster.
-struct DaemonSandboxBackendFactory {
-    paths: DaemonPaths,
-    runtime: Option<tokio::runtime::Handle>,
-}
-
-impl SandboxBackendFactory for DaemonSandboxBackendFactory {
-    fn open(&self, ctx: &ServiceContext) -> Result<Box<dyn SandboxBackend>, ServiceError> {
-        if ctx.cluster.is_some() {
-            Ok(Box::new(DaemonSandboxBackend {
-                paths: self.paths.clone(),
-                runtime: self.runtime.clone(),
-            }))
-        } else {
-            let backend =
-                LocalSandboxBackend::new(ctx.data_dir.root().join("sandbox").join("runtime"))
-                    .with_container_config_from_env()
-                    .map_err(|source| ServiceError::Service(source.to_string()))?;
-            Ok(Box::new(backend))
-        }
-    }
-}
-
 /// Build the registry of services the daemon serves through the seam, bound to this
 /// daemon's `paths` so foundational services act for the right process. Request-specific
 /// identity is supplied through [`ServiceContext::signer`] at dispatch time.
@@ -1903,6 +1573,7 @@ fn daemon_base_service_registry(
         Arc::new(DaemonLifecycleServiceHost {
             paths: paths.clone(),
             runtime: service_runtime.cloned(),
+            status_contributors: component_catalog.status_contributors(),
         }),
     );
     builder = sinomo_api::register_hosted_daemon_operations_service(
@@ -1973,128 +1644,12 @@ fn daemon_service_registry(
 }
 
 fn daemon_component_catalog(
-    paths: &DaemonPaths,
-    service_runtime: Option<&tokio::runtime::Handle>,
+    _paths: &DaemonPaths,
+    _service_runtime: Option<&tokio::runtime::Handle>,
     supplied_catalog: &ComponentCatalog,
     _event_hub: &Arc<DaemonEventHub>,
 ) -> Result<ComponentCatalog, sinomo_module::ComponentCatalogError> {
-    let is_shadow = crate::daemon_paths_are_shadow(paths);
-    let data_dir_root = paths.root.parent().unwrap_or(paths.root.as_path());
-    let data_dir = SinomoDataDir::new(data_dir_root);
-    let telemetry_host: Option<Arc<dyn sinomo_rollout::RolloutTelemetryHost>> =
-        (!is_shadow && ClusterPaths::new(&data_dir).state.exists()).then(|| {
-            Arc::new(crate::control::DaemonRolloutTelemetryHost {
-                paths: paths.clone(),
-            }) as Arc<dyn sinomo_rollout::RolloutTelemetryHost>
-        });
-    let modules =
-        daemon_internal_module_registry(data_dir_root, observe_module_should_register(paths))
-            .map_err(
-                |error| sinomo_module::ComponentCatalogError::InvalidComponent {
-                    component_id: "daemon-module-registry".to_string(),
-                    detail: error.to_string(),
-                },
-            )?;
-    let mut builder = supplied_catalog.to_builder();
-    for registration in modules.registrations() {
-        if supplied_catalog
-            .modules()
-            .get(registration.module_id())
-            .is_none()
-        {
-            builder = builder.register_module(registration.clone())?;
-        }
-    }
-    let rollout_factory: Arc<dyn ComponentFactory> = Arc::new(
-        sinomo_rollout::component_factory_with_telemetry(
-            Arc::new(DaemonRolloutServiceHost {
-                paths: paths.clone(),
-            }),
-            telemetry_host,
-            if is_shadow { "shadow-daemon" } else { "daemon" },
-        )
-        .expect("rollout component descriptor must be valid"),
-    );
-    if supplied_catalog
-        .factory(&rollout_factory.descriptor().component_id)
-        .is_none()
-    {
-        builder = builder.register_factory(rollout_factory)?;
-    }
-    if observe_module_should_register(paths) {
-        let observe_factory: Arc<dyn ComponentFactory> = Arc::new(
-            sinomo_observe::component_factory()
-                .expect("observe component descriptor must be valid"),
-        );
-        if supplied_catalog
-            .factory(&observe_factory.descriptor().component_id)
-            .is_none()
-        {
-            builder = builder.register_factory(observe_factory)?;
-        }
-    }
-    if !is_shadow {
-        let sandbox_factory: Arc<dyn ComponentFactory> = Arc::new(
-            sinomo_sandbox::component_factory_with_backend(Arc::new(DaemonSandboxBackendFactory {
-                paths: paths.clone(),
-                runtime: service_runtime.cloned(),
-            }))
-            .expect("sandbox component descriptor must be valid"),
-        );
-        if supplied_catalog
-            .factory(&sandbox_factory.descriptor().component_id)
-            .is_none()
-        {
-            builder = builder.register_factory(sandbox_factory)?;
-        }
-        let build_factory: Arc<dyn ComponentFactory> = Arc::new(
-            sinomo_build::component_factory().expect("build component descriptor must be valid"),
-        );
-        if supplied_catalog
-            .factory(&build_factory.descriptor().component_id)
-            .is_none()
-        {
-            builder = builder.register_factory(build_factory)?;
-        }
-        if let Some(runtime) = service_runtime
-            && ClusterPaths::new(&data_dir).state.exists()
-        {
-            let cluster_paths = ClusterPaths::new(&data_dir);
-            let state =
-                sinomo_core::cluster::read_cluster_state(&cluster_paths).map_err(|error| {
-                    sinomo_module::ComponentCatalogError::InvalidComponent {
-                        component_id: sinomo_module::SERVICE_CATALOG_PUBLISHER_COMPONENT_ID
-                            .to_string(),
-                        detail: error.to_string(),
-                    }
-                })?;
-            let publisher_factory: Arc<dyn ComponentFactory> = Arc::new(
-                sinomo_module::service_catalog_publisher_component_factory(Arc::new(
-                    DaemonServiceCatalogPublisherHost {
-                        paths: paths.clone(),
-                        data_dir: data_dir.clone(),
-                        runtime: runtime.clone(),
-                        local_node_id: state.local_node_id,
-                    },
-                ))
-                .expect("service catalog publisher descriptor must be valid"),
-            );
-            if supplied_catalog
-                .factory(&publisher_factory.descriptor().component_id)
-                .is_none()
-            {
-                builder = builder.register_factory(publisher_factory)?;
-            }
-        }
-    }
-    builder.build()
-}
-
-struct DaemonServiceCatalogPublisherHost {
-    paths: DaemonPaths,
-    data_dir: SinomoDataDir,
-    runtime: tokio::runtime::Handle,
-    local_node_id: sinomo_core::node::NodeId,
+    Ok(supplied_catalog.clone())
 }
 
 struct DaemonComponentEventPersistence {
@@ -2308,30 +1863,8 @@ impl sinomo_api::DaemonEventMirror for DaemonComponentEventMirror {
     }
 }
 
-impl sinomo_module::ServiceCatalogPublisherHost for DaemonServiceCatalogPublisherHost {
-    fn publish<'a>(
-        &'a self,
-        snapshot: Arc<sinomo_core::service::ServiceRegistrySnapshot>,
-    ) -> sinomo_module::ServiceCatalogPublishFuture<'a> {
-        Box::pin(async move {
-            let cluster_access =
-                DaemonClusterAccess::new(self.paths.clone(), &self.data_dir, Some(&self.runtime));
-            sinomo_core::service::publish_local_service_instances(
-                &cluster_access,
-                snapshot.registry(),
-                &self.local_node_id,
-                snapshot.version(),
-                time::OffsetDateTime::now_utc(),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        })
-    }
-}
-
 #[derive(Clone)]
-pub(crate) struct DaemonServiceRegistryHost {
+pub struct DaemonServiceRegistryHost {
     paths: DaemonPaths,
     service_data_dir: Arc<SinomoDataDir>,
     service_cluster: Option<Arc<dyn ClusterAccess>>,
@@ -2352,6 +1885,55 @@ static DAEMON_SERVICE_REGISTRY_HOSTS: OnceLock<Mutex<HashMap<PathBuf, DaemonServ
 static DAEMON_COMPONENT_EVENT_BUSES: OnceLock<
     Mutex<HashMap<PathBuf, sinomo_module::ComponentEventBus>>,
 > = OnceLock::new();
+static DAEMON_STATUS_CONTRIBUTORS: OnceLock<
+    Mutex<HashMap<PathBuf, Vec<sinomo_module::ComponentStatusContributor>>>,
+> = OnceLock::new();
+static DAEMON_MIGRATION_CONTRIBUTORS: OnceLock<
+    Mutex<HashMap<PathBuf, Vec<sinomo_module::ComponentMigrationContributor>>>,
+> = OnceLock::new();
+
+pub(crate) fn component_migration_contributions(
+    paths: &DaemonPaths,
+    source_cluster_id: &sinomo_core::node::ClusterId,
+) -> Result<sinomo_module::ComponentMigrationContribution, String> {
+    let contributors = DAEMON_MIGRATION_CONTRIBUTORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "daemon migration contributor map lock poisoned".to_string())?
+        .get(&paths.root)
+        .cloned()
+        .unwrap_or_default();
+    let data_dir = paths.root.parent().unwrap_or(paths.root.as_path());
+    let mut combined = sinomo_module::ComponentMigrationContribution::default();
+    for contribute in contributors {
+        let mut contribution = contribute(data_dir, source_cluster_id)?;
+        combined.moves.append(&mut contribution.moves);
+        combined
+            .evidence_refs
+            .append(&mut contribution.evidence_refs);
+    }
+    Ok(combined)
+}
+
+pub(crate) fn apply_component_status_contributors(
+    paths: &DaemonPaths,
+    status: &mut sinomo_api::DaemonStatus,
+) -> Result<(), String> {
+    let contributors = DAEMON_STATUS_CONTRIBUTORS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .map_err(|_| "daemon status contributor map lock poisoned".to_string())?
+        .get(&paths.root)
+        .cloned()
+        .unwrap_or_default();
+    let data_dir = paths.root.parent().unwrap_or(paths.root.as_path());
+    for contribute in contributors {
+        if let Some(projection) = contribute(data_dir)? {
+            status.apply_component_status_projection(projection.key, projection.value)?;
+        }
+    }
+    Ok(())
+}
 
 pub(crate) fn publish_component_event_for_paths(
     paths: &DaemonPaths,
@@ -2379,22 +1961,13 @@ impl DaemonServiceRegistryHost {
         paths: &DaemonPaths,
     ) -> Result<Self, DaemonError> {
         let event_hub = Arc::new(DaemonEventHub::new());
-        let data_dir_root = daemon_data_dir_path(paths)?;
-        let modules =
-            daemon_internal_module_registry(&data_dir_root, observe_module_should_register(paths))?;
-        let mut builder = ComponentCatalog::builder();
-        for registration in modules.registrations() {
-            builder = builder
-                .register_module(registration.clone())
+        let catalog =
+            ComponentCatalog::builder()
+                .build()
                 .map_err(|error| DaemonError::Network {
                     address: "daemon component catalog".to_string(),
                     detail: error.to_string(),
                 })?;
-        }
-        let catalog = builder.build().map_err(|error| DaemonError::Network {
-            address: "daemon component catalog".to_string(),
-            detail: error.to_string(),
-        })?;
         Self::from_registry_with_internal_modules(
             registry,
             paths.clone(),
@@ -2550,6 +2123,25 @@ impl DaemonServiceRegistryHost {
                 detail: "event bus map lock poisoned".to_string(),
             })?
             .insert(paths.root.clone(), component_event_bus.clone());
+        DAEMON_STATUS_CONTRIBUTORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon status contributor map".to_string(),
+                detail: "status contributor map lock poisoned".to_string(),
+            })?
+            .insert(paths.root.clone(), component_catalog.status_contributors());
+        DAEMON_MIGRATION_CONTRIBUTORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon migration contributor map".to_string(),
+                detail: "migration contributor map lock poisoned".to_string(),
+            })?
+            .insert(
+                paths.root.clone(),
+                component_catalog.migration_contributors(),
+            );
         Ok(Self {
             paths,
             service_data_dir,
@@ -2559,7 +2151,7 @@ impl DaemonServiceRegistryHost {
         })
     }
 
-    pub(crate) async fn new_on_runtime(
+    pub async fn new_on_runtime(
         paths: DaemonPaths,
         service_runtime: tokio::runtime::Handle,
     ) -> Result<Self, DaemonError> {
@@ -2607,8 +2199,7 @@ impl DaemonServiceRegistryHost {
         Self::new_on_runtime_with_catalog(paths, service_runtime, component_catalog).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn new_on_runtime_with_catalog(
+    pub async fn new_on_runtime_with_catalog(
         paths: DaemonPaths,
         service_runtime: tokio::runtime::Handle,
         component_catalog: ComponentCatalog,
@@ -2622,7 +2213,7 @@ impl DaemonServiceRegistryHost {
         .await
     }
 
-    pub(crate) async fn new_on_runtime_with_catalog_and_resources(
+    pub async fn new_on_runtime_with_catalog_and_resources(
         paths: DaemonPaths,
         service_runtime: tokio::runtime::Handle,
         component_catalog: ComponentCatalog,
@@ -2748,13 +2339,6 @@ pub(crate) fn component_catalog_from_factories(
     })
 }
 
-fn observe_module_should_register(paths: &DaemonPaths) -> bool {
-    daemon_data_dir_path(paths)
-        .ok()
-        .and_then(|data_dir| sinomo_observe::observe_module_enabled(&data_dir).ok())
-        .unwrap_or(true)
-}
-
 fn daemon_config_registry(component_catalog: &ComponentCatalog) -> ConfigRegistry {
     let mut builder = register_daemon_config_definitions(ConfigRegistry::builder())
         .expect("daemon config definitions must be valid");
@@ -2789,13 +2373,6 @@ impl ResponseSink for BufferSink {
         *slot = Some(response);
         Ok(())
     }
-}
-
-pub(crate) fn is_sandbox_stream_route(request: &ObjectRpcRequest) -> bool {
-    matches!(
-        request.route.as_str(),
-        SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE | SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE
-    )
 }
 
 fn service_error_to_network_error(error: ServiceError) -> NetworkError {
@@ -2979,64 +2556,6 @@ fn warn_daemon_service_auth_denied(
             .unwrap_or("unknown"),
         "daemon service object RPC authorization denied"
     );
-}
-
-fn module_error_to_network_error(error: impl std::fmt::Display) -> NetworkError {
-    NetworkError::Serialization {
-        detail: error.to_string(),
-    }
-}
-
-fn daemon_internal_module_registry(
-    data_dir_root: &std::path::Path,
-    register_observe_module: bool,
-) -> Result<sinomo_module::ModuleRegistry, NetworkError> {
-    let mut builder = sinomo_module::ModuleRegistry::builder()
-        .register(sinomo_build::build_module_registration())
-        .map_err(module_error_to_network_error)?
-        .register(crate::registry::network_module_registration())
-        .map_err(module_error_to_network_error)?
-        .register(sinomo_rollout::rollout_module_registration())
-        .map_err(module_error_to_network_error)?;
-    if register_observe_module {
-        builder = builder
-            .register(sinomo_observe::observe_module_registration())
-            .map_err(module_error_to_network_error)?;
-    }
-    let native_dylib_states =
-        match sinomo_module::read_native_dylib_module_loader_states(data_dir_root) {
-            Ok(states) => states,
-            Err(error) => {
-                tracing::warn!("daemon native-dylib module loader states unreadable: {error}");
-                Vec::new()
-            }
-        };
-    for state in native_dylib_states {
-        if !sinomo_rollout::native_dylib_loader_state_is_host_compatible(&state) {
-            tracing::warn!(
-                "daemon native-dylib module {} skipped because its build platform or native ABI does not match this host",
-                state.module_id
-            );
-            continue;
-        }
-        let registration = match sinomo_module::native_dylib_module_registration_from_loader_state(
-            data_dir_root,
-            &state,
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
-                tracing::warn!(
-                    "daemon native-dylib module {} registration skipped: {error}",
-                    state.module_id
-                );
-                continue;
-            }
-        };
-        builder = builder
-            .register(registration)
-            .map_err(module_error_to_network_error)?;
-    }
-    builder.try_build().map_err(module_error_to_network_error)
 }
 
 #[cfg(test)]
@@ -3330,6 +2849,56 @@ pub(crate) async fn dispatch_rpc_via_registry_with_body_async(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    struct TestRolloutHost;
+
+    impl sinomo_rollout::RolloutServiceHost for TestRolloutHost {
+        fn activate_binary<'a>(
+            &'a self,
+            _manifest: sinomo_rollout::ClusterRolloutBinaryManifest,
+        ) -> sinomo_rollout::RolloutHostFuture<
+            'a,
+            Result<sinomo_rollout::ClusterRolloutBinaryResponse, String>,
+        > {
+            Box::pin(async { Err("rollout activation is not exercised".to_string()) })
+        }
+
+        fn activate_native_dylib(
+            &self,
+            _request: sinomo_rollout::ClusterRolloutNativeDylibModuleRequest,
+        ) -> Result<sinomo_rollout::ClusterRolloutBinaryResponse, String> {
+            Err("native rollout activation is not exercised".to_string())
+        }
+
+        fn build(
+            &self,
+            _request: sinomo_rollout::ClusterRolloutBuildRequest,
+        ) -> Result<sinomo_rollout::ClusterRolloutBinaryResponse, String> {
+            Err("rollout build is not exercised".to_string())
+        }
+
+        fn finalize_shadow(&self) -> Result<String, String> {
+            Err("rollout finalization is not exercised".to_string())
+        }
+
+        fn clear_status(&self) -> Result<String, String> {
+            Err("rollout status clearing is not exercised".to_string())
+        }
+
+        fn should_stop_after(
+            &self,
+            _response: &sinomo_rollout::ClusterRolloutBinaryResponse,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn test_rollout_component_factory() -> crate::DaemonComponentFactory {
+        Arc::new(
+            sinomo_rollout::component_factory(Arc::new(TestRolloutHost))
+                .expect("rollout test component factory"),
+        )
+    }
 
     #[test]
     fn daemon_error_preserves_cluster_control_plane_identity() {
@@ -4255,7 +3824,7 @@ mod tests {
             &[CONFIG_GET_ROUTE]
         }
         fn route_categories(&self) -> Vec<ServiceRoute> {
-            vec![ServiceRoute::new(CONFIG_GET_ROUTE, "config")]
+            vec![ServiceRoute::new(CONFIG_GET_ROUTE, "config").with_auth_scope("admin")]
         }
         fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
             Box::pin(async move {
@@ -4941,6 +4510,7 @@ mod tests {
     #[test]
     fn local_signed_join_challenge_skips_pre_auth_dispatch() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-local-signed-join-challenge");
+        std::fs::create_dir_all(root.path().join("cluster")).expect("create authority watch root");
         let registry = ServiceRegistry::builder()
             .register(TestJoinChallengeService)
             .build();
@@ -5091,6 +4661,7 @@ mod tests {
     #[test]
     fn catalog_authentication_requires_node_local_permission_for_dynamic_route() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dynamic-route-local-permission");
+        std::fs::create_dir_all(root.path().join("cluster")).expect("create authority watch root");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder().register(TestStopService).build();
@@ -5127,6 +4698,7 @@ mod tests {
     #[test]
     fn local_permission_metadata_never_replaces_route_signer_authority() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-permission-only-route-auth");
+        std::fs::create_dir_all(root.path().join("cluster")).expect("create authority watch root");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
         let registry = ServiceRegistry::builder()
@@ -5960,22 +5532,17 @@ mod tests {
     }
 
     #[test]
-    fn observe_service_registration_tracks_native_rust_enablement() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-observe-module-toggle");
+    fn daemon_service_registry_uses_only_supplied_observe_component() {
+        let root = sinomo_testdir::TestDir::new("sinomo-daemon-observe-component-catalog");
         let data_dir = SinomoDataDir::new(&root);
         let paths = DaemonPaths::new(&data_dir);
 
         let registry = daemon_service_registry(&paths, None, &[]);
-        assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
-
-        sinomo_observe::set_observe_module_enabled(&root, false, "test", "disable observe")
-            .expect("disable observe");
-        let registry = daemon_service_registry(&paths, None, &[]);
         assert!(!registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
 
-        sinomo_observe::set_observe_module_enabled(&root, true, "test", "enable observe")
-            .expect("enable observe");
-        let registry = daemon_service_registry(&paths, None, &[]);
+        let observe_factory: crate::DaemonComponentFactory =
+            Arc::new(sinomo_observe::component_factory().expect("observe component factory"));
+        let registry = daemon_service_registry(&paths, None, &[observe_factory]);
         assert!(registry.owns(sinomo_observe::OBSERVE_EVENTS_ROUTE));
     }
 
@@ -6066,6 +5633,12 @@ mod tests {
         let supplied_catalog = ComponentCatalog::builder()
             .register_module(sinomo_dfs_nfs::nfs_module_registration())
             .expect("register product NFS module")
+            .register_factory(Arc::new(
+                sinomo_sandbox::component_factory().expect("sandbox component factory"),
+            ))
+            .expect("register product sandbox component")
+            .register_factory(test_rollout_component_factory())
+            .expect("register product rollout component")
             .build()
             .expect("product module catalog");
         let catalog = daemon_component_catalog(
@@ -6245,41 +5818,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_service_registry_host_uses_observe_enablement_for_route_snapshot() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-observe-module-snapshot-toggle");
-        let data_dir = SinomoDataDir::new(&root);
-        let paths = DaemonPaths::new(&data_dir);
-
-        let enabled_registry = daemon_service_registry(&paths, None, &[]);
-        let enabled_host =
-            DaemonServiceRegistryHost::from_registry_for_paths(enabled_registry, &paths)
-                .expect("enabled service host");
-        assert!(
-            enabled_host
-                .object_rpc_route_descriptor(sinomo_observe::OBSERVE_EVENTS_ROUTE)
-                .is_some_and(|descriptor| descriptor
-                    .observability
-                    .contains_key("daemon.module_route")),
-            "enabled observe route should be installed as a module-owned daemon route"
-        );
-
-        sinomo_observe::set_observe_module_enabled(&root, false, "test", "disable observe")
-            .expect("disable observe");
-        let disabled_registry = daemon_service_registry(&paths, None, &[]);
-        let disabled_host =
-            DaemonServiceRegistryHost::from_registry_for_paths(disabled_registry, &paths)
-                .expect("disabled service host");
-        assert!(
-            !disabled_host
-                .service_registry
-                .active_snapshot()
-                .registry()
-                .owns(sinomo_observe::OBSERVE_EVENTS_ROUTE),
-            "disabled observe service should not leave an object RPC route behind"
-        );
-    }
-
-    #[test]
     fn dfs_status_service_dispatch_allows_cluster_member_signer() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-dfs-status-member-dispatch");
         let data_dir = SinomoDataDir::new(&root);
@@ -6398,7 +5936,10 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let registry = daemon_service_registry(&paths, Some(runtime.handle()), &[]);
+        let build_factory: crate::DaemonComponentFactory =
+            Arc::new(sinomo_build::component_factory().expect("build component factory"));
+        let factories = vec![build_factory, test_rollout_component_factory()];
+        let registry = daemon_service_registry(&paths, Some(runtime.handle()), &factories);
 
         for route in CLUSTER_KV_RPC_ROUTES
             .iter()
@@ -7352,8 +6893,17 @@ mod tests {
             .build()
             .expect("runtime");
 
-        let main_registry = daemon_service_registry(&main_paths, Some(runtime.handle()), &[]);
-        let shadow_registry = daemon_service_registry(&shadow_paths, Some(runtime.handle()), &[]);
+        let main_factories: Vec<crate::DaemonComponentFactory> = vec![
+            Arc::new(sinomo_dfs::component_factory().expect("DFS component factory")),
+            Arc::new(sinomo_sandbox::component_factory().expect("sandbox component factory")),
+            Arc::new(sinomo_build::component_factory().expect("build component factory")),
+            test_rollout_component_factory(),
+        ];
+        let main_registry =
+            daemon_service_registry(&main_paths, Some(runtime.handle()), &main_factories);
+        let shadow_factories = vec![test_rollout_component_factory()];
+        let shadow_registry =
+            daemon_service_registry(&shadow_paths, Some(runtime.handle()), &shadow_factories);
 
         let authority_routes = CLUSTER_KV_RPC_ROUTES
             .iter()
@@ -7563,6 +7113,7 @@ mod tests {
             Arc::new(DaemonLifecycleServiceHost {
                 paths: paths.clone(),
                 runtime: Some(runtime.handle().clone()),
+                status_contributors: Vec::new(),
             }),
         );
         let registry =

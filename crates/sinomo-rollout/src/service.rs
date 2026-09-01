@@ -347,7 +347,7 @@ pub fn component_factory_with_telemetry(
         sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
             let builder = register_services(ServiceRegistryBuilder::default());
             scope.set_services(register_host_services(builder, Arc::clone(&host)).build());
-            if let Some(telemetry_host) = telemetry_host.as_ref() {
+            if telemetry_host.is_some() || context.runtime().is_some() {
                 let runtime = context.runtime().ok_or_else(|| {
                     sinomo_module::ComponentError::RuntimeUnavailable {
                         component_id: crate::SINOMO_ROLLOUT_MODULE_LEGACY_ID.to_string(),
@@ -360,8 +360,15 @@ pub fn component_factory_with_telemetry(
                             error,
                         )
                     })?;
+                let telemetry_host = telemetry_host.clone().unwrap_or_else(|| {
+                    Arc::new(crate::telemetry::ComponentRolloutTelemetryHost::new(
+                        context.data_dir_root(),
+                        context.cluster_access(),
+                        runtime.clone(),
+                    ))
+                });
                 let task = runtime.spawn(reactor.run_until_stopped_async(
-                    Arc::clone(telemetry_host),
+                    telemetry_host,
                     scope.shutdown_receiver(),
                     label.clone(),
                 ));

@@ -1,14 +1,18 @@
-//! Daemon runtime registry: composition for internal module registration and
-//! the durable storage layout assembled from owner crates.
+//! Daemon-owned registries and foundation storage contracts.
 //!
-//! This machinery previously lived in the `sinomo-runtime` facade; the facade
-//! now re-exports it from here so it stays behavior-free while the daemon owns
-//! process composition (stage E of
-//! docs/plans/r0-r1-crate-boundary-refactor.md).
+//! Product modules and their storage declarations arrive through an explicit
+//! [`sinomo_module::ComponentCatalog`]; this crate never assembles a hidden
+//! built-in module list.
 
 pub use sinomo_core::storage::*;
 
 pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
+    sinomo_data_dir_layout_with_catalog(&sinomo_module::ComponentCatalog::default())
+}
+
+pub fn sinomo_data_dir_layout_with_catalog(
+    catalog: &sinomo_module::ComponentCatalog,
+) -> Result<StorageLayout, StorageContractError> {
     let mut layout = StorageLayout::new();
     sinomo_core::network::register_storage_paths(&mut layout)?;
     sinomo_core::cluster::register_storage_paths(&mut layout)?;
@@ -16,11 +20,10 @@ pub fn sinomo_data_dir_layout() -> Result<StorageLayout, StorageContractError> {
     crate::register_storage_paths(&mut layout)?;
     sinomo_config::register_storage_paths(&mut layout)?;
     sinomo_module::register_storage_paths(&mut layout)?;
-    sinomo_registry::register_storage_paths(&mut layout)?;
     sinomo_core::node::register_storage_paths(&mut layout)?;
-    register_internal_module_storage_paths(&mut layout)?;
     sinomo_core::local::register_storage_paths(&mut layout)?;
     sinomo_core::events::register_storage_paths(&mut layout)?;
+    catalog.register_storage_paths(&mut layout)?;
     Ok(layout)
 }
 
@@ -32,6 +35,13 @@ pub fn verify_sinomo_data_dir(
     data_dir: impl AsRef<std::path::Path>,
 ) -> Result<StorageVerificationReport, StorageContractError> {
     sinomo_data_dir_layout()?.verify_data_dir(data_dir)
+}
+
+pub fn verify_sinomo_data_dir_with_catalog(
+    data_dir: impl AsRef<std::path::Path>,
+    catalog: &sinomo_module::ComponentCatalog,
+) -> Result<StorageVerificationReport, StorageContractError> {
+    sinomo_data_dir_layout_with_catalog(catalog)?.verify_data_dir(data_dir)
 }
 
 pub fn ensure_sinomo_data_dir_is_registered(
@@ -48,113 +58,10 @@ pub fn ensure_sinomo_data_dir_is_registered(
 }
 
 pub use sinomo_module::{
-    ModuleRegistration, ModuleRegistry, ModuleRegistryError, ModuleRegistrySnapshot,
-    ModuleRegistrySnapshotStore,
-};
-
-pub struct InternalModuleTable {
-    pub registry: ModuleRegistry,
-}
-
-pub fn internal_module_table() -> Result<InternalModuleTable, ModuleRegistryError> {
-    let registry = internal_module_registry()?;
-    Ok(InternalModuleTable { registry })
-}
-
-pub fn internal_module_registry() -> Result<ModuleRegistry, ModuleRegistryError> {
-    internal_component_catalog()
-        .map(|catalog| catalog.modules().clone())
-        .map_err(|error| match error {
-            sinomo_module::ComponentCatalogError::ModuleRegistry(error) => error,
-            other => ModuleRegistryError::InvalidRegistrationOrder {
-                detail: other.to_string(),
-            },
-        })
-}
-
-pub fn internal_component_catalog()
--> Result<sinomo_module::ComponentCatalog, sinomo_module::ComponentCatalogError> {
-    sinomo_module::ComponentCatalog::builder()
-        .register_module(sinomo_build::build_module_registration())?
-        .register_module(sinomo_dfs::dfs_module_registration())?
-        .register_module(sinomo_dfs_nfs::nfs_module_registration())?
-        .register_module(network_module_registration())?
-        .register_module(sinomo_rollout::rollout_module_registration())?
-        .register_module(sinomo_observe::observe_module_registration())?
-        .build()
-}
-
-/// Compose settings from every built-in module registration without requiring
-/// clients to name individual modules. Definitions already present in the
-/// host catalog may repeat only when byte-for-byte equal.
-pub fn register_internal_module_config_definitions(
-    mut builder: sinomo_config::ConfigRegistryBuilder,
-) -> Result<sinomo_config::ConfigRegistryBuilder, String> {
-    let registry = internal_module_registry().map_err(|error| error.to_string())?;
-    for registration in registry.registrations() {
-        for definition in registration
-            .surfaces
-            .config_definitions()
-            .map_err(|error| error.to_string())?
-        {
-            if let Ok(existing) = builder.get(definition.key.as_str()) {
-                if existing == &definition {
-                    continue;
-                }
-                return Err(format!(
-                    "module {} settings key {} conflicts with an existing host definition",
-                    registration.module_id(),
-                    definition.key
-                ));
-            }
-            builder = builder
-                .register(definition)
-                .map_err(|error| error.to_string())?;
-        }
-    }
-    Ok(builder)
-}
-
-pub use sinomo_module::{
     module_object_rpc_route_descriptor_to_service,
     module_registration_object_rpc_route_descriptors, module_registry_object_rpc_route_descriptors,
     module_registry_snapshot_object_rpc_route_descriptors,
 };
-
-pub fn register_internal_module_storage_paths(
-    layout: &mut sinomo_core::storage::StorageLayout,
-) -> Result<(), sinomo_core::storage::StorageContractError> {
-    internal_storage_component_catalog().register_storage_paths(layout)
-}
-
-fn internal_storage_component_catalog() -> sinomo_module::ComponentCatalog {
-    use std::sync::Arc;
-
-    sinomo_module::ComponentCatalog::builder()
-        .register_factory(Arc::new(
-            sinomo_build::component_factory().expect("build component descriptor"),
-        ))
-        .expect("register build storage component")
-        .register_factory(Arc::new(
-            sinomo_dfs::component_factory().expect("DFS component descriptor"),
-        ))
-        .expect("register DFS storage component")
-        .register_factory(Arc::new(
-            sinomo_observe::component_factory().expect("observe component descriptor"),
-        ))
-        .expect("register observe storage component")
-        .register_factory(Arc::new(
-            sinomo_sandbox::component_factory_with_backend(Arc::new(
-                sinomo_sandbox::LocalSandboxBackendFactory,
-            ))
-            .expect("sandbox component descriptor"),
-        ))
-        .expect("register sandbox storage component")
-        .register_storage_contributor("sinomo-rollout", sinomo_rollout::register_storage_paths)
-        .expect("register rollout storage contributor")
-        .build()
-        .expect("internal storage component catalog")
-}
 
 pub use sinomo_module::{
     ProcessNetworkModules as DaemonNetworkModules,
@@ -168,22 +75,6 @@ pub use sinomo_module::{
 mod tests {
     use super::*;
     use sinomo_core::{FileSystemAccess, ModuleKind, NetworkAccess, TrustRing};
-
-    #[test]
-    fn daemon_sandbox_lifecycle_recovery_state_is_registered() {
-        let layout = sinomo_data_dir_layout().expect("data-dir layout");
-        let report = layout
-            .verify_relative_paths([
-                "daemon/sandbox-lifecycle-recovery/last-safety-sweep",
-                "daemon/sandbox-lifecycle-recovery/pending/sandbox_marker",
-                "shadow-daemon/sandbox-lifecycle-recovery/last-safety-sweep",
-                "shadow-daemon/sandbox-lifecycle-recovery/pending/sandbox_marker",
-            ])
-            .expect("verify lifecycle recovery paths");
-
-        assert!(report.is_complete(), "{:#?}", report.unregistered);
-        assert_eq!(report.covered.len(), 4);
-    }
 
     #[test]
     fn daemon_mount_lease_is_registered() {
@@ -223,57 +114,6 @@ mod tests {
         assert_eq!(
             network.response_body_mode,
             sinomo_core::service::ServiceBodyMode::Required
-        );
-    }
-
-    #[test]
-    fn build_module_is_registered_with_component_factory() {
-        let table = internal_module_table().expect("internal module table");
-        let registration = table
-            .registry
-            .get(&sinomo_build::build_module_id())
-            .expect("build module registration");
-        let factory = sinomo_build::component_factory().expect("build component factory");
-        assert_eq!(
-            sinomo_module::ComponentFactory::descriptor(&factory).component_id,
-            registration.module_id().as_str()
-        );
-    }
-
-    #[test]
-    fn nfs_module_registers_its_own_settings_and_component_factory() {
-        let table = internal_module_table().expect("internal module table");
-        let registration = table
-            .registry
-            .get(&sinomo_dfs_nfs::nfs_module_id())
-            .expect("NFS module registration");
-        assert!(matches!(
-            &registration.backend,
-            sinomo_module::ModuleBackendRegistration::NativeRust { registration }
-                if registration.registration_key == sinomo_dfs_nfs::SINOMO_DFS_NFS_NATIVE_REGISTRATION_KEY
-        ));
-        let definitions = registration
-            .surfaces
-            .config_definitions()
-            .expect("NFS settings surfaces");
-        assert!(
-            definitions.iter().any(|definition| {
-                definition.key.as_str() == sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY
-            })
-        );
-        assert!(definitions.iter().any(|definition| {
-            definition.key.as_str() == sinomo_dfs_nfs::NFS_MOUNT_STATUS_CONFIG_KEY
-                && definition.read_only
-        }));
-        let catalog =
-            register_internal_module_config_definitions(sinomo_config::ConfigRegistry::builder())
-                .expect("compose built-in module config")
-                .build();
-        assert!(catalog.get(sinomo_dfs_nfs::NFS_MOUNT_CONFIG_KEY).is_ok());
-        let factory = sinomo_dfs_nfs::component_factory().expect("NFS component factory");
-        assert_eq!(
-            sinomo_module::ComponentFactory::descriptor(&factory).component_id,
-            registration.module_id().as_str()
         );
     }
 

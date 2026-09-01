@@ -17,6 +17,10 @@ pub struct ComponentCatalog {
     factory_order: Vec<String>,
     modules: ModuleRegistry,
     storage_contributors: BTreeMap<String, ComponentStorageContributor>,
+    status_contributors: BTreeMap<String, ComponentStatusContributor>,
+    startup_contributors: BTreeMap<String, ComponentStartupContributor>,
+    maintenance_inhibitors: BTreeMap<String, ComponentMaintenanceInhibitor>,
+    migration_contributors: BTreeMap<String, ComponentMigrationContributor>,
     native_request_preparers: BTreeMap<String, Arc<dyn crate::NativeModuleRequestPreparer>>,
     native_rust_control_targets: BTreeMap<String, crate::NativeRustModuleServiceTarget>,
 }
@@ -37,6 +41,22 @@ impl std::fmt::Debug for ComponentCatalog {
             .field(
                 "storage_contributors",
                 &self.storage_contributors.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "status_contributors",
+                &self.status_contributors.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "startup_contributors",
+                &self.startup_contributors.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "maintenance_inhibitors",
+                &self.maintenance_inhibitors.keys().collect::<Vec<_>>(),
+            )
+            .field(
+                "migration_contributors",
+                &self.migration_contributors.keys().collect::<Vec<_>>(),
             )
             .field(
                 "native_request_preparers",
@@ -66,6 +86,10 @@ impl ComponentCatalog {
                 .map(|registration| registration.module_id().clone())
                 .collect(),
             storage_contributors: self.storage_contributors.clone(),
+            status_contributors: self.status_contributors.clone(),
+            startup_contributors: self.startup_contributors.clone(),
+            maintenance_inhibitors: self.maintenance_inhibitors.clone(),
+            migration_contributors: self.migration_contributors.clone(),
             native_request_preparers: self.native_request_preparers.clone(),
             native_rust_control_targets: self.native_rust_control_targets.clone(),
         }
@@ -92,6 +116,25 @@ impl ComponentCatalog {
 
     pub fn native_rust_control_targets(&self) -> Vec<crate::NativeRustModuleServiceTarget> {
         self.native_rust_control_targets.values().cloned().collect()
+    }
+
+    pub fn status_contributors(&self) -> Vec<ComponentStatusContributor> {
+        self.status_contributors.values().copied().collect()
+    }
+
+    pub fn run_startup_contributors(&self, data_dir_root: &std::path::Path) -> Result<(), String> {
+        for contributor in self.startup_contributors.values() {
+            contributor(data_dir_root)?;
+        }
+        Ok(())
+    }
+
+    pub fn maintenance_inhibitors(&self) -> Vec<ComponentMaintenanceInhibitor> {
+        self.maintenance_inhibitors.values().copied().collect()
+    }
+
+    pub fn migration_contributors(&self) -> Vec<ComponentMigrationContributor> {
+        self.migration_contributors.values().copied().collect()
     }
 
     pub fn register_config_definitions(
@@ -144,8 +187,14 @@ impl ComponentCatalog {
         for factory in self.factories() {
             factory.register_storage_paths(layout)?;
         }
-        for contributor in self.storage_contributors.values() {
-            contributor(layout)?;
+        for (component_id, contributor) in &self.storage_contributors {
+            // A contributor is the storage-only fallback for a component that
+            // is disabled or not mounted in this product profile. When its
+            // factory is present, that factory remains the single authority so
+            // the same paths are never registered twice.
+            if !self.factories.contains_key(component_id) {
+                contributor(layout)?;
+            }
         }
         Ok(())
     }
@@ -176,6 +225,10 @@ pub struct ComponentCatalogBuilder {
     modules: crate::ModuleRegistryBuilder,
     module_ids: BTreeSet<ModuleId>,
     storage_contributors: BTreeMap<String, ComponentStorageContributor>,
+    status_contributors: BTreeMap<String, ComponentStatusContributor>,
+    startup_contributors: BTreeMap<String, ComponentStartupContributor>,
+    maintenance_inhibitors: BTreeMap<String, ComponentMaintenanceInhibitor>,
+    migration_contributors: BTreeMap<String, ComponentMigrationContributor>,
     native_request_preparers: BTreeMap<String, Arc<dyn crate::NativeModuleRequestPreparer>>,
     native_rust_control_targets: BTreeMap<String, crate::NativeRustModuleServiceTarget>,
 }
@@ -184,6 +237,37 @@ pub type ComponentStorageContributor = fn(
     &mut sinomo_core::storage::StorageLayout,
 )
     -> Result<(), sinomo_core::storage::StorageContractError>;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComponentStatusProjection {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+impl ComponentStatusProjection {
+    pub fn new(key: impl Into<String>, value: serde_json::Value) -> Self {
+        Self {
+            key: key.into(),
+            value,
+        }
+    }
+}
+
+pub type ComponentStatusContributor =
+    fn(&std::path::Path) -> Result<Option<ComponentStatusProjection>, String>;
+pub type ComponentStartupContributor = fn(&std::path::Path) -> Result<(), String>;
+pub type ComponentMaintenanceInhibitor = fn(&std::path::Path) -> bool;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ComponentMigrationContribution {
+    pub moves: Vec<(std::path::PathBuf, std::path::PathBuf)>,
+    pub evidence_refs: Vec<String>,
+}
+
+pub type ComponentMigrationContributor = fn(
+    &std::path::Path,
+    &sinomo_core::node::ClusterId,
+) -> Result<ComponentMigrationContribution, String>;
 
 impl ComponentCatalogBuilder {
     pub fn register_factory(
@@ -260,6 +344,70 @@ impl ComponentCatalogBuilder {
         Ok(self)
     }
 
+    pub fn register_status_contributor(
+        mut self,
+        component_id: impl Into<String>,
+        contributor: ComponentStatusContributor,
+    ) -> Result<Self, ComponentCatalogError> {
+        let component_id = component_id.into();
+        if self
+            .status_contributors
+            .insert(component_id.clone(), contributor)
+            .is_some()
+        {
+            return Err(ComponentCatalogError::DuplicateStatusContributor { component_id });
+        }
+        Ok(self)
+    }
+
+    pub fn register_startup_contributor(
+        mut self,
+        component_id: impl Into<String>,
+        contributor: ComponentStartupContributor,
+    ) -> Result<Self, ComponentCatalogError> {
+        let component_id = component_id.into();
+        if self
+            .startup_contributors
+            .insert(component_id.clone(), contributor)
+            .is_some()
+        {
+            return Err(ComponentCatalogError::DuplicateStartupContributor { component_id });
+        }
+        Ok(self)
+    }
+
+    pub fn register_maintenance_inhibitor(
+        mut self,
+        component_id: impl Into<String>,
+        inhibitor: ComponentMaintenanceInhibitor,
+    ) -> Result<Self, ComponentCatalogError> {
+        let component_id = component_id.into();
+        if self
+            .maintenance_inhibitors
+            .insert(component_id.clone(), inhibitor)
+            .is_some()
+        {
+            return Err(ComponentCatalogError::DuplicateMaintenanceInhibitor { component_id });
+        }
+        Ok(self)
+    }
+
+    pub fn register_migration_contributor(
+        mut self,
+        component_id: impl Into<String>,
+        contributor: ComponentMigrationContributor,
+    ) -> Result<Self, ComponentCatalogError> {
+        let component_id = component_id.into();
+        if self
+            .migration_contributors
+            .insert(component_id.clone(), contributor)
+            .is_some()
+        {
+            return Err(ComponentCatalogError::DuplicateMigrationContributor { component_id });
+        }
+        Ok(self)
+    }
+
     pub fn register_native_request_preparer(
         mut self,
         preparer: Arc<dyn crate::NativeModuleRequestPreparer>,
@@ -300,6 +448,18 @@ impl ComponentCatalogBuilder {
         for (component_id, contributor) in &catalog.storage_contributors {
             self = self.register_storage_contributor(component_id, *contributor)?;
         }
+        for (component_id, contributor) in &catalog.status_contributors {
+            self = self.register_status_contributor(component_id, *contributor)?;
+        }
+        for (component_id, contributor) in &catalog.startup_contributors {
+            self = self.register_startup_contributor(component_id, *contributor)?;
+        }
+        for (component_id, inhibitor) in &catalog.maintenance_inhibitors {
+            self = self.register_maintenance_inhibitor(component_id, *inhibitor)?;
+        }
+        for (component_id, contributor) in &catalog.migration_contributors {
+            self = self.register_migration_contributor(component_id, *contributor)?;
+        }
         for preparer in catalog.native_request_preparers.values() {
             self = self.register_native_request_preparer(Arc::clone(preparer))?;
         }
@@ -316,6 +476,10 @@ impl ComponentCatalogBuilder {
             factory_order: self.factory_order,
             modules,
             storage_contributors: self.storage_contributors,
+            status_contributors: self.status_contributors,
+            startup_contributors: self.startup_contributors,
+            maintenance_inhibitors: self.maintenance_inhibitors,
+            migration_contributors: self.migration_contributors,
             native_request_preparers: self.native_request_preparers,
             native_rust_control_targets: self.native_rust_control_targets,
         })
@@ -330,6 +494,14 @@ pub enum ComponentCatalogError {
     DuplicateModule { module_id: ModuleId },
     #[error("component catalog repeats storage contributor `{component_id}`")]
     DuplicateStorageContributor { component_id: String },
+    #[error("component catalog repeats status contributor `{component_id}`")]
+    DuplicateStatusContributor { component_id: String },
+    #[error("component catalog repeats startup contributor `{component_id}`")]
+    DuplicateStartupContributor { component_id: String },
+    #[error("component catalog repeats maintenance inhibitor `{component_id}`")]
+    DuplicateMaintenanceInhibitor { component_id: String },
+    #[error("component catalog repeats migration contributor `{component_id}`")]
+    DuplicateMigrationContributor { component_id: String },
     #[error("component catalog repeats native request preparer `{id}`")]
     DuplicateNativeRequestPreparer { id: String },
     #[error("component catalog repeats native Rust control target `{legacy_id}`")]

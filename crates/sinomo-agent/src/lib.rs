@@ -1750,7 +1750,10 @@ impl AgentCatalog {
     pub fn load_from_data_dir(
         data_dir: &sinomo_runtime::local::SinomoDataDir,
     ) -> Result<Self, AgentCatalogError> {
-        Self::load_from_store(AgentDefinitionSifsStore::open(Some(data_dir.root()))?)
+        let mut catalog =
+            Self::load_from_store(AgentDefinitionSifsStore::open(Some(data_dir.root()))?)?;
+        catalog.merge_product_modules(data_dir)?;
+        Ok(catalog)
     }
 
     /// Load the catalog through a caller-selected SIFS transport.
@@ -1760,7 +1763,11 @@ impl AgentCatalog {
     /// [`Self::load_from_data_dir`] remains an explicit mounted read path;
     /// mutation callers construct [`AgentDefinitionSifsStore::open`] directly.
     pub fn load_from_vfs(vfs: sinomo_runtime::vfs::VfsHandle) -> Result<Self, AgentCatalogError> {
-        Self::load_from_store(AgentDefinitionSifsStore::from_vfs(vfs)?)
+        let mut catalog = Self::load_from_store(AgentDefinitionSifsStore::from_vfs(vfs)?)?;
+        if let Ok(data_dir) = sinomo_runtime::local::SinomoDataDir::from_env_or_home() {
+            catalog.merge_product_modules(&data_dir)?;
+        }
+        Ok(catalog)
     }
 
     fn load_from_store(store: AgentDefinitionSifsStore) -> Result<Self, AgentCatalogError> {
@@ -1768,10 +1775,23 @@ impl AgentCatalog {
         for definition in store.load_definitions()? {
             catalog.upsert(definition)?;
         }
-        if let Ok(registry) = sinomo_runtime::modules::internal_module_registry() {
-            catalog.merge_module_registry(&registry)?;
-        }
         Ok(catalog)
+    }
+
+    fn merge_product_modules(
+        &mut self,
+        data_dir: &sinomo_runtime::local::SinomoDataDir,
+    ) -> Result<(), AgentCatalogError> {
+        let cluster_initialized = sinomo_runtime::network::ClusterPaths::new(data_dir)
+            .state
+            .exists();
+        if let Ok(components) = sinomo_product_profile::base_component_catalog(
+            data_dir,
+            sinomo_product_profile::ProductComponentProfile::main(cluster_initialized),
+        ) {
+            self.merge_module_registry(components.modules())?;
+        }
+        Ok(())
     }
 
     pub fn upsert(

@@ -143,7 +143,8 @@ pub(crate) fn parse_port(label: &str, value: &str) -> Result<u16, CliError> {
 pub(crate) fn data_dir_storage_contract_findings(
     data_dir: impl AsRef<Path>,
 ) -> Result<Vec<ClusterDoctorFinding>, CliError> {
-    let report = cli_data_dir_layout()?.verify_data_dir(data_dir)?;
+    let data_dir = data_dir.as_ref();
+    let report = cli_data_dir_layout(data_dir)?.verify_data_dir(data_dir)?;
     let mut unregistered = report.unregistered;
     unregistered.retain(|path| !known_transient_data_dir_path(path));
     if unregistered.is_empty() {
@@ -177,9 +178,19 @@ pub(crate) fn warn_data_dir_storage_contracts(data_dir: impl AsRef<Path>) -> Res
     Ok(())
 }
 
-fn cli_data_dir_layout()
--> Result<sinomo_runtime::storage::StorageLayout, sinomo_runtime::storage::StorageContractError> {
-    let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout()?;
+pub(crate) fn cli_data_dir_layout(
+    data_dir_root: &Path,
+) -> Result<sinomo_runtime::storage::StorageLayout, CliError> {
+    let data_dir = SinomoDataDir::new(data_dir_root);
+    let cluster_initialized = ClusterPaths::new(&data_dir).state.exists();
+    let catalog = sinomo_product_profile::base_component_catalog(
+        &data_dir,
+        sinomo_product_profile::ProductComponentProfile::main(cluster_initialized),
+    )
+    .map_err(|error| CliError::Parse {
+        detail: format!("build storage component catalog: {error}"),
+    })?;
+    let mut layout = sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&catalog)?;
     sinomo_agent::register_storage_paths(&mut layout)?;
     sinomo_pytorch::register_storage_paths(&mut layout)?;
     register_cli_application_storage_paths(&mut layout)?;

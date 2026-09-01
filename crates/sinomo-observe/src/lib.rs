@@ -2,7 +2,6 @@
 
 mod builtin_metrics;
 mod cli;
-mod idle_stats;
 mod profile;
 mod prometheus;
 mod prometheus_server;
@@ -37,9 +36,6 @@ pub use cli::{
     ObserveCliCommandHandler, observe_cli_command_handler,
     observe_cli_command_handler_with_cluster_rpc, observe_cli_command_handler_with_rpc,
 };
-pub use idle_stats::{
-    IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
-};
 pub use profile::{
     OBSERVE_CPU_PROFILE_ARTIFACT_ROOT, OBSERVE_CPU_PROFILE_DEFAULT_DURATION_SECONDS,
     OBSERVE_CPU_PROFILE_DEFAULT_FREQUENCY_HZ, OBSERVE_CPU_PROFILE_MAX_ARTIFACT_BYTES,
@@ -67,6 +63,9 @@ pub use runtime::{
     register_observe_metric_exporter, register_observe_metric_exporter_with_generation,
     register_observe_metric_exporter_with_policy, register_observe_metric_exporter_with_prefixes,
     update_observe_control,
+};
+pub use sinomo_api::{
+    IdleStatsAtomics, install_process_idle_stats, process_idle_stats, register_io_observer,
 };
 pub use timeline::{
     OBSERVE_NETWORK_TIMELINE_ARTIFACT_FILE_NAME, OBSERVE_NETWORK_TIMELINE_ARTIFACT_ROOT,
@@ -956,6 +955,33 @@ pub fn component_factory()
                     .build(),
             );
             if let Some(runtime) = context.runtime() {
+                let label = match context.host_role() {
+                    sinomo_module::ComponentHostRole::Main => "daemon",
+                    sinomo_module::ComponentHostRole::Shadow => "shadow-daemon",
+                    sinomo_module::ComponentHostRole::Embedded => "embedded-daemon",
+                };
+                let cluster_paths = sinomo_core::network::ClusterPaths::new(context.data_dir());
+                let node_id = cluster_paths
+                    .state
+                    .exists()
+                    .then(|| sinomo_core::cluster::read_cluster_state(&cluster_paths).ok())
+                    .flatten()
+                    .map(|state| state.local_node_id.to_string());
+                if let Err(error) = init_observe_runtime(ObserveRuntimeConfig::daemon(label, node_id))
+                {
+                    tracing::warn!(%error, "observe component runtime initialization failed");
+                }
+                register_builtin_observe_metric_exporters();
+                let timeline_data_dir = context.data_dir_root();
+                scope.defer(move || {
+                    if let Err(error) = persist_active_observe_network_timeline(&timeline_data_dir)
+                    {
+                        tracing::warn!(
+                            %error,
+                            "observe network timeline shutdown artifact was not preserved"
+                        );
+                    }
+                });
                 let subscription = sinomo_module::ComponentEventSubscription::new("*", "*", "*");
                 let mut events = context
                     .event_client(scope.descriptor())?

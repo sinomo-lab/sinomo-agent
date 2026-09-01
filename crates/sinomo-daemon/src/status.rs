@@ -19,7 +19,7 @@ pub use sinomo_api::{
 pub(crate) use sinomo_api::{
     current_daemon_cluster_options, current_shadow_daemon_options_on_runtime,
     daemon_cluster_options_from_status, daemon_cluster_process_from_paths,
-    daemon_cluster_status_matches, normalize_manual_daemon_tcp_endpoint_address,
+    daemon_cluster_status_matches,
 };
 
 #[cfg(test)]

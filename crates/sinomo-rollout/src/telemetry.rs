@@ -32,6 +32,165 @@ pub trait RolloutTelemetryHost: Send + Sync + 'static {
     fn reconcile_rollout_telemetry(&self) -> Result<RolloutTelemetryReconcileOutcome, String>;
 }
 
+pub(crate) struct ComponentRolloutTelemetryHost {
+    data_dir: PathBuf,
+    cluster: Option<Arc<dyn sinomo_core::service::ClusterAccess>>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ComponentRolloutTelemetryHost {
+    pub(crate) fn new(
+        data_dir: PathBuf,
+        cluster: Option<Arc<dyn sinomo_core::service::ClusterAccess>>,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            data_dir,
+            cluster,
+            runtime,
+        }
+    }
+
+    fn reconcile(&self) -> Result<RolloutTelemetryReconcileOutcome, String> {
+        let rollout_paths = SelfRolloutPaths::new(&self.data_dir);
+        let event_store = sinomo_core::events::JsonlEventStore::new(
+            self.data_dir
+                .join(sinomo_core::events::EVENT_LOG_RELATIVE_PATH),
+        );
+        let node_id = component_rollout_node_id(&self.data_dir)?;
+        let controller = crate::RolloutController::new(node_id);
+        let gate_config = crate::read_rollout_telemetry_gate_config(&rollout_paths)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+        let result = controller
+            .advance_rollout_from_live_telemetry(
+                &self.data_dir,
+                &rollout_paths,
+                &event_store,
+                crate::RolloutTelemetryAdvanceOptions::from(gate_config),
+            )
+            .map_err(|error| error.to_string())?;
+        let status = result.status;
+        let applied_transition = if status == RolloutTelemetryAdvanceStatus::AppliedTransition {
+            result.applied_transition
+        } else {
+            None
+        };
+        self.publish_module_status(&rollout_paths)?;
+        Ok(RolloutTelemetryReconcileOutcome {
+            status,
+            applied_transition,
+        })
+    }
+
+    fn publish_module_status(&self, rollout_paths: &SelfRolloutPaths) -> Result<(), String> {
+        let Some(cluster) = self.cluster.as_ref() else {
+            return Ok(());
+        };
+        let data_dir = sinomo_core::local::SinomoDataDir::new(&self.data_dir);
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let Ok(cluster_state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
+        else {
+            return Ok(());
+        };
+        let Some(runtime_state) =
+            crate::read_rollout_runtime_state(rollout_paths).map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let telemetry_state = crate::read_rollout_telemetry_advance_state(rollout_paths)
+            .map_err(|error| error.to_string())?
+            .filter(|telemetry| {
+                telemetry.rollout_plan_id == runtime_state.plan.rollout_plan_id
+                    && telemetry.module_id == runtime_state.plan.module_id
+            });
+        let record = sinomo_core::ClusterModuleRolloutStatusRecord {
+            cluster_id: cluster_state.cluster_id,
+            node_id: cluster_state.local_node_id,
+            rollout_plan_id: runtime_state.plan.rollout_plan_id,
+            module_id: runtime_state.plan.module_id,
+            artifact_id: runtime_state.plan.artifact_id,
+            stage: rollout_stage_label(&runtime_state.stage).to_string(),
+            current_weight_bps: runtime_state.current_weight_bps,
+            active_artifact_id: runtime_state.loader_state.active_artifact_id,
+            previous_artifact_id: runtime_state.loader_state.previous_artifact_id,
+            candidate_artifact_id: runtime_state.loader_state.candidate_artifact_id,
+            shadow_artifact_id: runtime_state.loader_state.shadow_artifact_id,
+            hot_swap_state: hot_swap_state_label(&runtime_state.loader_state.hot_swap_state)
+                .to_string(),
+            telemetry_kind: telemetry_state
+                .as_ref()
+                .map(|telemetry| telemetry.telemetry_kind.clone()),
+            telemetry_last_consumed_sequence: telemetry_state
+                .as_ref()
+                .and_then(|telemetry| telemetry.last_consumed_sequence)
+                .map(|sequence| sequence.0),
+            last_transition_record_id: telemetry_state
+                .and_then(|telemetry| telemetry.last_transition_record_id),
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        let op = crate::build_cluster_module_rollout_status_put_op(&record)
+            .map_err(|error| error.to_string())?;
+        self.runtime
+            .block_on(
+                cluster.kv_commit_async(sinomo_core::kv::KvTxnRequest::generated(
+                    sinomo_core::kv::KvTxn {
+                        compares: Vec::new(),
+                        success: vec![op],
+                        failure: Vec::new(),
+                    },
+                )),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+impl RolloutTelemetryHost for ComponentRolloutTelemetryHost {
+    fn reconcile_rollout_telemetry(&self) -> Result<RolloutTelemetryReconcileOutcome, String> {
+        self.reconcile()
+    }
+}
+
+fn component_rollout_node_id(data_dir: &Path) -> Result<sinomo_core::node::NodeId, String> {
+    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(data_dir);
+    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
+    if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
+        return Ok(state.local_node_id);
+    }
+    let identity = sinomo_core::node::load_or_create_main_node_identity(data_dir)
+        .map_err(|error| error.to_string())?;
+    Ok(sinomo_core::node::NodeId::derived(
+        "sinomo.rollout.local-node",
+        identity.public_key.as_bytes(),
+    ))
+}
+
+fn rollout_stage_label(stage: &crate::RolloutStage) -> &'static str {
+    match stage {
+        crate::RolloutStage::Shadow => "shadow",
+        crate::RolloutStage::Canary => "canary",
+        crate::RolloutStage::GuardedR1 => "guarded-r1",
+        crate::RolloutStage::Promoted => "promoted",
+        crate::RolloutStage::RolledBack => "rolled-back",
+        crate::RolloutStage::Quarantined => "quarantined",
+    }
+}
+
+fn hot_swap_state_label(state: &sinomo_core::HotSwapState) -> &'static str {
+    match state {
+        sinomo_core::HotSwapState::Stable => "stable",
+        sinomo_core::HotSwapState::Loading => "loading",
+        sinomo_core::HotSwapState::Shadowing => "shadowing",
+        sinomo_core::HotSwapState::Draining => "draining",
+        sinomo_core::HotSwapState::ActivationCheckpoint => "activation-checkpoint",
+        sinomo_core::HotSwapState::ActiveCandidate => "active-candidate",
+        sinomo_core::HotSwapState::RollbackCheckpoint => "rollback-checkpoint",
+        sinomo_core::HotSwapState::RollingBack => "rolling-back",
+        sinomo_core::HotSwapState::Quarantined => "quarantined",
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RolloutTelemetryEventTailOutcome {
     relevant_event_observed: bool,

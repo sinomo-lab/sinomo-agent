@@ -1,14 +1,11 @@
 use crate::cluster::{
-    ClusterNetworkMaintenance, DAEMON_CLUSTER_PUBLISH_INTERVAL, DAEMON_CLUSTER_TICK_INTERVAL,
-    DaemonDesiredRolloutReactor, cluster_paths_from_daemon_paths,
-    handle_daemon_cluster_kv_snapshot, prune_local_cluster_raft_uncommitted_tail,
+    ClusterNetworkMaintenance, DAEMON_CLUSTER_TICK_INTERVAL, cluster_paths_from_daemon_paths,
+    prune_local_cluster_raft_uncommitted_tail,
 };
 use crate::{
-    AuthenticatedDaemonCommand, DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR, DaemonClusterStatus,
-    DaemonError, DaemonLock, DaemonPaths, DaemonSignerAuthority, daemon_paths_are_shadow,
-    handle_daemon_finalize_shadow_rollout, read_daemon_status,
+    AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
+    DaemonSignerAuthority, daemon_paths_are_shadow, read_daemon_status,
 };
-use sinomo_core::ClusterModuleRolloutStatusRecord;
 use sinomo_core::cluster::{
     ClusterConnectivityProjectionChange as DaemonConnectivityProjectionChange,
     ClusterConnectivityTopologyProjection as DaemonConnectivityTopologyProjection,
@@ -19,20 +16,15 @@ use sinomo_core::cluster::{
     ClusterConnectivityTopologyValue as DaemonConnectivityTopologyValue,
     cluster_connectivity_events_cover_revision_range as daemon_connectivity_events_cover_revision_range,
 };
-use sinomo_core::events::EventStore;
-use sinomo_core::local::SinomoDataDir;
 use sinomo_core::node::NodeId;
 #[cfg(test)]
 use sinomo_core::{ClusterMemberRecord, ClusterTransportKind};
-use sinomo_rollout::{
-    RolloutController, RolloutTelemetryAdvanceOptions, RolloutTelemetryAdvanceStatus,
-    SelfRolloutPaths, read_rollout_status, rollout_main_activation_path,
-    rollout_shadow_finalize_path,
-};
+#[cfg(test)]
+use sinomo_rollout::SelfRolloutPaths;
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::future::Future;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex, OnceLock,
     atomic::{AtomicU8, AtomicU64, Ordering},
@@ -40,6 +32,7 @@ use std::sync::{
 #[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant};
+#[cfg(test)]
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
@@ -47,18 +40,12 @@ use tokio::io::AsyncWriteExt as _;
 // whose target is offline) retains a bounded retry cadence. Quiet nodes park:
 // an O(total-state) inventory is not an acceptable liveness probe.
 pub const DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
-pub const DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL: Duration =
-    DAEMON_CLUSTER_PUBLISH_INTERVAL;
 pub const DAEMON_NETWORK_ENVIRONMENT_WATCH_ENV: &str = "SINOMO_DAEMON_NETWORK_ENVIRONMENT_WATCH";
 const DAEMON_RUNTIME_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 const DAEMON_NETWORK_MODULE_CONTEXT_TASK_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DAEMON_RUNTIME_TASK_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const DAEMON_CONNECTIVITY_EXTERNAL_SNAPSHOT_DEBOUNCE: Duration = Duration::from_millis(100);
-const DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY: usize = 64;
-const DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES: usize = 256 * 1024;
-#[cfg(feature = "sandbox")]
-const DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 
 static DAEMON_CLUSTER_MAINTENANCE_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static DAEMON_CLUSTER_MAINTENANCE_DIRTY: AtomicU8 = AtomicU8::new(0);
@@ -135,14 +122,6 @@ fn daemon_cluster_maintenance_notify() -> Arc<tokio::sync::Notify> {
     Arc::clone(
         DAEMON_CLUSTER_MAINTENANCE_NOTIFY.get_or_init(|| Arc::new(tokio::sync::Notify::new())),
     )
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_now_unix_nanos() -> u64 {
-    OffsetDateTime::now_utc()
-        .unix_timestamp_nanos()
-        .max(0)
-        .min(i128::from(u64::MAX)) as u64
 }
 
 pub(crate) fn request_daemon_cluster_maintenance(reason: DaemonClusterMaintenanceReason) {
@@ -622,167 +601,6 @@ async fn start_daemon_network_environment_watch(
     Some(DaemonNetworkEnvironmentWatch { task })
 }
 
-fn daemon_sandbox_lifecycle_recovery_state(
-    paths: &DaemonPaths,
-) -> sinomo_sandbox::SandboxLifecycleRecoveryState {
-    sinomo_sandbox::SandboxLifecycleRecoveryState::new(
-        paths.root.join(DAEMON_SANDBOX_LIFECYCLE_RECOVERY_STATE_DIR),
-    )
-}
-
-type DaemonSandboxDfsService = sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>;
-type DaemonSandboxInstanceStore =
-    sinomo_sandbox::SifsSandboxInstanceStore<sinomo_dfs::DfsNodeTransport>;
-type DaemonSandboxExecutionLease =
-    sinomo_sandbox::ClusteredSandboxExecutionLease<sinomo_dfs::DfsNodeTransport>;
-
-struct DaemonSandboxLifecycleHooks<'a> {
-    paths: &'a DaemonPaths,
-}
-
-impl sinomo_sandbox::ClusteredSandboxLifecycleHooks for DaemonSandboxLifecycleHooks<'_> {
-    type Error = DaemonError;
-
-    fn load_policy_config(
-        &mut self,
-    ) -> Result<sinomo_sandbox::SandboxClusterPolicyConfig, Self::Error> {
-        load_daemon_sandbox_policy_config(self.paths)
-    }
-
-    fn append_event(
-        &mut self,
-        event: sinomo_core::EventEnvelope,
-        durability: sinomo_sandbox::SandboxAuditDurability,
-    ) -> Result<(), Self::Error> {
-        match durability {
-            sinomo_sandbox::SandboxAuditDurability::Buffered => {
-                append_daemon_sandbox_event(self.paths, event)
-            }
-            sinomo_sandbox::SandboxAuditDurability::Durable => {
-                append_daemon_sandbox_event_durable(self.paths, event)
-            }
-        }
-    }
-
-    fn clear_authoritative_recovery_pending(
-        &mut self,
-        sandbox_id: &sinomo_sandbox::SandboxId,
-        context: &'static str,
-    ) {
-        daemon_sandbox_lifecycle_recovery_state(self.paths)
-            .clear_authoritative_recovery_pending_best_effort(sandbox_id, context);
-    }
-
-    fn mark_authoritative_recovery_pending(
-        &mut self,
-        sandbox_id: &sinomo_sandbox::SandboxId,
-    ) -> Result<(), Self::Error> {
-        daemon_sandbox_lifecycle_recovery_state(self.paths)
-            .mark_authoritative_recovery_pending(sandbox_id)
-            .map_err(Into::into)
-    }
-
-    fn invalid(&mut self, detail: String) -> Self::Error {
-        DaemonError::Parse { detail }
-    }
-}
-
-impl sinomo_sandbox::ClusteredSandboxToolchainHooks for DaemonSandboxLifecycleHooks<'_> {
-    type Error = DaemonError;
-
-    fn load_policy_config(
-        &mut self,
-    ) -> Result<sinomo_sandbox::SandboxClusterPolicyConfig, Self::Error> {
-        load_daemon_sandbox_policy_config(self.paths)
-    }
-
-    fn append_event(&mut self, event: sinomo_core::EventEnvelope) -> Result<(), Self::Error> {
-        append_daemon_sandbox_event(self.paths, event)
-    }
-
-    fn invalid(&mut self, detail: String) -> Self::Error {
-        DaemonError::Parse { detail }
-    }
-}
-
-fn open_daemon_sandbox_store_with_mutation_lease(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<
-    (
-        DaemonSandboxExecutionLease,
-        DaemonSandboxInstanceStore,
-        Vec<sinomo_core::node::NodeId>,
-    ),
-    DaemonError,
-> {
-    open_daemon_sandbox_store_with_lease(
-        paths,
-        sandbox_id,
-        runtime,
-        sinomo_sandbox::ClusteredSandboxOperationKind::Mutation,
-        cfg!(feature = "sandbox"),
-    )
-}
-
-fn open_daemon_sandbox_store_with_transaction_lease(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<
-    (
-        DaemonSandboxExecutionLease,
-        DaemonSandboxInstanceStore,
-        Vec<sinomo_core::node::NodeId>,
-    ),
-    DaemonError,
-> {
-    open_daemon_sandbox_store_with_lease(
-        paths,
-        sandbox_id,
-        runtime,
-        sinomo_sandbox::ClusteredSandboxOperationKind::AuthoritativeTransaction,
-        false,
-    )
-}
-
-fn open_daemon_sandbox_store_with_lease(
-    paths: &DaemonPaths,
-    sandbox_id: &sinomo_sandbox::SandboxId,
-    runtime: Option<&tokio::runtime::Handle>,
-    kind: sinomo_sandbox::ClusteredSandboxOperationKind,
-    recover_existing: bool,
-) -> Result<
-    (
-        DaemonSandboxExecutionLease,
-        DaemonSandboxInstanceStore,
-        Vec<sinomo_core::node::NodeId>,
-    ),
-    DaemonError,
-> {
-    // The renewable lease requires an independently owned metadata service for
-    // its background renewal thread. Both services can still share one
-    // clone-backed content store and one replica view for the whole operation.
-    let content = open_daemon_sandbox_content_store(paths)?;
-    let (lease_dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
-            paths,
-            runtime,
-            content.clone(),
-        )?;
-    let dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(paths, runtime, content)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).open_operation(
-        lease_dfs,
-        dfs,
-        replica_candidates,
-        sandbox_id,
-        kind,
-        recover_existing,
-    )
-}
-
 pub fn run_daemon_control_loop(
     options: crate::DaemonRunOptions,
     paths: DaemonPaths,
@@ -906,17 +724,13 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     crate::cluster::deny_shadow_daemon_local_raft_access(&paths)?;
     crate::cluster::ensure_cluster_directory_installed();
     let _lock = DaemonLock::acquire(&paths, &options, cluster.clone())?;
-    // This must precede every loader-state read. Both the process-wide network
-    // registry below and the service module registry load native dylibs.
-    crate::rollout::recover_native_loader_intents_before_registry_load(&paths)?;
-    if let Err(error) =
-        sinomo_observe::init_observe_runtime(sinomo_observe::ObserveRuntimeConfig::daemon(
-            label,
-            cluster.as_ref().map(|status| status.node_id.to_string()),
-        ))
-    {
-        tracing::warn!("sinomo {label} observe runtime initialization failed: {error}");
-    }
+    // Product startup contributors run before every loader-state read. Rollout
+    // uses this hook to recover interrupted native-loader transactions without
+    // making the daemon depend on Rollout implementation code.
+    let data_dir_root = daemon_data_dir_path(&paths)?;
+    component_catalog
+        .run_startup_contributors(&data_dir_root)
+        .map_err(|detail| DaemonError::Parse { detail })?;
     if let Some(requested_port) = fallback_from_port {
         tracing::warn!(
             requested_port,
@@ -924,7 +738,6 @@ pub fn run_daemon_control_loop_with_prepared_listener(
             "sinomo {label} preferred port unavailable; using automatic fallback"
         );
     }
-    sinomo_observe::register_builtin_observe_metric_exporters();
     let startup_local_raft_resident_initialized =
         match prune_local_cluster_raft_uncommitted_tail(&paths) {
             Ok(initialized) => initialized,
@@ -949,41 +762,6 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     let shutdown_signal = shutdown_tx.clone();
     let mut runtime_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
     tracing::info!("sinomo {label} listening on {bind_address}");
-    if let Some(requested_port) = fallback_from_port {
-        crate::append_operational_event_best_effort(
-            &paths,
-            crate::OperationalSeverity::Warn,
-            "daemon-control",
-            "daemon.lifecycle.port-fallback",
-            format!(
-                "sinomo {label} preferred port {requested_port} was unavailable; listening on fallback port {}",
-                options.port
-            ),
-            None,
-            serde_json::json!({
-                "label": label,
-                "requested_port": requested_port,
-                "fallback_port": options.port,
-                "address": bind_address,
-                "pid": std::process::id(),
-            }),
-        );
-    }
-    crate::append_operational_event_best_effort(
-        &paths,
-        crate::OperationalSeverity::Info,
-        "daemon-control",
-        "daemon.lifecycle.started",
-        format!("sinomo {label} listening on {bind_address}"),
-        None,
-        serde_json::json!({
-            "label": label,
-            "address": bind_address,
-            "fallback_from_port": fallback_from_port,
-            "pid": std::process::id(),
-            "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
-        }),
-    );
     // Load native-dylib network modules into the process-wide
     // NetworkModuleRegistry before serving traffic. Loopback/LAN-TCP keep
     // their in-crate dial paths inside sinomo-network; every other transport
@@ -1059,6 +837,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
     let idle_stats = Arc::new(crate::IdleStatsAtomics::new());
     crate::install_process_idle_stats(idle_stats.clone());
     crate::register_io_observer(idle_stats.clone());
+    let maintenance_inhibitors = component_catalog.maintenance_inhibitors();
 
     // The service host owns a lifecycle-scoped catalog publisher component;
     // generic cluster maintenance no longer carries service discovery state.
@@ -1071,6 +850,41 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         ),
     )?;
     service_host.notify_component_host_start();
+    if let Some(requested_port) = fallback_from_port {
+        crate::append_operational_event_best_effort(
+            &paths,
+            crate::OperationalSeverity::Warn,
+            "daemon-control",
+            "daemon.lifecycle.port-fallback",
+            format!(
+                "sinomo {label} preferred port {requested_port} was unavailable; listening on fallback port {}",
+                options.port
+            ),
+            None,
+            serde_json::json!({
+                "label": label,
+                "requested_port": requested_port,
+                "fallback_port": options.port,
+                "address": bind_address,
+                "pid": std::process::id(),
+            }),
+        );
+    }
+    crate::append_operational_event_best_effort(
+        &paths,
+        crate::OperationalSeverity::Info,
+        "daemon-control",
+        "daemon.lifecycle.started",
+        format!("sinomo {label} listening on {bind_address}"),
+        None,
+        serde_json::json!({
+            "label": label,
+            "address": bind_address,
+            "fallback_from_port": fallback_from_port,
+            "pid": std::process::id(),
+            "cluster_node_id": cluster.as_ref().map(|status| status.node_id.to_string()),
+        }),
+    );
 
     let maintenance_paths = paths.clone();
     let maintenance_options = options.clone();
@@ -1098,6 +912,7 @@ pub fn run_daemon_control_loop_with_prepared_listener(
             startup_local_raft_resident_initialized,
             maintenance_connectivity_topology_subscription,
             startup_cluster_runtime_enabled,
+            maintenance_inhibitors,
             node_resources,
             shutdown_rx.clone(),
         )),
@@ -1142,20 +957,6 @@ pub fn run_daemon_control_loop_with_prepared_listener(
             "pid": std::process::id(),
         }),
     );
-    match daemon_data_dir_path(&paths) {
-        Ok(data_dir_root) => {
-            if let Err(error) =
-                sinomo_observe::persist_active_observe_network_timeline(&data_dir_root)
-            {
-                tracing::warn!(
-                    "sinomo {label} network timeline shutdown artifact was not preserved: {error}"
-                );
-            }
-        }
-        Err(error) => tracing::warn!(
-            "sinomo {label} network timeline shutdown artifact root was unavailable: {error}"
-        ),
-    }
     daemon_runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
     Ok(())
 }
@@ -1207,12 +1008,122 @@ fn drain_daemon_runtime_after_task_shutdown(runtime: &tokio::runtime::Runtime) {
     });
 }
 
-#[cfg(feature = "sandbox")]
-fn daemon_sandbox_lifecycle_maintenance_allowed(
-    label: &str,
-    startup_cluster_maintenance_attempted: bool,
-) -> bool {
-    label == "daemon" && startup_cluster_maintenance_attempted
+struct DaemonClusterMaintenanceReactorHost {
+    cluster_network: ClusterNetworkMaintenance,
+    paths: DaemonPaths,
+    options: crate::DaemonRunOptions,
+    label: String,
+    runtime: tokio::runtime::Handle,
+    startup_cluster: Option<DaemonClusterStatus>,
+    maintain_cluster_runtime: bool,
+    maintenance_inhibitors: Vec<sinomo_module::ComponentMaintenanceInhibitor>,
+    node_resources: sinomo_device::NodeResourceMonitor,
+}
+
+impl sinomo_core::cluster::ClusterMaintenanceReactorHost for DaemonClusterMaintenanceReactorHost {
+    type Work = crate::cluster::ClusterNetworkMaintenancePendingWork;
+    type Error = DaemonError;
+
+    fn identity_is_current<'a>(
+        &'a mut self,
+    ) -> sinomo_core::cluster::ClusterMaintenanceFuture<'a, bool, Self::Error> {
+        Box::pin(async move {
+            if !self.maintain_cluster_runtime {
+                return Ok(true);
+            }
+            daemon_cluster_identity_matches_startup(&self.paths, self.startup_cluster.as_ref())
+        })
+    }
+
+    fn inhibited(&self) -> bool {
+        self.label == "daemon"
+            && component_maintenance_is_inhibited(&self.paths, &self.maintenance_inhibitors)
+    }
+
+    fn plan<'a>(
+        &'a mut self,
+    ) -> sinomo_core::cluster::ClusterMaintenanceFuture<'a, Option<Self::Work>, Self::Error> {
+        Box::pin(async move {
+            if !self.maintain_cluster_runtime {
+                return Ok(None);
+            }
+            let mut observation = DaemonClusterNetworkMaintenanceSubphaseObservation::start(
+                DaemonClusterNetworkMaintenanceSubphase::TickPlan,
+            );
+            let work = self
+                .cluster_network
+                .tick_async(&self.paths, &self.options, self.runtime.clone())
+                .await?;
+            observation.complete(Some(work.is_some()));
+            Ok(work)
+        })
+    }
+
+    fn execute<'a>(
+        &'a mut self,
+        work: Self::Work,
+        deadline: Instant,
+    ) -> sinomo_core::cluster::ClusterMaintenanceFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            self.cluster_network
+                .run_pending_work_until_async(work, self.runtime.clone(), deadline)
+                .await;
+            Ok(())
+        })
+    }
+
+    fn next_due(&self, now: Instant) -> Duration {
+        if self.maintain_cluster_runtime {
+            self.cluster_network.next_due_duration(now)
+        } else {
+            DAEMON_CLUSTER_TICK_INTERVAL
+        }
+    }
+
+    fn record_plan_failure(&mut self, now: Instant) {
+        self.cluster_network.record_active_tick_plan_failure(now);
+    }
+
+    fn observe_phase(&mut self, timed_out: bool, elapsed: Duration) {
+        observe_cluster_network_maintenance_phase(
+            if timed_out {
+                DaemonClusterNetworkMaintenancePhaseDisposition::TimedOut
+            } else {
+                DaemonClusterNetworkMaintenancePhaseDisposition::Completed
+            },
+            elapsed,
+        );
+    }
+
+    fn on_wake(&mut self) {
+        let dirty = take_daemon_cluster_maintenance_dirty();
+        let now = Instant::now();
+        if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH != 0 {
+            self.cluster_network.request_publish_refresh(now);
+        }
+        if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY != 0 {
+            if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT != 0 {
+                self.cluster_network
+                    .request_network_environment_refresh(now);
+            } else {
+                self.cluster_network.request_connectivity_refresh(now);
+            }
+        }
+        if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
+            self.cluster_network.request_discovery_refresh(now);
+        }
+    }
+
+    fn wait_for_external_change<'a>(
+        &'a mut self,
+    ) -> sinomo_core::cluster::ClusterMaintenanceFuture<'a, (), Self::Error> {
+        Box::pin(async move {
+            let resources = self.node_resources.changed().await;
+            self.cluster_network.set_resource_mode(resources.mode);
+            observe_daemon_node_resources(resources);
+            Ok(())
+        })
+    }
 }
 
 async fn run_daemon_background_maintenance_loop(
@@ -1225,8 +1136,9 @@ async fn run_daemon_background_maintenance_loop(
     startup_local_raft_resident_initialized: bool,
     connectivity_topology_subscription: Option<DaemonConnectivityTopologySubscriptions>,
     maintain_cluster_runtime: bool,
+    maintenance_inhibitors: Vec<sinomo_module::ComponentMaintenanceInhibitor>,
     mut node_resources: sinomo_device::NodeResourceMonitor,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let _connectivity_topology_subscription = connectivity_topology_subscription;
     let mut cluster_network = ClusterNetworkMaintenance::with_idle_stats(
@@ -1237,252 +1149,35 @@ async fn run_daemon_background_maintenance_loop(
     let current_node_resources = node_resources.take_latest();
     cluster_network.set_resource_mode(current_node_resources.mode);
     observe_daemon_node_resources(current_node_resources);
-    let desired_rollout_task = if maintain_cluster_runtime && daemon_paths_are_shadow(&paths) {
-        match cluster_paths_from_daemon_paths(&paths).and_then(|cluster_paths| {
-            DaemonDesiredRolloutReactor::new(&cluster_paths).map(|reactor| (cluster_paths, reactor))
-        }) {
-            Ok((cluster_paths, reactor)) => {
-                let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-                let task = runtime.spawn(reactor.run_until_stopped_async(
-                    paths.clone(),
-                    cluster_paths,
-                    runtime.clone(),
-                    stop_rx,
-                ));
-                Some((stop_tx, task))
-            }
-            Err(error) => {
-                tracing::warn!(
-                    "sinomo {label} could not initialize the durable rollout watch: {error}"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-    #[cfg(feature = "sandbox")]
-    let mut last_sandbox_lifecycle_maintenance = Instant::now()
-        .checked_sub(DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL)
-        .unwrap_or_else(Instant::now);
-    #[cfg(feature = "sandbox")]
-    let mut startup_cluster_maintenance_attempted = !maintain_cluster_runtime;
     let cluster_notify = daemon_cluster_maintenance_notify();
     let network_environment_watch = if label == "daemon" && maintain_cluster_runtime {
         start_daemon_network_environment_watch(&label, shutdown_rx.clone()).await
     } else {
         None
     };
-
-    loop {
-        if daemon_shutdown_requested(&shutdown_rx) {
-            break;
-        }
-        if maintain_cluster_runtime {
-            match daemon_cluster_identity_matches_startup(&paths, startup_cluster.as_ref()) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    tracing::warn!(
-                        "sinomo {label} cluster maintenance deferred while startup identity is unreadable: {error}"
-                    );
-                    tokio::select! {
-                        _ = tokio::time::sleep(DAEMON_CLUSTER_TICK_INTERVAL) => {}
-                        changed = shutdown_rx.changed() => {
-                            if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-
-        if label == "daemon" {
-            let finalization_paths = paths.clone();
-            match tokio::task::spawn_blocking(move || {
-                handle_daemon_finalize_shadow_rollout(&finalization_paths)
-            })
-            .await
-            {
-                Ok(Ok(response)) if !response.starts_with("no pending shadow rollout") => {
-                    tracing::info!("sinomo {label} rollout finalization: {response}");
-                }
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!("sinomo {label} shadow rollout finalization failed: {error}")
-                }
-                Err(error) => tracing::warn!(
-                    "sinomo {label} shadow rollout finalization task failed: {error}"
-                ),
-            }
-        }
-
-        if label == "daemon" && daemon_rollout_handoff_pending(&paths) {
-            tokio::select! {
-                _ = tokio::time::sleep(DAEMON_CLUSTER_TICK_INTERVAL) => {}
-                changed = shutdown_rx.changed() => {
-                    if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-
-        #[cfg(feature = "sandbox")]
-        if daemon_sandbox_lifecycle_maintenance_allowed(
-            &label,
-            startup_cluster_maintenance_attempted,
-        ) && last_sandbox_lifecycle_maintenance.elapsed()
-            >= DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL
-        {
-            let lifecycle_paths = paths.clone();
-            let lifecycle_runtime = runtime.clone();
-            match tokio::task::spawn_blocking(move || {
-                run_daemon_sandbox_lifecycle_maintenance_tick(&lifecycle_paths, &lifecycle_runtime)
-            })
-            .await
-            {
-                Ok(Ok(recovered)) if recovered > 0 => tracing::info!(
-                    "sinomo {label} recovered {recovered} pending sandbox lifecycle operation(s)"
-                ),
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!("sinomo {label} sandbox lifecycle maintenance failed: {error}")
-                }
-                Err(error) => tracing::warn!(
-                    "sinomo {label} sandbox lifecycle maintenance task failed: {error}"
-                ),
-            }
-            last_sandbox_lifecycle_maintenance = Instant::now();
-        }
-
-        if maintain_cluster_runtime {
-            let phase_started = Instant::now();
-            let mut observation = DaemonClusterNetworkMaintenanceSubphaseObservation::start(
-                DaemonClusterNetworkMaintenanceSubphase::TickPlan,
-            );
-            let Some(tick_result) = wait_for_daemon_maintenance_or_shutdown(
-                tokio::time::timeout(
-                    DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
-                    cluster_network.tick_async(&paths, &options, runtime.clone()),
-                ),
-                &mut shutdown_rx,
-            )
-            .await
-            else {
-                break;
-            };
-            let (pending_work, timed_out) = match tick_result {
-                Ok(Ok(work)) => (work, false),
-                Ok(Err(error)) => {
-                    cluster_network.record_active_tick_plan_failure(Instant::now());
-                    tracing::warn!("sinomo {label} cluster network tick failed: {error}");
-                    (None, false)
-                }
-                Err(_) => {
-                    cluster_network.record_active_tick_plan_failure(Instant::now());
-                    tracing::warn!("sinomo {label} cluster network tick planning timed out");
-                    (None, true)
-                }
-            };
-            observation.complete(Some(pending_work.is_some()));
-            #[cfg(feature = "sandbox")]
-            {
-                startup_cluster_maintenance_attempted = true;
-            }
-            if let Some(work) = pending_work {
-                let deadline = Instant::now()
-                    .checked_add(
-                        DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT
-                            .saturating_sub(Duration::from_millis(500)),
-                    )
-                    .unwrap_or_else(Instant::now);
-                let Some(()) = wait_for_daemon_maintenance_or_shutdown(
-                    cluster_network.run_pending_work_until_async(work, runtime.clone(), deadline),
-                    &mut shutdown_rx,
-                )
-                .await
-                else {
-                    break;
-                };
-            }
-            observe_cluster_network_maintenance_phase(
-                if timed_out {
-                    DaemonClusterNetworkMaintenancePhaseDisposition::TimedOut
-                } else {
-                    DaemonClusterNetworkMaintenancePhaseDisposition::Completed
-                },
-                phase_started.elapsed(),
-            );
-        }
-
-        let now = Instant::now();
-        let shadow_finalization_due = if label == "daemon" {
-            let due_paths = paths.clone();
-            tokio::task::spawn_blocking(move || shadow_rollout_finalization_poll_due_in(&due_paths))
-                .await
-                .ok()
-        } else {
-            None
-        };
-        #[cfg(feature = "sandbox")]
-        let sandbox_due = daemon_sandbox_lifecycle_maintenance_allowed(
-            &label,
-            startup_cluster_maintenance_attempted,
-        )
-        .then(|| {
-            daemon_maintenance_interval_remaining(
-                now,
-                last_sandbox_lifecycle_maintenance,
-                DAEMON_SANDBOX_LIFECYCLE_MAINTENANCE_INTERVAL,
-            )
-        });
-        #[cfg(not(feature = "sandbox"))]
-        let sandbox_due = None;
-        let sleep_duration = daemon_maintenance_sleep_duration(
-            cluster_network.next_due_duration(now),
-            shadow_finalization_due,
-            sandbox_due,
-        );
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_duration) => {}
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || daemon_shutdown_requested(&shutdown_rx) {
-                    break;
-                }
-            }
-            _ = cluster_notify.notified() => {
-                let dirty = take_daemon_cluster_maintenance_dirty();
-                let now = Instant::now();
-                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_PUBLISH != 0 {
-                    cluster_network.request_publish_refresh(now);
-                }
-                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_CONNECTIVITY != 0 {
-                    if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_NETWORK_ENVIRONMENT != 0 {
-                        cluster_network.request_network_environment_refresh(now);
-                    } else {
-                        cluster_network.request_connectivity_refresh(now);
-                    }
-                }
-                if dirty & DAEMON_CLUSTER_MAINTENANCE_DIRTY_DISCOVERY != 0 {
-                    cluster_network.request_discovery_refresh(now);
-                }
-            }
-            resources = node_resources.changed() => {
-                cluster_network.set_resource_mode(resources.mode);
-                observe_daemon_node_resources(resources);
-            }
-        }
-    }
-    if let Some((stop_tx, task)) = desired_rollout_task {
-        let _ = stop_tx.send(true);
-        if let Err(error) = task.await {
-            tracing::warn!("sinomo {label} durable rollout watch task failed: {error}");
-        }
-    }
+    let mut host = DaemonClusterMaintenanceReactorHost {
+        cluster_network,
+        paths,
+        options,
+        label,
+        runtime,
+        startup_cluster,
+        maintain_cluster_runtime,
+        maintenance_inhibitors,
+        node_resources,
+    };
+    sinomo_core::cluster::run_cluster_maintenance_reactor(
+        &mut host,
+        sinomo_core::cluster::ClusterMaintenanceReactorConfig {
+            phase_timeout: DAEMON_CLUSTER_NETWORK_MAINTENANCE_PHASE_TIMEOUT,
+            execution_tail_reserve: Duration::from_millis(500),
+            inhibited_retry: DAEMON_CLUSTER_TICK_INTERVAL,
+            identity_retry: DAEMON_CLUSTER_TICK_INTERVAL,
+        },
+        cluster_notify,
+        shutdown_rx,
+    )
+    .await;
     if let Some(watch) = network_environment_watch {
         let _ = watch.task.await;
     }
@@ -1504,6 +1199,7 @@ fn daemon_cluster_identity_matches_startup(
     }
 }
 
+#[cfg(test)]
 async fn wait_for_daemon_maintenance_or_shutdown<F>(
     maintenance: F,
     shutdown_rx: &mut tokio::sync::watch::Receiver<bool>,
@@ -1525,7 +1221,7 @@ where
     }
 }
 
-pub(crate) async fn run_daemon_control_accept_loop(
+pub async fn run_daemon_control_accept_loop(
     listener: sinomo_core::network::AsyncDaemonControlListener,
     paths: DaemonPaths,
     label: String,
@@ -2607,42 +2303,6 @@ async fn dispatch_daemon_object_rpc_call_request_async(
             sinomo_core::network::ObjectRpcOutgoingResponse::new(response, body)
         };
         Ok((response, false, route))
-    } else if crate::service_adapter::is_sandbox_stream_route(&request.request) {
-        if request.body.is_attachment() {
-            return Err(DaemonError::Parse {
-                detail: "sandbox stream session does not accept an attached request body"
-                    .to_string(),
-            });
-        }
-        let stream_request = match route.as_str() {
-            sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE => {
-                DaemonSandboxStreamRequest::RunToolchain(
-                    request
-                        .decode_body::<sinomo_sandbox::SandboxRunToolchainRequest>()
-                        .await
-                        .map_err(DaemonError::from)?,
-                )
-            }
-            sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE => {
-                DaemonSandboxStreamRequest::RunProcessPlan(
-                    request
-                        .decode_body::<sinomo_sandbox::SandboxRunProcessPlanRequest>()
-                        .await
-                        .map_err(DaemonError::from)?,
-                )
-            }
-            _ => unreachable!("sandbox stream route predicate matched an unknown route"),
-        };
-        Ok((
-            daemon_sandbox_stream_rpc_response(
-                paths,
-                route.clone(),
-                stream_request,
-                service_runtime,
-            )?,
-            false,
-            route,
-        ))
     } else {
         crate::service_adapter::dispatch_rpc_via_registry_with_body_async(
             service_host,
@@ -2653,65 +2313,6 @@ async fn dispatch_daemon_object_rpc_call_request_async(
         .await
         .map(|(response, stop)| (response, stop, route))
     }
-}
-
-enum DaemonSandboxStreamRequest {
-    RunToolchain(sinomo_sandbox::SandboxRunToolchainRequest),
-    RunProcessPlan(sinomo_sandbox::SandboxRunProcessPlanRequest),
-}
-
-fn daemon_sandbox_stream_rpc_response(
-    paths: &DaemonPaths,
-    route: String,
-    request: DaemonSandboxStreamRequest,
-    runtime: &tokio::runtime::Handle,
-) -> Result<sinomo_core::network::ObjectRpcOutgoingResponse, DaemonError> {
-    let response = sinomo_core::network::ObjectRpcResponse::encode_body(&route, &())
-        .map_err(DaemonError::from)?;
-    let (reader, mut writer) = tokio::io::duplex(DAEMON_SANDBOX_SESSION_BODY_BUFFER_BYTES);
-    let paths = paths.clone();
-    let runtime = runtime.clone();
-    let producer = match request {
-        DaemonSandboxStreamRequest::RunToolchain(payload) => tokio::spawn(async move {
-            if let Err(error) = handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
-                &paths,
-                payload,
-                &mut writer,
-                &runtime,
-            )
-            .await
-            {
-                let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error {
-                    detail: error.to_string(),
-                };
-                let _ = write_daemon_sandbox_stream_frame_async(&mut writer, &frame).await;
-            }
-            let _ = writer.shutdown().await;
-        }),
-        DaemonSandboxStreamRequest::RunProcessPlan(payload) => tokio::spawn(async move {
-            if let Err(error) = handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
-                &paths,
-                payload,
-                &mut writer,
-                &runtime,
-            )
-            .await
-            {
-                let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Error {
-                    detail: error.to_string(),
-                };
-                let _ =
-                    write_daemon_sandbox_process_plan_stream_frame_async(&mut writer, &frame).await;
-            }
-            let _ = writer.shutdown().await;
-        }),
-    };
-    let body = sinomo_core::network::ObjectRpcBodySource::async_reader(reader, None)
-        .with_lifetime_guard(producer)
-        .map_err(DaemonError::from)?;
-    Ok(sinomo_core::network::ObjectRpcOutgoingResponse::new(
-        response, body,
-    ))
 }
 
 async fn read_daemon_control_frame_async(
@@ -2738,1088 +2339,22 @@ async fn write_daemon_rpc_response_frame_async(
     .map_err(DaemonError::from)
 }
 
-pub(crate) fn accepted_rollout_should_stop_current_daemon(
-    paths: &DaemonPaths,
-    response: &sinomo_rollout::ClusterRolloutBinaryResponse,
-) -> bool {
-    response.status == "accepted" && !daemon_paths_are_shadow(paths)
-}
-
-#[cfg(feature = "sandbox")]
-fn daemon_maintenance_interval_remaining(
-    now: Instant,
-    last: Instant,
-    interval: Duration,
-) -> Duration {
-    interval.saturating_sub(now.saturating_duration_since(last))
-}
-
-fn daemon_sleep_duration_or_min(duration: Duration) -> Duration {
-    if duration.is_zero() {
-        Duration::from_millis(1)
-    } else {
-        duration
-    }
-}
-
+#[cfg(test)]
 fn daemon_shutdown_requested(shutdown_rx: &tokio::sync::watch::Receiver<bool>) -> bool {
     *shutdown_rx.borrow()
 }
 
-fn daemon_maintenance_sleep_duration(
-    cluster_next_due: Duration,
-    shadow_finalization_due: Option<Duration>,
-    sandbox_lifecycle_maintenance_due: Option<Duration>,
-) -> Duration {
-    let mut next_due = cluster_next_due;
-    if let Some(shadow_finalization_due) = shadow_finalization_due {
-        next_due = next_due.min(shadow_finalization_due);
-    }
-    if let Some(sandbox_lifecycle_maintenance_due) = sandbox_lifecycle_maintenance_due {
-        next_due = next_due.min(sandbox_lifecycle_maintenance_due);
-    }
-    daemon_sleep_duration_or_min(next_due)
-}
-
-fn daemon_rollout_handoff_pending(paths: &DaemonPaths) -> bool {
+fn component_maintenance_is_inhibited(
+    paths: &DaemonPaths,
+    inhibitors: &[sinomo_module::ComponentMaintenanceInhibitor],
+) -> bool {
     let Some(data_dir) = paths.root.parent() else {
         return false;
     };
-    let rollout_paths = SelfRolloutPaths::new(data_dir);
-    rollout_shadow_finalize_path(&rollout_paths).exists()
-        || rollout_main_activation_path(&rollout_paths).exists()
+    inhibitors.iter().any(|inhibit| inhibit(data_dir))
 }
 
-fn shadow_rollout_finalization_poll_due_in(paths: &DaemonPaths) -> Duration {
-    if paths.root.parent().is_none() {
-        return DAEMON_CLUSTER_TICK_INTERVAL;
-    }
-    if daemon_rollout_handoff_pending(paths) {
-        DAEMON_CLUSTER_TICK_INTERVAL
-    } else {
-        DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL
-    }
-}
-
-pub fn handle_daemon_sandbox_http_fetch(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxHttpRequest,
-) -> Result<sinomo_sandbox::SandboxHttpResponse, DaemonError> {
-    let config = load_daemon_sandbox_policy_config(paths)?;
-    config
-        .policy
-        .validate_http_request(&request)
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })?;
-    daemon_sandbox_http_fetch(request)
-}
-
-pub fn handle_daemon_sandbox_http_fetch_to_file(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxHttpFetchToFileRequest,
-) -> Result<sinomo_sandbox::SandboxHttpFetchFileResult, DaemonError> {
-    handle_daemon_sandbox_http_fetch_to_file_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_http_fetch_to_file_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxHttpFetchToFileRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxHttpFetchFileResult, DaemonError> {
-    let (lifecycle_lease, store, replica_candidates) =
-        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).http_fetch_to_file(
-        &lifecycle_lease,
-        store,
-        replica_candidates,
-        &DaemonSandboxHttpTransport,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_create(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxCreateInstanceRequest,
-) -> Result<sinomo_sandbox::SandboxCreateInstanceResponse, DaemonError> {
-    handle_daemon_sandbox_create_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_create_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxCreateInstanceRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxCreateInstanceResponse, DaemonError> {
-    let sandbox_id = request
-        .sandbox_id
-        .clone()
-        .unwrap_or_else(sinomo_sandbox::SandboxId::generate);
-    let (lifecycle_lease, mut store, _replica_candidates) =
-        open_daemon_sandbox_store_with_transaction_lease(paths, &sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).create(
-        &lifecycle_lease,
-        &mut store,
-        sandbox_id,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_status(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxStatusRequest,
-) -> Result<sinomo_sandbox::SandboxStatusResponse, DaemonError> {
-    handle_daemon_sandbox_status_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_status_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxStatusRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxStatusResponse, DaemonError> {
-    let mut store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).status(&mut store, request)
-}
-
-pub fn handle_daemon_sandbox_update(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxUpdateInstanceRequest,
-) -> Result<sinomo_sandbox::SandboxUpdateInstanceResponse, DaemonError> {
-    handle_daemon_sandbox_update_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_update_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxUpdateInstanceRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxUpdateInstanceResponse, DaemonError> {
-    let sandbox_id = request.sandbox_id.clone();
-    let (lifecycle_lease, store, replica_candidates) =
-        open_daemon_sandbox_store_with_mutation_lease(paths, &sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).update(
-        &lifecycle_lease,
-        store,
-        replica_candidates,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_checkpoint(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxCheckpointRequest,
-) -> Result<sinomo_sandbox::SandboxCheckpointResponse, DaemonError> {
-    handle_daemon_sandbox_checkpoint_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_checkpoint_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxCheckpointRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxCheckpointResponse, DaemonError> {
-    let (lifecycle_lease, mut store, _replica_candidates) =
-        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).checkpoint(
-        &lifecycle_lease,
-        &mut store,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_resume(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxResumeRequest,
-) -> Result<sinomo_sandbox::SandboxResumeResponse, DaemonError> {
-    handle_daemon_sandbox_resume_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_resume_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxResumeRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxResumeResponse, DaemonError> {
-    let (lifecycle_lease, mut store, _replica_candidates) =
-        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).resume(
-        &lifecycle_lease,
-        &mut store,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_reboot(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRebootRequest,
-) -> Result<sinomo_sandbox::SandboxRebootResponse, DaemonError> {
-    handle_daemon_sandbox_reboot_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_reboot_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRebootRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxRebootResponse, DaemonError> {
-    let (lifecycle_lease, mut store, _replica_candidates) =
-        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).reboot(
-        &lifecycle_lease,
-        &mut store,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_destroy(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxDestroyRequest,
-) -> Result<sinomo_sandbox::SandboxDestroyResponse, DaemonError> {
-    handle_daemon_sandbox_destroy_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_destroy_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxDestroyRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxDestroyResponse, DaemonError> {
-    let (lifecycle_lease, mut store, _replica_candidates) =
-        open_daemon_sandbox_store_with_transaction_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).destroy(
-        &lifecycle_lease,
-        &mut store,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_list(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxListRequest,
-) -> Result<sinomo_sandbox::SandboxListResponse, DaemonError> {
-    handle_daemon_sandbox_list_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_list_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxListRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxListResponse, DaemonError> {
-    let store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).list(store, request)
-}
-
-pub fn handle_daemon_sandbox_read(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxReadRequest,
-) -> Result<sinomo_sandbox::SandboxReadResponse, DaemonError> {
-    handle_daemon_sandbox_read_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_read_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxReadRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxReadResponse, DaemonError> {
-    let store = open_daemon_sandbox_instance_store_on_runtime(paths, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).read(store, request)
-}
-
-pub fn handle_daemon_sandbox_write(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxWriteRequest,
-) -> Result<sinomo_sandbox::SandboxWriteResponse, DaemonError> {
-    handle_daemon_sandbox_write_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_write_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxWriteRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxWriteResponse, DaemonError> {
-    let (lifecycle_lease, store, replica_candidates) =
-        open_daemon_sandbox_store_with_mutation_lease(paths, &request.sandbox_id, runtime)?;
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks).write(
-        &lifecycle_lease,
-        store,
-        replica_candidates,
-        request,
-    )
-}
-
-pub fn handle_daemon_sandbox_import_busybox(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxImportBusyBoxToolchainRequest,
-) -> Result<sinomo_sandbox::SandboxImportBusyBoxToolchainResponse, DaemonError> {
-    handle_daemon_sandbox_import_busybox_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_import_busybox_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxImportBusyBoxToolchainRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxImportBusyBoxToolchainResponse, DaemonError> {
-    let (dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).import_busybox(store, request)
-}
-
-pub fn handle_daemon_sandbox_toolchain_add_command(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxAddToolchainCommandRequest,
-) -> Result<sinomo_sandbox::SandboxAddToolchainCommandResponse, DaemonError> {
-    handle_daemon_sandbox_toolchain_add_command_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_toolchain_add_command_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxAddToolchainCommandRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxAddToolchainCommandResponse, DaemonError> {
-    let (dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).add_command(store, request)
-}
-
-pub(crate) fn handle_daemon_sandbox_toolchain_import_package_from_path_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxImportToolchainPackageFromPathRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
-    let request = sinomo_sandbox::load_sandbox_toolchain_package_from_path(request)?;
-    handle_daemon_sandbox_toolchain_import_package_on_runtime(paths, request, runtime)
-}
-
-pub fn handle_daemon_sandbox_toolchain_import_package(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxImportToolchainPackageRequest,
-) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
-    handle_daemon_sandbox_toolchain_import_package_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_toolchain_import_package_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxImportToolchainPackageRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxImportToolchainPackageResponse, DaemonError> {
-    let (dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).import_package(store, request)
-}
-
-pub fn handle_daemon_sandbox_toolchain_add_artifact(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxAddToolchainArtifactRequest,
-) -> Result<sinomo_sandbox::SandboxAddToolchainArtifactResponse, DaemonError> {
-    handle_daemon_sandbox_toolchain_add_artifact_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_toolchain_add_artifact_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxAddToolchainArtifactRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxAddToolchainArtifactResponse, DaemonError> {
-    let (dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(paths, runtime)?;
-    let store = sinomo_sandbox::SifsSandboxToolchainStore::new(dfs)
-        .with_replica_candidates(replica_candidates);
-    let mut hooks = DaemonSandboxLifecycleHooks { paths };
-    sinomo_sandbox::ClusteredSandboxToolchainRuntime::new(&mut hooks).add_artifact(store, request)
-}
-
-pub fn handle_daemon_sandbox_run_toolchain(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunToolchainRequest,
-) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    handle_daemon_sandbox_run_toolchain_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_run_toolchain_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunToolchainRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
-        paths,
-        request,
-        None,
-        runtime,
-        sinomo_sandbox::SandboxCancellationToken::new(),
-    )
-}
-
-pub(crate) fn handle_daemon_sandbox_run_toolchain_with_cancellation_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunToolchainRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
-        paths,
-        request,
-        None,
-        runtime,
-        cancellation_token,
-    )
-}
-
-pub fn handle_daemon_sandbox_run_process_plan(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
-    handle_daemon_sandbox_run_process_plan_on_runtime(paths, request, None)
-}
-
-pub(crate) fn handle_daemon_sandbox_run_process_plan_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
-    handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-        paths,
-        request,
-        None,
-        runtime,
-        sinomo_sandbox::SandboxCancellationToken::new(),
-    )
-}
-
-pub(crate) fn handle_daemon_sandbox_run_process_plan_with_cancellation_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    runtime: Option<&tokio::runtime::Handle>,
-    cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
-    handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-        paths,
-        request,
-        None,
-        runtime,
-        cancellation_token,
-    )
-}
-
-/// Error returned by sandbox-execution RPC handlers when the daemon was built
-/// without the `sandbox` feature, so external sandbox executors are not
-/// available.
-#[cfg(not(feature = "sandbox"))]
-fn sandbox_runtime_not_compiled_error() -> DaemonError {
-    DaemonError::Parse {
-        detail: "sandbox runtime not compiled in; rebuild with `--features sandbox`".to_string(),
-    }
-}
-
-#[cfg(not(feature = "sandbox"))]
-fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-    _paths: &DaemonPaths,
-    _request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
-    _runtime: Option<&tokio::runtime::Handle>,
-    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
-    Err(sandbox_runtime_not_compiled_error())
-}
-
-#[cfg(feature = "sandbox")]
-fn handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-    _paths: &DaemonPaths,
-    _request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
-    _runtime: Option<&tokio::runtime::Handle>,
-    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxProcessPlanOutcome, DaemonError> {
-    Err(DaemonError::Parse {
-        detail: "daemon-hosted dynamic SIFS sandbox process plans were removed; execute through an external sandbox executor or the live DFS/FUSE simple sandbox".to_string(),
-    })
-}
-
-#[cfg(not(feature = "sandbox"))]
-fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
-    _paths: &DaemonPaths,
-    _request: sinomo_sandbox::SandboxRunToolchainRequest,
-    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
-    _runtime: Option<&tokio::runtime::Handle>,
-    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    Err(sandbox_runtime_not_compiled_error())
-}
-
-#[cfg(feature = "sandbox")]
-fn handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
-    _paths: &DaemonPaths,
-    _request: sinomo_sandbox::SandboxRunToolchainRequest,
-    _output_sink: Option<Arc<dyn sinomo_sandbox::SandboxOutputSink>>,
-    _runtime: Option<&tokio::runtime::Handle>,
-    _cancellation_token: sinomo_sandbox::SandboxCancellationToken,
-) -> Result<sinomo_sandbox::SandboxLocalCommandOutcome, DaemonError> {
-    Err(DaemonError::Parse {
-        detail: "daemon-hosted dynamic SIFS sandbox commands were removed; execute through an external sandbox executor or the live DFS/FUSE simple sandbox".to_string(),
-    })
-}
-
-#[cfg(feature = "sandbox")]
-fn run_daemon_sandbox_lifecycle_maintenance_scan(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-    marked_sandbox_ids: BTreeSet<sinomo_sandbox::SandboxId>,
-) -> Result<usize, DaemonError> {
-    // Metadata generations remain independent across listing, lease mutation,
-    // and recovery, while the immutable-content caches and initialized local
-    // layout are safe to share for the complete bounded scan.
-    let content = open_daemon_sandbox_content_store(paths)?;
-    let (dfs, replica_candidates) =
-        open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
-            paths,
-            Some(runtime),
-            content.clone(),
-        )?;
-    let mut authoritative_store = sinomo_sandbox::SifsSandboxInstanceStore::new(dfs)
-        .with_replica_candidates(replica_candidates.clone());
-    let pending_manifests = authoritative_store.list_pending_authoritative_manifests()?;
-    drop(authoritative_store);
-
-    let pending_sandbox_ids = pending_manifests
-        .into_iter()
-        .map(|manifest| manifest.sandbox_id)
-        .collect::<BTreeSet<_>>();
-    let mut candidate_sandbox_ids = marked_sandbox_ids;
-    for sandbox_id in &pending_sandbox_ids {
-        // Safety sweeps can discover fences written by an older binary or a
-        // direct store user. Persist the marker before attempting recovery so
-        // a second crash cannot return the daemon to unindexed work.
-        daemon_sandbox_lifecycle_recovery_state(paths)
-            .mark_authoritative_recovery_pending(sandbox_id)?;
-        candidate_sandbox_ids.insert(sandbox_id.clone());
-    }
-
-    let mut recovered = 0_usize;
-    for sandbox_id in candidate_sandbox_ids {
-        let result = (|| -> Result<(), DaemonError> {
-            // Acquire the lease first, then open the recovery generation. A
-            // store retained from the listing scan would have a stale journal
-            // view after the lease mutation and could not safely append.
-            let lease_dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(
-                paths,
-                Some(runtime),
-                content.clone(),
-            )?;
-            let recovery_dfs = open_daemon_sandbox_dfs_service_with_content_on_runtime(
-                paths,
-                Some(runtime),
-                content.clone(),
-            )?;
-            let mut hooks = DaemonSandboxLifecycleHooks { paths };
-            sinomo_sandbox::ClusteredSandboxLifecycleRuntime::new(&mut hooks)
-                .open_operation(
-                    lease_dfs,
-                    recovery_dfs,
-                    replica_candidates.clone(),
-                    &sandbox_id,
-                    sinomo_sandbox::ClusteredSandboxOperationKind::Mutation,
-                    true,
-                )
-                .map(|_| ())
-        })();
-        match result {
-            Ok(()) if pending_sandbox_ids.contains(&sandbox_id) => {
-                recovered = recovered.saturating_add(1)
-            }
-            Ok(()) => {}
-            Err(error) => tracing::warn!(
-                sandbox_id = %sandbox_id,
-                error = %error,
-                "authoritative sandbox transaction remains fenced for retry"
-            ),
-        }
-    }
-    Ok(recovered)
-}
-
-#[cfg(feature = "sandbox")]
-fn run_daemon_sandbox_lifecycle_maintenance_tick_with_scan<F>(
-    paths: &DaemonPaths,
-    now_unix_nanos: u64,
-    scan: F,
-) -> Result<usize, DaemonError>
-where
-    F: FnOnce(BTreeSet<sinomo_sandbox::SandboxId>) -> Result<usize, DaemonError>,
-{
-    daemon_sandbox_lifecycle_recovery_state(paths).run_due_recovery(now_unix_nanos, scan)
-}
-
-#[cfg(feature = "sandbox")]
-fn run_daemon_sandbox_lifecycle_maintenance_tick(
-    paths: &DaemonPaths,
-    runtime: &tokio::runtime::Handle,
-) -> Result<usize, DaemonError> {
-    run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(
-        paths,
-        daemon_now_unix_nanos(),
-        |marked_sandbox_ids| {
-            run_daemon_sandbox_lifecycle_maintenance_scan(paths, runtime, marked_sandbox_ids)
-        },
-    )
-}
-
-pub(crate) async fn handle_daemon_sandbox_run_toolchain_stream_async_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunToolchainRequest,
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    enum StreamMessage {
-        Output(sinomo_sandbox::SandboxOutputChunk),
-        Complete {
-            sandbox_id: sinomo_sandbox::SandboxId,
-            result: Result<sinomo_sandbox::SandboxLocalCommandOutcome, String>,
-        },
-    }
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY);
-    let output_sender = sender.clone();
-    let paths = paths.clone();
-    let runtime = runtime.clone();
-    let worker = tokio::task::spawn_blocking(move || {
-        let sandbox_id = request.sandbox_id.clone();
-        let output_sink = Arc::new(move |chunk: sinomo_sandbox::SandboxOutputChunk| {
-            let _ = output_sender.blocking_send(StreamMessage::Output(chunk));
-        });
-        let result = handle_daemon_sandbox_run_toolchain_with_output_sink_on_runtime(
-            &paths,
-            request,
-            Some(output_sink),
-            Some(&runtime),
-            sinomo_sandbox::SandboxCancellationToken::new(),
-        )
-        .map_err(|error| error.to_string());
-        let _ = sender.blocking_send(StreamMessage::Complete { sandbox_id, result });
-    });
-
-    let mut sent_output_chunks = BTreeSet::new();
-    while let Some(message) = receiver.recv().await {
-        let frame = match message {
-            StreamMessage::Output(chunk) => {
-                sent_output_chunks.insert(sinomo_sandbox::sandbox_output_chunk_stream_key(&chunk));
-                sinomo_sandbox::SandboxRunToolchainStreamFrame::Output { chunk }
-            }
-            StreamMessage::Complete {
-                sandbox_id,
-                result: Ok(outcome),
-            } => {
-                let mut completion_output_chunks = outcome.output_chunks.clone();
-                if completion_output_chunks.is_empty() {
-                    completion_output_chunks.extend(
-                        sinomo_sandbox::sandbox_output_chunks_from_bytes(
-                            &outcome.response.command_id,
-                            &sandbox_id,
-                            sinomo_sandbox::SandboxOutputStream::Stdout,
-                            &outcome.stdout,
-                        ),
-                    );
-                    completion_output_chunks.extend(
-                        sinomo_sandbox::sandbox_output_chunks_from_bytes(
-                            &outcome.response.command_id,
-                            &sandbox_id,
-                            sinomo_sandbox::SandboxOutputStream::Stderr,
-                            &outcome.stderr,
-                        ),
-                    );
-                }
-                for chunk in &completion_output_chunks {
-                    if sent_output_chunks
-                        .insert(sinomo_sandbox::sandbox_output_chunk_stream_key(chunk))
-                    {
-                        let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Output {
-                            chunk: chunk.clone(),
-                        };
-                        write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
-                    }
-                }
-                let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Complete { outcome };
-                write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
-                worker.await.map_err(|source| DaemonError::Network {
-                    address: "daemon sandbox stream".to_string(),
-                    detail: format!("sandbox stream task failed: {source}"),
-                })?;
-                return Ok(());
-            }
-            StreamMessage::Complete {
-                result: Err(detail),
-                ..
-            } => {
-                let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error { detail };
-                write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
-                worker.await.map_err(|source| DaemonError::Network {
-                    address: "daemon sandbox stream".to_string(),
-                    detail: format!("sandbox stream task failed: {source}"),
-                })?;
-                return Ok(());
-            }
-        };
-        write_daemon_sandbox_stream_frame_async(writer, &frame).await?;
-    }
-
-    worker.await.map_err(|source| DaemonError::Network {
-        address: "daemon sandbox stream".to_string(),
-        detail: format!("sandbox stream task failed: {source}"),
-    })?;
-    Ok(())
-}
-
-pub(crate) async fn handle_daemon_sandbox_run_process_plan_stream_async_on_runtime(
-    paths: &DaemonPaths,
-    request: sinomo_sandbox::SandboxRunProcessPlanRequest,
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    runtime: &tokio::runtime::Handle,
-) -> Result<(), DaemonError> {
-    enum StreamMessage {
-        Output(sinomo_sandbox::SandboxOutputChunk),
-        Complete(Result<sinomo_sandbox::SandboxProcessPlanOutcome, String>),
-    }
-
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(DAEMON_SANDBOX_STREAM_CHANNEL_CAPACITY);
-    let output_sender = sender.clone();
-    let paths = paths.clone();
-    let runtime = runtime.clone();
-    let worker = tokio::task::spawn_blocking(move || {
-        let output_sink = Arc::new(move |chunk: sinomo_sandbox::SandboxOutputChunk| {
-            let _ = output_sender.blocking_send(StreamMessage::Output(chunk));
-        });
-        let result = handle_daemon_sandbox_run_process_plan_with_output_sink_on_runtime(
-            &paths,
-            request,
-            Some(output_sink),
-            Some(&runtime),
-            sinomo_sandbox::SandboxCancellationToken::new(),
-        )
-        .map_err(|error| error.to_string());
-        let _ = sender.blocking_send(StreamMessage::Complete(result));
-    });
-
-    let mut sent_output_chunks = BTreeSet::new();
-    while let Some(message) = receiver.recv().await {
-        match message {
-            StreamMessage::Output(chunk) => {
-                sent_output_chunks.insert(sinomo_sandbox::sandbox_output_chunk_stream_key(&chunk));
-                let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output { chunk };
-                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
-            }
-            StreamMessage::Complete(Ok(outcome)) => {
-                for step in &outcome.step_outcomes {
-                    for chunk in &step.output_chunks {
-                        if sent_output_chunks
-                            .insert(sinomo_sandbox::sandbox_output_chunk_stream_key(chunk))
-                        {
-                            let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Output {
-                                chunk: chunk.clone(),
-                            };
-                            write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame)
-                                .await?;
-                        }
-                    }
-                }
-                let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Complete { outcome };
-                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
-                worker.await.map_err(|source| DaemonError::Network {
-                    address: "daemon sandbox stream".to_string(),
-                    detail: format!("sandbox stream task failed: {source}"),
-                })?;
-                return Ok(());
-            }
-            StreamMessage::Complete(Err(detail)) => {
-                let frame = sinomo_sandbox::SandboxRunProcessPlanStreamFrame::Error { detail };
-                write_daemon_sandbox_process_plan_stream_frame_async(writer, &frame).await?;
-                worker.await.map_err(|source| DaemonError::Network {
-                    address: "daemon sandbox stream".to_string(),
-                    detail: format!("sandbox stream task failed: {source}"),
-                })?;
-                return Ok(());
-            }
-        }
-    }
-
-    worker.await.map_err(|source| DaemonError::Network {
-        address: "daemon sandbox stream".to_string(),
-        detail: format!("sandbox stream task failed: {source}"),
-    })?;
-    Ok(())
-}
-
-async fn write_daemon_sandbox_stream_frame_async(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    frame: &sinomo_sandbox::SandboxRunToolchainStreamFrame,
-) -> Result<(), DaemonError> {
-    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
-        sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE,
-        frame,
-    )
-    .map_err(DaemonError::from)?;
-    sinomo_core::network::write_object_frame_async(
-        writer,
-        &response,
-        sinomo_core::network::ObjectFrameIoOptions::none(),
-    )
-    .await
-    .map_err(DaemonError::from)
-}
-
-async fn write_daemon_sandbox_process_plan_stream_frame_async(
-    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-    frame: &sinomo_sandbox::SandboxRunProcessPlanStreamFrame,
-) -> Result<(), DaemonError> {
-    let response = sinomo_core::network::ObjectRpcResponse::encode_body(
-        sinomo_sandbox::SANDBOX_RUN_PROCESS_PLAN_STREAM_ROUTE,
-        frame,
-    )
-    .map_err(DaemonError::from)?;
-    sinomo_core::network::write_object_frame_async(
-        writer,
-        &response,
-        sinomo_core::network::ObjectFrameIoOptions::none(),
-    )
-    .await
-    .map_err(DaemonError::from)
-}
-
-fn load_daemon_sandbox_policy_config(
-    paths: &DaemonPaths,
-) -> Result<sinomo_sandbox::SandboxClusterPolicyConfig, DaemonError> {
-    let snapshot = handle_daemon_cluster_kv_snapshot(paths)?;
-    sinomo_sandbox::sandbox_policy_config_from_cluster_kv_snapshot(&snapshot)
-        .map_err(|source| DaemonError::Parse {
-            detail: source.to_string(),
-        })
-        .map(Option::unwrap_or_default)
-}
-
-pub fn open_daemon_sandbox_dfs_service(
-    paths: &DaemonPaths,
-) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
-    open_daemon_sandbox_dfs_service_on_runtime(paths, None)
-}
-
-fn open_daemon_sandbox_dfs_service_with_replica_candidates_on_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<(DaemonSandboxDfsService, Vec<NodeId>), DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    let dfs = sinomo_dfs::runtime_host::open_dfs_runtime_service(&data_dir, runtime)?;
-    let candidates =
-        sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(&data_dir, dfs.node_id());
-    Ok((dfs, candidates))
-}
-
-fn open_daemon_sandbox_dfs_service_with_replica_candidates_and_content_on_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-    content: sinomo_dfs::LocalContentStore,
-) -> Result<(DaemonSandboxDfsService, Vec<NodeId>), DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    let dfs = sinomo_dfs::runtime_host::open_dfs_runtime_service_with_content(
-        &data_dir, runtime, content,
-    )?;
-    let candidates =
-        sinomo_dfs::runtime_host::dfs_runtime_replica_candidates(&data_dir, dfs.node_id());
-    Ok((dfs, candidates))
-}
-
-fn open_daemon_sandbox_dfs_service_with_content_on_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-    content: sinomo_dfs::LocalContentStore,
-) -> Result<DaemonSandboxDfsService, DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    sinomo_dfs::runtime_host::open_dfs_runtime_service_with_content(&data_dir, runtime, content)
-        .map_err(Into::into)
-}
-
-fn open_daemon_sandbox_instance_store_on_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<DaemonSandboxInstanceStore, DaemonError> {
-    open_daemon_sandbox_dfs_service_on_runtime(paths, runtime)
-        .map(sinomo_sandbox::SifsSandboxInstanceStore::new)
-}
-
-pub(crate) fn open_daemon_sandbox_dfs_service_on_runtime(
-    paths: &DaemonPaths,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<sinomo_dfs::NetworkedDfsService<sinomo_dfs::DfsNodeTransport>, DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    sinomo_dfs::runtime_host::open_dfs_runtime_service(&data_dir, runtime).map_err(Into::into)
-}
-
-fn open_daemon_sandbox_content_store(
-    paths: &DaemonPaths,
-) -> Result<sinomo_dfs::LocalContentStore, DaemonError> {
-    let data_dir = SinomoDataDir::new(daemon_data_dir_path(paths)?);
-    sinomo_dfs::runtime_host::open_dfs_runtime_content_store(&data_dir).map_err(Into::into)
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct DaemonRolloutTelemetryHost {
-    pub(crate) paths: DaemonPaths,
-}
-
-impl sinomo_rollout::RolloutTelemetryHost for DaemonRolloutTelemetryHost {
-    fn reconcile_rollout_telemetry(
-        &self,
-    ) -> Result<sinomo_rollout::RolloutTelemetryReconcileOutcome, String> {
-        run_daemon_rollout_telemetry_reconciliation_tick(&self.paths)
-            .map_err(|error| error.to_string())
-    }
-}
-
-pub(crate) fn run_daemon_rollout_telemetry_reconciliation_tick(
-    paths: &DaemonPaths,
-) -> Result<sinomo_rollout::RolloutTelemetryReconcileOutcome, DaemonError> {
-    let data_dir = daemon_data_dir_path(paths)?;
-    let rollout_paths = SelfRolloutPaths::new(&data_dir);
-    let event_store = daemon_event_store(paths)?;
-    let node_id = daemon_rollout_controller_node_id(&data_dir)?;
-    let controller = RolloutController::new(node_id);
-    let gate_config =
-        sinomo_rollout::read_rollout_telemetry_gate_config(&rollout_paths)?.unwrap_or_default();
-    let result = controller.advance_rollout_from_live_telemetry(
-        &data_dir,
-        &rollout_paths,
-        &event_store,
-        RolloutTelemetryAdvanceOptions::from(gate_config),
-    )?;
-    let status = result.status;
-    let applied_transition = if status == RolloutTelemetryAdvanceStatus::AppliedTransition {
-        result.applied_transition
-    } else {
-        None
-    };
-    publish_daemon_module_rollout_status_from_data_dir(&data_dir, &rollout_paths)?;
-    Ok(sinomo_rollout::RolloutTelemetryReconcileOutcome {
-        status,
-        applied_transition,
-    })
-}
-
-fn publish_daemon_module_rollout_status_from_data_dir(
-    data_dir: &Path,
-    rollout_paths: &SelfRolloutPaths,
-) -> Result<Option<ClusterModuleRolloutStatusRecord>, DaemonError> {
-    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(data_dir);
-    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
-    let Ok(cluster_state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)
-    else {
-        return Ok(None);
-    };
-    let Some(runtime_state) = sinomo_rollout::read_rollout_runtime_state(rollout_paths)? else {
-        return Ok(None);
-    };
-    let telemetry_state = sinomo_rollout::read_rollout_telemetry_advance_state(rollout_paths)?
-        .filter(|telemetry| {
-            telemetry.rollout_plan_id == runtime_state.plan.rollout_plan_id
-                && telemetry.module_id == runtime_state.plan.module_id
-        });
-    let record = ClusterModuleRolloutStatusRecord {
-        cluster_id: cluster_state.cluster_id.clone(),
-        node_id: cluster_state.local_node_id.clone(),
-        rollout_plan_id: runtime_state.plan.rollout_plan_id.clone(),
-        module_id: runtime_state.plan.module_id.clone(),
-        artifact_id: runtime_state.plan.artifact_id.clone(),
-        stage: daemon_rollout_stage_label(&runtime_state.stage).to_string(),
-        current_weight_bps: runtime_state.current_weight_bps,
-        active_artifact_id: runtime_state.loader_state.active_artifact_id.clone(),
-        previous_artifact_id: runtime_state.loader_state.previous_artifact_id.clone(),
-        candidate_artifact_id: runtime_state.loader_state.candidate_artifact_id.clone(),
-        shadow_artifact_id: runtime_state.loader_state.shadow_artifact_id.clone(),
-        hot_swap_state: daemon_hot_swap_state_label(&runtime_state.loader_state.hot_swap_state)
-            .to_string(),
-        telemetry_kind: telemetry_state
-            .as_ref()
-            .map(|telemetry| telemetry.telemetry_kind.clone()),
-        telemetry_last_consumed_sequence: telemetry_state
-            .as_ref()
-            .and_then(|telemetry| telemetry.last_consumed_sequence)
-            .map(|sequence| sequence.0),
-        last_transition_record_id: telemetry_state
-            .as_ref()
-            .and_then(|telemetry| telemetry.last_transition_record_id.clone()),
-        updated_at: OffsetDateTime::now_utc(),
-    };
-    let op = sinomo_rollout::build_cluster_module_rollout_status_put_op(&record)?;
-    commit_daemon_rollout_kv_ops(&cluster_paths, &cluster_state, vec![op])?;
-    Ok(Some(record))
-}
-
-fn commit_daemon_rollout_kv_ops(
-    cluster_paths: &sinomo_core::network::ClusterPaths,
-    cluster_state: &sinomo_core::ClusterBootstrapState,
-    ops: Vec<sinomo_core::kv::KvOp>,
-) -> Result<sinomo_core::kv::KvSnapshot, DaemonError> {
-    let mut commit_state = cluster_state.clone();
-    crate::cluster::commit_cluster_kv_txn_with_quorum(
-        cluster_paths,
-        &mut commit_state,
-        sinomo_core::kv::KvTxn {
-            compares: Vec::new(),
-            success: ops,
-            failure: Vec::new(),
-        },
-    )
-}
-
-fn daemon_rollout_controller_node_id(
-    data_dir: &Path,
-) -> Result<sinomo_core::node::NodeId, DaemonError> {
-    let data_dir_handle = sinomo_core::local::SinomoDataDir::new(data_dir);
-    let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir_handle);
-    if let Ok(state) = sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths) {
-        return Ok(state.local_node_id);
-    }
-    let identity = sinomo_core::node::load_or_create_main_node_identity(data_dir)?;
-    Ok(sinomo_core::node::NodeId::derived(
-        "sinomo.rollout.local-node",
-        identity.public_key.as_bytes(),
-    ))
-}
-
-fn daemon_rollout_stage_label(stage: &sinomo_rollout::RolloutStage) -> &'static str {
-    match stage {
-        sinomo_rollout::RolloutStage::Shadow => "shadow",
-        sinomo_rollout::RolloutStage::Canary => "canary",
-        sinomo_rollout::RolloutStage::GuardedR1 => "guarded-r1",
-        sinomo_rollout::RolloutStage::Promoted => "promoted",
-        sinomo_rollout::RolloutStage::RolledBack => "rolled-back",
-        sinomo_rollout::RolloutStage::Quarantined => "quarantined",
-    }
-}
-
-fn daemon_hot_swap_state_label(state: &sinomo_core::HotSwapState) -> &'static str {
-    match state {
-        sinomo_core::HotSwapState::Stable => "stable",
-        sinomo_core::HotSwapState::Loading => "loading",
-        sinomo_core::HotSwapState::Shadowing => "shadowing",
-        sinomo_core::HotSwapState::Draining => "draining",
-        sinomo_core::HotSwapState::ActivationCheckpoint => "activation-checkpoint",
-        sinomo_core::HotSwapState::ActiveCandidate => "active-candidate",
-        sinomo_core::HotSwapState::RollbackCheckpoint => "rollback-checkpoint",
-        sinomo_core::HotSwapState::RollingBack => "rolling-back",
-        sinomo_core::HotSwapState::Quarantined => "quarantined",
-    }
-}
-
-pub(crate) fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
+pub fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, DaemonError> {
     paths
         .root
         .parent()
@@ -3828,151 +2363,6 @@ pub(crate) fn daemon_data_dir_path(paths: &DaemonPaths) -> Result<PathBuf, Daemo
             path: paths.root.display().to_string(),
             detail: "daemon root has no data directory parent".to_string(),
         })
-}
-
-fn append_daemon_sandbox_event(
-    paths: &DaemonPaths,
-    event: sinomo_core::EventEnvelope,
-) -> Result<(), DaemonError> {
-    let mut store = daemon_event_store(paths)?;
-    store.append(event)?;
-    Ok(())
-}
-
-/// Append a transaction-derived lifecycle event idempotently and make it
-/// durable before the authoritative sandbox fence can be cleared. A retry
-/// after append-before-clear observes the same derived event ID.
-fn append_daemon_sandbox_event_durable(
-    paths: &DaemonPaths,
-    event: sinomo_core::EventEnvelope,
-) -> Result<(), DaemonError> {
-    let event_id = event.event_id.clone();
-    let expected_kind = event.kind.clone();
-    let expected_payload = event.payload.clone();
-    let mut store = daemon_event_store(paths)?;
-    match store.append(event) {
-        Ok(_) => {}
-        Err(sinomo_core::events::EventStoreError::DuplicateEventId {
-            event_id: duplicate,
-        }) if duplicate == event_id => {
-            let existing = store
-                .replay(sinomo_core::events::ReplayQuery::all())?
-                .into_iter()
-                .find(|stored| stored.event.event_id == event_id)
-                .ok_or_else(|| DaemonError::Parse {
-                    detail: format!(
-                        "event store reported duplicate {event_id} but replay could not find it"
-                    ),
-                })?;
-            if existing.event.kind != expected_kind || existing.event.payload != expected_payload {
-                return Err(DaemonError::Parse {
-                    detail: format!(
-                        "event {event_id} duplicate payload does not match authoritative sandbox transaction"
-                    ),
-                });
-            }
-        }
-        Err(error) => return Err(error.into()),
-    }
-    store.sync_all()?;
-    Ok(())
-}
-
-fn daemon_event_store(
-    paths: &DaemonPaths,
-) -> Result<sinomo_core::events::JsonlEventStore, DaemonError> {
-    let data_dir = daemon_data_dir_path(paths)?;
-    Ok(sinomo_core::events::JsonlEventStore::new(
-        data_dir.join("events/event-log.jsonl"),
-    ))
-}
-
-fn daemon_sandbox_http_fetch(
-    request: sinomo_sandbox::SandboxHttpRequest,
-) -> Result<sinomo_sandbox::SandboxHttpResponse, DaemonError> {
-    let timeout = Duration::from_millis(request.timeout_ms);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-        .map_err(|source| DaemonError::Network {
-            address: "sandbox http client".to_string(),
-            detail: source.to_string(),
-        })?;
-    let method = match request.method {
-        sinomo_sandbox::SandboxHttpMethod::Get => reqwest::Method::GET,
-        sinomo_sandbox::SandboxHttpMethod::Post => reqwest::Method::POST,
-        sinomo_sandbox::SandboxHttpMethod::Put => reqwest::Method::PUT,
-        sinomo_sandbox::SandboxHttpMethod::Delete => reqwest::Method::DELETE,
-        sinomo_sandbox::SandboxHttpMethod::Head => reqwest::Method::HEAD,
-    };
-    let mut builder = client.request(method, &request.url).timeout(timeout);
-    for (name, value) in &request.headers {
-        builder = builder.header(name, value);
-    }
-    if !request.body.is_empty() {
-        builder = builder.body(request.body);
-    }
-    let mut response = builder.send().map_err(|source| DaemonError::Network {
-        address: request.url.clone(),
-        detail: source.to_string(),
-    })?;
-    if let Some(length) = response.content_length()
-        && length > request.max_response_bytes
-    {
-        return Err(DaemonError::Network {
-            address: request.url,
-            detail: format!(
-                "sandbox HTTP response is {length} bytes; max is {}",
-                request.max_response_bytes
-            ),
-        });
-    }
-    let status = response.status().as_u16();
-    let mut headers = std::collections::BTreeMap::new();
-    for (name, value) in response.headers() {
-        if let Ok(value) = value.to_str() {
-            headers.insert(name.as_str().to_string(), value.to_string());
-        }
-    }
-    let mut body = Vec::new();
-    response
-        .by_ref()
-        .take(request.max_response_bytes.saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(|source| DaemonError::Network {
-            address: request.url.clone(),
-            detail: source.to_string(),
-        })?;
-    if body.len() as u64 > request.max_response_bytes {
-        return Err(DaemonError::Network {
-            address: request.url,
-            detail: format!(
-                "sandbox HTTP response exceeded max of {} bytes",
-                request.max_response_bytes
-            ),
-        });
-    }
-    Ok(sinomo_sandbox::SandboxHttpResponse {
-        status,
-        headers,
-        body,
-    })
-}
-
-struct DaemonSandboxHttpTransport;
-
-impl sinomo_sandbox::SandboxHttpTransport for DaemonSandboxHttpTransport {
-    fn fetch(
-        &self,
-        request: &sinomo_sandbox::SandboxHttpRequest,
-    ) -> Result<sinomo_sandbox::SandboxHttpResponse, sinomo_sandbox::SandboxNetworkError> {
-        daemon_sandbox_http_fetch(request.clone()).map_err(|source| {
-            sinomo_sandbox::SandboxNetworkError::Transport {
-                detail: source.to_string(),
-            }
-        })
-    }
 }
 
 pub(crate) async fn daemon_status_response_async(
@@ -3987,26 +2377,6 @@ pub(crate) async fn daemon_status_response_async(
             path: read_path,
             detail: format!("daemon status read task failed: {source}"),
         })??;
-    // This route is the rollout and supervision liveness probe. It must report
-    // the local process state without waiting on cluster/KV repair or quorum.
-    if let Some(data_dir) = paths.root.parent() {
-        let rollout_paths = SelfRolloutPaths::new(data_dir);
-        let rollout_path = rollout_paths.root.display().to_string();
-        match tokio::task::spawn_blocking(move || read_rollout_status(&rollout_paths))
-            .await
-            .map_err(|source| DaemonError::Io {
-                path: rollout_path.clone(),
-                detail: format!("rollout status read task failed: {source}"),
-            }) {
-            Ok(Ok(rollout)) => status.rollout = rollout,
-            Ok(Err(error)) => {
-                tracing::warn!("sinomo daemon status rollout decoration skipped: {error}");
-            }
-            Err(error) => {
-                tracing::warn!("sinomo daemon status rollout decoration skipped: {error}");
-            }
-        }
-    }
     if let Some(stats) = crate::process_idle_stats() {
         status.idle_stats = Some(stats.snapshot());
     }
@@ -4675,41 +3045,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_session_body_uses_standard_object_frames() {
-        let expected_detail = "sandbox stream test".to_string();
-        let frame = sinomo_sandbox::SandboxRunToolchainStreamFrame::Error {
-            detail: expected_detail.clone(),
-        };
-        let (mut writer, mut reader) = tokio::io::duplex(4096);
-
-        write_daemon_sandbox_stream_frame_async(&mut writer, &frame)
-            .await
-            .expect("write sandbox response frame");
-        drop(writer);
-
-        let response: sinomo_core::network::ObjectRpcResponse =
-            sinomo_core::network::read_object_frame_async(
-                &mut reader,
-                sinomo_core::network::ObjectFrameIoOptions::none(),
-            )
-            .await
-            .expect("read standard object frame");
-        assert_eq!(
-            response.route,
-            sinomo_sandbox::SANDBOX_RUN_TOOLCHAIN_STREAM_ROUTE
-        );
-        let decoded: sinomo_sandbox::SandboxRunToolchainStreamFrame = response
-            .decode_body()
-            .expect("decode sandbox response body");
-        match decoded {
-            sinomo_sandbox::SandboxRunToolchainStreamFrame::Error { detail } => {
-                assert_eq!(detail, expected_detail);
-            }
-            other => panic!("unexpected sandbox response frame: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn daemon_forward_fast_path_rejects_wrong_category_before_target_io() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-forward-fast-category");
         let data_dir = SinomoDataDir::new(&root);
@@ -4964,149 +3299,6 @@ mod tests {
         assert_eq!(actual.pid, expected.pid);
         assert_eq!(actual.data_dir, expected.data_dir);
         assert!(actual.rollout.is_none());
-    }
-
-    #[test]
-    fn daemon_liveness_status_response_uses_rollout_state_file() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-liveness-rollout-state");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let paths = DaemonPaths::new(&data_dir);
-        paths.ensure().expect("daemon paths");
-        let options = DaemonRunOptions::default();
-        let mut raw = crate::DaemonStatus::new(&options, &paths, None);
-        raw.rollout = Some(sinomo_core::ClusterNodeRolloutStatus {
-            status: "in-progress".to_string(),
-            mode: Some("cluster-remote-build".to_string()),
-            detail: Some("building".to_string()),
-            phase: Some("building".to_string()),
-            progress_current: Some(2),
-            progress_total: Some(5),
-            progress_message: Some("building".to_string()),
-            source: None,
-            requested_at: None,
-            staged_at: None,
-            updated_at: None,
-            failed_at: None,
-            diagnostics: None,
-            stdout_log: None,
-            stderr_log: None,
-            stdout_tail: None,
-            stderr_tail: None,
-        });
-        crate::write_daemon_status(&paths, &raw).expect("write daemon status");
-        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
-        sinomo_rollout::write_rollout_status(
-            &rollout_paths,
-            &sinomo_core::ClusterNodeRolloutStatus {
-                status: "accepted".to_string(),
-                mode: Some("local-apply".to_string()),
-                detail: Some("shadow rollout finalized".to_string()),
-                phase: Some("shadow-finalized".to_string()),
-                progress_current: Some(5),
-                progress_total: Some(5),
-                progress_message: Some("shadow rollout finalized".to_string()),
-                source: None,
-                requested_at: None,
-                staged_at: None,
-                updated_at: None,
-                failed_at: None,
-                diagnostics: None,
-                stdout_log: None,
-                stderr_log: None,
-                stdout_tail: None,
-                stderr_tail: None,
-            },
-        )
-        .expect("write rollout status");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        let actual = runtime
-            .block_on(daemon_status_response_async(&paths, None))
-            .expect("liveness status");
-
-        let rollout = actual.rollout.expect("decorated rollout status");
-        assert_eq!(rollout.status, "accepted");
-        assert_eq!(rollout.phase.as_deref(), Some("shadow-finalized"));
-        assert_eq!(rollout.progress_current, Some(5));
-    }
-
-    #[test]
-    fn shadow_liveness_status_response_uses_shared_rollout_state_file() {
-        let root = sinomo_testdir::TestDir::new("sinomo-shadow-liveness-rollout-state");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let paths = DaemonPaths::for_shadow(&data_dir);
-        paths.ensure().expect("shadow daemon paths");
-        let options = DaemonRunOptions::default();
-        let expected = crate::DaemonStatus::new(&options, &paths, None);
-        crate::write_daemon_status(&paths, &expected).expect("write shadow daemon status");
-        let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
-        sinomo_rollout::write_rollout_status(
-            &rollout_paths,
-            &sinomo_core::ClusterNodeRolloutStatus {
-                status: "main-staged".to_string(),
-                mode: Some("cluster-remote-build".to_string()),
-                detail: None,
-                phase: Some("main-staged".to_string()),
-                progress_current: Some(5),
-                progress_total: Some(5),
-                progress_message: Some("candidate main staged".to_string()),
-                source: Some("snapshot".to_string()),
-                requested_at: Some("2026-08-08T22:37:42Z".to_string()),
-                staged_at: Some("2026-08-08T22:40:00Z".to_string()),
-                updated_at: None,
-                failed_at: None,
-                diagnostics: None,
-                stdout_log: None,
-                stderr_log: None,
-                stdout_tail: None,
-                stderr_tail: None,
-            },
-        )
-        .expect("write shared rollout status");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-
-        let actual = runtime
-            .block_on(daemon_status_response_async(&paths, None))
-            .expect("shadow liveness status");
-
-        assert_eq!(actual.pid, expected.pid);
-        let rollout = actual.rollout.expect("shared rollout status");
-        assert_eq!(rollout.status, "main-staged");
-        assert_eq!(rollout.phase.as_deref(), Some("main-staged"));
-        assert_eq!(rollout.source.as_deref(), Some("snapshot"));
-        assert_eq!(
-            rollout.requested_at.as_deref(),
-            Some("2026-08-08T22:37:42Z")
-        );
-    }
-
-    fn authorize_local_raft_voter_for_test(state: &mut sinomo_core::ClusterBootstrapState) {
-        let capabilities =
-            sinomo_core::node::main_daemon_capabilities(&sinomo_core::ClusterMemberRole::Voter);
-        let member = state
-            .members
-            .iter_mut()
-            .find(|member| member.node_id == state.local_node_id)
-            .expect("local cluster member");
-        member.capabilities = capabilities.clone();
-        member.allowed_capabilities = capabilities;
-    }
-
-    fn cluster_module_rollout_statuses_for_test(
-        paths: &sinomo_core::network::ClusterPaths,
-    ) -> Result<Vec<ClusterModuleRolloutStatusRecord>, sinomo_core::network::NetworkError> {
-        let state = sinomo_core::cluster::read_cluster_state_without_kv(paths)?;
-        let snapshot = sinomo_core::cluster::read_cluster_kv_local_snapshot(paths, &state)?.value;
-        sinomo_rollout::project_cluster_module_rollout_statuses_from_snapshot(&snapshot)
-            .map_err(sinomo_core::network::NetworkError::directory)
     }
 
     #[test]
@@ -5761,304 +3953,6 @@ mod tests {
     }
 
     #[test]
-    fn daemon_rollout_telemetry_tick_advances_from_event_log() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-telemetry");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let daemon_paths = DaemonPaths::new(&data_dir);
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let node = daemon_rollout_controller_node_id(&root).expect("node id");
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_candidate").expect("artifact");
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_active").expect("active");
-        let plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_telemetry")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let controller = RolloutController::new(node.clone());
-        let state = controller.initial_state(plan, active_artifact_id.clone());
-        sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
-        sinomo_rollout::write_rollout_telemetry_gate_config(
-            &rollout_paths,
-            &sinomo_rollout::RolloutTelemetryGateConfig {
-                automatic_promotion_enabled: true,
-                ..Default::default()
-            },
-        )
-        .expect("telemetry gate config");
-        let mut event_store =
-            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-        event_store
-            .append(module_shadow_decision_event(
-                &node,
-                &module_id,
-                &active_artifact_id,
-                &artifact_id,
-                true,
-            ))
-            .expect("append telemetry");
-
-        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
-            .expect("telemetry tick")
-            .applied_transition
-            .expect("applied transition");
-
-        assert_eq!(
-            applied.transition.action,
-            sinomo_rollout::RolloutAction::AdvanceCanary
-        );
-        assert_eq!(applied.transition.current_weight_bps, 500);
-        assert!(
-            sinomo_rollout::read_rollout_telemetry_advance_state(&rollout_paths)
-                .expect("checkpoint")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn daemon_rollout_telemetry_tick_respects_configured_promotion_gates() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-telemetry-gated");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let daemon_paths = DaemonPaths::new(&data_dir);
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let node = daemon_rollout_controller_node_id(&root).expect("node id");
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id = sinomo_core::Id::from_legacy_named("artifact_daemon_gated_candidate")
-            .expect("artifact");
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_gated_active").expect("active");
-        let plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_gated_telemetry")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let controller = RolloutController::new(node.clone());
-        let state = controller.initial_state(plan, active_artifact_id.clone());
-        sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
-        sinomo_rollout::write_rollout_telemetry_gate_config(
-            &rollout_paths,
-            &sinomo_rollout::RolloutTelemetryGateConfig {
-                automatic_promotion_enabled: true,
-                maximum_automatic_weight_bps: Some(250),
-                ..Default::default()
-            },
-        )
-        .expect("telemetry gate config");
-        let mut event_store =
-            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-        event_store
-            .append(module_shadow_decision_event(
-                &node,
-                &module_id,
-                &active_artifact_id,
-                &artifact_id,
-                true,
-            ))
-            .expect("append telemetry");
-
-        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
-            .expect("telemetry tick")
-            .applied_transition;
-
-        assert_eq!(applied, None);
-        assert_eq!(
-            sinomo_rollout::read_rollout_runtime_state(&rollout_paths)
-                .expect("runtime state")
-                .expect("runtime state"),
-            state
-        );
-    }
-
-    #[test]
-    fn daemon_rollout_telemetry_tick_uses_canary_events_in_canary_stage() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-rollout-canary-telemetry");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let daemon_paths = DaemonPaths::new(&data_dir);
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let node = daemon_rollout_controller_node_id(&root).expect("node id");
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id = sinomo_core::Id::from_legacy_named("artifact_daemon_canary_candidate")
-            .expect("artifact");
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_canary_active").expect("active");
-        let plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_canary_telemetry")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500, 2_500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let controller = RolloutController::new(node.clone());
-        let mut state = controller.initial_state(plan, active_artifact_id);
-        state.stage = sinomo_rollout::RolloutStage::Canary;
-        state.current_weight_bps = 500;
-        state.loader_state.hot_swap_state = sinomo_core::HotSwapState::ActiveCandidate;
-        sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
-        sinomo_rollout::write_rollout_telemetry_gate_config(
-            &rollout_paths,
-            &sinomo_rollout::RolloutTelemetryGateConfig {
-                automatic_promotion_enabled: true,
-                maximum_automatic_weight_bps: Some(2_500),
-                ..Default::default()
-            },
-        )
-        .expect("telemetry gate config");
-        let mut event_store =
-            sinomo_core::events::JsonlEventStore::new(root.join("events").join("event-log.jsonl"));
-        event_store
-            .append(module_invocation_decision_event(
-                &node,
-                &module_id,
-                &artifact_id,
-                "candidate",
-                None,
-            ))
-            .expect("append telemetry");
-
-        let applied = run_daemon_rollout_telemetry_reconciliation_tick(&daemon_paths)
-            .expect("telemetry tick")
-            .applied_transition
-            .expect("applied transition");
-
-        assert_eq!(
-            applied.transition.action,
-            sinomo_rollout::RolloutAction::AdvanceCanary
-        );
-        assert_eq!(applied.transition.current_weight_bps, 2_500);
-        assert_eq!(
-            sinomo_rollout::read_rollout_telemetry_advance_state(&rollout_paths)
-                .expect("checkpoint")
-                .expect("checkpoint")
-                .telemetry_kind,
-            "module.invocation.decision"
-        );
-    }
-
-    #[test]
-    fn daemon_publishes_module_rollout_status_to_cluster_kv() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-module-rollout-status");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
-        cluster_paths.ensure().expect("cluster paths");
-        let cluster_id =
-            sinomo_core::node::ClusterId::from_legacy_named("cluster_daemon_module_rollout_status")
-                .expect("cluster");
-        let node = NodeId::from_legacy_named("node_daemon_module_rollout_status").expect("node id");
-        let mut cluster_state = sinomo_core::ClusterBootstrapState::initialized_locally(
-            cluster_id.clone(),
-            "daemon module rollout status",
-            node.clone(),
-            "daemon node",
-            "public-key",
-            OffsetDateTime::now_utc(),
-        );
-        authorize_local_raft_voter_for_test(&mut cluster_state);
-        sinomo_core::cluster::write_cluster_state(&cluster_paths, &cluster_state)
-            .expect("write cluster state");
-        sinomo_core::cluster::sync_cluster_state_to_local_kv_unchecked(
-            &cluster_paths,
-            &cluster_state,
-        )
-        .expect("sync cluster state");
-        sinomo_core::cluster::locked_set_cluster_raft_leader(
-            &cluster_paths,
-            &cluster_state.local_node_id,
-            1,
-        )
-        .expect("set local raft leader");
-
-        let rollout_paths = SelfRolloutPaths::new(&root);
-        let module_id =
-            sinomo_core::Id::from_legacy_named("module.trigger.silence_policy").expect("module");
-        let artifact_id = sinomo_core::Id::from_legacy_named("artifact_daemon_status_candidate")
-            .expect("artifact");
-        let active_artifact_id =
-            sinomo_core::Id::from_legacy_named("artifact_daemon_status_active").expect("active");
-        let plan = sinomo_core::RolloutPlan {
-            rollout_plan_id: sinomo_core::Id::from_legacy_named("rollout_daemon_status")
-                .expect("rollout"),
-            artifact_id: artifact_id.clone(),
-            module_id: module_id.clone(),
-            target_ring: sinomo_core::TrustRing::R3SandboxedModule,
-            strategy: sinomo_core::RolloutStrategy::Shadow,
-            target_nodes: vec![node.clone()],
-            initial_weight_bps: 0,
-            promotion_steps_bps: vec![500],
-            rollback_policy: sinomo_core::RollbackPolicy::default(),
-        };
-        let controller = RolloutController::new(node.clone());
-        let mut state = controller.initial_state(plan, active_artifact_id.clone());
-        state.stage = sinomo_rollout::RolloutStage::Canary;
-        state.current_weight_bps = 500;
-        state.loader_state.hot_swap_state = sinomo_core::HotSwapState::ActiveCandidate;
-        sinomo_rollout::write_rollout_runtime_state(&rollout_paths, &state).expect("runtime state");
-        sinomo_rollout::write_rollout_telemetry_advance_state(
-            &rollout_paths,
-            &sinomo_rollout::RolloutTelemetryAdvanceState {
-                rollout_plan_id: state.plan.rollout_plan_id.clone(),
-                module_id: module_id.clone(),
-                candidate_artifact_id: artifact_id.clone(),
-                telemetry_kind: "module.invocation.decision".to_string(),
-                last_consumed_sequence: Some(sinomo_core::events::EventSequence(7)),
-                last_transition_record_id: Some(
-                    sinomo_core::Id::from_legacy_named("transition_daemon_status")
-                        .expect("transition"),
-                ),
-                updated_at: "2026-06-01T00:00:00Z".to_string(),
-            },
-        )
-        .expect("telemetry checkpoint");
-
-        let published = publish_daemon_module_rollout_status_from_data_dir(&root, &rollout_paths)
-            .expect("publish module rollout status")
-            .expect("published status");
-        let statuses =
-            cluster_module_rollout_statuses_for_test(&cluster_paths).expect("cluster statuses");
-
-        assert_eq!(published.cluster_id, cluster_id);
-        assert_eq!(published.node_id, node);
-        assert_eq!(published.module_id, module_id);
-        assert_eq!(published.stage, "canary");
-        assert_eq!(published.current_weight_bps, 500);
-        assert_eq!(published.active_artifact_id, active_artifact_id);
-        assert_eq!(published.candidate_artifact_id, Some(artifact_id));
-        assert_eq!(
-            published.telemetry_kind.as_deref(),
-            Some("module.invocation.decision")
-        );
-        assert_eq!(published.telemetry_last_consumed_sequence, Some(7));
-        assert_eq!(statuses, vec![published]);
-    }
-
-    #[test]
     fn settled_solo_daemon_publishes_dfs_topology_before_serving() {
         let root = sinomo_testdir::TestDir::new("sinomo-daemon-control-solo-dfs-ready");
         let data_dir = SinomoDataDir::new(&root);
@@ -6223,31 +4117,6 @@ mod tests {
     }
 
     #[test]
-    fn accepted_rollout_stops_main_but_not_shadow() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-control-rollout-main-stop");
-        std::fs::create_dir_all(root.join("daemon")).expect("main root");
-        std::fs::create_dir_all(root.join("shadow-daemon")).expect("shadow root");
-        let main_paths = DaemonPaths::with_root(root.join("daemon"));
-        let shadow_paths = DaemonPaths::with_root(root.join("shadow-daemon"));
-        let accepted = sinomo_rollout::ClusterRolloutBinaryResponse {
-            status: "accepted".to_string(),
-            detail: "staged".to_string(),
-            main_binary: root.join("bin/sinomo"),
-            shadow_binary: root.join("bin/sinomo-shadow"),
-            source_head: None,
-        };
-
-        assert!(accepted_rollout_should_stop_current_daemon(
-            &main_paths,
-            &accepted
-        ));
-        assert!(!accepted_rollout_should_stop_current_daemon(
-            &shadow_paths,
-            &accepted
-        ));
-    }
-
-    #[test]
     fn rollout_telemetry_reconciliation_does_not_own_desired_rollout_state() {
         let source = include_str!("control.rs");
         let telemetry_reconciliation = source
@@ -6260,69 +4129,6 @@ mod tests {
         assert!(
             !telemetry_reconciliation.contains("module_rollout_desired"),
             "telemetry source reconciliation must not poll or own desired rollout state"
-        );
-    }
-
-    #[cfg(feature = "sandbox")]
-    #[test]
-    fn clustered_startup_maintenance_precedes_sandbox_lifecycle_recovery() {
-        assert!(
-            !daemon_sandbox_lifecycle_maintenance_allowed("daemon", false),
-            "a fresh clustered replacement must get its first node-status pass before sandbox recovery"
-        );
-        assert!(
-            daemon_sandbox_lifecycle_maintenance_allowed("daemon", true),
-            "sandbox recovery resumes immediately after the bounded cluster startup pass"
-        );
-        assert!(
-            !daemon_sandbox_lifecycle_maintenance_allowed("shadow-daemon", true),
-            "the shadow supervisor never owns sandbox lifecycle recovery"
-        );
-    }
-
-    #[cfg(feature = "sandbox")]
-    #[test]
-    fn sandbox_lifecycle_marker_survives_failure_and_wakes_recovery() {
-        let root = sinomo_testdir::TestDir::new("sandbox-lifecycle-pending-marker");
-        let paths = DaemonPaths::with_root(root.join("daemon"));
-        fs::create_dir_all(&paths.root).expect("daemon root");
-        let now = 2_000_000_000_000_u64;
-        daemon_sandbox_lifecycle_recovery_state(&paths)
-            .record_safety_sweep(now)
-            .expect("sweep stamp");
-        let sandbox_id =
-            sinomo_sandbox::SandboxId::from_legacy_named("sandbox_pending_marker_recovery")
-                .expect("sandbox id");
-        daemon_sandbox_lifecycle_recovery_state(&paths)
-            .mark_authoritative_recovery_pending(&sandbox_id)
-            .expect("pending marker");
-
-        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now, |marked| {
-            assert_eq!(marked, BTreeSet::from([sandbox_id.clone()]));
-            Err(DaemonError::Parse {
-                detail: "injected recovery failure".to_string(),
-            })
-        })
-        .expect_err("failed recovery");
-        assert_eq!(
-            daemon_sandbox_lifecycle_recovery_state(&paths)
-                .pending_sandbox_ids()
-                .expect("pending ids"),
-            BTreeSet::from([sandbox_id.clone()])
-        );
-
-        run_daemon_sandbox_lifecycle_maintenance_tick_with_scan(&paths, now + 1, |marked| {
-            assert_eq!(marked, BTreeSet::from([sandbox_id.clone()]));
-            daemon_sandbox_lifecycle_recovery_state(&paths)
-                .clear_authoritative_recovery_pending(&sandbox_id)?;
-            Ok(1)
-        })
-        .expect("successful recovery");
-        assert!(
-            daemon_sandbox_lifecycle_recovery_state(&paths)
-                .pending_sandbox_ids()
-                .expect("settled ids")
-                .is_empty()
         );
     }
 
@@ -6352,127 +4158,6 @@ mod tests {
             !daemon_network_environment_watch_enabled_for(Some("unexpected"), true),
             "unknown override values preserve the Linux default"
         );
-    }
-
-    #[test]
-    fn shadow_rollout_finalization_poll_backs_off_when_idle() {
-        let root = sinomo_testdir::TestDir::new("sinomo-daemon-shadow-finalization-poll");
-        let data_dir = SinomoDataDir::new(&root);
-        data_dir.ensure_root_layout().expect("layout");
-        let paths = DaemonPaths::new(&data_dir);
-        let rollout_paths = SelfRolloutPaths::new(&root);
-
-        assert_eq!(
-            shadow_rollout_finalization_poll_due_in(&paths),
-            DAEMON_SHADOW_ROLLOUT_IDLE_FINALIZATION_INTERVAL,
-            "quiet daemons should not wake every tick just to check absent rollout files"
-        );
-        assert!(
-            !daemon_rollout_handoff_pending(&paths),
-            "quiet daemons have no rollout handoff marker"
-        );
-
-        std::fs::create_dir_all(&rollout_paths.root).expect("rollout dir");
-        std::fs::write(rollout_shadow_finalize_path(&rollout_paths), b"pending")
-            .expect("pending shadow marker");
-
-        assert!(
-            daemon_rollout_handoff_pending(&paths),
-            "pending shadow finalization pauses heavy maintenance"
-        );
-        assert_eq!(
-            shadow_rollout_finalization_poll_due_in(&paths),
-            DAEMON_CLUSTER_TICK_INTERVAL,
-            "active shadow finalization keeps the short fallback poll interval"
-        );
-
-        std::fs::remove_file(rollout_shadow_finalize_path(&rollout_paths))
-            .expect("remove pending shadow marker");
-        std::fs::write(rollout_main_activation_path(&rollout_paths), b"pending")
-            .expect("pending main activation marker");
-
-        assert!(
-            daemon_rollout_handoff_pending(&paths),
-            "pending main activation pauses heavy maintenance"
-        );
-        assert_eq!(
-            shadow_rollout_finalization_poll_due_in(&paths),
-            DAEMON_CLUSTER_TICK_INTERVAL,
-            "active main activation keeps the short fallback poll interval"
-        );
-    }
-
-    fn module_shadow_decision_event(
-        node_id: &NodeId,
-        module_id: &sinomo_core::Id,
-        primary_artifact_id: &sinomo_core::Id,
-        shadow_artifact_id: &sinomo_core::Id,
-        matched: bool,
-    ) -> sinomo_core::EventEnvelope {
-        sinomo_core::EventEnvelope::new(
-            sinomo_core::events::EventId::generate(),
-            OffsetDateTime::now_utc(),
-            node_id.clone(),
-            sinomo_core::Source::new("module.live").expect("source"),
-            sinomo_core::EventKind::new("module.shadow.decision").expect("kind"),
-            sinomo_core::Salience::new(0.72).expect("salience"),
-            sinomo_core::Confidence::new(0.95).expect("confidence"),
-            sinomo_core::RoutingMetadata::new(
-                sinomo_core::RoutingScope::TrustedNetwork,
-                sinomo_core::LatencyClass::Background,
-                sinomo_core::PrivacyClass::Derived,
-            ),
-        )
-        .with_target_node(node_id.clone())
-        .with_payload(serde_json::json!({
-            "route_key": "live-session",
-            "telemetry_source": "live",
-            "module_id": module_id.as_str(),
-            "primary_artifact_id": primary_artifact_id.as_str(),
-            "primary_lane": "active",
-            "shadow_artifact_id": shadow_artifact_id.as_str(),
-            "shadow_matched": matched,
-            "primary_output_bytes": 12,
-            "shadow_output_bytes": 12,
-            "primary_error": null,
-            "shadow_error": null,
-        }))
-    }
-
-    fn module_invocation_decision_event(
-        node_id: &NodeId,
-        module_id: &sinomo_core::Id,
-        primary_artifact_id: &sinomo_core::Id,
-        primary_lane: &str,
-        primary_error: Option<&str>,
-    ) -> sinomo_core::EventEnvelope {
-        sinomo_core::EventEnvelope::new(
-            sinomo_core::events::EventId::generate(),
-            OffsetDateTime::now_utc(),
-            node_id.clone(),
-            sinomo_core::Source::new("module.live").expect("source"),
-            sinomo_core::EventKind::new("module.invocation.decision").expect("kind"),
-            sinomo_core::Salience::new(0.72).expect("salience"),
-            sinomo_core::Confidence::new(0.95).expect("confidence"),
-            sinomo_core::RoutingMetadata::new(
-                sinomo_core::RoutingScope::TrustedNetwork,
-                sinomo_core::LatencyClass::Background,
-                sinomo_core::PrivacyClass::Derived,
-            ),
-        )
-        .with_target_node(node_id.clone())
-        .with_payload(serde_json::json!({
-            "route_key": "live-session",
-            "telemetry_source": "live",
-            "module_id": module_id.as_str(),
-            "primary_artifact_id": primary_artifact_id.as_str(),
-            "primary_lane": primary_lane,
-            "traffic_weight_bps": 500,
-            "route_bucket_bps": 42,
-            "hot_swap_state": "active-candidate",
-            "primary_output_bytes": 12,
-            "primary_error": primary_error,
-        }))
     }
 
     fn send_test_status_request(

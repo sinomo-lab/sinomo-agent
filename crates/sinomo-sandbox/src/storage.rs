@@ -4,6 +4,14 @@ use sinomo_core::storage::{StorageContractError, StorageLayout, StorageRing};
 pub fn register_storage_paths(layout: &mut StorageLayout) -> Result<(), StorageContractError> {
     for (relative_path, reason) in [
         (
+            "daemon/sandbox-lifecycle-recovery",
+            "durable clustered sandbox lifecycle recovery markers and sweep state",
+        ),
+        (
+            "shadow-daemon/sandbox-lifecycle-recovery",
+            "legacy shadow-hosted sandbox lifecycle recovery markers and sweep state",
+        ),
+        (
             "sandbox/cache/toolchains",
             "node-local cache for SIFS-replicated sandbox toolchain artifacts",
         ),

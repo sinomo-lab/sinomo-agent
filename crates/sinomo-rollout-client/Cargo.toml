@@ -1,0 +1,22 @@
+[package]
+name = "sinomo-rollout-client"
+version.workspace = true
+description = "Typed client for the Sinomo rollout component"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "r1"
+
+[dependencies]
+serde.workspace = true
+sinomo-core = { path = "../sinomo-core" }
+sinomo-daemon = { path = "../sinomo-daemon", default-features = false }
+sinomo-rollout = { path = "../sinomo-rollout" }
+tokio.workspace = true
+
+[dev-dependencies]
+blake3.workspace = true
+sinomo-testdir = { path = "../sinomo-testdir" }
