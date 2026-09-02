@@ -74,6 +74,11 @@ use sinomo_client::{
     SifsPlacementPreviewToken, SifsPlacementReconciliationJob, SifsPlacementScope,
     SifsPlacementUpdateOutcome, SifsReplaceFileIfVersionOutcome,
 };
+use sinomo_runtime::module::UiExtensionCatalogEntry;
+use sinomo_runtime::module_api::{
+    FILE_PREVIEW_EXTENSION_POINT_ID, FILE_PREVIEW_EXTENSION_POINT_VERSION, UiContentGrant,
+    UiContributionPayload,
+};
 use sinomo_runtime::{
     api::{
         DAEMON_EVENT_SUBSCRIBE_ROUTE, DAEMON_RPC_CATEGORY, DaemonApiError, DaemonEventStreamItem,
@@ -93,6 +98,7 @@ use crate::ui::files_thumbnail::{
     ThumbnailBitmap, ThumbnailBucket, ThumbnailCache, ThumbnailCacheEntry, ThumbnailIdentity,
     ThumbnailRequest, ThumbnailRequestKey, decode_thumbnail, thumbnail_candidate,
 };
+use crate::ui::module_widget::{ModuleWidget, ModuleWidgetSession};
 use crate::ui::settings::SettingsSection;
 use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot};
 
@@ -134,6 +140,10 @@ const PLACE_SECTION_HEADER_H: f32 = 28.0;
 const PLACE_SECTION_GAP: f32 = 12.0;
 const PLACE_RAIL_BOTTOM_PAD: f32 = 12.0;
 const FILE_PREVIEW_MAX_BYTES: u64 = 32 * 1024;
+/// Custom preview components may inspect a larger, still bounded prefix through
+/// their per-instance content grant. No path or filesystem capability crosses
+/// into the extension host.
+const CUSTOM_FILE_PREVIEW_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const FILE_PREVIEW_MAX_LINES: usize = 8;
 /// The text surface keeps the entire accepted document resident. Reject larger files explicitly
 /// instead of silently presenting a partial document that could be saved over the original.
@@ -899,6 +909,15 @@ struct FilesPreview {
     lines: Vec<String>,
     truncated: bool,
     binary: bool,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct CustomFilesPreview {
+    contribution_id: String,
+    label: String,
+    sizing: sinomo_runtime::module_api::UiWidgetSizing,
+    session: ModuleWidgetSession,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1139,6 +1158,9 @@ pub struct FilesState {
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
+    ui_preview_catalog_generation: u64,
+    ui_preview_entries: Vec<UiExtensionCatalogEntry>,
+    custom_preview: Option<CustomFilesPreview>,
     history_open: bool,
     history_revision: u64,
     history_loading: bool,
@@ -1299,6 +1321,7 @@ struct FilesInspectorStructure {
     selected_preview: Option<FilesPreview>,
     preview_loading: bool,
     preview_error: Option<String>,
+    custom_preview_id: Option<String>,
     inspector_details_open: bool,
 }
 
@@ -1448,6 +1471,7 @@ impl FilesStructureKey {
                     selected_preview: None,
                     preview_loading: false,
                     preview_error: None,
+                    custom_preview_id: None,
                     inspector_details_open: false,
                 },
                 tasks: Vec::new(),
@@ -1520,6 +1544,10 @@ impl FilesStructureKey {
             selected_preview: state.selected_preview.clone(),
             preview_loading: state.preview_loading,
             preview_error: state.preview_error.clone(),
+            custom_preview_id: state
+                .custom_preview
+                .as_ref()
+                .map(|preview| preview.contribution_id.clone()),
             inspector_details_open: state.inspector_details_open,
         };
         let placement_activity = FilesPlacementActivityStructure {
@@ -1605,6 +1633,19 @@ impl FilesStructureKey {
 impl FilesState {
     pub fn new(backend: &Backend) -> Self {
         let local_path = default_local_path(backend.data_dir.root());
+        let (ui_preview_catalog_generation, ui_preview_entries) =
+            match backend.ui_extension_catalog(Some(FILE_PREVIEW_EXTENSION_POINT_ID)) {
+                Ok(catalog) => {
+                    for warning in catalog.warnings {
+                        tracing::warn!(%warning, "UI extension catalog warning");
+                    }
+                    (catalog.registry_generation, catalog.entries)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "UI extension catalog is unavailable");
+                    (0, Vec::new())
+                }
+            };
         Self {
             data_dir: backend.data_dir.clone(),
             daemon_address: backend.connection.daemon_address().map(str::to_string),
@@ -1637,6 +1678,9 @@ impl FilesState {
             selected_preview: None,
             preview_loading: false,
             preview_error: None,
+            ui_preview_catalog_generation,
+            ui_preview_entries,
+            custom_preview: None,
             history_open: false,
             history_revision: 0,
             history_loading: false,
@@ -2432,6 +2476,7 @@ impl FilesState {
                         self.preview_loading = false;
                         self.pending_preview_request_id = None;
                         self.selected_preview = None;
+                        self.custom_preview = None;
                         self.preview_error = Some("SIFS browser worker stopped".to_string());
                         changed = true;
                     }
@@ -2693,11 +2738,13 @@ impl FilesState {
                 }
                 match result {
                     Ok(preview) => {
+                        self.custom_preview = self.start_custom_preview(&path, &preview);
                         self.selected_preview = Some(preview);
                         self.preview_error = None;
                     }
                     Err(error) => {
                         self.selected_preview = None;
+                        self.custom_preview = None;
                         self.preview_error = Some(error);
                     }
                 }
@@ -3522,6 +3569,7 @@ impl FilesState {
         self.details_error = None;
         self.pending_details_request_id = None;
         self.selected_preview = None;
+        self.custom_preview = None;
         self.preview_loading = false;
         self.preview_error = None;
         self.pending_preview_request_id = None;
@@ -3619,6 +3667,7 @@ impl FilesState {
 
     fn request_selected_preview(&mut self, entry: SifsEntry) {
         self.selected_preview = None;
+        self.custom_preview = None;
         self.preview_error = None;
         self.pending_preview_request_id = None;
         if entry.is_dir {
@@ -3626,6 +3675,11 @@ impl FilesState {
             return;
         }
         if let Some(tx) = self.worker_tx.clone() {
+            let max_bytes = if self.ui_preview_entries.is_empty() {
+                FILE_PREVIEW_MAX_BYTES
+            } else {
+                CUSTOM_FILE_PREVIEW_MAX_BYTES
+            };
             let request_id = self.next_request_id;
             self.next_request_id = self.next_request_id.wrapping_add(1);
             self.pending_preview_request_id = Some(request_id);
@@ -3635,6 +3689,7 @@ impl FilesState {
                     request_id,
                     source: self.source,
                     path: entry.path,
+                    max_bytes,
                 })
                 .is_err()
             {
@@ -3646,6 +3701,11 @@ impl FilesState {
         }
 
         self.preview_loading = false;
+        let max_bytes = if self.ui_preview_entries.is_empty() {
+            FILE_PREVIEW_MAX_BYTES
+        } else {
+            CUSTOM_FILE_PREVIEW_MAX_BYTES
+        };
         let result = match self.source {
             FilesSourceKind::Sifs => self
                 .browser
@@ -3653,15 +3713,94 @@ impl FilesState {
                 .ok_or_else(|| "SIFS browser is not open".to_string())
                 .and_then(|browser| {
                     browser
-                        .read_file_prefix(&entry.path, FILE_PREVIEW_MAX_BYTES)
+                        .read_file_prefix(&entry.path, max_bytes)
                         .map(|read| preview_from_read(&entry.name, read))
                 }),
-            FilesSourceKind::Local => local_read_file_prefix(&entry.path, FILE_PREVIEW_MAX_BYTES)
+            FilesSourceKind::Local => local_read_file_prefix(&entry.path, max_bytes)
                 .map(|read| preview_from_read(&entry.name, read)),
         };
         match result {
-            Ok(preview) => self.selected_preview = Some(preview),
-            Err(error) => self.preview_error = Some(error),
+            Ok(preview) => {
+                self.custom_preview = self.start_custom_preview(&entry.path, &preview);
+                self.selected_preview = Some(preview);
+            }
+            Err(error) => {
+                self.custom_preview = None;
+                self.preview_error = Some(error);
+            }
+        }
+    }
+
+    fn start_custom_preview(
+        &self,
+        path: &str,
+        preview: &FilesPreview,
+    ) -> Option<CustomFilesPreview> {
+        if cfg!(target_os = "android") {
+            // Android needs a platform isolated-service host rather than the
+            // desktop sibling-executable lifecycle. Preserve the built-in
+            // preview until that backend exists.
+            return None;
+        }
+        let name = Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(path);
+        let matches = self
+            .ui_preview_entries
+            .iter()
+            .filter(|entry| ui_preview_entry_matches(entry, name, &preview.bytes))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matches.len() > 1 {
+            tracing::warn!(
+                file_name = name,
+                providers = matches.len(),
+                "custom file preview is ambiguous; preserving the built-in preview until the user selects a provider"
+            );
+            return None;
+        }
+        let entry = matches.into_iter().next()?;
+        let UiContributionPayload::CustomWidget { widget } = &entry.contribution.payload else {
+            return None;
+        };
+        entry.component_path.as_ref()?;
+        let content = UiContentGrant {
+            grant_id: format!(
+                "files.preview.{}.{}",
+                self.ui_preview_catalog_generation, self.list_revision
+            ),
+            display_name: name.to_string(),
+            content_version: format!("{}:{}", self.list_revision, path),
+            size_bytes: self
+                .selected_entry()
+                .and_then(|selected| selected.size)
+                .unwrap_or_else(|| {
+                    (preview.bytes.len() as u64).saturating_add(u64::from(preview.truncated))
+                }),
+            media_type: None,
+            initial_bytes: preview.bytes.clone(),
+        };
+        match ModuleWidgetSession::start(
+            entry.clone(),
+            content,
+            DefaultTheme::default(),
+            self.worker_waker.clone(),
+        ) {
+            Ok(session) => Some(CustomFilesPreview {
+                contribution_id: entry.contribution.contribution_id,
+                label: widget.label.clone(),
+                sizing: widget.sizing,
+                session,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    contribution_id = %entry.contribution.contribution_id,
+                    %error,
+                    "custom file preview did not start"
+                );
+                None
+            }
         }
     }
 
@@ -6205,6 +6344,7 @@ enum FilesWorkerCommand {
         request_id: u64,
         source: FilesSourceKind,
         path: String,
+        max_bytes: u64,
     },
     ReadDocument {
         request_id: u64,
@@ -6616,6 +6756,7 @@ fn files_worker_loop(
                 request_id,
                 source,
                 path,
+                max_bytes,
             } => {
                 let requested_path = normalize_source_path(source, &path);
                 let (path, result) = if source == FilesSourceKind::Local {
@@ -6637,7 +6778,7 @@ fn files_worker_loop(
                         .and_then(|name| name.to_str())
                         .unwrap_or(&path)
                         .to_string();
-                    let result = local_read_file_prefix(&path, FILE_PREVIEW_MAX_BYTES)
+                    let result = local_read_file_prefix(&path, max_bytes)
                         .map(|read| preview_from_read(&name, read));
                     (path, result)
                 } else if let Some(error) = &open_error {
@@ -6669,7 +6810,7 @@ fn files_worker_loop(
                                 .unwrap_or(&path)
                                 .to_string();
                             let result = browser
-                                .read_file_prefix(&path, FILE_PREVIEW_MAX_BYTES)
+                                .read_file_prefix(&path, max_bytes)
                                 .map(|read| preview_from_read(&name, read));
                             (path, result)
                         }
@@ -10976,6 +11117,7 @@ fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
             lines: vec!["Empty file".to_string()],
             truncated: read.truncated,
             binary: false,
+            bytes: read.bytes,
         };
     }
     if !preview_bytes_are_text(&read.bytes) {
@@ -10984,6 +11126,7 @@ fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
             lines: binary_preview_lines(&read.bytes),
             truncated: read.truncated,
             binary: true,
+            bytes: read.bytes,
         };
     }
     let text = String::from_utf8_lossy(&read.bytes).replace("\r\n", "\n");
@@ -11007,7 +11150,32 @@ fn preview_from_read(name: &str, read: SifsFileRead) -> FilesPreview {
         lines,
         truncated: read.truncated || line_truncated,
         binary: false,
+        bytes: read.bytes,
     }
+}
+
+fn ui_preview_entry_matches(
+    entry: &UiExtensionCatalogEntry,
+    file_name: &str,
+    bytes: &[u8],
+) -> bool {
+    if entry.component_path.is_none()
+        || entry.contribution.extension_point_id != FILE_PREVIEW_EXTENSION_POINT_ID
+        || entry.contribution.extension_point_version != FILE_PREVIEW_EXTENSION_POINT_VERSION
+    {
+        return false;
+    }
+    let UiContributionPayload::CustomWidget { widget } = &entry.contribution.payload else {
+        return false;
+    };
+    let file_name = file_name.to_ascii_lowercase();
+    widget.selectors.iter().any(|selector| {
+        selector
+            .file_extensions
+            .iter()
+            .any(|extension| file_name.ends_with(&extension.to_ascii_lowercase()))
+            || (!selector.magic_prefix.is_empty() && bytes.starts_with(&selector.magic_prefix))
+    })
 }
 
 fn preview_bytes_are_text(bytes: &[u8]) -> bool {
@@ -15801,10 +15969,32 @@ fn preview_card(
     loading: bool,
     error: Option<&str>,
     preview: Option<&FilesPreview>,
+    custom_preview: Option<&CustomFilesPreview>,
     reader: &ThemeReader,
 ) -> Surface {
     let theme = reader();
     let mut body = Stack::vertical().alignment(Alignment::Stretch).spacing(8.0);
+    if !loading
+        && error.is_none()
+        && let Some(custom) = custom_preview
+    {
+        body = body
+            .with_child(
+                StatusBadge::new(format!("Custom preview · {}", custom.label))
+                    .tone(SemanticTone::Accent)
+                    .theme_when(clone_reader(reader)),
+            )
+            .with_child(
+                SizedBox::new()
+                    .height(custom.sizing.preferred_height.clamp(160, 420) as f32)
+                    .with_child(ModuleWidget::new(
+                        custom.session.clone(),
+                        custom.sizing,
+                        reader.clone(),
+                    )),
+            );
+        return inspector_card("Preview", body, reader, None, false);
+    }
     let (badge, badge_tone, text, muted) = if loading {
         (
             "Reading preview",
@@ -16302,6 +16492,7 @@ fn composed_inspector_content(shared: &Shared, reader: &ThemeReader) -> WidgetPo
             files.preview_loading,
             files.preview_error.as_deref(),
             files.selected_preview.as_ref(),
+            files.custom_preview.as_ref(),
             reader,
         ));
     }
@@ -27396,6 +27587,117 @@ mod tests {
         assert!(binary.binary);
         assert!(binary.truncated);
         assert!(binary.lines.iter().any(|line| line.contains("00 01 02 03")));
+        assert_eq!(binary.bytes, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn custom_preview_selector_matches_extension_or_magic_without_claiming_other_files() {
+        use sinomo_runtime::module_api::{
+            FILE_PREVIEW_EXTENSION_POINT_VERSION, UiComponentArtifact, UiContentSelector,
+            UiCustomWidgetContribution, UiExtensionContribution,
+        };
+
+        let mut magic = UiContentSelector::default();
+        magic.magic_prefix = b"SINO".to_vec();
+        let widget = UiCustomWidgetContribution::new(
+            "Fixture preview",
+            UiComponentArtifact::wasm(
+                "artifact.fixture.preview",
+                format!("blake3:{}", "0".repeat(64)),
+                "ui/fixture.wasm",
+                "sinomo:ui-widget/widget",
+            ),
+        )
+        .with_selector(UiContentSelector::extension(".fixture"))
+        .with_selector(magic);
+        let entry = UiExtensionCatalogEntry {
+            module_id: "module.fixture".to_string(),
+            module_version: "1.0.0".to_string(),
+            module_backend: "declarative".to_string(),
+            component_path: Some("/verified/ui/fixture.wasm".to_string()),
+            contribution: UiExtensionContribution::custom_widget(
+                "module.fixture.preview",
+                FILE_PREVIEW_EXTENSION_POINT_ID,
+                FILE_PREVIEW_EXTENSION_POINT_VERSION,
+                widget,
+            ),
+        };
+
+        assert!(ui_preview_entry_matches(&entry, "model.FIXTURE", b"other"));
+        assert!(ui_preview_entry_matches(&entry, "model.bin", b"SINOMO"));
+        assert!(!ui_preview_entry_matches(&entry, "model.bin", b"other"));
+    }
+
+    #[test]
+    fn preview_card_mounts_cached_custom_widget_instead_of_binary_fallback() -> sui::Result<()> {
+        use sinomo_runtime::module_api::{
+            UiRect, UiSemanticsNode, UiSemanticsRole, UiWidgetFrame, UiWidgetSizing,
+        };
+
+        let session = ModuleWidgetSession::from_frame(UiWidgetFrame {
+            generation: 1,
+            semantics: vec![UiSemanticsNode {
+                id: "fixture.custom.preview".to_string(),
+                parent_id: None,
+                role: UiSemanticsRole::Canvas,
+                bounds: UiRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 280.0,
+                    height: 180.0,
+                },
+                name: Some("Rendered fixture format".to_string()),
+                value: None,
+                actions: Vec::new(),
+            }],
+            ..UiWidgetFrame::default()
+        });
+        let custom = CustomFilesPreview {
+            contribution_id: "module.fixture.preview".to_string(),
+            label: "Fixture format".to_string(),
+            sizing: UiWidgetSizing::default(),
+            session,
+        };
+        let fallback = preview_from_read(
+            "model.fixture",
+            SifsFileRead {
+                bytes: vec![0, 1, 2, 3],
+                truncated: false,
+            },
+        );
+        let reader: ThemeReader = Rc::new(DefaultTheme::dark);
+        let runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Custom Files preview")
+                    .root(
+                        SizedBox::new()
+                            .width(340.0)
+                            .height(420.0)
+                            .with_child(preview_card(
+                                FilesSourceKind::Sifs,
+                                false,
+                                None,
+                                Some(&fallback),
+                                Some(&custom),
+                                &reader,
+                            )),
+                    ),
+            )
+            .build()?;
+        let app = sui_testing::TestApp::from_runtime(runtime)?;
+        let window = app.main_window()?;
+        window
+            .get_by_text("Custom preview · Fixture format")
+            .expect()
+            .to_be_visible()?;
+        window
+            .get_by_role(SemanticsRole::Canvas)
+            .with_name("Rendered fixture format")
+            .expect()
+            .to_be_visible()?;
+        window.get_by_text("00 01 02 03").expect().to_be_hidden()?;
+        Ok(())
     }
 
     #[test]

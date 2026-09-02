@@ -2,6 +2,7 @@
 
 mod chat_render;
 mod files_thumbnail;
+mod module_widget;
 
 pub mod chat;
 pub mod cluster;

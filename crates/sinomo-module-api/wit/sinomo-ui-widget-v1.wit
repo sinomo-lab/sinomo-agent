@@ -1,0 +1,10 @@
+package sinomo:ui-widget@1.0.0;
+
+interface widget {
+    /// Receives and returns a SOBJ envelope defined by sinomo-module-api.
+    handle: func(request-sobj: list<u8>) -> list<u8>;
+}
+
+world ui-widget {
+    export widget;
+}

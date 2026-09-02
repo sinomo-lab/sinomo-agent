@@ -5,8 +5,10 @@
 //! service implementation dependency.
 
 mod component;
+mod ui;
 
 pub use component::*;
+pub use ui::*;
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
@@ -458,6 +460,10 @@ pub struct NativeModuleSurfaces {
     /// load-bearing for descriptors produced before interface discovery.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interface_exports: Vec<ModuleInterfaceExport>,
+    /// Application UI contributions. Custom widgets reference immutable UI
+    /// component artifacts and never carry native widget callbacks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_contributions: Vec<UiExtensionContribution>,
 }
 
 impl NativeModuleSurfaces {
@@ -470,6 +476,7 @@ impl NativeModuleSurfaces {
             && self.settings.is_empty()
             && self.network_transports.is_empty()
             && self.interface_exports.is_empty()
+            && self.ui_contributions.is_empty()
     }
 }
 
@@ -814,6 +821,7 @@ mod tests {
         assert_eq!(decoded.module_id, "module.legacy");
         assert_eq!(decoded.surfaces.storage_owners, vec!["legacy"]);
         assert!(decoded.surfaces.interface_exports.is_empty());
+        assert!(decoded.surfaces.ui_contributions.is_empty());
     }
 
     #[test]

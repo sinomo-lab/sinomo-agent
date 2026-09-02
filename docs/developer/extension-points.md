@@ -14,6 +14,7 @@ evolve during the pre-1.0 period.
 | Agent tool | `AgentTool`, `AgentToolRegistry` | `sinomo-agent` |
 | Model provider | `LanguageModelProvider` | `sinomo-lm` and provider wiring |
 | Native module | generic component descriptor and `sinomo-module-api` | independently built external module fixture and packages |
+| Application UI | `UiExtensionContribution`, semantic slots, isolated `sinomo.ui.widget` components | `sinomo-module-api`, `sinomo-ui-extension-host`, `sinomo-app` |
 | Network transport | `NetworkModule` and registry/ABI | `sinomo-network`, `modules/network/iroh` |
 | DFS backend or service | DFS backend/transport traits and service registration | `sinomo-dfs` |
 | Sandbox backend | `SandboxBackend`, `SandboxBackendFactory` | `sinomo-sandbox`, WASIX module |
@@ -113,6 +114,79 @@ crash-recovery compensation inside the external package; read its
 [architecture](../cloud-files-architecture.md) and
 [module maintainer guide](../../modules/dfs/cloud-files/README.md) before
 changing its ABI, durable state, lifecycle callbacks, or provider selection.
+
+## Application UI
+
+Use declarative contributions for ordinary actions, panels, settings, status
+items, and host-native views. When a surface must draw content that stock
+widgets cannot express, contribute a `custom-widget` payload referencing a
+Wasm component stored inside the declarative module package. The component must
+export `sinomo:ui-widget/widget.handle` with the contract in
+`crates/sinomo-module-api/wit/sinomo-ui-widget-v1.wit`.
+
+The component receives and returns SOBJ `UiWidgetRequest` and
+`UiWidgetResponse` envelopes. It returns complete `UiWidgetFrame` values with
+paint commands and semantic nodes; it never receives a SUI or wgpu object.
+Frames are bounded and clipped by the app. File preview components target
+`sinomo.app.files.preview-provider` version `1.0.0` and declare extension,
+media-type, or magic-prefix selectors. Competing previewers use deterministic
+catalog order but version 1 opens a custom surface only when exactly one active
+provider matches. Ambiguity preserves the built-in preview until a later user
+selection surface records an explicit preference; activation order is not
+precedence.
+
+A declarative package manifest uses the following surface shape (the digest is
+the BLAKE3 hash of the exact component file):
+
+```json
+{
+  "surfaces": {
+    "ui_contributions": [{
+      "contribution_id": "module.example.preview.widget",
+      "extension_point_id": "sinomo.app.files.preview-provider",
+      "extension_point_version": "1.0.0",
+      "payload": {
+        "type": "custom-widget",
+        "widget": {
+          "label": "Example format preview",
+          "component": {
+            "artifact_id": "artifact.example.preview",
+            "content_hash": "blake3:<64 lowercase hex digits>",
+            "resource_path": "ui/preview.wasm",
+            "runtime": "wasm-component",
+            "protocol_id": "sinomo.ui.widget",
+            "protocol_version": "1.0.0",
+            "entrypoint": "sinomo:ui-widget/widget"
+          },
+          "selectors": [{ "file_extensions": [".example"] }]
+        }
+      }
+    }]
+  }
+}
+```
+
+Version 1 is read-only. A selected preview receives an opaque content grant and
+up to an 8 MiB prefix. Bounded `ReadContent` host requests can page within the
+granted bytes; requests beyond that prefix and mutation actions fail closed.
+The executable custom-surface backend is desktop-only in version 1; Android
+keeps the built-in preview until a platform isolated-service host implements
+the same protocol.
+The module package installer verifies
+the component path and BLAKE3 digest, the daemon re-verifies it while composing
+the local UI catalog, and the isolated helper verifies it again before Wasm
+compilation.
+
+Build the app with both sibling helpers:
+
+```sh
+cargo build -p sinomo-app-daemon -p sinomo-ui-extension-host -p sinomo-app
+```
+
+Do not expose a `WidgetPod`, Rust trait object, native widget callback, raw
+route, filesystem path, or renderer handle from a module. Native and webview
+renderers may be added later only behind the same artifact, lifecycle, content
+grant, frame, and authority contracts.
 
 ## Network Transports
 

@@ -358,6 +358,24 @@ Those payload schemas do not own placement or cross-extension conflict
 resolution. Raw routes, arbitrary rendered-tree patches, native widget
 callbacks, arbitrary colors, and executable UI payloads are not catalog data.
 
+When host-rendered documents are not expressive enough, a custom-surface
+payload may reference a separately hashed UI component inside the module's
+immutable payload. The reference remains catalog data; executable bytes do not.
+The desktop app starts `sinomo-ui-extension-host` lazily, one isolated worker
+per component instance. The worker exposes no ambient filesystem, network,
+clipboard, device, or daemon API and accepts only the `sinomo.ui.widget/1.0.0`
+contract. It returns complete bounded frames containing validated paint
+commands, image resources, semantic nodes, and explicit host requests. SUI
+paints the most recent accepted frame, so component execution and IPC never
+block measure, arrange, event dispatch, or paint.
+
+Custom content is clipped to its host-owned rectangle. Arbitrary color and
+geometry are permitted inside that rectangle, but a component cannot restyle
+host chrome or receive native window, renderer, GPU, SUI widget, or Rust trait
+objects. Read-only content access uses an instance-scoped versioned grant and
+bounded range requests rather than a path. Side effects remain logical action
+requests mediated by the daemon and re-authorized at the final owner.
+
 Built-in surfaces expose stable semantic slots rather than mutable child
 indexes or selectors. Additive contributions such as actions, panels, badges,
 and tooltip sections compose as ordered collections. Scalar properties such as
@@ -705,6 +723,11 @@ The crate boundary follows the trust-ring architecture:
 - `sinomo-client` is the R2 client facade for application surfaces. It owns
   connection supervision and typed remote clients, never domain authority or
   daemon-side implementations.
+- `sinomo-ui-extension-host` is an application-ring sibling process. It reaches
+  the data-only `sinomo-module-api` contract through a narrow reviewed ABI
+  exception, verifies the selected artifact hash, applies Wasm memory and fuel
+  limits, and exposes no runtime, daemon, module-loader, sandbox, or
+  product-composition implementation to the graphical process.
 - The direct-link layer inside `sinomo-network` owns the network-transport
   registry, descriptors, and network-module dylib vtable that transport modules
   implement.
@@ -775,7 +798,9 @@ R2 and application crates cross into these foundations through
     scans or standalone host-adapter crates.
 17. Module UI contributions use bounded, versioned extension-point payloads;
     modules never load Rust/SUI widgets, patch rendered child indexes, or name
-    unvalidated transport routes in the app.
+    unvalidated transport routes in the app. Custom surfaces execute only as
+    verified isolated UI components and the app renders their validated last
+    complete frame.
 18. A module may affect existing behavior only through a typed, versioned
     extension point declared by the subsystem that owns that behavior.
 19. Extension-point composition, ordering, failure handling, and final

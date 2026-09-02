@@ -10539,6 +10539,17 @@ version = "0.2.1"
 source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"
 
 [[package]]
+name = "sinomo-ui-extension-host"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "sinomo-module-api",
+ "thiserror 2.0.20",
+ "wasmtime",
+ "wat",
+]
+
+[[package]]
 name = "sinomo-ui-layout"
 version = "0.2.1"
 source = "git+https://github.com/sinomo-lab/sui.git?branch=main#940c649daa941c54280a9e8d8a520392aa88f2fb"

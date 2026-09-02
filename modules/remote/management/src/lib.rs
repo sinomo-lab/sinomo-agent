@@ -222,6 +222,7 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
             settings: Vec::new(),
             network_transports: Vec::new(),
             interface_exports: Vec::new(),
+            ui_contributions: Vec::new(),
         },
         component: ComponentDescriptor::new(REMOTE_MANAGEMENT_MODULE_ID, env!("CARGO_PKG_VERSION"))
             .with_offer(

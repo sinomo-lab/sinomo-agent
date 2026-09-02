@@ -11,6 +11,14 @@ const FACADE_MIGRATION_COMPLETE: bool = true;
 /// modules do not have to link the whole R0 graph for the wire codec.
 const ABI_OBJECT_EXEMPT: &[&str] = &["sinomo-module-api"];
 
+/// The isolated UI helper is itself the consumer-side endpoint of the stable
+/// module UI ABI. Keeping it on `sinomo-module-api` avoids pulling the complete
+/// R1 client facade (including DFS contracts) into the disposable renderer
+/// process. It remains forbidden from linking `sinomo-module` or any authority
+/// implementation; the dedicated graphical-app test below enforces that cut.
+const APPLICATION_ABI_EXEMPT: &[(&str, &str)] =
+    &[("sinomo-ui-extension-host", "sinomo-module-api")];
+
 #[derive(Clone, Debug)]
 struct PackageManifest {
     name: String,
@@ -209,6 +217,11 @@ fn r2_and_application_crates_cross_the_boundary_through_sinomo_runtime() {
             let Some(dependency_manifest) = packages.get(dependency) else {
                 continue;
             };
+            if APPLICATION_ABI_EXEMPT
+                .contains(&(package.name.as_str(), dependency_manifest.name.as_str()))
+            {
+                continue;
+            }
             assert!(
                 !matches!(
                     dependency_manifest.ring.as_str(),
@@ -233,12 +246,16 @@ fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
     let daemon_host = packages
         .get("sinomo-app-daemon")
         .expect("sinomo-app-daemon package should exist");
+    let ui_extension_host = packages
+        .get("sinomo-ui-extension-host")
+        .expect("sinomo-ui-extension-host package should exist");
     let client = packages
         .get("sinomo-client")
         .expect("sinomo-client package should exist");
 
     assert_eq!(app.ring, "application");
     assert_eq!(daemon_host.ring, "application");
+    assert_eq!(ui_extension_host.ring, "application");
     assert_eq!(client.ring, "r2");
     assert!(
         app.dependencies.contains(&client.name),
@@ -255,6 +272,22 @@ fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
     assert!(
         !app.dependencies.contains(&daemon_host.name),
         "sinomo-app must discover the sibling daemon executable at runtime instead of linking its package"
+    );
+    assert!(
+        !app.dependencies.contains(&ui_extension_host.name),
+        "sinomo-app must discover the isolated UI extension helper at runtime instead of linking its Wasm host"
+    );
+    assert!(
+        ui_extension_host
+            .dependencies
+            .contains(&"sinomo-module-api".to_string())
+            && !ui_extension_host
+                .dependencies
+                .contains(&"sinomo-module".to_string())
+            && !ui_extension_host
+                .dependencies
+                .contains(&"sinomo-runtime".to_string()),
+        "the reviewed UI ABI helper may depend directly on sinomo-module-api but must not link module loading, runtime, or daemon implementations"
     );
     assert!(
         daemon_host.dependencies.contains(&"sinomo-cli".to_string())

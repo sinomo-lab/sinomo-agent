@@ -75,6 +75,11 @@ pub fn materialize_module_service_snapshot(
     options: NativeModuleServiceMaterialization,
 ) -> Result<ServiceRegistry, NetworkError> {
     let mut builder = registry.to_builder();
+    builder = crate::register_ui_extension_catalog_service(
+        builder,
+        Arc::clone(&module_snapshot.snapshot),
+        data_dir_root.clone(),
+    );
     let active_operations = NativeModuleOperationCancellationRegistry::default();
     let module_snapshot_version = module_snapshot.snapshot.version().to_string();
     let service_registry_key = format!("{}.service_registry", options.host_observability_namespace);

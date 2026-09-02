@@ -497,7 +497,15 @@ for a contributed surface, not a general rendered-tree patch format. The
 application owns rendering, accessibility, focus, theming, input, and user
 layout preferences; the daemon mediates logical query and command operations.
 A module cannot load Rust/SUI widgets, name arbitrary routes, mutate child
-indexes, or gain authority through presentation metadata.
+indexes, or gain authority through presentation metadata. A custom-surface
+contribution may instead reference an immutable, verified UI component
+artifact. Desktop applications execute that artifact in a separately
+supervised UI-extension process with no ambient WASI imports. The component
+returns a bounded display list, resource updates, host requests, and semantic
+nodes through a versioned contract; the application validates and renders the
+last complete frame without waiting for extension code on its UI thread.
+Android preserves host-rendered fallback content until an isolated-service
+backend implements the same UI component protocol.
 
 External providers are selected by interface offer, never by provider crate or
 hardcoded module ID in the main runtime. WASIX implements the generic sandbox

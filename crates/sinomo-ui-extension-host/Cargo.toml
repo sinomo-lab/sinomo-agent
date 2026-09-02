@@ -1,0 +1,20 @@
+[package]
+name = "sinomo-ui-extension-host"
+version.workspace = true
+description = "Isolated Wasm component host for Sinomo custom UI widgets"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+include = ["src/**/*.rs", "Cargo.toml"]
+
+[package.metadata.sinomo]
+ring = "application"
+
+[dependencies]
+blake3.workspace = true
+sinomo-module-api = { path = "../sinomo-module-api" }
+thiserror.workspace = true
+wasmtime = { version = "46.0.1", default-features = false, features = ["component-model", "cranelift", "runtime", "std", "wat"] }
+
+[dev-dependencies]
+wat = "1.253.0"

@@ -13,6 +13,7 @@ mod network_runtime;
 mod service;
 mod service_catalog_component;
 mod service_client;
+mod ui_service;
 
 pub use active_component::*;
 pub use catalog::*;
@@ -30,6 +31,7 @@ pub use network_runtime::*;
 pub use service::*;
 pub use service_catalog_component::*;
 pub use service_client::*;
+pub use ui_service::*;
 
 use arc_swap::ArcSwap;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -1238,6 +1240,11 @@ pub struct ModuleSurfaces {
     /// native, object-RPC, or sandbox invocation path.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interface_exports: Vec<sinomo_module_api::ModuleInterfaceExport>,
+    /// Host-composed application UI contributions. Executable custom widgets
+    /// reference immutable UI component artifacts; no native widget callbacks
+    /// cross the module catalog boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ui_contributions: Vec<sinomo_module_api::UiExtensionContribution>,
 }
 
 impl ModuleSurfaces {
@@ -1251,6 +1258,7 @@ impl ModuleSurfaces {
             && self.capabilities.is_empty()
             && self.network_transports.is_empty()
             && self.interface_exports.is_empty()
+            && self.ui_contributions.is_empty()
     }
 
     pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
@@ -1396,6 +1404,14 @@ impl ModuleSurfaces {
         self
     }
 
+    pub fn with_ui_contribution(
+        mut self,
+        contribution: sinomo_module_api::UiExtensionContribution,
+    ) -> Self {
+        self.ui_contributions.push(contribution);
+        self
+    }
+
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
         self.capabilities.imports.push(capability);
         self
@@ -1503,6 +1519,11 @@ impl ModuleSurfaces {
                 detail: source.to_string(),
             },
         )?;
+        sinomo_module_api::validate_ui_contributions(&self.ui_contributions).map_err(|source| {
+            ModuleSurfaceError::InvalidUiContribution {
+                detail: source.to_string(),
+            }
+        })?;
         for export in &self.interface_exports {
             for operation in &export.operations {
                 if let sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc {
@@ -2003,6 +2024,7 @@ impl ModuleRegistry {
 
         let mut object_rpc_routes = BTreeMap::<String, ModuleId>::new();
         let mut settings_keys = BTreeMap::<String, ModuleId>::new();
+        let mut ui_contribution_ids = BTreeMap::<String, ModuleId>::new();
         for (module_id, registration) in &self.registrations {
             if registration.module_id() != module_id {
                 return Err(ModuleRegistryError::InvalidRegistrationOrder {
@@ -2050,6 +2072,17 @@ impl ModuleRegistry {
                 {
                     return Err(ModuleRegistryError::DuplicateSettingsKey {
                         key,
+                        first_module_id: previous_module_id,
+                        second_module_id: module_id.clone(),
+                    });
+                }
+            }
+            for contribution in &registration.surfaces.ui_contributions {
+                if let Some(previous_module_id) = ui_contribution_ids
+                    .insert(contribution.contribution_id.clone(), module_id.clone())
+                {
+                    return Err(ModuleRegistryError::DuplicateUiContributionId {
+                        contribution_id: contribution.contribution_id.clone(),
                         first_module_id: previous_module_id,
                         second_module_id: module_id.clone(),
                     });
@@ -2239,6 +2272,14 @@ pub enum ModuleRegistryError {
         first_module_id: ModuleId,
         second_module_id: ModuleId,
     },
+    #[error(
+        "duplicate UI contribution id `{contribution_id}` from {first_module_id} and {second_module_id}"
+    )]
+    DuplicateUiContributionId {
+        contribution_id: String,
+        first_module_id: ModuleId,
+        second_module_id: ModuleId,
+    },
     #[error("invalid module registry order: {detail}")]
     InvalidRegistrationOrder { detail: String },
     #[error("module registry snapshot lock failed: {detail}")]
@@ -2281,6 +2322,8 @@ pub enum ModuleSurfaceError {
     DuplicateCapabilityExport { capability: String },
     #[error("invalid module interface export: {detail}")]
     InvalidInterfaceExport { detail: String },
+    #[error("invalid module UI contribution: {detail}")]
+    InvalidUiContribution { detail: String },
     #[error(
         "module interface export `{export_id}` operation `{logical_operation}` targets object RPC `{route}` / `{operation}`, which is not exported"
     )]
@@ -3566,6 +3609,7 @@ fn native_descriptor_surfaces_to_module_surfaces(
         surfaces = surfaces.with_network_transport(transport.clone());
     }
     surfaces.interface_exports = descriptor.surfaces.interface_exports.clone();
+    surfaces.ui_contributions = descriptor.surfaces.ui_contributions.clone();
     surfaces.capabilities = ModuleCapabilities {
         imports: descriptor
             .surfaces
@@ -4155,6 +4199,42 @@ fn validate_declarative_module_resource_paths(
                 detail: format!(
                     "declarative resource `{}` points to missing payload path `{}`",
                     resource.id, resource.path
+                ),
+            });
+        }
+    }
+    for contribution in &manifest.surfaces.ui_contributions {
+        let sinomo_module_api::UiContributionPayload::CustomWidget { widget } =
+            &contribution.payload
+        else {
+            continue;
+        };
+        let component_path = Path::new(&widget.component.resource_path);
+        let component_bytes = files
+            .iter()
+            .find_map(|(path, bytes)| (path == component_path).then_some(bytes))
+            .ok_or_else(|| DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "UI contribution `{}` points to missing component `{}`",
+                    contribution.contribution_id, widget.component.resource_path
+                ),
+            })?;
+        if component_bytes.len() as u64 > sinomo_module_api::MAX_UI_COMPONENT_ARTIFACT_BYTES {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "UI contribution `{}` component is {} bytes; limit is {}",
+                    contribution.contribution_id,
+                    component_bytes.len(),
+                    sinomo_module_api::MAX_UI_COMPONENT_ARTIFACT_BYTES
+                ),
+            });
+        }
+        let actual_hash = native_module_content_hash(component_bytes);
+        if actual_hash != widget.component.content_hash {
+            return Err(DeclarativeModuleInstallError::Descriptor {
+                detail: format!(
+                    "UI contribution `{}` component hash mismatch: expected {}, actual {actual_hash}",
+                    contribution.contribution_id, widget.component.content_hash
                 ),
             });
         }
@@ -5783,6 +5863,7 @@ mod tests {
         assert_eq!(decoded.storage_owners, vec!["legacy-owner"]);
         assert!(decoded.settings.is_empty());
         assert!(decoded.interface_exports.is_empty());
+        assert!(decoded.ui_contributions.is_empty());
         decoded.validate().expect("legacy surfaces remain valid");
     }
 
@@ -6283,6 +6364,7 @@ mod tests {
                 settings: vec![settings_export],
                 network_transports: vec!["iroh".to_string()],
                 interface_exports: vec![interface_export.clone()],
+                ui_contributions: Vec::new(),
             },
             component: sinomo_module_api::ComponentDescriptor::new(
                 "module.dynamic-native",
@@ -6498,6 +6580,85 @@ mod tests {
                 .expect("read state")
                 .expect("state");
         assert_eq!(read_state, result.state);
+    }
+
+    #[test]
+    fn declarative_module_install_verifies_custom_ui_component_artifact() {
+        use sinomo_module_api::{
+            FILE_PREVIEW_EXTENSION_POINT_ID, FILE_PREVIEW_EXTENSION_POINT_VERSION,
+            UiComponentArtifact, UiContentSelector, UiContributionPayload,
+            UiCustomWidgetContribution, UiExtensionContribution,
+        };
+
+        let data_root = unique_temp("declarative-ui-module-data");
+        let package_root = unique_temp("declarative-ui-module-package");
+        std::fs::create_dir_all(package_root.join("ui")).expect("ui dir");
+        let wasm = b"fixture component bytes";
+        std::fs::write(package_root.join("ui/preview.wasm"), wasm).expect("UI component");
+        let contribution = UiExtensionContribution::custom_widget(
+            "module.preview.fixture.widget",
+            FILE_PREVIEW_EXTENSION_POINT_ID,
+            FILE_PREVIEW_EXTENSION_POINT_VERSION,
+            UiCustomWidgetContribution::new(
+                "Fixture preview",
+                UiComponentArtifact::wasm(
+                    "artifact.preview.fixture",
+                    native_module_content_hash(wasm),
+                    "ui/preview.wasm",
+                    "sinomo:ui-widget/widget",
+                ),
+            )
+            .with_selector(UiContentSelector::extension(".fixture")),
+        );
+        let package_manifest = DeclarativeModulePackageManifest {
+            module_id: "module.preview.fixture".to_string(),
+            version: "1.0.0".to_string(),
+            owner: "fixture".to_string(),
+            api_version: DECLARATIVE_MODULE_API_VERSION.to_string(),
+            target_ring: TrustRing::R3SandboxedModule,
+            capabilities: ModuleCapabilities::default(),
+            surfaces: ModuleSurfaces::default().with_ui_contribution(contribution),
+            resources: Vec::new(),
+        };
+        std::fs::write(
+            package_root.join("sinomo.module.json"),
+            serde_json::to_vec_pretty(&package_manifest).expect("manifest json"),
+        )
+        .expect("manifest");
+
+        let result = install_declarative_module_package(
+            &data_root,
+            &package_root,
+            DeclarativeModuleInstallRequest::new("test-ui-package"),
+        )
+        .expect("install UI package");
+
+        assert_eq!(result.registration.surfaces.ui_contributions.len(), 1);
+        assert_eq!(
+            std::fs::read(result.payload_path.join("ui/preview.wasm"))
+                .expect("cached UI component"),
+            wasm
+        );
+
+        let mut mismatched = package_manifest;
+        let UiContributionPayload::CustomWidget { widget } =
+            &mut mismatched.surfaces.ui_contributions[0].payload
+        else {
+            unreachable!("fixture is a custom widget")
+        };
+        widget.component.content_hash = format!("blake3:{}", "f".repeat(64));
+        std::fs::write(
+            package_root.join("sinomo.module.json"),
+            serde_json::to_vec_pretty(&mismatched).expect("mismatched manifest"),
+        )
+        .expect("write mismatched manifest");
+        let error = install_declarative_module_package(
+            &data_root,
+            &package_root,
+            DeclarativeModuleInstallRequest::new("mismatched-ui-package"),
+        )
+        .expect_err("mismatched UI component hash must fail");
+        assert!(error.to_string().contains("component hash mismatch"));
     }
 
     #[test]

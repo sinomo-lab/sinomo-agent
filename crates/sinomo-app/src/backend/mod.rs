@@ -17,6 +17,7 @@ pub mod mounts;
 pub mod observe;
 pub mod remote_management;
 pub mod sifs;
+pub mod ui_extensions;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -5,6 +5,7 @@ description = "Stable native module ABI and SOBJ envelopes for Sinomo modules"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+include = ["src/**/*.rs", "wit/**", "Cargo.toml"]
 
 [package.metadata.sinomo]
 ring = "r1"

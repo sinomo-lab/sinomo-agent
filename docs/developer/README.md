@@ -38,7 +38,7 @@ before a change that crosses crates or changes state ownership.
 | `scripts/` | CI, formal, debugging, and Android helpers. |
 | `docs/` | User guides, architecture, developer material, references, plans, evaluation guidance, and research notes. |
 
-The workspace currently has 61 members. Fifty-four default members build with
+The workspace currently has 68 members. Sixty-one default members build with
 plain `cargo build`; platform-specific applications, native module artifacts,
 and benchmark packages are opt-in.
 
