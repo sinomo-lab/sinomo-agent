@@ -5,6 +5,8 @@ use crate::file_manager::{
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
+#[cfg(any(unix, test))]
+use sinomo_runtime::dfs::DfsPosixCreateAttrs;
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
@@ -17,12 +19,11 @@ use sinomo_runtime::dfs::{
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
     DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
     DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
-    DfsPosixCreateAttrs, DfsPosixDistributedFilePrefixReadOutcome,
-    DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy,
-    DfsStableNamespaceOperationReconciliation, DfsStat, DfsWriteOptions, LocalContentStore,
-    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
-    default_dfs_metadata_shards_root, default_dfs_pin_root, discovered_cluster_dfs_peer_node_ids,
-    fallback_dfs_node_id, metadata_shards_prefix,
+    DfsPosixDistributedFilePrefixReadOutcome, DfsPosixDistributedFileReadOutcome, DfsPosixError,
+    DfsResolvedPlacementPolicy, DfsStableNamespaceOperationReconciliation, DfsStat,
+    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
+    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
+    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
@@ -1943,6 +1944,7 @@ impl SifsFileManagerBackend {
     /// writable by the local kernel identity. Existing directories are only
     /// accepted when their ownership and mode already match; roaming devices
     /// must never silently steal one another's session home.
+    #[cfg(any(unix, test))]
     pub(crate) fn ensure_posix_directory_with_attrs(
         &self,
         path: &str,
@@ -5280,6 +5282,7 @@ fn sifs_operation_remaining(
         .ok_or_else(|| format!("SIFS operation deadline expired during {operation}"))
 }
 
+#[cfg(any(unix, test))]
 fn validate_posix_directory_attrs(
     path: &str,
     stat: &DfsStat,

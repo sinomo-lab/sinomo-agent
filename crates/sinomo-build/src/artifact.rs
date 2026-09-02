@@ -149,6 +149,7 @@ impl BuildArtifactManifest {
             path: source_path.display().to_string(),
             detail: source.to_string(),
         })?;
+        #[cfg(unix)]
         let metadata = fs::metadata(&source_path).map_err(|source| BuildError::Io {
             path: source_path.display().to_string(),
             detail: source.to_string(),
@@ -413,21 +414,19 @@ pub fn extract_artifact_bundle(
             path: output.display().to_string(),
             detail: source.to_string(),
         })?;
+        #[cfg(unix)]
         if let Some(artifact) = manifest
             .artifacts
             .iter()
             .find(|artifact| artifact.relative_path == relative_path)
         {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&output, fs::Permissions::from_mode(artifact.mode)).map_err(
-                    |source| BuildError::Io {
-                        path: output.display().to_string(),
-                        detail: source.to_string(),
-                    },
-                )?;
-            }
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&output, fs::Permissions::from_mode(artifact.mode)).map_err(
+                |source| BuildError::Io {
+                    path: output.display().to_string(),
+                    detail: source.to_string(),
+                },
+            )?;
         }
         extracted.push(output);
     }
@@ -802,7 +801,8 @@ mod tests {
         let paths =
             extract_artifact_bundle(&bundle.manifest, &bundle.bytes, &output).expect("extract");
 
-        assert_eq!(paths, vec![output.join("bin/sinomo")]);
+        let canonical_output = fs::canonicalize(&output).expect("canonical output");
+        assert_eq!(paths, vec![canonical_output.join("bin/sinomo")]);
         assert_eq!(fs::read(&paths[0]).expect("read"), b"verified binary");
         verify_artifact_file(&bundle.manifest.artifacts[0], &paths[0])
             .expect("streaming file verification");

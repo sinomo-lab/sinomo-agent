@@ -1004,12 +1004,15 @@ async fn write_sandbox_stream_frame<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SandboxId;
+    #[cfg(unix)]
     use crate::{
         SANDBOX_UNLIMITED_WALL_TIME_MS, SandboxContainerBackendConfig, SandboxContainerRuntime,
-        SandboxCreateInstanceRequest, SandboxId, SandboxRunToolchainRequest, SandboxTempPolicy,
+        SandboxCreateInstanceRequest, SandboxRunToolchainRequest, SandboxTempPolicy,
         SandboxToolchainId,
     };
     use std::sync::Mutex;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
 
     use sinomo_core::local::SinomoDataDir;
@@ -1047,10 +1050,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     struct FakeContainerFactory {
         config: SandboxContainerBackendConfig,
     }
 
+    #[cfg(unix)]
     impl SandboxBackendFactory for FakeContainerFactory {
         fn open(&self, ctx: &ServiceContext) -> Result<Box<dyn SandboxBackend>, ServiceError> {
             Ok(Box::new(

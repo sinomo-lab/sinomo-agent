@@ -4021,11 +4021,8 @@ fn orchestrator_records_benchmark_summary_metrics() {
         }
     }"#
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 0".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4242,11 +4239,8 @@ fn orchestrator_marks_host_blocked_swebench_summary_inconclusive() {
         }
     })
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}; exit 1",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 1".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4337,11 +4331,8 @@ fn orchestrator_marks_harness_incomplete_swebench_summary_inconclusive() {
         }
     })
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 0".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4438,11 +4429,8 @@ fn orchestrator_fails_swebench_summary_with_orphan_tool_pairs() {
         }
     })
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 0".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4534,11 +4522,8 @@ fn orchestrator_fails_swebench_summary_with_tool_pair_count_mismatch() {
         }
     })
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 0".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4626,11 +4611,8 @@ fn orchestrator_fails_unresolved_swebench_summary() {
         }
     })
     .to_string();
-    let benchmark_command = format!(
-        "printf %s {} > {}",
-        shell_quote(&summary_json),
-        shell_quote(&summary_path.display().to_string())
-    );
+    fs::write(&summary_path, summary_json).expect("benchmark summary");
+    let benchmark_command = "exit 0".to_string();
     let orchestrator = EvolutionOrchestrator::new(
         FakeWorkspace {
             root: root.to_path_buf(),
@@ -4737,7 +4719,7 @@ fn orchestrator_writes_reusable_regression_evidence_and_lesson_for_failed_candid
                 intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "failing-static-check".to_string(),
-                    command: "printf failure-details >&2; exit 7".to_string(),
+                    command: failing_verification_command().to_string(),
                     expected_exit_code: 0,
                     gate: EvaluationGate::StaticChecks,
                 }],
@@ -5200,7 +5182,7 @@ fn agent_mutation_worker_binds_local_permission_store_for_host_commands() {
         command_logs: Vec::new(),
     };
     let patch = "*** Begin Patch\n*** Update File: hello.txt\n@@\n-old\n+new\n*** End Patch";
-    let command = output_command();
+    let command = agent_output_command();
     let model = FakeInteractionModel::new([
         serde_json::json!({
             "response_mode": "defer",
@@ -5682,7 +5664,7 @@ fn approve_override_records_preflight_and_candidate_summary() {
             .contains("\"approval_preflight\"")
     );
     assert_eq!(
-        fs::read_to_string(source.join("README.md")).expect("source readme"),
+        normalize_newlines(&fs::read_to_string(source.join("README.md")).expect("source readme")),
         "# source\n\napproved\n"
     );
     let _ = run_in(
@@ -5904,7 +5886,7 @@ fn approved_candidate_commit_fast_forwards_source_checkout() {
     commit_and_fast_forward_approved_candidate(&record).expect("approved candidate");
 
     assert_eq!(
-        fs::read_to_string(source.join("README.md")).expect("source readme"),
+        normalize_newlines(&fs::read_to_string(source.join("README.md")).expect("source readme")),
         "# source\n\napproved\n"
     );
     assert_eq!(
@@ -6890,7 +6872,31 @@ fn output_command() -> &'static str {
     "Write-Output sinomo-stdout; [Console]::Error.WriteLine('sinomo-stderr')"
 }
 
+fn normalize_newlines(value: &str) -> String {
+    value.replace("\r\n", "\n")
+}
+
 #[cfg(not(windows))]
 fn output_command() -> &'static str {
     "printf sinomo-stdout; printf sinomo-stderr >&2"
+}
+
+#[cfg(windows)]
+fn agent_output_command() -> &'static str {
+    "echo sinomo-stdout & echo sinomo-stderr 1>&2"
+}
+
+#[cfg(not(windows))]
+fn agent_output_command() -> &'static str {
+    output_command()
+}
+
+#[cfg(windows)]
+fn failing_verification_command() -> &'static str {
+    "[Console]::Error.Write('failure-details'); exit 7"
+}
+
+#[cfg(not(windows))]
+fn failing_verification_command() -> &'static str {
+    "printf failure-details >&2; exit 7"
 }

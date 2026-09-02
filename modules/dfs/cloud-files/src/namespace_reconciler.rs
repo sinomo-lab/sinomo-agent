@@ -564,12 +564,6 @@ pub(crate) struct CloudFilesCursorRecoveryReconciliationPlan {
     pub(crate) expected_audit: Vec<u8>,
 }
 
-impl CloudFilesCursorRecoveryReconciliationPlan {
-    pub(crate) fn cursor_count_cleared(&self) -> u64 {
-        self.cursor_count_cleared
-    }
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 struct CloudFilesCursorRecoveryRewrite {
     schema_version: u16,
@@ -3206,15 +3200,6 @@ impl CloudFilesNamespaceReconciler {
         Ok(reconciler)
     }
 
-    pub(crate) fn open_authorized_cursor_recovery(
-        data_dir: &SinomoDataDir,
-        mount: impl Into<String>,
-        root: impl Into<String>,
-        plan: &CloudFilesCursorRecoveryReconciliationPlan,
-    ) -> Result<Self, CloudFilesNamespaceReconcileError> {
-        open_authorized_cursor_recovery_progress(data_dir, mount, root, plan)
-    }
-
     pub(crate) fn open_authorized_cursor_recovery_with_suppressions(
         data_dir: &SinomoDataDir,
         mount: impl Into<String>,
@@ -3520,11 +3505,13 @@ impl CloudFilesNamespaceReconciler {
         &self.state.conflicts
     }
 
+    #[cfg(test)]
     pub(crate) fn historical_test_conflict_reconciliation_v1_completed(&self) -> bool {
         self.state
             .historical_test_conflict_reconciliation_v1_completed
     }
 
+    #[cfg(test)]
     pub(crate) fn complete_historical_test_conflict_reconciliation_v1(
         &mut self,
     ) -> Result<bool, CloudFilesNamespaceReconcileError> {
@@ -3542,37 +3529,13 @@ impl CloudFilesNamespaceReconciler {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) fn historical_test_conflict_reconciliation_v2_completed(&self) -> bool {
         self.state
             .historical_test_conflict_reconciliation_v2_completed
     }
 
-    pub(crate) fn complete_historical_test_conflict_reconciliation_v2(
-        &mut self,
-    ) -> Result<bool, CloudFilesNamespaceReconcileError> {
-        self.ensure_usable()?;
-        if self
-            .state
-            .historical_test_conflict_reconciliation_v2_completed
-        {
-            return Ok(false);
-        }
-        let previous = self.state.clone();
-        // A fresh scope crosses both migrations with one durable state write;
-        // an upgraded v1 scope advances only the new fence.
-        self.state
-            .historical_test_conflict_reconciliation_v1_completed = true;
-        self.state
-            .historical_test_conflict_reconciliation_v2_completed = true;
-        self.persist_or_restore(previous)?;
-        Ok(true)
-    }
-
-    pub(crate) fn historical_sparse_delete_reconciliation_v3_completed(&self) -> bool {
-        self.state
-            .historical_sparse_delete_reconciliation_v3_completed
-    }
-
+    #[cfg(test)]
     pub(crate) fn complete_historical_sparse_delete_reconciliation_v3(
         &mut self,
     ) -> Result<bool, CloudFilesNamespaceReconcileError> {
@@ -5044,6 +5007,7 @@ pub(crate) fn resume_authorized_cursor_recovery(
 /// Reopens a recovery after the deterministic rewrite has completed and the
 /// authoritative scan may already have installed bounded page deltas. This
 /// never accepts a pristine/torn rewrite cut and never repairs owner files.
+#[cfg(test)]
 pub(crate) fn open_authorized_cursor_recovery_progress(
     data_dir: &SinomoDataDir,
     mount: impl Into<String>,
@@ -5644,19 +5608,6 @@ fn validate_cursor_recovery_ready_to_finalize(
     Ok(())
 }
 
-/// Removes only the exact plan-bound Terminal marker after the outer/module
-/// owner has durably committed Ready. An armed marker, changed plan, pending
-/// audit, or nonterminal state is never deleted.
-pub(crate) fn finalize_authorized_cursor_recovery_after_ready(
-    data_dir: &SinomoDataDir,
-    mount: &str,
-    root: &str,
-    plan: &CloudFilesCursorRecoveryReconciliationPlan,
-    ready: CloudFilesCursorRecoveryReadyToFinalize,
-) -> Result<bool, CloudFilesNamespaceReconcileError> {
-    let mut reconciler = open_authorized_cursor_recovery_progress(data_dir, mount, root, plan)?;
-    reconciler.finalize_authorized_cursor_recovery_after_ready(plan, ready)
-}
 fn cursor_recovery_progress_state_is_valid(
     state: &CloudFilesNamespaceReconciliationState,
     plan: &ValidatedCursorRecoveryPlan,

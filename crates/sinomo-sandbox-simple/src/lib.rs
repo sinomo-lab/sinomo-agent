@@ -27,9 +27,9 @@ use sinomo_sandbox::{
     SandboxCancellationToken, SandboxCommandExecutionError, SandboxCommandId, SandboxCommandRecord,
     SandboxCommandRecordStatus, SandboxCommandRequest, SandboxFsError, SandboxLocalCommandOutcome,
     SandboxLocalExecutionJournal, SandboxLocalExecutionLease, SandboxLocalExecutionOutcome,
-    SandboxMount, SandboxMountMode, SandboxOutputChunk, SandboxOutputSink, SandboxOutputStream,
-    SandboxPath, SandboxPolicy, SandboxProcessPlan, SandboxProcessPlanOutcome,
-    SandboxResourceLimits, SandboxResourceUsage, SandboxStoreError, SandboxWasiError,
+    SandboxMount, SandboxOutputChunk, SandboxOutputSink, SandboxOutputStream, SandboxPath,
+    SandboxPolicy, SandboxProcessPlan, SandboxProcessPlanOutcome, SandboxResourceLimits,
+    SandboxResourceUsage, SandboxStoreError, SandboxWasiError,
     activate_sandbox_local_execution_journal, begin_sandbox_local_execution_journal,
     cleanup_sandbox_local_execution_external_owner, effective_sandbox_timeout_ms,
     persist_command_outputs, prepare_sandbox_local_execution_audit_identity,
@@ -41,7 +41,8 @@ use sinomo_sandbox::{
 };
 #[cfg(target_os = "linux")]
 use sinomo_sandbox::{
-    SandboxLocalExecutionExternalOwner, prepare_sandbox_local_execution_external_owner,
+    SandboxLocalExecutionExternalOwner, SandboxMountMode,
+    prepare_sandbox_local_execution_external_owner,
 };
 use time::OffsetDateTime;
 
@@ -698,11 +699,13 @@ fn transition_after_native_return(
 struct NativeProjectedMount {
     source_host_path: PathBuf,
     guest_path: PathBuf,
+    #[cfg(target_os = "linux")]
     mode: SandboxMountMode,
 }
 
 #[derive(Clone, Debug)]
 struct NativeMountProjection {
+    #[cfg(target_os = "linux")]
     bwrap_program: PathBuf,
     mounts: Vec<NativeProjectedMount>,
 }
@@ -808,6 +811,7 @@ fn prepare_native_mount_projection(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn normalized_sifs_relative_path(path: &str) -> Result<PathBuf, SandboxWasiError> {
     let path = Path::new(path);
     if !path.is_absolute() {
@@ -833,6 +837,7 @@ fn normalized_sifs_relative_path(path: &str) -> Result<PathBuf, SandboxWasiError
     Ok(relative)
 }
 
+#[cfg(target_os = "linux")]
 fn find_host_program(name: &str) -> Option<PathBuf> {
     env::var_os("PATH")
         .into_iter()
@@ -1609,6 +1614,7 @@ mod windows {
     };
 
     const READ_BUFFER_SIZE: usize = 64 * 1024;
+    #[allow(dead_code)]
     const SECURITY_MAX_SID_SIZE: usize = 68;
 
     pub(super) fn execute_native_command(
@@ -1825,6 +1831,10 @@ mod windows {
         Ok(job)
     }
 
+    // Retained as the narrow Windows restricted-token hardening path. The
+    // current native runner uses job-object lifecycle containment while this
+    // token path is completed and enabled as one unit.
+    #[allow(dead_code)]
     fn create_restricted_token(low_integrity: bool) -> Result<OwnedHandle, SandboxWasiError> {
         let mut current_token = ptr::null_mut();
         let desired_access =
@@ -1860,6 +1870,7 @@ mod windows {
         Ok(restricted_token)
     }
 
+    #[allow(dead_code)]
     fn set_low_integrity_token(token: HANDLE) -> Result<(), SandboxWasiError> {
         let mut sid = [0u8; SECURITY_MAX_SID_SIZE];
         let mut sid_size = sid.len() as u32;
@@ -1895,6 +1906,7 @@ mod windows {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn prepare_low_integrity_layout(
         layout: &LocalSandboxInstanceLayout,
         config: &SandboxSimpleNativeConfig,
@@ -1910,6 +1922,7 @@ mod windows {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn set_low_integrity_directory(path: &Path) -> Result<(), SandboxWasiError> {
         let sddl = wide_null("S:(ML;OICI;NW;;;LW)");
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
@@ -2309,6 +2322,7 @@ mod windows {
         }
     }
 
+    #[allow(dead_code)]
     struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
 
     impl Drop for LocalSecurityDescriptor {
@@ -2421,7 +2435,9 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sinomo_sandbox::{SandboxFileSystem, SandboxId, SandboxToolchainId};
+    #[cfg(target_os = "linux")]
+    use sinomo_sandbox::SandboxFileSystem;
+    use sinomo_sandbox::{SandboxId, SandboxToolchainId};
 
     fn create_store() -> (
         sinomo_testdir::TestDir,
@@ -2449,6 +2465,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn run_shell(
         store: &LocalSandboxInstanceStore,
         sandbox_id: &SandboxId,

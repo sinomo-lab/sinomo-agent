@@ -809,11 +809,6 @@ fn linux_process_group_has_live_members(process_group_id: i32) -> Option<bool> {
     Some(false)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn linux_process_start_time_ticks(_process_id: u32) -> Option<u64> {
-    None
-}
-
 #[cfg(target_os = "linux")]
 fn cleanup_linux_process_group(
     process_group: &SandboxLocalExecutionLinuxProcessGroup,

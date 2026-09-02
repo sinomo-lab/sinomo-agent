@@ -606,6 +606,7 @@ where
             return Err(error);
         }
         match publish_staged_no_replace(&temp_path, path) {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             Ok(NoReplacePublication::Renamed) => continue,
             Ok(NoReplacePublication::Linked) => {}
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {}
@@ -621,6 +622,7 @@ where
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NoReplacePublication {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     Renamed,
     Linked,
 }

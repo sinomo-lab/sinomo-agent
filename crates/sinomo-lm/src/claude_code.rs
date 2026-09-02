@@ -190,7 +190,9 @@ impl LanguageModelProvider for ClaudeCodeProvider {
 mod tests {
     use super::*;
     use crate::{LanguageModelMessage, LanguageModelResponseFormat, LanguageModelRole};
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write;
 
     fn request() -> LanguageModelRequest {

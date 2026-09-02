@@ -562,11 +562,10 @@ fn set_process_group(pid: i32, pgid: i32) -> i32 {
     unsafe { setpgid(pid, pgid) }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 
-    #[cfg(not(windows))]
     #[test]
     fn process_manager_streams_stdin_output_and_cancels() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-process-manager");

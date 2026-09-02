@@ -1123,7 +1123,7 @@ fn run_cli_closure_with_capture(
     run_cli_closure_with_cli_output_capture(f, false)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_cli_closure_with_process_stdio_capture(
     f: impl FnOnce() -> Result<(), CliError>,
 ) -> CliCommandCaptureExecution {

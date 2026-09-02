@@ -46,6 +46,7 @@ pub const CLOUD_FILES_CURSOR_ONLY_RECOVERY_TOKEN_DOMAIN: &str =
 pub const CLOUD_FILES_WRITABLE_SYNC_UNSUPPORTED_CODE: &str = "writable-sync-unsupported";
 pub const CLOUD_FILES_WRITABLE_SYNC_CONTRACT_NOT_READY_CODE: &str =
     "writable-sync-contract-not-ready";
+#[cfg(test)]
 pub const CLOUD_FILES_READ_ONLY_ENFORCEMENT_UNAVAILABLE_CODE: &str =
     "read-only-enforcement-unavailable";
 pub const CLOUD_FILES_STALE_PLACEHOLDER_IDENTITY_CODE: &str = "stale-placeholder-identity";
@@ -816,6 +817,7 @@ pub struct CloudFilesProviderReplacementContext {
 }
 
 impl CloudFilesMountRequest {
+    #[cfg(test)]
     pub fn new(sync_root: impl Into<PathBuf>) -> Self {
         Self {
             sync_root: sync_root.into(),

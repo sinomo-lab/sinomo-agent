@@ -1177,12 +1177,14 @@ mod tests {
         assert!(observer.has_interrupted_event(&run_id));
     }
 
+    #[cfg(not(windows))]
     #[derive(Clone, Default)]
     struct RecordingCommandObserver {
         events: Arc<Mutex<Vec<CommandRunEvent>>>,
         started_sender: Arc<Mutex<Option<mpsc::Sender<CommandRunId>>>>,
     }
 
+    #[cfg(not(windows))]
     impl RecordingCommandObserver {
         fn forward_started_to(&self, sender: mpsc::Sender<CommandRunId>) {
             *self.started_sender.lock().expect("started sender lock") = Some(sender);
@@ -1209,6 +1211,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     impl CommandRunObserver for RecordingCommandObserver {
         fn on_command_event(&self, event: CommandRunEvent) {
             let started_run_id = match &event {

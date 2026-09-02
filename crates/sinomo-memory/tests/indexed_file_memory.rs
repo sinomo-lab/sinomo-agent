@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use sinomo_memory::SourceFreshness;
 use sinomo_memory::{
     EvidenceCoverage, IndexRootPolicy, IndexedFileMemoryStore, LocalIndexRootConfig,
     LocalScanCursor, LocalScanFrame, MemoryAccessContext, MemoryQuery, MemorySourceCatalog,
-    MemoryTraceStore, SourceFreshness,
+    MemoryTraceStore,
 };
 use sinomo_runtime::core::{Id, MemoryScope, TrustDomain};
 use std::collections::{BTreeMap, BTreeSet};

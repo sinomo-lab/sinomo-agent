@@ -1,3 +1,6 @@
+#[cfg(unix)]
+use crate::AgentProcessLifecycleStatus;
+#[cfg(unix)]
 use crate::tools::local_workspace::provision_default_agent_session_sandbox;
 use crate::{
     AGENT_DEFINITION_SIFS_ROOT, AGENT_OBJECT_RPC_ROUTES, AGENT_RPC_CATEGORY,
@@ -9,15 +12,15 @@ use crate::{
     AgentDefinitionValidationError, AgentItem, AgentLoopInput, AgentLoopResponseMode,
     AgentModelDecisionSource, AgentModelEvent, AgentModuleToolProjection, AgentOp,
     AgentOutputFormat, AgentPackageProvenance, AgentPackageSource, AgentPlacementMetadata,
-    AgentProcessLifecycleStatus, AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool,
-    AgentRemoteObjectRpcTransport, AgentRole, AgentRun, AgentRunContext, AgentRuntimeControlError,
-    AgentRuntimeControlHost, AgentRuntimeControlRegistry, AgentSession,
-    AgentSessionControlEventCursor, AgentSessionControlResponse, AgentSessionControlResult,
-    AgentSessionControlSnapshot, AgentSessionFollowUpRequest, AgentSessionInspectRequest,
-    AgentSessionInspectResponse, AgentSessionInterruptRequest, AgentSessionProgressRequest,
-    AgentSessionProgressResponse, AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest,
-    AgentSessionResumeRequest, AgentSessionResumeResponse, AgentSessionRuntime,
-    AgentSessionSnapshot, AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
+    AgentRemoteObjectRpcFuture, AgentRemoteObjectRpcTool, AgentRemoteObjectRpcTransport, AgentRole,
+    AgentRun, AgentRunContext, AgentRuntimeControlError, AgentRuntimeControlHost,
+    AgentRuntimeControlRegistry, AgentSession, AgentSessionControlEventCursor,
+    AgentSessionControlResponse, AgentSessionControlResult, AgentSessionControlSnapshot,
+    AgentSessionFollowUpRequest, AgentSessionInspectRequest, AgentSessionInspectResponse,
+    AgentSessionInterruptRequest, AgentSessionProgressRequest, AgentSessionProgressResponse,
+    AgentSessionReattachState, AgentSessionRemoveQueuedInputRequest, AgentSessionResumeRequest,
+    AgentSessionResumeResponse, AgentSessionRuntime, AgentSessionSnapshot,
+    AgentSessionSteerRequest, AgentSessionStore, AgentSessionStoreRecord,
     AgentSessionStoreRecordKind, AgentSessionTerminalResultsRequest,
     AgentSessionTerminalResultsResponse, AgentSkillPlan, AgentStopReason, AgentTaskLifecycleStatus,
     AgentTaskRef, AgentTaskSnapshot, AgentToolCall, AgentToolCapability, AgentToolEvidence,
