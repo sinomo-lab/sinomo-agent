@@ -317,8 +317,14 @@ static DFS_REPAIR_QUEUE_STORES: OnceLock<
 
 #[cfg(test)]
 thread_local! {
-    static BOUNDED_STATUS_RECORD_CLONES: std::cell::Cell<usize> =
+    static BOUNDED_STATUS_RECORD_VISITS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn record_bounded_status_record_visit() {
+    #[cfg(test)]
+    BOUNDED_STATUS_RECORD_VISITS.set(BOUNDED_STATUS_RECORD_VISITS.get().saturating_add(1));
 }
 
 /// Cloneable handle to the process-local materialized repair queue.
@@ -391,7 +397,13 @@ impl LocalDfsRepairQueueStore {
         if !state.loaded {
             return Ok(DfsRepairQueueBoundedStatus::NotHydrated);
         }
-        let records = state.records.values().take(max_records).cloned().collect();
+        let records = state
+            .records
+            .values()
+            .take(max_records)
+            .inspect(|_| record_bounded_status_record_visit())
+            .cloned()
+            .collect();
         Ok(DfsRepairQueueBoundedStatus::Hydrated(
             DfsRepairQueueStatusView {
                 head_sequence: state.head_sequence,
@@ -890,7 +902,7 @@ mod tests {
         records.push(sentinel.clone());
         store.append_enqueues(records).expect("seed large queue");
 
-        BOUNDED_STATUS_RECORD_CLONES.set(0);
+        BOUNDED_STATUS_RECORD_VISITS.set(0);
         let DfsRepairQueueBoundedStatus::Hydrated(view) =
             store.bounded_status_view(32).expect("bounded hot view")
         else {
@@ -900,9 +912,9 @@ mod tests {
         assert_eq!(view.records.len(), 32);
         assert!(!view.records.contains(&sentinel));
         assert_eq!(
-            BOUNDED_STATUS_RECORD_CLONES.get(),
+            BOUNDED_STATUS_RECORD_VISITS.get(),
             32,
-            "status may clone only the requested sample, not the complete resident queue"
+            "status may visit and clone only the requested sample, not the complete resident queue"
         );
 
         let cold = reopen(&snapshot_path);

@@ -9209,8 +9209,13 @@ fn networked_sifs_remote_read_retries_lost_request_within_readthrough_budget() {
 
 #[test]
 fn networked_sifs_remote_read_falls_back_after_stale_location_rejection() {
-    let stale = NodeId::from_legacy_named("node_stale").expect("node");
-    let owner = NodeId::from_legacy_named("node_owner").expect("node");
+    let candidate_a = NodeId::from_legacy_named("node_stale_candidate_a").expect("node");
+    let candidate_b = NodeId::from_legacy_named("node_stale_candidate_b").expect("node");
+    let (stale, owner) = if candidate_a < candidate_b {
+        (candidate_a, candidate_b)
+    } else {
+        (candidate_b, candidate_a)
+    };
     let reader = NodeId::from_legacy_named("node_reader").expect("node");
     let root = temp_root("networked_sifs_readthrough_stale_location_rejection");
     let network = InProcessNetwork::new();
@@ -9365,8 +9370,13 @@ fn networked_sifs_remote_read_falls_back_after_stale_location_rejection() {
 
 #[test]
 fn networked_dfs_remote_read_prunes_stale_version_source_before_retry() {
-    let stale = NodeId::from_legacy_named("node_stale_version").expect("node");
-    let owner = NodeId::from_legacy_named("node_current_owner").expect("node");
+    let candidate_a = NodeId::from_legacy_named("node_version_candidate_a").expect("node");
+    let candidate_b = NodeId::from_legacy_named("node_version_candidate_b").expect("node");
+    let (stale, owner) = if candidate_a < candidate_b {
+        (candidate_a, candidate_b)
+    } else {
+        (candidate_b, candidate_a)
+    };
     let reader = NodeId::from_legacy_named("node_version_reader").expect("node");
     let file_system_id = DfsFileSystemId::from_legacy_named("sifs").expect("filesystem");
     let object_id = DfsObjectId::from_legacy_named("obj_stale_version").expect("object");
