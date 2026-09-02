@@ -154,6 +154,7 @@ pub struct ComponentContext {
     node_resources: Option<sinomo_device::NodeResourceMonitor>,
     activity_observer: Option<Arc<dyn ComponentActivityObserver>>,
     service_registry: Option<ServiceRegistrySnapshotStore>,
+    module_runtime: Option<crate::ModuleRuntimeHost>,
     event_bus: Option<crate::ComponentEventBus>,
 }
 
@@ -168,6 +169,7 @@ impl ComponentContext {
             node_resources: None,
             activity_observer: None,
             service_registry: None,
+            module_runtime: None,
             event_bus: None,
         }
     }
@@ -216,6 +218,11 @@ impl ComponentContext {
         self
     }
 
+    pub fn with_module_runtime(mut self, module_runtime: crate::ModuleRuntimeHost) -> Self {
+        self.module_runtime = Some(module_runtime);
+        self
+    }
+
     pub fn with_event_bus(mut self, event_bus: crate::ComponentEventBus) -> Self {
         self.event_bus = Some(event_bus);
         self
@@ -248,6 +255,46 @@ impl ComponentContext {
                 component_id: "component-host".to_string(),
                 detail: "component service registry is unavailable".to_string(),
             })
+    }
+
+    pub fn extension_registry_snapshot(
+        &self,
+    ) -> Result<Arc<crate::ExtensionRegistrySnapshot>, ComponentError> {
+        self.module_runtime
+            .as_ref()
+            .map(|runtime| {
+                runtime
+                    .generations
+                    .active_snapshot()
+                    .extension_registry
+                    .clone()
+            })
+            .ok_or_else(|| ComponentError::Component {
+                component_id: "component-host".to_string(),
+                detail: "component extension registry is unavailable".to_string(),
+            })
+    }
+
+    /// Build an executor over the exact extension and service generations
+    /// exposed to this component. Reducers, pipeline validators, and final
+    /// state application remain trusted code owned by the extension point.
+    pub fn extension_executor(
+        &self,
+        owner: &ComponentDescriptor,
+    ) -> Result<crate::ExtensionExecutor, ComponentError> {
+        Ok(crate::ExtensionExecutor::new(
+            owner.clone(),
+            self.extension_registry_snapshot()?,
+            Arc::clone(&self.data_dir),
+            self.service_registry_snapshot_store()?,
+        )
+        .with_invocation_leases(
+            self.module_runtime
+                .as_ref()
+                .expect("extension registry availability checked above")
+                .invocations
+                .clone(),
+        ))
     }
 
     pub fn event_client(
@@ -577,6 +624,7 @@ pub struct ComponentReconciler {
     event_bus: crate::ComponentEventBus,
     external_offers: Vec<ServiceOffer>,
     active: BTreeMap<String, ComponentScope>,
+    retiring: BTreeMap<String, Vec<ComponentScope>>,
 }
 
 impl ComponentReconciler {
@@ -592,6 +640,7 @@ impl ComponentReconciler {
             base_registry,
             external_offers: Vec::new(),
             active: BTreeMap::new(),
+            retiring: BTreeMap::new(),
         }
     }
 
@@ -610,6 +659,7 @@ impl ComponentReconciler {
             event_bus,
             external_offers: Vec::new(),
             active: BTreeMap::new(),
+            retiring: BTreeMap::new(),
         }
     }
 
@@ -627,6 +677,18 @@ impl ComponentReconciler {
 
     pub fn active_component_ids(&self) -> Vec<String> {
         self.active.keys().cloned().collect()
+    }
+
+    pub fn planned_active_component_ids(
+        &self,
+        factories: &[Arc<dyn ComponentFactory>],
+    ) -> Result<Vec<String>, ComponentError> {
+        let factories = validated_factories(factories)?;
+        let (activation_order, _) = resolve_component_activation(&factories, &self.external_offers);
+        Ok(activation_order
+            .iter()
+            .map(|factory| factory.descriptor().component_id.clone())
+            .collect())
     }
 
     pub fn notify_host_start(&self) {
@@ -648,7 +710,10 @@ impl ComponentReconciler {
             .map_err(|error| ComponentError::Registry {
                 detail: error.to_string(),
             })?;
-        self.active.clear();
+        for (component_id, scope) in std::mem::take(&mut self.active) {
+            self.retiring.entry(component_id).or_default().push(scope);
+        }
+        self.retiring.clear();
         Ok(())
     }
 
@@ -693,6 +758,40 @@ impl ComponentReconciler {
     }
 
     pub fn reconcile(
+        &mut self,
+        factories: &[Arc<dyn ComponentFactory>],
+    ) -> Result<ComponentReconcileReport, ComponentError> {
+        let report = self.reconcile_staged(factories)?;
+        self.finish_retiring(&report.stopped);
+        Ok(report)
+    }
+
+    /// Publish a new base/service generation while retaining removed scopes.
+    /// Hot-unload callers wait for invocation leases before calling
+    /// [`Self::finish_retiring`], so no new request can enter a removed route
+    /// and existing handlers keep their component-owned state until drained.
+    pub fn reconcile_staged_with_base_registry(
+        &mut self,
+        base_registry: ServiceRegistry,
+        factories: &[Arc<dyn ComponentFactory>],
+    ) -> Result<ComponentReconcileReport, ComponentError> {
+        let previous = std::mem::replace(&mut self.base_registry, base_registry);
+        match self.reconcile_staged(factories) {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.base_registry = previous;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn finish_retiring(&mut self, component_ids: &[String]) {
+        for component_id in component_ids {
+            self.retiring.remove(component_id);
+        }
+    }
+
+    fn reconcile_staged(
         &mut self,
         factories: &[Arc<dyn ComponentFactory>],
     ) -> Result<ComponentReconcileReport, ComponentError> {
@@ -760,9 +859,14 @@ impl ComponentReconciler {
             })
             .cloned()
             .collect::<Vec<_>>();
-        self.active.retain(|component_id, _| {
-            desired_ids.contains(component_id) && !mounted.contains_key(component_id)
-        });
+        for component_id in &stopped {
+            if let Some(scope) = self.active.remove(component_id) {
+                self.retiring
+                    .entry(component_id.clone())
+                    .or_default()
+                    .push(scope);
+            }
+        }
         self.active.extend(mounted);
 
         Ok(ComponentReconcileReport {
@@ -1181,6 +1285,54 @@ mod tests {
                 .route_count(),
             0
         );
+    }
+
+    #[test]
+    fn staged_reconcile_withdraws_routes_before_retiring_component_scope() {
+        let disposed = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn ComponentFactory> = Arc::new(
+            StaticComponentFactory::new(ComponentDescriptor::new("fixture.retiring", "1.0.0"), {
+                let disposed = Arc::clone(&disposed);
+                move |_, scope| {
+                    scope.set_services(
+                        ServiceRegistryBuilder::default()
+                            .register(NamedService {
+                                name: "fixture-retiring",
+                                routes: &["/fixture/retiring"],
+                            })
+                            .build(),
+                    );
+                    scope.defer({
+                        let disposed = Arc::clone(&disposed);
+                        move || {
+                            disposed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                    Ok(())
+                }
+            })
+            .expect("factory"),
+        );
+        let mut reconciler = ComponentReconciler::new(context(), ServiceRegistry::default());
+        reconciler
+            .reconcile(&[factory])
+            .expect("activate component");
+
+        let report = reconciler
+            .reconcile_staged_with_base_registry(ServiceRegistry::default(), &[])
+            .expect("stage retirement");
+        assert_eq!(report.stopped, ["fixture.retiring"]);
+        assert!(
+            !reconciler
+                .service_registry()
+                .active_snapshot()
+                .registry()
+                .owns("/fixture/retiring")
+        );
+        assert_eq!(disposed.load(Ordering::SeqCst), 0);
+
+        reconciler.finish_retiring(&report.stopped);
+        assert_eq!(disposed.load(Ordering::SeqCst), 1);
     }
 
     #[test]

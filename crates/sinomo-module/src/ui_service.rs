@@ -1,17 +1,18 @@
 //! Local application catalog for module-contributed UI extension surfaces.
 
-use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use sinomo_core::network::ObjectRpcRequest;
 use sinomo_core::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,
     ServiceRegistryBuilder, ServiceRoute,
 };
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
 
-use crate::{ModuleBackendRegistration, ModuleRegistrySnapshot};
+use crate::{
+    ExtensionRegistrySnapshot, ModuleBackendRegistration, ModuleRegistrySnapshot,
+    ModuleRuntimeGenerationStore, compile_default_extension_registry,
+};
 
 pub const MODULE_UI_CATALOG_ROUTE: &str = "/module/ui/catalog";
 pub const MODULE_UI_RPC_CATEGORY: &str = "module.ui";
@@ -42,14 +43,14 @@ pub struct UiExtensionCatalogResponse {
 
 #[derive(Clone)]
 pub struct HostedUiExtensionCatalogService {
-    snapshot: Arc<ModuleRegistrySnapshot>,
+    generations: ModuleRuntimeGenerationStore,
     data_dir_root: PathBuf,
 }
 
 impl HostedUiExtensionCatalogService {
-    pub fn new(snapshot: Arc<ModuleRegistrySnapshot>, data_dir_root: PathBuf) -> Self {
+    pub fn new(generations: ModuleRuntimeGenerationStore, data_dir_root: PathBuf) -> Self {
         Self {
-            snapshot,
+            generations,
             data_dir_root,
         }
     }
@@ -69,16 +70,21 @@ impl Service for HostedUiExtensionCatalogService {
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
-        let snapshot = Arc::clone(&self.snapshot);
+        let generations = self.generations.clone();
         let data_dir_root = self.data_dir_root.clone();
         Box::pin(async move {
             if request.route != MODULE_UI_CATALOG_ROUTE {
                 return Err(ServiceError::UnknownRoute(request.route));
             }
             let payload: UiExtensionCatalogRequest = ctx.decode_request_body(&request).await?;
-            let response =
-                ui_extension_catalog_response(snapshot.as_ref(), &payload, &data_dir_root)
-                    .map_err(ServiceError::Service)?;
+            let generation = generations.active_snapshot();
+            let response = ui_extension_catalog_response_with_registry(
+                generation.module_registry.as_ref(),
+                generation.extension_registry.as_ref(),
+                &payload,
+                &data_dir_root,
+            )
+            .map_err(ServiceError::Service)?;
             ctx.respond_value(MODULE_UI_CATALOG_ROUTE, response)?;
             Ok(ServiceDisposition::Continue)
         })
@@ -87,11 +93,11 @@ impl Service for HostedUiExtensionCatalogService {
 
 pub fn register_ui_extension_catalog_service(
     builder: ServiceRegistryBuilder,
-    snapshot: Arc<ModuleRegistrySnapshot>,
+    generations: ModuleRuntimeGenerationStore,
     data_dir_root: PathBuf,
 ) -> ServiceRegistryBuilder {
     builder.register(HostedUiExtensionCatalogService::new(
-        snapshot,
+        generations,
         data_dir_root,
     ))
 }
@@ -113,6 +119,17 @@ pub fn ui_extension_catalog_response(
     request: &UiExtensionCatalogRequest,
     data_dir_root: &Path,
 ) -> Result<UiExtensionCatalogResponse, String> {
+    let registry =
+        compile_default_extension_registry(snapshot).map_err(|error| error.to_string())?;
+    ui_extension_catalog_response_with_registry(snapshot, &registry, request, data_dir_root)
+}
+
+pub fn ui_extension_catalog_response_with_registry(
+    snapshot: &ModuleRegistrySnapshot,
+    registry: &ExtensionRegistrySnapshot,
+    request: &UiExtensionCatalogRequest,
+    data_dir_root: &Path,
+) -> Result<UiExtensionCatalogResponse, String> {
     if let Some(point) = request.extension_point_id.as_deref()
         && (point.is_empty()
             || point.len() > 256
@@ -123,70 +140,150 @@ pub fn ui_extension_catalog_response(
     {
         return Err("UI extension point filter is invalid".to_string());
     }
-    let mut by_point = BTreeMap::<String, Vec<UiExtensionCatalogEntry>>::new();
-    let mut warnings = Vec::new();
+    let mut ui_point_ids = registry
+        .points
+        .iter()
+        .filter(|point| {
+            point.definition.contribution_schema_id
+                == sinomo_module_api::UI_EXTENSION_PAYLOAD_SCHEMA_ID
+        })
+        .map(|point| point.definition.point_id.as_str())
+        .collect::<BTreeSet<_>>();
     for registration in snapshot.registry().registrations() {
-        for contribution in &registration.surfaces.ui_contributions {
-            if request
-                .extension_point_id
-                .as_deref()
-                .is_some_and(|point| point != contribution.extension_point_id)
+        ui_point_ids.extend(
+            registration
+                .surfaces
+                .ui_contributions
+                .iter()
+                .map(|contribution| contribution.extension_point_id.as_str()),
+        );
+    }
+    let mut warnings = registry
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| ui_point_ids.contains(diagnostic.point_id.as_str()))
+        .map(|diagnostic| {
+            format!(
+                "extension registry {:?} for `{}`{}: {}",
+                diagnostic.code,
+                diagnostic.point_id,
+                diagnostic
+                    .contribution_id
+                    .as_deref()
+                    .map(|id| format!(" contribution `{id}`"))
+                    .unwrap_or_default(),
+                diagnostic.detail
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut entries = Vec::new();
+    for point in &registry.points {
+        if request
+            .extension_point_id
+            .as_deref()
+            .is_some_and(|requested| requested != point.definition.point_id)
+        {
+            continue;
+        }
+        for resolved in &point.contributions {
+            if resolved.contribution.payload_schema_id
+                != sinomo_module_api::UI_EXTENSION_PAYLOAD_SCHEMA_ID
+                || resolved.contribution.payload_sobj.is_empty()
             {
                 continue;
             }
-            let component_path =
-                match resolve_ui_component_path(data_dir_root, &registration.backend, contribution)
-                {
-                    Ok(path) => path,
-                    Err(detail) => {
-                        warnings.push(format!(
-                            "UI contribution `{}` from module `{}` is unavailable: {detail}",
-                            contribution.contribution_id,
-                            registration.module_id()
-                        ));
-                        None
-                    }
-                };
-            by_point
-                .entry(contribution.extension_point_id.clone())
-                .or_default()
-                .push(UiExtensionCatalogEntry {
-                    module_id: registration.module_id().to_string(),
-                    module_version: registration.manifest.version.clone(),
-                    module_backend: module_backend_label(&registration.backend).to_string(),
-                    component_path,
-                    contribution: contribution.clone(),
-                });
+            let payload = match sinomo_module_api::decode_sobj::<
+                sinomo_module_api::UiContributionPayload,
+            >(&resolved.contribution.payload_sobj)
+            {
+                Ok(payload) => payload,
+                Err(error) => {
+                    warnings.push(format!(
+                        "UI contribution `{}` payload is invalid: {error}",
+                        resolved.contribution.contribution_id
+                    ));
+                    continue;
+                }
+            };
+            let contribution = ui_contribution_from_generic(
+                &resolved.contribution,
+                &point.definition.point_version,
+                payload,
+            );
+            let Some(registration) = snapshot
+                .registry()
+                .registrations()
+                .find(|registration| registration.module_id().to_string() == resolved.module_id)
+            else {
+                warnings.push(format!(
+                    "UI contribution `{}` lost its module registration",
+                    contribution.contribution_id
+                ));
+                continue;
+            };
+            let component_path = match resolve_ui_component_path(
+                data_dir_root,
+                &registration.backend,
+                &contribution,
+            ) {
+                Ok(path) => path,
+                Err(detail) => {
+                    warnings.push(format!(
+                        "UI contribution `{}` from module `{}` is unavailable: {detail}",
+                        contribution.contribution_id, resolved.module_id
+                    ));
+                    None
+                }
+            };
+            entries.push(UiExtensionCatalogEntry {
+                module_id: resolved.module_id.clone(),
+                module_version: resolved.module_version.clone(),
+                module_backend: resolved.module_backend.clone(),
+                component_path,
+                contribution,
+            });
         }
     }
-
-    let mut entries = Vec::new();
-    for (point, mut point_entries) in by_point {
-        let contributions = point_entries
-            .iter()
-            .map(|entry| entry.contribution.clone())
-            .collect::<Vec<_>>();
-        let order = match sinomo_module_api::order_ui_contributions(&contributions) {
-            Ok(order) => order,
-            Err(sinomo_module_api::UiExtensionContractError::CyclicOrdering { contributions }) => {
-                warnings.push(format!(
-                    "UI extension point `{point}` discarded cyclic relative ordering among {}",
-                    contributions.join(", ")
-                ));
-                point_entries
-                    .sort_by(|left, right| ui_entry_sort_key(left).cmp(&ui_entry_sort_key(right)));
-                entries.extend(point_entries);
-                continue;
-            }
-            Err(error) => return Err(error.to_string()),
-        };
-        entries.extend(order.into_iter().map(|index| point_entries[index].clone()));
-    }
     Ok(UiExtensionCatalogResponse {
-        registry_generation: snapshot.version(),
+        registry_generation: registry.generation.module_registry_generation,
         entries,
         warnings,
     })
+}
+
+fn ui_contribution_from_generic(
+    contribution: &sinomo_module_api::ExtensionContribution,
+    point_version: &str,
+    payload: sinomo_module_api::UiContributionPayload,
+) -> sinomo_module_api::UiExtensionContribution {
+    sinomo_module_api::UiExtensionContribution {
+        contribution_id: contribution.contribution_id.clone(),
+        extension_point_id: contribution.point_id.clone(),
+        extension_point_version: point_version.to_string(),
+        group: contribution.group.clone(),
+        order: contribution.order,
+        before: contribution.before.clone(),
+        after: contribution.after.clone(),
+        when: contribution
+            .when
+            .iter()
+            .map(|condition| sinomo_module_api::UiContextCondition {
+                key: condition.key.clone(),
+                value: match &condition.value {
+                    sinomo_module_api::ExtensionContextValue::Bool(value) => {
+                        sinomo_module_api::UiContextValue::Bool(*value)
+                    }
+                    sinomo_module_api::ExtensionContextValue::String(value) => {
+                        sinomo_module_api::UiContextValue::String(value.clone())
+                    }
+                    sinomo_module_api::ExtensionContextValue::Integer(value) => {
+                        sinomo_module_api::UiContextValue::Integer(*value)
+                    }
+                },
+            })
+            .collect(),
+        payload,
+    }
 }
 
 fn resolve_ui_component_path(
@@ -258,25 +355,6 @@ fn validate_relative_path(value: &str) -> Result<(), String> {
         return Err(format!("path `{value}` is not a normalized relative path"));
     }
     Ok(())
-}
-
-fn ui_entry_sort_key(entry: &UiExtensionCatalogEntry) -> (&str, i32, &str, &str) {
-    (
-        entry.contribution.group.as_str(),
-        entry.contribution.order,
-        entry.module_id.as_str(),
-        entry.contribution.contribution_id.as_str(),
-    )
-}
-
-fn module_backend_label(backend: &ModuleBackendRegistration) -> &'static str {
-    match backend {
-        ModuleBackendRegistration::NativeRust { .. } => "native-rust",
-        ModuleBackendRegistration::NativeDylib { .. } => "native-dylib",
-        ModuleBackendRegistration::Declarative { .. } => "declarative",
-        ModuleBackendRegistration::SandboxProcess { .. } => "sandbox-process",
-        ModuleBackendRegistration::WasmComponent { .. } => "wasm-component",
-    }
 }
 
 #[cfg(test)]
@@ -400,6 +478,37 @@ mod tests {
     fn catalog_route_is_local_command_only() {
         let route = ui_extension_catalog_route();
         assert_eq!(route.auth_scope.as_deref(), Some("local-command"));
+    }
+
+    #[test]
+    fn catalog_projects_generic_ui_contributions_from_the_shared_registry() {
+        let ui = contribution("module.generic.preview", 0);
+        let mut registration = registration("module.generic", Vec::new());
+        registration.surfaces.extension_contributions = vec![
+            ui.to_extension_contribution()
+                .expect("generic UI contribution"),
+        ];
+        let registry = ModuleRegistry::builder()
+            .register(registration)
+            .expect("registration")
+            .try_build()
+            .expect("registry");
+        let store = crate::ModuleRegistrySnapshotStore::new(registry).expect("snapshot store");
+        let snapshot = store.active_snapshot().expect("snapshot");
+        let root = sinomo_testdir::TestDir::new("sinomo-module-generic-ui-catalog");
+
+        let response = ui_extension_catalog_response(
+            snapshot.as_ref(),
+            &UiExtensionCatalogRequest::default(),
+            root.path(),
+        )
+        .expect("catalog");
+
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(
+            response.entries[0].contribution.contribution_id,
+            "module.generic.preview"
+        );
     }
 
     #[test]

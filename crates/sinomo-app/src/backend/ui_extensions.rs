@@ -25,20 +25,27 @@ impl Backend {
                 warnings: Vec::new(),
             });
         };
-        let request = ObjectRpcRequest::encode_body(
-            MODULE_UI_CATALOG_ROUTE,
-            MODULE_UI_RPC_CATEGORY,
-            &UiExtensionCatalogRequest {
-                extension_point_id: extension_point_id.map(str::to_string),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        let response = DaemonApiClient::at_address(address)
-            .with_timeout(UI_EXTENSION_CATALOG_TIMEOUT)
-            .call_request(&request)
-            .map_err(|error| error.to_string())?;
-        response.decode_body().map_err(|error| error.to_string())
+        ui_extension_catalog_at_address(address, extension_point_id)
     }
+}
+
+pub(crate) fn ui_extension_catalog_at_address(
+    address: &str,
+    extension_point_id: Option<&str>,
+) -> Result<UiExtensionCatalogResponse, String> {
+    let request = ObjectRpcRequest::encode_body(
+        MODULE_UI_CATALOG_ROUTE,
+        MODULE_UI_RPC_CATEGORY,
+        &UiExtensionCatalogRequest {
+            extension_point_id: extension_point_id.map(str::to_string),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let response = DaemonApiClient::at_address(address)
+        .with_timeout(UI_EXTENSION_CATALOG_TIMEOUT)
+        .call_request(&request)
+        .map_err(|error| error.to_string())?;
+    response.decode_body().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

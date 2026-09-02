@@ -348,6 +348,33 @@ pub struct ProcessNetworkModules {
     pub loader_module_ids: std::collections::BTreeMap<String, crate::ModuleId>,
 }
 
+impl ProcessNetworkModules {
+    pub fn unload_loader_module(
+        &self,
+        module_id: &crate::ModuleId,
+        timeout: std::time::Duration,
+    ) -> Result<
+        Vec<sinomo_core::network::NetworkModuleUnloadReport>,
+        sinomo_core::network::NetworkError,
+    > {
+        let network_module_ids = self
+            .loader_module_ids
+            .iter()
+            .filter(|(_, loader_module_id)| *loader_module_id == module_id)
+            .map(|(network_module_id, _)| network_module_id.clone())
+            .collect::<Vec<_>>();
+        let started = std::time::Instant::now();
+        let mut reports = Vec::with_capacity(network_module_ids.len());
+        for network_module_id in network_module_ids {
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .unwrap_or(std::time::Duration::ZERO);
+            reports.push(self.registry.unregister(&network_module_id, remaining)?);
+        }
+        Ok(reports)
+    }
+}
+
 static PROCESS_NETWORK_MODULES: std::sync::Mutex<Option<Arc<ProcessNetworkModules>>> =
     std::sync::Mutex::new(None);
 

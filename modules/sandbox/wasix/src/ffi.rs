@@ -14,11 +14,11 @@ use sinomo_module_api::SinomoModuleHostIsCancelledFn;
 use sinomo_module_api::{
     ComponentDescriptor, NativeModuleBackend, NativeModuleCapabilitiesResponse,
     NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleInvocationResponse,
-    NativeModuleRequest, NativeModuleResponse, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
-    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
-    decode_sobj, encode_sobj,
+    NativeModuleLifecycle, NativeModuleRequest, NativeModuleResponse,
+    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 use sinomo_sandbox::{
     SANDBOX_EXECUTOR_INTERFACE_ID, SANDBOX_EXECUTOR_INTERFACE_VERSION, SANDBOX_EXECUTOR_OPERATION,
@@ -49,6 +49,7 @@ unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
 
 static HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
+static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_api_version() -> u32 {
@@ -67,12 +68,18 @@ pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModul
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
+    if !MODULE_LIFECYCLE.initialize() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = Some(StoredHostApi(host));
             SINOMO_MODULE_STATUS_OK
         }
-        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        Err(_) => {
+            let _ = MODULE_LIFECYCLE.begin_shutdown();
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        }
     }
 }
 
@@ -81,6 +88,16 @@ pub extern "C" fn sinomo_module_invoke(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
 ) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return write_response(
+            response_sobj,
+            NativeModuleResponse::Error(native_error_response(
+                "module-unavailable",
+                "WASIX module is not initialized or is shutting down",
+            )),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        );
+    };
     let result = catch_unwind(AssertUnwindSafe(|| unsafe {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -99,6 +116,9 @@ pub extern "C" fn sinomo_module_invoke(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
+    if !MODULE_LIFECYCLE.begin_shutdown() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = None;
@@ -613,6 +633,8 @@ fn usize_or_default(value: u64, default: usize) -> usize {
 mod tests {
     use super::*;
 
+    static MODULE_ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     unsafe extern "C" fn test_is_cancelled(user_data: *mut std::ffi::c_void) -> u8 {
         let Some(cancelled) = (unsafe { (user_data as *const AtomicBool).as_ref() }) else {
             return 0;
@@ -645,6 +667,7 @@ mod tests {
 
     #[test]
     fn host_cancellation_bridge_flips_module_token() {
+        let _guard = MODULE_ABI_TEST_LOCK.lock().expect("ABI test lock");
         let cancelled = AtomicBool::new(false);
         let _restore = install_test_host_api(&cancelled);
         let bridge = HostCancellationBridge::start();
@@ -660,5 +683,33 @@ mod tests {
         }
 
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn module_shutdown_is_idempotent_and_reinitializable() {
+        let _guard = MODULE_ABI_TEST_LOCK.lock().expect("ABI test lock");
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        let mut response = SinomoModuleByteBuffer::null();
+        assert_eq!(
+            sinomo_module_invoke(SinomoModuleByteSlice::from_slice(&[]), &mut response),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        );
+        let bytes = unsafe { SinomoModuleByteBuffer::into_vec(response) };
+        assert!(matches!(
+            decode_sobj::<NativeModuleResponse>(&bytes).expect("rejected response"),
+            NativeModuleResponse::Error(NativeModuleErrorResponse { ref code, .. })
+                if code == "module-unavailable"
+        ));
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
     }
 }

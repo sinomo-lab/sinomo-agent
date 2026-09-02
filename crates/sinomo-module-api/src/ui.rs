@@ -11,9 +11,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::{
+    ExtensionCompositionPolicy, ExtensionContextCondition, ExtensionContextValue,
+    ExtensionContribution, ExtensionPointDefinition, ExtensionVersionRequirement,
+    NativeModuleApiError,
+};
+
 pub const UI_WIDGET_PROTOCOL_ID: &str = "sinomo.ui.widget";
 pub const UI_WIDGET_PROTOCOL_VERSION: &str = "1.0.0";
 pub const UI_WIDGET_WIT: &str = include_str!("../wit/sinomo-ui-widget-v1.wit");
+pub const UI_EXTENSION_CONTEXT_SCHEMA_ID: &str = "sinomo.ui.context/v1";
+pub const UI_EXTENSION_PAYLOAD_SCHEMA_ID: &str = "sinomo.ui.contribution/v1";
+pub const UI_EXTENSION_RESOLVED_SCHEMA_ID: &str = "sinomo.ui.resolved-contribution-list/v1";
 pub const FILE_PREVIEW_EXTENSION_POINT_ID: &str = "sinomo.app.files.preview-provider";
 pub const FILE_PREVIEW_EXTENSION_POINT_VERSION: &str = "1.0.0";
 
@@ -108,6 +117,48 @@ impl UiExtensionContribution {
         }
         self.payload.validate(&self.contribution_id)
     }
+
+    /// Adapt the legacy UI-specific surface onto the generic extension
+    /// contribution envelope. Hosts use this during the migration period so
+    /// old manifests and new generic contributors share one registry.
+    pub fn to_extension_contribution(&self) -> Result<ExtensionContribution, NativeModuleApiError> {
+        let mut contribution = ExtensionContribution::declarative(
+            self.contribution_id.clone(),
+            self.extension_point_id.clone(),
+            ExtensionVersionRequirement::exact(self.extension_point_version.clone()),
+            UI_EXTENSION_PAYLOAD_SCHEMA_ID,
+            crate::encode_sobj(&self.payload)?,
+        )
+        .with_order(self.group.clone(), self.order);
+        contribution.before = self.before.clone();
+        contribution.after = self.after.clone();
+        contribution.when = self
+            .when
+            .iter()
+            .map(|condition| ExtensionContextCondition {
+                key: condition.key.clone(),
+                value: match &condition.value {
+                    UiContextValue::Bool(value) => ExtensionContextValue::Bool(*value),
+                    UiContextValue::String(value) => ExtensionContextValue::String(value.clone()),
+                    UiContextValue::Integer(value) => ExtensionContextValue::Integer(*value),
+                },
+            })
+            .collect();
+        Ok(contribution)
+    }
+}
+
+pub fn file_preview_extension_point_definition() -> ExtensionPointDefinition {
+    ExtensionPointDefinition::new(
+        FILE_PREVIEW_EXTENSION_POINT_ID,
+        FILE_PREVIEW_EXTENSION_POINT_VERSION,
+        UI_EXTENSION_CONTEXT_SCHEMA_ID,
+        UI_EXTENSION_PAYLOAD_SCHEMA_ID,
+        UI_EXTENSION_RESOLVED_SCHEMA_ID,
+        ExtensionCompositionPolicy::SelectOne,
+    )
+    .require_explicit_selection()
+    .with_limits(32, 64 * 1024, MAX_UI_COMPONENT_ARTIFACT_BYTES, 2_000)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

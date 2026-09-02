@@ -13,7 +13,7 @@
 //! real [`DaemonClusterAccess`] via [`ServiceContext::cluster`] when clustered.
 
 use sinomo_core::cluster::{ClusterKvPathsExt, RemoteClusterControlAuthorityFence};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1872,6 +1872,13 @@ pub struct DaemonServiceRegistryHost {
     /// component and request dispatch.
     service_registry: ServiceRegistrySnapshotStore,
     component_reconciler: Arc<Mutex<ComponentReconciler>>,
+    module_snapshots: sinomo_module::ModuleRegistrySnapshotStore,
+    module_runtime: sinomo_module::ModuleRuntimeHost,
+    component_catalog: Arc<Mutex<ComponentCatalog>>,
+    host_registry: ServiceRegistry,
+    component_event_bus: sinomo_module::ComponentEventBus,
+    event_hub: Arc<DaemonEventHub>,
+    module_transition: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct DaemonServiceAssembly {
@@ -2009,6 +2016,8 @@ impl DaemonServiceRegistryHost {
         event_hub: Arc<DaemonEventHub>,
         node_resources: Option<sinomo_device::NodeResourceMonitor>,
     ) -> Result<Self, DaemonError> {
+        let registry = register_daemon_module_hot_unload_service(registry, paths.clone());
+        let host_registry = registry.clone();
         let data_dir_root =
             daemon_data_dir_path(&paths).map_err(|source| DaemonError::Network {
                 address: "daemon module registry".to_string(),
@@ -2027,7 +2036,7 @@ impl DaemonServiceRegistryHost {
                     detail: source.to_string(),
                 }
             })?;
-        let registry = sinomo_module::materialize_module_service_snapshot(
+        let materialized = sinomo_module::materialize_module_service_snapshot_with_extensions(
             registry,
             module_snapshot,
             data_dir_root.clone(),
@@ -2038,6 +2047,8 @@ impl DaemonServiceRegistryHost {
             address: "daemon service route registry".to_string(),
             detail: source.to_string(),
         })?;
+        let module_runtime = materialized.runtime.clone();
+        let registry = materialized.registry;
         let service_data_dir = Arc::new(SinomoDataDir::new(data_dir_root));
         let component_event_bus = daemon_component_event_bus(
             &paths,
@@ -2065,8 +2076,21 @@ impl DaemonServiceRegistryHost {
                 None
             };
         let service_registry = ServiceRegistrySnapshotStore::new(registry.clone());
+        let active_runtime_generation = module_runtime.generations.active_snapshot();
+        module_runtime
+            .generations
+            .publish(
+                active_runtime_generation.module_registry.clone(),
+                materialized.extension_registry.clone(),
+                service_registry.active_snapshot().version(),
+            )
+            .map_err(|source| DaemonError::Network {
+                address: "daemon module runtime generation".to_string(),
+                detail: source.to_string(),
+            })?;
         let mut component_context = ComponentContext::new(Arc::clone(&service_data_dir))
             .with_event_bus(component_event_bus.clone())
+            .with_module_runtime(module_runtime.clone())
             .with_host_role(if crate::daemon_paths_are_shadow(&paths) {
                 ComponentHostRole::Shadow
             } else {
@@ -2101,7 +2125,7 @@ impl DaemonServiceRegistryHost {
         let mut component_factories = component_catalog.factories();
         component_factories.push(component_event_stream_bridge_factory(
             component_event_bus.clone(),
-            event_hub,
+            Arc::clone(&event_hub),
         )?);
         component_reconciler
             .reconcile(&component_factories)
@@ -2113,6 +2137,18 @@ impl DaemonServiceRegistryHost {
             .prepare_host_on_runtime(service_runtime.as_ref())
             .map_err(|source| DaemonError::Network {
                 address: "daemon component startup".to_string(),
+                detail: source.to_string(),
+            })?;
+        let active_runtime_generation = module_runtime.generations.active_snapshot();
+        module_runtime
+            .generations
+            .publish(
+                active_runtime_generation.module_registry.clone(),
+                active_runtime_generation.extension_registry.clone(),
+                service_registry.active_snapshot().version(),
+            )
+            .map_err(|source| DaemonError::Network {
+                address: "daemon component runtime generation".to_string(),
                 detail: source.to_string(),
             })?;
         DAEMON_COMPONENT_EVENT_BUSES
@@ -2148,6 +2184,13 @@ impl DaemonServiceRegistryHost {
             service_cluster,
             service_registry,
             component_reconciler: Arc::new(Mutex::new(component_reconciler)),
+            module_snapshots,
+            module_runtime,
+            component_catalog: Arc::new(Mutex::new(component_catalog)),
+            host_registry,
+            component_event_bus,
+            event_hub,
+            module_transition: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -2276,6 +2319,359 @@ impl DaemonServiceRegistryHost {
         }
     }
 
+    pub async fn hot_unload_module(
+        &self,
+        module_id: &sinomo_module::ModuleId,
+        drain_timeout: Duration,
+        reason: &str,
+    ) -> Result<sinomo_module::ModuleHotUnloadReport, DaemonError> {
+        let _transition = self.module_transition.lock().await;
+        let transition_started = Instant::now();
+        let runtime_before = self.module_runtime.generations.active_snapshot();
+        let current_catalog = self
+            .component_catalog
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload".to_string(),
+                detail: "component catalog lock poisoned".to_string(),
+            })?
+            .clone();
+        let _registration = current_catalog
+            .modules()
+            .get(module_id)
+            .cloned()
+            .ok_or_else(|| DaemonError::Network {
+                address: "daemon module hot unload".to_string(),
+                detail: format!("module {module_id} is not active"),
+            })?;
+        let active_before = self
+            .component_reconciler
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload plan".to_string(),
+                detail: "component reconciler lock poisoned".to_string(),
+            })?
+            .active_component_ids()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut next_catalog = current_catalog
+            .without_module(module_id)
+            .map_err(|source| DaemonError::Network {
+                address: "daemon module hot unload catalog".to_string(),
+                detail: source.to_string(),
+            })?;
+        let mut cascade_module_ids = Vec::new();
+        loop {
+            let planned = self
+                .component_reconciler
+                .lock()
+                .map_err(|_| DaemonError::Network {
+                    address: "daemon module hot unload plan".to_string(),
+                    detail: "component reconciler lock poisoned".to_string(),
+                })?
+                .planned_active_component_ids(&next_catalog.factories())
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon module hot unload plan".to_string(),
+                    detail: source.to_string(),
+                })?
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            let newly_inactive = next_catalog
+                .modules()
+                .registrations()
+                .filter_map(|candidate| {
+                    let component =
+                        sinomo_module::component_descriptor_from_registration(candidate).ok()?;
+                    (active_before.contains(&component.component_id)
+                        && !planned.contains(&component.component_id))
+                    .then(|| candidate.module_id().clone())
+                })
+                .collect::<Vec<_>>();
+            if newly_inactive.is_empty() {
+                break;
+            }
+            for cascade_module_id in newly_inactive {
+                next_catalog =
+                    next_catalog
+                        .without_module(&cascade_module_id)
+                        .map_err(|source| DaemonError::Network {
+                            address: "daemon module hot unload cascade".to_string(),
+                            detail: source.to_string(),
+                        })?;
+                cascade_module_ids.push(cascade_module_id);
+            }
+        }
+        let mut draining_module_ids = vec![module_id.clone()];
+        draining_module_ids.extend(cascade_module_ids.iter().cloned());
+        let mut invocations_at_drain_start = 0_u64;
+        for draining_module_id in &draining_module_ids {
+            invocations_at_drain_start = invocations_at_drain_start.saturating_add(
+                self.module_runtime
+                    .invocations
+                    .begin_drain(draining_module_id.as_str())
+                    .map_err(|source| DaemonError::Network {
+                        address: "daemon module hot unload drain".to_string(),
+                        detail: source.to_string(),
+                    })?,
+            );
+        }
+
+        let next_module_snapshot = self
+            .module_snapshots
+            .replace_registry(next_catalog.modules().clone())
+            .map_err(|source| DaemonError::Network {
+                address: "daemon module hot unload registry".to_string(),
+                detail: source.to_string(),
+            })?;
+        let module_service_snapshot =
+            sinomo_module::module_service_snapshot_from_snapshot(next_module_snapshot.clone())
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon module hot unload routes".to_string(),
+                    detail: source.to_string(),
+                })?;
+        let materialized = sinomo_module::materialize_module_service_snapshot_for_runtime(
+            self.host_registry.clone(),
+            module_service_snapshot,
+            self.service_data_dir.root(),
+            Arc::new(next_catalog.clone()),
+            sinomo_module::NativeModuleServiceMaterialization::new("daemon"),
+            self.module_runtime.clone(),
+        )
+        .map_err(|source| DaemonError::Network {
+            address: "daemon module hot unload materialization".to_string(),
+            detail: source.to_string(),
+        })?;
+        let next_base_registry = sinomo_module::register_component_event_ingress_service(
+            materialized.registry.to_builder(),
+            self.component_event_bus.clone(),
+        )
+        .build();
+        let mut factories = next_catalog.factories();
+        factories.push(component_event_stream_bridge_factory(
+            self.component_event_bus.clone(),
+            Arc::clone(&self.event_hub),
+        )?);
+        let reconcile = self
+            .component_reconciler
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload components".to_string(),
+                detail: "component reconciler lock poisoned".to_string(),
+            })?
+            .reconcile_staged_with_base_registry(next_base_registry, &factories)
+            .map_err(|source| DaemonError::Network {
+                address: "daemon module hot unload components".to_string(),
+                detail: source.to_string(),
+            })?;
+        let runtime_after = self
+            .module_runtime
+            .generations
+            .publish(
+                next_module_snapshot,
+                materialized.extension_registry,
+                reconcile.service_registry_version,
+            )
+            .map_err(|source| DaemonError::Network {
+                address: "daemon module hot unload generation".to_string(),
+                detail: source.to_string(),
+            })?;
+        *self
+            .component_catalog
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload".to_string(),
+                detail: "component catalog lock poisoned".to_string(),
+            })? = next_catalog.clone();
+        DAEMON_STATUS_CONTRIBUTORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload status contributors".to_string(),
+                detail: "status contributor map lock poisoned".to_string(),
+            })?
+            .insert(self.paths.root.clone(), next_catalog.status_contributors());
+        DAEMON_MIGRATION_CONTRIBUTORS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload migration contributors".to_string(),
+                detail: "migration contributor map lock poisoned".to_string(),
+            })?
+            .insert(
+                self.paths.root.clone(),
+                next_catalog.migration_contributors(),
+            );
+
+        let mut network_module_reports = Vec::new();
+        if let Some(network_modules) = sinomo_module::process_network_modules() {
+            for draining_module_id in &draining_module_ids {
+                let remaining = drain_timeout
+                    .checked_sub(transition_started.elapsed())
+                    .unwrap_or(Duration::ZERO);
+                let network_modules = Arc::clone(&network_modules);
+                let draining_module_id = draining_module_id.clone();
+                let reports = tokio::task::spawn_blocking(move || {
+                    network_modules.unload_loader_module(&draining_module_id, remaining)
+                })
+                .await
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon network module hot unload".to_string(),
+                    detail: format!("network module retirement task failed: {source}"),
+                })?
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon network module hot unload".to_string(),
+                    detail: source.to_string(),
+                })?;
+                network_module_reports.extend(reports);
+            }
+        }
+        let network_modules_retired = network_module_reports.len() as u64;
+        let network_module_retirement_complete = network_module_reports
+            .iter()
+            .all(|report| report.stop_complete && report.object_released);
+
+        let native_operations_cancelled = draining_module_ids
+            .iter()
+            .map(|draining_module_id| {
+                self.module_runtime
+                    .native_operations
+                    .cancel_module(draining_module_id.as_str()) as u64
+            })
+            .sum();
+        let mut drained = true;
+        let mut remaining_invocations = 0_u64;
+        for draining_module_id in &draining_module_ids {
+            let remaining_timeout = drain_timeout
+                .checked_sub(transition_started.elapsed())
+                .unwrap_or(Duration::ZERO);
+            let outcome = self
+                .module_runtime
+                .invocations
+                .wait_for_drain(draining_module_id.as_str(), remaining_timeout)
+                .await
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon module hot unload drain".to_string(),
+                    detail: source.to_string(),
+                })?;
+            drained &= outcome.drained;
+            remaining_invocations =
+                remaining_invocations.saturating_add(outcome.remaining_invocations);
+        }
+        if !drained {
+            return Ok(sinomo_module::ModuleHotUnloadReport {
+                module_id: module_id.to_string(),
+                cascade_modules: cascade_module_ids.iter().map(ToString::to_string).collect(),
+                runtime_generation_before: runtime_before.generation,
+                runtime_generation_after: runtime_after.generation,
+                module_registry_generation: runtime_after.module_registry.version(),
+                service_registry_generation: runtime_after.service_registry_generation,
+                invocations_at_drain_start,
+                native_operations_cancelled,
+                network_modules_retired,
+                network_module_retirement_complete,
+                drained: false,
+                remaining_invocations,
+                logical_unload_complete: true,
+                component_teardown_complete: false,
+                physical_unload_attempted: false,
+                physical_unload_succeeded: false,
+                restart_required: true,
+                detail: format!(
+                    "module routes and contributions were withdrawn, but invocation drain timed out; component state remains quarantined; reason={reason}"
+                ),
+            });
+        }
+
+        let mut persistence_details = Vec::new();
+        for draining_module_id in &draining_module_ids {
+            let Some(draining_registration) = current_catalog.modules().get(draining_module_id)
+            else {
+                continue;
+            };
+            if !matches!(
+                draining_registration.backend,
+                sinomo_module::ModuleBackendRegistration::NativeDylib { .. }
+            ) {
+                persistence_details.push(persist_non_dylib_hot_unload_state(
+                    self.service_data_dir.as_ref(),
+                    draining_registration,
+                    reason,
+                )?);
+            }
+        }
+
+        self.component_reconciler
+            .lock()
+            .map_err(|_| DaemonError::Network {
+                address: "daemon module hot unload teardown".to_string(),
+                detail: "component reconciler lock poisoned".to_string(),
+            })?
+            .finish_retiring(&reconcile.stopped);
+        for draining_module_id in &draining_module_ids {
+            self.module_runtime
+                .invocations
+                .complete_unload(draining_module_id.as_str())
+                .map_err(|source| DaemonError::Network {
+                    address: "daemon module hot unload completion".to_string(),
+                    detail: source.to_string(),
+                })?;
+        }
+
+        let mut physical_unload_attempted = false;
+        let mut physical_unload_succeeded = network_module_retirement_complete;
+        let mut physical_details = persistence_details;
+        physical_details.extend(
+            network_module_reports
+                .iter()
+                .map(|report| format!("network {}: {}", report.module_id, report.detail)),
+        );
+        for draining_module_id in &draining_module_ids {
+            let Some(draining_registration) = current_catalog.modules().get(draining_module_id)
+            else {
+                continue;
+            };
+            if matches!(
+                draining_registration.backend,
+                sinomo_module::ModuleBackendRegistration::NativeDylib { .. }
+            ) {
+                let (attempted, succeeded, detail) = hot_unload_native_dylib_runtime(
+                    self.service_data_dir.as_ref(),
+                    draining_module_id,
+                    reason,
+                )?;
+                physical_unload_attempted |= attempted;
+                physical_unload_succeeded &= succeeded;
+                physical_details.push(format!("{draining_module_id}: {detail}"));
+            }
+        }
+        let physical_detail = if physical_details.is_empty() {
+            "modules have no dynamically mapped runtime artifacts".to_string()
+        } else {
+            physical_details.join("; ")
+        };
+        let restart_required = !physical_unload_succeeded;
+        Ok(sinomo_module::ModuleHotUnloadReport {
+            module_id: module_id.to_string(),
+            cascade_modules: cascade_module_ids.iter().map(ToString::to_string).collect(),
+            runtime_generation_before: runtime_before.generation,
+            runtime_generation_after: runtime_after.generation,
+            module_registry_generation: runtime_after.module_registry.version(),
+            service_registry_generation: runtime_after.service_registry_generation,
+            invocations_at_drain_start,
+            native_operations_cancelled,
+            network_modules_retired,
+            network_module_retirement_complete,
+            drained: true,
+            remaining_invocations: 0,
+            logical_unload_complete: true,
+            component_teardown_complete: true,
+            physical_unload_attempted,
+            physical_unload_succeeded,
+            restart_required,
+            detail: format!("{physical_detail}; reason={reason}"),
+        })
+    }
+
     pub(crate) fn shutdown_components(&self) {
         if let Ok(mut reconciler) = self.component_reconciler.lock()
             && let Err(error) = reconciler.shutdown()
@@ -2283,6 +2679,213 @@ impl DaemonServiceRegistryHost {
             tracing::warn!(%error, "daemon component shutdown failed");
         }
     }
+}
+
+fn register_daemon_module_hot_unload_service(
+    registry: ServiceRegistry,
+    paths: DaemonPaths,
+) -> ServiceRegistry {
+    let route = ServiceRoute::from_route_metadata(
+        sinomo_module::MODULE_HOT_UNLOAD_ROUTE,
+        sinomo_module::MODULE_RPC_CATEGORY,
+        "local-or-cluster-member",
+        [sinomo_core::node::MODULE_HOT_UNLOAD_ADMIN_CAPABILITY],
+    )
+    .require_local_permission("remote-management")
+    .observable("module.hot-unload", "admin");
+    registry
+        .to_builder()
+        .register_dynamic("module-hot-unload", route, move |mut context, request| {
+            let paths = paths.clone();
+            async move {
+                let payload: sinomo_module::ModuleHotUnloadRequest =
+                    context.decode_request_body(&request).await?;
+                payload.validate().map_err(ServiceError::Service)?;
+                let module_id = sinomo_module::ModuleId::new(payload.module_id.clone())
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                let host = DAEMON_SERVICE_REGISTRY_HOSTS
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .map_err(|_| {
+                        ServiceError::Service(
+                            "daemon service registry cache lock poisoned".to_string(),
+                        )
+                    })?
+                    .get(&paths.root)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ServiceError::Service(
+                            "daemon module hot-unload host is unavailable".to_string(),
+                        )
+                    })?;
+                let report = host
+                    .hot_unload_module(
+                        &module_id,
+                        Duration::from_millis(payload.drain_timeout_ms),
+                        &payload.reason,
+                    )
+                    .await
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                context.respond_value(sinomo_module::MODULE_HOT_UNLOAD_ROUTE, report)?;
+                Ok(ServiceDisposition::Continue)
+            }
+        })
+        .build()
+}
+
+fn persist_non_dylib_hot_unload_state(
+    data_dir: &SinomoDataDir,
+    registration: &sinomo_module::ModuleRegistration,
+    reason: &str,
+) -> Result<String, DaemonError> {
+    let module_id = registration.module_id();
+    let detail = match &registration.backend {
+        sinomo_module::ModuleBackendRegistration::NativeRust { .. } => {
+            sinomo_module::set_native_rust_module_enabled(
+                &data_dir.root(),
+                module_id,
+                false,
+                "daemon-hot-unload",
+                reason,
+            )
+            .map_err(|source| DaemonError::Network {
+                address: "daemon native Rust module hot unload state".to_string(),
+                detail: source.to_string(),
+            })?;
+            "persisted disabled native-Rust runtime state".to_string()
+        }
+        sinomo_module::ModuleBackendRegistration::Declarative { .. } => {
+            if let Some(mut state) =
+                sinomo_module::read_declarative_module_loader_state(&data_dir.root(), module_id)
+                    .map_err(|source| DaemonError::Network {
+                        address: "daemon declarative module hot unload state".to_string(),
+                        detail: source.to_string(),
+                    })?
+            {
+                state.active = false;
+                state.source = format!("daemon-hot-unload: {reason}");
+                sinomo_module::write_declarative_module_loader_state(&data_dir.root(), &state)
+                    .map_err(|source| DaemonError::Network {
+                        address: "daemon declarative module hot unload state".to_string(),
+                        detail: source.to_string(),
+                    })?;
+                "persisted inactive declarative loader state".to_string()
+            } else {
+                "declarative loader state was already absent".to_string()
+            }
+        }
+        sinomo_module::ModuleBackendRegistration::SandboxProcess { .. }
+        | sinomo_module::ModuleBackendRegistration::WasmComponent { .. } => {
+            "backend has no durable applied-state adapter; logical unload is process-scoped"
+                .to_string()
+        }
+        sinomo_module::ModuleBackendRegistration::NativeDylib { .. } => {
+            unreachable!("native dylib persistence is handled with physical unload")
+        }
+    };
+    let record = sinomo_module::ModuleUnloadRecord {
+        module_id: module_id.clone(),
+        backend: registration.manifest.kind.clone(),
+        artifact_id: None,
+        content_hash: None,
+        cache_key: None,
+        library_name: None,
+        state_removed: true,
+        runtime_unload_attempted: false,
+        runtime_unload_succeeded: true,
+        runtime_unload_detail: format!("{detail}; reason={reason}"),
+        unloaded_at: sinomo_module::module_loader_applied_at_now(),
+        source: "daemon-hot-unload".to_string(),
+    };
+    sinomo_module::write_module_unload_record(&data_dir.root(), &record).map_err(|source| {
+        DaemonError::Network {
+            address: "daemon module hot unload record".to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    Ok(format!("{module_id}: {detail}"))
+}
+
+fn hot_unload_native_dylib_runtime(
+    data_dir: &SinomoDataDir,
+    module_id: &sinomo_module::ModuleId,
+    reason: &str,
+) -> Result<(bool, bool, String), DaemonError> {
+    let previous =
+        sinomo_module::remove_native_dylib_module_loader_state(&data_dir.root(), module_id)
+            .map_err(|source| DaemonError::Network {
+                address: "daemon native module hot unload state".to_string(),
+                detail: source.to_string(),
+            })?;
+    let Some(state) = previous else {
+        return Ok((
+            false,
+            true,
+            "native module loader state was already absent after logical unload".to_string(),
+        ));
+    };
+    let path = sinomo_module::native_module_cache_path(
+        data_dir.root(),
+        &state.cache_key,
+        &state.content_hash,
+        &state.library_name,
+    );
+    let (attempted, succeeded, detail) = if path.exists() {
+        match unsafe {
+            sinomo_module::NativeModule::load_from_content_addressed_path(
+                &path,
+                &state.content_hash,
+            )
+        } {
+            Ok(module) => {
+                let report = module.unload();
+                (
+                    true,
+                    report.shutdown_ok && report.library_handle_released,
+                    format!(
+                        "{}; library_handle_released={}",
+                        report.detail, report.library_handle_released
+                    ),
+                )
+            }
+            Err(error) => (
+                true,
+                false,
+                format!("load cached native module for shutdown: {error}"),
+            ),
+        }
+    } else {
+        (
+            false,
+            false,
+            format!(
+                "cached native module artifact {} is missing; logical unload completed but physical unmapping could not be verified",
+                path.display()
+            ),
+        )
+    };
+    let record_detail = format!("{detail}; reason={reason}");
+    let record = sinomo_module::ModuleUnloadRecord {
+        module_id: module_id.clone(),
+        backend: sinomo_core::ModuleKind::NativeDylib,
+        artifact_id: state.artifact_id,
+        content_hash: Some(state.content_hash),
+        cache_key: Some(state.cache_key),
+        library_name: Some(state.library_name),
+        state_removed: true,
+        runtime_unload_attempted: attempted,
+        runtime_unload_succeeded: succeeded,
+        runtime_unload_detail: record_detail,
+        unloaded_at: sinomo_module::module_loader_applied_at_now(),
+        source: "daemon-hot-unload".to_string(),
+    };
+    sinomo_module::write_module_unload_record(&data_dir.root(), &record).map_err(|source| {
+        DaemonError::Network {
+            address: "daemon native module hot unload record".to_string(),
+            detail: source.to_string(),
+        }
+    })?;
+    Ok((attempted, succeeded, detail))
 }
 
 async fn daemon_service_registry_on_blocking_pool(
@@ -3624,7 +4227,7 @@ mod tests {
     fn dropping_native_dylib_dispatch_registration_cancels_and_unregisters() {
         let active = NativeModuleOperationCancellationRegistry::default();
         let registration = active
-            .register(Some("operation.drop".to_string()))
+            .register("module.fixture", Some("operation.drop".to_string()))
             .expect("register operation");
         let token = registration.token();
         assert!(!token.is_cancelled());
@@ -5582,6 +6185,236 @@ mod tests {
                 .get("daemon.service_registry")
                 .map(String::as_str),
             Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_unload_withdraws_routes_before_draining_and_then_tears_down_scope() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ROUTE: &str = "/fixture/hot-unload/wait";
+        const CATEGORY: &str = "fixture.hot-unload";
+        const OPERATION: &str = "fixture.hot-unload.wait";
+
+        let root = sinomo_testdir::TestDir::new("daemon-module-hot-unload");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let paths = DaemonPaths::new(&data_dir);
+        paths.ensure().expect("daemon paths");
+        let module_id = sinomo_module::ModuleId::from_legacy_named("module.fixture.hot_unload")
+            .expect("module id");
+        let registration = sinomo_module::ModuleRegistration::native_rust(
+            module_id.clone(),
+            "1.0.0",
+            "fixture",
+            "fixture",
+            "1.0.0",
+            sinomo_core::TrustRing::R1TrustedRuntime,
+            "module.fixture.hot_unload",
+        )
+        .with_surfaces(
+            sinomo_module::ModuleSurfaces::default()
+                .with_capability_export(
+                    sinomo_core::CapabilityName::new(OPERATION).expect("capability"),
+                )
+                .with_object_rpc_route(sinomo_module::ModuleObjectRpcRoute::new(
+                    ROUTE,
+                    CATEGORY,
+                    OPERATION,
+                    sinomo_module::ModuleRouteAuth::LocalCommand,
+                ))
+                .with_ui_contribution(sinomo_module_api::UiExtensionContribution {
+                    contribution_id: "module.fixture.hot-unload.preview".to_string(),
+                    extension_point_id: sinomo_module_api::FILE_PREVIEW_EXTENSION_POINT_ID
+                        .to_string(),
+                    extension_point_version:
+                        sinomo_module_api::FILE_PREVIEW_EXTENSION_POINT_VERSION.to_string(),
+                    group: "preview".to_string(),
+                    order: 0,
+                    before: Vec::new(),
+                    after: Vec::new(),
+                    when: Vec::new(),
+                    payload: sinomo_module_api::UiContributionPayload::Declarative {
+                        schema_id: "fixture.preview/v1".to_string(),
+                        payload_sobj: vec![1],
+                    },
+                }),
+        );
+        let descriptor = sinomo_module::component_descriptor_from_registration(&registration)
+            .expect("component descriptor");
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let disposed = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn sinomo_module::ComponentFactory> = Arc::new(
+            sinomo_module::StaticComponentFactory::new(descriptor, {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                let disposed = Arc::clone(&disposed);
+                move |_, scope| {
+                    let service_started = Arc::clone(&started);
+                    let service_release = Arc::clone(&release);
+                    scope.set_services(
+                        ServiceRegistry::builder()
+                            .register_dynamic(
+                                "fixture-hot-unload",
+                                ServiceRoute::from_route_metadata(
+                                    ROUTE,
+                                    CATEGORY,
+                                    "local-command",
+                                    [OPERATION],
+                                ),
+                                move |mut context, request| {
+                                    let started = Arc::clone(&service_started);
+                                    let release = Arc::clone(&service_release);
+                                    async move {
+                                        let _: () = context.decode_request_body(&request).await?;
+                                        started.notify_one();
+                                        let permit = release.acquire().await.map_err(|error| {
+                                            ServiceError::Service(error.to_string())
+                                        })?;
+                                        permit.forget();
+                                        context.respond_value(request.route, ())?;
+                                        Ok(ServiceDisposition::Continue)
+                                    }
+                                },
+                            )
+                            .build(),
+                    );
+                    scope.defer({
+                        let disposed = Arc::clone(&disposed);
+                        move || disposed.store(true, Ordering::Release)
+                    });
+                    Ok(())
+                }
+            })
+            .expect("factory"),
+        );
+        let catalog = ComponentCatalog::builder()
+            .register_module_factory(registration, factory)
+            .expect("module factory")
+            .build()
+            .expect("catalog");
+        let host = DaemonServiceRegistryHost::from_registry_with_internal_modules(
+            ServiceRegistry::default(),
+            paths,
+            Some(tokio::runtime::Handle::current()),
+            catalog,
+            Arc::new(DaemonEventHub::new()),
+            None,
+        )
+        .expect("service host");
+        assert!(host.object_rpc_route_descriptor(ROUTE).is_some());
+        let unload_route = host
+            .object_rpc_route_descriptor(sinomo_module::MODULE_HOT_UNLOAD_ROUTE)
+            .expect("hot unload route");
+        assert!(
+            unload_route
+                .required_capabilities
+                .iter()
+                .any(|capability| capability
+                    == sinomo_core::node::MODULE_HOT_UNLOAD_ADMIN_CAPABILITY)
+        );
+        assert_eq!(
+            unload_route.required_local_permissions,
+            ["remote-management"]
+        );
+        let old_registry = host.service_registry.active_snapshot().registry_arc();
+        let ui_request = ObjectRpcRequest::encode_body(
+            sinomo_module::MODULE_UI_CATALOG_ROUTE,
+            sinomo_module::MODULE_UI_RPC_CATEGORY,
+            &sinomo_module::UiExtensionCatalogRequest::default(),
+        )
+        .expect("UI catalog request");
+        let ui_before: sinomo_module::UiExtensionCatalogResponse =
+            call_value_service_host_async(&host, ui_request)
+                .await
+                .expect("UI catalog before unload")
+                .decode_body()
+                .expect("UI catalog response");
+        assert_eq!(ui_before.entries.len(), 1);
+
+        let request = ObjectRpcRequest::encode_body(ROUTE, CATEGORY, &()).expect("request");
+        let call = {
+            let host = host.clone();
+            tokio::spawn(async move { call_value_service_host_async(&host, request).await })
+        };
+        started.notified().await;
+        let unload = {
+            let host = host.clone();
+            let module_id = module_id.clone();
+            tokio::spawn(async move {
+                host.hot_unload_module(&module_id, Duration::from_secs(2), "test hot unload")
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.object_rpc_route_descriptor(ROUTE).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route withdrawal");
+        assert!(!disposed.load(Ordering::Acquire));
+        let stale_request =
+            ObjectRpcRequest::encode_body(ROUTE, CATEGORY, &()).expect("stale request");
+        let stale_error = dispatch_service_registry_request(
+            old_registry,
+            Arc::clone(&host.service_data_dir),
+            host.service_cluster.clone(),
+            ServiceSigner::Local,
+            ObjectRpcIncomingRequest::value(stale_request),
+        )
+        .await
+        .expect_err("stale registry invocation must be fenced");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("cannot accept new invocations")
+        );
+        release.add_permits(1);
+        call.await
+            .expect("call join")
+            .expect("in-flight call completes");
+        let report = unload.await.expect("unload join").expect("hot unload");
+
+        assert!(report.drained);
+        assert!(report.logical_unload_complete);
+        assert!(report.component_teardown_complete);
+        assert!(!report.restart_required);
+        assert!(disposed.load(Ordering::Acquire));
+        let ui_request = ObjectRpcRequest::encode_body(
+            sinomo_module::MODULE_UI_CATALOG_ROUTE,
+            sinomo_module::MODULE_UI_RPC_CATEGORY,
+            &sinomo_module::UiExtensionCatalogRequest::default(),
+        )
+        .expect("UI catalog request");
+        let ui_after: sinomo_module::UiExtensionCatalogResponse =
+            call_value_service_host_async(&host, ui_request)
+                .await
+                .expect("UI catalog after unload")
+                .decode_body()
+                .expect("UI catalog response");
+        assert!(ui_after.registry_generation > ui_before.registry_generation);
+        assert!(ui_after.entries.is_empty());
+        let persisted = sinomo_module::read_native_rust_module_runtime_state(
+            &host.service_data_dir.root(),
+            &module_id,
+        )
+        .expect("native Rust runtime state")
+        .expect("persisted disabled state");
+        assert!(!persisted.enabled);
+        let unload_record =
+            sinomo_module::read_module_unload_record(&host.service_data_dir.root(), &module_id)
+                .expect("unload record")
+                .expect("persisted unload record");
+        assert_eq!(unload_record.source, "daemon-hot-unload");
+        assert_eq!(
+            host.module_runtime
+                .invocations
+                .status(module_id.as_str())
+                .expect("module lifecycle")
+                .state,
+            sinomo_module::ModuleRuntimeLifecycleState::Unloaded
         );
     }
 

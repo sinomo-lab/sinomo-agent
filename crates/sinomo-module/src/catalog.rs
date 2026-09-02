@@ -110,6 +110,34 @@ impl ComponentCatalog {
         &self.modules
     }
 
+    /// Remove one module's runtime registration and matching component-owned
+    /// effects while retaining storage declarations and generic host adapters
+    /// needed for recovery or a later reactivation.
+    pub fn without_module(&self, module_id: &ModuleId) -> Result<Self, ComponentCatalogError> {
+        let registration = self.modules.get(module_id).ok_or_else(|| {
+            ComponentCatalogError::ModuleRegistry(ModuleRegistryError::UnknownModule {
+                module_id: module_id.clone(),
+            })
+        })?;
+        let component_id = crate::component_descriptor_from_registration(registration)
+            .map_err(|error| ComponentCatalogError::InvalidComponent {
+                component_id: module_id.to_string(),
+                detail: error.to_string(),
+            })?
+            .component_id;
+        let mut catalog = self.clone();
+        catalog.modules = self.modules.without(module_id)?;
+        catalog.factories.remove(&component_id);
+        catalog
+            .factory_order
+            .retain(|candidate| candidate != &component_id);
+        catalog.status_contributors.remove(&component_id);
+        catalog.startup_contributors.remove(&component_id);
+        catalog.maintenance_inhibitors.remove(&component_id);
+        catalog.migration_contributors.remove(&component_id);
+        Ok(catalog)
+    }
+
     pub fn has_native_request_preparer(&self, id: &str) -> bool {
         self.native_request_preparers.contains_key(id)
     }

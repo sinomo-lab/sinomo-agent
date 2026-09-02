@@ -14,6 +14,7 @@ evolve during the pre-1.0 period.
 | Agent tool | `AgentTool`, `AgentToolRegistry` | `sinomo-agent` |
 | Model provider | `LanguageModelProvider` | `sinomo-lm` and provider wiring |
 | Native module | generic component descriptor and `sinomo-module-api` | independently built external module fixture and packages |
+| Existing behavior or semantic slot | `ExtensionPointDefinition`, `ExtensionContribution`, compiled registry, owner executor | `sinomo-module-api`, `sinomo-module` |
 | Application UI | `UiExtensionContribution`, semantic slots, isolated `sinomo.ui.widget` components | `sinomo-module-api`, `sinomo-ui-extension-host`, `sinomo-app` |
 | Network transport | `NetworkModule` and registry/ABI | `sinomo-network`, `modules/network/iroh` |
 | DFS backend or service | DFS backend/transport traits and service registration | `sinomo-dfs` |
@@ -115,6 +116,85 @@ crash-recovery compensation inside the external package; read its
 [module maintainer guide](../../modules/dfs/cloud-files/README.md) before
 changing its ABI, durable state, lifecycle callbacks, or provider selection.
 
+## Generic Behavior And Presentation Extensions
+
+Use the generic extension registry when several modules participate in a join
+point owned by an existing subsystem. The owner declares an
+`ExtensionPointDefinition`; contributors add `ExtensionContribution` records
+to either `ModuleSurfaces` or `NativeModuleSurfaces`. Both new fields default to
+empty when older JSON or SOBJ surfaces are decoded.
+
+Definitions own the versioned input, contribution, and output schema IDs,
+locality, accepted contribution kinds, composition and failure policies,
+resource limits, capability boundary, and eligible context keys. Contributions
+carry bounded declarative SOBJ data, a reference to a logical operation in one
+of the contributor's typed interface exports, or both. Do not name a raw route,
+host function, callback, Rust type, or authority token.
+
+`compile_default_extension_registry` normalizes legacy UI records into generic
+contributions and compiles all active definitions and contributions into an
+immutable `ExtensionRegistrySnapshot`. Its generation is the module-registry
+generation from which it was built. The compiler resolves compatible point
+versions and typed operation contracts, orders contributions deterministically,
+and retains missing points, version mismatches, rejected capabilities, and
+ordering cycles as catalog diagnostics. Inspect the local
+`/module/extensions/catalog` route when debugging a pending contribution.
+
+An owning component obtains `ExtensionExecutor` from its `ComponentContext`.
+The executor uses the matching compiled extension snapshot and the live checked
+service registry. Choose the narrowest composition policy:
+
+- `many-ordered` returns deterministic catalog content without invoking it;
+- `collect` invokes independent providers and preserves attributed partial
+  success;
+- `select-one` requires an `ExtensionSelection` naming the point version and
+  contribution; install or activation order is never selection;
+- `reduce` invokes providers, then passes each attributed value to a reducer
+  implemented by the trusted point owner;
+- `pipeline` accepts typed deltas only, with owner validation after every step;
+- `veto` is valid only with `fail-closed`; denial, malformed output, timeout,
+  recursion failure, and provider disappearance all constrain the result.
+
+The first host behavior point is
+`sinomo.module.diagnostics.enrich` version `1.0.0`, a bounded `collect` point.
+Use `ModuleDiagnosticsInput` and `ModuleDiagnosticContribution`, and keep the
+authoritative diagnostic decision in the owning subsystem. Reducers, pipeline
+state application, and final side effects are deliberately not contributor
+callbacks.
+
+### Hot unload
+
+Use `sinomo module native-dylib unload <module-id>` for an active dynamic
+module. The CLI sends an authenticated `ModuleHotUnloadRequest` to the running
+daemon; it never deletes loader state directly. The daemon withdraws service,
+extension, and UI-catalog entries, cancels native operations, drains invocation
+leases, retires component scopes, and then attempts physical library shutdown.
+
+`ModuleHotUnloadReport` distinguishes logical withdrawal, invocation drain,
+component teardown, physical unload, cascading dependent modules, and whether
+a restart is required. A timeout is intentionally fail-safe: routes stay
+withdrawn, the old scope remains quarantined, and the report is not marked as a
+completed physical unload.
+
+Native-dylib conformance requires more than exporting a shutdown symbol:
+
+- use one static `NativeModuleLifecycle` around `init`, `invoke`, and
+  `shutdown`;
+- do not clear host callback/user-data state while an invocation guard exists;
+- make shutdown idempotent and allow a later load to initialize again;
+- cancel and join per-invocation workers, child processes, and callback bridges
+  before returning;
+- for network vtables, make `stop` idempotent and make `destroy` synchronously
+  drain the private runtime; open streams must retain the executable token;
+- return a non-OK shutdown status when teardown is incomplete. The host then
+  quarantines the mapping and reports `restart_required`.
+
+The opt-in `native_dylib_hot_unload` integration test accepts
+`SINOMO_NATIVE_HOT_UNLOAD_FIXTURES` as semicolon-separated
+`module-id=/absolute/library/path` entries. It loads, unloads, and reloads every
+fixture twice in one process; the Iroh fixture also creates and unregisters its
+real network-vtable instance twice.
+
 ## Application UI
 
 Use declarative contributions for ordinary actions, panels, settings, status
@@ -123,6 +203,12 @@ widgets cannot express, contribute a `custom-widget` payload referencing a
 Wasm component stored inside the declarative module package. The component must
 export `sinomo:ui-widget/widget.handle` with the contract in
 `crates/sinomo-module-api/wit/sinomo-ui-widget-v1.wit`.
+
+The UI catalog is a compatibility projection of the same generic extension
+registry generation; it is not a second plugin registry. Existing
+`ui_contributions` continue to decode and are normalized under
+`sinomo.ui.contribution/v1`. New generic behavior should use
+`extension_points` and `extension_contributions` directly.
 
 The component receives and returns SOBJ `UiWidgetRequest` and
 `UiWidgetResponse` envelopes. It returns complete `UiWidgetFrame` values with

@@ -221,8 +221,9 @@ pub use network_info::{
 pub use network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
     NetworkModuleEndpointRole, NetworkModuleRegistry, NetworkModuleStatus,
-    RegisteredNetworkModuleLinkProvider, authenticated_transport_metadata_matches_endpoint,
-    network_module_registry, network_module_routing_generation, set_network_module_registry,
+    NetworkModuleUnloadProbe, NetworkModuleUnloadReport, RegisteredNetworkModuleLinkProvider,
+    authenticated_transport_metadata_matches_endpoint, network_module_registry,
+    network_module_routing_generation, set_network_module_registry,
 };
 pub use network_module_abi::FfiNetworkModule;
 pub use object::try_clone_id;

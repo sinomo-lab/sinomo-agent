@@ -14,6 +14,9 @@ pub const MODULE_NATIVE_RUST_READ_CAPABILITY: &str = "module.native-rust.read";
 /// Allows a cluster member, subject to node-local remote-management consent,
 /// to change built-in native Rust module state on the target node.
 pub const MODULE_NATIVE_RUST_ADMIN_CAPABILITY: &str = "module.native-rust.admin";
+/// Allows a cluster member, subject to node-local remote-management consent,
+/// to withdraw a module generation and drain its in-flight work on the target.
+pub const MODULE_HOT_UNLOAD_ADMIN_CAPABILITY: &str = "module.hot-unload.admin";
 /// Advertised only by main daemons that understand snapshot-bound placement
 /// reconciliation jobs and their v1 control-plane namespace.
 pub const DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY: &str = "dfs.placement.reconciliation.v1";
@@ -44,6 +47,7 @@ pub fn main_daemon_capabilities(role: &ClusterMemberRole) -> Vec<CapabilityName>
         CapabilityName::new(DAEMON_MAIN_RUN_CAPABILITY).expect("static capability"),
         CapabilityName::new(MODULE_NATIVE_RUST_READ_CAPABILITY).expect("static capability"),
         CapabilityName::new(MODULE_NATIVE_RUST_ADMIN_CAPABILITY).expect("static capability"),
+        CapabilityName::new(MODULE_HOT_UNLOAD_ADMIN_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_PLACEMENT_RECONCILIATION_V1_CAPABILITY).expect("static capability"),
         CapabilityName::new(DFS_METADATA_PACKED_NAMESPACE_PREPARE_V1_CAPABILITY)
             .expect("static capability"),

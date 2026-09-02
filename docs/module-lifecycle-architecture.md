@@ -243,9 +243,9 @@ policy, and loader or rollout state.
 Module catalog registration is pure data. It records the manifest, backend
 descriptor, declared capabilities, and public surfaces exposed by the module.
 Public surfaces include object-RPC methods, event kinds, capability imports and
-exports, settings definitions, and storage contract owners. This data is
-serializable, inspectable, comparable across nodes, and safe to place in
-registry or cluster desired state.
+exports, settings definitions, extension-point definitions and contributions,
+and storage contract owners. This data is serializable, inspectable, comparable
+across nodes, and safe to place in registry or cluster desired state.
 
 ### Typed Extension Points And Contributions
 
@@ -649,19 +649,55 @@ routing on a node.
 
 The architectural contract is:
 
-- new invocations should stop selecting the unloaded version after loader state
-  changes,
-- in-flight invocations may complete on the old generation,
-- cleanup hooks are best effort,
+- the module first enters `draining`; a process-wide invocation gate rejects
+  new calls even through retained old service or extension snapshots,
+- the host compiles and publishes module, extension, UI-catalog, and service
+  projections without the draining module before teardown,
+- dependency-driven component deactivations join the same bounded drain rather
+  than losing their scopes underneath active handlers,
+- in-flight invocations may complete within the point/route deadline; native
+  callback operations also receive cancellation,
+- component scopes, workers, and reverse-order disposers remain alive until
+  their invocation leases reach zero,
+- a drain timeout leaves the routes withdrawn and the component scope
+  quarantined, reports `restart_required`, and does not claim physical unload,
+- cleanup hooks and native-library unmapping remain best effort after logical
+  unload is complete,
 - content-addressed artifacts are not overwritten in place,
 - process restart remains the correctness fallback for host-process resource
   reclamation.
+
+`ModuleRuntimeGenerationStore` publishes the matching module and extension
+snapshots together with the service-registry generation that serves them.
+Catalog services read this live generation instead of retaining a startup-only
+snapshot. UI clients observe catalog-generation changes and discard isolated
+widget sessions from the previous generation, preserving the built-in surface
+until a provider is selected again.
 
 For sandbox-process and future Wasm backends, unload usually means tearing down
 processes, instances, or cached runners. For native dynamic libraries, unload
 means calling the module shutdown hook if available and releasing the host's
 library handle, while accepting that the operating system or runtime may keep
 some state resident.
+
+Every standard native-dylib entry uses `NativeModuleLifecycle`. Initialization
+opens module-local admission, every ABI invocation retains a guard, and
+shutdown closes admission and refuses to proceed while a guard is active. A
+failed shutdown keeps host callbacks and the executable mapping quarantined;
+the host must never turn a non-OK shutdown status into a successful unmap.
+
+Network dylibs have a second lifetime because authenticated links and streams
+hold vtable callbacks outside standard object RPC. Network-module unregister
+publishes route removal first, stops the listener/dialer, and waits for the last
+transport or stream owner to run `destroy` and release the library keep-alive.
+If that retirement probe misses the drain deadline, generic module unload may
+finish logically but physical unload is reported incomplete and requires a
+process restart.
+
+The authenticated `/module/hot-unload` route is the runtime transition owner.
+The CLI calls this route and deliberately refuses the old shortcut of deleting
+native loader state in a separate process, because that cannot fence daemon
+routes or drain daemon-owned invocations.
 
 ## State Ownership
 

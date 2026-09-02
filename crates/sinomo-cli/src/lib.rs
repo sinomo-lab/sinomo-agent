@@ -1540,6 +1540,7 @@ fn default_module_cli_command_config(
     local_data_dir: Option<&SinomoDataDir>,
 ) -> sinomo_runtime::module::ModuleCliCommandConfig {
     let module_config = sinomo_runtime::module::ModuleCliCommandConfig::new()
+        .with_hot_unload_client(module_hot_unload_cli)
         .with_toggleable_native_rust_module_name(
             sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
             "distributed filesystem provider module",
@@ -1564,6 +1565,31 @@ fn default_module_cli_command_config(
                 .ok()
         })
         .unwrap_or(module_config)
+}
+
+fn module_hot_unload_cli(
+    module_id: &sinomo_runtime::module::ModuleId,
+    drain_timeout: Duration,
+    reason: &str,
+) -> Result<sinomo_runtime::module::ModuleHotUnloadReport, String> {
+    let status = daemon_default_main_daemon_status(Duration::from_secs(5))
+        .map_err(|source| source.to_string())?
+        .ok_or_else(|| "module hot unload requires the local daemon to be running".to_string())?;
+    let request = network::ObjectRpcRequest::encode_body(
+        sinomo_runtime::module::MODULE_HOT_UNLOAD_ROUTE,
+        sinomo_runtime::module::MODULE_RPC_CATEGORY,
+        &sinomo_runtime::module::ModuleHotUnloadRequest {
+            module_id: module_id.to_string(),
+            drain_timeout_ms: drain_timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            reason: reason.to_string(),
+        },
+    )
+    .map_err(|source| source.to_string())?;
+    let timeout = drain_timeout.saturating_add(Duration::from_secs(10));
+    daemon_send_daemon_rpc(&status.address, &request, timeout)
+        .map_err(|source| source.to_string())?
+        .decode_body()
+        .map_err(|source| source.to_string())
 }
 
 pub fn default_cli_command_registry() -> CliCommandRegistry {

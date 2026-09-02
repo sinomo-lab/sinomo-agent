@@ -489,6 +489,18 @@ authority or replace foundational identity, integrity, consensus, policy, or
 recovery checks. Services remain the checked invocation substrate and events
 remain attributable facts rather than implicit middleware.
 
+The daemon compiles one immutable extension snapshot for each active
+module-registry generation. Pending definitions, version mismatches, rejected
+capabilities, and ordering cycles remain inspectable diagnostics rather than
+ambient load-order behavior. Components receive that snapshot alongside the
+live service registry used to invoke resolved logical operations; trusted
+reducers, typed-delta validation, and final effects stay in the point owner.
+Hot unload first fences the module through the process-wide service and
+extension invocation gate, then publishes a generation without its routes and
+contributions. Removed component scopes are retained until bounded invocation
+leases drain; timeout leaves them quarantined and requires restart. Physical
+native-library release is reported separately from logical unload.
+
 Application UI is one family of extension points. Semantic host slots accept
 actions, panels, views, inspector or settings sections, status items, and
 decorations. UI extension-point owners define bounded, versioned payload

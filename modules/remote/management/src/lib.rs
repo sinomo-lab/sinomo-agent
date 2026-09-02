@@ -22,11 +22,12 @@ use sinomo_module_api::{
     ComponentDescriptor, NativeModuleBackend, NativeModuleBodyMode,
     NativeModuleCapabilitiesResponse, NativeModuleDeclarativeResource, NativeModuleDescriptor,
     NativeModuleErrorResponse, NativeModuleInvocationRequest, NativeModuleInvocationResponse,
-    NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse, NativeModuleStagedBody,
-    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
-    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
-    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    NativeModuleLifecycle, NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse,
+    NativeModuleStagedBody, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
+    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
+    decode_sobj, encode_sobj,
 };
 use sinomo_remote_management::*;
 use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
@@ -93,6 +94,7 @@ unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
 
 static HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
+static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_api_version() -> u32 {
@@ -111,12 +113,18 @@ pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModul
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
+    if !MODULE_LIFECYCLE.initialize() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = Some(StoredHostApi(host));
             SINOMO_MODULE_STATUS_OK
         }
-        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        Err(_) => {
+            let _ = MODULE_LIFECYCLE.begin_shutdown();
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        }
     }
 }
 
@@ -125,6 +133,16 @@ pub extern "C" fn sinomo_module_invoke(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
 ) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return write_response(
+            response_sobj,
+            NativeModuleResponse::Error(native_error_response(
+                "module-unavailable",
+                "remote-management module is not initialized or is shutting down",
+            )),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        );
+    };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -143,6 +161,9 @@ pub extern "C" fn sinomo_module_invoke(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
+    if !MODULE_LIFECYCLE.begin_shutdown() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = None;
@@ -223,6 +244,8 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
             network_transports: Vec::new(),
             interface_exports: Vec::new(),
             ui_contributions: Vec::new(),
+            extension_points: Vec::new(),
+            extension_contributions: Vec::new(),
         },
         component: ComponentDescriptor::new(REMOTE_MANAGEMENT_MODULE_ID, env!("CARGO_PKG_VERSION"))
             .with_offer(
@@ -1988,6 +2011,18 @@ mod tests {
         assert!(text.contains(CONFIG_SET_ROUTE));
         assert!(!text.contains("/remote-management/config"));
         assert!(text.contains("locally"));
+    }
+
+    #[test]
+    fn module_shutdown_is_idempotent_and_restores_host_state_on_reinitialize() {
+        let _guard = remote_management_permission_for_test(true);
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert!(HOST_API.lock().expect("host API").is_none());
+        let mut host = SinomoModuleHostApiV2::empty();
+        host.local_permission_granted = Some(test_local_permission_granted);
+        assert_eq!(sinomo_module_init(host), SINOMO_MODULE_STATUS_OK);
+        assert!(HOST_API.lock().expect("host API").is_some());
     }
 
     #[test]

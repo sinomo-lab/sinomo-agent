@@ -67,6 +67,13 @@ impl NativeModuleServiceMaterialization {
     }
 }
 
+#[derive(Clone)]
+pub struct MaterializedModuleServiceSnapshot {
+    pub registry: ServiceRegistry,
+    pub extension_registry: Arc<crate::ExtensionRegistrySnapshot>,
+    pub runtime: crate::ModuleRuntimeHost,
+}
+
 pub fn materialize_module_service_snapshot(
     registry: ServiceRegistry,
     module_snapshot: ModuleServiceSnapshot,
@@ -74,13 +81,94 @@ pub fn materialize_module_service_snapshot(
     request_preparer: Arc<dyn NativeModuleRequestPreparer>,
     options: NativeModuleServiceMaterialization,
 ) -> Result<ServiceRegistry, NetworkError> {
-    let mut builder = registry.to_builder();
+    materialize_module_service_snapshot_with_extensions(
+        registry,
+        module_snapshot,
+        data_dir_root,
+        request_preparer,
+        options,
+    )
+    .map(|materialized| materialized.registry)
+}
+
+pub fn materialize_module_service_snapshot_with_extensions(
+    registry: ServiceRegistry,
+    module_snapshot: ModuleServiceSnapshot,
+    data_dir_root: PathBuf,
+    request_preparer: Arc<dyn NativeModuleRequestPreparer>,
+    options: NativeModuleServiceMaterialization,
+) -> Result<MaterializedModuleServiceSnapshot, NetworkError> {
+    let extension_registry = Arc::new(
+        crate::compile_default_extension_registry(module_snapshot.snapshot.as_ref()).map_err(
+            |error| NetworkError::Serialization {
+                detail: format!("compile module extension registry: {error}"),
+            },
+        )?,
+    );
+    let runtime = crate::ModuleRuntimeHost::new(
+        Arc::clone(&module_snapshot.snapshot),
+        Arc::clone(&extension_registry),
+        0,
+    )
+    .map_err(module_error)?;
+    materialize_module_service_snapshot_with_runtime(
+        registry,
+        module_snapshot,
+        data_dir_root,
+        request_preparer,
+        options,
+        runtime,
+        extension_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn materialize_module_service_snapshot_for_runtime(
+    registry: ServiceRegistry,
+    module_snapshot: ModuleServiceSnapshot,
+    data_dir_root: PathBuf,
+    request_preparer: Arc<dyn NativeModuleRequestPreparer>,
+    options: NativeModuleServiceMaterialization,
+    runtime: crate::ModuleRuntimeHost,
+) -> Result<MaterializedModuleServiceSnapshot, NetworkError> {
+    let extension_registry = Arc::new(
+        crate::compile_default_extension_registry(module_snapshot.snapshot.as_ref()).map_err(
+            |error| NetworkError::Serialization {
+                detail: format!("compile module extension registry: {error}"),
+            },
+        )?,
+    );
+    materialize_module_service_snapshot_with_runtime(
+        registry,
+        module_snapshot,
+        data_dir_root,
+        request_preparer,
+        options,
+        runtime,
+        extension_registry,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_module_service_snapshot_with_runtime(
+    registry: ServiceRegistry,
+    module_snapshot: ModuleServiceSnapshot,
+    data_dir_root: PathBuf,
+    request_preparer: Arc<dyn NativeModuleRequestPreparer>,
+    options: NativeModuleServiceMaterialization,
+    runtime: crate::ModuleRuntimeHost,
+    extension_registry: Arc<crate::ExtensionRegistrySnapshot>,
+) -> Result<MaterializedModuleServiceSnapshot, NetworkError> {
+    let invocation_gate: Arc<dyn sinomo_core::service::ServiceInvocationGate> =
+        Arc::new(runtime.invocations.clone());
+    let mut builder = registry.to_builder().with_invocation_gate(invocation_gate);
+    builder = crate::register_extension_catalog_service(builder, runtime.generations.clone());
     builder = crate::register_ui_extension_catalog_service(
         builder,
-        Arc::clone(&module_snapshot.snapshot),
+        runtime.generations.clone(),
         data_dir_root.clone(),
     );
-    let active_operations = NativeModuleOperationCancellationRegistry::default();
+    let active_operations = runtime.native_operations.clone();
     let module_snapshot_version = module_snapshot.snapshot.version().to_string();
     let service_registry_key = format!("{}.service_registry", options.host_observability_namespace);
     let native_route_key = format!(
@@ -191,7 +279,11 @@ pub fn materialize_module_service_snapshot(
             }
         },
     );
-    Ok(builder.build())
+    Ok(MaterializedModuleServiceSnapshot {
+        registry: builder.build(),
+        extension_registry,
+        runtime,
+    })
 }
 
 async fn dispatch_native_module_service_request(
@@ -209,7 +301,8 @@ async fn dispatch_native_module_service_request(
         target.request_body_mode,
         has_request_body,
     )?;
-    let cancellation_registration = active_operations.register(operation_id)?;
+    let cancellation_registration =
+        active_operations.register(target.module_id.to_string(), operation_id)?;
     let cancellation_token = cancellation_registration.token();
     let staging = (target.request_body_mode != ServiceBodyMode::None
         || target.response_body_mode != ServiceBodyMode::None)
@@ -437,5 +530,41 @@ fn native_module_cancel_route_descriptor(observability_key: String) -> ServiceRo
 fn module_error(error: impl std::fmt::Display) -> NetworkError {
     NetworkError::Serialization {
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn materialization_publishes_one_extension_generation_to_both_catalogs() {
+        let module_snapshots = crate::ModuleRegistrySnapshotStore::default();
+        let module_snapshot =
+            crate::module_service_snapshot(&module_snapshots).expect("module service snapshot");
+        let expected_generation = module_snapshot.snapshot.version();
+        let root = sinomo_testdir::TestDir::new("module-extension-materialization");
+        let materialized = materialize_module_service_snapshot_with_extensions(
+            ServiceRegistry::default(),
+            module_snapshot,
+            root.path().to_path_buf(),
+            Arc::new(PassthroughNativeModuleRequestPreparer),
+            NativeModuleServiceMaterialization::new("fixture"),
+        )
+        .expect("materialized services");
+
+        assert!(
+            materialized
+                .registry
+                .owns(crate::MODULE_EXTENSION_CATALOG_ROUTE)
+        );
+        assert!(materialized.registry.owns(crate::MODULE_UI_CATALOG_ROUTE));
+        assert_eq!(
+            materialized
+                .extension_registry
+                .generation
+                .module_registry_generation,
+            expected_generation
+        );
     }
 }

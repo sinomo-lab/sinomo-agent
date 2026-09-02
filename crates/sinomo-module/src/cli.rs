@@ -1,27 +1,29 @@
 use crate::{
     ArtifactId, DeclarativeModuleInstallError, DeclarativeModuleInstallRequest,
-    ModuleBackendRegistration, ModuleDeclarativeResourceKind, ModuleId, ModuleLoaderStoreError,
-    ModuleUnloadRecord, NativeDylibModuleInstallError, NativeDylibModuleInstallRequest,
-    NativeModule, install_declarative_module_package, install_native_dylib_module_from_file,
-    module_loader_applied_at_now, native_module_cache_path, read_declarative_module_loader_state,
+    ModuleBackendRegistration, ModuleDeclarativeResourceKind, ModuleHotUnloadReport, ModuleId,
+    ModuleLoaderStoreError, NativeDylibModuleInstallError, NativeDylibModuleInstallRequest,
+    install_declarative_module_package, install_native_dylib_module_from_file,
+    native_module_cache_path, read_declarative_module_loader_state,
     read_declarative_module_loader_states, read_declarative_module_registration,
     read_declarative_module_registrations,
     read_native_dylib_module_cache_entries_excluding_cache_keys,
     read_native_dylib_module_loader_states, read_native_rust_module_runtime_states,
-    remove_native_dylib_module_loader_state, set_native_rust_module_enabled,
-    validate_native_dylib_module_cache_key, validate_native_dylib_module_library_name,
-    write_module_unload_record,
+    set_native_rust_module_enabled, validate_native_dylib_module_cache_key,
+    validate_native_dylib_module_library_name,
 };
 use sinomo_cli_registry::{
     CliAutocompleteChoice, CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue,
     CliCommand, CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp,
     CliCommandMetadata, CliCommandPolicy, CliParseError,
 };
-use sinomo_core::ModuleKind;
 use sinomo_core::local::SinomoDataDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[cfg(test)]
+use crate::module_loader_applied_at_now;
 
 const MODULE_POLICY: CliCommandPolicy = CliCommandPolicy {
     requires_cluster_state: false,
@@ -32,7 +34,11 @@ const MODULE_POLICY: CliCommandPolicy = CliCommandPolicy {
 pub struct ModuleCliCommandConfig {
     pub toggleable_native_rust_modules: Vec<ModuleNativeRustToggleTarget>,
     pub native_dylib_modules: Vec<ModuleNativeDylibKnownTarget>,
+    pub hot_unload: Option<ModuleHotUnloadClient>,
 }
+
+pub type ModuleHotUnloadClient =
+    fn(&ModuleId, Duration, &str) -> Result<ModuleHotUnloadReport, String>;
 
 impl ModuleCliCommandConfig {
     pub fn new() -> Self {
@@ -80,6 +86,11 @@ impl ModuleCliCommandConfig {
                 value,
                 detail: detail.into(),
             });
+        self
+    }
+
+    pub fn with_hot_unload_client(mut self, hot_unload: ModuleHotUnloadClient) -> Self {
+        self.hot_unload = Some(hot_unload);
         self
     }
 
@@ -713,7 +724,7 @@ fn run_module_cli_command(
             activate_native_dylib_module(context, options)
         }
         ModuleCliCommand::NativeDylib(ModuleNativeDylibCliCommand::Unload(options)) => {
-            unload_native_dylib_module(context, options)
+            unload_native_dylib_module(context, options, config)
         }
         ModuleCliCommand::NativeRust(ModuleNativeRustCliCommand::Enable(options)) => {
             set_native_rust_module_runtime_enabled(context, options, config, true)
@@ -1041,104 +1052,51 @@ fn activate_native_dylib_module(
 fn unload_native_dylib_module(
     context: &mut CliCommandContext<'_>,
     options: ModuleNativeDylibUnloadOptions,
+    config: &ModuleCliCommandConfig,
 ) -> Result<(), CliCommandError> {
-    let data_dir = SinomoDataDir::from_env_or_home().map_err(command_error)?;
-    data_dir.ensure_root_layout().map_err(command_error)?;
     let module_id = options.module_id;
-    let previous_state = remove_native_dylib_module_loader_state(&data_dir.root(), &module_id)
-        .map_err(module_loader_store_error_to_command)?;
-
-    let mut artifact_id = None;
-    let mut content_hash = None;
-    let mut cache_key = None;
-    let mut library_name = None;
-    let mut runtime_unload_attempted = false;
-    let mut runtime_unload_succeeded = previous_state.is_none();
-    let mut runtime_unload_detail = "no active native-dylib loader state".to_string();
-    let mut cache_path = None;
-
-    if let Some(state) = previous_state.as_ref() {
-        artifact_id = state.artifact_id.clone();
-        content_hash = Some(state.content_hash.clone());
-        cache_key = Some(state.cache_key.clone());
-        library_name = Some(state.library_name.clone());
-        let path = native_module_cache_path(
-            data_dir.root(),
-            &state.cache_key,
-            &state.content_hash,
-            &state.library_name,
-        );
-        cache_path = Some(path.clone());
-        if path.exists() {
-            runtime_unload_attempted = true;
-            match unsafe {
-                NativeModule::load_from_content_addressed_path(&path, &state.content_hash)
-            } {
-                Ok(module) => {
-                    let report = module.unload();
-                    runtime_unload_succeeded = report.shutdown_ok && report.library_handle_released;
-                    runtime_unload_detail = format!(
-                        "{}; library_handle_released={}",
-                        report.detail, report.library_handle_released
-                    );
-                }
-                Err(error) => {
-                    runtime_unload_succeeded = false;
-                    runtime_unload_detail =
-                        format!("load cached native module for unload probe: {error}");
-                }
-            }
-        } else {
-            runtime_unload_detail = format!(
-                "cached native module library not found at {}; active state was still removed",
-                path.display()
-            );
-        }
-    }
-
-    let record = ModuleUnloadRecord {
-        module_id: module_id.clone(),
-        backend: ModuleKind::NativeDylib,
-        artifact_id,
-        content_hash,
-        cache_key,
-        library_name,
-        state_removed: previous_state.is_some(),
-        runtime_unload_attempted,
-        runtime_unload_succeeded,
-        runtime_unload_detail: runtime_unload_detail.clone(),
-        unloaded_at: module_loader_applied_at_now(),
-        source: "local-cli".to_string(),
-    };
-    let record_path = write_module_unload_record(&data_dir.root(), &record)
-        .map_err(module_loader_store_error_to_command)?;
-
+    let hot_unload = config.hot_unload.ok_or_else(|| {
+        CliCommandError::new(
+            "native module hot unload requires a running module-runtime host; direct loader-state removal is intentionally disabled",
+        )
+    })?;
+    let report = hot_unload(
+        &module_id,
+        Duration::from_secs(30),
+        "operator requested native module hot unload from the CLI",
+    )
+    .map_err(CliCommandError::new)?;
     context.stdout_line(format_args!("module-state-id: {module_id}"))?;
     context.stdout_line(format_args!(
-        "state: {}",
-        if previous_state.is_some() {
-            "removed"
+        "logical-unload: {}",
+        if report.logical_unload_complete {
+            "ok"
         } else {
-            "not-active"
+            "incomplete"
         }
     ))?;
-    if let Some(cache_path) = cache_path.as_ref() {
-        context.stdout_line(format_args!("cache: {}", cache_path.display()))?;
-    }
+    context.stdout_line(format_args!("drained: {}", report.drained))?;
     context.stdout_line(format_args!(
-        "runtime-unload: {}",
-        if runtime_unload_attempted {
-            if runtime_unload_succeeded {
+        "component-teardown: {}",
+        report.component_teardown_complete
+    ))?;
+    context.stdout_line(format_args!(
+        "physical-unload: {}",
+        if report.physical_unload_attempted {
+            if report.physical_unload_succeeded {
                 "ok"
             } else {
                 "failed"
             }
         } else {
-            "skipped"
+            "not-required"
         }
     ))?;
-    context.stdout_line(format_args!("detail: {runtime_unload_detail}"))?;
-    context.stdout_line(format_args!("record: {}", record_path.display()))?;
+    context.stdout_line(format_args!(
+        "restart-required: {}",
+        report.restart_required
+    ))?;
+    context.stdout_line(format_args!("detail: {}", report.detail))?;
     Ok(())
 }
 
@@ -1391,6 +1349,22 @@ mod tests {
             }),
             "missing unload choice for {module_id:?}: {unload:?}"
         );
+    }
+
+    #[test]
+    fn native_dylib_unload_refuses_direct_loader_state_removal_without_runtime_host() {
+        let module_id = ModuleId::from_legacy_named("module.remote-management")
+            .expect("module id")
+            .to_string();
+        let command = module_cli_command_handler(ModuleCliCommandConfig::new())
+            .parse(&["native-dylib".to_string(), "unload".to_string(), module_id])
+            .expect("parse unload");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let error = command
+            .run(&mut CliCommandContext::new(&mut stdout, &mut stderr))
+            .expect_err("unmanaged unload must fail");
+        assert!(error.to_string().contains("direct loader-state removal"));
     }
 
     #[test]

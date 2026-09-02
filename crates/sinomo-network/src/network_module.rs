@@ -28,7 +28,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 static NEXT_NETWORK_MODULE_ROUTING_GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -93,6 +93,49 @@ pub struct NetworkModuleContext {
     pub daemon_forward_address: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct NetworkModuleUnloadProbe {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl NetworkModuleUnloadProbe {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    pub(crate) fn complete(&self) {
+        let (completed, changed) = &*self.state;
+        if let Ok(mut completed) = completed.lock() {
+            *completed = true;
+            changed.notify_all();
+        }
+    }
+
+    pub fn wait(&self, timeout: std::time::Duration) -> bool {
+        let (completed, changed) = &*self.state;
+        let Ok(completed) = completed.lock() else {
+            return false;
+        };
+        if *completed {
+            return true;
+        }
+        changed
+            .wait_timeout_while(completed, timeout, |completed| !*completed)
+            .map(|(completed, _)| *completed)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkModuleUnloadReport {
+    pub module_id: String,
+    pub stop_complete: bool,
+    pub object_released: bool,
+    pub detail: String,
+}
+
 /// A runtime-registered network transport implementation.
 ///
 /// Implementations must be safe to call from any thread. The FFI adapter
@@ -109,6 +152,13 @@ pub trait NetworkModule: Send + Sync {
     /// Stop the module's listener/proxy. The module object stays alive and
     /// may be started again (runtime toggle).
     fn stop(&self) -> Result<(), NetworkError>;
+
+    /// Completion probe for dynamically loaded implementations. It completes
+    /// after the final transport/stream owner destroys its module instance and
+    /// releases the dynamic-library keep-alive token.
+    fn unload_probe(&self) -> Option<NetworkModuleUnloadProbe> {
+        None
+    }
 
     /// Establishes one authenticated adjacent-peer link.
     ///
@@ -240,10 +290,10 @@ pub struct NetworkModuleStatus {
 /// Registry of runtime network modules keyed by module id.
 ///
 /// Reads (dispatch, snapshots) are lock-free `arc-swap` loads; mutations
-/// (register, enable/disable) serialize on an internal lock. Disabling a
-/// module calls [`NetworkModule::stop`] but NEVER drops the module object:
-/// for dylib-backed modules the registry's `Arc` keeps the library's vtable
-/// pointers alive for the process lifetime.
+/// (register, enable/disable/unregister) serialize on an internal lock.
+/// Disabling retains a module for restart; unregistering withdraws it and may
+/// wait for a dylib-backed module's final transport/stream owner to release
+/// its executable code.
 #[derive(Default)]
 pub struct NetworkModuleRegistry {
     entries: ArcSwap<BTreeMap<String, Arc<NetworkModuleEntry>>>,
@@ -378,6 +428,59 @@ impl NetworkModuleRegistry {
             descriptor: entry.descriptor.clone(),
             enabled,
             started,
+        })
+    }
+
+    /// Withdraws `id` from lock-free routing before stopping it, then waits
+    /// for old route snapshots and streams to release a dylib-backed object.
+    pub fn unregister(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<NetworkModuleUnloadReport, NetworkError> {
+        let (entry, entries) =
+            {
+                let _guard = self
+                    .mutate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let entries = self.entries.load_full();
+                let entry = entries.get(id).cloned().ok_or_else(|| {
+                    NetworkError::InvalidClusterCommand {
+                        detail: format!("unknown network module `{id}`"),
+                    }
+                })?;
+                self.advance_routing_generation();
+                let mut updated = BTreeMap::clone(&entries);
+                updated.remove(id);
+                self.entries.store(Arc::new(updated));
+                self.advance_routing_generation();
+                (entry, entries)
+            };
+        let probe = entry.module.unload_probe();
+        let stop_error = if entry.started {
+            entry.module.stop().err()
+        } else {
+            None
+        };
+        drop(entries);
+        drop(entry);
+        let object_released = probe.as_ref().is_none_or(|probe| probe.wait(timeout));
+        Ok(NetworkModuleUnloadReport {
+            module_id: id.to_string(),
+            stop_complete: stop_error.is_none(),
+            object_released,
+            detail: if let Some(error) = stop_error {
+                format!(
+                    "network module routing was withdrawn and its object retirement was {object_released}, but stop failed: {error}"
+                )
+            } else if object_released {
+                "network module routing, runtime, streams, and executable object retired"
+                    .to_string()
+            } else {
+                "network module routing was withdrawn, but an old transport or stream still retains the executable object"
+                    .to_string()
+            },
         })
     }
 
@@ -1171,5 +1274,81 @@ mod tests {
             registry.endpoint_transport_identity(&endpoint).as_deref(),
             Some("authenticated-principal")
         );
+    }
+
+    #[test]
+    fn unregister_withdraws_routing_then_waits_for_retained_module_owner() {
+        struct RetirableModule {
+            probe: NetworkModuleUnloadProbe,
+            stops: Arc<AtomicUsize>,
+        }
+
+        impl Drop for RetirableModule {
+            fn drop(&mut self) {
+                self.probe.complete();
+            }
+        }
+
+        impl NetworkModule for RetirableModule {
+            fn descriptor(&self) -> NetworkModuleDescriptor {
+                NetworkModuleDescriptor {
+                    id: "retirable".to_string(),
+                    transports: vec![ClusterTransportKind::WebRtc],
+                    address_schemes: vec!["retirable".to_string()],
+                    dialer: true,
+                    listener: true,
+                    supports_runtime_toggle: true,
+                }
+            }
+
+            fn start(&self, _ctx: &NetworkModuleContext) -> Result<(), NetworkError> {
+                Ok(())
+            }
+
+            fn stop(&self) -> Result<(), NetworkError> {
+                self.stops.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn unload_probe(&self) -> Option<NetworkModuleUnloadProbe> {
+                Some(self.probe.clone())
+            }
+
+            fn local_endpoints(&self) -> Result<Vec<ClusterEndpointRecord>, NetworkError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let registry = Arc::new(NetworkModuleRegistry::new());
+        let stops = Arc::new(AtomicUsize::new(0));
+        let retained = Arc::new(RetirableModule {
+            probe: NetworkModuleUnloadProbe::new(),
+            stops: Arc::clone(&stops),
+        });
+        registry.register(retained.clone(), Some(test_context()), true, true);
+        let unload = {
+            let registry = Arc::clone(&registry);
+            std::thread::spawn(move || {
+                registry.unregister("retirable", std::time::Duration::from_secs(1))
+            })
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while registry.module("retirable").is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "routing not withdrawn"
+            );
+            std::thread::yield_now();
+        }
+        while stops.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline, "module not stopped");
+            std::thread::yield_now();
+        }
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert!(!unload.is_finished());
+        drop(retained);
+        let report = unload.join().expect("unload join").expect("unload");
+        assert!(report.stop_complete);
+        assert!(report.object_released);
     }
 }

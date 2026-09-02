@@ -5,15 +5,18 @@
 //! service implementation dependency.
 
 mod component;
+mod extension;
 mod ui;
 
 pub use component::*;
+pub use extension::*;
 pub use ui::*;
 
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::ptr;
 use std::slice;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde::{Deserialize, Serialize};
 use sinomo_object::{LengthMode, serde_ext as sinomo_object_serde};
@@ -25,6 +28,76 @@ pub const SINOMO_MODULE_OBJECT_VERSION: u16 = 1;
 /// Keep them independently bounded so a malformed module cannot make registry
 /// discovery allocate an unbounded payload.
 pub const MAX_MODULE_INTERFACE_DESCRIPTOR_BYTES: usize = 256 * 1024;
+
+/// Module-local admission fence complementing the host's invocation leases.
+/// A dylib uses one static instance to reject new ABI calls once shutdown
+/// begins and to make shutdown fail rather than invalidate callbacks still in
+/// use by an active invocation.
+pub struct NativeModuleLifecycle {
+    accepting_invocations: AtomicBool,
+    active_invocations: AtomicUsize,
+}
+
+impl NativeModuleLifecycle {
+    pub const fn new() -> Self {
+        Self {
+            accepting_invocations: AtomicBool::new(false),
+            active_invocations: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn initialize(&self) -> bool {
+        if self.active_invocations.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        self.accepting_invocations.store(true, Ordering::Release);
+        true
+    }
+
+    pub fn begin_invocation(&self) -> Option<NativeModuleInvocationGuard<'_>> {
+        if !self.accepting_invocations.load(Ordering::Acquire) {
+            return None;
+        }
+        self.active_invocations.fetch_add(1, Ordering::AcqRel);
+        if !self.accepting_invocations.load(Ordering::Acquire) {
+            self.active_invocations.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(NativeModuleInvocationGuard { lifecycle: self })
+    }
+
+    pub fn begin_shutdown(&self) -> bool {
+        self.accepting_invocations.store(false, Ordering::Release);
+        if self.active_invocations.load(Ordering::Acquire) == 0 {
+            true
+        } else {
+            self.accepting_invocations.store(true, Ordering::Release);
+            false
+        }
+    }
+
+    pub fn active_invocations(&self) -> usize {
+        self.active_invocations.load(Ordering::Acquire)
+    }
+}
+
+impl Default for NativeModuleLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct NativeModuleInvocationGuard<'a> {
+    lifecycle: &'a NativeModuleLifecycle,
+}
+
+impl Drop for NativeModuleInvocationGuard<'_> {
+    fn drop(&mut self) {
+        self.lifecycle
+            .active_invocations
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub type SinomoModuleStatusCode = i32;
 
@@ -464,6 +537,12 @@ pub struct NativeModuleSurfaces {
     /// component artifacts and never carry native widget callbacks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_contributions: Vec<UiExtensionContribution>,
+    /// Typed behavior or presentation extension points owned by this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_points: Vec<ExtensionPointDefinition>,
+    /// Generic contributions targeting host- or module-owned extension points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_contributions: Vec<ExtensionContribution>,
 }
 
 impl NativeModuleSurfaces {
@@ -477,6 +556,8 @@ impl NativeModuleSurfaces {
             && self.network_transports.is_empty()
             && self.interface_exports.is_empty()
             && self.ui_contributions.is_empty()
+            && self.extension_points.is_empty()
+            && self.extension_contributions.is_empty()
     }
 }
 
@@ -708,6 +789,24 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_module_lifecycle_rejects_shutdown_until_invocations_drain() {
+        let lifecycle = NativeModuleLifecycle::new();
+        assert!(lifecycle.initialize());
+        let first = lifecycle.begin_invocation().expect("first invocation");
+        assert_eq!(lifecycle.active_invocations(), 1);
+        assert!(!lifecycle.begin_shutdown());
+        let second = lifecycle
+            .begin_invocation()
+            .expect("failed shutdown restores admission");
+        drop(first);
+        drop(second);
+        assert!(lifecycle.begin_shutdown());
+        assert!(lifecycle.begin_invocation().is_none());
+        assert!(lifecycle.begin_shutdown(), "shutdown is idempotent");
+        assert!(lifecycle.initialize(), "a later load can initialize again");
+    }
+
     #[derive(Serialize)]
     struct LegacyNativeModuleObjectRpcRoute {
         route: String,
@@ -822,6 +921,8 @@ mod tests {
         assert_eq!(decoded.surfaces.storage_owners, vec!["legacy"]);
         assert!(decoded.surfaces.interface_exports.is_empty());
         assert!(decoded.surfaces.ui_contributions.is_empty());
+        assert!(decoded.surfaces.extension_points.is_empty());
+        assert!(decoded.surfaces.extension_contributions.is_empty());
     }
 
     #[test]
