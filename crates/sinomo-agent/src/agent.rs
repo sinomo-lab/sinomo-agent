@@ -4756,10 +4756,15 @@ fn default_visible_toolsets_for_role(role: &crate::AgentRole) -> Vec<String> {
     let toolsets: &[&str] = match role {
         crate::AgentRole::Main => &[
             "core",
+            "coding",
+            "local",
             "interactive",
+            "discovery",
+            "version_control",
             "config",
             "delegation",
             "perception",
+            "cluster",
             "remote",
         ],
         crate::AgentRole::Background => &[
@@ -4792,7 +4797,7 @@ fn default_visible_toolsets_for_role_and_provider(
     if is_openai_provider(provider)
         && matches!(
             role,
-            crate::AgentRole::Deliberation | crate::AgentRole::Evolution
+            crate::AgentRole::Main | crate::AgentRole::Deliberation | crate::AgentRole::Evolution
         )
     {
         push_unique(&mut toolsets, "provider_specific".to_string());
@@ -16876,17 +16881,50 @@ mod tests {
 
     #[test]
     fn default_agent_tools_match_initial_architecture_surface() {
-        let default_tool_names = default_coding_agent_tools()
+        let coding_tool_names = default_coding_agent_tools()
             .into_iter()
             .map(|spec| spec.name)
             .collect::<Vec<_>>();
-        assert!(!default_tool_names.contains(&"changed_files".to_string()));
-        assert!(!default_tool_names.contains(&"git_diff".to_string()));
-        assert!(!default_tool_names.contains(&"apply_patch".to_string()));
-        assert!(!default_tool_names.contains(&"replace_exact".to_string()));
-        assert!(!default_tool_names.contains(&"replace_range".to_string()));
-        assert!(default_tool_names.contains(&"edit_file".to_string()));
-        assert!(default_tool_names.contains(&"write_file".to_string()));
+        assert!(!coding_tool_names.contains(&"changed_files".to_string()));
+        assert!(!coding_tool_names.contains(&"git_diff".to_string()));
+        assert!(!coding_tool_names.contains(&"apply_patch".to_string()));
+        assert!(!coding_tool_names.contains(&"replace_exact".to_string()));
+        assert!(!coding_tool_names.contains(&"replace_range".to_string()));
+        assert!(coding_tool_names.contains(&"edit_file".to_string()));
+        assert!(coding_tool_names.contains(&"write_file".to_string()));
+
+        let main_tool_names = default_main_agent_tools()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        for tool in &coding_tool_names {
+            assert!(
+                main_tool_names.contains(tool),
+                "main defaults are missing coding tool {tool}"
+            );
+        }
+        for system_tool in [
+            "config_search",
+            "config_get",
+            "config_set",
+            "cluster_status",
+        ] {
+            assert!(
+                main_tool_names.contains(&system_tool.to_string()),
+                "main defaults are missing Sinomo system tool {system_tool}"
+            );
+        }
+
+        let background_tool_names = default_background_agent_tools()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        for mutation_tool in ["edit_file", "write_file", "run_command", "tool_call"] {
+            assert!(
+                !background_tool_names.contains(&mutation_tool.to_string()),
+                "background defaults unexpectedly gained {mutation_tool}"
+            );
+        }
 
         for (role, tools) in [
             ("main", default_main_agent_tools()),
@@ -17015,7 +17053,7 @@ mod tests {
     }
 
     #[test]
-    fn openai_coding_tool_surface_exposes_apply_patch() {
+    fn openai_workspace_agent_surfaces_expose_apply_patch() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-openai-apply-patch-surface");
         let openai_config = AgentConfig::new("openai", "gpt-5.2-codex")
             .with_agent_definition(AgentDefinition::coding())
@@ -17076,6 +17114,34 @@ mod tests {
         assert!(fake_tools.contains(&"edit_file"));
         assert!(fake_tools.contains(&"write_file"));
         assert!(!fake_tools.contains(&"apply_patch"));
+
+        let openai_main = Agent::new(
+            SequencedModel::new(std::iter::empty::<String>()),
+            "openai",
+            "gpt-5.2-codex",
+        )
+        .with_config(
+            AgentConfig::new("openai", "gpt-5.2-codex")
+                .with_agent_definition(AgentDefinition::main())
+                .with_workspace_root(&root),
+        )
+        .with_tool_registry(AgentToolRegistry::local_workspace_with_config(
+            LocalWorkspaceAgentConfig::new(&root),
+        ));
+        let openai_main_context = openai_main
+            .assemble_context(&agent_input("inspect"), &[], 0)
+            .expect("openai main context");
+        let openai_main_tools = openai_main_context
+            .available_tool_specs
+            .iter()
+            .map(|descriptor| descriptor.spec.name.as_str())
+            .collect::<Vec<_>>();
+        for coding_tool in ["edit_file", "write_file", "apply_patch"] {
+            assert!(
+                openai_main_tools.contains(&coding_tool),
+                "OpenAI main tool surface is missing {coding_tool}"
+            );
+        }
     }
 
     #[test]

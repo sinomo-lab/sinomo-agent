@@ -92,13 +92,20 @@ agent, **Test readiness** connects to enabled servers and reports the negotiated
 protocol version, the server that answered, and the discovered tool names. Realtime voice can also hand coding, research, or longer work to the
 same regular agent and bring the result back into the live conversation.
 
-For a coding task in **Chat**, select **coding-agent**, open the folder-shaped
-**Workspace** control in the composer, and choose the project directory. The
-selection replaces the conversation's complete workspace grant; **Remove
-access** revokes it. Choose a model, then describe the implementation and
-validation outcome you want. File reads, edits, patches, and audited command
-execution use that folder as their root, while tool calls and captured command
-output appear in the conversation's **Tool activity** expander.
+For a coding task in **Chat**, the default **main-agent** can use the complete
+coding toolset; **coding-agent** remains available as a dedicated workspace
+persona. Open the folder-shaped **Workspace** control in the composer and choose
+the project directory. The selection replaces the conversation's complete
+workspace grant; **Remove access** revokes it. Choose a model, then describe the
+implementation and validation outcome you want. File reads, edits, patches,
+and audited command execution use that folder as their root, while tool calls
+and captured command output appear in the conversation's **Tool activity**
+expander.
+
+The main agent can also inspect and update registered Sinomo configuration,
+read cluster health, and use available module, integration, and remote-node
+tools. Operations that affect another node still require that node's explicit
+local permission; selecting the main agent does not bypass those checks.
 
 A host-local folder remains on the node that owns it and is not implicitly
 copied into SIFS. A workspace selected from a live SIFS filesystem mount uses

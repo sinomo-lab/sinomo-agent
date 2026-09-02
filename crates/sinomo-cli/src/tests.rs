@@ -16198,10 +16198,25 @@ fn main_agent_handler_sends_native_tools_through_agent_runtime() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&"tool_search"));
-    assert!(tool_names.contains(&"config_search"));
-    assert!(tool_names.contains(&"config_get"));
-    assert!(tool_names.contains(&"config_set"));
+    for expected in [
+        "edit_file",
+        "write_file",
+        "run_command",
+        "request_user_input",
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+        "config_search",
+        "config_get",
+        "config_set",
+        "cluster_status",
+        "remote_system_info",
+    ] {
+        assert!(
+            tool_names.contains(&expected),
+            "main-agent model request is missing {expected}"
+        );
+    }
 }
 
 #[test]
@@ -17000,6 +17015,7 @@ fn main_agent_tool_registry_exposes_config_catalog_and_workspace_tools() {
         "config_search",
         "config_get",
         "config_set",
+        "cluster_status",
         "skill_update",
         "read_file",
         "search",
@@ -17402,51 +17418,55 @@ fn explicit_agent_sandbox_attachment_is_never_provisioned_by_tool_setup() {
 }
 
 #[test]
-fn coding_agent_rejects_unsafe_mutating_workspace_roots() {
+fn mutation_capable_agents_reject_unsafe_workspace_roots() {
     let root = sinomo_testdir::TestDir::new("sinomo-cli-agent-unsafe-workspace");
     let data_dir = SinomoDataDir::new(root.join("data"));
     let session_id = SessionId::generate();
-    let definition = sinomo_agent::AgentDefinition::coding();
 
-    let data_dir_error = super::agent_tool_registry_for_workspace(
-        &data_dir,
-        &data_dir.root(),
-        &definition,
-        Some(&session_id),
-        None,
-        true,
-    )
-    .err()
-    .expect("data directory must not become a mutating coding workspace");
-    assert!(data_dir_error.to_string().contains("unsafe workspace root"));
-
-    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
-        let home_error = super::agent_tool_registry_for_workspace(
+    for definition in [
+        sinomo_agent::AgentDefinition::main(),
+        sinomo_agent::AgentDefinition::coding(),
+    ] {
+        let data_dir_error = super::agent_tool_registry_for_workspace(
             &data_dir,
-            std::path::Path::new(&home),
+            &data_dir.root(),
             &definition,
             Some(&session_id),
             None,
             true,
         )
         .err()
-        .expect("home directory must not become a mutating coding workspace");
-        assert!(home_error.to_string().contains("unsafe workspace root"));
-    }
+        .expect("data directory must not become a mutating agent workspace");
+        assert!(data_dir_error.to_string().contains("unsafe workspace root"));
 
-    #[cfg(unix)]
-    {
-        let root_error = super::agent_tool_registry_for_workspace(
-            &data_dir,
-            std::path::Path::new("/"),
-            &definition,
-            Some(&session_id),
-            None,
-            true,
-        )
-        .err()
-        .expect("filesystem root must not become a mutating coding workspace");
-        assert!(root_error.to_string().contains("unsafe workspace root"));
+        if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+            let home_error = super::agent_tool_registry_for_workspace(
+                &data_dir,
+                std::path::Path::new(&home),
+                &definition,
+                Some(&session_id),
+                None,
+                true,
+            )
+            .err()
+            .expect("home directory must not become a mutating agent workspace");
+            assert!(home_error.to_string().contains("unsafe workspace root"));
+        }
+
+        #[cfg(unix)]
+        {
+            let root_error = super::agent_tool_registry_for_workspace(
+                &data_dir,
+                std::path::Path::new("/"),
+                &definition,
+                Some(&session_id),
+                None,
+                true,
+            )
+            .err()
+            .expect("filesystem root must not become a mutating agent workspace");
+            assert!(root_error.to_string().contains("unsafe workspace root"));
+        }
     }
 }
 

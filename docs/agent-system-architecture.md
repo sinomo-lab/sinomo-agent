@@ -655,7 +655,18 @@ Main-agent defaults:
 - session/task state tracking;
 - local live inference when available;
 - typed background-handoff requests when a dispatcher is available;
-- bounded direct workspace work when visible tools allow it.
+- the same workspace read, edit, command, clarification, tool-discovery, and
+  skill capabilities as the built-in coding agent when the conversation has
+  an explicit workspace grant;
+- local configuration and cluster-health tools, plus discoverable module,
+  integration, and remote-node operations that retain their normal runtime and
+  node-local authority checks.
+
+The built-in main and coding identities are the only ordinary interactive
+packages granted workspace-mutation authority. A custom package does not gain
+that authority merely by declaring the `main` or `deliberation` role or copying
+the same tool names. Background defaults remain workspace-restricted and do not
+inherit the main agent's workspace mutation or generic command tools.
 
 Background-agent defaults:
 
