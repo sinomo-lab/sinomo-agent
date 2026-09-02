@@ -792,6 +792,7 @@ fn top_level_cli_parser_routes_subcommands() {
         (vec!["observe", "events"], "observe", false),
         (vec!["dfs", "status"], "dfs", false),
         (vec!["sandbox"], "sandbox", true),
+        (vec!["evolve"], "evolve", true),
         (vec!["agent"], "agent", true),
         (vec!["skills", "list", "--all"], "skill", false),
     ];
@@ -818,7 +819,6 @@ fn top_level_cli_parser_routes_subcommands() {
         .expect("module list")
         .expect("registered module command");
     assert!(!list.requires_rollout_admission());
-    assert!(parse_cli_command(&["evolve".to_string()]).is_err());
 }
 
 #[test]

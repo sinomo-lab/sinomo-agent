@@ -206,13 +206,15 @@ fn materialize_module_service_snapshot_with_runtime(
                     ),
                 });
             }
-            descriptor.concurrency_limit = Some(options.native_route_concurrency);
-            descriptor.timeout_ms = Some(
+            descriptor.concurrency_limit = descriptor
+                .concurrency_limit
+                .or(Some(options.native_route_concurrency));
+            descriptor.timeout_ms = descriptor.timeout_ms.or(Some(
                 options
                     .native_route_timeout
                     .as_millis()
                     .min(u128::from(u64::MAX)) as u64,
-            );
+            ));
             descriptor = descriptor
                 .with_buffered_request_value()
                 .observable(&native_route_key, "true")
@@ -426,6 +428,7 @@ fn invoke_native_module_service_request(
             ),
         });
     }
+    let host_data_dir_root = data_dir_root.to_string_lossy().into_owned();
     let callbacks: Arc<dyn NativeModuleHostCallbacks> = Arc::new(
         DefaultNativeModuleHostCallbacks::new(cancellation_token, data_dir_root),
     );
@@ -435,6 +438,7 @@ fn invoke_native_module_service_request(
                 sinomo_module_api::NativeModuleInvocationRequest {
                     operation: target.operation.clone(),
                     payload_sobj: request.body,
+                    host_data_dir_root: Some(host_data_dir_root),
                     cancellation_wait_handle: callbacks.cancellation_wait_handle(),
                     request_body: staged_request_body,
                     response_body_path,

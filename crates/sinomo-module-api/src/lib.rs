@@ -597,6 +597,15 @@ pub struct NativeModuleObjectRpcRoute {
     /// accepting a same-key legacy alias would weaken source binding.
     #[serde(default)]
     pub exact_member_identity: bool,
+    /// Optional route-specific concurrency limit. Hosts apply their bounded
+    /// native-module default when this is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
+    /// Optional route-specific wall-clock timeout. Long-running module
+    /// operations must declare this explicitly instead of changing the host's
+    /// default for every native module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 impl NativeModuleObjectRpcRoute {
@@ -615,6 +624,8 @@ impl NativeModuleObjectRpcRoute {
             response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
             exact_member_identity: false,
+            concurrency_limit: None,
+            timeout_ms: None,
         }
     }
 
@@ -645,6 +656,16 @@ impl NativeModuleObjectRpcRoute {
 
     pub fn require_exact_member_identity(mut self) -> Self {
         self.exact_member_identity = true;
+        self
+    }
+
+    pub fn with_concurrency_limit(mut self, concurrency_limit: u32) -> Self {
+        self.concurrency_limit = Some(concurrency_limit);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
         self
     }
 }
@@ -690,6 +711,11 @@ pub struct NativeModuleProbeCapabilitiesRequest {}
 pub struct NativeModuleInvocationRequest {
     pub operation: String,
     pub payload_sobj: Vec<u8>,
+    /// Trusted host data-directory root for this invocation. This path is
+    /// process-local context, not caller input, and modules must not return or
+    /// persist it as remote authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_data_dir_root: Option<String>,
     /// Optional process-local wait handle which becomes signaled when the
     /// host cancels this invocation. This is an opaque native value and must
     /// never be persisted, returned to a remote caller, or used by a module
@@ -966,6 +992,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: "files.write".to_string(),
             payload_sobj: vec![1, 2, 3],
+            host_data_dir_root: Some("/private/sinomo-data".to_string()),
             cancellation_wait_handle: Some(u64::MAX),
             request_body: Some(staged.clone()),
             response_body_path: Some("/private/session/response.body".to_string()),

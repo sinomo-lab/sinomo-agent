@@ -1,0 +1,36 @@
+[package]
+name = "sinomo-evolution"
+version.workspace = true
+description = "Independent native-dylib module for Sinomo self-evolution"
+authors = ["Infinity_X <Infinity_X@sinomo.net>"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+include = ["**/*.rs", "Cargo.toml"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[package.metadata.sinomo]
+ring = "r2"
+
+[package.metadata.sinomo.native-dylib]
+module-id = "module.evolution"
+interface-version = "sinomo.evolution.v1"
+cache-key = "module/evolution/sinomo-evolution"
+source = "rollout:modules/evolution/sinomo-evolution"
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+sinomo-agent = { path = "../../../crates/sinomo-agent" }
+sinomo-app-contract = { path = "../../../crates/sinomo-app-contract" }
+sinomo-lm = { path = "../../../crates/sinomo-lm" }
+sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
+sinomo-runtime = { path = "../../../crates/sinomo-runtime" }
+
+[dev-dependencies]
+sinomo-testdir = { path = "../../../crates/sinomo-testdir" }

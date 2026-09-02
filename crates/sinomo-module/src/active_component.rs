@@ -219,6 +219,7 @@ impl ActiveNativeComponent {
         let native_request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: operation.to_string(),
             payload_sobj,
+            host_data_dir_root: None,
             cancellation_wait_handle,
             request_body: None,
             response_body_path: None,

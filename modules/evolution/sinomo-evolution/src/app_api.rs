@@ -4,7 +4,7 @@ use sinomo_app_contract::evolution as contract;
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::persistence::{EvolutionPaths, StoredEvolutionJob, list_job_records};
-use crate::{CliError, EvolutionJobStatus, run_evolve_command};
+use crate::{CliError, EvolutionJobStatus, run_evolve_command_captured};
 
 pub fn app_evolution_dashboard(data_dir: &SinomoDataDir) -> contract::EvolutionDashboard {
     let paths = EvolutionPaths::new(data_dir);
@@ -38,17 +38,18 @@ pub fn run_app_evolution_job(request: contract::EvolutionStartRequest) -> Result
         args.push("--allow".to_string());
         args.push(path);
     }
-    run_evolve_command(&args)
+    run_evolve_command_captured(&args).map(|_| ())
 }
 
 pub fn run_app_evolution_decision(
     request: contract::EvolutionDecisionRequest,
 ) -> Result<(), CliError> {
-    run_evolve_command(&[
+    run_evolve_command_captured(&[
         request.action.command().to_string(),
         "--job".to_string(),
         request.job_id,
     ])
+    .map(|_| ())
 }
 
 fn summarize_record(record: StoredEvolutionJob) -> contract::EvolutionJobSummary {

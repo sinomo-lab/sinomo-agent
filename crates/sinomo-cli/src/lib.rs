@@ -293,6 +293,7 @@ mod agent_history;
 pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
+mod evolution_cli;
 mod help;
 mod media_transport;
 mod providers;
@@ -726,10 +727,8 @@ mod skill_service;
 mod sobj_file_preview;
 pub use agent_management_service::register_hosted_agent_management_service;
 pub use chat_service::register_hosted_chat_service;
-mod evolution_service;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
-pub use evolution_service::register_hosted_evolution_service;
 pub use skill_service::register_hosted_skill_service;
 
 /// Application-host integration for one node-local supervised SIFS mount.
@@ -761,7 +760,6 @@ pub fn hosted_agent_chat_component_factory(
             );
             let services =
                 register_hosted_chat_service(services, daemon_address.clone(), runtime_control);
-            let services = register_hosted_evolution_service(services);
             let services = register_hosted_skill_service(services, daemon_address.clone());
             let services =
                 register_hosted_agent_management_service(services, daemon_address.clone());
@@ -1611,6 +1609,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(test_cli_command_handler())
         .register(agent_cli_command_handler())
         .register(skill_cli_command_handler())
+        .register(evolution_cli::evolution_cli_command_handler())
         .register(models_cli_command_handler())
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,

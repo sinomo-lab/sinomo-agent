@@ -1,19 +1,37 @@
-//! Stable app-facing self-evolution commands and projections.
+//! Stable self-evolution module commands and app-facing projections.
 
 use serde::{Deserialize, Serialize};
 
+pub const EVOLUTION_MODULE_ID: &str = "module.evolution";
+pub const EVOLUTION_MODULE_OWNER: &str = "sinomo-evolution";
+pub const EVOLUTION_INTERFACE_ID: &str = "sinomo.evolution";
+pub const EVOLUTION_INTERFACE_VERSION: &str = "1.0.0";
+pub const EVOLUTION_MODULE_INTERFACE_VERSION: &str = "sinomo.evolution.v1";
+pub const EVOLUTION_SERVICE_ID: &str = "evolution";
 pub const EVOLUTION_RPC_CATEGORY: &str = "evolution.app";
 pub const EVOLUTION_ROUTE_AUTH_SCOPE: &str = "local-command";
 pub const EVOLUTION_DASHBOARD_ROUTE: &str = "/evolution/app/dashboard";
 pub const EVOLUTION_START_ROUTE: &str = "/evolution/app/start";
 pub const EVOLUTION_DECISION_ROUTE: &str = "/evolution/app/decision";
+pub const EVOLUTION_CLI_ROUTE: &str = "/evolution/cli/run";
 pub const EVOLUTION_RPC_ROUTES: &[&str] = &[
     EVOLUTION_DASHBOARD_ROUTE,
     EVOLUTION_START_ROUTE,
     EVOLUTION_DECISION_ROUTE,
+    EVOLUTION_CLI_ROUTE,
 ];
 pub const EVOLUTION_READ_CAPABILITY: &str = "evolution.app.read";
 pub const EVOLUTION_WRITE_CAPABILITY: &str = "evolution.app.write";
+pub const EVOLUTION_DASHBOARD_OPERATION: &str = "evolution.dashboard.read";
+pub const EVOLUTION_START_OPERATION: &str = "evolution.job.start";
+pub const EVOLUTION_DECISION_OPERATION: &str = "evolution.job.decision";
+pub const EVOLUTION_CLI_OPERATION: &str = "evolution.cli.run";
+pub const EVOLUTION_OPERATIONS: &[&str] = &[
+    EVOLUTION_DASHBOARD_OPERATION,
+    EVOLUTION_START_OPERATION,
+    EVOLUTION_DECISION_OPERATION,
+    EVOLUTION_CLI_OPERATION,
+];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionDashboard {
@@ -169,6 +187,16 @@ pub struct EvolutionDashboardResponse {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 pub struct EvolutionMutationResponse {
     pub accepted: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionCliRequest {
+    pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct EvolutionCliResponse {
+    pub stdout: String,
 }
 
 #[cfg(test)]

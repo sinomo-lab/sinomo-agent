@@ -66,7 +66,6 @@ sinomo-runtime = { path = "../sinomo-runtime", default-features = false, feature
 jni.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-product-profile = { path = "../sinomo-product-profile", default-features = false }
 sinomo-runtime = { path = "../sinomo-runtime", features = ["host", "native-devices"] }
 

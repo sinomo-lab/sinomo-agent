@@ -785,9 +785,12 @@ The crate boundary follows the trust-ring architecture:
   transition, but the rollout decision model stays outside `sinomo-module`.
 - `sinomo-sandbox` owns sandbox-process containment and optional sandboxed
   execution backends.
-- `sinomo-evolution` owns candidate generation, evidence assembly, evidence
-  interpretation, self-evolution scorecard adapters, and promotion requests; it
-  consumes module lifecycle contracts but does not define R1 module primitives.
+- `modules/evolution/sinomo-evolution` is the independently built
+  `module.evolution` native-dylib. It owns candidate generation, evidence
+  assembly and interpretation, self-evolution scorecard adapters, promotion
+  requests, settings, routes, and CLI execution. Hosts consume its typed
+  contract and generic native-module descriptor; they do not link its
+  implementation or register a parallel evolution service.
 - Domain module crates own their domain method names, event kinds, storage
   roots, extension-point schemas, trusted reducers and delta validators, and
   host-service binding helpers. Generic infrastructure crates own framing,

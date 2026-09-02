@@ -1848,6 +1848,10 @@ pub struct ModuleObjectRpcRoute {
     pub required_local_permissions: Vec<String>,
     #[serde(default)]
     pub exact_member_identity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1861,6 +1865,8 @@ pub struct ModuleObjectRpcRouteDescriptor {
     pub exact_member_identity: bool,
     pub request_body_mode: NativeModuleBodyMode,
     pub response_body_mode: NativeModuleBodyMode,
+    pub concurrency_limit: Option<usize>,
+    pub timeout_ms: Option<u64>,
 }
 
 fn default_native_module_body_mode() -> NativeModuleBodyMode {
@@ -1883,6 +1889,8 @@ impl ModuleObjectRpcRoute {
             response_body_mode: NativeModuleBodyMode::None,
             required_local_permissions: Vec::new(),
             exact_member_identity: false,
+            concurrency_limit: None,
+            timeout_ms: None,
         }
     }
 
@@ -1903,6 +1911,16 @@ impl ModuleObjectRpcRoute {
 
     pub fn require_exact_member_identity(mut self) -> Self {
         self.exact_member_identity = true;
+        self
+    }
+
+    pub fn with_concurrency_limit(mut self, concurrency_limit: usize) -> Self {
+        self.concurrency_limit = Some(concurrency_limit);
+        self
+    }
+
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
         self
     }
 
@@ -1946,6 +1964,18 @@ impl ModuleObjectRpcRoute {
                 });
             }
         }
+        if self.concurrency_limit == Some(0) {
+            return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+                route: self.route.clone(),
+                detail: "concurrency_limit must be greater than zero".to_string(),
+            });
+        }
+        if self.timeout_ms == Some(0) {
+            return Err(ModuleSurfaceError::InvalidObjectRpcRoute {
+                route: self.route.clone(),
+                detail: "timeout_ms must be greater than zero".to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -1976,6 +2006,8 @@ impl ModuleObjectRpcRoute {
             exact_member_identity: self.exact_member_identity,
             request_body_mode: self.request_body_mode,
             response_body_mode: self.response_body_mode,
+            concurrency_limit: self.concurrency_limit,
+            timeout_ms: self.timeout_ms,
         })
     }
 }
@@ -3715,6 +3747,14 @@ fn native_descriptor_route_to_module_route(
     .with_request_body_mode(route.request_body_mode)
     .with_response_body_mode(route.response_body_mode)
     .require_local_permissions(route.required_local_permissions.clone());
+    let route_descriptor = match route.concurrency_limit {
+        Some(limit) => route_descriptor.with_concurrency_limit(limit as usize),
+        None => route_descriptor,
+    };
+    let route_descriptor = match route.timeout_ms {
+        Some(timeout_ms) => route_descriptor.with_timeout_ms(timeout_ms),
+        None => route_descriptor,
+    };
     Ok(if route.exact_member_identity {
         route_descriptor.require_exact_member_identity()
     } else {
@@ -6436,6 +6476,8 @@ mod tests {
                     response_body_mode: sinomo_module_api::NativeModuleBodyMode::Required,
                     required_local_permissions: vec!["remote-management".to_string()],
                     exact_member_identity: false,
+                    concurrency_limit: None,
+                    timeout_ms: None,
                 }],
                 declarative_resources: vec![NativeModuleDeclarativeResource {
                     id: "skill.dynamic-native".to_string(),

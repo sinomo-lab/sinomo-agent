@@ -1,0 +1,79 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+use sinomo_module::{ActiveNativeComponent, ActiveNativeComponentResponse};
+use sinomo_module_api::ServiceRequirement;
+
+const EVOLUTION_INTERFACE_ID: &str = "sinomo.evolution";
+const EVOLUTION_INTERFACE_VERSION: &str = "1.0.0";
+const EVOLUTION_CLI_OPERATION: &str = "evolution.cli.run";
+
+#[derive(Clone, Debug, Serialize)]
+struct EvolutionCliRequest {
+    args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EvolutionCliResponse {
+    stdout: String,
+}
+
+#[test]
+fn independently_built_evolution_dylib_serves_its_cli_contract() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let manifest = workspace.join("modules/evolution/sinomo-evolution/Cargo.toml");
+    let target = workspace.join("target");
+    let status = Command::new("cargo")
+        .args(["build", "--manifest-path"])
+        .arg(&manifest)
+        .status()
+        .expect("build evolution module");
+    assert!(status.success(), "evolution dylib build failed");
+
+    let requirement = ServiceRequirement::new(EVOLUTION_INTERFACE_ID, EVOLUTION_INTERFACE_VERSION)
+        .from_service("evolution")
+        .with_operation(EVOLUTION_CLI_OPERATION)
+        .with_caller_capability(EVOLUTION_CLI_OPERATION);
+    let component =
+        unsafe { ActiveNativeComponent::load_verified(library_path(&target), &requirement) }
+            .expect("load evolution component");
+    let descriptor = component.descriptor();
+    assert_eq!(descriptor.module_id, "module.evolution");
+    assert_eq!(descriptor.surfaces.settings.len(), 1);
+    let cli_route = descriptor
+        .surfaces
+        .object_rpc_routes
+        .iter()
+        .find(|route| route.operation == EVOLUTION_CLI_OPERATION)
+        .expect("evolution CLI route");
+    assert_eq!(cli_route.concurrency_limit, Some(1));
+    assert_eq!(cli_route.timeout_ms, Some(60 * 60 * 1_000));
+    let response = component
+        .invoke_sobj::<_, EvolutionCliResponse>(
+            EVOLUTION_CLI_OPERATION,
+            &EvolutionCliRequest {
+                args: vec!["help".to_string()],
+            },
+            None,
+        )
+        .expect("invoke evolution CLI contract");
+    let ActiveNativeComponentResponse::Value(response) = response else {
+        panic!("unexpected evolution response: {response:?}");
+    };
+    assert!(response.stdout.contains("sinomo evolve propose"));
+    assert!(component.unload().shutdown_ok);
+}
+
+fn library_path(target: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let filename = "sinomo_evolution.dll";
+    #[cfg(target_os = "macos")]
+    let filename = "libsinomo_evolution.dylib";
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let filename = "libsinomo_evolution.so";
+    target.join("debug").join(filename)
+}

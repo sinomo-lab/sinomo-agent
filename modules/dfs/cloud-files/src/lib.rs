@@ -1181,6 +1181,7 @@ mod tests {
                 let response = invoke_cloud_files_operation(NativeModuleInvocationRequest {
                     operation: operation.to_string(),
                     payload_sobj: encode_sobj(payload).expect("encode mismatched request"),
+                    host_data_dir_root: None,
                     cancellation_wait_handle: None,
                     request_body: None,
                     response_body_path: None,

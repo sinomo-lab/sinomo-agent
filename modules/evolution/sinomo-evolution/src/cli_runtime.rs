@@ -4,9 +4,10 @@ use serde::de::DeserializeOwned;
 #[allow(unused_imports)]
 use sinomo_runtime::cluster;
 use sinomo_runtime::cluster::ClusterKvPathsExt;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -45,6 +46,95 @@ const EVOLUTION_ITERATION_MEMORY_CONTEXT_LIMIT: usize = 8;
 
 thread_local! {
     static EVOLUTION_CLI_FORCE_LOCAL_MODE: Cell<bool> = const { Cell::new(false) };
+    static EVOLUTION_CLI_OUTPUT: RefCell<Option<String>> = const { RefCell::new(None) };
+    static EVOLUTION_DATA_DIR_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+fn write_evolution_cli_line(args: std::fmt::Arguments<'_>) {
+    let captured = EVOLUTION_CLI_OUTPUT.with(|output| {
+        let mut output = output.borrow_mut();
+        let Some(output) = output.as_mut() else {
+            return false;
+        };
+        let _ = output.write_fmt(args);
+        output.push('\n');
+        true
+    });
+    if !captured {
+        std::println!("{args}");
+    }
+}
+
+macro_rules! println {
+    () => {
+        write_evolution_cli_line(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        write_evolution_cli_line(format_args!($($arg)*))
+    };
+}
+
+struct EvolutionCliOutputCapture;
+
+impl EvolutionCliOutputCapture {
+    fn begin() -> Result<Self, CliError> {
+        EVOLUTION_CLI_OUTPUT.with(|output| {
+            let mut output = output.borrow_mut();
+            if output.is_some() {
+                return Err(CliError::Parse {
+                    detail: "nested evolution CLI output capture is not supported".to_string(),
+                });
+            }
+            *output = Some(String::new());
+            Ok(Self)
+        })
+    }
+
+    fn finish(self) -> String {
+        EVOLUTION_CLI_OUTPUT.with(|output| output.borrow_mut().take().unwrap_or_default())
+    }
+}
+
+impl Drop for EvolutionCliOutputCapture {
+    fn drop(&mut self) {
+        EVOLUTION_CLI_OUTPUT.with(|output| {
+            output.borrow_mut().take();
+        });
+    }
+}
+
+struct EvolutionDataDirGuard {
+    previous: Option<PathBuf>,
+}
+
+impl EvolutionDataDirGuard {
+    fn enter(root: &Path) -> Self {
+        let previous = EVOLUTION_DATA_DIR_ROOT
+            .with(|current| current.borrow_mut().replace(root.to_path_buf()));
+        Self { previous }
+    }
+}
+
+impl Drop for EvolutionDataDirGuard {
+    fn drop(&mut self) {
+        EVOLUTION_DATA_DIR_ROOT.with(|current| {
+            *current.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub(crate) fn with_evolution_data_dir<T>(root: &Path, run: impl FnOnce() -> T) -> T {
+    let _guard = EvolutionDataDirGuard::enter(root);
+    run()
+}
+
+pub(crate) fn evolution_data_dir() -> Result<SinomoDataDir, CliError> {
+    EVOLUTION_DATA_DIR_ROOT
+        .with(|root| root.borrow().clone())
+        .map(SinomoDataDir::new)
+        .map(Ok)
+        .unwrap_or_else(SinomoDataDir::from_env_or_home)
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Error)]
@@ -246,6 +336,14 @@ fn evolve_cli_help() -> CliCommandHelp {
             "      Inspect or synchronize trusted artifact signers between local registry and cluster KV.",
         ],
     )
+}
+
+fn print_evolve_cli_help() {
+    let help = evolve_cli_help();
+    println!("{}", help.title);
+    for line in help.lines {
+        println!("{line}");
+    }
 }
 
 fn evolve_cli_autocomplete() -> CliAutocompleteSpec {
@@ -478,7 +576,7 @@ pub(crate) fn resolve_job_from_args(
     args: &[String],
     waiting_only: bool,
 ) -> Result<(EvolutionPaths, StoredEvolutionJob), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let job_id = job_flag(args)?;
@@ -594,17 +692,16 @@ pub fn run_evolve_command(args: &[String]) -> Result<(), CliError> {
     run_evolve_cli_command(parse_evolve_command(args)?)
 }
 
+pub fn run_evolve_command_captured(args: &[String]) -> Result<String, CliError> {
+    let capture = EvolutionCliOutputCapture::begin()?;
+    run_evolve_command(args)?;
+    Ok(capture.finish())
+}
+
 pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), CliError> {
     match command {
         EvolveCliCommand::Help => {
-            evolve_cli_help()
-                .write(&mut CliCommandContext::new(
-                    &mut std::io::stdout(),
-                    &mut std::io::stderr(),
-                ))
-                .map_err(|error| CliError::Parse {
-                    detail: error.to_string(),
-                })?;
+            print_evolve_cli_help();
             Ok(())
         }
         EvolveCliCommand::Propose(args) => evolve_propose(&args),
@@ -645,18 +742,11 @@ pub struct TrustedSignersSyncReport {
 fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliError> {
     match command {
         TrustedSignersCliCommand::Help => {
-            evolve_cli_help()
-                .write(&mut CliCommandContext::new(
-                    &mut std::io::stdout(),
-                    &mut std::io::stderr(),
-                ))
-                .map_err(|error| CliError::Parse {
-                    detail: error.to_string(),
-                })?;
+            print_evolve_cli_help();
             Ok(())
         }
         TrustedSignersCliCommand::List(options) => {
-            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let data_dir = evolution_data_dir()?;
             let (source, signers) = read_trusted_signers_for_node(&data_dir)?;
             if options.json {
                 print_json(
@@ -683,7 +773,7 @@ fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliEr
             Ok(())
         }
         TrustedSignersCliCommand::Publish => {
-            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let data_dir = evolution_data_dir()?;
             let report = publish_trusted_signers_to_cluster(&data_dir)?;
             println!("trusted signers published: {}", report.count);
             println!("source: {}", report.source);
@@ -691,7 +781,7 @@ fn evolve_trusted_signers(command: TrustedSignersCliCommand) -> Result<(), CliEr
             Ok(())
         }
         TrustedSignersCliCommand::Hydrate => {
-            let data_dir = SinomoDataDir::from_env_or_home()?;
+            let data_dir = evolution_data_dir()?;
             let report = hydrate_trusted_signers_from_cluster(&data_dir)?;
             println!("trusted signers hydrated: {}", report.count);
             println!("source: {}", report.source);
@@ -1147,7 +1237,7 @@ impl EvolutionLifecycleObserver for PersistentEvolutionLifecycleObserver {
 
 pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
     let options = parse_propose_options(args)?;
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     data_dir.ensure_root_layout()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
@@ -1234,7 +1324,7 @@ pub(crate) fn evolve_propose(args: &[String]) -> Result<(), CliError> {
 
 pub(crate) fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
     let options = parse_schedule_options(args)?;
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if !options.dry_run {
@@ -1256,7 +1346,7 @@ pub(crate) fn evolve_schedule(args: &[String]) -> Result<(), CliError> {
 
 pub(crate) fn evolve_iterate(args: &[String]) -> Result<(), CliError> {
     let options = parse_iteration_options(args)?;
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     data_dir.ensure_root_layout()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
@@ -1428,7 +1518,7 @@ fn module_replay_report_ref_key(report: &ModuleReplayReportRef) -> String {
 
 pub(crate) fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
     let options = parse_stage_evaluation_options(args)?;
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let campaign = read_campaign(&paths, &options.campaign_id)?;
@@ -1449,7 +1539,7 @@ pub(crate) fn evolve_evaluate(args: &[String]) -> Result<(), CliError> {
 }
 
 pub(crate) fn evolve_campaign(command: CampaignCliCommand) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let (options, decision) = match command {
@@ -1629,7 +1719,7 @@ pub(crate) fn evolve_tick(args: &[String]) -> Result<(), CliError> {
     if !options.dry_run && !options.dispatch_approved {
         return Err(CliError::Usage);
     }
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     let config = read_config(&paths).ok();
@@ -1744,7 +1834,7 @@ pub(crate) fn evolve_decide(
 }
 
 pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
-    let data_dir = SinomoDataDir::from_env_or_home()?;
+    let data_dir = evolution_data_dir()?;
     let paths = EvolutionPaths::new(&data_dir);
     paths.ensure()?;
     if let Some(job_id) = job_flag(args)? {

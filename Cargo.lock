@@ -9479,7 +9479,6 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sinomo-cli",
- "sinomo-evolution",
  "sinomo-runtime",
  "sinomo-testdir",
 ]
@@ -9548,7 +9547,6 @@ dependencies = [
  "sinomo-audio",
  "sinomo-cli",
  "sinomo-client",
- "sinomo-evolution",
  "sinomo-lm",
  "sinomo-product-profile",
  "sinomo-runtime",
@@ -9683,7 +9681,6 @@ dependencies = [
  "sinomo-app-contract",
  "sinomo-audio",
  "sinomo-dfs-fuse",
- "sinomo-evolution",
  "sinomo-lm",
  "sinomo-memory",
  "sinomo-models",
@@ -9952,6 +9949,7 @@ dependencies = [
  "sinomo-agent",
  "sinomo-app-contract",
  "sinomo-lm",
+ "sinomo-module-api",
  "sinomo-runtime",
  "sinomo-testdir",
  "thiserror 2.0.20",

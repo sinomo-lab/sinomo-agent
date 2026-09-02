@@ -115,9 +115,6 @@ pub fn build_config_store() -> Result<ConfigStore, String> {
         .map_err(|e| format!("product component config: {e}"))?;
     let builder =
         sinomo_lm::register_config_definitions(builder).map_err(|e| format!("lm config: {e:?}"))?;
-    #[cfg(target_os = "android")]
-    let builder = sinomo_evolution::register_config_definitions(builder)
-        .map_err(|e| format!("evolution config: {e:?}"))?;
     Ok(ConfigStore::new(builder.build()))
 }
 

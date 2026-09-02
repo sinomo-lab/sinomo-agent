@@ -225,7 +225,7 @@ fn evolution_request_preparation_selects_model_defaults_and_verification() {
     let prepared = prepare_evolution_request(EvolutionRequestInput {
         objective: "refactor the scheduler".to_string(),
         target_ring: TrustRing::R1TrustedRuntime,
-        intended_paths: vec!["crates/sinomo-evolution".to_string()],
+        intended_paths: vec!["modules/evolution/sinomo-evolution".to_string()],
         verification_commands: vec!["cargo test -p sinomo-evolution".to_string()],
         benchmark_specs: vec!["swebench:psf__requests-1142".to_string()],
         module_replay_report_specs: vec!["trigger=reports/trigger-replay.json".to_string()],
@@ -275,7 +275,12 @@ fn evolution_request_preparation_selects_model_defaults_and_verification() {
 #[test]
 fn bootstrap_job_preserves_rust_default_verification_for_sinomo_repo() {
     let root = temp_dir("sinomo-project-profile");
-    fs::create_dir_all(root.join("crates").join("sinomo-evolution")).expect("crate dir");
+    fs::create_dir_all(
+        root.join("modules")
+            .join("evolution")
+            .join("sinomo-evolution"),
+    )
+    .expect("module dir");
     fs::create_dir_all(root.join("docs")).expect("docs dir");
     fs::write(root.join("Cargo.toml"), "[workspace]\n").expect("cargo toml");
     fs::write(
@@ -977,7 +982,7 @@ fn scheduled_iteration_prepares_dry_run_agent_handoff_from_approved_campaign() {
     let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: Some(task_id.clone()),
-        intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+        intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
         extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
         dry_run: true,
     })
@@ -994,7 +999,7 @@ fn scheduled_iteration_prepares_dry_run_agent_handoff_from_approved_campaign() {
     );
     assert_eq!(
         plan.evolution_request.intended_paths,
-        vec!["crates/sinomo-evolution/**".to_string()]
+        vec!["modules/evolution/sinomo-evolution/**".to_string()]
     );
     assert!(
         plan.evolution_request
@@ -1043,7 +1048,7 @@ fn scheduled_iteration_attaches_prior_memory_to_agent_handoff() {
     let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: Some(task_id.clone()),
-        intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+        intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
         extra_verification_commands: Vec::new(),
         dry_run: false,
     })
@@ -1442,7 +1447,7 @@ fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
     let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: Some(task_id.clone()),
-        intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+        intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
         extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
         dry_run: true,
     })
@@ -1512,7 +1517,7 @@ fn scheduled_iteration_result_pauses_campaign_for_rollout_review() {
             gates: Vec::new(),
             metrics: Vec::new(),
         }),
-        changed_files: vec!["crates/sinomo-evolution/src/lib.rs".to_string()],
+        changed_files: vec!["modules/evolution/sinomo-evolution/src/lib.rs".to_string()],
     };
 
     let updated = record_scheduled_iteration_result(
@@ -2302,7 +2307,7 @@ fn sample_iteration_report(
     let plan = prepare_scheduled_iteration(ScheduledIterationRequest {
         campaign: campaign.clone(),
         task_id: Some(task_id.to_string()),
-        intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+        intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
         extra_verification_commands: vec!["cargo test -p sinomo-evolution --lib".to_string()],
         dry_run: true,
     })
@@ -2372,7 +2377,7 @@ fn sample_iteration_report(
             gates: Vec::new(),
             metrics: Vec::new(),
         }),
-        changed_files: vec!["crates/sinomo-evolution/src/lib.rs".to_string()],
+        changed_files: vec!["modules/evolution/sinomo-evolution/src/lib.rs".to_string()],
     }
 }
 
@@ -3049,7 +3054,7 @@ fn mutation_prompt_contains_objective_verification_and_recovery() {
         target_ring: TrustRing::R1TrustedRuntime,
         edit_scope: EditScope {
             workspace_root: "candidate".to_string(),
-            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
             notes: "keep it focused".to_string(),
         },
         relevant_files: Vec::new(),
@@ -3084,7 +3089,7 @@ fn bridge_prompt_exposes_candidate_workspace_tools_and_json_contract() {
         target_ring: TrustRing::R1TrustedRuntime,
         edit_scope: EditScope {
             workspace_root: root.display().to_string(),
-            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
             notes: "keep it focused".to_string(),
         },
         relevant_files: Vec::new(),
@@ -3545,7 +3550,7 @@ fn orchestrator_dry_run_writes_bundle_and_runs_verification() {
             EvolutionRequest {
                 objective: "dry run".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -3590,7 +3595,7 @@ fn orchestrator_lifecycle_observer_records_durable_statuses() {
             EvolutionRequest {
                 objective: "observe lifecycle".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -3651,7 +3656,7 @@ fn orchestrator_writes_model_turn_and_tool_evidence_artifacts() {
             EvolutionRequest {
                 objective: "write model evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -3695,7 +3700,7 @@ fn orchestrator_writes_agent_run_artifacts() {
             EvolutionRequest {
                 objective: "write agent evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: Vec::new(),
                 benchmark_gates: Vec::new(),
                 module_replay_reports: Vec::new(),
@@ -4036,7 +4041,7 @@ fn orchestrator_records_benchmark_summary_metrics() {
             EvolutionRequest {
                 objective: "write benchmark evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4257,7 +4262,7 @@ fn orchestrator_marks_host_blocked_swebench_summary_inconclusive() {
             EvolutionRequest {
                 objective: "record host-blocked benchmark evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4352,7 +4357,7 @@ fn orchestrator_marks_harness_incomplete_swebench_summary_inconclusive() {
             EvolutionRequest {
                 objective: "record incomplete benchmark harness evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4453,7 +4458,7 @@ fn orchestrator_fails_swebench_summary_with_orphan_tool_pairs() {
             EvolutionRequest {
                 objective: "record orphan tool-pair benchmark evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4549,7 +4554,7 @@ fn orchestrator_fails_swebench_summary_with_tool_pair_count_mismatch() {
             EvolutionRequest {
                 objective: "record tool-pair mismatch benchmark evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4641,7 +4646,7 @@ fn orchestrator_fails_unresolved_swebench_summary() {
             EvolutionRequest {
                 objective: "write benchmark evidence".to_string(),
                 target_ring: TrustRing::R1TrustedRuntime,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "success".to_string(),
                     command: "exit 0".to_string(),
@@ -4729,7 +4734,7 @@ fn orchestrator_writes_reusable_regression_evidence_and_lesson_for_failed_candid
             EvolutionRequest {
                 objective: "capture failed regression evidence".to_string(),
                 target_ring: TrustRing::R2TrustedService,
-                intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+                intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
                 verification_commands: vec![VerificationCommand {
                     name: "failing-static-check".to_string(),
                     command: "printf failure-details >&2; exit 7".to_string(),

@@ -682,9 +682,11 @@ and handles, not unbounded cluster logs.
 
 ## Self-Evolution Boundary
 
-Self-evolution is outside the agent runtime core. It is an R2 caller that uses
-the generic `Agent` loop with context attachments for evolution jobs, mutation
-packets, candidate bundles, and prior evidence.
+Self-evolution is outside the agent runtime core. The separately built
+`module.evolution` native dylib is an R2 caller that uses the generic `Agent`
+loop with context attachments for evolution jobs, mutation packets, candidate
+bundles, and prior evidence. Agent and daemon host crates do not link the
+evolution implementation.
 
 The agent runtime provides generic evidence: model events, tool calls, tool
 results, patch snapshots, validation records, model metrics, and tool-pair

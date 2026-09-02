@@ -22,7 +22,6 @@ native-models = ["sinomo-cli/native-models"]
 
 [dependencies]
 sinomo-cli = { path = "../sinomo-cli", default-features = false }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]

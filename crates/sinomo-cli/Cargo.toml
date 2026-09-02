@@ -35,7 +35,6 @@ serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
 sinomo-app-contract = { path = "../sinomo-app-contract" }
 sinomo-audio = { path = "../sinomo-audio" }
-sinomo-evolution = { path = "../sinomo-evolution" }
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse", optional = true, default-features = false }
 sinomo-lm = { path = "../sinomo-lm", features = ["test-cases"] }
 sinomo-memory = { path = "../sinomo-memory" }

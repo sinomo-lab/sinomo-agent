@@ -219,6 +219,8 @@ fn r2_and_application_crates_cross_the_boundary_through_sinomo_runtime() {
             };
             if APPLICATION_ABI_EXEMPT
                 .contains(&(package.name.as_str(), dependency_manifest.name.as_str()))
+                || (is_native_module_package(package)
+                    && dependency_manifest.name == "sinomo-module-api")
             {
                 continue;
             }
@@ -383,6 +385,26 @@ fn native_dylib_modules_are_not_default_workspace_build_members() {
         !default_members.contains(&"crates/sinomo-benchmarks".to_string()),
         "the old benchmark crate path must not remain in default-members"
     );
+}
+
+#[test]
+fn evolution_is_an_external_module_not_a_host_dependency() {
+    let packages = read_workspace_packages();
+    let evolution = packages
+        .get("sinomo-evolution")
+        .expect("evolution module package should exist");
+    assert!(
+        is_native_module_package(evolution),
+        "sinomo-evolution must live under modules/ as an independently built artifact"
+    );
+    for host in ["sinomo", "sinomo-cli", "sinomo-app", "sinomo-app-daemon"] {
+        let host = packages.get(host).expect("host package should exist");
+        assert!(
+            !host.dependencies.contains(&evolution.name),
+            "{} must reach evolution through its module contract, not link the implementation",
+            host.name
+        );
+    }
 }
 
 #[test]

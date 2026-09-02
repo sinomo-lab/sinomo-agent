@@ -6720,7 +6720,31 @@ mod tests {
         )
         .expect("install test native dylib");
 
-        let host = test_service_host(&root, ServiceRegistry::builder().build());
+        let state = sinomo_module::read_native_dylib_module_loader_state(
+            &root,
+            &sinomo_module::ModuleId::from_legacy_named(&descriptor.module_id).expect("module id"),
+        )
+        .expect("read installed module state")
+        .expect("installed module state");
+        let registration =
+            sinomo_module::native_dylib_module_registration_from_loader_state(&root, &state)
+                .expect("installed module registration");
+        let catalog = sinomo_module::ComponentCatalog::builder()
+            .register_module(registration)
+            .expect("register installed module")
+            .build()
+            .expect("component catalog");
+        let data_dir = SinomoDataDir::new(&root);
+        let paths = DaemonPaths::new(&data_dir);
+        let host = DaemonServiceRegistryHost::from_registry_with_internal_modules(
+            ServiceRegistry::builder().build(),
+            paths,
+            None,
+            catalog,
+            Arc::new(DaemonEventHub::new()),
+            None,
+        )
+        .expect("service registry host");
         let route_descriptor = host
             .object_rpc_route_descriptor(&route.route)
             .expect("native dylib route descriptor");
