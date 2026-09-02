@@ -2032,26 +2032,13 @@ fn parse_agent_role(value: &str) -> Option<AgentRole> {
 }
 
 pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
-    let mut tools = default_agent_recall_tools();
-    tools.extend([
-        AgentToolSpec::new(
-            AgentToolKind::ReadFile,
-            "read_file",
-            "Read a workspace file or one-based line range into model-visible text with a bounded byte budget.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ListFiles,
-            "list_files",
-            "List workspace files and directories with bounded recursion.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::SearchFiles,
-            "search",
-            "Search workspace text files for a literal query.",
-            false,
-        ),
+    let mut tools = default_coding_agent_tools();
+    tools.extend(default_sinomo_system_tools());
+    tools
+}
+
+fn default_sinomo_system_tools() -> Vec<AgentToolSpec> {
+    vec![
         AgentToolSpec::new(
             AgentToolKind::ConfigSearch,
             "config_search",
@@ -2070,42 +2057,26 @@ pub fn default_main_agent_tools() -> Vec<AgentToolSpec> {
             "Update a registered Sinomo configuration value through the shared config resolver.",
             true,
         ),
-    ]);
-    tools
+        AgentToolSpec::new(
+            AgentToolKind::ClusterStatus,
+            "cluster_status",
+            "Read a live cluster-wide health summary from the local control plane.",
+            false,
+        ),
+    ]
 }
 
 pub fn default_background_agent_tools() -> Vec<AgentToolSpec> {
-    let mut tools = default_main_agent_tools();
-    tools.push(AgentToolSpec::new(
-        AgentToolKind::ClusterStatus,
-        "cluster_status",
-        "Read a live cluster-wide health summary from the local control plane.",
-        false,
-    ));
+    let mut tools = default_agent_recall_tools();
+    tools.extend(default_workspace_read_tools());
+    tools.extend(default_sinomo_system_tools());
     tools
 }
 
 pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
     let mut tools = default_agent_recall_tools();
+    tools.extend(default_workspace_read_tools());
     tools.extend([
-        AgentToolSpec::new(
-            AgentToolKind::ReadFile,
-            "read_file",
-            "Read a workspace file or one-based line range into model-visible text with a bounded byte budget; prefer line ranges for focused snippets.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::ListFiles,
-            "list_files",
-            "List workspace files and directories with bounded recursion; use this before broad shell commands when discovering workspace structure.",
-            false,
-        ),
-        AgentToolSpec::new(
-            AgentToolKind::SearchFiles,
-            "search",
-            "Search workspace text files for a literal query.",
-            false,
-        ),
         AgentToolSpec::new(
             AgentToolKind::EditFile,
             "edit_file",
@@ -2170,6 +2141,29 @@ pub fn default_coding_agent_tools() -> Vec<AgentToolSpec> {
     tools
 }
 
+fn default_workspace_read_tools() -> Vec<AgentToolSpec> {
+    vec![
+        AgentToolSpec::new(
+            AgentToolKind::ReadFile,
+            "read_file",
+            "Read a workspace file or one-based line range into model-visible text with a bounded byte budget; prefer line ranges for focused snippets.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::ListFiles,
+            "list_files",
+            "List workspace files and directories with bounded recursion; use this before broad shell commands when discovering workspace structure.",
+            false,
+        ),
+        AgentToolSpec::new(
+            AgentToolKind::SearchFiles,
+            "search",
+            "Search workspace text files for a literal query.",
+            false,
+        ),
+    ]
+}
+
 fn default_agent_recall_tools() -> Vec<AgentToolSpec> {
     vec![
         AgentToolSpec::new(
@@ -2203,11 +2197,20 @@ fn main_agent_base_prompt() -> &'static str {
     r#"You are Sinomo, the user-facing main agent.
 
 Operate as a responsive, event-driven agent. Answer directly when the request
-does not need a tool. Use only tools visible in the current request, and use
-read_file, list_files, search, or the configuration tools when they provide
-useful evidence. Keep tool work bounded; if the available tools cannot complete
-the request, explain the concrete limitation instead of promising unavailable
-background or asynchronous work.
+does not need a tool. The main agent has the same workspace inspection,
+editing, command, interactive, discovery, and skill tools as the coding agent
+whenever the conversation has an explicit workspace grant. Use them to
+complete coding and other workspace tasks directly. Commands start at the
+granted workspace root and execute through simple-sandbox; respect its runtime
+policy and do not claim stronger containment than it provides.
+
+Use config_search, config_get, config_set, and cluster_status for Sinomo system
+inspection and configuration. Use tool_search, tool_describe, and tool_call to
+discover and invoke available module, plugin, remote-node, and integration tools
+without bypassing their runtime availability or node-local authority checks.
+Keep tool work bounded; if the available tools cannot complete the request,
+explain the concrete limitation instead of promising unavailable background or
+asynchronous work.
 
 Coding advice, document drafting, image/file reasoning from provided context,
 critique, and role-play should return the actual user-facing result in `text`,

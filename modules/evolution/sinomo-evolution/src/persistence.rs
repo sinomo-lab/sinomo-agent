@@ -2168,7 +2168,7 @@ mod tests {
         let plan = crate::prepare_scheduled_iteration(crate::ScheduledIterationRequest {
             campaign: campaign.clone(),
             task_id: Some(task_id.clone()),
-            intended_paths: vec!["crates/sinomo-evolution/**".to_string()],
+            intended_paths: vec!["modules/evolution/sinomo-evolution/**".to_string()],
             extra_verification_commands: vec!["cargo test -p sinomo-evolution".to_string()],
             dry_run: false,
         })
@@ -2176,7 +2176,7 @@ mod tests {
         let mut record = stored_record_fixture(&root, EvolutionJobStatus::AwaitingApproval);
         record.job.objective = plan.evolution_request.objective.clone();
         record.job.target_ring = campaign.target_ring.clone();
-        record.changed_files = vec!["crates/sinomo-evolution/src/engine.rs".to_string()];
+        record.changed_files = vec!["modules/evolution/sinomo-evolution/src/engine.rs".to_string()];
         record.bundle.scorecard_path = Some(
             root.join("bundle")
                 .join("scorecard.json")

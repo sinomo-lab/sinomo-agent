@@ -237,6 +237,8 @@ pub fn benchmarks_module_descriptor() -> NativeModuleDescriptor {
                 response_body_mode: NativeModuleBodyMode::None,
                 required_local_permissions: Vec::new(),
                 exact_member_identity: false,
+                concurrency_limit: None,
+                timeout_ms: None,
             }],
             capability_exports: vec![
                 SINOMO_BENCHMARKS_OPERATION.to_string(),
@@ -1876,6 +1878,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
             payload_sobj,
+            host_data_dir_root: None,
             cancellation_wait_handle: None,
             request_body: None,
             response_body_path: None,
@@ -1956,6 +1959,7 @@ mod tests {
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_CANCEL_PROBE_OPERATION.to_string(),
             payload_sobj,
+            host_data_dir_root: None,
             cancellation_wait_handle: None,
             request_body: None,
             response_body_path: None,

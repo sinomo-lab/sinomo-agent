@@ -21,6 +21,23 @@ applicable, and audit events. Sinomo self-mutation is the default target when no
 repository is supplied; `sinomo evolve ... --repo <path>` uses the same
 candidate, verification, and evidence lifecycle for another project.
 
+## Runtime Boundary
+
+The implementation is the independently built native-dylib module
+`module.evolution`, located at `modules/evolution/sinomo-evolution`. Its module
+descriptor owns the evolution service interface, app and CLI routes, settings,
+storage identity, imported and exported capabilities, and lifecycle admission.
+The signed default module distribution profile builds and activates it as a
+separate artifact on supported desktop/server platforms.
+
+The `sinomo` binary, daemon/CLI host, and graphical app depend only on the
+serializable evolution contract and generic module clients. They do not link
+`sinomo-evolution`, call its Rust functions, or register a host-side evolution
+service. App operations and `sinomo evolve` cross the authenticated local daemon
+boundary and resolve the active module routes. Missing, disabled, incompatible,
+or failed evolution modules therefore make only evolution unavailable; they do
+not prevent the daemon, chat, or unrelated modules from starting.
+
 ## Design Goals
 
 - Keep Sinomo running while it changes itself.

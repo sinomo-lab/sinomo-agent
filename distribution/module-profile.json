@@ -26,6 +26,20 @@
       "default_enabled": true
     },
     {
+      "module_id": "module.evolution",
+      "interface_version": "sinomo.evolution.v1",
+      "package": "sinomo-evolution",
+      "cache_key": "module/evolution/sinomo-evolution",
+      "library_name": "sinomo_evolution",
+      "source": "rollout:modules/evolution/sinomo-evolution",
+      "platforms": [
+        "linux",
+        "macos",
+        "windows"
+      ],
+      "default_enabled": true
+    },
+    {
       "module_id": "module.sandbox.wasix",
       "interface_version": "1.0.0",
       "package": "sinomo-sandbox-wasix-module",
@@ -59,6 +73,6 @@
       "default_enabled": false
     }
   ],
-  "signer_public_key": "IMK-U9iwPZ5euJ5dSzkt84lfJzWpqT3dAXI_immwL3A",
-  "signature": "local-ed25519:Zmt7EVuIUHjPobXlzIevThJCcGpX9IUTdDeJR_p0145xOVfZyHZ5QDljph9himYFbxzJAupV-lryP3eYdHkFDQ"
+  "signer_public_key": "_BbSqUQuz01cogX-8N5LFt8kkfxdPWlkALuzjZJsNfs",
+  "signature": "local-ed25519:MHM_j4nxx4FVA8ct4mdggDq70fN-aappITIldMtk0VZuwh1ti1hdqsgfdRA4HO0wUQl6etkoUjGJ6HtXjOsiBw"
 }

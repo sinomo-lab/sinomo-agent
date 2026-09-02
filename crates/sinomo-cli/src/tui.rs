@@ -8933,7 +8933,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         if let Some(workspaces) = workspaces {
             candidate.workspace_binding = workspaces.first().cloned();
         }
-        if agent_definition_has_coding_authority(&definition)
+        if agent_definition_has_workspace_mutation_authority(&definition)
             && candidate.workspace_binding.is_none()
             && workspaces.is_none()
             && let Some(workspace_root) = self.workspace_root.as_ref()
@@ -8951,7 +8951,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 });
             }
             candidate.workspace_binding = Some(
-                coding_agent_workspace_binding(data_dir, workspace_root)?
+                mutating_agent_workspace_binding(data_dir, workspace_root)?
                     .binding()
                     .clone(),
             );
@@ -9129,7 +9129,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             })?;
         let requested_workspace_root = if workspaces.is_none()
             && snapshot.workspace_binding.is_none()
-            && agent_definition_has_coding_authority(&self.agent_definition)
+            && agent_definition_has_workspace_mutation_authority(&self.agent_definition)
         {
             self.workspace_root.clone()
         } else {
@@ -9178,33 +9178,34 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             });
         }
 
-        let requested_binding =
-            if conversation_workspaces.is_none() && session.workspace_binding.is_none() {
-                requested_workspace_root
-                    .map(|root| {
-                        let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
-                            path: root.display().to_string(),
-                            detail: format!("workspace directory is unavailable: {source}"),
-                        })?;
-                        if !metadata.is_dir() {
-                            return Err(CliError::Parse {
-                                detail: format!(
-                                    "workspace path is not a directory: {}",
-                                    root.display()
-                                ),
-                            });
-                        }
-                        if agent_definition_has_coding_authority(&self.agent_definition) {
-                            coding_agent_workspace_binding(data_dir, root)
-                        } else {
-                            workspace_ref_for_selected_root(data_dir, root)
-                        }
-                    })
-                    .transpose()?
-                    .map(|workspace| workspace.binding().clone())
-            } else {
-                None
-            };
+        let requested_binding = if conversation_workspaces.is_none()
+            && session.workspace_binding.is_none()
+        {
+            requested_workspace_root
+                .map(|root| {
+                    let metadata = std::fs::metadata(root).map_err(|source| CliError::Io {
+                        path: root.display().to_string(),
+                        detail: format!("workspace directory is unavailable: {source}"),
+                    })?;
+                    if !metadata.is_dir() {
+                        return Err(CliError::Parse {
+                            detail: format!(
+                                "workspace path is not a directory: {}",
+                                root.display()
+                            ),
+                        });
+                    }
+                    if agent_definition_has_workspace_mutation_authority(&self.agent_definition) {
+                        mutating_agent_workspace_binding(data_dir, root)
+                    } else {
+                        workspace_ref_for_selected_root(data_dir, root)
+                    }
+                })
+                .transpose()?
+                .map(|workspace| workspace.binding().clone())
+        } else {
+            None
+        };
         let workspace_bindings = if let Some(conversation_workspaces) = conversation_workspaces {
             conversation_workspaces.to_vec()
         } else if let Some(legacy_workspace) = session.workspace_binding.clone() {
@@ -9284,7 +9285,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             &self.agent_definition,
             Some(session_id),
             sandbox_node_id,
-            agent_definition_has_coding_authority(&self.agent_definition),
+            agent_definition_has_workspace_mutation_authority(&self.agent_definition),
         ) {
             if let Some(previous_root) = previous_workspace_root {
                 self.workspace_root = previous_root;
@@ -9455,14 +9456,14 @@ pub(crate) fn execute_tui_workspace_tool(
 
 #[cfg(test)]
 #[test]
-fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
-    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-coding-authority");
+fn tui_grants_workspace_mutation_to_builtin_main_and_coding_agents() {
+    let root = sinomo_testdir::TestDir::new("sinomo-cli-tui-workspace-mutation-authority");
     let data_dir = SinomoDataDir::new(root.join("data"));
     let mut local_permissions = sinomo_runtime::node::LocalNodePermissions::new();
     local_permissions.set_remote_management_enabled(true);
     sinomo_runtime::node::LocalNodePermissionStore::new(data_dir.root())
         .save(&local_permissions)
-        .expect("grant local host-command permission for the coding-agent fixture");
+        .expect("grant local host-command permission for the workspace-agent fixture");
     let workspace = root.join("workspace");
     fs::create_dir_all(&workspace).expect("create workspace");
     let workspace = fs::canonicalize(workspace).expect("canonical workspace");
@@ -9474,7 +9475,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
         .expect("select coding agent");
     let session = InteractionSession::new(
         SessionId::generate(),
-        NodeId::from_legacy_named("node_tui_coding_authority").expect("node id"),
+        NodeId::from_legacy_named("node_tui_workspace_mutation_authority").expect("node id"),
         InteractionSurface::new("test.tui", InteractionSurfaceKind::CommandLine),
     );
 
@@ -9538,25 +9539,77 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
 
     handler
         .set_agent_definition(AgentDefinition::main())
-        .expect("select non-coding agent");
+        .expect("select main agent");
     handler
         .configure_tui_tool_runtime_for_session(&data_dir, &session, None, None, false)
-        .expect("configure non-coding tools");
+        .expect("configure main-agent tools");
+    let main_write = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        3,
+        "write_file",
+        serde_json::json!({ "path": "main-written.txt", "content": "main\n" }),
+    );
+    let main_patch = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        4,
+        "apply_patch",
+        serde_json::json!({
+            "patch": "*** Begin Patch\n*** Add File: main-patched.txt\n+main-patched\n*** End Patch"
+        }),
+    );
+    let main_command = execute_tui_workspace_tool(
+        &handler,
+        &session,
+        5,
+        "run_command",
+        serde_json::json!({ "command": "printf main-shell > main-shell.txt" }),
+    );
+    assert_eq!(main_write.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(main_patch.status, sinomo_agent::AgentToolStatus::Succeeded);
+    assert_eq!(
+        main_command.status,
+        sinomo_agent::AgentToolStatus::Succeeded
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("main-written.txt")).expect("main-written file"),
+        "main\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("main-patched.txt")).expect("main-patched file"),
+        "main-patched\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("main-shell.txt")).expect("main shell output"),
+        "main-shell"
+    );
+
+    handler
+        .set_agent_definition(AgentDefinition::custom(
+            "custom-main",
+            AgentRole::Main,
+            "Custom main-role agent.",
+        ))
+        .expect("select custom main-role agent");
+    handler
+        .configure_tui_tool_runtime_for_session(&data_dir, &session, None, None, false)
+        .expect("configure custom main-role tools");
     for (call_index, tool, input) in [
         (
-            3,
+            6,
             "write_file",
             serde_json::json!({ "path": "blocked-write.txt", "content": "blocked" }),
         ),
         (
-            4,
+            7,
             "apply_patch",
             serde_json::json!({
                 "patch": "*** Begin Patch\n*** Add File: blocked-patch.txt\n+blocked\n*** End Patch"
             }),
         ),
         (
-            5,
+            8,
             "run_command",
             serde_json::json!({ "command": "printf blocked" }),
         ),
@@ -9565,7 +9618,7 @@ fn tui_grants_workspace_mutation_only_to_the_builtin_coding_agent() {
         assert_eq!(
             outcome.status,
             sinomo_agent::AgentToolStatus::Blocked,
-            "non-coding agent unexpectedly executed {tool}"
+            "custom main-role agent unexpectedly executed {tool}"
         );
     }
 }

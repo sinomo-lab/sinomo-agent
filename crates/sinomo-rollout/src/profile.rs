@@ -278,5 +278,10 @@ mod tests {
         assert_eq!(profile.profile_id, "sinomo-default");
         assert!(profile.modules.iter().any(|module| module.default_enabled));
         assert!(profile.modules.iter().any(|module| !module.default_enabled));
+        assert!(profile.modules.iter().any(|module| {
+            module.module_id == "module.evolution"
+                && module.package == "sinomo-evolution"
+                && module.default_enabled
+        }));
     }
 }

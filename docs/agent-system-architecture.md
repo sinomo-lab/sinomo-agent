@@ -655,7 +655,18 @@ Main-agent defaults:
 - session/task state tracking;
 - local live inference when available;
 - typed background-handoff requests when a dispatcher is available;
-- bounded direct workspace work when visible tools allow it.
+- the same workspace read, edit, command, clarification, tool-discovery, and
+  skill capabilities as the built-in coding agent when the conversation has
+  an explicit workspace grant;
+- local configuration and cluster-health tools, plus discoverable module,
+  integration, and remote-node operations that retain their normal runtime and
+  node-local authority checks.
+
+The built-in main and coding identities are the only ordinary interactive
+packages granted workspace-mutation authority. A custom package does not gain
+that authority merely by declaring the `main` or `deliberation` role or copying
+the same tool names. Background defaults remain workspace-restricted and do not
+inherit the main agent's workspace mutation or generic command tools.
 
 Background-agent defaults:
 
@@ -671,9 +682,11 @@ and handles, not unbounded cluster logs.
 
 ## Self-Evolution Boundary
 
-Self-evolution is outside the agent runtime core. It is an R2 caller that uses
-the generic `Agent` loop with context attachments for evolution jobs, mutation
-packets, candidate bundles, and prior evidence.
+Self-evolution is outside the agent runtime core. The separately built
+`module.evolution` native dylib is an R2 caller that uses the generic `Agent`
+loop with context attachments for evolution jobs, mutation packets, candidate
+bundles, and prior evidence. Agent and daemon host crates do not link the
+evolution implementation.
 
 The agent runtime provides generic evidence: model events, tool calls, tool
 results, patch snapshots, validation records, model metrics, and tool-pair

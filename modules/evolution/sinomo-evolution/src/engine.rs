@@ -3021,7 +3021,7 @@ fn default_iteration_intended_paths(kind: &EvolutionResultKind) -> Vec<String> {
         EvolutionResultKind::RolloutGuard => vec![
             "crates/sinomo-rollout/**".to_string(),
             "crates/sinomo-module/**".to_string(),
-            "crates/sinomo-evolution/**".to_string(),
+            "modules/evolution/sinomo-evolution/**".to_string(),
             "crates/sinomo-cli/**".to_string(),
             "docs/**".to_string(),
         ],
@@ -3029,7 +3029,7 @@ fn default_iteration_intended_paths(kind: &EvolutionResultKind) -> Vec<String> {
         | EvolutionResultKind::FoundationRepair
         | EvolutionResultKind::Patch
         | EvolutionResultKind::Other(_) => vec![
-            "crates/sinomo-evolution/**".to_string(),
+            "modules/evolution/sinomo-evolution/**".to_string(),
             "crates/sinomo-cli/**".to_string(),
             "docs/**".to_string(),
         ],
@@ -7662,7 +7662,11 @@ impl EvolutionProjectKind {
 }
 
 fn project_profile_for_root(source_root: &Path) -> EvolutionProjectProfile {
-    let kind = if source_root.join("crates").join("sinomo-evolution").exists()
+    let kind = if source_root
+        .join("modules")
+        .join("evolution")
+        .join("sinomo-evolution")
+        .exists()
         && source_root
             .join("docs")
             .join("self-evolution-architecture.md")

@@ -293,6 +293,7 @@ mod agent_history;
 pub use agent_history::register_agent_history_search_tool_with_vfs;
 mod chat_activity;
 mod error;
+mod evolution_cli;
 mod help;
 mod media_transport;
 mod providers;
@@ -726,10 +727,8 @@ mod skill_service;
 mod sobj_file_preview;
 pub use agent_management_service::register_hosted_agent_management_service;
 pub use chat_service::register_hosted_chat_service;
-mod evolution_service;
 pub(crate) use commands::*;
 pub(crate) use completion::*;
-pub use evolution_service::register_hosted_evolution_service;
 pub use skill_service::register_hosted_skill_service;
 
 /// Application-host integration for one node-local supervised SIFS mount.
@@ -761,7 +760,6 @@ pub fn hosted_agent_chat_component_factory(
             );
             let services =
                 register_hosted_chat_service(services, daemon_address.clone(), runtime_control);
-            let services = register_hosted_evolution_service(services);
             let services = register_hosted_skill_service(services, daemon_address.clone());
             let services =
                 register_hosted_agent_management_service(services, daemon_address.clone());
@@ -1611,6 +1609,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
         .register(test_cli_command_handler())
         .register(agent_cli_command_handler())
         .register(skill_cli_command_handler())
+        .register(evolution_cli::evolution_cli_command_handler())
         .register(models_cli_command_handler())
         .register(sinomo_runtime::module::module_cli_command_handler(
             module_config,
@@ -4501,15 +4500,16 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
         path: "current directory".to_string(),
         detail: source.to_string(),
     })?;
-    let coding_authority = agent_definition_has_coding_authority(&definition);
+    let workspace_mutation_authority =
+        agent_definition_has_workspace_mutation_authority(&definition);
     let mut _resolved_workspace_root = None;
     let mut _resolved_workspace_binding = None;
-    let (workspace_root, workspace_binding) = if coding_authority {
+    let (workspace_root, workspace_binding) = if workspace_mutation_authority {
         match persisted_session.as_ref() {
             Some(session) => {
                 let binding = session.workspace_binding.as_ref().ok_or_else(|| CliError::Parse {
                     detail: format!(
-                        "coding-agent session `{session_id}` has no workspace binding; refusing a mutation-capable resume because its original workspace cannot be verified"
+                        "mutation-capable agent session `{session_id}` has no workspace binding; refusing resume because its original workspace cannot be verified"
                     ),
                 })?;
                 let resolved =
@@ -4519,7 +4519,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
                 (root, Some(binding.clone()))
             }
             None => {
-                let resolved = coding_agent_workspace_binding(&data_dir, &current_root)?;
+                let resolved = mutating_agent_workspace_binding(&data_dir, &current_root)?;
                 let binding = resolved.binding().clone();
                 _resolved_workspace_binding = Some(resolved);
                 (current_root.clone(), Some(binding))
@@ -4994,7 +4994,7 @@ fn load_or_create_agent_run_session(
                     None => {
                         return Err(CliError::Parse {
                             detail: format!(
-                                "coding-agent session `{}` has no workspace binding; refusing a mutation-capable resume because its original workspace cannot be verified; start a new session without `--session`",
+                                "mutation-capable agent session `{}` has no workspace binding; refusing resume because its original workspace cannot be verified; start a new session without `--session`",
                                 session.session_id
                             ),
                         });
@@ -5032,7 +5032,7 @@ fn load_or_create_agent_run_session(
     }
 }
 
-pub(crate) fn coding_agent_workspace_binding(
+pub(crate) fn mutating_agent_workspace_binding(
     data_dir: &SinomoDataDir,
     workspace_root: &Path,
 ) -> Result<ResolvedWorkspaceBinding, CliError> {
@@ -5200,7 +5200,7 @@ pub(crate) fn local_workspace_binding_root<'a>(
 ) -> Result<&'a Path, CliError> {
     binding.local_root.as_deref().ok_or_else(|| CliError::Parse {
         detail: format!(
-            "coding-agent session `{session_id}` has a non-local workspace binding and cannot be resumed by the local CLI"
+            "agent session `{session_id}` has a non-local workspace binding and cannot be resumed by the local CLI"
         ),
     })
 }
@@ -5282,7 +5282,7 @@ pub(crate) fn agent_tool_registry_for_workspace(
     definition: &AgentDefinition,
     session_id: Option<&SessionId>,
     sandbox_node_id: Option<NodeId>,
-    allow_coding_mutation: bool,
+    allow_workspace_mutation: bool,
 ) -> Result<AgentToolRegistry, CliError> {
     let registry = AgentToolRegistry::new();
     configure_agent_tool_registry_for_workspace(
@@ -5292,7 +5292,7 @@ pub(crate) fn agent_tool_registry_for_workspace(
         definition,
         session_id,
         sandbox_node_id,
-        allow_coding_mutation,
+        allow_workspace_mutation,
     )?;
     Ok(registry)
 }
@@ -5395,7 +5395,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
     definition: &AgentDefinition,
     session_id: Option<&SessionId>,
     sandbox_node_id: Option<NodeId>,
-    allow_coding_mutation: bool,
+    allow_workspace_mutation: bool,
 ) -> Result<(), CliError> {
     let workspace = workspace_ref_for_selected_root(data_dir, workspace_root)?
         .binding()
@@ -5409,7 +5409,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace(
         definition,
         session_id,
         sandbox_node_id,
-        allow_coding_mutation,
+        allow_workspace_mutation,
     )
 }
 
@@ -5422,18 +5422,19 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     definition: &AgentDefinition,
     session_id: Option<&SessionId>,
     sandbox_node_id: Option<NodeId>,
-    allow_coding_mutation: bool,
+    allow_workspace_mutation: bool,
 ) -> Result<(), CliError> {
     let store = main_agent_config_store()?;
     let mut config = LocalWorkspaceAgentConfig::new(workspace_root)
         .with_additional_workspace_roots(resolved_workspace_roots.iter().skip(1).cloned());
     let requested_sandbox_node_id = sandbox_node_id.clone();
-    let coding_authority = agent_definition_has_coding_authority(definition);
+    let workspace_mutation_authority =
+        agent_definition_has_workspace_mutation_authority(definition);
     let workspace_uses_live_mount =
         workspace_root_uses_simple_sandbox_sifs_mount(data_dir, workspace_root)?;
     let needs_live_sifs_mount = session_id.is_some()
         || workspace_uses_live_mount
-        || (allow_coding_mutation && coding_authority);
+        || (allow_workspace_mutation && workspace_mutation_authority);
     let live_sifs_mount = if needs_live_sifs_mount {
         match ensure_simple_sandbox_sifs_mount(data_dir) {
             Ok(mount) => mount,
@@ -5451,7 +5452,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
     } else {
         None
     };
-    if allow_coding_mutation && coding_authority {
+    if allow_workspace_mutation && workspace_mutation_authority {
         for root in resolved_workspace_roots {
             validate_mutating_workspace_root_with_live_mount(
                 data_dir,
@@ -5538,7 +5539,7 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
         }
         let mut mounts = sandbox_mounts_for_workspace_grants(
             workspace_grants,
-            allow_coding_mutation && coding_authority,
+            allow_workspace_mutation && workspace_mutation_authority,
         )?;
         if let Some(home_sifs_path) = config.agent_home_sifs_path.as_ref() {
             mounts.push(sinomo_runtime::sandbox::SandboxMount {
@@ -5905,9 +5906,11 @@ fn workspace_root_uses_simple_sandbox_sifs_mount(
     Ok(workspace_root.starts_with(expected_mount_root))
 }
 
-pub(crate) fn agent_definition_has_coding_authority(definition: &AgentDefinition) -> bool {
+pub(crate) fn agent_definition_has_workspace_mutation_authority(
+    definition: &AgentDefinition,
+) -> bool {
     definition.package.provenance.source == AgentPackageSource::BuiltIn
-        && definition.key() == "coding-agent"
+        && matches!(definition.key(), "main-agent" | "coding-agent")
 }
 
 fn validate_mutating_workspace_root_with_live_mount(
@@ -5917,12 +5920,12 @@ fn validate_mutating_workspace_root_with_live_mount(
 ) -> Result<(), CliError> {
     let workspace_root = absolute_normalized_path(workspace_root)?;
     if workspace_root.parent().is_none() {
-        return Err(unsafe_coding_workspace_error(&workspace_root));
+        return Err(unsafe_mutating_workspace_error(&workspace_root));
     }
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = absolute_normalized_path(Path::new(&home))?;
         if workspace_root == home {
-            return Err(unsafe_coding_workspace_error(&workspace_root));
+            return Err(unsafe_mutating_workspace_error(&workspace_root));
         }
     }
     let data_root = absolute_normalized_path(&data_dir.root())?;
@@ -5933,7 +5936,7 @@ fn validate_mutating_workspace_root_with_live_mount(
     if (workspace_root == data_root || workspace_root.starts_with(&data_root))
         && !is_live_sifs_workspace
     {
-        return Err(unsafe_coding_workspace_error(&workspace_root));
+        return Err(unsafe_mutating_workspace_error(&workspace_root));
     }
     Ok(())
 }
@@ -5953,10 +5956,10 @@ pub(crate) fn absolute_normalized_path(path: &Path) -> Result<PathBuf, CliError>
         })
 }
 
-fn unsafe_coding_workspace_error(workspace_root: &Path) -> CliError {
+fn unsafe_mutating_workspace_error(workspace_root: &Path) -> CliError {
     CliError::Parse {
         detail: format!(
-            "coding-agent mutation is disabled for unsafe workspace root `{}`; run the command from an explicit workspace directory",
+            "agent workspace mutation is disabled for unsafe workspace root `{}`; select an explicit workspace directory",
             workspace_root.display()
         ),
     }

@@ -31,7 +31,6 @@ default-members = [
     "crates/sinomo-dfs-nfs",
     "crates/sinomo-eval",
     "crates/sinomo-events",
-    "crates/sinomo-evolution",
     "crates/sinomo-fusion",
     "crates/sinomo-gateway",
     "crates/sinomo-installer",

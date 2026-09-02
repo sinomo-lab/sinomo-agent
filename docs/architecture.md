@@ -455,6 +455,15 @@ Rust, a native library, a declarative resource, a sandboxed process, or a Wasm
 component. The lifecycle covers identity, compatibility, evaluation,
 activation, observation, replacement, and rollback.
 
+Self-evolution is delivered as the default-enabled `module.evolution` native
+dynamic-library module. Its implementation lives under
+`modules/evolution/sinomo-evolution`, owns its settings, storage identity,
+object-RPC routes, CLI execution, and lifecycle descriptor, and is built and
+rolled out as a separate artifact. The main binary, daemon host, CLI, and app do
+not link the implementation; they retain only the data contract and generic
+module/client machinery. If the module is unavailable, evolution surfaces fail
+closed without affecting agent chat or daemon startup.
+
 Runtime activation is component-based. Every implementation supplies a
 `ComponentDescriptor` with versioned service offers and requirements and is
 materialized through `ComponentFactory`. A mounted `ComponentScope` owns all
