@@ -1594,6 +1594,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         mut job: DfsNamespaceJobRecord,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
+        // The caller may retain an older Running snapshot while the reactive
+        // maintenance owner advances the same durable job. Always begin from
+        // the authoritative row, and never reinterpret a terminal saga as a
+        // fresh source-path mutation after its object was already evicted.
+        if let Some(current) = self.namespace_job(&job.job_id)? {
+            job = current;
+        }
         if job.status != DfsNamespaceJobStatus::Running {
             return Ok(job);
         }
@@ -1727,6 +1734,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     path: format!("{}: unexpected frame {other:?}", job.job_id),
                 }),
             };
+            if let Some(current) = self.namespace_job(&job.job_id)?
+                && current.status != DfsNamespaceJobStatus::Running
+            {
+                return Ok(current);
+            }
             match outcome {
                 Ok(()) => {
                     job.processed_object_count = job.processed_object_count.saturating_add(1);
@@ -1761,6 +1773,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     return Err(error);
                 }
             }
+        }
+        if let Some(current) = self.namespace_job(&job.job_id)?
+            && current.status != DfsNamespaceJobStatus::Running
+        {
+            return Ok(current);
         }
         let now = time::OffsetDateTime::now_utc();
         job.status = DfsNamespaceJobStatus::Completed;

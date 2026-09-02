@@ -12,6 +12,22 @@ use crate::{ComponentDescriptor, ComponentError, StaticComponentFactory};
 pub const SERVICE_CATALOG_PUBLISHER_COMPONENT_ID: &str = "sinomo.cluster.service-catalog-publisher";
 const SERVICE_CATALOG_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SERVICE_CATALOG_RETRY_MAX: Duration = Duration::from_secs(30);
+const SERVICE_CATALOG_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct ServiceCatalogPublisherTiming {
+    publish_timeout: Duration,
+    retry_initial: Duration,
+    retry_max: Duration,
+}
+
+impl ServiceCatalogPublisherTiming {
+    const PRODUCTION: Self = Self {
+        publish_timeout: SERVICE_CATALOG_PUBLISH_TIMEOUT,
+        retry_initial: SERVICE_CATALOG_RETRY_INITIAL,
+        retry_max: SERVICE_CATALOG_RETRY_MAX,
+    };
+}
 
 pub type ServiceCatalogPublishFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
@@ -123,10 +139,25 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
 async fn run_service_catalog_publisher(
     host: Arc<dyn ServiceCatalogPublisherHost>,
     registry: sinomo_core::service::ServiceRegistrySnapshotStore,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    run_service_catalog_publisher_with_timing(
+        host,
+        registry,
+        shutdown,
+        ServiceCatalogPublisherTiming::PRODUCTION,
+    )
+    .await;
+}
+
+async fn run_service_catalog_publisher_with_timing(
+    host: Arc<dyn ServiceCatalogPublisherHost>,
+    registry: sinomo_core::service::ServiceRegistrySnapshotStore,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    timing: ServiceCatalogPublisherTiming,
 ) {
     let mut versions = registry.subscribe_versions();
-    let mut retry = SERVICE_CATALOG_RETRY_INITIAL;
+    let mut retry = timing.retry_initial;
     if registry.active_snapshot().version() == 1 {
         tokio::select! {
             changed = versions.changed() => {
@@ -147,9 +178,21 @@ async fn run_service_catalog_publisher(
             break;
         }
         let snapshot = registry.active_snapshot();
-        match host.publish(snapshot.clone()).await {
+        let publication = match tokio::time::timeout(
+            timing.publish_timeout,
+            host.publish(snapshot.clone()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(format!(
+                "component service catalog publication exceeded its {}ms attempt timeout",
+                timing.publish_timeout.as_millis()
+            )),
+        };
+        match publication {
             Ok(()) => {
-                retry = SERVICE_CATALOG_RETRY_INITIAL;
+                retry = timing.retry_initial;
                 tracing::debug!(
                     version = snapshot.version(),
                     "published component service catalog generation"
@@ -176,14 +219,14 @@ async fn run_service_catalog_publisher(
                 );
                 tokio::select! {
                     _ = tokio::time::sleep(retry) => {
-                        retry = retry.saturating_mul(2).min(SERVICE_CATALOG_RETRY_MAX);
+                        retry = retry.saturating_mul(2).min(timing.retry_max);
                     }
                     changed = versions.changed() => {
                         if changed.is_err() {
                             break;
                         }
                         let _ = versions.borrow_and_update();
-                        retry = SERVICE_CATALOG_RETRY_INITIAL;
+                        retry = timing.retry_initial;
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() {
@@ -210,6 +253,23 @@ mod tests {
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    struct HangingOnceHost(AtomicUsize);
+
+    impl ServiceCatalogPublisherHost for HangingOnceHost {
+        fn publish<'a>(
+            &'a self,
+            _snapshot: Arc<ServiceRegistrySnapshot>,
+        ) -> ServiceCatalogPublishFuture<'a> {
+            Box::pin(async move {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    std::future::pending::<()>().await;
+                }
                 Ok(())
             })
         }
@@ -272,6 +332,37 @@ mod tests {
             1,
             "an unchanged service generation must remain parked"
         );
+
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher task");
+    }
+
+    #[tokio::test]
+    async fn timed_out_publication_is_cancelled_and_retried() {
+        let host = Arc::new(HangingOnceHost(AtomicUsize::new(0)));
+        let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(run_service_catalog_publisher_with_timing(
+            host.clone(),
+            registry.clone(),
+            shutdown_rx,
+            ServiceCatalogPublisherTiming {
+                publish_timeout: Duration::from_millis(10),
+                retry_initial: Duration::from_millis(1),
+                retry_max: Duration::from_millis(2),
+            },
+        ));
+        registry
+            .replace_registry(sinomo_core::service::ServiceRegistry::default())
+            .expect("publish reconciled registry");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.0.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("publisher retried after cancelling the stuck attempt");
 
         shutdown_tx.send_replace(true);
         task.await.expect("publisher task");

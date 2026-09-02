@@ -517,6 +517,11 @@ pub struct NetworkedDfsService<T> {
     /// so the request admission must remain pending rather than recording a
     /// contradictory terminal rejection.
     pub(crate) active_durable_namespace_prepare_recorded: bool,
+    /// Set once the active request owns a durable running or completed
+    /// namespace job. A later coordination/sync error cannot prove the
+    /// operation did not apply; exact replay must resume or reconcile that job
+    /// before the outer request becomes terminal.
+    pub(crate) active_durable_namespace_job_recorded: bool,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,

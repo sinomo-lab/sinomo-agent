@@ -1105,7 +1105,12 @@ const DAEMON_DFS_METADATA_HISTORY_GC_RECORD_TRIGGER: u64 = 10_000;
 const DAEMON_DFS_METADATA_HISTORY_GC_BYTES_TRIGGER: u64 = 64 * 1024 * 1024;
 const DAEMON_DFS_METADATA_AUTHORITY_PREFIX: &str = "/dfs/filesystems/";
 const DAEMON_DFS_METADATA_PUBLISH_MAX_RETRY_ROUNDS: usize = 3;
-const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+// A dirty durable journal lane can outlive the route/authority generation
+// which first rejected it. Source-change notifications are the fast path, but
+// a missed projection edge must not park replica catch-up for the complete
+// five-minute placement-handoff window. Complete lanes remain fully idle;
+// only a retained failed lane performs this sparse safety reprobe.
+const DAEMON_DFS_METADATA_PUBLISH_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_INITIAL: Duration = Duration::from_secs(1);
 const DAEMON_DFS_METADATA_DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(60);
 const DAEMON_DFS_SMOKE_TIMEOUT: Duration = Duration::from_millis(9_500);

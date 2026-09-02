@@ -494,6 +494,68 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
     }
 
+    /// Rename under a caller-owned durable operation identity.
+    ///
+    /// A caller retrying after an ambiguous transport result must reuse this
+    /// exact id. The source metadata authority binds it to the rename command
+    /// and replays the canonical terminal result instead of attempting a
+    /// second rename after the source has already become a tombstone.
+    pub fn posix_rename_with_operation_id(
+        &mut self,
+        from: &str,
+        to: &str,
+        operation_id: &str,
+    ) -> Result<DfsStat> {
+        crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
+        let normalized_from = normalize_posix_path(from)?;
+        let normalized_to = normalize_posix_path(to)?;
+        let operation = DfsNamespaceOperation::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+        };
+        let mut primaries = self
+            .routed_namespace_primaries_for_paths_fresh([
+                normalized_from.as_str(),
+                normalized_to.as_str(),
+            ])?
+            .into_iter();
+        let from_primary = primaries.next().unwrap_or(None);
+        let to_primary = primaries.next().unwrap_or(None);
+        match (from_primary, to_primary) {
+            (None, None) if self.control_plane.is_some() => {
+                self.execute_local_primary_namespace_operation_with_request_id(
+                    operation_id.to_string(),
+                    operation,
+                )?;
+                self.stat_routed_namespace_result(&normalized_to, true)
+            }
+            (None, None) => self.posix_rename_local(from, to),
+            (None, Some(_)) => {
+                // This node owns the source side and coordinates the
+                // cross-shard move itself through durable admission.
+                self.execute_local_primary_namespace_operation_with_request_id(
+                    operation_id.to_string(),
+                    operation,
+                )?;
+                self.stat_routed_namespace_result(&normalized_to, true)
+            }
+            (Some(source_primary), to_primary) => {
+                // The source-side shard primary coordinates; it adopts the
+                // record into the destination shard when that lives
+                // elsewhere.
+                self.route_namespace_operation_with_request_id(
+                    operation_id.to_string(),
+                    source_primary.clone(),
+                    operation,
+                )?;
+                if to_primary.is_some_and(|to_primary| to_primary != source_primary) {
+                    self.sync_remote_namespace_path(&normalized_to)?;
+                }
+                self.stat_routed_namespace_result(&normalized_to, true)
+            }
+        }
+    }
+
     /// Rename under exact source and destination generation fences.
     ///
     /// The current cross-shard adoption protocol cannot atomically carry a

@@ -9,19 +9,20 @@ use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DaemonDfsInspectionRequest, DaemonDfsInspectionResponse,
     DfsControlPlaneKvClient, DfsControlPlaneStore, DfsError, DfsFileSystemConfig,
     DfsMetadataJournalReplicationOptions, DfsMetadataJournalReplicationReport,
-    DfsMetadataShardConfig, DfsNodeAdvertisement, DfsNodeTransport, DfsObjectKind,
-    DfsObjectRpcSendOptions, DfsOperatorObjectView, DfsOperatorStatus, DfsPeerTransport,
-    DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode,
+    DfsMetadataShardConfig, DfsNamespaceOperation, DfsNodeAdvertisement, DfsNodeTransport,
+    DfsObjectKind, DfsObjectRpcSendOptions, DfsOperatorObjectView, DfsOperatorStatus,
+    DfsPeerTransport, DfsPeerTransportError, DfsPeerTransportFuture, DfsPinAddRequest, DfsPinMode,
     DfsPlacementBlockingDiagnostic, DfsPlacementImpact, DfsPlacementNodePreview,
     DfsPlacementNodeReachability, DfsPlacementPolicy, DfsPlacementPreview,
     DfsPlacementPreviewToken, DfsPlacementReconciliationActivityCursor,
     DfsPlacementReconciliationActivityPage, DfsPlacementReconciliationActivityStatus,
     DfsPlacementReconciliationJob, DfsPlacementReconciliationState, DfsPlacementScope,
     DfsPosixCreateAttrs, DfsPosixDistributedFilePrefixReadOutcome,
-    DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy, DfsStat,
-    DfsWriteOptions, LocalContentStore, NetworkedDfsService, content_services_prefix,
-    default_dfs_metadata_root, default_dfs_metadata_shards_root, default_dfs_pin_root,
-    discovered_cluster_dfs_peer_node_ids, fallback_dfs_node_id, metadata_shards_prefix,
+    DfsPosixDistributedFileReadOutcome, DfsPosixError, DfsResolvedPlacementPolicy,
+    DfsStableNamespaceOperationReconciliation, DfsStat, DfsWriteOptions, LocalContentStore,
+    NetworkedDfsService, content_services_prefix, default_dfs_metadata_root,
+    default_dfs_metadata_shards_root, default_dfs_pin_root, discovered_cluster_dfs_peer_node_ids,
+    fallback_dfs_node_id, metadata_shards_prefix,
     open_cluster_aware_dfs_metadata_backend_for_inspection,
     open_cluster_aware_dfs_metadata_backend_for_inspection_with_topology,
     open_local_sharded_metadata_backend_for_replica_repair, open_root_local_metadata_backend,
@@ -338,6 +339,7 @@ impl SifsFileManagerObservation {
         self.node_id.to_string()
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata_shard_for_path(
         &self,
         path: &str,
@@ -351,6 +353,32 @@ impl SifsFileManagerObservation {
         DfsControlPlaneStore::new(&mut kv)
             .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
             .map_err(|error| format!("cannot read SIFS metadata shard for {path}: {error}"))
+    }
+
+    pub(crate) fn metadata_shard_for_path_at_authority(
+        &self,
+        path: &str,
+        authority: &SinomoTestAuthoritativeClusterSnapshot,
+    ) -> Result<Option<DfsMetadataShardConfig>, String> {
+        let path = normalize_sifs_path(path)?;
+        let cluster_paths = ClusterPaths::new(&self.data_dir);
+        let expected_source = cluster_paths.kv_paths().snapshot;
+        if authority.source() != expected_source {
+            return Err(format!(
+                "SIFS observation authority source {} does not match local cluster snapshot {}",
+                authority.source().display(),
+                expected_source.display()
+            ));
+        }
+        let mut kv = SifsSnapshotControlPlaneKvClient::from_validated_snapshot(
+            &cluster_paths,
+            authority.snapshot(),
+        );
+        DfsControlPlaneStore::new(&mut kv)
+            .select_metadata_shard_for_path_strict_default_sifs_split(&sifs_file_system_id(), &path)
+            .map_err(|error| {
+                format!("cannot read authoritative SIFS metadata shard for {path}: {error}")
+            })
     }
 
     pub(crate) fn object_by_path(
@@ -1408,6 +1436,57 @@ impl SifsFileManagerBackend {
         deadline: Instant,
     ) -> Result<(), String> {
         self.rename_with_operation_deadline(from, to, Some(deadline))
+    }
+
+    pub(crate) fn rename_with_operation_id_and_deadline(
+        &self,
+        from: &str,
+        to: &str,
+        operation_id: &str,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let from = normalize_sifs_path(from)?;
+        let to = normalize_sifs_path(to)?;
+        self.run_namespace_mutation_with_deadline(Some(deadline), "SIFS rename", |service| {
+            service
+                .posix_rename_with_operation_id(&from, &to, operation_id)
+                .map(|_| ())
+                .map_err(|error| format!("cannot rename SIFS item {from} to {to}: {error}"))
+        })
+    }
+
+    pub(crate) fn reconcile_rename_with_operation_id_and_deadline(
+        &self,
+        from: &str,
+        to: &str,
+        operation_id: &str,
+        deadline: Instant,
+    ) -> Result<DfsStableNamespaceOperationReconciliation, String> {
+        let from = normalize_sifs_path(from)?;
+        let to = normalize_sifs_path(to)?;
+        let operation_deadline = Some(deadline);
+        sifs_operation_remaining(operation_deadline, "SIFS rename reconciliation")?;
+        let mut service = self.lock_service_with_deadline(operation_deadline)?;
+        let previous_deadline = service.set_transport_operation_deadline(Some(deadline));
+        let result = (|| {
+            self.refresh_service_peer_targets_with_deadline(&mut service, operation_deadline);
+            sifs_operation_remaining(operation_deadline, "refreshing SIFS peer targets")?;
+            service
+                .reconcile_stable_namespace_operation(
+                    operation_id,
+                    &DfsNamespaceOperation::Rename {
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                )
+                .map_err(|error| {
+                    format!(
+                        "cannot reconcile SIFS rename {from} to {to} under operation {operation_id}: DFS error: {error}"
+                    )
+                })
+        })();
+        service.set_transport_operation_deadline(previous_deadline);
+        result
     }
 
     pub(crate) fn delete_file_with_deadline(
@@ -2950,10 +3029,22 @@ enum SifsKvReadPlan<T> {
 }
 
 impl SifsSnapshotControlPlaneKvClient {
+    #[cfg(test)]
     fn new(cluster_paths: &ClusterPaths) -> Self {
         Self {
             cluster_paths: cluster_paths.clone(),
             snapshot: Arc::new(Mutex::new(SifsKvSnapshotCache::default())),
+        }
+    }
+
+    fn from_validated_snapshot(cluster_paths: &ClusterPaths, snapshot: Arc<KvSnapshot>) -> Self {
+        Self {
+            cluster_paths: cluster_paths.clone(),
+            snapshot: Arc::new(Mutex::new(SifsKvSnapshotCache {
+                loaded: true,
+                snapshot: Some(snapshot),
+                ..SifsKvSnapshotCache::default()
+            })),
         }
     }
 
@@ -6147,6 +6238,83 @@ mod tests {
             metadata_journal_heads(&data_dir, &shards),
             before,
             "layout, invariant, and path observations must not append metadata"
+        );
+    }
+
+    #[test]
+    fn sifs_observation_uses_invocation_authority_over_stale_materialized_topology() {
+        let root = temp_sifs_data_dir("observation-authoritative-topology");
+        let data_dir = SinomoDataDir::new(&root);
+        let shards = seed_observation_cluster(&data_dir);
+        let cluster_paths = ClusterPaths::new(&data_dir);
+        let materialized = read_sifs_materialized_cluster_kv_snapshot(&cluster_paths)
+            .expect("read materialized snapshot")
+            .expect("materialized snapshot");
+        let mut authoritative = materialized.as_ref().clone();
+        let mut current_users = shards
+            .iter()
+            .find(|shard| shard.shard_id == "users")
+            .expect("users shard")
+            .clone();
+        current_users.epoch = 9;
+        current_users.primary_node_id =
+            NodeId::from_legacy_named("node_sifs_observation_current_users").expect("current node");
+        let users_key = sinomo_runtime::dfs::metadata_shard_key(
+            &current_users.file_system_id,
+            &current_users.shard_id,
+        );
+        let KvOp::Put { value, .. } =
+            KvOp::put_serde(&users_key, &current_users, None).expect("encode current users shard")
+        else {
+            unreachable!("put_serde constructs a put operation")
+        };
+        let revision = KvRevision(authoritative.revision.0.saturating_add(1));
+        let users_entry = authoritative
+            .entries
+            .iter_mut()
+            .find(|entry| entry.key == users_key)
+            .expect("materialized users entry");
+        users_entry.value = value;
+        users_entry.modify_revision = revision;
+        users_entry.version = sinomo_runtime::kv::KvVersion(users_entry.version.0 + 1);
+        authoritative.revision = revision;
+        authoritative.canonicalize();
+        let token = sinomo_runtime::test::SinomoTestContext::new(&root)
+            .try_with_authoritative_cluster_snapshot(
+                sinomo_runtime::kv::KvAuthoritativeRead {
+                    value: authoritative,
+                    authority: sinomo_runtime::kv::KvAuthorityProof {
+                        term: 4,
+                        commit_index: revision.0.saturating_add(10),
+                        revision,
+                        basis: sinomo_runtime::kv::KvAuthorityBasis::CurrentTermQuorum {
+                            voter_acks: 1,
+                            required_quorum: 1,
+                        },
+                    },
+                },
+                cluster_paths.kv_paths().snapshot.clone(),
+            )
+            .expect("valid authoritative context")
+            .authoritative_cluster_snapshot()
+            .expect("authoritative token");
+
+        let observation = SifsFileManagerObservation::open(&data_dir).expect("observation");
+        assert_eq!(
+            observation
+                .metadata_shard_for_path("/users/layout-probe")
+                .expect("materialized users shard")
+                .expect("materialized users assignment")
+                .epoch,
+            1,
+            "the fixture must retain the stale observational checkpoint"
+        );
+        assert_eq!(
+            observation
+                .metadata_shard_for_path_at_authority("/users/layout-probe", &token)
+                .expect("authoritative users shard")
+                .expect("authoritative users assignment"),
+            current_users
         );
     }
 

@@ -1201,6 +1201,7 @@ fn dfs_metadata_publish_retry_class(
         matches!(
             outcome,
             DfsMetadataJournalReplicationOutcome::Failed { .. }
+                | DfsMetadataJournalReplicationOutcome::Rejected { .. }
                 | DfsMetadataJournalReplicationOutcome::CursorDurabilityInconsistencyUnhealed { .. }
         )
     }) {
@@ -1778,6 +1779,19 @@ mod publish_scheduler_tests {
         }
     }
 
+    fn rejected_publish_report() -> DfsMetadataJournalReplicationReport {
+        DfsMetadataJournalReplicationReport {
+            outcomes: vec![DfsMetadataJournalReplicationOutcome::Rejected {
+                target_node_id: NodeId::from_legacy_named(
+                    "node_metadata_publish_scheduler_rejected",
+                )
+                .expect("target node"),
+                shard_id: DfsMetadataShardId::new("services"),
+                reason: "metadata journal batch has no local shard config".to_string(),
+            }],
+        }
+    }
+
     fn backlog_publish_report() -> DfsMetadataJournalReplicationReport {
         let target_node_id = NodeId::from_legacy_named("node_metadata_publish_scheduler_backlog")
             .expect("target node");
@@ -1864,6 +1878,11 @@ mod publish_scheduler_tests {
         assert_eq!(
             dfs_metadata_publish_retry_class(&failed_publish_report()),
             DfsMetadataPublishRetryClass::Failed
+        );
+        assert_eq!(
+            dfs_metadata_publish_retry_class(&rejected_publish_report()),
+            DfsMetadataPublishRetryClass::Failed,
+            "a receiver which is still hydrating must remain under bounded retry"
         );
         assert_eq!(
             dfs_metadata_publish_retry_class(&stalled_backlog_publish_report()),
@@ -4407,6 +4426,10 @@ fn dfs_metadata_replication_suppression_for<'a>(
         record.target_node_id == *target_node_id
             && record.shard_id == *shard_id
             && record.shard_epoch == shard_epoch
+            // Older versions persisted transient receiver-startup failures as
+            // epoch-long suppressions. Revalidate the reason so those records
+            // cannot strand a restarted replica after upgrading.
+            && metadata_replication_rejection_is_topology_mismatch(&record.reason)
     })
 }
 
@@ -10640,12 +10663,15 @@ pub(crate) fn metadata_journal_rejection_allows_snapshot_repair(reason: &str) ->
 }
 
 pub(crate) fn metadata_replication_rejection_is_topology_mismatch(reason: &str) -> bool {
-    reason.contains("metadata journal batch has no local shard config")
-        || reason.contains("metadata snapshot install has no local shard config")
-        || reason.contains("is not configured as a replica for metadata shard")
-        || (reason.contains("metadata journal source")
-            && reason.contains("is not shard")
-            && reason.contains("primary"))
+    // Missing/not-yet-configured replica state is expected while a member is
+    // restarting and hydrating its authoritative shard projection. Persisting
+    // that response for the entire shard epoch permanently suppresses catch-up
+    // even after the receiver is healthy. Only an exact primary-authority
+    // disagreement is terminal for this topology generation; receiver startup
+    // rejections remain ordinary retryable failures.
+    (reason.contains("metadata journal source")
+        && reason.contains("is not shard")
+        && reason.contains("primary"))
         || (reason.contains("metadata snapshot source")
             && reason.contains("is not shard")
             && reason.contains("primary"))

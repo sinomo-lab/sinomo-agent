@@ -2250,6 +2250,7 @@ fn metadata_publish_discovery_uses_applied_topology_ahead_of_materialized_snapsh
     let discovery_runtime = runtime.handle().clone();
     let discovery = runtime.spawn(async move {
         daemon_dfs_metadata_publish_discovery_lanes_boxed_async(
+            &data_dir,
             &discovery_cluster_paths,
             &discovery_runtime,
         )
@@ -10931,6 +10932,129 @@ fn metadata_authority_change_schedules_inherited_local_primary_backlog() {
         daemon_dfs_metadata_publish_lane_request_count(&data_dir, &lane) > initial_requests,
         "the authority edge must publish an inherited journal without another DFS mutation"
     );
+}
+
+#[test]
+fn metadata_authority_discovery_rolls_resident_generation_without_publish_lanes() {
+    let root = temp_root("daemon-dfs-authority-idle-resident-rollover");
+    let data_root = root.join("data");
+    let data_dir = SinomoDataDir::new(&data_root);
+    data_dir.ensure_root_layout().expect("data dir");
+    let cluster_paths = ClusterPaths::new(&data_dir);
+    let local = NodeId::from_legacy_named("node_dfs_idle_rollover_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_dfs_idle_rollover_remote").expect("remote");
+    write_test_cluster_state(&data_root, &local);
+    let file_system = distributed_sifs(local.clone());
+    let mut shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: "root".to_string(),
+        primary_node_id: remote,
+        replica_node_ids: Vec::new(),
+        epoch: 1,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    append_cluster_raft_command(
+        &cluster_paths,
+        &local,
+        sinomo_core::kv::KvCommand::Txn(sinomo_core::kv::KvTxn {
+            compares: Vec::new(),
+            success: vec![
+                sinomo_core::kv::KvOp::put_serde(
+                    file_system_config_key(&file_system.file_system_id),
+                    &DfsFileSystemConfig::from(&file_system),
+                    None,
+                )
+                .expect("filesystem config op"),
+                sinomo_core::kv::KvOp::put_serde(
+                    metadata_shard_key(&file_system.file_system_id, "root"),
+                    &shard,
+                    None,
+                )
+                .expect("remote-primary shard op"),
+            ],
+            failure: Vec::new(),
+        }),
+    )
+    .expect("initial remote-only authority");
+
+    let runtime = daemon_test_runtime("daemon-dfs-authority-idle-resident-rollover");
+    let paths = DaemonPaths::new(&data_dir);
+    let control_owner =
+        Arc::new(DaemonDataOwnerLock::acquire(&paths).expect("data-owner capability"));
+    register_daemon_dfs_data_owner_lock(&paths, &control_owner)
+        .expect("register data-owner capability");
+
+    assert!(
+        runtime
+            .block_on(daemon_dfs_metadata_publish_discovery_lanes_boxed_async(
+                &data_dir,
+                &cluster_paths,
+                runtime.handle(),
+            ))
+            .expect("initial remote-only discovery")
+            .is_empty(),
+        "a node with no primary assignment must have no publish lane"
+    );
+    let peer_snapshot = read_daemon_dfs_message_peer_snapshot(&cluster_paths)
+        .expect("peer snapshot")
+        .expect("clustered peer snapshot");
+    daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot)
+        .expect("initial idle resident generation");
+    let authority = daemon_dfs_metadata_authority_generation_for_identity(
+        &cluster_paths,
+        &peer_snapshot.cluster_id,
+        &local,
+        Some(runtime.handle()),
+    )
+    .expect("metadata authority");
+    let initial_generation = authority.generation();
+
+    shard.epoch = shard.epoch.saturating_add(1);
+    append_cluster_raft_command(
+        &cluster_paths,
+        &local,
+        sinomo_core::kv::KvCommand::Op(
+            sinomo_core::kv::KvOp::put_serde(
+                metadata_shard_key(&file_system.file_system_id, "root"),
+                &shard,
+                None,
+            )
+            .expect("advanced remote-primary shard op"),
+        ),
+    )
+    .expect("advance remote-only authority");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while authority.generation() == initial_generation && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(authority.generation() > initial_generation);
+
+    assert!(
+        runtime
+            .block_on(daemon_dfs_metadata_publish_discovery_lanes_boxed_async(
+                &data_dir,
+                &cluster_paths,
+                runtime.handle(),
+            ))
+            .expect("advanced remote-only discovery")
+            .is_empty()
+    );
+    let resident = daemon_dfs_bounded_status_resident(&data_dir, &peer_snapshot)
+        .expect("idle resident generation rolled forward");
+    assert!(resident.bounded_status_snapshot().is_ok());
+    let cache = daemon_dfs_message_service_cache()
+        .lock()
+        .expect("message cache");
+    let entry = cache.get(&data_dir.root()).expect("resident cache entry");
+    assert_eq!(
+        entry.signature.metadata_authority_generation,
+        authority.generation()
+    );
+    assert!(entry.signature.metadata_authority_generation > initial_generation);
+    drop(cache);
+    assert!(evict_daemon_dfs_message_service_cache(&data_dir).expect("evict message cache"));
 }
 
 #[test]

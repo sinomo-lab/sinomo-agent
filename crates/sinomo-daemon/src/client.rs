@@ -706,6 +706,14 @@ async fn send_daemon_rpc_call_to_endpoint_with_options_and_connectivity_async(
         detail: "routed endpoint RPC requires a local cluster state".to_string(),
     })?;
     let state = sinomo_core::cluster::read_cluster_state_cached(&paths)?;
+    if endpoint_is_local_loopback(&state, endpoint) {
+        // Loopback endpoint records are host-relative. They name the local
+        // main daemon for sibling processes such as the shadow supervisor and
+        // must use the explicit local carrier path: routed endpoint dispatch
+        // treats source == target as a non-edge and would otherwise publish a
+        // bogus self-connectivity failure into cluster KV.
+        return send_daemon_rpc_call_async(&endpoint.address, call, options, runtime).await;
+    }
     let mut host =
         DaemonObjectRpcAsyncHost::new(runtime, observe_connectivity).with_cluster_paths(&paths);
     let mut client = sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &paths);
@@ -713,6 +721,15 @@ async fn send_daemon_rpc_call_to_endpoint_with_options_and_connectivity_async(
         .call_endpoint(&state, endpoint, call, options)
         .await
         .map_err(Into::into)
+}
+
+fn endpoint_is_local_loopback(
+    state: &sinomo_core::ClusterBootstrapState,
+    endpoint: &ClusterEndpointRecord,
+) -> bool {
+    endpoint.node_id == state.local_node_id
+        && endpoint.transport == sinomo_core::ClusterTransportKind::Loopback
+        && sinomo_core::network::is_loopback_connect_address(&endpoint.address)
 }
 
 pub async fn send_object_rpc_call_to_target_async_with_options(
@@ -2064,6 +2081,58 @@ mod tests {
     use sinomo_core::network::ClusterEndpointId;
     use sinomo_core::network::ObjectRpcRequest;
     use std::time::Duration;
+
+    #[test]
+    fn only_the_local_nodes_loopback_endpoint_uses_local_dispatch() {
+        let cluster_id =
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_local_loopback_dispatch")
+                .expect("cluster id");
+        let local_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_local_loopback_dispatch")
+                .expect("local node");
+        let remote_node =
+            sinomo_core::node::NodeId::from_legacy_named("node_remote_loopback_dispatch")
+                .expect("remote node");
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            cluster_id,
+            "local loopback dispatch",
+            local_node.clone(),
+            "local",
+            "pk-local",
+            time::OffsetDateTime::now_utc(),
+        );
+        let endpoint = |node_id, transport, address: &str| ClusterEndpointRecord {
+            endpoint_id: ClusterEndpointId::generate(),
+            node_id,
+            transport,
+            address: address.to_string(),
+            source: ClusterEndpointSource::Static,
+            privacy: ClusterEndpointPrivacy::LocalOnly,
+            priority: 0,
+            last_observed_latency_ms: None,
+        };
+
+        assert!(super::endpoint_is_local_loopback(
+            &state,
+            &endpoint(
+                local_node.clone(),
+                ClusterTransportKind::Loopback,
+                "127.0.0.1:21353",
+            ),
+        ));
+        assert!(!super::endpoint_is_local_loopback(
+            &state,
+            &endpoint(
+                remote_node,
+                ClusterTransportKind::Loopback,
+                "127.0.0.1:21353",
+            ),
+        ));
+        assert!(!super::endpoint_is_local_loopback(
+            &state,
+            &endpoint(local_node, ClusterTransportKind::LanTcp, "127.0.0.1:21353",),
+        ));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cluster_node_target_uses_explicit_local_main_service_path() {

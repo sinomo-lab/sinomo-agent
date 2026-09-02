@@ -64,12 +64,16 @@ mod tests {
         });
 
         assert!(
-            !namespace_execution_must_remain_pending(&error, false),
+            !namespace_execution_must_remain_pending(&error, false, false),
             "an ordinary deterministic distributed rejection remains terminal"
         );
         assert!(
-            namespace_execution_must_remain_pending(&error, true),
+            namespace_execution_must_remain_pending(&error, true, false),
             "once a hidden request-owned prepare is durable, recovery—not a contradictory rejection—owns the terminal result"
+        );
+        assert!(
+            namespace_execution_must_remain_pending(&error, false, true),
+            "once a request-owned namespace job is durable, its recovery owns the terminal result"
         );
     }
 
@@ -1019,8 +1023,11 @@ fn namespace_execution_error_is_retriable(error: &posix_model::DfsPosixError) ->
 fn namespace_execution_must_remain_pending(
     error: &posix_model::DfsPosixError,
     durable_prepare_recorded: bool,
+    durable_job_recorded: bool,
 ) -> bool {
-    durable_prepare_recorded || namespace_execution_error_is_retriable(error)
+    durable_prepare_recorded
+        || durable_job_recorded
+        || namespace_execution_error_is_retriable(error)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -2334,6 +2341,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             }
                             durable_execute => {
                                 self.active_durable_namespace_prepare_recorded = false;
+                                self.active_durable_namespace_job_recorded = false;
                                 let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {
                                         DurableNamespaceRequestAdmission::Execute {
@@ -2496,13 +2504,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 );
                                 let durable_prepare_recorded =
                                     self.active_durable_namespace_prepare_recorded;
+                                let durable_job_recorded =
+                                    self.active_durable_namespace_job_recorded;
                                 self.active_durable_namespace_request = None;
                                 self.active_durable_namespace_prepare_recorded = false;
+                                self.active_durable_namespace_job_recorded = false;
                                 trace_execute_ms = execute_started.elapsed().as_millis();
                                 let retryable_error = outcome.as_ref().err().is_some_and(|error| {
                                     namespace_execution_must_remain_pending(
                                         error,
                                         durable_prepare_recorded,
+                                        durable_job_recorded,
                                     )
                                 });
                                 if retryable_error

@@ -85,6 +85,7 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             pending_namespace_request_recovery_cursor: None,
             active_durable_namespace_request: None,
             active_durable_namespace_prepare_recorded: false,
+            active_durable_namespace_job_recorded: false,
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: Default::default(),
             last_events: Vec::new(),
@@ -546,6 +547,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             && self.active_namespace_operation_context.is_none()
             && self.active_durable_namespace_request.is_none()
             && !self.active_durable_namespace_prepare_recorded
+            && !self.active_durable_namespace_job_recorded
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
     }
@@ -799,6 +801,9 @@ mod projection_release_tests {
         service.active_durable_namespace_prepare_recorded = true;
         assert!(!service.can_release_hydrated_metadata_projection());
         service.active_durable_namespace_prepare_recorded = false;
+        service.active_durable_namespace_job_recorded = true;
+        assert!(!service.can_release_hydrated_metadata_projection());
+        service.active_durable_namespace_job_recorded = false;
         assert!(service.can_release_hydrated_metadata_projection());
 
         service.pending_namespace_request_recovery_cursor =

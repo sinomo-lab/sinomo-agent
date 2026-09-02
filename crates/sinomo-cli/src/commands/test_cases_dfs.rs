@@ -71,7 +71,8 @@ use sinomo_runtime::dfs::{
     DfsMetadataNamespacePrepareCodec, DfsNetworkMessage, DfsObjectId, DfsOperatorRepairView,
     DfsOperatorStatus, DfsPlacementPolicy, DfsPlacementReconciliationState, DfsPlacementScope,
     DfsReadData, DfsReadResponse, DfsReadResult, DfsRoutedMessage, DfsRpcAttachmentDescriptor,
-    DfsStageBlobCommand, DfsVersion, SIFS_FILE_SYSTEM_ID,
+    DfsStableNamespaceOperationReconciliation, DfsStageBlobCommand, DfsVersion,
+    SIFS_FILE_SYSTEM_ID,
 };
 use sinomo_runtime::local::SinomoDataDir;
 use sinomo_runtime::network::{self, ClusterPaths, ObjectRpcRequest};
@@ -88,6 +89,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_EXPECT_TIMEOUT_SECONDS: u64 = 30;
+const RENAME_ATTEMPT_MAX: Duration = Duration::from_secs(60);
 const DEFAULT_PLACEMENT_EXPECT_TIMEOUT_SECONDS: u64 = 180;
 const DEFAULT_ROUTED_STATUS_TIMEOUT_MS: u64 = 5_000;
 const MAX_ROUTED_STATUS_CONCURRENCY: usize = 16;
@@ -421,7 +423,7 @@ sinomo_runtime::test::sinomo_test_case! {
         id: "cluster.dfs.shard-layout",
         summary: "Resolve the live root, services, and users metadata-shard primaries and prepare codecs",
         tags: ["cluster-dfs", "probe", "performance"],
-        requirements: [SinomoTestRequirement::ClusterRuntime],
+        requirements: [SinomoTestRequirement::ClusterRuntime, SinomoTestRequirement::ClusterKvSnapshot],
         run: {
             run_shard_layout(ctx)
         }
@@ -1525,12 +1527,17 @@ fn run_shard_layout(ctx: &mut SinomoTestContext) -> SinomoTestResult {
         optional_usize_parameter(ctx, "expected-distinct-primary-count", 0)?;
     let expected_namespace_prepare_codec =
         optional_namespace_prepare_codec_parameter(ctx, "expected-namespace-prepare-codec")?;
+    let authority = ctx.authoritative_cluster_snapshot().ok_or_else(|| {
+        SinomoTestError::failed(
+            "live SIFS shard layout requires one invocation-scoped authoritative cluster snapshot",
+        )
+    })?;
     let backend = open_observation(ctx)?;
     let node = backend.node_label();
     let mut layouts = Vec::with_capacity(PROBES.len());
     for (lane, base_prefix, candidate_path) in PROBES {
         let shard = backend
-            .metadata_shard_for_path(candidate_path)
+            .metadata_shard_for_path_at_authority(candidate_path, &authority)
             .map_err(SinomoTestError::failed)?
             .ok_or_else(|| {
                 SinomoTestError::failed(format!(
@@ -4574,12 +4581,76 @@ fn run_rename(ctx: &mut SinomoTestContext) -> SinomoTestResult {
     let deadline = started + timeout;
     let backend = open_backend_until(ctx, deadline)?;
     let node = backend.node_label();
+    let operation_id = format!(
+        "cluster.dfs.rename:{}",
+        blake3::hash(format!("{from}\0{to}").as_bytes()).to_hex()
+    );
+    let mut reconcile_before_attempt = false;
+    let mut retry_metrics = DfsMutationRetryMetrics::default();
     loop {
-        match backend.rename_with_deadline(&from, &to, deadline) {
+        let now = Instant::now();
+        let attempt_budget = deadline
+            .saturating_duration_since(now)
+            .div_f64(2.0)
+            .min(RENAME_ATTEMPT_MAX);
+        let attempt_deadline = (now + attempt_budget).min(deadline);
+        if reconcile_before_attempt {
+            match backend.reconcile_rename_with_operation_id_and_deadline(
+                &from,
+                &to,
+                &operation_id,
+                attempt_deadline,
+            ) {
+                Ok(DfsStableNamespaceOperationReconciliation::Applied { .. }) => {
+                    ctx.record("node", &node);
+                    ctx.record("from", &from);
+                    ctx.record("to", &to);
+                    ctx.record("operation_id", &operation_id);
+                    ctx.record("retry_count", retry_metrics.retry_count);
+                    ctx.record("retry_reasons", &retry_metrics.retry_reasons);
+                    ctx.record("reconciled", true);
+                    ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
+                    return Ok(SinomoTestOutcome::passed(format!(
+                        "reconciled durable rename {from} to {to} on node {node} after {}ms",
+                        started.elapsed().as_millis()
+                    )));
+                }
+                Ok(DfsStableNamespaceOperationReconciliation::NotApplied)
+                | Ok(DfsStableNamespaceOperationReconciliation::AmbiguousOrExpired { .. }) => {}
+                Ok(DfsStableNamespaceOperationReconciliation::Conflict { reason }) => {
+                    return Err(SinomoTestError::failed(format!(
+                        "rename operation {operation_id} conflicts with durable history: {reason}"
+                    )));
+                }
+                Err(error) if is_retryable_rename_error(&error) => {
+                    retry_metrics.record_retry(&error);
+                    if Instant::now() >= deadline {
+                        ctx.record("last_state", &error);
+                        return Ok(SinomoTestOutcome::failed(format!(
+                            "rename {from} to {to} on node {node} could not reconcile within {}s: {error}",
+                            timeout.as_secs()
+                        )));
+                    }
+                    std::thread::sleep(EXPECT_POLL_INTERVAL);
+                    continue;
+                }
+                Err(error) => return Err(SinomoTestError::failed(error)),
+            }
+        }
+        match backend.rename_with_operation_id_and_deadline(
+            &from,
+            &to,
+            &operation_id,
+            attempt_deadline,
+        ) {
             Ok(()) => {
                 ctx.record("node", &node);
                 ctx.record("from", &from);
                 ctx.record("to", &to);
+                ctx.record("operation_id", &operation_id);
+                ctx.record("retry_count", retry_metrics.retry_count);
+                ctx.record("retry_reasons", &retry_metrics.retry_reasons);
+                ctx.record("reconciled", false);
                 ctx.record("elapsed_ms", started.elapsed().as_millis() as u64);
                 return Ok(SinomoTestOutcome::passed(format!(
                     "renamed {from} to {to} on node {node} after {}ms",
@@ -4587,10 +4658,15 @@ fn run_rename(ctx: &mut SinomoTestContext) -> SinomoTestResult {
                 )));
             }
             Err(error) if is_retryable_rename_error(&error) => {
+                retry_metrics.record_retry(&error);
+                reconcile_before_attempt = true;
                 if Instant::now() >= deadline {
                     ctx.record("node", &node);
                     ctx.record("from", &from);
                     ctx.record("to", &to);
+                    ctx.record("operation_id", &operation_id);
+                    ctx.record("retry_count", retry_metrics.retry_count);
+                    ctx.record("retry_reasons", &retry_metrics.retry_reasons);
                     ctx.record("last_state", &error);
                     return Ok(SinomoTestOutcome::failed(format!(
                         "rename {from} to {to} on node {node} did not complete within {}s: {error}",
@@ -6501,6 +6577,7 @@ fn dfs_stat_reports_path_present<T>(path: &str, stat: Result<T, String>) -> Resu
 fn is_retryable_rename_error(error: &str) -> bool {
     error.contains("moving between metadata shards")
         || error.contains("retry the operation")
+        || error.contains("SIFS operation deadline expired during SIFS rename")
         || error.contains("metadata shard config incomplete")
         || is_retryable_dfs_probe_error(error)
 }
@@ -6512,7 +6589,9 @@ fn is_retryable_dfs_probe_error(error: &str) -> bool {
         || error.contains("write did not commit yet")
         || (error.contains("DFS error: network error") && error.contains("timed out"))
         || (error.contains("DFS error: network delivery PossiblyApplied")
-            && (error.contains("timed out") || error.contains("network retries exhausted")))
+            && (error.contains("timed out")
+                || error.contains("network timeout")
+                || error.contains("network retries exhausted")))
         || (error.contains("metadata serialization error")
             && (error.contains("invalid magic") || error.contains("unexpected end of input")))
 }
@@ -6593,6 +6672,13 @@ mod tests {
         assert!(is_retryable_rename_error(
             "DFS error: network error: DFS metadata authority advanced after async preflight of \
              generation 2"
+        ));
+        assert!(is_retryable_rename_error(
+            "SIFS operation deadline expired during SIFS rename"
+        ));
+        assert!(is_retryable_rename_error(
+            "DFS error: network delivery PossiblyApplied: daemon network request failed \
+             (PossiblyApplied): network timeout during local object RPC in Overall"
         ));
     }
 

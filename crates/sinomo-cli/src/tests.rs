@@ -9977,7 +9977,7 @@ fn daemon_auth_only_accepts_active_signed_join_invites() {
 }
 
 #[test]
-fn daemon_authorization_restricts_admin_and_local_commands() {
+fn daemon_static_authorization_restricts_core_and_defers_component_routes() {
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
             sinomo_runtime::daemon::DAEMON_STATUS_ROUTE,
@@ -10111,7 +10111,8 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_local",
             "pk_local"
         ))
-        .is_ok()
+        .is_err(),
+        "component routes must be authorized by their live registry descriptor"
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10129,7 +10130,8 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_local",
             "pk_local"
         ))
-        .is_ok()
+        .is_err(),
+        "component routes must be authorized by their live registry descriptor"
     );
     for route in [
         sinomo_runtime::sandbox::SANDBOX_CREATE_ROUTE,
@@ -10171,8 +10173,8 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
                 "node_local",
                 "pk_local"
             ))
-            .is_ok(),
-            "local signer should be authorized for {route}"
+            .is_err(),
+            "static authorization must defer component route {route} to the live registry"
         );
     }
     assert!(
@@ -10191,7 +10193,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_local",
             "pk_local"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10209,7 +10211,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_local",
             "pk_local"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10227,7 +10229,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_voter",
             "pk_voter"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10245,7 +10247,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_voter",
             "pk_voter"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10254,7 +10256,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_voter",
             "pk_voter"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -10272,7 +10274,7 @@ fn daemon_authorization_restricts_admin_and_local_commands() {
             "node_local",
             "pk_local"
         ))
-        .is_ok()
+        .is_err()
     );
     assert!(
         super::authorize_authenticated_daemon_command(&authenticated_test_command(
@@ -11365,7 +11367,11 @@ fn daemon_sandbox_http_fetch_to_file_audits_transport_failure_in_sifs() {
     )
     .expect_err("broken server should fail after policy");
     server.join().expect("server");
-    assert!(format!("{error:?}").contains("sandbox mediated http"));
+    assert!(matches!(
+        error,
+        sinomo_runtime::sandbox::SandboxBackendError::Other(ref detail)
+            if detail.contains("sandbox network transport error")
+    ));
 
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");
@@ -12011,7 +12017,12 @@ fn daemon_sandbox_write_to_read_only_mount_emits_denial_events() {
         },
     )
     .expect_err("read-only mount write denied");
-    assert!(format!("{error:?}").contains("read-only"));
+    assert!(matches!(
+        error,
+        sinomo_runtime::sandbox::SandboxBackendError::Fs(
+            sinomo_runtime::sandbox::SandboxFsError::ReadOnly { ref path }
+        ) if path == &sinomo_runtime::sandbox::SandboxPath::new("/host/out.txt").expect("path")
+    ));
 
     let dfs =
         super::daemon_open_daemon_sandbox_dfs_service(&daemon_paths).expect("reopen dfs service");

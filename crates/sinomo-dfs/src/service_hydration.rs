@@ -331,6 +331,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.active_namespace_operation_context = None;
         self.active_durable_namespace_request = None;
         self.active_durable_namespace_prepare_recorded = false;
+        self.active_durable_namespace_job_recorded = false;
         self.routed_namespace_settle_depth = 0;
         self.restore_durable_intent_counter_floor()
     }

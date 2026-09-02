@@ -80,26 +80,36 @@ pub fn base_component_catalog(
     data_dir: &SinomoDataDir,
     profile: ProductComponentProfile,
 ) -> Result<ComponentCatalog, ComponentCatalogError> {
+    // Catalog-owned lifecycle contributions use the same canonical component
+    // identity as factories projected from module registrations. Legacy names
+    // remain a CLI/config compatibility surface; using them as catalog keys
+    // prevents factory-presence checks and hot-unload cleanup from matching the
+    // owning component.
+    let build_component_id = sinomo_runtime::build::build_module_id().to_string();
+    let dfs_component_id = sinomo_runtime::dfs::dfs_module_id().to_string();
+    let observe_component_id = sinomo_runtime::observe::observe_module_id().to_string();
+    let rollout_component_id = sinomo_runtime::rollout::rollout_module_id().to_string();
+    let sandbox_component_id = sinomo_runtime::sandbox::sandbox_module_id().to_string();
     let mut builder = ComponentCatalog::builder()
         .register_native_request_preparer(Arc::new(RemoteManagementRequestPreparer))?
         .register_storage_contributor(
-            sinomo_runtime::build::SINOMO_BUILD_MODULE_LEGACY_ID,
+            build_component_id,
             sinomo_runtime::build::register_storage_paths,
         )?
         .register_storage_contributor(
-            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
+            dfs_component_id.clone(),
             sinomo_runtime::dfs::register_storage_paths,
         )?
         .register_storage_contributor(
-            sinomo_runtime::observe::SINOMO_OBSERVE_MODULE_LEGACY_ID,
+            observe_component_id,
             sinomo_runtime::observe::register_storage_paths,
         )?
         .register_storage_contributor(
-            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            rollout_component_id.clone(),
             sinomo_runtime::rollout::register_storage_paths,
         )?
         .register_storage_contributor(
-            sinomo_runtime::sandbox::SINOMO_SANDBOX_MODULE_LEGACY_ID,
+            sandbox_component_id,
             sinomo_runtime::sandbox::register_storage_paths,
         )?
         .register_storage_contributor(
@@ -107,21 +117,18 @@ pub fn base_component_catalog(
             sinomo_runtime::registry::register_storage_paths,
         )?
         .register_status_contributor(
-            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            rollout_component_id.clone(),
             sinomo_runtime::rollout_host::daemon_status_projection,
         )?
         .register_startup_contributor(
-            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            rollout_component_id.clone(),
             sinomo_runtime::rollout_host::recover_startup_state,
         )?
         .register_maintenance_inhibitor(
-            sinomo_runtime::rollout::SINOMO_ROLLOUT_MODULE_LEGACY_ID,
+            rollout_component_id,
             sinomo_runtime::rollout_host::maintenance_inhibited,
         )?
-        .register_migration_contributor(
-            sinomo_runtime::dfs::SINOMO_DFS_MODULE_LEGACY_ID,
-            dfs_migration_contribution,
-        )?;
+        .register_migration_contributor(dfs_component_id, dfs_migration_contribution)?;
     builder =
         builder.register_module(sinomo_runtime::network_module::network_module_registration())?;
     builder = register_module_factory(
@@ -410,6 +417,24 @@ mod tests {
         assert_eq!(main.status_contributors().len(), 1);
         assert_eq!(main.maintenance_inhibitors().len(), 1);
         assert_eq!(main.migration_contributors().len(), 1);
+    }
+
+    #[test]
+    fn main_profile_storage_layout_registers_each_component_path_once() {
+        let root = std::env::temp_dir().join(format!(
+            "sinomo-product-storage-profile-{}",
+            sinomo_runtime::core::Id::generate()
+        ));
+        let data_dir = SinomoDataDir::new(&root);
+        let catalog = base_component_catalog(&data_dir, ProductComponentProfile::main(true))
+            .expect("main profile");
+
+        let layout = sinomo_runtime::storage::sinomo_data_dir_layout_with_catalog(&catalog)
+            .expect("compose product storage layout");
+
+        assert!(layout.owner_for("build/jobs/example/status.sobj").is_some());
+        assert!(layout.owner_for("dfs/metadata").is_some());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

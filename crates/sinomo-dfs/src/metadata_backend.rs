@@ -10275,6 +10275,29 @@ impl DfsMetadataBackend for LocalSobjMetadataBackend {
                 )
                 .map(drop);
         }
+        if let Some(existing) = self.tables.namespace_jobs.get(&job.job_id) {
+            if existing == job {
+                return Ok(());
+            }
+            if existing.status != DfsNamespaceJobStatus::Running {
+                let same_identity = existing.file_system_id == job.file_system_id
+                    && existing.origin == job.origin
+                    && existing.kind == job.kind
+                    && existing.root_path == job.root_path
+                    && existing.target_path == job.target_path
+                    && existing.created_at == job.created_at;
+                if same_identity && job.status == DfsNamespaceJobStatus::Running {
+                    // Another runner already made the same durable saga
+                    // terminal. A stale in-memory frame must not resurrect it;
+                    // the caller will reload the canonical terminal record.
+                    return Ok(());
+                }
+                return Err(MetadataBackendError::Serde(format!(
+                    "namespace job {} cannot replace terminal state {:?} with {:?}",
+                    job.job_id, existing.status, job.status
+                )));
+            }
+        }
         if !self.tables.namespace_jobs.contains_key(&job.job_id)
             && self
                 .tables
@@ -30167,6 +30190,45 @@ mod tests {
                 .expect("bounded reopened versions")
                 .len(),
             1
+        );
+
+        cleanup(&root);
+    }
+
+    #[test]
+    fn namespace_job_terminal_state_rejects_stale_runner_regression() {
+        let root = temp_root("namespace-job-terminal-monotonic");
+        let shard_id = DfsMetadataShardId::new("root");
+        let running = namespace_job(91, "/users/terminal-monotonic");
+        let mut completed = running.clone();
+        completed.status = DfsNamespaceJobStatus::Completed;
+        completed.processed_object_count = 1;
+        completed.updated_at += time::Duration::seconds(1);
+        completed.completed_at = Some(completed.updated_at);
+
+        let mut backend = LocalSobjMetadataBackend::new(shard_id, &root).expect("metadata backend");
+        backend.put_file_system(&file_system()).expect("filesystem");
+        backend.put_namespace_job(&running).expect("running job");
+        backend.put_namespace_job(&completed).expect("complete job");
+        backend
+            .put_namespace_job(&running)
+            .expect("stale running retry is an idempotent no-op");
+        assert_eq!(
+            backend
+                .get_namespace_job(&completed.job_id)
+                .expect("terminal job lookup"),
+            Some(completed.clone())
+        );
+
+        let mut conflicting_terminal = completed;
+        conflicting_terminal.status = DfsNamespaceJobStatus::Failed;
+        conflicting_terminal.failure_reason = Some("stale runner failure".to_string());
+        assert!(
+            backend
+                .put_namespace_job(&conflicting_terminal)
+                .expect_err("one terminal outcome cannot replace another")
+                .to_string()
+                .contains("cannot replace terminal state")
         );
 
         cleanup(&root);

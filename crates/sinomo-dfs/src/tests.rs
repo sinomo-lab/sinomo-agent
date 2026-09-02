@@ -11391,7 +11391,7 @@ fn metadata_journal_publisher_routes_primary_shards_and_reports_non_primary() {
 }
 
 #[test]
-fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
+fn metadata_journal_publish_suppresses_proven_primary_mismatch_for_epoch() {
     let root = temp_root("metadata-journal-publish-suppresses-topology-mismatch");
     let local = NodeId::from_legacy_named("node_meta_suppress_local").expect("local");
     let replica = NodeId::from_legacy_named("node_meta_suppress_replica").expect("replica");
@@ -11411,8 +11411,10 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
         target_node_id: replica.clone(),
         shard_id: shard_id.clone(),
         shard_epoch: 7,
-        reason: "local node node_meta_suppress_replica is not configured as a replica for metadata shard root"
-            .to_string(),
+        reason: format!(
+            "metadata journal source {local} is not shard root primary {}",
+            NodeId::from_legacy_named("node_meta_suppress_other_primary").expect("other primary")
+        ),
         updated_at_unix_nanos: dfs_now_unix_nanos(),
     };
     let mut host = RecordingMetadataJournalPublisherHost::new(root.join("suppressed"));
@@ -11472,6 +11474,63 @@ fn metadata_journal_publish_suppresses_proven_topology_mismatch_for_epoch() {
             after_sequence: 0,
         }]
     );
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn metadata_journal_publish_retries_legacy_transient_replica_suppression() {
+    let root = temp_root("metadata-journal-publish-retries-transient-suppression");
+    let local = NodeId::from_legacy_named("node_meta_retry_local").expect("local");
+    let replica = NodeId::from_legacy_named("node_meta_retry_replica").expect("replica");
+    let shard_id = DfsMetadataShardId::new("root");
+    let file_system = file_system(local.clone());
+    let shard = DfsMetadataShardConfig {
+        file_system_id: file_system.file_system_id.clone(),
+        shard_id: shard_id.0.clone(),
+        primary_node_id: local.clone(),
+        replica_node_ids: vec![replica.clone()],
+        epoch: 7,
+        assignment: DfsMetadataShardAssignment::Root,
+        namespace_prepare_codec: Default::default(),
+        default_policy: DfsObjectPolicy::ReplicatedEventual,
+    };
+    let suppression = DfsMetadataReplicationSuppressionRecord {
+        target_node_id: replica.clone(),
+        shard_id: shard_id.clone(),
+        shard_epoch: 7,
+        reason: "metadata journal batch has no local shard config".to_string(),
+        updated_at_unix_nanos: dfs_now_unix_nanos(),
+    };
+    let mut host = RecordingMetadataJournalPublisherHost::new(root.join("transient"));
+
+    let (outcomes, targets) = prepare_dfs_metadata_journal_publish_with_host(
+        file_system.file_system_id,
+        &local,
+        vec![shard],
+        &mut host,
+        &[suppression],
+        DfsMetadataJournalReplicationOptions::default(),
+    )
+    .expect("prepare transiently rejected replica");
+
+    assert!(targets.is_empty());
+    assert_eq!(
+        host.cursor_requests,
+        vec![(replica.clone(), shard_id.clone())],
+        "a stale suppression from a receiver startup race must be ignored"
+    );
+    assert_eq!(
+        outcomes,
+        vec![DfsMetadataJournalReplicationOutcome::NoChanges {
+            target_node_id: replica,
+            shard_id,
+            after_sequence: 0,
+        }]
+    );
+    assert!(!metadata_replication_rejection_is_topology_mismatch(
+        "local node replica is not configured as a replica for metadata shard root"
+    ));
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -45375,6 +45434,62 @@ fn sifs_cluster_posix_rename_across_shard_primaries_moves_object_transactionally
 }
 
 #[test]
+fn sifs_cluster_cross_shard_rename_replays_caller_owned_operation_id() {
+    let cluster = sifs_two_primary_cluster("sifs-xshard-stable-rename-replay");
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = cluster;
+    let source_path = "/users/stable-replay-source.txt";
+    let target_path = "/services/stable-replay-target.txt";
+    let operation_id = "dfs_test_cross_shard_stable_rename";
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_stop = Arc::clone(&stop);
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+
+    replica
+        .posix_write_file(
+            source_path,
+            b"stable cross-shard rename replay",
+            DfsWriteOptions::replicated_eventual(vec![replica_node]),
+        )
+        .expect("create stable-rename source");
+    let first = replica
+        .posix_rename_with_operation_id(source_path, target_path, operation_id)
+        .expect("first stable cross-shard rename");
+    let replay = replica
+        .posix_rename_with_operation_id(source_path, target_path, operation_id)
+        .expect("replay stable cross-shard rename");
+
+    assert_eq!(replay.object_id, first.object_id);
+    assert_eq!(replay.version, first.version);
+    assert_eq!(
+        replica
+            .posix_read_file(target_path)
+            .expect("target remains readable after exact replay"),
+        b"stable cross-shard rename replay"
+    );
+    assert!(matches!(
+        replica.posix_stat(source_path),
+        Err(DfsPosixError::NotFound { .. })
+    ));
+
+    stop.store(true, Ordering::SeqCst);
+    users_thread.join().expect("users service thread");
+    services_thread.join().expect("services service thread");
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
 fn sifs_cluster_posix_cross_shard_rename_preserves_durable_version_pin() {
     let cluster = sifs_two_primary_cluster("sifs-xshard-pinned-rename");
     let SifsTwoPrimaryCluster {
@@ -46955,6 +47070,19 @@ fn sifs_cluster_posix_cross_shard_rename_pending_replay_reconciles_completed_job
         Some(DfsNamespaceJobOrigin::from_request(&pending_request)),
         "new cross-shard sagas must retain the exact durable request identity"
     );
+    let mut stale_runner_job = parked_job.clone();
+    for frame in &mut stale_runner_job.pending_frames {
+        if let DfsNamespaceJobFrame::CrossShardAdopt { moved_object, .. } = frame {
+            moved_object.object_id =
+                DfsObjectId::from_legacy_named("object_stale_completed_saga_runner")
+                    .expect("stale object id");
+        }
+    }
+    let terminal_replay = cluster
+        .users_primary
+        .run_cross_shard_namespace_job(stale_runner_job, 512)
+        .expect("stale runner reloads terminal job before executing old frames");
+    assert_eq!(terminal_replay, completed_job);
     let gc_report = cluster
         .users_primary
         .metadata_backend

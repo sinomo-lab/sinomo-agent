@@ -377,6 +377,15 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 metadata_replica_progress: false,
                 metadata_materialization: false,
             });
+            if job.status != DfsNamespaceJobStatus::Failed
+                && job.origin.as_ref().is_some_and(|origin| {
+                    self.active_durable_namespace_request
+                        .as_ref()
+                        .is_some_and(|request| origin.matches_request(request))
+                })
+            {
+                self.active_durable_namespace_job_recorded = true;
+            }
         }
         if namespace_job_kind_is_cross_shard(&job.kind) {
             // The locally durable running record is already an authority

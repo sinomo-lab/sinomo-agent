@@ -320,6 +320,7 @@ pub(super) fn schedule_daemon_dfs_replica_materialization_on_runtime(
 /// lane discovery has consumed the exact proof; concurrent callers join its
 /// single bounded ReadIndex and are woken by the refresh-owner guard.
 pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
+    data_dir: &SinomoDataDir,
     cluster_paths: &ClusterPaths,
     runtime: &tokio::runtime::Handle,
 ) -> Result<Vec<DaemonDfsMutationLaneKey>, String> {
@@ -343,7 +344,78 @@ pub(super) async fn daemon_dfs_metadata_publish_discovery_lanes_async(
                 preflight.generation
             )
         })?;
-    sinomo_dfs::metadata_publish_lanes_from_authority(&state.local_node_id, &authoritative)
+    let lanes =
+        sinomo_dfs::metadata_publish_lanes_from_authority(&state.local_node_id, &authoritative)?;
+    if lanes.is_empty() {
+        let peer_snapshot = read_daemon_dfs_message_peer_snapshot(cluster_paths)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "DFS metadata lanes lack a cluster peer snapshot".to_string())?;
+        ensure_daemon_dfs_idle_resident_generation_after_preflight(
+            data_dir.clone(),
+            cluster_paths.clone(),
+            peer_snapshot,
+            preflight,
+            runtime.clone(),
+        )
+        .await?;
+    }
+    Ok(lanes)
+}
+
+/// Keep a node with no local-primary publish lanes on the current resident
+/// metadata generation. Without this authority-edge rollover, a node omitted
+/// from every shard placement can retain its startup generation forever:
+/// neither a primary publisher nor replica ingress exists to take the global
+/// admission that replaces the stale cache entry.
+async fn ensure_daemon_dfs_idle_resident_generation_after_preflight(
+    data_dir: SinomoDataDir,
+    cluster_paths: ClusterPaths,
+    peer_snapshot: DaemonDfsMessagePeerSnapshot,
+    preflight: DaemonDfsMetadataAuthorityPreflight,
+    runtime: tokio::runtime::Handle,
+) -> Result<(), String> {
+    let already_current = {
+        let cache = daemon_dfs_message_service_cache()
+            .lock()
+            .map_err(|_| "DFS metadata resident cache is poisoned".to_string())?;
+        cache.get(&data_dir.root()).is_some_and(|entry| {
+            entry.signature.cluster_id == peer_snapshot.cluster_id
+                && entry.signature.local_node_id == peer_snapshot.local_node_id
+                && entry.signature.metadata_authority_generation == preflight.generation
+                && Arc::ptr_eq(&entry.metadata_authority_generation, &preflight.authority)
+                && entry.resident_metadata_initialized
+                && entry.resident_metadata_backend.is_some()
+        })
+    };
+    if already_current {
+        return Ok(());
+    }
+
+    let data_owner_lock = DaemonDfsControlPlaneKvClient::discover_data_owner_lock(&cluster_paths)
+        .ok_or_else(|| {
+        "DFS metadata idle-generation rollover lacks the live data-owner capability".to_string()
+    })?;
+    let mutation_scheduler =
+        daemon_dfs_mutation_scheduler(&data_dir).map_err(|error| error.to_string())?;
+    let admission = mutation_scheduler
+        .admit(&DfsMessageExecutionScope::GlobalExclusive)
+        .await
+        .map_err(|error| format!("DFS metadata idle-generation admission failed: {error}"))?;
+    tokio::task::spawn_blocking(move || {
+        let _admission = admission;
+        let _data_owner_lock = data_owner_lock;
+        daemon_dfs_resident_metadata_backend_after_preflight(
+            &data_dir,
+            &cluster_paths,
+            &peer_snapshot,
+            &preflight,
+            &runtime,
+        )
+        .map(drop)
+        .map_err(|error| format!("DFS metadata idle-generation rollover failed: {error}"))
+    })
+    .await
+    .map_err(|error| format!("DFS metadata idle-generation task failed: {error}"))?
 }
 
 pub(super) type DaemonDfsMetadataPublishDiscoveryFuture<'a> = std::pin::Pin<
@@ -360,10 +432,12 @@ pub(super) type DaemonDfsMetadataPublishDiscoveryFuture<'a> = std::pin::Pin<
 /// worker. Dynamic dispatch here bounds the scheduler's poll frame while the
 /// future state itself remains owned by the task.
 pub(super) fn daemon_dfs_metadata_publish_discovery_lanes_boxed_async<'a>(
+    data_dir: &'a SinomoDataDir,
     cluster_paths: &'a ClusterPaths,
     runtime: &'a tokio::runtime::Handle,
 ) -> DaemonDfsMetadataPublishDiscoveryFuture<'a> {
     Box::pin(daemon_dfs_metadata_publish_discovery_lanes_async(
+        data_dir,
         cluster_paths,
         runtime,
     ))
@@ -463,6 +537,7 @@ pub(super) fn schedule_daemon_dfs_metadata_publish_discovery_on_runtime(
             let runtime = publish_runtime.clone();
             async move {
                 let discovered = daemon_dfs_metadata_publish_discovery_lanes_boxed_async(
+                    &data_dir,
                     &cluster_paths,
                     &runtime,
                 )
