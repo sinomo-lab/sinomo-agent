@@ -138,16 +138,16 @@ impl NativeLibrary {
 }
 
 pub struct NativeModule {
-    _library: Library,
+    library: Option<Library>,
     descriptor: NativeModuleDescriptor,
     invoke: SinomoModuleInvokeFn,
     shutdown: Option<SinomoModuleShutdownFn>,
     free_buffer: SinomoModuleFreeBufferFn,
-    callbacks: Box<NativeModuleHostCallbackState>,
+    callbacks: Option<Box<NativeModuleHostCallbackState>>,
     // Native dylibs store the host API in process-global module state. Hold a
     // per-library owned permit until shutdown and unload complete so two
     // handles cannot overwrite each other's callback user_data pointers.
-    _lifecycle_permit: NativeModuleLifecyclePermit,
+    lifecycle_permit: Option<NativeModuleLifecyclePermit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -362,13 +362,13 @@ impl NativeModule {
         }
 
         Ok(Self {
-            _library: library,
+            library: Some(library),
             descriptor,
             invoke,
             shutdown: Some(shutdown),
             free_buffer,
-            callbacks,
-            _lifecycle_permit: lifecycle_permit,
+            callbacks: Some(callbacks),
+            lifecycle_permit: Some(lifecycle_permit),
         })
     }
 
@@ -514,7 +514,11 @@ impl NativeModule {
     ) -> Result<NativeModuleResponse, NativeModuleHostError> {
         let request_bytes = encode_sobj(request)
             .map_err(|source| NativeModuleHostError::Object(source.to_string()))?;
-        let _guard = self.callbacks.set_callbacks(callbacks)?;
+        let _guard = self
+            .callbacks
+            .as_ref()
+            .expect("loaded native module callback state")
+            .set_callbacks(callbacks)?;
         let mut response_buffer = SinomoModuleByteBuffer::null();
         let status = unsafe {
             (self.invoke)(
@@ -544,6 +548,14 @@ impl NativeModule {
     /// best-effort unload.
     pub fn unload(mut self) -> NativeModuleUnloadReport {
         let mut report = self.shutdown_module("explicit unload");
+        if !report.shutdown_ok {
+            self.quarantine_after_failed_shutdown();
+            drop(self);
+            report
+                .detail
+                .push_str("; executable mapping quarantined until process exit");
+            return report;
+        }
         drop(self);
         report.library_handle_released = true;
         report
@@ -561,10 +573,13 @@ impl NativeModule {
                 library_handle_released: false,
             };
         };
-        if let Ok(mut callbacks) = self.callbacks.callbacks.lock() {
+        let status = unsafe { shutdown() };
+        if status == SINOMO_MODULE_STATUS_OK
+            && let Some(callback_state) = self.callbacks.as_ref()
+            && let Ok(mut callbacks) = callback_state.callbacks.lock()
+        {
             *callbacks = None;
         }
-        let status = unsafe { shutdown() };
         NativeModuleUnloadReport {
             module_id: self.descriptor.module_id.clone(),
             interface_version: self.descriptor.interface_version.clone(),
@@ -579,11 +594,26 @@ impl NativeModule {
             library_handle_released: false,
         }
     }
+
+    fn quarantine_after_failed_shutdown(&mut self) {
+        if let Some(library) = self.library.take() {
+            std::mem::forget(library);
+        }
+        if let Some(callbacks) = self.callbacks.take() {
+            std::mem::forget(callbacks);
+        }
+        if let Some(permit) = self.lifecycle_permit.take() {
+            std::mem::forget(permit);
+        }
+    }
 }
 
 impl Drop for NativeModule {
     fn drop(&mut self) {
-        let _ = self.shutdown_module("drop");
+        let report = self.shutdown_module("drop");
+        if !report.shutdown_ok {
+            self.quarantine_after_failed_shutdown();
+        }
     }
 }
 

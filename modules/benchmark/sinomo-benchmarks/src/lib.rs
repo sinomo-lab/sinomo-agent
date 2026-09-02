@@ -14,8 +14,8 @@ use sinomo_pytorch::{MINICPM_DEFAULT_MODEL, PytorchDevice, PytorchRuntimeConfig}
 use sinomo_runtime::module_api::{
     ComponentDescriptor, NativeModuleBackend, NativeModuleBodyMode,
     NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
-    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleObjectRpcRoute,
-    NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
+    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleLifecycle,
+    NativeModuleObjectRpcRoute, NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
     SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
     SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
     SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
@@ -44,6 +44,7 @@ struct StoredHostApi {
 }
 
 static MODULE_HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
+static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct BenchmarkHarnessPlan {
@@ -956,13 +957,22 @@ pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModul
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
-    if let Ok(mut stored) = MODULE_HOST_API.lock() {
-        *stored = Some(StoredHostApi {
-            user_data: host.user_data as usize,
-            is_cancelled: host.is_cancelled,
-        });
+    if !MODULE_LIFECYCLE.initialize() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
     }
-    SINOMO_MODULE_STATUS_OK
+    match MODULE_HOST_API.lock() {
+        Ok(mut stored) => {
+            *stored = Some(StoredHostApi {
+                user_data: host.user_data as usize,
+                is_cancelled: host.is_cancelled,
+            });
+            SINOMO_MODULE_STATUS_OK
+        }
+        Err(_) => {
+            let _ = MODULE_LIFECYCLE.begin_shutdown();
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -970,6 +980,16 @@ pub extern "C" fn sinomo_module_invoke(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
 ) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return write_response(
+            response_sobj,
+            NativeModuleResponse::Error(native_error_response(
+                "module-unavailable",
+                "benchmark module is not initialized or is shutting down",
+            )),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        );
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -1007,10 +1027,16 @@ fn invoke_unchecked(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
-    if let Ok(mut stored) = MODULE_HOST_API.lock() {
-        *stored = None;
+    if !MODULE_LIFECYCLE.begin_shutdown() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
     }
-    SINOMO_MODULE_STATUS_OK
+    match MODULE_HOST_API.lock() {
+        Ok(mut stored) => {
+            *stored = None;
+            SINOMO_MODULE_STATUS_OK
+        }
+        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1188,6 +1214,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    static MODULE_ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn terminalbench_plan_uses_harbor_custom_agent_shape() {
@@ -1839,6 +1867,11 @@ mod tests {
 
     #[test]
     fn benchmark_module_native_abi_returns_catalog() {
+        let _guard = MODULE_ABI_TEST_LOCK.lock().expect("ABI test lock");
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
         let payload_sobj = encode_sobj(&BenchmarkModuleRequest::Catalog).expect("payload");
         let request = NativeModuleRequest::Invoke(NativeModuleInvocationRequest {
             operation: SINOMO_BENCHMARKS_OPERATION.to_string(),
@@ -1874,6 +1907,26 @@ mod tests {
                 .iter()
                 .any(|plan| plan.name == "swebench-verified-10")
         );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        let mut rejected_buffer = SinomoModuleByteBuffer::null();
+        assert_eq!(
+            sinomo_module_invoke(
+                SinomoModuleByteSlice::from_slice(&request_sobj),
+                &mut rejected_buffer,
+            ),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        );
+        let rejected_bytes = unsafe { SinomoModuleByteBuffer::into_vec(rejected_buffer) };
+        assert!(matches!(
+            decode_sobj::<NativeModuleResponse>(&rejected_bytes).expect("rejected response"),
+            NativeModuleResponse::Error(NativeModuleErrorResponse { ref code, .. })
+                if code == "module-unavailable"
+        ));
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
     }
 
     unsafe extern "C" fn test_host_is_cancelled(user_data: *mut c_void) -> u8 {
@@ -1883,6 +1936,7 @@ mod tests {
 
     #[test]
     fn benchmark_module_native_abi_cancel_probe_observes_host_cancellation() {
+        let _guard = MODULE_ABI_TEST_LOCK.lock().expect("ABI test lock");
         let cancelled = AtomicBool::new(false);
         let status = sinomo_module_init(SinomoModuleHostApiV2 {
             abi_version: SINOMO_NATIVE_MODULE_ABI_VERSION,
@@ -1919,6 +1973,11 @@ mod tests {
                 (status, response_bytes)
             });
             std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                sinomo_module_shutdown(),
+                SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+                "shutdown must not invalidate callbacks held by an active invocation"
+            );
             cancelled.store(true, Ordering::SeqCst);
             let (status, response_bytes) = worker.join().expect("cancel probe worker");
             assert_eq!(status, SINOMO_MODULE_STATUS_OK);

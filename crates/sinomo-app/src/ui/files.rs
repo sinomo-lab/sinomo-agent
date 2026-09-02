@@ -106,6 +106,7 @@ use crate::ui::widgets::{self, VirtualCollectionHost, VirtualCollectionSnapshot}
 /// The wide branch reserves enough room for Places, the inspector, and the compact file table so
 /// the Availability column never disappears behind horizontal overflow.
 const WIDE_THRESHOLD: f32 = 880.0;
+const UI_EXTENSION_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const INSPECTOR_W: f32 = 340.0;
 const ROW_THUMBNAIL_SIDE: f32 = 20.0;
@@ -1160,6 +1161,8 @@ pub struct FilesState {
     preview_error: Option<String>,
     ui_preview_catalog_generation: u64,
     ui_preview_entries: Vec<UiExtensionCatalogEntry>,
+    ui_preview_catalog_refresh_pending: bool,
+    ui_preview_catalog_refresh_after: Instant,
     custom_preview: Option<CustomFilesPreview>,
     history_open: bool,
     history_revision: u64,
@@ -1680,6 +1683,9 @@ impl FilesState {
             preview_error: None,
             ui_preview_catalog_generation,
             ui_preview_entries,
+            ui_preview_catalog_refresh_pending: false,
+            ui_preview_catalog_refresh_after: Instant::now()
+                + UI_EXTENSION_CATALOG_REFRESH_INTERVAL,
             custom_preview: None,
             history_open: false,
             history_revision: 0,
@@ -2223,6 +2229,7 @@ impl FilesState {
         self.worker_rx = None;
         self.worker_result_tx = None;
         self.worker_waker = None;
+        self.ui_preview_catalog_refresh_pending = false;
         self.thumbnail_tx = None;
         self.thumbnail_rx = None;
         self.thumbnail_inflight.clear();
@@ -2451,6 +2458,7 @@ impl FilesState {
     }
 
     pub fn pump_load(&mut self) -> bool {
+        self.schedule_ui_extension_catalog_refresh();
         let mut changed = self.poll_native_picker() | self.pump_thumbnail_results();
         loop {
             let result = match self.worker_rx.as_ref().map(|rx| rx.try_recv()) {
@@ -2554,6 +2562,7 @@ impl FilesState {
                     self.worker_tx = None;
                     self.worker_result_tx = None;
                     self.worker_waker = None;
+                    self.ui_preview_catalog_refresh_pending = false;
                     if let Some(abort) = self.live_event_abort.take() {
                         abort.abort();
                     }
@@ -2573,6 +2582,25 @@ impl FilesState {
 
     fn apply_worker_result(&mut self, result: FilesWorkerResult) -> bool {
         match result {
+            FilesWorkerResult::UiExtensionCatalog(result) => {
+                self.ui_preview_catalog_refresh_pending = false;
+                let Ok(catalog) = result else {
+                    return false;
+                };
+                for warning in &catalog.warnings {
+                    tracing::warn!(%warning, "UI extension catalog refresh warning");
+                }
+                if catalog.registry_generation == self.ui_preview_catalog_generation {
+                    return false;
+                }
+                self.ui_preview_catalog_generation = catalog.registry_generation;
+                self.ui_preview_entries = catalog.entries;
+                // Dropping the session disconnects its isolated worker. Keep
+                // the built-in preview until the current file is selected
+                // again under the new catalog generation.
+                self.custom_preview = None;
+                true
+            }
             FilesWorkerResult::LiveUpdate(update) => self.apply_live_update(update),
             FilesWorkerResult::List {
                 request_id,
@@ -3303,6 +3331,32 @@ impl FilesState {
                 true
             }
         }
+    }
+
+    fn schedule_ui_extension_catalog_refresh(&mut self) {
+        if self.ui_preview_catalog_refresh_pending
+            || Instant::now() < self.ui_preview_catalog_refresh_after
+        {
+            return;
+        }
+        self.ui_preview_catalog_refresh_after =
+            Instant::now() + UI_EXTENSION_CATALOG_REFRESH_INTERVAL;
+        let (Some(address), Some(result_tx), Some(waker)) = (
+            self.daemon_address.clone(),
+            self.worker_result_tx.clone(),
+            self.worker_waker.clone(),
+        ) else {
+            return;
+        };
+        self.ui_preview_catalog_refresh_pending = true;
+        self.app_runtime.spawn_blocking(move || {
+            let result = crate::backend::ui_extensions::ui_extension_catalog_at_address(
+                &address,
+                Some(FILE_PREVIEW_EXTENSION_POINT_ID),
+            );
+            let _ = result_tx.send(FilesWorkerResult::UiExtensionCatalog(result));
+            waker.wake();
+        });
     }
 
     fn apply_live_update(&mut self, update: FilesLiveUpdate) -> bool {
@@ -6226,6 +6280,7 @@ fn sifs_health_probe(browser: &SifsBrowser) -> (Option<SifsHealthSummary>, Optio
 }
 
 enum FilesWorkerResult {
+    UiExtensionCatalog(Result<sinomo_runtime::module::UiExtensionCatalogResponse, String>),
     LiveUpdate(FilesLiveUpdate),
     List {
         request_id: u64,
@@ -27626,6 +27681,34 @@ mod tests {
         assert!(ui_preview_entry_matches(&entry, "model.FIXTURE", b"other"));
         assert!(ui_preview_entry_matches(&entry, "model.bin", b"SINOMO"));
         assert!(!ui_preview_entry_matches(&entry, "model.bin", b"other"));
+    }
+
+    #[test]
+    fn catalog_generation_change_drops_the_running_custom_preview_session() {
+        let mut files = FilesState::new(&Backend::local_fallback());
+        files.ui_preview_catalog_generation = 1;
+        files.custom_preview = Some(CustomFilesPreview {
+            contribution_id: "module.fixture.preview".to_string(),
+            label: "Fixture preview".to_string(),
+            sizing: sinomo_runtime::module_api::UiWidgetSizing::default(),
+            session: ModuleWidgetSession::from_frame(sinomo_runtime::module_api::UiWidgetFrame {
+                generation: 1,
+                ..sinomo_runtime::module_api::UiWidgetFrame::default()
+            }),
+        });
+
+        assert!(
+            files.apply_worker_result(FilesWorkerResult::UiExtensionCatalog(Ok(
+                sinomo_runtime::module::UiExtensionCatalogResponse {
+                    registry_generation: 2,
+                    entries: Vec::new(),
+                    warnings: Vec::new(),
+                },
+            )))
+        );
+
+        assert_eq!(files.ui_preview_catalog_generation, 2);
+        assert!(files.custom_preview.is_none());
     }
 
     #[test]

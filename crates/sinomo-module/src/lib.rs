@@ -5,11 +5,15 @@ mod catalog;
 mod cli;
 mod component;
 mod event_bus;
+mod extension_executor;
+mod extension_registry;
+mod extension_service;
 mod native_cancellation;
 mod native_host;
 mod native_service;
 mod native_staging;
 mod network_runtime;
+mod runtime_generation;
 mod service;
 mod service_catalog_component;
 mod service_client;
@@ -23,11 +27,15 @@ pub use cli::{
 };
 pub use component::*;
 pub use event_bus::*;
+pub use extension_executor::*;
+pub use extension_registry::*;
+pub use extension_service::*;
 pub use native_cancellation::*;
 pub use native_host::*;
 pub use native_service::*;
 pub use native_staging::*;
 pub use network_runtime::*;
+pub use runtime_generation::*;
 pub use service::*;
 pub use service_catalog_component::*;
 pub use service_client::*;
@@ -83,6 +91,7 @@ pub const MODULE_POLICY_BLOCKED_EVENT_KIND: &str = "module.policy.blocked";
 pub const DECLARATIVE_MODULE_API_VERSION: &str = "sinomo.declarative.module.v1";
 pub const MODULE_RPC_CATEGORY: &str = "module";
 pub const MODULE_NATIVE_DYLIB_CANCEL_ROUTE: &str = "/module/native-dylib/cancel";
+pub const MODULE_HOT_UNLOAD_ROUTE: &str = "/module/hot-unload";
 pub const MODULE_NATIVE_RUST_LIST_ROUTE: &str = "/module/native-rust";
 pub const MODULE_NATIVE_RUST_SET_ENABLED_ROUTE: &str = "/module/native-rust/set-enabled";
 pub const MODULE_NATIVE_RUST_RPC_CATEGORY: &str = "module.native-rust";
@@ -1245,6 +1254,12 @@ pub struct ModuleSurfaces {
     /// cross the module catalog boundary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui_contributions: Vec<sinomo_module_api::UiExtensionContribution>,
+    /// Generic typed extension points owned by this module.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_points: Vec<sinomo_module_api::ExtensionPointDefinition>,
+    /// Generic contributions to host- or module-owned extension points.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_contributions: Vec<sinomo_module_api::ExtensionContribution>,
 }
 
 impl ModuleSurfaces {
@@ -1259,6 +1274,8 @@ impl ModuleSurfaces {
             && self.network_transports.is_empty()
             && self.interface_exports.is_empty()
             && self.ui_contributions.is_empty()
+            && self.extension_points.is_empty()
+            && self.extension_contributions.is_empty()
     }
 
     pub fn with_object_rpc_route(mut self, route: ModuleObjectRpcRoute) -> Self {
@@ -1412,6 +1429,22 @@ impl ModuleSurfaces {
         self
     }
 
+    pub fn with_extension_point(
+        mut self,
+        definition: sinomo_module_api::ExtensionPointDefinition,
+    ) -> Self {
+        self.extension_points.push(definition);
+        self
+    }
+
+    pub fn with_extension_contribution(
+        mut self,
+        contribution: sinomo_module_api::ExtensionContribution,
+    ) -> Self {
+        self.extension_contributions.push(contribution);
+        self
+    }
+
     pub fn with_capability_import(mut self, capability: CapabilityName) -> Self {
         self.capabilities.imports.push(capability);
         self
@@ -1524,6 +1557,15 @@ impl ModuleSurfaces {
                 detail: source.to_string(),
             }
         })?;
+        sinomo_module_api::validate_extension_points(&self.extension_points).map_err(|source| {
+            ModuleSurfaceError::InvalidExtensionPoint {
+                detail: source.to_string(),
+            }
+        })?;
+        sinomo_module_api::validate_extension_contributions(&self.extension_contributions)
+            .map_err(|source| ModuleSurfaceError::InvalidExtensionContribution {
+                detail: source.to_string(),
+            })?;
         for export in &self.interface_exports {
             for operation in &export.operations {
                 if let sinomo_module_api::ModuleInterfaceOperationTarget::ObjectRpc {
@@ -2002,6 +2044,27 @@ impl ModuleRegistry {
         self.registrations.is_empty()
     }
 
+    pub fn without(&self, module_id: &ModuleId) -> Result<Self, ModuleRegistryError> {
+        if !self.registrations.contains_key(module_id) {
+            return Err(ModuleRegistryError::UnknownModule {
+                module_id: module_id.clone(),
+            });
+        }
+        let mut registrations = self.registrations.clone();
+        registrations.remove(module_id);
+        let registry = Self {
+            registrations,
+            registration_order: self
+                .registration_order
+                .iter()
+                .filter(|candidate| *candidate != module_id)
+                .cloned()
+                .collect(),
+        };
+        registry.validate()?;
+        Ok(registry)
+    }
+
     pub fn validate(&self) -> Result<(), ModuleRegistryError> {
         let mut ordered_ids = BTreeSet::new();
         for module_id in &self.registration_order {
@@ -2256,6 +2319,8 @@ impl ModuleRegistryBuilder {
 pub enum ModuleRegistryError {
     #[error("duplicate module registration for {module_id}")]
     DuplicateModuleId { module_id: ModuleId },
+    #[error("module registry does not contain {module_id}")]
+    UnknownModule { module_id: ModuleId },
     #[error("invalid module surfaces for {module_id}: {detail}")]
     InvalidModuleSurfaces { module_id: ModuleId, detail: String },
     #[error(
@@ -2324,6 +2389,10 @@ pub enum ModuleSurfaceError {
     InvalidInterfaceExport { detail: String },
     #[error("invalid module UI contribution: {detail}")]
     InvalidUiContribution { detail: String },
+    #[error("invalid module extension point: {detail}")]
+    InvalidExtensionPoint { detail: String },
+    #[error("invalid module extension contribution: {detail}")]
+    InvalidExtensionContribution { detail: String },
     #[error(
         "module interface export `{export_id}` operation `{logical_operation}` targets object RPC `{route}` / `{operation}`, which is not exported"
     )]
@@ -3610,6 +3679,8 @@ fn native_descriptor_surfaces_to_module_surfaces(
     }
     surfaces.interface_exports = descriptor.surfaces.interface_exports.clone();
     surfaces.ui_contributions = descriptor.surfaces.ui_contributions.clone();
+    surfaces.extension_points = descriptor.surfaces.extension_points.clone();
+    surfaces.extension_contributions = descriptor.surfaces.extension_contributions.clone();
     surfaces.capabilities = ModuleCapabilities {
         imports: descriptor
             .surfaces
@@ -5864,6 +5935,8 @@ mod tests {
         assert!(decoded.settings.is_empty());
         assert!(decoded.interface_exports.is_empty());
         assert!(decoded.ui_contributions.is_empty());
+        assert!(decoded.extension_points.is_empty());
+        assert!(decoded.extension_contributions.is_empty());
         decoded.validate().expect("legacy surfaces remain valid");
     }
 
@@ -6184,6 +6257,23 @@ mod tests {
                 .with_capability_export(CapabilityName::new("dfs.status.read").expect("capability"))
                 .with_capability_export(
                     CapabilityName::new("dfs.metadata.replicate").expect("capability"),
+                )
+                .with_extension_point(sinomo_module_api::ExtensionPointDefinition::new(
+                    "sinomo.dfs.diagnostics.enrich",
+                    "1.0.0",
+                    "sinomo.dfs.diagnostics.input/v1",
+                    "sinomo.dfs.diagnostics.contribution/v1",
+                    "sinomo.dfs.diagnostics.output/v1",
+                    sinomo_module_api::ExtensionCompositionPolicy::Collect,
+                ))
+                .with_extension_contribution(
+                    sinomo_module_api::ExtensionContribution::declarative(
+                        "module.dfs.diagnostics.baseline",
+                        "sinomo.dfs.diagnostics.enrich",
+                        sinomo_module_api::ExtensionVersionRequirement::exact("1.0.0"),
+                        "sinomo.dfs.diagnostics.contribution/v1",
+                        vec![1],
+                    ),
                 ),
         );
 
@@ -6241,6 +6331,8 @@ mod tests {
                 .iter()
                 .any(|capability| capability.as_str() == "dfs.metadata.replicate")
         );
+        assert_eq!(decoded.surfaces.extension_points.len(), 1);
+        assert_eq!(decoded.surfaces.extension_contributions.len(), 1);
         let descriptors = decoded
             .surfaces
             .object_rpc_route_descriptors()
@@ -6365,6 +6457,23 @@ mod tests {
                 network_transports: vec!["iroh".to_string()],
                 interface_exports: vec![interface_export.clone()],
                 ui_contributions: Vec::new(),
+                extension_points: vec![sinomo_module_api::ExtensionPointDefinition::new(
+                    "dynamic.native.diagnostics.enrich",
+                    "1.0.0",
+                    "dynamic.native.diagnostics.input/v1",
+                    "dynamic.native.diagnostics.contribution/v1",
+                    "dynamic.native.diagnostics.output/v1",
+                    sinomo_module_api::ExtensionCompositionPolicy::Collect,
+                )],
+                extension_contributions: vec![
+                    sinomo_module_api::ExtensionContribution::declarative(
+                        "dynamic.native.diagnostics.baseline",
+                        "dynamic.native.diagnostics.enrich",
+                        sinomo_module_api::ExtensionVersionRequirement::exact("1.0.0"),
+                        "dynamic.native.diagnostics.contribution/v1",
+                        vec![1],
+                    ),
+                ],
             },
             component: sinomo_module_api::ComponentDescriptor::new(
                 "module.dynamic-native",
@@ -6414,6 +6523,8 @@ mod tests {
             registration.surfaces.interface_exports,
             vec![interface_export]
         );
+        assert_eq!(registration.surfaces.extension_points.len(), 1);
+        assert_eq!(registration.surfaces.extension_contributions.len(), 1);
         assert_eq!(
             registration
                 .surfaces

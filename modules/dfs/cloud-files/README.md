@@ -10,6 +10,15 @@ The module builds as both an `rlib` for tests and a `cdylib` for rollout. It is
 Windows-only in production and runs inside the Sinomo daemon process; the ABI
 is a version/rollout boundary, not a sandbox.
 
+Hot unload uses the shared native-module lifecycle fence. The daemon withdraws
+routes, signals the invocation cancellation handle, and waits for the writable
+worker and CFAPI operation to return before calling `sinomo_module_shutdown`.
+Shutdown refuses to clear host callbacks while an ABI invocation remains
+active. If cancellation, disconnect, or shutdown cannot complete within the
+drain deadline, the mapping is quarantined and a process restart is required;
+durable registration and recovery evidence are never deleted as an unload
+shortcut.
+
 ## Source Map
 
 | Path | Owner |

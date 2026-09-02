@@ -32,7 +32,7 @@ use crate::direct_link::{AuthenticatedLink, AuthenticatedTransportMetadata, Boxe
 use crate::error::{NetworkDeliveryState, NetworkError, NetworkTimeoutPhase};
 use crate::network_module::{
     NetworkFuture, NetworkModule, NetworkModuleContext, NetworkModuleDescriptor,
-    NetworkModuleEndpointRole,
+    NetworkModuleEndpointRole, NetworkModuleUnloadProbe,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -447,6 +447,7 @@ struct FfiNetworkModuleShared {
     /// Taken by [`Drop::drop`] and moved with the instance to the teardown
     /// thread. `None` means ownership has already been transferred.
     keep_alive: Option<Box<dyn Any + Send + Sync>>,
+    unload_probe: NetworkModuleUnloadProbe,
 }
 
 /// Complete ownership bundle transferred out of the final Arc drop. Keeping
@@ -455,7 +456,8 @@ struct FfiNetworkModuleShared {
 struct FfiNetworkModuleTeardown {
     instance: FfiNetworkModuleInstance,
     vtable: ValidatedNetworkModuleVtable,
-    _keep_alive: Box<dyn Any + Send + Sync>,
+    keep_alive: Box<dyn Any + Send + Sync>,
+    unload_probe: NetworkModuleUnloadProbe,
 }
 
 #[derive(Clone, Copy)]
@@ -473,11 +475,17 @@ impl FfiNetworkModuleTeardownPtr {
         // SAFETY: the pointer came from Box::into_raw below and ownership was
         // transferred to this one teardown worker.
         let teardown = unsafe { Box::from_raw(self.0) };
+        let FfiNetworkModuleTeardown {
+            instance,
+            vtable,
+            keep_alive,
+            unload_probe,
+        } = *teardown;
         // SAFETY: the entry contract made this instance/vtable pair callable;
         // the keep-alive token remains owned by `teardown` until return.
-        unsafe { (teardown.vtable.destroy)(teardown.instance.0) };
-        // `teardown` now drops on this plain OS thread, unloading the library
-        // only after the module has synchronously finished destruction.
+        unsafe { (vtable.destroy)(instance.0) };
+        drop(keep_alive);
+        unload_probe.complete();
     }
 }
 
@@ -671,7 +679,8 @@ impl Drop for FfiNetworkModuleShared {
         let teardown = Box::new(FfiNetworkModuleTeardown {
             instance: self.instance,
             vtable: self.vtable,
-            _keep_alive: keep_alive,
+            keep_alive,
+            unload_probe: self.unload_probe.clone(),
         });
         let teardown = FfiNetworkModuleTeardownPtr(Box::into_raw(teardown));
         let worker_teardown = teardown;
@@ -762,6 +771,7 @@ impl FfiNetworkModule {
             instance: FfiNetworkModuleInstance(instance),
             vtable,
             keep_alive: Some(keep_alive),
+            unload_probe: NetworkModuleUnloadProbe::new(),
         });
         let mut buffer = SinomoNetworkByteBuffer::null();
         // SAFETY: descriptor/free_buffer are valid per the entry contract.
@@ -836,6 +846,10 @@ impl NetworkModule for FfiNetworkModule {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         Ok(())
+    }
+
+    fn unload_probe(&self) -> Option<NetworkModuleUnloadProbe> {
+        Some(self.shared.unload_probe.clone())
     }
 
     fn connect_link(

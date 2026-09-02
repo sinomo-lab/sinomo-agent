@@ -251,6 +251,7 @@ mod tests {
             "cluster.kv.write",
             MODULE_NATIVE_RUST_READ_CAPABILITY,
             MODULE_NATIVE_RUST_ADMIN_CAPABILITY,
+            MODULE_HOT_UNLOAD_ADMIN_CAPABILITY,
         ] {
             assert!(
                 voter_capabilities

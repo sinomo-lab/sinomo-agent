@@ -1,7 +1,7 @@
 use crate::NativeModuleOperationCancellation;
 use sinomo_core::network::{NetworkError, ObjectRpcCancelRequest, ObjectRpcCancelResponse};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Per-invocation cancellation signal shared with native host callbacks and
@@ -38,32 +38,49 @@ impl NativeModuleOperationCancellation for NativeModuleOperationCancellationToke
 /// an authenticated cancel request reaches it.
 #[derive(Clone, Debug, Default)]
 pub struct NativeModuleOperationCancellationRegistry {
-    active: Arc<Mutex<BTreeMap<String, NativeModuleOperationCancellationToken>>>,
+    active: Arc<Mutex<BTreeMap<String, ActiveNativeModuleOperation>>>,
+    next_unnamed_id: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveNativeModuleOperation {
+    module_id: String,
+    token: NativeModuleOperationCancellationToken,
 }
 
 impl NativeModuleOperationCancellationRegistry {
     pub fn register(
         &self,
+        module_id: impl Into<String>,
         operation_id: Option<String>,
     ) -> Result<NativeModuleOperationCancellationRegistration, NetworkError> {
+        let module_id = module_id.into();
         let token = NativeModuleOperationCancellationToken::new();
-        if let Some(operation_id) = operation_id.as_deref() {
-            let mut active = self.active.lock().map_err(|_| NetworkError::Io {
-                operation: "register native dylib module cancellation".to_string(),
-                detail: "native dylib operation cancellation registry lock poisoned".to_string(),
-            })?;
-            if active.contains_key(operation_id) {
-                return Err(NetworkError::Serialization {
-                    detail: format!(
-                        "native dylib module operation `{operation_id}` is already active"
-                    ),
-                });
-            }
-            active.insert(operation_id.to_string(), token.clone());
+        let registry_key = operation_id.clone().unwrap_or_else(|| {
+            format!(
+                "unnamed:{module_id}:{}",
+                self.next_unnamed_id.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        let mut active = self.active.lock().map_err(|_| NetworkError::Io {
+            operation: "register native dylib module cancellation".to_string(),
+            detail: "native dylib operation cancellation registry lock poisoned".to_string(),
+        })?;
+        if operation_id.is_some() && active.contains_key(&registry_key) {
+            return Err(NetworkError::Serialization {
+                detail: format!("native dylib module operation `{registry_key}` is already active"),
+            });
         }
+        active.insert(
+            registry_key.clone(),
+            ActiveNativeModuleOperation {
+                module_id,
+                token: token.clone(),
+            },
+        );
         Ok(NativeModuleOperationCancellationRegistration {
             registry: self.clone(),
-            operation_id,
+            registry_key,
             token,
         })
     }
@@ -92,7 +109,7 @@ impl NativeModuleOperationCancellationRegistry {
                 detail: "native dylib operation cancellation registry lock poisoned".to_string(),
             })?
             .get(&operation_id)
-            .cloned();
+            .map(|active| active.token.clone());
         let (cancelled, detail) = if let Some(token) = token {
             token.cancel();
             (true, payload.reason)
@@ -120,12 +137,39 @@ impl NativeModuleOperationCancellationRegistry {
         self.active.lock().map(|active| active.len()).unwrap_or(0)
     }
 
-    fn unregister(&self, operation_id: Option<&str>) {
-        let Some(operation_id) = operation_id else {
-            return;
-        };
+    pub fn active_for_module(&self, module_id: &str) -> usize {
+        self.active
+            .lock()
+            .map(|active| {
+                active
+                    .values()
+                    .filter(|operation| operation.module_id == module_id)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn cancel_module(&self, module_id: &str) -> usize {
+        let tokens = self
+            .active
+            .lock()
+            .map(|active| {
+                active
+                    .values()
+                    .filter(|operation| operation.module_id == module_id)
+                    .map(|operation| operation.token.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for token in &tokens {
+            token.cancel();
+        }
+        tokens.len()
+    }
+
+    fn unregister(&self, registry_key: &str) {
         if let Ok(mut active) = self.active.lock() {
-            active.remove(operation_id);
+            active.remove(registry_key);
         }
     }
 }
@@ -133,7 +177,7 @@ impl NativeModuleOperationCancellationRegistry {
 /// RAII owner for one registered invocation.
 pub struct NativeModuleOperationCancellationRegistration {
     registry: NativeModuleOperationCancellationRegistry,
-    operation_id: Option<String>,
+    registry_key: String,
     token: NativeModuleOperationCancellationToken,
 }
 
@@ -149,7 +193,7 @@ impl Drop for NativeModuleOperationCancellationRegistration {
         // Signal callbacks before removing the addressable registry entry so
         // synchronous work and staged-file lifetimes can stop promptly.
         self.token.cancel();
-        self.registry.unregister(self.operation_id.as_deref());
+        self.registry.unregister(&self.registry_key);
     }
 }
 
@@ -161,14 +205,14 @@ mod tests {
     fn registration_is_unique_and_drop_cancels_then_unregisters() {
         let registry = NativeModuleOperationCancellationRegistry::default();
         let registration = registry
-            .register(Some("operation.one".to_string()))
+            .register("module.one", Some("operation.one".to_string()))
             .expect("register operation");
         let token = registration.token();
         assert!(registry.is_active("operation.one"));
         assert!(!token.is_cancelled());
         assert!(
             registry
-                .register(Some("operation.one".to_string()))
+                .register("module.one", Some("operation.one".to_string()))
                 .is_err()
         );
 
@@ -182,7 +226,7 @@ mod tests {
     fn cancel_request_fences_metadata_and_signals_registered_operation() {
         let registry = NativeModuleOperationCancellationRegistry::default();
         let registration = registry
-            .register(Some("operation.one".to_string()))
+            .register("module.one", Some("operation.one".to_string()))
             .expect("register operation");
         let token = registration.token();
         let mismatch = registry
@@ -208,5 +252,28 @@ mod tests {
             .expect("cancel response");
         assert!(cancelled.cancelled);
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn module_drain_cancels_named_and_unnamed_native_operations() {
+        let registry = NativeModuleOperationCancellationRegistry::default();
+        let first = registry
+            .register("module.one", Some("operation.one".to_string()))
+            .expect("named operation");
+        let second = registry
+            .register("module.one", None)
+            .expect("unnamed operation");
+        let other = registry
+            .register("module.two", Some("operation.two".to_string()))
+            .expect("other operation");
+        let first_token = first.token();
+        let second_token = second.token();
+        let other_token = other.token();
+
+        assert_eq!(registry.active_for_module("module.one"), 2);
+        assert_eq!(registry.cancel_module("module.one"), 2);
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
+        assert!(!other_token.is_cancelled());
     }
 }

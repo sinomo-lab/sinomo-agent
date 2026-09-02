@@ -38,11 +38,12 @@ use sinomo_core::network::{
 use sinomo_core::node::{ClusterId, NodeId, shadow_daemon_node_id};
 use sinomo_module_api::{
     ComponentDescriptor, NativeModuleBackend, NativeModuleCapabilitiesResponse,
-    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleRequest, NativeModuleResponse,
-    NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
-    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
-    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
-    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
+    NativeModuleDescriptor, NativeModuleErrorResponse, NativeModuleLifecycle, NativeModuleRequest,
+    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
+    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
+    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
+    decode_sobj, encode_sobj,
 };
 use std::collections::HashSet;
 use std::ffi::c_void;
@@ -60,6 +61,7 @@ pub const SINOMO_NETWORK_IROH_INTERFACE_VERSION: &str = "sinomo.network-iroh.v1"
 /// Network-module descriptor id (`NetworkModuleDescriptor::id`).
 pub const SINOMO_NETWORK_IROH_NETWORK_MODULE_ID: &str = "iroh";
 const SINOMO_DISABLE_IROH_ENV: &str = "SINOMO_DISABLE_IROH";
+static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 
 fn iroh_disabled_by_env() -> bool {
     std::env::var(SINOMO_DISABLE_IROH_ENV).ok().as_deref() == Some("1")
@@ -86,7 +88,11 @@ pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModul
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
-    SINOMO_MODULE_STATUS_OK
+    if MODULE_LIFECYCLE.initialize() {
+        SINOMO_MODULE_STATUS_OK
+    } else {
+        SINOMO_MODULE_STATUS_RUNTIME_ERROR
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -94,6 +100,16 @@ pub extern "C" fn sinomo_module_invoke(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
 ) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return write_module_response(
+            response_sobj,
+            NativeModuleResponse::Error(NativeModuleErrorResponse {
+                code: "module-unavailable".to_string(),
+                detail: "iroh module is not initialized or is shutting down".to_string(),
+            }),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        );
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -112,7 +128,11 @@ pub extern "C" fn sinomo_module_invoke(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
-    SINOMO_MODULE_STATUS_OK
+    if MODULE_LIFECYCLE.begin_shutdown() {
+        SINOMO_MODULE_STATUS_OK
+    } else {
+        SINOMO_MODULE_STATUS_RUNTIME_ERROR
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1252,6 +1272,22 @@ mod tests {
             descriptor.surfaces.network_transports,
             vec![SINOMO_NETWORK_IROH_NETWORK_MODULE_ID.to_string()]
         );
+    }
+
+    #[test]
+    fn standard_module_lifecycle_is_idempotent_and_reinitializable() {
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
     }
 
     #[test]

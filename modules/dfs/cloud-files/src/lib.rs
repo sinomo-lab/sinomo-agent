@@ -35,12 +35,12 @@ use crate::protocol::{
 use sinomo_module_api::{
     ComponentDescriptor, ModuleSettingsExport, NativeModuleBackend,
     NativeModuleCapabilitiesResponse, NativeModuleDescriptor, NativeModuleErrorResponse,
-    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleRequest,
-    NativeModuleResponse, NativeModuleSurfaces, SINOMO_MODULE_STATUS_INVALID_ARGUMENT,
-    SINOMO_MODULE_STATUS_OK, SINOMO_MODULE_STATUS_RUNTIME_ERROR,
-    SINOMO_MODULE_STATUS_UNSUPPORTED_ABI, SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer,
-    SinomoModuleByteBuffer, SinomoModuleByteSlice, SinomoModuleHostApiV2, SinomoModuleStatusCode,
-    decode_sobj, encode_sobj,
+    NativeModuleInvocationRequest, NativeModuleInvocationResponse, NativeModuleLifecycle,
+    NativeModuleRequest, NativeModuleResponse, NativeModuleSurfaces,
+    SINOMO_MODULE_STATUS_INVALID_ARGUMENT, SINOMO_MODULE_STATUS_OK,
+    SINOMO_MODULE_STATUS_RUNTIME_ERROR, SINOMO_MODULE_STATUS_UNSUPPORTED_ABI,
+    SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
+    SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
 #[cfg(windows)]
 use sinomo_runtime::dfs::HostFilesystemProviderEvent;
@@ -228,6 +228,7 @@ unsafe impl Send for StoredHostApi {}
 unsafe impl Sync for StoredHostApi {}
 
 static HOST_API: Mutex<Option<StoredHostApi>> = Mutex::new(None);
+static MODULE_LIFECYCLE: NativeModuleLifecycle = NativeModuleLifecycle::new();
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_api_version() -> u32 {
@@ -246,12 +247,18 @@ pub extern "C" fn sinomo_module_init(host: SinomoModuleHostApiV2) -> SinomoModul
     if host.abi_version != SINOMO_NATIVE_MODULE_ABI_VERSION {
         return SINOMO_MODULE_STATUS_UNSUPPORTED_ABI;
     }
+    if !MODULE_LIFECYCLE.initialize() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = Some(StoredHostApi(host));
             SINOMO_MODULE_STATUS_OK
         }
-        Err(_) => SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        Err(_) => {
+            let _ = MODULE_LIFECYCLE.begin_shutdown();
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR
+        }
     }
 }
 
@@ -260,6 +267,16 @@ pub extern "C" fn sinomo_module_invoke(
     request_sobj: SinomoModuleByteSlice,
     response_sobj: *mut SinomoModuleByteBuffer,
 ) -> SinomoModuleStatusCode {
+    let Some(_invocation) = MODULE_LIFECYCLE.begin_invocation() else {
+        return write_response(
+            response_sobj,
+            NativeModuleResponse::Error(native_error_response(
+                "module-unavailable",
+                "Cloud Files module is not initialized or is shutting down",
+            )),
+            SINOMO_MODULE_STATUS_RUNTIME_ERROR,
+        );
+    };
     let result = catch_unwind(AssertUnwindSafe(|| {
         invoke_unchecked(request_sobj, response_sobj)
     }));
@@ -278,6 +295,9 @@ pub extern "C" fn sinomo_module_invoke(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn sinomo_module_shutdown() -> SinomoModuleStatusCode {
+    if !MODULE_LIFECYCLE.begin_shutdown() {
+        return SINOMO_MODULE_STATUS_RUNTIME_ERROR;
+    }
     match HOST_API.lock() {
         Ok(mut api) => {
             *api = None;
@@ -974,6 +994,8 @@ fn platform_triple() -> String {
 mod tests {
     use super::*;
 
+    static MODULE_ABI_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn descriptor_exposes_blocked_mount_and_supported_unregister_honestly() {
         let descriptor = cloud_files_module_descriptor();
@@ -1081,6 +1103,24 @@ mod tests {
             .expect("read-only mount status setting");
         assert!(status.read_only);
         assert!(status.schema.is_some());
+    }
+
+    #[test]
+    fn module_shutdown_is_idempotent_and_reinitializable() {
+        let _guard = MODULE_ABI_TEST_LOCK.lock().expect("ABI test lock");
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
+        assert!(HOST_API.lock().expect("host API").is_none());
+        assert_eq!(
+            sinomo_module_init(SinomoModuleHostApiV2::empty()),
+            SINOMO_MODULE_STATUS_OK
+        );
+        assert_eq!(sinomo_module_shutdown(), SINOMO_MODULE_STATUS_OK);
     }
 
     #[test]

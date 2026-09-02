@@ -705,6 +705,30 @@ impl ServiceRoute {
 type ServiceHandler =
     Arc<dyn Fn(ServiceContext, ObjectRpcRequest) -> ServiceFuture<'static> + Send + Sync + 'static>;
 
+/// Stable identity supplied to a process-wide invocation gate before a
+/// service handler starts. The gate is host mechanism: it can fence a draining
+/// component generation without teaching the service registry about modules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceInvocationMetadata {
+    pub route: String,
+    pub category: String,
+    pub component_id: Option<String>,
+    pub component_version: Option<String>,
+    pub artifact_id: Option<String>,
+    pub component_generation: Option<u64>,
+}
+
+pub trait ServiceInvocationLease: Send + Sync {}
+
+impl<T: Send + Sync> ServiceInvocationLease for T {}
+
+pub trait ServiceInvocationGate: Send + Sync {
+    fn enter(
+        &self,
+        invocation: &ServiceInvocationMetadata,
+    ) -> Result<Arc<dyn ServiceInvocationLease>, ServiceError>;
+}
+
 #[derive(Clone)]
 struct RouteOwner {
     service_name: &'static str,
@@ -734,6 +758,7 @@ struct RouteOwner {
 pub struct ServiceRegistry {
     service_names: Vec<&'static str>,
     by_route: BTreeMap<String, RouteOwner>,
+    invocation_gate: Option<Arc<dyn ServiceInvocationGate>>,
 }
 
 impl ServiceRegistry {
@@ -765,8 +790,37 @@ impl ServiceRegistry {
                 let timeout = owner.timeout_ms.map(Duration::from_millis);
                 let response_body_mode = owner.response_body_mode;
                 let request_value_mode = owner.request_value_mode;
+                let invocation_gate = self.invocation_gate.clone();
+                let invocation = ServiceInvocationMetadata {
+                    route: request.route.clone(),
+                    category: owner.category.clone(),
+                    component_id: owner
+                        .discovery
+                        .as_ref()
+                        .map(|identity| identity.component_id.clone()),
+                    component_version: owner
+                        .discovery
+                        .as_ref()
+                        .map(|identity| identity.component_version.clone()),
+                    artifact_id: owner
+                        .discovery
+                        .as_ref()
+                        .and_then(|identity| identity.artifact_id.clone()),
+                    component_generation: owner
+                        .discovery
+                        .as_ref()
+                        .map(|identity| identity.component_generation),
+                };
                 Box::pin(async move {
+                    let invocation_lease = invocation_gate
+                        .as_ref()
+                        .map(|gate| gate.enter(&invocation))
+                        .transpose()?;
                     let mut ctx = ctx;
+                    if let Some(invocation_lease) = invocation_lease.as_ref() {
+                        ctx.hold_response_lifetime_guard(Arc::clone(invocation_lease));
+                    }
+                    let _handler_invocation_lease = invocation_lease;
                     let mut request = request;
                     ctx.set_response_body_mode(response_body_mode);
                     if request_value_mode == ServiceRequestValueMode::BufferedCompatibility {
@@ -910,6 +964,7 @@ impl ServiceRegistry {
     pub fn to_builder(&self) -> ServiceRegistryBuilder {
         ServiceRegistryBuilder {
             service_names: self.service_names.clone(),
+            invocation_gate: self.invocation_gate.clone(),
             by_route: self
                 .by_route
                 .iter()
@@ -1079,6 +1134,7 @@ impl ServiceRegistrySnapshotStore {
 pub struct ServiceRegistryBuilder {
     service_names: Vec<&'static str>,
     by_route: BTreeMap<String, PendingRouteOwner>,
+    invocation_gate: Option<Arc<dyn ServiceInvocationGate>>,
 }
 
 #[derive(Clone)]
@@ -1089,6 +1145,11 @@ struct PendingRouteOwner {
 }
 
 impl ServiceRegistryBuilder {
+    pub fn with_invocation_gate(mut self, gate: Arc<dyn ServiceInvocationGate>) -> Self {
+        self.invocation_gate = Some(gate);
+        self
+    }
+
     /// Merge one immutable registry fragment into this registry generation.
     ///
     /// Component scopes build private fragments once at mount time. The host
@@ -1217,6 +1278,7 @@ impl ServiceRegistryBuilder {
     pub fn build(self) -> ServiceRegistry {
         ServiceRegistry {
             service_names: self.service_names,
+            invocation_gate: self.invocation_gate,
             by_route: self
                 .by_route
                 .into_iter()
@@ -1746,7 +1808,28 @@ mod tests {
             }
         }
 
-        let registry = ServiceRegistry::builder().register(BodyService).build();
+        struct CountingGate(Arc<AtomicUsize>);
+        struct CountingLease(Arc<AtomicUsize>);
+        impl Drop for CountingLease {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        impl ServiceInvocationGate for CountingGate {
+            fn enter(
+                &self,
+                _invocation: &ServiceInvocationMetadata,
+            ) -> Result<Arc<dyn ServiceInvocationLease>, ServiceError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(CountingLease(Arc::clone(&self.0))))
+            }
+        }
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let registry = ServiceRegistry::builder()
+            .with_invocation_gate(Arc::new(CountingGate(Arc::clone(&active))))
+            .register(BodyService)
+            .build();
         let sink = CollectingSink::default();
         let frames = Arc::clone(&sink.frames);
         let request = ObjectRpcRequest::encode_body("/test/body", "body", &()).expect("encode");
@@ -1755,6 +1838,11 @@ mod tests {
             .await
             .expect("dispatch");
         let body_response = frames.lock().expect("frames").pop().expect("response");
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            1,
+            "streaming response must retain its invocation lease"
+        );
 
         assert_eq!(
             body_response
@@ -1772,6 +1860,8 @@ mod tests {
                     .with_response_body_mode(ServiceBodyMode::Optional)
             ]
         );
+        drop(body_response);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
