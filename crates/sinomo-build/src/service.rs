@@ -9,15 +9,15 @@ use crate::{
     BUILD_ARTIFACT_ROUTE, BUILD_CAPABILITIES_ROUTE, BUILD_OBJECT_RPC_ROUTES, BUILD_PROTOCOL,
     BUILD_STATUS_ROUTE, BUILD_SUBMIT_ROUTE, BuildArtifactKind, BuildArtifactRequest,
     BuildArtifactResponse, BuildArtifactSetManifest, BuildCapabilitiesRequest,
-    BuildCapabilitiesResponse, BuildJobId, BuildJobState, BuildJobStatus, BuildKey, BuildPlan,
-    BuildResourceSnapshot, BuildServiceCapabilities, BuildStatusRequest, BuildStatusResponse,
-    BuildSubmitRequest, BuildSubmitResponse, BuildTargetCapability, CargoBuildExecutor,
-    NativeModuleSelection,
+    BuildCapabilitiesResponse, BuildJobId, BuildJobState, BuildJobStatus, BuildKey,
+    BuildPlacementRequirements, BuildPlan, BuildServiceCapabilities, BuildStatusRequest,
+    BuildStatusResponse, BuildSubmitRequest, BuildSubmitResponse, BuildTargetCapability,
+    CargoBuildExecutor,
 };
 use sinomo_core::local::SinomoDataDir;
 use sinomo_core::network::{
     ObjectRpcBodySource, ObjectRpcIncomingBody, ObjectRpcRequest, ObjectRpcResponse,
-    read_object_file, read_optional_object_file, write_object_file,
+    read_object_file, write_object_file,
 };
 use sinomo_core::node::NodeId;
 use sinomo_core::service::{
@@ -26,7 +26,6 @@ use sinomo_core::service::{
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -275,30 +274,27 @@ impl BuildQueueHost {
         request: BuildCapabilitiesRequest,
     ) -> Result<BuildCapabilitiesResponse, ServiceError> {
         self.ensure_initialized()?;
-        let resources = BuildResourceSnapshot {
-            cpu_threads: std::thread::available_parallelism()
-                .map(|count| u16::try_from(count.get()).unwrap_or(u16::MAX))
-                .unwrap_or(1),
-            memory_total_mb: host_memory_mb("MemTotal:"),
-            memory_available_mb: host_memory_mb("MemAvailable:"),
-            cpu_load_milli: None,
-            active_jobs: u16::from(self.worker_active.load(Ordering::Relaxed)),
-            max_jobs: 1,
-            queue_depth: self.queue_depth.load(Ordering::Relaxed),
-        };
+        let resources = crate::sample_build_resources(
+            &self.paths,
+            u16::from(self.worker_active.load(Ordering::Relaxed)),
+            1,
+            self.queue_depth.load(Ordering::Relaxed),
+        );
         let capabilities = BuildServiceCapabilities {
             node_id: self.node_id.clone(),
             protocol: BUILD_PROTOCOL.to_string(),
             targets: self.target_capabilities.clone(),
             resources,
         };
-        let supports_requested_target = request
-            .target
-            .as_ref()
-            .map(|target| capabilities.supports(target, &request.artifact_kinds));
         let cache_hit = request.build_key.as_ref().map(|key| {
             self.cached_manifest(key, false)
                 .is_ok_and(|manifest| manifest.is_some())
+        });
+        let supports_requested_target = request.target.as_ref().map(|target| {
+            capabilities.supports(target, &request.artifact_kinds)
+                && (cache_hit == Some(true)
+                    || BuildPlacementRequirements::for_source_bytes(0)
+                        .is_satisfied_by(&capabilities.resources))
         });
         Ok(BuildCapabilitiesResponse {
             capabilities,
@@ -354,6 +350,16 @@ impl BuildQueueHost {
                 cache_hit: true,
             });
         }
+        crate::BuildExecutionPolicy::for_source_bytes(
+            &crate::sample_build_resources(
+                &self.paths,
+                u16::from(self.worker_active.load(Ordering::Relaxed)),
+                1,
+                self.queue_depth.load(Ordering::Relaxed),
+            ),
+            request.plan.source.bundle_bytes,
+        )
+        .map_err(build_service_error)?;
 
         let job_id = BuildJobId::generate();
         let now = OffsetDateTime::now_utc();
@@ -510,75 +516,8 @@ impl BuildQueueHost {
         key: &BuildKey,
         verify_content: bool,
     ) -> Result<Option<BuildArtifactSetManifest>, ServiceError> {
-        let path = self.paths.cache_manifest(key);
-        let manifest: Option<BuildArtifactSetManifest> = match read_optional_object_file(&path) {
-            Ok(manifest) => manifest,
-            Err(error) if self.paths.cache_entry_dir(key).exists() => {
-                self.quarantine_cache_entry(key, &error.to_string())?;
-                return Ok(None);
-            }
-            Err(error) => return Err(ServiceError::from(error)),
-        };
-        let Some(manifest) = manifest else {
-            return Ok(None);
-        };
-        let validation = (|| -> Result<(), String> {
-            manifest.validate().map_err(|error| error.to_string())?;
-            if &manifest.provenance.build_key != key {
-                return Err(format!(
-                    "cached build manifest key {} does not match path key {key}",
-                    manifest.provenance.build_key
-                ));
-            }
-            let artifact_root = self.paths.cache_artifacts_dir(key);
-            for artifact in &manifest.artifacts {
-                let path = artifact_root.join(&artifact.relative_path);
-                if verify_content {
-                    crate::verify_artifact_file(artifact, &path)
-                        .map_err(|error| error.to_string())?;
-                } else {
-                    let size_bytes = fs::metadata(&path)
-                        .map_err(|source| format!("inspect {}: {source}", path.display()))?
-                        .len();
-                    if size_bytes != artifact.size_bytes {
-                        return Err(format!(
-                            "artifact {} size mismatch: expected {}, got {size_bytes}",
-                            artifact.artifact_id, artifact.size_bytes
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        })();
-        if let Err(detail) = validation {
-            self.quarantine_cache_entry(key, &detail)?;
-            return Ok(None);
-        }
-        Ok(Some(manifest))
-    }
-
-    fn quarantine_cache_entry(&self, key: &BuildKey, detail: &str) -> Result<(), ServiceError> {
-        let entry = self.paths.cache_entry_dir(key);
-        if !entry.exists() {
-            return Ok(());
-        }
-        let quarantine = entry.with_extension(format!(
-            "corrupt-{}",
-            OffsetDateTime::now_utc().unix_timestamp_nanos()
-        ));
-        fs::rename(&entry, &quarantine).map_err(|source| {
-            ServiceError::Service(format!(
-                "cached artifact set {} is invalid ({detail}) and could not be quarantined to {}: {source}",
-                entry.display(),
-                quarantine.display()
-            ))
-        })?;
-        tracing::warn!(
-            build_key = %key,
-            quarantine = %quarantine.display(),
-            "quarantined invalid build artifact cache entry: {detail}"
-        );
-        Ok(())
+        crate::manager::cached_build_manifest(&self.paths, key, verify_content)
+            .map_err(build_service_error)
     }
 
     fn clear_inflight(&self, key: &BuildKey) {
@@ -852,7 +791,7 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
         host.clear_inflight(&job.plan.key);
         return;
     };
-    match execute_and_cache_build(
+    match crate::manager::execute_and_cache_build(
         &host.paths,
         &job.job_id,
         &job.plan,
@@ -867,9 +806,9 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
             let _ = host.persist_status(&status);
             let _ = fs::remove_dir_all(host.paths.job_work_dir(&job.job_id));
         }
-        Err(detail) => {
+        Err(error) => {
             status.state = BuildJobState::Failed;
-            status.detail = detail;
+            status.detail = error.to_string();
             status.artifact_set = None;
             status.finished_at = Some(OffsetDateTime::now_utc());
             let _ = host.persist_status(&status);
@@ -878,264 +817,9 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
     host.clear_inflight(&job.plan.key);
 }
 
-fn execute_and_cache_build(
-    paths: &crate::BuildPaths,
-    job_id: &BuildJobId,
-    plan: &BuildPlan,
-    executor: &CargoBuildExecutor,
+pub(crate) fn configured_build_executor(
     cargo_program: &Path,
-) -> Result<BuildArtifactSetManifest, String> {
-    let work_dir = paths.job_work_dir(job_id);
-    if work_dir.exists() {
-        fs::remove_dir_all(&work_dir)
-            .map_err(|source| format!("clear build workspace {}: {source}", work_dir.display()))?;
-    }
-    fs::create_dir_all(&work_dir)
-        .map_err(|source| format!("create build workspace {}: {source}", work_dir.display()))?;
-    let source_repo = materialize_build_source_bundle(&work_dir, &paths.job_source_bundle(job_id))?;
-    if let Some(expected_revision) = plan.source.revision.as_deref() {
-        let actual_revision = build_source_head(&source_repo)?;
-        if !source_heads_match(Some(actual_revision.as_str()), expected_revision) {
-            return Err(format!(
-                "imported source revision {actual_revision} does not match requested {expected_revision}"
-            ));
-        }
-    }
-
-    verify_build_lockfile(&source_repo, plan)?;
-    let _source_guard = BuildSourceLockfileGuard::capture(&source_repo)?;
-    validate_requested_outputs(cargo_program, &source_repo, plan)?;
-    let artifact_root = paths.job_work_dir(job_id).join("artifact-set");
-    let result = executor
-        .execute(&source_repo, plan, &artifact_root)
-        .map_err(|error| format!("Cargo build failed: {error}"))?;
-    let log = format!(
-        "command: {}\nrepo: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        result.command.display(),
-        source_repo.display(),
-        result.stdout,
-        result.stderr
-    );
-    fs::write(paths.job_log(job_id), log).map_err(|source| format!("write build log: {source}"))?;
-    publish_artifact_cache(
-        paths,
-        plan,
-        &result.artifact_root,
-        result.artifact_set,
-        job_id,
-    )
-}
-
-fn materialize_build_source_bundle(work_dir: &Path, bundle_path: &Path) -> Result<PathBuf, String> {
-    if !bundle_path.is_file() {
-        return Err(format!(
-            "build source bundle {} does not exist",
-            bundle_path.display()
-        ));
-    }
-    let source_repo = work_dir.join("source").join("sinomo");
-    let parent = source_repo
-        .parent()
-        .expect("build source repository has a parent");
-    fs::create_dir_all(parent)
-        .map_err(|source| format!("create build source root {}: {source}", parent.display()))?;
-    let output = crate::process::noninteractive_command("git")
-        .arg("clone")
-        .arg(bundle_path)
-        .arg(&source_repo)
-        .output()
-        .map_err(|source| {
-            format!(
-                "clone build source bundle {}: {source}",
-                bundle_path.display()
-            )
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "git clone {} {} failed with status {}: {}",
-            bundle_path.display(),
-            source_repo.display(),
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    remove_build_source_remotes(&source_repo)?;
-    Ok(source_repo)
-}
-
-fn remove_build_source_remotes(repo: &Path) -> Result<(), String> {
-    let output = crate::process::noninteractive_command("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("remote")
-        .output()
-        .map_err(|source| format!("list build source remotes in {}: {source}", repo.display()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "git remote in {} failed with status {}: {}",
-            repo.display(),
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    for remote in String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|remote| !remote.is_empty())
-    {
-        let output = crate::process::noninteractive_command("git")
-            .arg("-C")
-            .arg(repo)
-            .args(["remote", "remove", remote])
-            .output()
-            .map_err(|source| {
-                format!(
-                    "remove build source remote {remote} in {}: {source}",
-                    repo.display()
-                )
-            })?;
-        if !output.status.success() {
-            return Err(format!(
-                "git remote remove {remote} in {} failed with status {}: {}",
-                repo.display(),
-                output.status.code().unwrap_or(-1),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn build_source_head(repo: &Path) -> Result<String, String> {
-    let output = crate::process::noninteractive_command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .map_err(|source| {
-            format!(
-                "inspect build source revision in {}: {source}",
-                repo.display()
-            )
-        })?;
-    if !output.status.success() {
-        return Err(format!(
-            "git rev-parse in {} failed with status {}: {}",
-            repo.display(),
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
-}
-
-struct BuildSourceLockfileGuard {
-    path: PathBuf,
-    original: Option<Vec<u8>>,
-}
-
-impl BuildSourceLockfileGuard {
-    fn capture(repo: &Path) -> Result<Self, String> {
-        let path = repo.join("Cargo.lock");
-        let original = match fs::read(&path) {
-            Ok(original) => Some(original),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(format!(
-                    "capture build source lockfile {}: {source}",
-                    path.display()
-                ));
-            }
-        };
-        Ok(Self { path, original })
-    }
-}
-
-impl Drop for BuildSourceLockfileGuard {
-    fn drop(&mut self) {
-        match self.original.take() {
-            Some(original) => {
-                let _ = fs::write(&self.path, original);
-            }
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {}
-            },
-        }
-    }
-}
-
-fn publish_artifact_cache(
-    paths: &crate::BuildPaths,
-    plan: &BuildPlan,
-    artifact_root: &Path,
-    manifest: BuildArtifactSetManifest,
-    job_id: &BuildJobId,
-) -> Result<BuildArtifactSetManifest, String> {
-    let bundle = crate::create_artifact_bundle(manifest, artifact_root)
-        .map_err(|error| error.to_string())?;
-    let entry = paths.cache_entry_dir(&plan.key);
-    let staging = entry.with_extension(format!("next-{job_id}"));
-    if staging.exists() {
-        fs::remove_dir_all(&staging)
-            .map_err(|source| format!("clear artifact cache staging: {source}"))?;
-    }
-    let staging_artifacts = staging.join("artifacts");
-    fs::create_dir_all(&staging_artifacts)
-        .map_err(|source| format!("create artifact cache staging: {source}"))?;
-    for artifact in &bundle.manifest.artifacts {
-        copy_build_artifact(
-            &artifact_root.join(&artifact.relative_path),
-            &staging_artifacts.join(&artifact.relative_path),
-        )?;
-    }
-    fs::write(staging.join("artifacts.tar"), &bundle.bytes)
-        .map_err(|source| format!("write artifact cache bundle: {source}"))?;
-    write_object_file(&staging.join("manifest.sobj"), &bundle.manifest)
-        .map_err(|error| format!("write artifact cache manifest: {error}"))?;
-    match fs::rename(&staging, &entry) {
-        Ok(()) => Ok(bundle.manifest),
-        Err(_source) if entry.is_dir() => {
-            let _ = fs::remove_dir_all(&staging);
-            let existing: BuildArtifactSetManifest = read_object_file(&entry.join("manifest.sobj"))
-                .map_err(|error| format!("read concurrent artifact cache winner: {error}"))?;
-            existing.validate().map_err(|error| error.to_string())?;
-            if existing.provenance.build_key != plan.key {
-                return Err("concurrent artifact cache winner has the wrong build key".to_string());
-            }
-            Ok(existing)
-        }
-        Err(source) => Err(format!(
-            "publish artifact cache {}: {source}",
-            entry.display()
-        )),
-    }
-}
-
-fn copy_build_artifact(source: &Path, destination: &Path) -> Result<(), String> {
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("create artifact directory {}: {error}", parent.display()))?;
-    }
-    fs::copy(source, destination).map_err(|error| {
-        format!(
-            "copy build artifact {} to {}: {error}",
-            source.display(),
-            destination.display()
-        )
-    })?;
-    Ok(())
-}
-
-fn configured_build_executor(cargo_program: &Path) -> Result<CargoBuildExecutor, String> {
+) -> Result<CargoBuildExecutor, String> {
     let rustc_program = std::env::var_os("RUSTC")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("rustc"));
@@ -1184,83 +868,6 @@ fn build_executor_for_targets(
         .map_err(|error| format!("configure Cargo build executor: {error}"))
 }
 
-fn verify_build_lockfile(source_repo: &Path, plan: &BuildPlan) -> Result<(), String> {
-    let lockfile = source_repo.join("Cargo.lock");
-    let bytes = fs::read(&lockfile)
-        .map_err(|source| format!("read build lockfile {}: {source}", lockfile.display()))?;
-    let actual = crate::build_content_hash(&bytes);
-    if actual != plan.input.lockfile_hash {
-        return Err(format!(
-            "build lockfile hash mismatch: expected {}, got {actual}",
-            plan.input.lockfile_hash
-        ));
-    }
-    Ok(())
-}
-
-fn validate_requested_outputs(
-    cargo_program: &Path,
-    source_repo: &Path,
-    plan: &BuildPlan,
-) -> Result<(), String> {
-    for output in plan
-        .input
-        .outputs
-        .iter()
-        .filter(|output| output.kind == BuildArtifactKind::Binary)
-    {
-        if output.name != "sinomo"
-            || output.package != "sinomo"
-            || output.cargo_target != "sinomo"
-            || output.native_dylib.is_some()
-        {
-            return Err(format!(
-                "unsupported binary output descriptor {}/{}/{}; expected sinomo/sinomo/sinomo",
-                output.name, output.package, output.cargo_target
-            ));
-        }
-    }
-    let requested_module_ids = plan
-        .input
-        .outputs
-        .iter()
-        .filter(|output| output.kind == BuildArtifactKind::NativeDylibModule)
-        .map(|output| {
-            output
-                .native_dylib
-                .as_ref()
-                .map(|metadata| metadata.module_id.clone())
-                .ok_or_else(|| format!("native output {} has no loader metadata", output.name))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if requested_module_ids.is_empty() {
-        return Ok(());
-    }
-    let mut discovered = crate::discover_native_dylib_outputs(
-        cargo_program,
-        source_repo,
-        &plan.input.target,
-        NativeModuleSelection::ModuleIds(requested_module_ids),
-    )
-    .map_err(|error| format!("validate target-aware native module outputs: {error}"))?;
-    let mut requested = plan
-        .input
-        .outputs
-        .iter()
-        .filter(|output| output.kind == BuildArtifactKind::NativeDylibModule)
-        .cloned()
-        .collect::<Vec<_>>();
-    discovered.sort();
-    requested.sort();
-    if discovered != requested {
-        return Err(format!(
-            "requested native module descriptors do not match source metadata for target {}",
-            plan.input.target.path_key()
-        ));
-    }
-    Ok(())
-}
-
 fn local_build_node_id(data_dir_root: &Path) -> NodeId {
     let data_dir = SinomoDataDir::new(data_dir_root);
     let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
@@ -1272,15 +879,6 @@ fn local_build_node_id(data_dir_root: &Path) -> NodeId {
                 data_dir_root.as_os_str().as_encoded_bytes(),
             )
         })
-}
-
-fn host_memory_mb(label: &str) -> Option<u64> {
-    let contents = fs::read_to_string("/proc/meminfo").ok()?;
-    let kib = contents.lines().find_map(|line| {
-        let value = line.strip_prefix(label)?.trim();
-        value.split_whitespace().next()?.parse::<u64>().ok()
-    })?;
-    Some(kib / 1024)
 }
 
 fn build_service_error(error: impl std::fmt::Display) -> ServiceError {
@@ -1427,11 +1025,12 @@ mod tests {
             "git bundle",
         );
 
-        let materialized = materialize_build_source_bundle(&root.join("work"), &bundle)
-            .expect("materialize source bundle");
+        let materialized =
+            crate::manager::materialize_build_source_bundle(&root.join("work"), &bundle)
+                .expect("materialize source bundle");
         assert!(materialized.join("Cargo.toml").is_file());
         assert!(
-            !build_source_head(&materialized)
+            !crate::build_source_head(&materialized)
                 .expect("materialized head")
                 .is_empty()
         );

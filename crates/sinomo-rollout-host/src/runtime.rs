@@ -35,14 +35,14 @@ use sinomo_rollout::{
     remove_main_activation, remove_native_dylib_loader_state_rollback, remove_shadow_finalize,
     restore_native_dylib_loader_state_for_activation, restore_native_dylib_loader_state_rollback,
     restore_rollout_binary_from_backup, rollout_artifact_suffix,
-    rollout_bind_covers_manual_tcp_endpoint, rollout_build_dev_artifacts,
-    rollout_main_activation_path, rollout_previous_binary_path, rollout_remote_repo_path,
-    rollout_shadow_finalize_path, rollout_staged_main_binary, rollout_staged_shadow_binary,
-    rollout_timestamp_now, select_rollout_main_host, select_rollout_shadow_host,
-    shadow_main_should_start, source_heads_match, stage_native_dylib_loader_state_rollback,
-    stage_pending_shadow_rollout, stage_rollout_file, stage_rollout_file_pair,
-    validate_rollout_upload_component, verify_rollout_uploaded_artifact,
-    verify_rollout_uploaded_module, write_json, write_main_activation, write_rollout_status,
+    rollout_bind_covers_manual_tcp_endpoint, rollout_build_artifacts, rollout_main_activation_path,
+    rollout_previous_binary_path, rollout_remote_repo_path, rollout_shadow_finalize_path,
+    rollout_staged_main_binary, rollout_staged_shadow_binary, rollout_timestamp_now,
+    select_rollout_main_host, select_rollout_shadow_host, shadow_main_should_start,
+    source_heads_match, stage_native_dylib_loader_state_rollback, stage_pending_shadow_rollout,
+    stage_rollout_file, stage_rollout_file_pair, validate_rollout_upload_component,
+    verify_rollout_uploaded_artifact, verify_rollout_uploaded_module, write_json,
+    write_main_activation, write_rollout_status,
 };
 use std::collections::BTreeSet;
 use std::env;
@@ -306,7 +306,7 @@ fn start_cluster_rollout_build_heartbeat(
                 &requested_at,
                 phase,
                 progress_current,
-                format!("cargo build running for {elapsed}s"),
+                format!("build-service compiler running for {elapsed}s"),
             );
         }
     });
@@ -3753,7 +3753,7 @@ pub fn handle_daemon_rollout_build_request(
         &requested_at,
         "building",
         2,
-        "cargo build running",
+        "build-service compiler running",
     )?;
     let (heartbeat_stop, heartbeat) = start_cluster_rollout_build_heartbeat(
         paths.clone(),
@@ -3764,7 +3764,7 @@ pub fn handle_daemon_rollout_build_request(
         "building",
         2,
     );
-    let built_artifacts = match rollout_build_dev_artifacts(&repo, &rollout_paths.build_log) {
+    let built_artifacts = match rollout_build_artifacts(&repo, &rollout_paths.build_log) {
         Ok(artifacts) => {
             let _ = heartbeat_stop.send(());
             let _ = heartbeat.join();

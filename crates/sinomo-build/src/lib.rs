@@ -8,22 +8,28 @@
 mod artifact;
 mod client_protocol;
 mod executor;
+mod manager;
 mod module;
 mod paths;
 mod process;
 mod protocol;
+mod resource;
 mod service;
+mod source;
 mod target;
 
 pub use artifact::*;
 pub use client_protocol::*;
 pub use executor::*;
+pub use manager::*;
 pub use module::*;
 pub use paths::*;
 pub use protocol::*;
+pub use resource::*;
 pub use service::{
     BuildService, component_factory, register_services, register_services_for_data_dir,
 };
+pub use source::*;
 pub use target::*;
 
 use thiserror::Error;

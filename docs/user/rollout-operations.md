@@ -29,7 +29,8 @@ the selected nodes' explicit target requirements, groups compatible targets,
 and asks the cluster build service for one verified artifact per group. A cache
 hit is distributed immediately. Otherwise the service queues one build for
 matching requests and selects a live compatible worker using toolchain support,
-available CPU and memory, queue pressure, and transfer locality.
+available CPU, memory and disk headroom, current load, queue pressure, and
+transfer locality.
 
 The selected worker need not be the rollout target. For example, a server with
 the correct cross-toolchain should build a Raspberry Pi artifact when it can
@@ -60,11 +61,13 @@ sinomo rollout cluster \
   --target 192.168.1.154:21353
 ```
 
-The default command uses the cluster build service. `--remote-build` is the
-explicit mixed-version recovery path: it retains the older behavior in which
-each target builds its own managed checkout. That path bypasses scheduling and
-may be very slow on constrained targets. `--remote-repo` and `--force-source`
-belong to this legacy path.
+The default command uses the cluster build service. `--remote-build` is retained
+as a compatibility spelling and now selects the same service. For a
+mixed-version recovery that must use a checkout already present on the target,
+combine it with `--remote-repo`; this bypasses cluster placement but still uses
+the same build-owned executor, cache, resource admission, and artifact
+verification. `--force-source` applies only while importing a managed source
+checkout.
 
 Each build server advertises its installed host target automatically. To let a
 server build for additional installed Rust targets, set a comma-separated list
@@ -87,9 +90,12 @@ Build and activate the current machine's managed source:
 sinomo rollout apply
 ```
 
-Local apply remains a bootstrap and development convenience and still builds
-locally. A clustered shared update should use the cluster workflow so other
-compatible nodes can reuse the same build result.
+Local apply remains a bootstrap and development convenience. It submits the
+managed checkout to the same build-owned planner and executor locally, uses a
+release profile, reuses the content-addressed artifact cache and incremental
+target directory, and then hands the verified outputs to rollout. A clustered
+shared update should use the cluster workflow so other compatible nodes can
+reuse the same build result.
 
 Import an external checkout and apply it in one step:
 
@@ -140,8 +146,8 @@ target.
 The rollout target is only a build candidate when it advertises the required
 capability. It receives no local-first preference, so a much faster compatible
 server normally wins a cache miss. The command does not silently fall back to
-the old per-target build path; use `--remote-build` only when that tradeoff is
-intentional.
+target-local source. An explicit `--remote-repo` is required for that recovery
+behavior.
 
 ## Activation Safety
 
@@ -171,10 +177,10 @@ For a remote target:
 sinomo rollout diagnostics --target 192.168.1.154:21353
 ```
 
-Diagnostics include rollout state, the legacy/local build log, and candidate
-output tails. Cluster-build job records, source bundles, logs, workspaces, and
-verified cache entries live under `$SINOMO_DATA_DIR/build/` on each build
-server.
+Diagnostics include rollout state, the latest local build-service log, and
+candidate output tails. Cluster-build job records, source bundles, logs,
+workspaces, reusable target directories, and verified cache entries live under
+`$SINOMO_DATA_DIR/build/` on each build server.
 The main local artifacts are under `$SINOMO_DATA_DIR/rollout/`; use the
 diagnostics command before inspecting those files directly.
 
@@ -212,6 +218,7 @@ SHADOW_ENDPOINT=shadow-host.example:21354
 sinomo rollout diagnostics --target "$SHADOW_ENDPOINT"
 sinomo rollout cluster \
   --remote-build \
+  --remote-repo /path/to/sinomo \
   --skip-local \
   --target "$SHADOW_ENDPOINT"
 ```
@@ -227,11 +234,12 @@ This clears the recorded status; it does not delete pending candidate files.
 
 ## Managed Source
 
-The managed source checkout lives under `$SINOMO_DATA_DIR/source/sinomo`. Import
-merges reviewed external changes into that checkout and removes external remotes
-so later builds do not depend on a public forge. Cluster builds identify an
-immutable source input from this reviewed state; workers materialize that input
-instead of depending on an independently mutable checkout on every target.
+The build service owns the managed source checkout at
+`$SINOMO_DATA_DIR/source/sinomo`. Import merges reviewed external changes into
+that checkout and removes external remotes so later builds do not depend on a
+public forge. Cluster builds identify an immutable source input from this
+reviewed state; workers materialize that input instead of depending on an
+independently mutable checkout on every target.
 
 To bring self-evolution changes back to an external checkout:
 

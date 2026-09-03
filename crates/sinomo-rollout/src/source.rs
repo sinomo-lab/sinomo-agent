@@ -1,23 +1,15 @@
 use crate::{
-    RolloutError, SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths,
-    append_native_dylib_module_build_args, discover_all_native_dylib_module_builds,
-    discover_default_native_dylib_module_builds, ensure_rollout_layout, rollout_staged_main_binary,
+    RolloutError, SelfRolloutPaths, ensure_rollout_layout, rollout_staged_main_binary,
     rollout_staged_shadow_binary, stage_rollout_file_pair,
 };
 use std::env;
-use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
-const ROLLOUT_NATIVE_DYLIB_TARGET_DIR: &str = "rollout-native-dylib";
-
-#[cfg(windows)]
-fn rollout_child_command(program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
+#[cfg(all(test, windows))]
+fn rollout_child_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -25,74 +17,13 @@ fn rollout_child_command(program: impl AsRef<OsStr>) -> Command {
     command
 }
 
-#[cfg(not(windows))]
-fn rollout_child_command(program: impl AsRef<OsStr>) -> Command {
-    Command::new(program)
-}
-
-fn rollout_cargo_program() -> OsString {
-    rollout_cargo_program_from_environment(
-        env::var_os("CARGO"),
-        env::var_os("CARGO_HOME").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
-        env::var_os("USERPROFILE").map(PathBuf::from),
-    )
-}
-
-fn rollout_cargo_program_from_environment(
-    explicit_cargo: Option<OsString>,
-    cargo_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-    user_profile: Option<PathBuf>,
-) -> OsString {
-    if let Some(explicit_cargo) = explicit_cargo.filter(|value| !value.is_empty()) {
-        return explicit_cargo;
-    }
-
-    let executable = format!("cargo{}", env::consts::EXE_SUFFIX);
-    let mut candidates = Vec::new();
-    if let Some(cargo_home) = cargo_home {
-        candidates.push(cargo_home.join("bin").join(&executable));
-    }
-    for home in [home, user_profile].into_iter().flatten() {
-        candidates.push(home.join(".cargo").join("bin").join(&executable));
-    }
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map(PathBuf::into_os_string)
-        .unwrap_or_else(|| OsString::from("cargo"))
+#[cfg(all(test, not(windows)))]
+fn rollout_child_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    std::process::Command::new(program)
 }
 
 pub fn discover_current_git_repo() -> Result<Option<PathBuf>, RolloutError> {
-    let current_dir = std::env::current_dir().map_err(|source| RolloutError::Io {
-        path: ".".to_string(),
-        detail: source.to_string(),
-    })?;
-    let output = rollout_child_command("git")
-        .args(["-C"])
-        .arg(&current_dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if root.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(PathBuf::from(root)))
-            }
-        }
-        Ok(_) if current_dir.join(".git").exists() && current_dir.join("Cargo.toml").exists() => {
-            Ok(Some(current_dir))
-        }
-        Ok(_) => Ok(None),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(RolloutError::Io {
-            path: "git rev-parse --show-toplevel".to_string(),
-            detail: source.to_string(),
-        }),
-    }
+    sinomo_build::discover_current_git_repo().map_err(Into::into)
 }
 
 pub fn rollout_artifact_suffix() -> String {
@@ -104,55 +35,19 @@ pub fn rollout_artifact_suffix() -> String {
 }
 
 pub fn rollout_source_head(repo: &Path) -> Result<String, RolloutError> {
-    let output = rollout_child_command("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--short=8", "HEAD"])
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!("git -C {} rev-parse --short=8 HEAD", repo.display()),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let head = sinomo_build::build_source_head(repo)?;
+    Ok(head.chars().take(8).collect())
 }
 
 /// Resolve a full or abbreviated Git object name to its unique canonical
 /// commit. Git performs the abbreviation ambiguity check; callers must not
 /// treat a textual prefix match as artifact identity.
 pub fn resolve_rollout_source_commit(repo: &Path, revision: &str) -> Result<String, RolloutError> {
-    let revision = revision.trim();
-    if revision.len() < 7 || !revision.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(RolloutError::InvalidArtifact {
-            detail: format!("rollout source revision {revision:?} is not a Git commit id"),
-        });
-    }
-    let commit = format!("{revision}^{{commit}}");
-    let resolved = git_one_line(
-        repo,
-        &["rev-parse", "--verify", "--end-of-options", &commit],
-    )?;
-    if resolved.len() < 40 || !resolved.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(RolloutError::InvalidArtifact {
-            detail: format!(
-                "rollout source revision {revision:?} resolved to invalid commit {resolved:?}"
-            ),
-        });
-    }
-    Ok(resolved.to_ascii_lowercase())
+    sinomo_build::resolve_build_source_commit(repo, revision).map_err(Into::into)
 }
 
 pub fn source_heads_match(actual: Option<&str>, expected: &str) -> bool {
-    let Some(actual) = actual else {
-        return false;
-    };
-    actual == expected || actual.starts_with(expected) || expected.starts_with(actual)
+    sinomo_build::build_source_heads_match(actual, expected)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,259 +66,126 @@ pub struct LocalRolloutNativeDylibModuleArtifact {
     pub source: String,
 }
 
-impl From<SelfRolloutNativeDylibModuleBuild> for LocalRolloutNativeDylibModuleArtifact {
-    fn from(value: SelfRolloutNativeDylibModuleBuild) -> Self {
-        Self {
-            module_id: value.module_id,
-            interface_version: value.interface_version,
-            cache_key: value.cache_key,
-            library_name: value.library_name,
-            built_library: value.built_library,
-            source: value.source,
-        }
-    }
-}
-
-pub fn rollout_build_dev_artifacts(
+pub fn rollout_build_artifacts(
     repo: &Path,
     build_log: &Path,
 ) -> Result<RolloutBuiltArtifacts, RolloutError> {
-    let modules = rollout_native_dylib_modules_for_build(
+    execute_rollout_build(
         repo,
-        discover_default_native_dylib_module_builds(repo)?,
-    );
-    let _source_guards = prepare_rollout_build_source(repo)?;
-
-    let binary_build_args = rollout_binary_build_args();
-    let (binary_command, binary_build) = run_rollout_cargo_build(repo, &binary_build_args, None)?;
-    let mut log = rollout_build_log_section(repo, &binary_command, &binary_build);
-    if !binary_build.status.success() {
-        fs::write(build_log, &log).map_err(|source| RolloutError::Io {
-            path: build_log.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        return Err(rollout_build_process_error(binary_command, &binary_build));
-    }
-
-    if !modules.is_empty() {
-        let module_build_args = rollout_module_build_args(&modules);
-        let module_target_dir = rollout_native_dylib_target_dir(repo);
-        let (module_command, module_build) =
-            run_rollout_cargo_build(repo, &module_build_args, Some(&module_target_dir))?;
-        log.push_str("\n---\n\n");
-        log.push_str(&rollout_build_log_section(
-            repo,
-            &module_command,
-            &module_build,
-        ));
-        if !module_build.status.success() {
-            fs::write(build_log, &log).map_err(|source| RolloutError::Io {
-                path: build_log.display().to_string(),
-                detail: source.to_string(),
-            })?;
-            return Err(rollout_build_process_error(module_command, &module_build));
-        }
-    }
-
-    fs::write(build_log, &log).map_err(|source| RolloutError::Io {
-        path: build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let built_binary = repo
-        .join("target")
-        .join("debug")
-        .join(format!("sinomo{}", env::consts::EXE_SUFFIX));
-    ensure_artifact_exists(&built_binary)?;
-    let native_dylib_modules = modules
-        .into_iter()
-        .map(LocalRolloutNativeDylibModuleArtifact::from)
-        .collect::<Vec<_>>();
-    for module in &native_dylib_modules {
-        ensure_artifact_exists(&module.built_library)?;
-    }
-    Ok(RolloutBuiltArtifacts {
-        built_binary,
-        native_dylib_modules,
-    })
+        build_log,
+        sinomo_build::LocalBuildOutputSelection::Full,
+    )
 }
 
-pub fn rollout_build_dev_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
-    let _source_guards = prepare_rollout_build_source(repo)?;
-    let build_args = rollout_binary_build_args();
-    let (command, build) = run_rollout_cargo_build(repo, &build_args, None)?;
-    let log = rollout_build_log_section(repo, &command, &build);
-    fs::write(build_log, log).map_err(|source| RolloutError::Io {
-        path: build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if !build.status.success() {
-        return Err(rollout_build_process_error(command, &build));
-    }
-    let built_binary = repo
-        .join("target")
-        .join("debug")
-        .join(format!("sinomo{}", env::consts::EXE_SUFFIX));
-    ensure_artifact_exists(&built_binary)?;
-    Ok(built_binary)
+pub fn rollout_build_binary(repo: &Path, build_log: &Path) -> Result<PathBuf, RolloutError> {
+    Ok(execute_rollout_build(
+        repo,
+        build_log,
+        sinomo_build::LocalBuildOutputSelection::Binary,
+    )?
+    .built_binary)
 }
 
-fn rollout_build_dev_native_dylib_modules(
+fn rollout_build_native_dylib_modules(
     repo: &Path,
     build_log: &Path,
 ) -> Result<Vec<LocalRolloutNativeDylibModuleArtifact>, RolloutError> {
-    let modules = rollout_native_dylib_modules_for_build(
+    Ok(execute_rollout_build(
         repo,
-        discover_default_native_dylib_module_builds(repo)?,
-    );
-    let build_args = rollout_module_build_args(&modules);
-    let _source_guards = prepare_rollout_build_source(repo)?;
-    let module_target_dir = rollout_native_dylib_target_dir(repo);
-    let build = rollout_cargo_build_command(repo, &build_args, Some(&module_target_dir))?
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: format!("cargo {}", build_args.join(" ")),
-            detail: source.to_string(),
-        })?;
-    let command = rollout_cargo_build_log_command(&build_args, Some(&module_target_dir));
-    let log = format!(
-        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        repo.display(),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-    fs::write(build_log, log).map_err(|source| RolloutError::Io {
-        path: build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if !build.status.success() {
-        return Err(RolloutError::Process {
-            command,
-            status: build.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-        });
-    }
-    let artifacts = modules
-        .into_iter()
-        .map(LocalRolloutNativeDylibModuleArtifact::from)
-        .collect::<Vec<_>>();
-    for module in &artifacts {
-        ensure_artifact_exists(&module.built_library)?;
-    }
-    Ok(artifacts)
+        build_log,
+        sinomo_build::LocalBuildOutputSelection::DefaultNativeModules,
+    )?
+    .native_dylib_modules)
 }
 
-pub fn rollout_build_dev_native_dylib_module(
+pub fn rollout_build_native_dylib_module(
     repo: &Path,
     build_log: &Path,
     selector: &str,
 ) -> Result<LocalRolloutNativeDylibModuleArtifact, RolloutError> {
-    let modules = discover_all_native_dylib_module_builds(repo)?;
-    let matches = modules
-        .into_iter()
-        .filter(|module| rollout_module_selector_matches(module, selector))
-        .collect::<Vec<_>>();
-    let module = match matches.as_slice() {
-        [module] => module.clone(),
-        [] => {
-            return Err(RolloutError::InvalidArtifact {
-                detail: format!("no native-dylib module matches `{selector}`"),
-            });
-        }
-        many => {
-            return Err(RolloutError::InvalidArtifact {
-                detail: format!(
-                    "native-dylib module selector `{selector}` matched multiple modules: {}",
-                    many.iter()
-                        .map(|module| module.module_id.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
-            });
-        }
-    };
-    let module = rollout_native_dylib_module_for_build(repo, module);
-    let build_args = rollout_single_module_build_args(&module);
-    let _source_guards = prepare_rollout_build_source(repo)?;
-    let module_target_dir = rollout_native_dylib_target_dir(repo);
-    let build = rollout_cargo_build_command(repo, &build_args, Some(&module_target_dir))?
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: format!("cargo {}", build_args.join(" ")),
+    let mut modules = execute_rollout_build(
+        repo,
+        build_log,
+        sinomo_build::LocalBuildOutputSelection::NativeModule(selector.to_string()),
+    )?
+    .native_dylib_modules;
+    modules.pop().ok_or_else(|| RolloutError::InvalidArtifact {
+        detail: format!("build service returned no native module for `{selector}`"),
+    })
+}
+
+fn execute_rollout_build(
+    repo: &Path,
+    build_log: &Path,
+    selection: sinomo_build::LocalBuildOutputSelection,
+) -> Result<RolloutBuiltArtifacts, RolloutError> {
+    let requires_binary = matches!(
+        &selection,
+        sinomo_build::LocalBuildOutputSelection::Full
+            | sinomo_build::LocalBuildOutputSelection::Binary
+    );
+    let build_root = build_log.parent().ok_or_else(|| RolloutError::Io {
+        path: build_log.display().to_string(),
+        detail: "build log has no parent directory".to_string(),
+    })?;
+    let paths = sinomo_build::BuildPaths::from_build_root(build_root);
+    let result = sinomo_build::execute_local_build(&paths, repo, selection)?;
+    if result.build_log != build_log {
+        fs::copy(&result.build_log, build_log).map_err(|source| RolloutError::Io {
+            path: build_log.display().to_string(),
             detail: source.to_string(),
         })?;
-    let command = rollout_cargo_build_log_command(&build_args, Some(&module_target_dir));
-    let log = format!(
-        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        repo.display(),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
-    fs::write(build_log, log).map_err(|source| RolloutError::Io {
-        path: build_log.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    if !build.status.success() {
-        return Err(RolloutError::Process {
-            command,
-            status: build.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-        });
     }
-    ensure_artifact_exists(&module.built_library)?;
-    Ok(LocalRolloutNativeDylibModuleArtifact::from(module))
-}
-
-fn rollout_binary_build_args() -> Vec<String> {
-    vec![
-        "build".to_string(),
-        "--locked".to_string(),
-        "-p".to_string(),
-        "sinomo".to_string(),
-    ]
-}
-
-#[cfg(test)]
-fn rollout_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec![
-        "build".to_string(),
-        "--locked".to_string(),
-        "-p".to_string(),
-        "sinomo".to_string(),
-    ];
-    append_native_dylib_module_build_args(&mut args, modules);
-    args
-}
-
-fn rollout_module_build_args(modules: &[SelfRolloutNativeDylibModuleBuild]) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--locked".to_string()];
-    append_native_dylib_module_build_args(&mut args, modules);
-    args
-}
-
-fn rollout_single_module_build_args(module: &SelfRolloutNativeDylibModuleBuild) -> Vec<String> {
-    let mut args = vec![
-        "build".to_string(),
-        "--locked".to_string(),
-        "-p".to_string(),
-        module.package.clone(),
-    ];
-    if !module.features.is_empty() {
-        args.push("--features".to_string());
-        args.push(module.features.join(","));
+    let mut built_binary = None;
+    let mut native_dylib_modules = Vec::new();
+    for artifact in &result.manifest.artifacts {
+        let path = result.artifact_path(&artifact.artifact_id).ok_or_else(|| {
+            RolloutError::MissingArtifact {
+                artifact: artifact.artifact_id.clone(),
+            }
+        })?;
+        ensure_artifact_exists(&path)?;
+        match artifact.kind {
+            sinomo_build::BuildArtifactKind::Binary => {
+                if built_binary.replace(path).is_some() {
+                    return Err(RolloutError::InvalidArtifact {
+                        detail: "build service returned multiple rollout binaries".to_string(),
+                    });
+                }
+            }
+            sinomo_build::BuildArtifactKind::NativeDylibModule => {
+                let metadata = artifact.native_dylib.as_ref().ok_or_else(|| {
+                    RolloutError::InvalidArtifact {
+                        detail: format!(
+                            "native module artifact {} has no loader metadata",
+                            artifact.artifact_id
+                        ),
+                    }
+                })?;
+                native_dylib_modules.push(LocalRolloutNativeDylibModuleArtifact {
+                    module_id: metadata.module_id.to_string(),
+                    interface_version: metadata.interface_version.clone(),
+                    cache_key: metadata.cache_key.clone(),
+                    library_name: metadata.library_name.clone(),
+                    built_library: path,
+                    source: metadata.source.clone(),
+                });
+            }
+        }
     }
-    args
-}
-
-fn rollout_module_selector_matches(
-    module: &SelfRolloutNativeDylibModuleBuild,
-    selector: &str,
-) -> bool {
-    module.module_id == selector
-        || module.package == selector
-        || module.cache_key == selector
-        || module.source == selector
+    native_dylib_modules.sort_by(|left, right| left.module_id.cmp(&right.module_id));
+    let built_binary = match (requires_binary, built_binary) {
+        (true, None) => {
+            return Err(RolloutError::InvalidArtifact {
+                detail: "build service returned no rollout binary".to_string(),
+            });
+        }
+        (_, built_binary) => built_binary.unwrap_or_default(),
+    };
+    Ok(RolloutBuiltArtifacts {
+        built_binary,
+        native_dylib_modules,
+    })
 }
 
 fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {
@@ -436,147 +198,7 @@ fn ensure_artifact_exists(path: &Path) -> Result<(), RolloutError> {
     }
 }
 
-fn rollout_build_commit_override(repo: &Path) -> Result<String, RolloutError> {
-    git_one_line(repo, &["rev-parse", "--short=12", "HEAD"])
-}
-
-fn rollout_cargo_build_command(
-    repo: &Path,
-    build_args: &[String],
-    target_dir: Option<&Path>,
-) -> Result<Command, RolloutError> {
-    let commit = rollout_build_commit_override(repo)?;
-    let mut command = rollout_child_command(rollout_cargo_program());
-    command
-        .args(build_args)
-        .current_dir(repo)
-        .env(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV, commit);
-    if let Some(target_dir) = target_dir {
-        command.env("CARGO_TARGET_DIR", target_dir);
-    }
-    Ok(command)
-}
-
-fn run_rollout_cargo_build(
-    repo: &Path,
-    build_args: &[String],
-    target_dir: Option<&Path>,
-) -> Result<(String, std::process::Output), RolloutError> {
-    let command = rollout_cargo_build_log_command(build_args, target_dir);
-    let build = rollout_cargo_build_command(repo, build_args, target_dir)?
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: command.clone(),
-            detail: source.to_string(),
-        })?;
-    Ok((command, build))
-}
-
-fn rollout_cargo_build_log_command(build_args: &[String], target_dir: Option<&Path>) -> String {
-    let command = format!("cargo {}", build_args.join(" "));
-    match target_dir {
-        Some(target_dir) => format!("CARGO_TARGET_DIR={} {command}", target_dir.display()),
-        None => command,
-    }
-}
-
-fn rollout_native_dylib_target_dir(repo: &Path) -> PathBuf {
-    repo.join("target").join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR)
-}
-
-fn rollout_native_dylib_artifact_dir(repo: &Path) -> PathBuf {
-    rollout_native_dylib_target_dir(repo).join("debug")
-}
-
-fn rollout_native_dylib_modules_for_build(
-    repo: &Path,
-    modules: Vec<SelfRolloutNativeDylibModuleBuild>,
-) -> Vec<SelfRolloutNativeDylibModuleBuild> {
-    modules
-        .into_iter()
-        .map(|module| rollout_native_dylib_module_for_build(repo, module))
-        .collect()
-}
-
-fn rollout_native_dylib_module_for_build(
-    repo: &Path,
-    mut module: SelfRolloutNativeDylibModuleBuild,
-) -> SelfRolloutNativeDylibModuleBuild {
-    module.built_library = rollout_native_dylib_artifact_dir(repo).join(&module.library_name);
-    module
-}
-
-fn rollout_build_log_section(repo: &Path, command: &str, build: &std::process::Output) -> String {
-    format!(
-        "command: {command}\nrepo: {}\nstatus: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        repo.display(),
-        build.status,
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    )
-}
-
-fn rollout_build_process_error(command: String, build: &std::process::Output) -> RolloutError {
-    RolloutError::Process {
-        command,
-        status: build.status.code().unwrap_or(-1),
-        stderr: String::from_utf8_lossy(&build.stderr).trim().to_string(),
-    }
-}
-
-/// Restores the rollout lockfile snapshot when dropped.
-///
-/// Cluster build hosts use this guard around the compiler executor while
-/// keeping artifact construction and caching outside the rollout path.
-pub struct RolloutBuildSourceGuards {
-    _lockfile: RolloutBuildLockfileGuard,
-}
-
-pub fn prepare_rollout_build_source(repo: &Path) -> Result<RolloutBuildSourceGuards, RolloutError> {
-    let lockfile = RolloutBuildLockfileGuard::capture(repo)?;
-    Ok(RolloutBuildSourceGuards {
-        _lockfile: lockfile,
-    })
-}
-
-struct RolloutBuildLockfileGuard {
-    path: PathBuf,
-    original: Option<Vec<u8>>,
-}
-
-impl RolloutBuildLockfileGuard {
-    fn capture(repo: &Path) -> Result<Self, RolloutError> {
-        let path = repo.join("Cargo.lock");
-        let original = match fs::read(&path) {
-            Ok(original) => Some(original),
-            Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(RolloutError::Io {
-                    path: path.display().to_string(),
-                    detail: source.to_string(),
-                });
-            }
-        };
-        Ok(Self { path, original })
-    }
-}
-
-impl Drop for RolloutBuildLockfileGuard {
-    fn drop(&mut self) {
-        match self.original.take() {
-            Some(original) => {
-                let _ = fs::write(&self.path, original);
-            }
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => {}
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-                Err(_) => {}
-            },
-        }
-    }
-}
-
-pub fn prepare_rollout_dev_binary(
+pub fn prepare_rollout_binary(
     paths: &SelfRolloutPaths,
     repo: &Path,
     binary: Option<&Path>,
@@ -590,10 +212,10 @@ pub fn prepare_rollout_dev_binary(
         }
         return Ok(binary.to_path_buf());
     }
-    rollout_build_dev_binary(repo, &paths.plan().build_log)
+    rollout_build_binary(repo, &paths.plan().build_log)
 }
 
-pub fn prepare_rollout_dev_artifacts(
+pub fn prepare_rollout_artifacts(
     paths: &SelfRolloutPaths,
     repo: &Path,
     binary: Option<&Path>,
@@ -603,13 +225,13 @@ pub fn prepare_rollout_dev_artifacts(
         ensure_artifact_exists(binary)?;
         return Ok(RolloutBuiltArtifacts {
             built_binary: binary.to_path_buf(),
-            native_dylib_modules: rollout_build_dev_native_dylib_modules(
+            native_dylib_modules: rollout_build_native_dylib_modules(
                 repo,
                 &paths.plan().build_log,
             )?,
         });
     }
-    rollout_build_dev_artifacts(repo, &paths.plan().build_log)
+    rollout_build_artifacts(repo, &paths.plan().build_log)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -635,7 +257,7 @@ pub fn prepare_local_rollout_artifacts_with_options(
     ensure_rollout_layout(paths)?;
     ensure_rollout_source_repo_with_options(paths, repo, source_options)?;
     let plan = paths.plan();
-    let built_artifacts = rollout_build_dev_artifacts(&plan.build_dir, &plan.build_log)?;
+    let built_artifacts = rollout_build_artifacts(&plan.source_repo, &plan.build_log)?;
     stage_local_rollout_artifacts(paths, built_artifacts)
 }
 
@@ -666,10 +288,11 @@ pub fn rollout_remote_repo_path(paths: &SelfRolloutPaths, repo: Option<&Path>) -
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ManagedSourceDeployOptions {
-    pub force_overwrite: bool,
+fn build_paths(paths: &SelfRolloutPaths) -> sinomo_build::BuildPaths {
+    sinomo_build::BuildPaths::new(paths.root.parent().unwrap_or(&paths.root))
 }
+
+pub type ManagedSourceDeployOptions = sinomo_build::ManagedSourceDeployOptions;
 
 pub fn ensure_rollout_source_repo(
     paths: &SelfRolloutPaths,
@@ -690,13 +313,9 @@ pub fn create_source_repo_bundle_bytes(
     paths: &SelfRolloutPaths,
     repo: &Path,
 ) -> Result<(Vec<u8>, String), RolloutError> {
-    let bundle = paths
-        .root
-        .join("staged")
-        .join(format!("source-{}.bundle", rollout_artifact_suffix()));
-    create_source_repo_bundle(repo, &bundle)?;
-    let bytes = fs::read(&bundle).map_err(|source| RolloutError::Io {
-        path: bundle.display().to_string(),
+    let bundle = sinomo_build::prepare_source_bundle(&build_paths(paths), repo)?;
+    let bytes = fs::read(&bundle.path).map_err(|source| RolloutError::Io {
+        path: bundle.path.display().to_string(),
         detail: source.to_string(),
     })?;
     Ok((bytes, rollout_source_head(repo)?))
@@ -726,74 +345,16 @@ pub fn deploy_managed_source_repo_with_options(
     source_repo: &Path,
     options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
-    if same_path_if_exists(source_repo, &paths.source_repo) {
-        return Ok(());
-    }
-    if paths.source_repo.join(".git").exists() {
-        merge_external_repo_into_managed(paths, source_repo, options)?;
-        return Ok(());
-    }
-    let Some(parent) = paths.source_repo.parent() else {
-        return Err(RolloutError::Io {
-            path: paths.source_repo.display().to_string(),
-            detail: "managed source path has no parent".to_string(),
-        });
-    };
-    fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-        path: parent.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let next = paths.source_repo.with_extension("next");
-    let previous = paths.source_repo.with_extension("previous");
-    remove_dir_if_exists(&next)?;
-    let output = rollout_child_command("git")
-        .arg("clone")
-        .arg("--no-hardlinks")
-        .arg(source_repo)
-        .arg(&next)
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: "git clone".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!(
-                "git clone --no-hardlinks {} {}",
-                source_repo.display(),
-                next.display()
-            ),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    remove_dir_if_exists(&previous)?;
-    if paths.source_repo.exists() {
-        fs::rename(&paths.source_repo, &previous).map_err(|source| RolloutError::Io {
-            path: format!("{} -> {}", paths.source_repo.display(), previous.display()),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&next, &paths.source_repo).map_err(|source| RolloutError::Io {
-        path: format!("{} -> {}", next.display(), paths.source_repo.display()),
-        detail: source.to_string(),
-    })?;
-    remove_all_git_remotes(&paths.source_repo)?;
-    remove_dir_if_exists(&previous)
+    sinomo_build::deploy_managed_source_repo(&paths.source_repo, source_repo, options)
+        .map_err(Into::into)
 }
 
 pub fn sync_external_repo_from_managed(
     paths: &SelfRolloutPaths,
     external_repo: &Path,
 ) -> Result<(), RolloutError> {
-    require_git_repo(&paths.source_repo, "managed source repo")?;
-    require_git_repo(external_repo, "external source repo")?;
-    merge_repo_head(
-        external_repo,
-        &paths.source_repo,
-        "sinomo-internal",
-        ManagedSourceDeployOptions::default(),
-    )
+    sinomo_build::sync_external_repo_from_managed(&paths.source_repo, external_repo)
+        .map_err(Into::into)
 }
 
 pub fn deploy_managed_source_repo_or_current(
@@ -827,49 +388,7 @@ pub fn create_source_repo_bundle(
     source_repo: &Path,
     bundle_path: &Path,
 ) -> Result<(), RolloutError> {
-    require_git_repo(source_repo, "source repo")?;
-    let dirty = git_one_line(source_repo, &["status", "--porcelain"])?;
-    if !dirty.is_empty() {
-        return Err(RolloutError::Process {
-            command: format!("git -C {} status --porcelain", source_repo.display()),
-            status: 1,
-            stderr: "source repo has uncommitted changes; commit them before remote-build rollout or use --binary".to_string(),
-        });
-    }
-    if let Some(parent) = bundle_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-            path: parent.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let _ = fs::remove_file(bundle_path);
-    let output = rollout_child_command("git")
-        .arg("-C")
-        .arg(source_repo)
-        .args(["bundle", "create"])
-        .arg(bundle_path)
-        .arg("HEAD")
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: "git bundle create".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!(
-                "git -C {} bundle create {} HEAD",
-                source_repo.display(),
-                bundle_path.display()
-            ),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    run_git(
-        source_repo,
-        &["bundle", "verify", &bundle_path.display().to_string()],
-    )?;
-    Ok(())
+    sinomo_build::create_source_repo_bundle(source_repo, bundle_path).map_err(Into::into)
 }
 
 pub fn deploy_managed_source_bundle(
@@ -888,82 +407,14 @@ pub fn deploy_managed_source_bundle_with_options(
     bundle_path: &Path,
     options: ManagedSourceDeployOptions,
 ) -> Result<(), RolloutError> {
-    if !bundle_path.exists() {
-        return Err(RolloutError::MissingArtifact {
-            artifact: bundle_path.display().to_string(),
-        });
-    }
-    if paths.source_repo.join(".git").exists() {
-        return merge_bundle_head_into_managed(paths, bundle_path, options);
-    }
-    let Some(parent) = paths.source_repo.parent() else {
-        return Err(RolloutError::Io {
-            path: paths.source_repo.display().to_string(),
-            detail: "managed source path has no parent".to_string(),
-        });
-    };
-    fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-        path: parent.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let next = paths.source_repo.with_extension("next");
-    let previous = paths.source_repo.with_extension("previous");
-    remove_dir_if_exists(&next)?;
-    let output = rollout_child_command("git")
-        .arg("clone")
-        .arg(bundle_path)
-        .arg(&next)
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: "git clone".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!("git clone {} {}", bundle_path.display(), next.display()),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    remove_dir_if_exists(&previous)?;
-    if paths.source_repo.exists() {
-        fs::rename(&paths.source_repo, &previous).map_err(|source| RolloutError::Io {
-            path: format!("{} -> {}", paths.source_repo.display(), previous.display()),
-            detail: source.to_string(),
-        })?;
-    }
-    fs::rename(&next, &paths.source_repo).map_err(|source| RolloutError::Io {
-        path: format!("{} -> {}", next.display(), paths.source_repo.display()),
-        detail: source.to_string(),
-    })?;
-    remove_all_git_remotes(&paths.source_repo)?;
-    remove_dir_if_exists(&previous)?;
-    Ok(())
+    sinomo_build::deploy_managed_source_bundle(&paths.source_repo, bundle_path, options)
+        .map_err(Into::into)
 }
 
 pub fn managed_source_status(
     paths: &SelfRolloutPaths,
 ) -> Result<ManagedSourceStatus, RolloutError> {
-    let exists = paths.source_repo.exists();
-    let is_git_repo = paths.source_repo.join(".git").exists();
-    let remotes = if is_git_repo {
-        git_lines(&paths.source_repo, &["remote"])?
-    } else {
-        Vec::new()
-    };
-    let head = if is_git_repo {
-        Some(git_one_line(&paths.source_repo, &["rev-parse", "HEAD"])?)
-    } else {
-        None
-    };
-    Ok(ManagedSourceStatus {
-        path: paths.source_repo.clone(),
-        exists,
-        is_git_repo,
-        has_external_remotes: !remotes.is_empty(),
-        remotes,
-        head,
-    })
+    sinomo_build::managed_source_status(&paths.source_repo).map_err(Into::into)
 }
 
 pub fn rollout_status_view(paths: &SelfRolloutPaths) -> Result<RolloutStatusView, RolloutError> {
@@ -979,15 +430,7 @@ pub fn rollout_status_view(paths: &SelfRolloutPaths) -> Result<RolloutStatusView
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedSourceStatus {
-    pub path: PathBuf,
-    pub exists: bool,
-    pub is_git_repo: bool,
-    pub has_external_remotes: bool,
-    pub remotes: Vec<String>,
-    pub head: Option<String>,
-}
+pub type ManagedSourceStatus = sinomo_build::ManagedSourceStatus;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RolloutStatusView {
@@ -1001,166 +444,12 @@ pub struct RolloutStatusView {
     pub source_status: ManagedSourceStatus,
 }
 
-fn merge_external_repo_into_managed(
-    paths: &SelfRolloutPaths,
-    source_repo: &Path,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    require_git_repo(&paths.source_repo, "managed source repo")?;
-    require_git_repo(source_repo, "external source repo")?;
-    merge_repo_head(&paths.source_repo, source_repo, "sinomo-external", options)?;
-    remove_all_git_remotes(&paths.source_repo)
+pub fn remove_dir_if_exists(path: &Path) -> Result<(), RolloutError> {
+    sinomo_build::remove_dir_if_exists(path).map_err(Into::into)
 }
 
-fn merge_bundle_head_into_managed(
-    paths: &SelfRolloutPaths,
-    bundle_path: &Path,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    require_git_repo(&paths.source_repo, "managed source repo")?;
-    let fetch = rollout_child_command("git")
-        .arg("-C")
-        .arg(&paths.source_repo)
-        .arg("fetch")
-        .arg(bundle_path)
-        .arg("HEAD")
-        .output()
-        .map_err(|source| RolloutError::Io {
-            path: "git fetch bundle".to_string(),
-            detail: source.to_string(),
-        })?;
-    if !fetch.status.success() {
-        return Err(RolloutError::Process {
-            command: format!(
-                "git -C {} fetch {} HEAD",
-                paths.source_repo.display(),
-                bundle_path.display()
-            ),
-            status: fetch.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&fetch.stderr).trim().to_string(),
-        });
-    }
-    update_managed_repo_to_fetched_head(&paths.source_repo, options)?;
-    remove_all_git_remotes(&paths.source_repo)
-}
-
-fn merge_repo_head(
-    destination_repo: &Path,
-    source_repo: &Path,
-    remote_name: &str,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    let _ = run_git(destination_repo, &["remote", "remove", remote_name]);
-    run_git_paths(
-        destination_repo,
-        &["remote", "add", remote_name],
-        &[source_repo],
-    )?;
-    let fetch_result = run_git(destination_repo, &["fetch", remote_name, "HEAD"]);
-    let remove_result = run_git(destination_repo, &["remote", "remove", remote_name]);
-    fetch_result?;
-    remove_result?;
-    update_managed_repo_to_fetched_head(destination_repo, options)
-}
-
-fn update_managed_repo_to_fetched_head(
-    repo: &Path,
-    options: ManagedSourceDeployOptions,
-) -> Result<(), RolloutError> {
-    if options.force_overwrite {
-        preserve_dirty_managed_source(repo)?;
-        return reset_managed_repo_to_fetched_head(repo);
-    }
-
-    if run_git(repo, &["merge", "--ff-only", "FETCH_HEAD"]).is_ok() {
-        return Ok(());
-    }
-
-    ensure_clean_git_worktree(repo)?;
-    reset_managed_repo_to_fetched_head(repo)
-}
-
-fn reset_managed_repo_to_fetched_head(repo: &Path) -> Result<(), RolloutError> {
-    let current = git_one_line(repo, &["rev-parse", "HEAD"])?;
-    if !current.is_empty() {
-        run_git(
-            repo,
-            &["branch", "-f", "sinomo-managed-source-backup", &current],
-        )?;
-    }
-    run_git(repo, &["reset", "--hard", "FETCH_HEAD"]).map(|_| ())
-}
-
-fn preserve_dirty_managed_source(repo: &Path) -> Result<(), RolloutError> {
-    let status = run_git(repo, &["status", "--porcelain"])?;
-    if status.trim().is_empty() {
-        return Ok(());
-    }
-    run_git(
-        repo,
-        &[
-            "stash",
-            "push",
-            "--include-untracked",
-            "-m",
-            &format!(
-                "sinomo-managed-source-force-overwrite-{}",
-                rollout_artifact_suffix()
-            ),
-        ],
-    )
-    .map(|_| ())
-}
-
-fn ensure_clean_git_worktree(repo: &Path) -> Result<(), RolloutError> {
-    let status = run_git(repo, &["status", "--porcelain"])?;
-    if status.trim().is_empty() {
-        Ok(())
-    } else {
-        Err(RolloutError::Process {
-            command: format!("git -C {} status --porcelain", repo.display()),
-            status: 1,
-            stderr: "managed source worktree has local changes; refusing to overwrite".to_string(),
-        })
-    }
-}
-
-fn remove_all_git_remotes(repo: &Path) -> Result<(), RolloutError> {
-    for remote in git_lines(repo, &["remote"])? {
-        run_git(repo, &["remote", "remove", &remote])?;
-    }
-    let _ = run_git(repo, &["branch", "--unset-upstream"]);
-    Ok(())
-}
-
-fn require_git_repo(repo: &Path, label: &str) -> Result<(), RolloutError> {
-    if repo.join(".git").exists() {
-        Ok(())
-    } else {
-        Err(RolloutError::MissingArtifact {
-            artifact: format!("{label} at {} is not a git repository", repo.display()),
-        })
-    }
-}
-
+#[cfg(test)]
 fn git_one_line(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
-    Ok(git_lines(repo, args)?
-        .into_iter()
-        .next()
-        .unwrap_or_default())
-}
-
-fn git_lines(repo: &Path, args: &[&str]) -> Result<Vec<String>, RolloutError> {
-    let output = run_git(repo, args)?;
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
     let output = rollout_child_command("git")
         .arg("-C")
         .arg(repo)
@@ -1177,48 +466,12 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, RolloutError> {
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn run_git_paths(repo: &Path, args: &[&str], paths: &[&Path]) -> Result<String, RolloutError> {
-    let mut command = rollout_child_command("git");
-    command.arg("-C").arg(repo).args(args);
-    for path in paths {
-        command.arg(path);
-    }
-    let output = command.output().map_err(|source| RolloutError::Io {
-        path: format!("git -C {} {}", repo.display(), args.join(" ")),
-        detail: source.to_string(),
-    })?;
-    if !output.status.success() {
-        return Err(RolloutError::Process {
-            command: format!("git -C {} {}", repo.display(), args.join(" ")),
-            status: output.status.code().unwrap_or(-1),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-pub fn remove_dir_if_exists(path: &Path) -> Result<(), RolloutError> {
-    match fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(RolloutError::Io {
-            path: path.display().to_string(),
-            detail: source.to_string(),
-        }),
-    }
-}
-
-fn same_path_if_exists(left: &Path, right: &Path) -> bool {
-    let Ok(left) = fs::canonicalize(left) else {
-        return false;
-    };
-    let Ok(right) = fs::canonicalize(right) else {
-        return false;
-    };
-    left == right
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string())
 }
 
 #[cfg(test)]
@@ -1271,156 +524,6 @@ mod tests {
             synthetic
         );
         assert!(resolve_rollout_source_commit(&repo, "unknown").is_err());
-    }
-
-    #[test]
-    fn rollout_build_args_use_source_packages() {
-        let module = SelfRolloutNativeDylibModuleBuild {
-            package: "sinomo-test-module".to_string(),
-            features: vec!["sinomo-test-module/test-feature".to_string()],
-            module_id: "module.test".to_string(),
-            interface_version: "test.v1".to_string(),
-            cache_key: "module/test".to_string(),
-            library_name: "libsinomo_test_module.so".to_string(),
-            built_library: PathBuf::from("target/debug/libsinomo_test_module.so"),
-            source: "test".to_string(),
-        };
-
-        assert_eq!(
-            rollout_binary_build_args(),
-            vec!["build", "--locked", "-p", "sinomo"]
-        );
-        assert_eq!(
-            rollout_build_args(std::slice::from_ref(&module)),
-            vec![
-                "build",
-                "--locked",
-                "-p",
-                "sinomo",
-                "-p",
-                "sinomo-test-module",
-                "--features",
-                "sinomo-test-module/test-feature",
-            ]
-        );
-        assert_eq!(
-            rollout_module_build_args(std::slice::from_ref(&module)),
-            vec![
-                "build",
-                "--locked",
-                "-p",
-                "sinomo-test-module",
-                "--features",
-                "sinomo-test-module/test-feature",
-            ]
-        );
-        assert_eq!(
-            rollout_single_module_build_args(&module),
-            vec![
-                "build",
-                "--locked",
-                "-p",
-                "sinomo-test-module",
-                "--features",
-                "sinomo-test-module/test-feature",
-            ]
-        );
-    }
-
-    #[test]
-    fn rollout_native_dylib_modules_build_in_isolated_target_dir() {
-        let repo = Path::new("/tmp/sinomo-source");
-        let module = SelfRolloutNativeDylibModuleBuild {
-            package: "sinomo-test-module".to_string(),
-            features: Vec::new(),
-            module_id: "module.test".to_string(),
-            interface_version: "test.v1".to_string(),
-            cache_key: "module/test".to_string(),
-            library_name: "libsinomo_test_module.so".to_string(),
-            built_library: repo
-                .join("target")
-                .join("debug")
-                .join("libsinomo_test_module.so"),
-            source: "test".to_string(),
-        };
-
-        let retargeted = rollout_native_dylib_module_for_build(repo, module.clone());
-
-        assert_eq!(retargeted.package, module.package);
-        assert_eq!(retargeted.module_id, module.module_id);
-        assert_eq!(
-            retargeted.built_library,
-            repo.join("target")
-                .join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR)
-                .join("debug")
-                .join("libsinomo_test_module.so")
-        );
-    }
-
-    #[test]
-    fn rollout_cargo_build_command_sets_optional_target_dir() {
-        let root = unique_temp("sinomo-rollout-build-command");
-        run_git_for_test(&root, &["init"]);
-        run_git_for_test(&root, &["config", "user.email", "test@example.com"]);
-        run_git_for_test(&root, &["config", "user.name", "Sinomo Test"]);
-        fs::write(root.join("README.md"), "test\n").expect("readme");
-        run_git_for_test(&root, &["add", "README.md"]);
-        run_git_for_test(&root, &["commit", "-m", "init"]);
-
-        let args = vec![
-            "build".to_string(),
-            "--locked".to_string(),
-            "-p".to_string(),
-            "sinomo".to_string(),
-        ];
-        let target_dir = root.join("target").join(ROLLOUT_NATIVE_DYLIB_TARGET_DIR);
-        let command =
-            rollout_cargo_build_command(&root, &args, Some(&target_dir)).expect("command");
-        let envs = command
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().to_string(),
-                    value.map(|value| value.to_string_lossy().to_string()),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let expected_commit =
-            rollout_build_commit_override(&root).expect("rollout build commit override");
-
-        assert!(!envs.contains_key("CARGO_INCREMENTAL"));
-        assert_eq!(
-            envs.get(ROLLOUT_BUILD_COMMIT_OVERRIDE_ENV),
-            Some(&Some(expected_commit)),
-            "the daemon status commit must describe the selected rollout source HEAD"
-        );
-        assert_eq!(
-            envs.get("CARGO_TARGET_DIR"),
-            Some(&Some(target_dir.display().to_string()))
-        );
-        assert_eq!(
-            rollout_cargo_build_log_command(&args, Some(&target_dir)),
-            format!(
-                "CARGO_TARGET_DIR={} cargo build --locked -p sinomo",
-                target_dir.display()
-            )
-        );
-    }
-
-    #[test]
-    fn rollout_cargo_program_finds_user_toolchain_with_sanitized_path() {
-        let root = unique_temp("sinomo-rollout-cargo-program");
-        let cargo = root
-            .join(".cargo")
-            .join("bin")
-            .join(format!("cargo{}", env::consts::EXE_SUFFIX));
-        fs::create_dir_all(cargo.parent().expect("cargo parent")).expect("cargo home");
-        fs::write(&cargo, b"test cargo").expect("cargo executable");
-
-        assert_eq!(
-            rollout_cargo_program_from_environment(None, None, Some(root.to_path_buf()), None),
-            cargo.into_os_string()
-        );
     }
 
     #[test]
@@ -1490,37 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn rollout_build_source_guard_leaves_workspace_manifest_untouched() {
-        let root = unique_temp("sinomo-rollout-build-source");
-        let manifest = root.join("Cargo.toml");
-        let original =
-            "[workspace]\nresolver = \"3\"\ndefault-members = [\n    \"crates/sinomo-app\",\n]\n";
-        fs::write(&manifest, original).expect("manifest");
-
-        {
-            let _guard = prepare_rollout_build_source(&root).expect("guard");
-            assert_eq!(fs::read_to_string(&manifest).expect("manifest"), original);
-        }
-
-        assert_eq!(fs::read_to_string(&manifest).expect("manifest"), original);
-    }
-
-    #[test]
-    fn rollout_build_lockfile_guard_restores_original_lockfile() {
-        let root = unique_temp("sinomo-rollout-build-lockfile");
-        let lockfile = root.join("Cargo.lock");
-        let original = b"# original lockfile\n";
-        fs::write(&lockfile, original).expect("lockfile");
-
-        {
-            let _guard = RolloutBuildLockfileGuard::capture(&root).expect("guard");
-            fs::write(&lockfile, b"# changed lockfile\n").expect("changed lockfile");
-        }
-
-        assert_eq!(fs::read(&lockfile).expect("restored"), original);
-    }
-
-    #[test]
     fn create_source_repo_bundle_bytes_returns_bundle_and_head() {
         let root = unique_temp("sinomo-rollout-source-bundle-bytes");
         let external = root.join("external");
@@ -1540,7 +612,7 @@ mod tests {
 
         assert!(!bundle.is_empty());
         assert_eq!(head, expected_head);
-        assert!(paths.root.join("staged").exists());
+        assert!(build_paths(&paths).sources.exists());
     }
 
     #[test]

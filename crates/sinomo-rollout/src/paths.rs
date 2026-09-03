@@ -20,38 +20,23 @@ impl SelfRolloutPaths {
     pub fn new(data_dir_root: &Path) -> Self {
         let root = data_dir_root.join("rollout");
         let bin = data_dir_root.join("bin");
+        let build_paths = sinomo_build::BuildPaths::new(data_dir_root);
         Self {
-            source_repo: data_dir_root.join("source").join("sinomo"),
+            source_repo: build_paths.managed_source,
             main_binary: bin.join(executable_name("sinomo")),
             shadow_binary: bin.join(executable_name("sinomo-shadow")),
             state: root.join("state.sobj"),
-            build_log: root.join("build.log"),
+            build_log: build_paths.local_log,
             root,
             bin,
         }
     }
 
     pub fn plan(&self) -> SelfRolloutPlan {
-        let native_dylib_modules = default_native_dylib_module_builds(&self.source_repo);
-        let mut build_args = vec![
-            "build".to_string(),
-            "--locked".to_string(),
-            "-p".to_string(),
-            "sinomo".to_string(),
-        ];
-        append_native_dylib_module_build_args(&mut build_args, &native_dylib_modules);
         SelfRolloutPlan {
-            build_program: "cargo".to_string(),
-            build_args,
-            build_dir: self.source_repo.clone(),
-            built_binary: self
-                .source_repo
-                .join("target")
-                .join("debug")
-                .join(executable_name("sinomo")),
+            source_repo: self.source_repo.clone(),
             install_main_binary: self.main_binary.clone(),
             install_shadow_binary: self.shadow_binary.clone(),
-            native_dylib_modules,
             build_log: self.build_log.clone(),
             state: self.state.clone(),
         }
@@ -60,27 +45,11 @@ impl SelfRolloutPaths {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SelfRolloutPlan {
-    pub build_program: String,
-    pub build_args: Vec<String>,
-    pub build_dir: PathBuf,
-    pub built_binary: PathBuf,
+    pub source_repo: PathBuf,
     pub install_main_binary: PathBuf,
     pub install_shadow_binary: PathBuf,
-    pub native_dylib_modules: Vec<SelfRolloutNativeDylibModuleBuild>,
     pub build_log: PathBuf,
     pub state: PathBuf,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct SelfRolloutNativeDylibModuleBuild {
-    pub package: String,
-    pub features: Vec<String>,
-    pub module_id: String,
-    pub interface_version: String,
-    pub cache_key: String,
-    pub library_name: String,
-    pub built_library: PathBuf,
-    pub source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -124,84 +93,10 @@ pub fn native_dylib_library_name(stem: &str) -> String {
     }
 }
 
-pub fn default_native_dylib_module_builds(
-    build_dir: &Path,
-) -> Vec<SelfRolloutNativeDylibModuleBuild> {
-    discover_default_native_dylib_module_builds(build_dir).unwrap_or_default()
-}
-
-pub fn discover_default_native_dylib_module_builds(
-    build_dir: &Path,
-) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    module_builds_from_signed_profile(build_dir, false)
-}
-
-pub fn discover_native_dylib_module_builds(
-    build_dir: &Path,
-) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    discover_default_native_dylib_module_builds(build_dir)
-}
-
-pub fn discover_all_native_dylib_module_builds(
-    build_dir: &Path,
-) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    module_builds_from_signed_profile(build_dir, true)
-}
-
-fn module_builds_from_signed_profile(
-    build_dir: &Path,
-    include_non_default: bool,
-) -> Result<Vec<SelfRolloutNativeDylibModuleBuild>, RolloutError> {
-    let Some(profile) = crate::read_module_distribution_profile(build_dir).map_err(|error| {
-        RolloutError::InvalidArtifact {
-            detail: error.to_string(),
-        }
-    })?
-    else {
-        return Ok(Vec::new());
-    };
-    let mut modules = profile
-        .modules
-        .into_iter()
-        .filter(|entry| entry.applies_to_current_platform())
-        .filter(|entry| include_non_default || entry.default_enabled)
-        .map(|entry| {
-            let library_name = distribution_library_name(&entry.library_name);
-            SelfRolloutNativeDylibModuleBuild {
-                package: entry.package,
-                features: entry.features,
-                module_id: entry.module_id,
-                interface_version: entry.interface_version,
-                cache_key: entry.cache_key,
-                built_library: build_dir.join("target").join("debug").join(&library_name),
-                library_name,
-                source: entry.source,
-            }
-        })
-        .collect::<Vec<_>>();
-    modules.sort_by(|left, right| {
-        left.source
-            .cmp(&right.source)
-            .then_with(|| left.package.cmp(&right.package))
-    });
-    Ok(modules)
-}
-
-fn distribution_library_name(stem_or_name: &str) -> String {
-    let extension = Path::new(stem_or_name)
-        .extension()
-        .and_then(|extension| extension.to_str());
-    if matches!(extension, Some("dll" | "dylib" | "so")) {
-        stem_or_name.to_string()
-    } else {
-        native_dylib_library_name(stem_or_name)
-    }
-}
-
 pub fn discover_native_dylib_module_platform_policies(
-    build_dir: &Path,
+    source_repo: &Path,
 ) -> Result<Vec<NativeDylibModulePlatformPolicy>, RolloutError> {
-    let Some(profile) = crate::read_module_distribution_profile(build_dir).map_err(|error| {
+    let Some(profile) = crate::read_module_distribution_profile(source_repo).map_err(|error| {
         RolloutError::InvalidArtifact {
             detail: error.to_string(),
         }
@@ -300,34 +195,10 @@ pub fn reconcile_rollout_native_dylib_platforms(
     })
 }
 
-pub fn append_native_dylib_module_build_args(
-    args: &mut Vec<String>,
-    modules: &[SelfRolloutNativeDylibModuleBuild],
-) {
-    for module in modules {
-        args.push("-p".to_string());
-        args.push(module.package.clone());
-    }
-    let features = modules
-        .iter()
-        .flat_map(|module| module.features.iter().cloned())
-        .collect::<Vec<_>>();
-    if !features.is_empty() {
-        args.push("--features".to_string());
-        args.push(features.join(","));
-    }
-}
-
 pub fn ensure_rollout_layout(paths: &SelfRolloutPaths) -> Result<(), RolloutError> {
     for path in [&paths.root, &paths.bin] {
         fs::create_dir_all(path).map_err(|source| RolloutError::Io {
             path: path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    if let Some(parent) = paths.source_repo.parent() {
-        fs::create_dir_all(parent).map_err(|source| RolloutError::Io {
-            path: parent.display().to_string(),
             detail: source.to_string(),
         })?;
     }
@@ -355,122 +226,19 @@ mod tests {
             root.join("bin").join(executable_name("sinomo-shadow"))
         );
         assert_eq!(paths.state, root.join("rollout").join("state.sobj"));
-        assert_eq!(paths.build_log, root.join("rollout").join("build.log"));
+        assert_eq!(paths.build_log, root.join("build").join("local.log"));
     }
 
     #[test]
-    fn self_rollout_plan_builds_sinomo_binary_from_source_repo() {
+    fn self_rollout_plan_contains_only_activation_handoff_paths() {
         let paths = SelfRolloutPaths::new(Path::new("/tmp/sinomo-data"));
         let plan = paths.plan();
-        let expected_modules = default_native_dylib_module_builds(&paths.source_repo);
-        let mut expected_build_args = vec![
-            "build".to_string(),
-            "--locked".to_string(),
-            "-p".to_string(),
-            "sinomo".to_string(),
-        ];
-        append_native_dylib_module_build_args(&mut expected_build_args, &expected_modules);
 
-        assert_eq!(plan.build_program, "cargo");
-        assert_eq!(plan.build_args, expected_build_args);
-        assert_eq!(plan.build_dir, paths.source_repo);
-        assert_eq!(
-            plan.built_binary,
-            plan.build_dir
-                .join("target")
-                .join("debug")
-                .join(executable_name("sinomo"))
-        );
+        assert_eq!(plan.source_repo, paths.source_repo);
         assert_eq!(plan.install_main_binary, paths.main_binary);
         assert_eq!(plan.install_shadow_binary, paths.shadow_binary);
-        assert_eq!(
-            plan.native_dylib_modules,
-            default_native_dylib_module_builds(&plan.build_dir)
-        );
-    }
-
-    #[test]
-    fn native_dylib_module_builds_come_from_signed_distribution_profile() {
-        let root = unique_temp("native-dylib-discovery");
-        write_profile(
-            &root,
-            vec![profile_entry(
-                "module.external-fixture",
-                "sinomo.external-fixture.v2",
-                "external-fixture-module",
-                "module/external-fixture",
-                "external_fixture_module",
-                "profile:external-fixture",
-                Vec::new(),
-                true,
-            )],
-        );
-
-        let modules = discover_default_native_dylib_module_builds(&root).expect("discover modules");
-
-        assert_eq!(modules.len(), 1);
-        assert_eq!(modules[0].package, "external-fixture-module");
-        assert_eq!(modules[0].module_id, "module.external-fixture");
-        assert_eq!(modules[0].interface_version, "sinomo.external-fixture.v2");
-        assert_eq!(modules[0].cache_key, "module/external-fixture");
-        assert_eq!(modules[0].source, "profile:external-fixture");
-        assert_eq!(
-            modules[0].built_library,
-            root.join("target")
-                .join("debug")
-                .join(native_dylib_library_name("external_fixture_module"))
-        );
-    }
-
-    #[test]
-    fn signed_profile_filters_platforms_and_opt_in_modules() {
-        let root = unique_temp("native-dylib-discovery-filter");
-        write_profile(
-            &root,
-            vec![
-                profile_entry(
-                    "module.platform-fixture",
-                    "sinomo.platform-fixture.v1",
-                    "platform-fixture-module",
-                    "module/platform-fixture",
-                    "platform_fixture_module",
-                    "profile:platform-fixture",
-                    vec!["windows".to_string()],
-                    true,
-                ),
-                profile_entry(
-                    "module.opt-in-fixture",
-                    "sinomo.opt-in-fixture.v1",
-                    "opt-in-fixture-module",
-                    "module/opt-in-fixture",
-                    "opt_in_fixture_module",
-                    "profile:opt-in-fixture",
-                    Vec::new(),
-                    false,
-                ),
-            ],
-        );
-
-        let modules = discover_default_native_dylib_module_builds(&root).expect("discover modules");
-        let all_modules =
-            discover_all_native_dylib_module_builds(&root).expect("discover all modules");
-
-        assert_eq!(
-            modules
-                .iter()
-                .any(|module| module.package == "platform-fixture-module"),
-            cfg!(windows)
-        );
-        assert!(
-            modules
-                .iter()
-                .all(|module| module.package != "opt-in-fixture-module")
-        );
-        assert!(
-            all_modules
-                .iter()
-                .any(|module| module.package == "opt-in-fixture-module")
-        );
+        assert_eq!(plan.build_log, paths.build_log);
+        assert_eq!(plan.state, paths.state);
     }
 
     #[test]

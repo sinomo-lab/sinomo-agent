@@ -401,7 +401,7 @@ pub(crate) fn install_current_modules(
         );
         return Ok(Vec::new());
     }
-    let artifacts = prepare_rollout_dev_artifacts(&rollout_paths, &repo, Some(&layout.binary))?;
+    let artifacts = prepare_rollout_artifacts(&rollout_paths, &repo, Some(&layout.binary))?;
     install_prepared_native_dylib_modules(&layout.data_dir, &repo, &artifacts.native_dylib_modules)
 }
 

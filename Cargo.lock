@@ -9638,6 +9638,7 @@ name = "sinomo-build"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "fs2",
  "serde",
  "serde_json",
  "sinomo-core",
@@ -10296,6 +10297,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sinomo-build",
  "sinomo-config",
  "sinomo-core",
  "sinomo-module",

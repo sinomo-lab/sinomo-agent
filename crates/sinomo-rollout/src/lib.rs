@@ -112,13 +112,10 @@ pub use native_install::{
     native_dylib_module_install_request,
 };
 pub use paths::{
-    NativeDylibModulePlatformPolicy, NativeDylibPlatformReconciliationReport,
-    SelfRolloutNativeDylibModuleBuild, SelfRolloutPaths, SelfRolloutPlan,
-    append_native_dylib_module_build_args, default_native_dylib_module_builds,
-    discover_all_native_dylib_module_builds, discover_default_native_dylib_module_builds,
-    discover_native_dylib_module_builds, discover_native_dylib_module_platform_policies,
-    ensure_rollout_layout, executable_name, native_dylib_library_name,
-    native_dylib_loader_state_is_host_compatible, reconcile_rollout_native_dylib_platforms,
+    NativeDylibModulePlatformPolicy, NativeDylibPlatformReconciliationReport, SelfRolloutPaths,
+    SelfRolloutPlan, discover_native_dylib_module_platform_policies, ensure_rollout_layout,
+    executable_name, native_dylib_library_name, native_dylib_loader_state_is_host_compatible,
+    reconcile_rollout_native_dylib_platforms,
 };
 pub use process::{MainExitKind, MainExitObservation, classify_main_exit};
 pub use profile::*;
@@ -148,12 +145,11 @@ pub use source::{
     deploy_managed_source_repo_with_options, discover_current_git_repo, ensure_rollout_source_repo,
     ensure_rollout_source_repo_with_options, managed_source_status,
     prepare_local_rollout_artifacts, prepare_local_rollout_artifacts_with_options,
-    prepare_rollout_build_source, prepare_rollout_dev_artifacts, prepare_rollout_dev_binary,
-    prepare_rollout_source_bundle, remove_dir_if_exists, resolve_rollout_source_commit,
-    rollout_artifact_suffix, rollout_build_dev_artifacts, rollout_build_dev_binary,
-    rollout_build_dev_native_dylib_module, rollout_remote_repo_path, rollout_source_head,
-    rollout_status_view, source_heads_match, stage_local_rollout_artifacts,
-    sync_external_repo_from_managed,
+    prepare_rollout_artifacts, prepare_rollout_binary, prepare_rollout_source_bundle,
+    remove_dir_if_exists, resolve_rollout_source_commit, rollout_artifact_suffix,
+    rollout_build_artifacts, rollout_build_binary, rollout_build_native_dylib_module,
+    rollout_remote_repo_path, rollout_source_head, rollout_status_view, source_heads_match,
+    stage_local_rollout_artifacts, sync_external_repo_from_managed,
 };
 pub use state::{
     NativeDylibLoaderRollbackLifecycle, NativeDylibLoaderStateRollback, NativeDylibRolloutGuard,
@@ -371,7 +367,6 @@ pub fn register_storage_paths(
         .field("maximum_automatic_weight_bps", "Option<u16>")
         .field("maximum_candidate_latency_p95_ms", "Option<u64>"),
     )?;
-    layout.register_human_text("sinomo-rollout", StorageRing::R1, "rollout/build.log")?;
     layout.register_human_text(
         "sinomo-rollout",
         StorageRing::R1,
@@ -390,7 +385,6 @@ pub fn register_storage_paths(
         ObjectSchema::new("PendingShadowRollout", STORAGE_CONTRACT_OBJECT_VERSION),
     )?;
     for (relative_path, reason) in [
-        ("source", "managed or imported source repositories"),
         ("bin", "installed runtime binaries"),
         ("rollout/staged", "staged rollout build artifacts"),
         (

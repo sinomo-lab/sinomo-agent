@@ -78,6 +78,35 @@ impl fmt::Display for RolloutError {
 
 impl std::error::Error for RolloutError {}
 
+impl From<sinomo_build::BuildError> for RolloutError {
+    fn from(error: sinomo_build::BuildError) -> Self {
+        match error {
+            sinomo_build::BuildError::Io { path, detail } => Self::Io { path, detail },
+            sinomo_build::BuildError::Process {
+                command,
+                status,
+                stderr,
+            } => Self::Process {
+                command,
+                status,
+                stderr,
+            },
+            sinomo_build::BuildError::HashMismatch {
+                artifact,
+                expected,
+                actual,
+            } => Self::InvalidArtifact {
+                detail: format!(
+                    "build artifact {artifact} failed content verification: expected {expected}, got {actual}"
+                ),
+            },
+            other => Self::InvalidArtifact {
+                detail: other.to_string(),
+            },
+        }
+    }
+}
+
 impl From<sinomo_core::events::EventStoreError> for RolloutError {
     fn from(error: sinomo_core::events::EventStoreError) -> Self {
         Self::Object {

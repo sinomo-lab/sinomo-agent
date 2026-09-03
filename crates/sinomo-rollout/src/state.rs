@@ -1674,6 +1674,8 @@ mod tests {
         let root = unique_temp("sinomo-rollout-diagnostics");
         let paths = SelfRolloutPaths::new(&root);
         fs::create_dir_all(&paths.root).expect("rollout root");
+        fs::create_dir_all(paths.build_log.parent().expect("build log parent"))
+            .expect("build log parent");
         fs::write(&paths.build_log, "build log\n").expect("build log");
         write_rollout_status(
             &paths,
