@@ -1687,20 +1687,29 @@ fn cluster_build_contacts(
     options: &RolloutOptions,
     rollout_groups: &[ClusterBuildTargetGroup],
 ) -> Vec<RolloutTarget> {
-    let mut contacts = Vec::new();
     let mut discovery = options.clone();
     discovery.targets.clear();
     discovery.skip_local = false;
-    if let Ok(discovered) = rollout_cluster_targets(&discovery) {
-        for target in discovered {
-            push_unique_rollout_target(&mut contacts, target);
-        }
-    }
+    let discovered = rollout_cluster_targets(&discovery).unwrap_or_default();
+    cluster_build_contacts_from_discovered(discovered, rollout_groups)
+}
+
+fn cluster_build_contacts_from_discovered(
+    discovered: impl IntoIterator<Item = RolloutTarget>,
+    rollout_groups: &[ClusterBuildTargetGroup],
+) -> Vec<RolloutTarget> {
+    let mut contacts = Vec::new();
+    // Preserve the operator-selected route when it names the same endpoint as
+    // discovery. In particular, an explicit public address must not be
+    // replaced by a node-id route whose current best endpoint is stale.
     for target in rollout_groups
         .iter()
         .flat_map(|group| group.rollout_targets.iter())
     {
         push_unique_rollout_target(&mut contacts, target.clone());
+    }
+    for target in discovered {
+        push_unique_rollout_target(&mut contacts, target);
     }
     contacts
 }
@@ -1867,10 +1876,16 @@ fn build_plan_for_capability(
     features: &[String],
     outputs: &[BuildOutputRequest],
 ) -> Result<BuildPlan, CliError> {
+    let build_source = if capability.supports_source_identity_hash {
+        source.source.clone()
+    } else {
+        source.source.clone().legacy_bundle_key()
+    };
+    let source_hash = build_source.build_key_source_hash().to_string();
     BuildPlan::new(
-        source.source.clone(),
+        build_source,
         BuildKeyInput {
-            source_hash: source.source.bundle_hash.clone(),
+            source_hash,
             source_revision: source.source.revision.clone(),
             lockfile_hash: source.lockfile_hash.clone(),
             target: capability.target.clone(),
@@ -2645,7 +2660,7 @@ mod cluster_build_service_tests {
     use super::*;
     use sinomo_runtime::build::{
         BUILD_PROTOCOL, BuildResourceSnapshot, BuildServiceCapabilities, BuildSource,
-        NativeDylibArtifactMetadata, build_content_hash,
+        NativeDylibArtifactMetadata, build_content_hash, build_source_identity_hash,
     };
 
     fn exact_linux_target() -> BuildTarget {
@@ -2670,6 +2685,7 @@ mod cluster_build_service_tests {
             BuildSource {
                 label: "test-source".to_string(),
                 revision: None,
+                identity_hash: None,
                 bundle_hash: source_hash.clone(),
                 bundle_bytes: 6,
             },
@@ -2692,6 +2708,7 @@ mod cluster_build_service_tests {
                 target,
                 artifact_kinds: vec![BuildArtifactKind::Binary],
                 toolchain_fingerprint,
+                supports_source_identity_hash: true,
             }],
             resources: BuildResourceSnapshot {
                 cpu_threads,
@@ -2721,12 +2738,14 @@ mod cluster_build_service_tests {
     #[test]
     fn cluster_rollout_build_plan_uses_release_profile() {
         let target = exact_linux_target();
-        let source_hash = build_content_hash(b"source");
+        let bundle_hash = build_content_hash(b"source");
+        let identity_hash = build_source_identity_hash("test-revision");
         let source = ClusterBuildSourceInput {
             source: BuildSource {
                 label: "test-source".to_string(),
                 revision: Some("test-revision".to_string()),
-                bundle_hash: source_hash,
+                identity_hash: Some(identity_hash.clone()),
+                bundle_hash: bundle_hash.clone(),
                 bundle_bytes: 6,
             },
             source_repo: PathBuf::from("test-source"),
@@ -2737,6 +2756,7 @@ mod cluster_build_service_tests {
             target,
             artifact_kinds: vec![BuildArtifactKind::Binary],
             toolchain_fingerprint: "test-toolchain".to_string(),
+            supports_source_identity_hash: true,
         };
 
         let plan = build_plan_for_capability(
@@ -2749,6 +2769,63 @@ mod cluster_build_service_tests {
 
         assert_eq!(plan.input.profile, CLUSTER_ROLLOUT_BUILD_PROFILE);
         assert_eq!(plan.input.profile, "release");
+        assert_eq!(plan.input.source_hash, identity_hash);
+        assert_ne!(plan.input.source_hash, bundle_hash);
+    }
+
+    #[test]
+    fn legacy_builder_plan_uses_transport_bundle_hash() {
+        let target = exact_linux_target();
+        let bundle_hash = build_content_hash(b"source");
+        let source = ClusterBuildSourceInput {
+            source: BuildSource {
+                label: "test-source".to_string(),
+                revision: Some("test-revision".to_string()),
+                identity_hash: Some(build_source_identity_hash("test-revision")),
+                bundle_hash: bundle_hash.clone(),
+                bundle_bytes: 6,
+            },
+            source_repo: PathBuf::from("test-source"),
+            source_bundle: PathBuf::from("test-source.bundle"),
+            lockfile_hash: build_content_hash(b"lockfile"),
+        };
+        let capability = BuildTargetCapability {
+            target,
+            artifact_kinds: vec![BuildArtifactKind::Binary],
+            toolchain_fingerprint: "legacy-toolchain".to_string(),
+            supports_source_identity_hash: false,
+        };
+
+        let plan = build_plan_for_capability(
+            &source,
+            &capability,
+            &[],
+            &[BuildOutputRequest::binary("sinomo", "sinomo")],
+        )
+        .expect("legacy plan");
+
+        assert_eq!(plan.input.source_hash, bundle_hash);
+        assert_eq!(plan.source.identity_hash, None);
+    }
+
+    #[test]
+    fn explicit_build_contact_wins_over_same_address_discovery_route() {
+        let address = "129.146.106.76:21353".to_string();
+        let node_id = NodeId::from_legacy_named("oracle-builder").expect("node id");
+        let discovered = RolloutTarget::endpoint_for_node(
+            ClusterEndpointRecord::loopback(node_id.clone(), address.clone()),
+            node_id,
+        );
+        let groups = vec![ClusterBuildTargetGroup {
+            target: exact_linux_target(),
+            rollout_targets: vec![RolloutTarget::address(address.clone())],
+        }];
+
+        let contacts = cluster_build_contacts_from_discovered([discovered], &groups);
+
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].label(), address);
+        assert_eq!(contacts[0].rollout_node_id(), None);
     }
 
     #[test]

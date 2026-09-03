@@ -310,9 +310,9 @@ impl BuildQueueHost {
     ) -> Result<BuildSubmitResponse, ServiceError> {
         self.ensure_initialized()?;
         request.plan.verify_key().map_err(build_service_error)?;
-        if request.plan.source.bundle_hash != request.plan.input.source_hash {
+        if request.plan.source.build_key_source_hash() != request.plan.input.source_hash {
             return Err(ServiceError::Service(
-                "build source bundle hash does not match the source hash in the build key input"
+                "build source identity does not match the source hash in the build key input"
                     .to_string(),
             ));
         }
@@ -861,6 +861,7 @@ fn build_executor_for_targets(
                     BuildArtifactKind::NativeDylibModule,
                 ],
                 toolchain_fingerprint: toolchain.fingerprint.clone(),
+                supports_source_identity_hash: true,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -934,6 +935,12 @@ mod tests {
                 .supported_targets()
                 .iter()
                 .all(|capability| capability.target.rust_target.is_some())
+        );
+        assert!(
+            executor
+                .supported_targets()
+                .iter()
+                .all(|capability| capability.supports_source_identity_hash)
         );
     }
 

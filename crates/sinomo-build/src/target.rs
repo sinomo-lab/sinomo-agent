@@ -135,6 +135,11 @@ pub struct BuildTargetCapability {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifact_kinds: Vec<BuildArtifactKind>,
     pub toolchain_fingerprint: String,
+    /// Newer builders key source-controlled builds by the immutable revision
+    /// identity while verifying the Git bundle independently as transport.
+    /// Missing means the legacy v1 bundle-hash key for rolling upgrades.
+    #[serde(default)]
+    pub supports_source_identity_hash: bool,
 }
 
 impl BuildTargetCapability {
@@ -371,6 +376,13 @@ fn candidate_rank_reason(candidate: &BuildCandidate) -> String {
 mod tests {
     use super::*;
 
+    #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+    struct LegacyBuildTargetCapability {
+        target: BuildTarget,
+        artifact_kinds: Vec<BuildArtifactKind>,
+        toolchain_fingerprint: String,
+    }
+
     fn node(name: &str) -> NodeId {
         NodeId::from_legacy_named(name).expect("node id")
     }
@@ -391,6 +403,7 @@ mod tests {
                         BuildArtifactKind::NativeDylibModule,
                     ],
                     toolchain_fingerprint: "rustc-test".to_string(),
+                    supports_source_identity_hash: true,
                 }],
                 resources: BuildResourceSnapshot {
                     cpu_threads,
@@ -407,6 +420,30 @@ mod tests {
             cache_hit: false,
             transfer_cost: 1,
         }
+    }
+
+    #[test]
+    fn source_identity_capability_is_wire_compatible_with_legacy_builders() {
+        let legacy = LegacyBuildTargetCapability {
+            target: BuildTarget::new("linux", "x86_64").expect("target"),
+            artifact_kinds: vec![BuildArtifactKind::Binary],
+            toolchain_fingerprint: "legacy-toolchain".to_string(),
+        };
+        let codec = sinomo_core::network::SinomoObjectCodec::network_frame();
+        let legacy_bytes = codec.encode(&legacy).expect("encode legacy");
+        let decoded: BuildTargetCapability = codec.decode(&legacy_bytes).expect("decode current");
+        assert!(!decoded.supports_source_identity_hash);
+
+        let current = BuildTargetCapability {
+            target: legacy.target.clone(),
+            artifact_kinds: legacy.artifact_kinds.clone(),
+            toolchain_fingerprint: legacy.toolchain_fingerprint.clone(),
+            supports_source_identity_hash: true,
+        };
+        let current_bytes = codec.encode(&current).expect("encode current");
+        let decoded_legacy: LegacyBuildTargetCapability =
+            codec.decode(&current_bytes).expect("decode legacy");
+        assert_eq!(decoded_legacy, legacy);
     }
 
     #[test]

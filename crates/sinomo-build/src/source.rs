@@ -1,4 +1,6 @@
-use crate::{BuildError, BuildPaths, BuildSource, Result, build_content_hash};
+use crate::{
+    BuildError, BuildPaths, BuildSource, Result, build_content_hash, build_source_identity_hash,
+};
 use std::env;
 use std::fs;
 use std::io;
@@ -103,10 +105,12 @@ pub fn prepare_build_source(paths: &BuildPaths, source_repo: &Path) -> Result<Pr
         path: lockfile_path.display().to_string(),
         detail: source.to_string(),
     })?;
+    let identity_hash = build_source_identity_hash(&bundle.revision);
     Ok(PreparedBuildSource {
         source: BuildSource {
             label: source_repo.display().to_string(),
             revision: Some(bundle.revision),
+            identity_hash: Some(identity_hash),
             bundle_hash: bundle.hash,
             bundle_bytes: bundle.bytes,
         },
@@ -197,10 +201,11 @@ pub fn create_source_repo_bundle(source_repo: &Path, bundle_path: &Path) -> Resu
 }
 
 fn source_bundle_command(source_repo: &Path, bundle_path: &Path) -> std::process::Command {
-    // A bundle is both the transport payload and the source identity in the
-    // v1 build key. Git's parallel pack writer may make different, equally
-    // valid delta choices for the same object graph, so force one pack thread
-    // to keep repeated bundles of the same commit byte-for-byte stable.
+    // The bundle remains independently content-addressed as a transport
+    // payload. One pack thread avoids needless duplicate payloads when the
+    // same checkout prepares a build repeatedly; the build key itself uses
+    // the Git revision identity and therefore also survives clone-local pack
+    // layout differences.
     let mut command = crate::process::noninteractive_command("git");
     command
         .args(["-c", "pack.threads=1"])

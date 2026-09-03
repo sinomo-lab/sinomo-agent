@@ -770,6 +770,7 @@ mod tests {
             BuildSource {
                 label: "test source".to_string(),
                 revision: Some("deadbeef".to_string()),
+                identity_hash: None,
                 bundle_hash: source_hash,
                 bundle_bytes: 13,
             },

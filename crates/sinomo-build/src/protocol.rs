@@ -1,7 +1,7 @@
 use crate::{
     BuildArtifactKind, BuildArtifactManifest, BuildArtifactSetManifest, BuildError,
     BuildServiceCapabilities, BuildTarget, BuildTargetCapability, NativeDylibArtifactMetadata,
-    Result,
+    Result, build_content_hash,
 };
 use serde::{Deserialize, Serialize};
 use sinomo_core::Id;
@@ -321,6 +321,11 @@ pub struct BuildSource {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Stable source identity used by newer build keys. The bundle hash below
+    /// remains the integrity check for the transport payload. Omitted plans
+    /// retain the legacy behavior where the bundle hash is also the source key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_hash: Option<String>,
     pub bundle_hash: String,
     pub bundle_bytes: u64,
 }
@@ -337,6 +342,23 @@ impl BuildSource {
                 detail: "build source revision must not be empty when present".to_string(),
             });
         }
+        if let Some(identity_hash) = &self.identity_hash {
+            validate_blake3_hash(identity_hash, "build source identity hash")?;
+            let revision = self
+                .revision
+                .as_deref()
+                .ok_or_else(|| BuildError::InvalidValue {
+                    detail: "build source identity hash requires a source revision".to_string(),
+                })?;
+            let expected = build_source_identity_hash(revision);
+            if *identity_hash != expected {
+                return Err(BuildError::InvalidValue {
+                    detail: format!(
+                        "build source identity hash does not match revision {revision}"
+                    ),
+                });
+            }
+        }
         validate_blake3_hash(&self.bundle_hash, "build source bundle hash")?;
         if self.bundle_bytes == 0 {
             return Err(BuildError::InvalidValue {
@@ -345,6 +367,19 @@ impl BuildSource {
         }
         Ok(())
     }
+
+    pub fn build_key_source_hash(&self) -> &str {
+        self.identity_hash.as_deref().unwrap_or(&self.bundle_hash)
+    }
+
+    pub fn legacy_bundle_key(mut self) -> Self {
+        self.identity_hash = None;
+        self
+    }
+}
+
+pub fn build_source_identity_hash(revision: &str) -> String {
+    build_content_hash(format!("sinomo.build.git-commit.v1\0{revision}").as_bytes())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -365,9 +400,9 @@ impl BuildPlan {
 
     pub fn validate(&self) -> Result<()> {
         self.source.validate()?;
-        if self.source.bundle_hash != self.input.source_hash {
+        if self.source.build_key_source_hash() != self.input.source_hash {
             return Err(BuildError::InvalidValue {
-                detail: "build source bundle hash must match build-key source hash".to_string(),
+                detail: "build source identity must match build-key source hash".to_string(),
             });
         }
         if self.source.revision != self.input.source_revision {
@@ -600,6 +635,7 @@ mod tests {
                 .expect("triple"),
             artifact_kinds: vec![BuildArtifactKind::Binary],
             toolchain_fingerprint: "cargo-toolchain-musl".to_string(),
+            supports_source_identity_hash: true,
         };
 
         let resolved = input.resolved_for_capability(&capability).expect("resolve");
@@ -624,6 +660,7 @@ mod tests {
             BuildSource {
                 label: "test source".to_string(),
                 revision: Some("deadbeef".to_string()),
+                identity_hash: None,
                 bundle_hash: input.source_hash.clone(),
                 bundle_bytes: 1,
             },
@@ -643,5 +680,34 @@ mod tests {
             plan.verify_key(),
             Err(BuildError::InvalidValue { .. })
         ));
+    }
+
+    #[test]
+    fn source_identity_key_is_independent_of_bundle_encoding() {
+        let revision = "deadbeef";
+        let identity_hash = build_source_identity_hash(revision);
+        let mut input = key_input();
+        input.target = input
+            .target
+            .with_family("unix")
+            .expect("family")
+            .with_rust_target("x86_64-unknown-linux-gnu")
+            .expect("triple");
+        input.source_revision = Some(revision.to_string());
+        input.source_hash = identity_hash.clone();
+
+        let source = |bundle: &[u8]| BuildSource {
+            label: "test source".to_string(),
+            revision: Some(revision.to_string()),
+            identity_hash: Some(identity_hash.clone()),
+            bundle_hash: build_content_hash(bundle),
+            bundle_bytes: bundle.len() as u64,
+        };
+        let first =
+            BuildPlan::new(source(b"first bundle encoding"), input.clone()).expect("first plan");
+        let second = BuildPlan::new(source(b"second bundle encoding"), input).expect("second plan");
+
+        assert_ne!(first.source.bundle_hash, second.source.bundle_hash);
+        assert_eq!(first.key, second.key);
     }
 }

@@ -72,7 +72,7 @@ pub fn execute_local_build_with_profile(
     let plan = BuildPlan::new(
         prepared.source.clone(),
         BuildKeyInput {
-            source_hash: prepared.source.bundle_hash.clone(),
+            source_hash: prepared.source.build_key_source_hash().to_string(),
             source_revision: prepared.source.revision.clone(),
             lockfile_hash: prepared.lockfile_hash.clone(),
             target: capability.target.clone(),

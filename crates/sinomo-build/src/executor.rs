@@ -898,12 +898,14 @@ mod tests {
             target: target.clone(),
             artifact_kinds: vec![BuildArtifactKind::Binary],
             toolchain_fingerprint: "rustc-windows".to_string(),
+            supports_source_identity_hash: true,
         };
         let source_hash = build_content_hash(b"source");
         let plan = BuildPlan::new(
             BuildSource {
                 label: "source".to_string(),
                 revision: None,
+                identity_hash: None,
                 bundle_hash: source_hash.clone(),
                 bundle_bytes: 6,
             },
@@ -999,6 +1001,7 @@ version = "0.1.0"
             target: target.clone(),
             artifact_kinds: vec![BuildArtifactKind::Binary],
             toolchain_fingerprint: toolchain.fingerprint.clone(),
+            supports_source_identity_hash: true,
         };
         let source_identity = [
             MANIFEST.as_bytes(),
@@ -1012,6 +1015,7 @@ version = "0.1.0"
             BuildSource {
                 label: "tiny host executor fixture".to_string(),
                 revision: Some("fixture-v1".to_string()),
+                identity_hash: None,
                 bundle_hash: source_hash.clone(),
                 bundle_bytes: source_identity.len() as u64,
             },
