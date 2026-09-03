@@ -230,6 +230,7 @@ pub fn remote_management_module_descriptor() -> NativeModuleDescriptor {
                     REMOTE_MANAGEMENT_SYSTEM_OBSERVE_OPERATION,
                 ),
             ],
+            agent_definitions: Vec::new(),
             declarative_resources: declarative_resources(),
             storage_owners: Vec::new(),
             capability_imports: CAPABILITY_IMPORTS

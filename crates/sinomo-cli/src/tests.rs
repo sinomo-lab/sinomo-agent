@@ -17114,7 +17114,12 @@ fn normal_agent_registries_attach_all_recall_tool_executors() {
         sinomo_agent::AgentDefinition::main(),
         sinomo_agent::AgentDefinition::background(),
         sinomo_agent::AgentDefinition::coding(),
-        sinomo_agent::AgentDefinition::evolution(),
+        sinomo_agent::AgentDefinition::custom(
+            "test-evolution-agent",
+            sinomo_agent::AgentRole::Evolution,
+            "Test evolution agent.",
+        )
+        .with_tools(sinomo_agent::default_coding_agent_tools()),
     ] {
         let registry = super::agent_tool_registry_for_workspace(
             &data_dir,

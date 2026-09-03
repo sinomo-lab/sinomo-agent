@@ -4650,6 +4650,8 @@ fn agent_summaries_from_snapshot(snapshot: &AgentConfigSnapshot) -> Vec<AgentSum
             key: agent.id.clone(),
             name: agent.name.clone(),
             description: agent.description.clone(),
+            module_id: agent.module_id.clone(),
+            module_version: agent.module_version.clone(),
             tool_runtime: sinomo_client::chat_contract::ChatToolRuntimeSelection {
                 sandbox_node_id: agent.sandbox_node_id.clone(),
                 workspace_root: None,
@@ -5526,7 +5528,15 @@ fn agent_summary_line(agent: &AgentConfigSummary) -> String {
     {
         parts.push(format!("sandbox {}", short(node_id, 12)));
     }
-    parts.push(agent.source.clone());
+    if let Some(module_id) = agent
+        .module_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        parts.push(format!("provided by {module_id}"));
+    } else {
+        parts.push(agent.source.clone());
+    }
     parts.join(" · ")
 }
 
@@ -11152,8 +11162,21 @@ fn agent_editor_section(shared: &Shared, reader: &ThemeReader) -> impl Widget + 
                 reader,
                 "Package",
                 format!("{} · version {}", summary.source, summary.package_version),
-            ))
-            .with_child(value_row(shared, reader, "Provenance", summary.provenance));
+            ));
+        if let Some(module_id) = summary
+            .module_id
+            .as_deref()
+            .filter(|module_id| !module_id.trim().is_empty())
+        {
+            let module = summary
+                .module_version
+                .as_deref()
+                .filter(|version| !version.trim().is_empty())
+                .map(|version| format!("{module_id} · version {version}"))
+                .unwrap_or_else(|| module_id.to_string());
+            package = package.with_child(value_row(shared, reader, "Module", module));
+        }
+        package = package.with_child(value_row(shared, reader, "Provenance", summary.provenance));
     }
     Stack::vertical()
         .spacing(14.0)
@@ -16408,6 +16431,23 @@ mod tests {
             .use_mounted_catalog_reads_for_tests()
             .expect("test agent catalog VFS");
         backend
+    }
+
+    #[test]
+    fn agent_summary_identifies_the_providing_module() {
+        let summary = AgentConfigSummary {
+            role: "evolution".to_string(),
+            source: "module".to_string(),
+            default_model: "Cluster default".to_string(),
+            module_id: Some("module.evolution".to_string()),
+            module_version: Some("0.1.0".to_string()),
+            ..AgentConfigSummary::default()
+        };
+
+        assert_eq!(
+            agent_summary_line(&summary),
+            "evolution · Cluster default · provided by module.evolution"
+        );
     }
 
     /// A settings state plus the index of a non-boolean (text-editable) config key, or `None`

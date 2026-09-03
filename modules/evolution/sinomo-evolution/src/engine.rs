@@ -4641,7 +4641,7 @@ where
         })?;
 
         let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
-            .with_agent_definition(sinomo_agent::AgentDefinition::evolution())
+            .with_agent_definition(crate::evolution_agent_definition())
             .with_workspace_root(&workspace.path)
             .with_context_budget(AgentContextBudget::for_loaded_model(
                 &self.provider,
@@ -4663,13 +4663,13 @@ where
         let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
         if let Some(data_dir) = &self.local_permission_data_dir {
             tool_registry.set_local_permission_data_dir(data_dir.root());
-            let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(
-                data_dir,
-                sinomo_agent::AgentDefinition::evolution().key(),
-            )
-            .map_err(|source| MutationModelError::Agent {
-                detail: format!("configure evolution-agent Markdown memory notes: {source}"),
-            })?;
+            let memory_backend =
+                sinomo_agent::SifsMemoryNoteBackend::new(data_dir, crate::EVOLUTION_AGENT_ID)
+                    .map_err(|source| MutationModelError::Agent {
+                        detail: format!(
+                            "configure evolution-agent Markdown memory notes: {source}"
+                        ),
+                    })?;
             sinomo_agent::memory_notes::register_tools(
                 &tool_registry,
                 sinomo_agent::MemoryNoteAgentToolConfig::from_backend(memory_backend),

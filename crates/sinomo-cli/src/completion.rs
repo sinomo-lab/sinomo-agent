@@ -124,10 +124,6 @@ const TUI_AGENT_CHOICES: &[ValueChoice] = &[
         value: Cow::Borrowed("coding-agent"),
         detail: Cow::Borrowed("workspace coding and verification agent"),
     },
-    ValueChoice {
-        value: Cow::Borrowed("evolution-agent"),
-        detail: Cow::Borrowed("supervised self-evolution mutation agent"),
-    },
 ];
 
 #[cfg(not(test))]

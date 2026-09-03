@@ -1,5 +1,6 @@
 //! Independent native-dylib implementation of Sinomo self-evolution.
 
+mod agent_package;
 mod app_api;
 pub mod cli;
 mod cli_runtime;
@@ -12,6 +13,7 @@ mod test_cases;
 pub mod tools;
 mod types;
 
+pub use agent_package::{EVOLUTION_AGENT_ID, evolution_agent_definition};
 pub use app_api::{app_evolution_dashboard, run_app_evolution_decision, run_app_evolution_job};
 pub use cli::*;
 pub use cli_runtime::*;

@@ -126,11 +126,6 @@ pub fn run_local_agent_readiness_gate(workspace_root: impl Into<PathBuf>) -> Age
         AgentDefinition::coding(),
         &workspace_root,
     ));
-    checks.push(check_local_tool_readiness(
-        "evolution-agent",
-        AgentDefinition::evolution(),
-        &workspace_root,
-    ));
     checks.push(check_progressive_disclosure_bridges(&workspace_root));
     checks.push(check_tool_disclosure_hidden_tool_guard_smoke(
         &workspace_root,

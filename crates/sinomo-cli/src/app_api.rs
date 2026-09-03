@@ -3780,11 +3780,13 @@ impl AgentChatToolContext {
         registry: AgentToolRegistry,
         session: InteractionSession,
         definition: AgentDefinition,
+        module_tool_projection: sinomo_agent::AgentModuleToolProjection,
         provider: &str,
         model: &str,
     ) -> Self {
         let config = sinomo_agent::AgentConfig::new(provider, model)
-            .with_agent_definition(definition.clone());
+            .with_agent_definition(definition.clone())
+            .with_module_tool_projection(module_tool_projection);
         let plan = AgentToolPlanner::plan(
             registry.descriptors(),
             &config.module_tool_projection,
@@ -4375,6 +4377,7 @@ impl AgentChat {
             handler.tool_registry(),
             self.runtime.session().clone(),
             handler.agent_definition().clone(),
+            handler.module_tool_projection(),
             &info.provider,
             &info.model,
         )
@@ -7044,6 +7047,8 @@ fn agent_catalog_summaries(catalog: &AgentCatalog) -> Vec<AgentSummary> {
                 definition.name.clone()
             },
             description: definition.description.clone(),
+            module_id: definition.package.provenance.module_id.clone(),
+            module_version: definition.package.provenance.module_version.clone(),
             tool_runtime: sinomo_app_contract::chat::ChatToolRuntimeSelection {
                 sandbox_node_id: definition.tool_runtime.sandbox_node_id.clone(),
                 workspace_root: None,

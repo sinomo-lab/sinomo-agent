@@ -458,11 +458,14 @@ activation, observation, replacement, and rollback.
 Self-evolution is delivered as the default-enabled `module.evolution` native
 dynamic-library module. Its implementation lives under
 `modules/evolution/sinomo-evolution`, owns its settings, storage identity,
-object-RPC routes, CLI execution, and lifecycle descriptor, and is built and
-rolled out as a separate artifact. The main binary, daemon host, CLI, and app do
-not link the implementation; they retain only the data contract and generic
-module/client machinery. If the module is unavailable, evolution surfaces fail
-closed without affecting agent chat or daemon startup.
+object-RPC routes, CLI execution, lifecycle descriptor, `evolution-agent`
+package, standard tool manifest, and embedded evolution skills, and is built
+and rolled out as a separate artifact. The main binary, daemon host, CLI, and
+app do not link the implementation; they retain only the data contract and
+generic module/client machinery. Module agent packages are projected through
+the catalog with their module ID and version, which the app presents as package
+provenance. If the module is unavailable, evolution surfaces and its agent
+package fail closed without affecting ordinary agent chat or daemon startup.
 
 Runtime activation is component-based. Every implementation supplies a
 `ComponentDescriptor` with versioned service offers and requirements and is

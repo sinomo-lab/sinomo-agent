@@ -133,8 +133,9 @@ limited to trusted code and gated like other host-process code.
 The dynamic boundary should stay small and stable: a versioned C-compatible
 loader ABI, byte buffers, status codes, host callback tables, descriptors, and
 SOBJ request and response envelopes. Native descriptors may declare object-RPC
-methods and embedded declarative resources so the host can expose a module at
-runtime without linking module-specific crates into the main binary.
+methods, agent packages, and embedded declarative resources so the host can
+expose a module at runtime without linking module-specific crates into the main
+binary.
 
 Active native providers bind through one generic
 `sinomo_module::ActiveNativeComponent` path. The selector accepts a
@@ -242,10 +243,28 @@ policy, and loader or rollout state.
 
 Module catalog registration is pure data. It records the manifest, backend
 descriptor, declared capabilities, and public surfaces exposed by the module.
-Public surfaces include object-RPC methods, event kinds, capability imports and
-exports, settings definitions, extension-point definitions and contributions,
-and storage contract owners. This data is serializable, inspectable, comparable
-across nodes, and safe to place in registry or cluster desired state.
+Public surfaces include object-RPC methods, agent package definitions, embedded
+skills and prompts, event kinds, capability imports and exports, settings
+definitions, extension-point definitions and contributions, and storage
+contract owners. This data is serializable, inspectable, comparable across
+nodes, and safe to place in registry or cluster desired state.
+
+Agent definitions are declarative module surfaces even when their provider is a
+native dynamic library. They name a role, prompt, standard tool descriptors,
+skill resources, and optional context/tool-surface hints. The host validates the
+data and assigns provenance from the enclosing module registration; modules do
+not supply arbitrary Rust constructors or catalog mutation callbacks. Agent IDs
+must be unique within a module, across the active registry, and against existing
+catalog principals. Ambiguity fails activation instead of using registration
+order as a tie-breaker.
+
+Agents, skills, and callable tools remain independent surfaces. An agent package
+may list default skill IDs and visible toolsets, but a skill is not owned by or
+hard-bound to that agent and may resolve from another active module or the shared
+skill catalog. Object-RPC routes are the module's standalone callable tool
+surface: agent runtimes may project them as tools, while modules and non-agent
+clients may call the same routes directly through normal capability, policy,
+and authority checks.
 
 ### Typed Extension Points And Contributions
 

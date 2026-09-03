@@ -12,6 +12,7 @@ use sinomo_module_api::{
 use std::path::Path;
 use std::sync::Mutex;
 
+use crate::agent_package::{evolution_agent_export, evolution_agent_resources};
 use crate::{
     app_evolution_dashboard, evolution_config_definition, evolution_data_dir,
     run_app_evolution_decision, run_app_evolution_job, run_evolve_command_captured,
@@ -138,6 +139,8 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
                     contract::EVOLUTION_CLI_OPERATION,
                 ),
             ],
+            agent_definitions: vec![evolution_agent_export()],
+            declarative_resources: evolution_agent_resources(),
             storage_owners: vec![contract::EVOLUTION_MODULE_OWNER.to_string()],
             capability_imports: CAPABILITY_IMPORTS
                 .iter()
@@ -410,6 +413,23 @@ mod tests {
             contract::EVOLUTION_RPC_ROUTES.len()
         );
         assert_eq!(descriptor.surfaces.settings.len(), 1);
+        assert_eq!(descriptor.surfaces.agent_definitions.len(), 1);
+        assert_eq!(
+            descriptor.surfaces.agent_definitions[0].id,
+            crate::EVOLUTION_AGENT_ID
+        );
+        assert_eq!(descriptor.surfaces.declarative_resources.len(), 2);
+        assert!(
+            descriptor
+                .surfaces
+                .declarative_resources
+                .iter()
+                .all(|resource| {
+                    resource.kind == "skill"
+                        && resource.target_agents.is_empty()
+                        && resource.embedded_text.is_some()
+                })
+        );
         assert_eq!(
             descriptor.surfaces.object_rpc_routes[1].timeout_ms,
             Some(60 * 60 * 1_000)

@@ -85,6 +85,10 @@ pub struct AgentSummary {
     pub key: String,
     pub name: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_version: Option<String>,
     pub tool_runtime: ChatToolRuntimeSelection,
 }
 
@@ -94,12 +98,16 @@ pub fn fallback_agent_summaries() -> Vec<AgentSummary> {
             key: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
             description: "general workspace task and verification agent".to_string(),
+            module_id: None,
+            module_version: None,
             tool_runtime: ChatToolRuntimeSelection::default(),
         },
         AgentSummary {
             key: "main-agent".to_string(),
             name: "main-agent".to_string(),
             description: "user-facing interactive agent".to_string(),
+            module_id: None,
+            module_version: None,
             tool_runtime: ChatToolRuntimeSelection::default(),
         },
     ]

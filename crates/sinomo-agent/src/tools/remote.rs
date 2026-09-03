@@ -1,6 +1,7 @@
 use super::{
-    AgentToolCapability, AgentToolDescriptor, AgentToolGateway, AgentToolGatewayCancellation,
-    AgentToolGatewayTask, AgentToolRegistry, AgentToolRequest, AgentToolResult,
+    AgentModuleToolProjection, AgentToolCapability, AgentToolDescriptor, AgentToolGateway,
+    AgentToolGatewayCancellation, AgentToolGatewayTask, AgentToolRegistry, AgentToolRequest,
+    AgentToolResult,
 };
 use crate::{AgentToolKind, AgentToolSpec};
 use serde::Deserialize;
@@ -499,6 +500,39 @@ pub fn register_remote_management_agent_tools(
     transport: Arc<dyn AgentRemoteObjectRpcTransport>,
 ) {
     for tool in remote_management_agent_tools(transport) {
+        registry.register_gateway(tool);
+    }
+}
+
+/// Build executable agent gateways for every independently callable route in
+/// the active module projection. The routes remain ordinary object-RPC
+/// services; this is only an agent-facing adapter over the same authority path.
+pub fn module_agent_tools(
+    projection: &AgentModuleToolProjection,
+    transport: Arc<dyn AgentRemoteObjectRpcTransport>,
+) -> Vec<AgentRemoteObjectRpcTool> {
+    projection
+        .project_bindings()
+        .into_iter()
+        .map(|binding| {
+            AgentRemoteObjectRpcTool::new(
+                binding.descriptor,
+                binding.route,
+                binding.category,
+                MODULE_NATIVE_DYLIB_CANCEL_ROUTE,
+                MODULE_RPC_CATEGORY,
+                Arc::clone(&transport),
+            )
+        })
+        .collect()
+}
+
+pub fn register_module_agent_tools(
+    registry: &AgentToolRegistry,
+    projection: &AgentModuleToolProjection,
+    transport: Arc<dyn AgentRemoteObjectRpcTransport>,
+) {
+    for tool in module_agent_tools(projection, transport) {
         registry.register_gateway(tool);
     }
 }
@@ -1448,6 +1482,46 @@ mod tests {
             }
             self.call(call)
         }
+    }
+
+    #[test]
+    fn module_routes_build_independent_executable_agent_gateways() {
+        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.evolution")
+            .expect("module id");
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            module_id,
+            "0.1.0",
+            "sinomo-evolution",
+            "sinomo-evolution",
+            "sinomo.evolution.v1",
+            sinomo_runtime::core::TrustRing::R2TrustedService,
+            "sinomo-evolution",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_object_rpc_route(
+                sinomo_runtime::module::ModuleObjectRpcRoute::new(
+                    "/evolution/app/dashboard",
+                    "evolution.app",
+                    "evolution.dashboard.read",
+                    sinomo_runtime::module::ModuleRouteAuth::LocalCommand,
+                ),
+            ),
+        );
+        let projection = AgentModuleToolProjection::new().with_registration(registration);
+        let transport: Arc<dyn AgentRemoteObjectRpcTransport> =
+            Arc::new(FakeRemoteTransport::default());
+
+        let tools = module_agent_tools(&projection, transport);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].route, "/evolution/app/dashboard");
+        assert_eq!(tools[0].category, "evolution.app");
+        assert!(
+            tools[0]
+                .descriptor
+                .toolsets
+                .contains(&"sinomo-evolution".to_string())
+        );
     }
 
     #[derive(Default)]

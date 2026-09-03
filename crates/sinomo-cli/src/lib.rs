@@ -4616,6 +4616,7 @@ pub(crate) fn run_agent_once(options: AgentRunOptions) -> Result<(), CliError> {
     };
     let agent_config = sinomo_agent::AgentConfig::new(provider.clone(), model.clone())
         .with_agent_definition(definition.clone())
+        .with_module_tool_projection(agent_module_tool_projection(&data_dir))
         .with_workspace_root(&workspace_root)
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts)
@@ -5604,9 +5605,29 @@ pub(crate) fn configure_agent_tool_registry_for_workspace_projection(
             },
         ),
     );
+    let module_projection = agent_module_tool_projection(data_dir);
+    sinomo_agent::register_module_agent_tools(
+        registry,
+        &module_projection,
+        Arc::clone(&remote_transport),
+    );
     sinomo_agent::register_remote_management_agent_tools(registry, remote_transport);
     registry.register(CliClusterStatusAgentTool::new(data_dir.clone()));
     Ok(())
+}
+
+pub(crate) fn agent_module_tool_projection(
+    data_dir: &SinomoDataDir,
+) -> sinomo_agent::AgentModuleToolProjection {
+    match sinomo_agent::product_module_tool_projection(data_dir) {
+        Ok(projection) => projection,
+        Err(error) => {
+            eprintln!(
+                "warning: active module tools are unavailable to this agent runtime: {error}"
+            );
+            sinomo_agent::AgentModuleToolProjection::default()
+        }
+    }
 }
 
 fn agent_mcp_tool_registry(

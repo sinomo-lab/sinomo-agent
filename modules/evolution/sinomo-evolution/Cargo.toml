@@ -6,7 +6,7 @@ authors = ["Infinity_X <Infinity_X@sinomo.net>"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-include = ["**/*.rs", "Cargo.toml"]
+include = ["**/*.rs", "skills/**/*.md", "Cargo.toml"]
 
 [lib]
 crate-type = ["rlib", "cdylib"]

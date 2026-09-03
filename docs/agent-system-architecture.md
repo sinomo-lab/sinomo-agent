@@ -71,10 +71,26 @@ Built-in packages use built-in provenance. Custom and imported package
 definitions are cluster-wide agent configuration and are stored in SIFS under
 `/services/sinomo/agents/*.json`; the importing node only contributes the source
 path recorded in provenance. Module-projected packages receive module provenance
-from the module registration id and version. The four built-in ids are reserved
-principals: stored, imported, and module-projected packages cannot replace them.
-This is an identity boundary because the definition id also selects durable
-session-history and memory namespaces.
+from the module registration id and version. The three core built-in ids
+(`main-agent`, `background-agent`, and `coding-agent`) are reserved principals:
+stored, imported, and module-projected packages cannot replace them. Active
+module agent IDs are also collision-checked against stored packages and every
+other module, so activation order never chooses an identity. This is an identity
+boundary because the definition id also selects durable session-history and
+memory namespaces.
+
+Modules may export complete agent packages through their serializable module
+surfaces. The native-dylib ABI carries the agent prompt, role, tool descriptors,
+skill references, and context/tool-surface hints; the host validates and projects
+that data into the catalog with immutable module provenance. The default-enabled
+`module.evolution` owns `evolution-agent`, its coding tool manifest, and its
+embedded planning and review skills. Removing or disabling the module removes
+that package instead of leaving a host-owned fallback implementation.
+The package lists those skills and the evolution module toolset as defaults,
+but skills and callable module routes remain independent catalog surfaces. A
+user or another module may configure another agent to use the same skills or
+toolset, and non-agent callers may invoke the routes through the normal typed
+service boundary.
 
 Package validation rejects malformed ids, package versions, duplicate tools,
 invalid tool names, invalid tool-surface entries, invalid skills, invalid
@@ -647,7 +663,7 @@ are available to interactive chat selectors. `background` and `evolution`
 packages are intentionally hidden and rejected by interactive switching because
 their authority and lifecycle belong to dedicated background/service and
 self-evolution paths. Package inspection and validation surfaces still show all
-four roles.
+four roles and identify the providing module for module-contributed packages.
 
 Main-agent defaults:
 

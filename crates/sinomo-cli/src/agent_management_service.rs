@@ -202,6 +202,9 @@ fn agent_snapshot(
         .and_then(|definition| contract_definition(definition).ok());
     let mut tools = default_agent_tool_descriptors();
     tools.extend([web_search_descriptor(), image_generation_descriptor()]);
+    if let Ok(projection) = sinomo_agent::product_module_tool_projection(data_dir) {
+        tools.extend(projection.project_descriptors());
+    }
     contract::AgentConfigSnapshot {
         agents: definitions.iter().map(summary).collect(),
         selected_agent: selected,
@@ -375,6 +378,8 @@ fn summary(definition: &AgentDefinition) -> contract::AgentConfigSummary {
         source: source_label(&definition.package.provenance.source).to_string(),
         package_version: definition.package.version.clone(),
         provenance: provenance_label(definition),
+        module_id: definition.package.provenance.module_id.clone(),
+        module_version: definition.package.provenance.module_version.clone(),
         readiness: if definition.validate().is_ok() {
             contract::AgentReadiness::Ready
         } else {

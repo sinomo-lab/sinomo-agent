@@ -34,6 +34,8 @@ pub fn built_in_agent_config_snapshot(
             source: "built-in".to_string(),
             package_version: definition.package.version.clone(),
             provenance: "Bundled with Sinomo".to_string(),
+            module_id: None,
+            module_version: None,
             readiness: AgentReadiness::Ready,
             editable: false,
             tool_count: definition.tools.len(),
@@ -366,6 +368,8 @@ fn test_summary(definition: &sinomo_agent::AgentDefinition) -> AgentConfigSummar
         .to_string(),
         package_version: definition.package.version.clone(),
         provenance: "test catalog".to_string(),
+        module_id: definition.package.provenance.module_id.clone(),
+        module_version: definition.package.provenance.module_version.clone(),
         readiness: if definition.validate().is_ok() {
             AgentReadiness::Ready
         } else {

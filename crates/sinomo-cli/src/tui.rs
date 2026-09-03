@@ -7998,6 +7998,7 @@ where
     skill_catalog_texts: std::collections::BTreeMap<String, String>,
     skill_catalog_resources:
         std::collections::BTreeMap<String, Vec<sinomo_agent::AgentSkillPackageFile>>,
+    module_tool_projection: sinomo_agent::AgentModuleToolProjection,
     tool_registry: sinomo_agent::AgentToolRegistry,
     thinking: ThinkingControl,
     provider: String,
@@ -8118,6 +8119,7 @@ where
             skill_catalog: sinomo_agent::SkillCatalog::default(),
             skill_catalog_texts: std::collections::BTreeMap::new(),
             skill_catalog_resources: std::collections::BTreeMap::new(),
+            module_tool_projection: sinomo_agent::AgentModuleToolProjection::default(),
             tool_registry: sinomo_agent::AgentToolRegistry::new(),
             thinking,
             provider: provider.into(),
@@ -8133,6 +8135,14 @@ where
 
     pub fn with_tool_registry(mut self, registry: sinomo_agent::AgentToolRegistry) -> Self {
         self.tool_registry = registry;
+        self
+    }
+
+    pub fn with_module_tool_projection(
+        mut self,
+        projection: sinomo_agent::AgentModuleToolProjection,
+    ) -> Self {
+        self.module_tool_projection = projection;
         self
     }
 
@@ -8170,6 +8180,10 @@ where
         self.tool_registry.clone()
     }
 
+    pub(crate) fn module_tool_projection(&self) -> sinomo_agent::AgentModuleToolProjection {
+        self.module_tool_projection.clone()
+    }
+
     pub(crate) fn agent_definition(&self) -> &AgentDefinition {
         &self.agent_definition
     }
@@ -8198,6 +8212,7 @@ where
         let mut config =
             sinomo_agent::AgentConfig::new(self.provider.clone(), self.model_name.clone())
                 .with_agent_definition(self.agent_definition.clone())
+                .with_module_tool_projection(self.module_tool_projection.clone())
                 .with_model_context_limits(self.max_context_tokens, self.auto_compact_token_limit)
                 .with_skill_catalog(self.skill_catalog.clone())
                 .with_skill_catalog_texts(self.skill_catalog_texts.clone())
@@ -8741,6 +8756,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
         Ok(
             Self::with_thinking(model, runtime_info.provider, runtime_info.model, thinking)
                 .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+                .with_module_tool_projection(crate::agent_module_tool_projection(data_dir))
                 .with_skill_catalog(skill_catalog)
                 .with_skill_catalog_texts(skill_catalog_texts)
                 .with_skill_catalog_resources(skill_catalog_resources)
@@ -8775,6 +8791,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             with_tui_model_config_mode(daemon_connected, || load_model_config_for_node(data_dir))?;
         let resolved = resolve_default_model(Some(&config), None)?;
         let (skill_catalog, skill_catalog_texts, skill_catalog_resources) = runtime_skill_catalog;
+        let module_tool_projection = crate::agent_module_tool_projection(data_dir);
         if resolved.provider == default_main_agent_chat_model_provider()
             && resolved.model == default_main_agent_chat_model_id()
         {
@@ -8791,6 +8808,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
                 thinking,
             )
             .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+            .with_module_tool_projection(module_tool_projection.clone())
             .with_skill_catalog(skill_catalog)
             .with_skill_catalog_texts(skill_catalog_texts)
             .with_skill_catalog_resources(skill_catalog_resources)
@@ -8812,6 +8830,7 @@ impl RuntimeMainAgentInteractionHandler<DefaultMainAgentChatModel> {
             thinking,
         )
         .with_runtime_storage(AgentRuntimeStorage::from_data_dir(data_dir))
+        .with_module_tool_projection(module_tool_projection)
         .with_skill_catalog(skill_catalog)
         .with_skill_catalog_texts(skill_catalog_texts)
         .with_skill_catalog_resources(skill_catalog_resources)

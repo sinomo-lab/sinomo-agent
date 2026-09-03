@@ -1510,6 +1510,16 @@ impl ModuleSurfaces {
             }
         }
 
+        let mut agent_definition_ids = BTreeSet::new();
+        for definition in &self.agent_definitions {
+            definition.validate()?;
+            if !agent_definition_ids.insert(definition.id.as_str()) {
+                return Err(ModuleSurfaceError::DuplicateAgentDefinition {
+                    id: definition.id.clone(),
+                });
+            }
+        }
+
         let mut imports = BTreeSet::new();
         for capability in &self.capabilities.imports {
             if !imports.insert(capability.as_str()) {
@@ -1603,6 +1613,8 @@ pub struct ModuleAgentDefinitionExport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ModuleAgentToolExport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub visible_toolsets: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_pipeline_id: Option<String>,
@@ -1624,6 +1636,7 @@ impl ModuleAgentDefinitionExport {
             role: role.into(),
             system_prompt: system_prompt.into(),
             tools: Vec::new(),
+            skills: Vec::new(),
             visible_toolsets: Vec::new(),
             context_pipeline_id: None,
             compaction_strategy_id: None,
@@ -1640,6 +1653,11 @@ impl ModuleAgentDefinitionExport {
         self
     }
 
+    pub fn with_skill(mut self, skill: impl Into<String>) -> Self {
+        self.skills.push(skill.into());
+        self
+    }
+
     pub fn with_visible_toolset(mut self, toolset: impl Into<String>) -> Self {
         self.visible_toolsets.push(toolset.into());
         self
@@ -1653,6 +1671,41 @@ impl ModuleAgentDefinitionExport {
     pub fn with_compaction_strategy(mut self, strategy_id: impl Into<String>) -> Self {
         self.compaction_strategy_id = Some(strategy_id.into());
         self
+    }
+
+    pub fn validate(&self) -> Result<(), ModuleSurfaceError> {
+        validate_module_agent_token(&self.id, &self.id, "agent id")?;
+        validate_module_agent_text(&self.id, &self.name, "agent name")?;
+        validate_module_agent_token(&self.id, &self.role, "agent role")?;
+        validate_module_agent_text(&self.id, &self.system_prompt, "system prompt")?;
+        if !self.description.is_empty() && self.description.chars().any(char::is_control) {
+            return Err(ModuleSurfaceError::InvalidAgentDefinition {
+                id: self.id.clone(),
+                detail: "description must not contain control characters".to_string(),
+            });
+        }
+
+        let mut tool_names = BTreeSet::new();
+        for tool in &self.tools {
+            validate_module_agent_token(&self.id, &tool.kind, "tool kind")?;
+            validate_module_agent_token(&self.id, &tool.name, "tool name")?;
+            validate_module_agent_text(&self.id, &tool.description, "tool description")?;
+            if !tool_names.insert(tool.name.as_str()) {
+                return Err(ModuleSurfaceError::InvalidAgentDefinition {
+                    id: self.id.clone(),
+                    detail: format!("tool `{}` is listed more than once", tool.name),
+                });
+            }
+        }
+        validate_module_agent_tokens(&self.id, &self.skills, "skill id")?;
+        validate_module_agent_tokens(&self.id, &self.visible_toolsets, "visible toolset id")?;
+        if let Some(pipeline_id) = &self.context_pipeline_id {
+            validate_module_agent_token(&self.id, pipeline_id, "context pipeline id")?;
+        }
+        if let Some(strategy_id) = &self.compaction_strategy_id {
+            validate_module_agent_token(&self.id, strategy_id, "compaction strategy id")?;
+        }
+        Ok(())
     }
 }
 
@@ -1714,6 +1767,8 @@ pub struct ModuleDeclarativeResourceExport {
     pub path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Legacy discovery metadata only. Agent packages own their default skill
+    /// references; this list does not restrict or activate the resource.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2118,6 +2173,7 @@ impl ModuleRegistry {
         }
 
         let mut object_rpc_routes = BTreeMap::<String, ModuleId>::new();
+        let mut agent_definition_ids = BTreeMap::<String, ModuleId>::new();
         let mut settings_keys = BTreeMap::<String, ModuleId>::new();
         let mut ui_contribution_ids = BTreeMap::<String, ModuleId>::new();
         for (module_id, registration) in &self.registrations {
@@ -2148,6 +2204,17 @@ impl ModuleRegistry {
                 {
                     return Err(ModuleRegistryError::DuplicateObjectRpcRoute {
                         route: descriptor.route,
+                        first_module_id: previous_module_id,
+                        second_module_id: module_id.clone(),
+                    });
+                }
+            }
+            for definition in &registration.surfaces.agent_definitions {
+                if let Some(previous_module_id) =
+                    agent_definition_ids.insert(definition.id.clone(), module_id.clone())
+                {
+                    return Err(ModuleRegistryError::DuplicateAgentDefinitionId {
+                        id: definition.id.clone(),
                         first_module_id: previous_module_id,
                         second_module_id: module_id.clone(),
                     });
@@ -2363,6 +2430,14 @@ pub enum ModuleRegistryError {
         first_module_id: ModuleId,
         second_module_id: ModuleId,
     },
+    #[error(
+        "duplicate module agent definition id `{id}` from {first_module_id} and {second_module_id}"
+    )]
+    DuplicateAgentDefinitionId {
+        id: String,
+        first_module_id: ModuleId,
+        second_module_id: ModuleId,
+    },
     #[error("duplicate module settings key `{key}` from {first_module_id} and {second_module_id}")]
     DuplicateSettingsKey {
         key: String,
@@ -2399,6 +2474,10 @@ pub enum ModuleSurfaceError {
     },
     #[error("duplicate module object RPC route `{route}`")]
     DuplicateObjectRpcRoute { route: String },
+    #[error("module agent definition `{id}` is invalid: {detail}")]
+    InvalidAgentDefinition { id: String, detail: String },
+    #[error("duplicate module agent definition `{id}`")]
+    DuplicateAgentDefinition { id: String },
     #[error("module object RPC route `{route}` operation `{operation}` is not exported")]
     ObjectRpcRouteOperationNotExported { route: String, operation: String },
     #[error("module storage owner `{owner}` is invalid: {detail}")]
@@ -2462,6 +2541,75 @@ fn validate_module_object_rpc_route_path(route: &str) -> Result<(), ModuleSurfac
             route: route.to_string(),
             detail: "route must not contain control characters".to_string(),
         });
+    }
+    Ok(())
+}
+
+fn validate_module_agent_token(
+    agent_id: &str,
+    value: &str,
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
+    if value.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidAgentDefinition {
+            id: agent_id.to_string(),
+            detail: format!("{context} must be non-empty"),
+        });
+    }
+    if value != value.trim() {
+        return Err(ModuleSurfaceError::InvalidAgentDefinition {
+            id: agent_id.to_string(),
+            detail: format!("{context} must not have leading or trailing whitespace"),
+        });
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        return Err(ModuleSurfaceError::InvalidAgentDefinition {
+            id: agent_id.to_string(),
+            detail: format!(
+                "{context} must contain only ASCII letters, digits, '.', '-', '_', or ':'"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_module_agent_text(
+    agent_id: &str,
+    value: &str,
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
+    if value.trim().is_empty() {
+        return Err(ModuleSurfaceError::InvalidAgentDefinition {
+            id: agent_id.to_string(),
+            detail: format!("{context} must be non-empty"),
+        });
+    }
+    if value.chars().any(|ch| ch == '\0') {
+        return Err(ModuleSurfaceError::InvalidAgentDefinition {
+            id: agent_id.to_string(),
+            detail: format!("{context} must not contain NUL bytes"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_module_agent_tokens(
+    agent_id: &str,
+    values: &[String],
+    context: &str,
+) -> Result<(), ModuleSurfaceError> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        validate_module_agent_token(agent_id, value, context)?;
+        if !unique.insert(value.as_str()) {
+            return Err(ModuleSurfaceError::InvalidAgentDefinition {
+                id: agent_id.to_string(),
+                detail: format!("{context} `{value}` is listed more than once"),
+            });
+        }
     }
     Ok(())
 }
@@ -3674,6 +3822,36 @@ fn native_descriptor_surfaces_to_module_surfaces(
     }
     for route in &descriptor.surfaces.object_rpc_routes {
         surfaces = surfaces.with_object_rpc_route(native_descriptor_route_to_module_route(route)?);
+    }
+    for definition in &descriptor.surfaces.agent_definitions {
+        let mut export = ModuleAgentDefinitionExport::new(
+            definition.id.clone(),
+            definition.name.clone(),
+            definition.role.clone(),
+            definition.system_prompt.clone(),
+        )
+        .with_description(definition.description.clone());
+        for tool in &definition.tools {
+            export = export.with_tool(ModuleAgentToolExport::new(
+                tool.kind.clone(),
+                tool.name.clone(),
+                tool.description.clone(),
+                tool.async_default,
+            ));
+        }
+        for skill in &definition.skills {
+            export = export.with_skill(skill.clone());
+        }
+        for toolset in &definition.visible_toolsets {
+            export = export.with_visible_toolset(toolset.clone());
+        }
+        if let Some(pipeline_id) = &definition.context_pipeline_id {
+            export = export.with_context_pipeline(pipeline_id.clone());
+        }
+        if let Some(strategy_id) = &definition.compaction_strategy_id {
+            export = export.with_compaction_strategy(strategy_id.clone());
+        }
+        surfaces = surfaces.with_agent_definition(export);
     }
     for resource in &descriptor.surfaces.declarative_resources {
         surfaces = surfaces
@@ -6238,6 +6416,45 @@ mod tests {
     }
 
     #[test]
+    fn module_registry_rejects_agent_id_collisions_across_modules() {
+        let agent = || {
+            ModuleAgentDefinitionExport::new(
+                "shared-agent",
+                "Shared agent",
+                "deliberation",
+                "Handle shared work.",
+            )
+        };
+        let registration = |module_id_name: &str| {
+            let module_id = ModuleId::from_legacy_named(module_id_name).expect("module");
+            ModuleRegistration::native_rust(
+                module_id,
+                "0.1.0",
+                module_id_name,
+                module_id_name,
+                "sinomo.test.agent.v1",
+                TrustRing::R2TrustedService,
+                module_id_name,
+            )
+            .with_surfaces(ModuleSurfaces::default().with_agent_definition(agent()))
+        };
+
+        let error = ModuleRegistry::builder()
+            .register(registration("module.agent.first"))
+            .expect("first agent provider")
+            .register(registration("module.agent.second"))
+            .expect("second agent provider")
+            .try_build()
+            .expect_err("duplicate agent id must be rejected");
+
+        assert!(matches!(
+            error,
+            ModuleRegistryError::DuplicateAgentDefinitionId { ref id, .. }
+                if id == "shared-agent"
+        ));
+    }
+
+    #[test]
     fn native_rust_registration_constructor_pairs_manifest_and_backend() {
         let module_id = ModuleId::from_legacy_named("module.dfs").expect("module");
         let registration = ModuleRegistration::native_rust(
@@ -6479,12 +6696,29 @@ mod tests {
                     concurrency_limit: None,
                     timeout_ms: None,
                 }],
+                agent_definitions: vec![
+                    sinomo_module_api::NativeModuleAgentDefinition::new(
+                        "dynamic-native-agent",
+                        "Dynamic native agent",
+                        "deliberation",
+                        "Use the dynamic native module safely.",
+                    )
+                    .with_description("Agent exported by a native module")
+                    .with_tool(sinomo_module_api::NativeModuleAgentTool::new(
+                        "read_file",
+                        "read_file",
+                        "Read a workspace file.",
+                        false,
+                    ))
+                    .with_skill("skill.dynamic-native")
+                    .with_visible_toolset("coding"),
+                ],
                 declarative_resources: vec![NativeModuleDeclarativeResource {
                     id: "skill.dynamic-native".to_string(),
                     kind: "skill".to_string(),
                     path: "skills/dynamic-native/SKILL.md".to_string(),
                     description: "Dynamic native module skill".to_string(),
-                    target_agents: vec!["agent.coding".to_string()],
+                    target_agents: Vec::new(),
                     model_families: vec!["gpt".to_string()],
                     activation_tags: vec!["dynamic-native".to_string()],
                     required_capabilities: vec!["dynamic.native.inspect".to_string()],
@@ -6537,6 +6771,15 @@ mod tests {
             "descriptor network transports map onto module surfaces"
         );
         assert_eq!(registration.surfaces.object_rpc_routes.len(), 1);
+        assert_eq!(registration.surfaces.agent_definitions.len(), 1);
+        assert_eq!(
+            registration.surfaces.agent_definitions[0].skills,
+            ["skill.dynamic-native"]
+        );
+        assert_eq!(
+            registration.surfaces.agent_definitions[0].tools[0].kind,
+            "read_file"
+        );
         assert_eq!(
             registration.surfaces.object_rpc_routes[0].auth,
             ModuleRouteAuth::Admin
@@ -6995,6 +7238,53 @@ mod tests {
                 if observed == &module_id && detail.contains("operation `invalid.route.invoke` is not exported")),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn module_agent_surfaces_reject_malformed_and_duplicate_exports() {
+        let duplicate_tools = ModuleAgentDefinitionExport::new(
+            "module-agent",
+            "Module agent",
+            "deliberation",
+            "Use module tools.",
+        )
+        .with_tool(ModuleAgentToolExport::new(
+            "read_file",
+            "read_file",
+            "Read a file.",
+            false,
+        ))
+        .with_tool(ModuleAgentToolExport::new(
+            "read_file",
+            "read_file",
+            "Read the same file.",
+            false,
+        ));
+        let error = ModuleSurfaces::default()
+            .with_agent_definition(duplicate_tools)
+            .validate()
+            .expect_err("duplicate tool names must fail");
+        assert!(matches!(
+            error,
+            ModuleSurfaceError::InvalidAgentDefinition { ref id, ref detail }
+                if id == "module-agent" && detail.contains("listed more than once")
+        ));
+
+        let definition = ModuleAgentDefinitionExport::new(
+            "module-agent",
+            "Module agent",
+            "deliberation",
+            "Use module tools.",
+        );
+        let error = ModuleSurfaces::default()
+            .with_agent_definition(definition.clone())
+            .with_agent_definition(definition)
+            .validate()
+            .expect_err("duplicate agent definitions must fail");
+        assert!(matches!(
+            error,
+            ModuleSurfaceError::DuplicateAgentDefinition { ref id } if id == "module-agent"
+        ));
     }
 
     #[test]

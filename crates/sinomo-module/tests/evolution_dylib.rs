@@ -44,6 +44,29 @@ fn independently_built_evolution_dylib_serves_its_cli_contract() {
     let descriptor = component.descriptor();
     assert_eq!(descriptor.module_id, "module.evolution");
     assert_eq!(descriptor.surfaces.settings.len(), 1);
+    let evolution_agent = descriptor
+        .surfaces
+        .agent_definitions
+        .iter()
+        .find(|agent| agent.id == "evolution-agent")
+        .expect("evolution agent export");
+    assert_eq!(
+        evolution_agent.skills,
+        ["evolution-planning", "evolution-review"]
+    );
+    assert!(
+        evolution_agent
+            .visible_toolsets
+            .contains(&"sinomo-evolution".to_string())
+    );
+    assert!(!evolution_agent.tools.is_empty());
+    assert!(
+        descriptor
+            .surfaces
+            .declarative_resources
+            .iter()
+            .all(|resource| resource.kind != "skill" || resource.target_agents.is_empty())
+    );
     let cli_route = descriptor
         .surfaces
         .object_rpc_routes

@@ -998,12 +998,7 @@ impl Default for AgentDefinition {
 
 impl AgentDefinition {
     pub fn built_ins() -> Vec<Self> {
-        vec![
-            Self::main(),
-            Self::background(),
-            Self::coding(),
-            Self::evolution(),
-        ]
+        vec![Self::main(), Self::background(), Self::coding()]
     }
 
     pub fn built_in(name: &str) -> Option<Self> {
@@ -1013,7 +1008,6 @@ impl AgentDefinition {
             "coding" | "coding-agent" | "deliberation" | "deliberation-agent" => {
                 Some(Self::coding())
             }
-            "evolution" | "evolution-agent" => Some(Self::evolution()),
             _ => None,
         }
     }
@@ -1135,30 +1129,6 @@ impl AgentDefinition {
             description: "general workspace task and verification agent".to_string(),
             role: AgentRole::Deliberation,
             system_prompt: coding_agent_base_prompt().to_string(),
-            tools: default_coding_agent_tools(),
-            tool_surface: AgentToolSurfaceDefinition::default(),
-            skills: Vec::new(),
-            context: AgentContextDefinition::default(),
-            compaction: AgentCompactionDefinition::default(),
-            model_policy: AgentModelPolicy::default(),
-            runtime_limits: AgentRuntimeLimitsDefinition::default(),
-            placement: AgentPlacementDefinition::default(),
-            tool_runtime: AgentToolRuntimeDefinition::default(),
-            output_format: AgentOutputFormat::JsonDecision,
-            temperature: None,
-            max_output_tokens: None,
-        }
-    }
-
-    pub fn evolution() -> Self {
-        Self {
-            schema_version: AGENT_DEFINITION_SCHEMA_VERSION,
-            package: AgentPackageDefinition::built_in(),
-            id: "evolution-agent".to_string(),
-            name: "evolution-agent".to_string(),
-            description: "supervised self-evolution mutation agent".to_string(),
-            role: AgentRole::Evolution,
-            system_prompt: evolution_agent_base_prompt().to_string(),
             tools: default_coding_agent_tools(),
             tool_surface: AgentToolSurfaceDefinition::default(),
             skills: Vec::new(),
@@ -1827,11 +1797,38 @@ impl AgentCatalog {
                     registration.module_id().as_str(),
                     registration.manifest.version.clone(),
                 );
+                if let Some(existing) = self.get(definition.key()) {
+                    return Err(AgentCatalogError::AgentIdCollision {
+                        id: definition.key().to_string(),
+                        existing_source: existing.package.provenance.source.clone(),
+                        module_id: registration.module_id().as_str().to_string(),
+                    });
+                }
                 self.upsert(definition)?;
             }
         }
         Ok(())
     }
+}
+
+/// Resolve independently callable module routes for agent-facing projection.
+///
+/// Product composition remains the authority for which registrations exist;
+/// this function does not discover modules or grant route capabilities.
+pub fn product_module_tool_projection(
+    data_dir: &sinomo_runtime::local::SinomoDataDir,
+) -> Result<AgentModuleToolProjection, String> {
+    let cluster_initialized = sinomo_runtime::network::ClusterPaths::new(data_dir)
+        .state
+        .exists();
+    let components = sinomo_product_profile::base_component_catalog(
+        data_dir,
+        sinomo_product_profile::ProductComponentProfile::main(cluster_initialized),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(AgentModuleToolProjection::from_registry(
+        components.modules(),
+    ))
 }
 
 #[derive(Clone, Debug, Error)]
@@ -1840,6 +1837,14 @@ pub enum AgentCatalogError {
     Store(#[from] AgentDefinitionStoreError),
     #[error(transparent)]
     Validation(#[from] AgentDefinitionValidationError),
+    #[error(
+        "module `{module_id}` agent `{id}` collides with an existing {existing_source:?} agent package"
+    )]
+    AgentIdCollision {
+        id: String,
+        existing_source: AgentPackageSource,
+        module_id: String,
+    },
 }
 
 pub trait AgentDefinitionStore {
@@ -1987,6 +1992,7 @@ impl AgentDefinition {
         let mut definition = AgentDefinition::custom(&export.name, role, &export.system_prompt);
         definition.id = export.id.clone();
         definition.description = export.description.clone();
+        definition.skills = export.skills.clone();
         definition.tool_surface.visible_toolsets = export.visible_toolsets.clone();
         definition.context.pipeline_id = export
             .context_pipeline_id
@@ -2273,19 +2279,6 @@ when the selected model/provider has a reliable native patch capability.
 When the next step is clear and no more tools are needed, return an empty
 tool_calls array. If a tool fails or is blocked, recover from the model-visible
 tool_result instead of repeating the same call blindly."#
-}
-
-fn evolution_agent_base_prompt() -> &'static str {
-    r#"You are Sinomo's evolution agent model.
-
-You operate inside Sinomo's supervised self-evolution loop. The runtime owns
-tool execution, tool-surface availability, sandbox enforcement, event emission,
-candidate evidence, and session state. Use tools when evidence or workspace
-changes are needed, then continue after tool_result messages arrive.
-
-Prefer small, auditable changes that satisfy the mutation packet and produce
-clear verification evidence. When the next step is clear and no more tools are
-needed, return an empty tool_calls array."#
 }
 
 pub fn main_agent_system_prompt(tools: &[AgentToolSpec]) -> String {
@@ -3461,7 +3454,6 @@ mod tests {
         assert!(ids.contains(&"main-agent"));
         assert!(ids.contains(&"background-agent"));
         assert!(ids.contains(&"coding-agent"));
-        assert!(ids.contains(&"evolution-agent"));
         for definition in catalog.list() {
             definition
                 .validate()
@@ -3527,7 +3519,10 @@ mod tests {
         assert!(AgentDefinition::main().supports_interactive_chat());
         assert!(AgentDefinition::coding().supports_interactive_chat());
         assert!(!AgentDefinition::background().supports_interactive_chat());
-        assert!(!AgentDefinition::evolution().supports_interactive_chat());
+        assert!(
+            !AgentDefinition::custom("evolution-agent", AgentRole::Evolution, "Evolve.")
+                .supports_interactive_chat()
+        );
     }
 
     #[test]
@@ -3536,7 +3531,6 @@ mod tests {
             AgentDefinition::main(),
             AgentDefinition::background(),
             AgentDefinition::coding(),
-            AgentDefinition::evolution(),
         ] {
             assert_eq!(
                 definition.temperature,
@@ -4031,6 +4025,7 @@ mod tests {
             "Read a workspace file.",
             false,
         ))
+        .with_skill("skill.module-example")
         .with_visible_toolset("coding");
         let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.example")
             .expect("module id");
@@ -4063,6 +4058,7 @@ mod tests {
         assert_eq!(definition.name, "module-example-agent");
         assert_eq!(definition.role, AgentRole::Deliberation);
         assert_eq!(definition.tools[0].kind, AgentToolKind::ReadFile);
+        assert_eq!(definition.skills, ["skill.module-example"]);
         assert_eq!(definition.tool_surface.visible_toolsets, vec!["coding"]);
         assert_eq!(definition.package.version, "0.1.0");
         assert_eq!(
@@ -4077,6 +4073,49 @@ mod tests {
             definition.package.provenance.module_version.as_deref(),
             Some("0.1.0")
         );
+    }
+
+    #[test]
+    fn module_agent_exports_cannot_shadow_existing_catalog_principals() {
+        let export = sinomo_runtime::module::ModuleAgentDefinitionExport::new(
+            "main-agent",
+            "module-main-agent",
+            "main",
+            "Replace the main agent.",
+        );
+        let module_id = sinomo_runtime::module::ModuleId::from_legacy_named("module.shadow")
+            .expect("module id");
+        let registration = sinomo_runtime::module::ModuleRegistration::native_rust(
+            module_id.clone(),
+            "0.1.0",
+            "module-shadow",
+            "module-shadow",
+            "module-shadow-v1",
+            sinomo_runtime::core::TrustRing::R2TrustedService,
+            "module-shadow",
+        )
+        .with_surfaces(
+            sinomo_runtime::module::ModuleSurfaces::default().with_agent_definition(export),
+        );
+        let registry = sinomo_runtime::module::ModuleRegistry::builder()
+            .register(registration)
+            .expect("register")
+            .build();
+        let mut catalog = AgentCatalog::built_ins();
+
+        let error = catalog
+            .merge_module_registry(&registry)
+            .expect_err("module agent must not shadow a built-in principal");
+
+        assert!(matches!(
+            error,
+            AgentCatalogError::AgentIdCollision {
+                ref id,
+                existing_source: AgentPackageSource::BuiltIn,
+                module_id: ref observed_module_id,
+            } if id == "main-agent" && observed_module_id == module_id.as_str()
+        ));
+        assert_eq!(catalog.get("main-agent"), Some(&AgentDefinition::main()));
     }
 
     #[test]

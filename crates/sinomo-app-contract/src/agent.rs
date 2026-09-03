@@ -470,6 +470,10 @@ pub struct AgentConfigSummary {
     pub source: String,
     pub package_version: String,
     pub provenance: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub module_version: Option<String>,
     pub readiness: AgentReadiness,
     pub editable: bool,
     pub tool_count: usize,

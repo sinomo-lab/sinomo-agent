@@ -509,6 +509,10 @@ fn validate_interface_token(value: &str, context: &str) -> Result<(), String> {
 pub struct NativeModuleSurfaces {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub object_rpc_routes: Vec<NativeModuleObjectRpcRoute>,
+    /// Agent packages contributed by this module. Hosts validate role, tool,
+    /// skill, and package semantics before merging them into the live catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_definitions: Vec<NativeModuleAgentDefinition>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub declarative_resources: Vec<NativeModuleDeclarativeResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -548,6 +552,7 @@ pub struct NativeModuleSurfaces {
 impl NativeModuleSurfaces {
     pub fn is_empty(&self) -> bool {
         self.object_rpc_routes.is_empty()
+            && self.agent_definitions.is_empty()
             && self.declarative_resources.is_empty()
             && self.storage_owners.is_empty()
             && self.capability_imports.is_empty()
@@ -670,6 +675,103 @@ impl NativeModuleObjectRpcRoute {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleAgentDefinition {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    pub role: String,
+    pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<NativeModuleAgentTool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visible_toolsets: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_pipeline_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_strategy_id: Option<String>,
+}
+
+impl NativeModuleAgentDefinition {
+    pub fn new(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        role: impl Into<String>,
+        system_prompt: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            description: String::new(),
+            role: role.into(),
+            system_prompt: system_prompt.into(),
+            tools: Vec::new(),
+            skills: Vec::new(),
+            visible_toolsets: Vec::new(),
+            context_pipeline_id: None,
+            compaction_strategy_id: None,
+        }
+    }
+
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+
+    pub fn with_tool(mut self, tool: NativeModuleAgentTool) -> Self {
+        self.tools.push(tool);
+        self
+    }
+
+    pub fn with_skill(mut self, skill: impl Into<String>) -> Self {
+        self.skills.push(skill.into());
+        self
+    }
+
+    pub fn with_visible_toolset(mut self, toolset: impl Into<String>) -> Self {
+        self.visible_toolsets.push(toolset.into());
+        self
+    }
+
+    pub fn with_context_pipeline(mut self, pipeline_id: impl Into<String>) -> Self {
+        self.context_pipeline_id = Some(pipeline_id.into());
+        self
+    }
+
+    pub fn with_compaction_strategy(mut self, strategy_id: impl Into<String>) -> Self {
+        self.compaction_strategy_id = Some(strategy_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct NativeModuleAgentTool {
+    pub kind: String,
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub async_default: bool,
+}
+
+impl NativeModuleAgentTool {
+    pub fn new(
+        kind: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        async_default: bool,
+    ) -> Self {
+        Self {
+            kind: kind.into(),
+            name: name.into(),
+            description: description.into(),
+            async_default,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NativeModuleBodyMode {
@@ -685,6 +787,8 @@ pub struct NativeModuleDeclarativeResource {
     pub path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
+    /// Optional legacy discovery metadata. Hosts must not use this list to
+    /// bind a skill to an agent or grant activation authority.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -945,6 +1049,7 @@ mod tests {
 
         assert_eq!(decoded.module_id, "module.legacy");
         assert_eq!(decoded.surfaces.storage_owners, vec!["legacy"]);
+        assert!(decoded.surfaces.agent_definitions.is_empty());
         assert!(decoded.surfaces.interface_exports.is_empty());
         assert!(decoded.surfaces.ui_contributions.is_empty());
         assert!(decoded.surfaces.extension_points.is_empty());

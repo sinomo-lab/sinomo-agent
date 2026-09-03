@@ -11020,18 +11020,21 @@ fn session_updated_label(updated_unix: i64) -> String {
 }
 
 fn agent_list_detail(agent: &AgentSummary) -> String {
-    match agent.key.as_str() {
-        "main-agent" => return "Interactive assistant".to_string(),
-        "coding-agent" => return "Code and verification".to_string(),
-        "evolution-agent" => return "Self-evolution workflows".to_string(),
-        "background-agent" => return "Maintenance + cluster support".to_string(),
-        _ => {}
+    let purpose = match agent.key.as_str() {
+        "main-agent" => "Interactive assistant".to_string(),
+        "coding-agent" => "Code and verification".to_string(),
+        "background-agent" => "Maintenance + cluster support".to_string(),
+        _ if !agent.description.trim().is_empty() => compact_line(agent.description.trim(), 36),
+        _ => "Agent participant".to_string(),
+    };
+    match agent
+        .module_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        Some(module_id) => format!("{purpose} · {module_id}"),
+        None => purpose,
     }
-    let description = agent.description.trim();
-    if !description.is_empty() {
-        return compact_line(description, 36);
-    }
-    "Agent participant".to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -18756,12 +18759,16 @@ mod tests {
                 key: "main-agent".to_string(),
                 name: "main-agent".to_string(),
                 description: String::new(),
+                module_id: None,
+                module_version: None,
                 tool_runtime: ChatToolRuntimeSelection::default(),
             },
             AgentSummary {
                 key: "coding-agent".to_string(),
                 name: "coding-agent".to_string(),
                 description: String::new(),
+                module_id: None,
+                module_version: None,
                 tool_runtime: ChatToolRuntimeSelection::default(),
             },
         ];
@@ -19544,18 +19551,22 @@ mod tests {
             key: "custom-agent".to_string(),
             name: "Custom".to_string(),
             description: "Investigates product workflows and summarizes risky edges.".to_string(),
+            module_id: Some("module.workflow".to_string()),
+            module_version: Some("1.2.3".to_string()),
             tool_runtime: ChatToolRuntimeSelection::default(),
         };
         let coding = AgentSummary {
             key: "coding-agent".to_string(),
             name: "coding-agent".to_string(),
             description: String::new(),
+            module_id: None,
+            module_version: None,
             tool_runtime: ChatToolRuntimeSelection::default(),
         };
 
         assert_eq!(
             agent_list_detail(&described),
-            "Investigates product workflows an..."
+            "Investigates product workflows an... · module.workflow"
         );
         assert_eq!(agent_list_detail(&coding), "Code and verification");
     }
@@ -20936,12 +20947,16 @@ mod tests {
                 key: "background-agent".to_string(),
                 name: "background-agent".to_string(),
                 description: String::new(),
+                module_id: None,
+                module_version: None,
                 tool_runtime: ChatToolRuntimeSelection::default(),
             },
             AgentSummary {
                 key: "main-agent".to_string(),
                 name: "main-agent".to_string(),
                 description: String::new(),
+                module_id: None,
+                module_version: None,
                 tool_runtime: ChatToolRuntimeSelection::default(),
             },
         ];

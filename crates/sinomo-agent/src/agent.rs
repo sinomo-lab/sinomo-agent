@@ -14858,7 +14858,11 @@ mod tests {
                         "other-agent",
                         "skills/other-agent/SKILL.md",
                     )
-                    .with_target_agent("background-agent"),
+                    .with_description("A skill carrying unrelated legacy target metadata.")
+                    .with_target_agent("background-agent")
+                    .with_embedded_text(
+                        "---\nname: other-agent\ndescription: A skill carrying unrelated legacy target metadata.\n---\n\n# Other agent\nRemain independently discoverable.",
+                    ),
                 ),
         );
         let module_projection = AgentModuleToolProjection {
@@ -14899,7 +14903,7 @@ mod tests {
             &AgentToolCall {
                 call_id: None,
                 tool: "skill_search".to_string(),
-                input: serde_json::json!({ "query": "rust" }),
+                input: serde_json::json!({ "query": "" }),
                 r#async: false,
                 summary: "find rust skill".to_string(),
             },
@@ -14935,10 +14939,10 @@ mod tests {
             "{matches:?}"
         );
         assert!(
-            !matches.iter().any(|entry| {
+            matches.iter().any(|entry| {
                 entry.get("id").and_then(serde_json::Value::as_str) == Some("other-agent")
             }),
-            "{matches:?}"
+            "module skills must remain discoverable independently of legacy target metadata: {matches:?}"
         );
 
         let describe = orchestrator.execute(
@@ -16934,7 +16938,6 @@ mod tests {
             ("main", default_main_agent_tools()),
             ("background", default_background_agent_tools()),
             ("coding", default_coding_agent_tools()),
-            ("evolution", AgentDefinition::evolution().tools),
             (
                 "custom",
                 AgentDefinition::custom("custom-defaults", AgentRole::Background, "Custom agent.")

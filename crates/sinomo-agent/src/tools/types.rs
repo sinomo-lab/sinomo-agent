@@ -569,6 +569,8 @@ pub struct AgentSkillDescriptor {
     pub module_version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Legacy discovery metadata retained for wire compatibility. Skill
+    /// eligibility and activation are independent of agent identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_agents: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -691,7 +693,7 @@ impl AgentSkillPlan {
     pub fn from_package_modules_and_catalog(
         package_skills: impl IntoIterator<Item = impl Into<String>>,
         module_projection: &AgentModuleToolProjection,
-        agent_keys: impl IntoIterator<Item = impl Into<String>>,
+        _agent_keys: impl IntoIterator<Item = impl Into<String>>,
         catalog_skills: impl IntoIterator<Item = AgentSkillDescriptor>,
     ) -> Self {
         let mut descriptors = BTreeMap::<String, AgentSkillDescriptor>::new();
@@ -703,18 +705,9 @@ impl AgentSkillPlan {
         for skill in &package_skill_ids {
             descriptors.insert(skill.clone(), AgentSkillDescriptor::package(skill.clone()));
         }
-        let agent_keys = agent_keys
-            .into_iter()
-            .map(Into::into)
-            .collect::<BTreeSet<_>>();
         for registration in &module_projection.registrations {
             for resource in &registration.surfaces.declarative_resources {
                 if resource.kind != ModuleDeclarativeResourceKind::Skill {
-                    continue;
-                }
-                if !resource_matches_agent(resource, &agent_keys)
-                    && !package_skill_ids.contains(&resource.id)
-                {
                     continue;
                 }
                 descriptors.insert(
@@ -765,17 +758,6 @@ impl AgentSkillPlan {
             .filter(|skill| skill_matches_query(skill, &query))
             .collect()
     }
-}
-
-fn resource_matches_agent(
-    resource: &ModuleDeclarativeResourceExport,
-    agent_keys: &BTreeSet<String>,
-) -> bool {
-    resource.target_agents.is_empty()
-        || resource
-            .target_agents
-            .iter()
-            .any(|target_agent| agent_keys.contains(target_agent))
 }
 
 fn skill_matches_query(skill: &AgentSkillDescriptor, query: &str) -> bool {
@@ -889,6 +871,13 @@ pub struct AgentModuleToolProjection {
     pub loader_states: Vec<ModuleLoaderState>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AgentModuleToolBinding {
+    pub descriptor: AgentToolDescriptor,
+    pub route: String,
+    pub category: String,
+}
+
 impl AgentModuleToolProjection {
     pub fn new() -> Self {
         Self::default()
@@ -908,20 +897,26 @@ impl AgentModuleToolProjection {
         self
     }
 
-    pub fn project_descriptors(&self) -> Vec<AgentToolDescriptor> {
-        let active_module_ids = self
+    pub fn from_registry(registry: &sinomo_runtime::module::ModuleRegistry) -> Self {
+        Self {
+            registrations: registry.registrations().cloned().collect(),
+            loader_states: Vec::new(),
+        }
+    }
+
+    pub fn project_bindings(&self) -> Vec<AgentModuleToolBinding> {
+        let loader_states = self
             .loader_states
             .iter()
-            .filter(|state| module_loader_state_is_routable(state))
-            .map(|state| state.module_id.as_str().to_string())
-            .collect::<BTreeSet<_>>();
-        if active_module_ids.is_empty() {
-            return Vec::new();
-        }
-        let mut descriptors = Vec::new();
+            .map(|state| (state.module_id.as_str(), state))
+            .collect::<BTreeMap<_, _>>();
+        let mut bindings = Vec::new();
         let mut names = BTreeSet::new();
         for registration in &self.registrations {
-            if !active_module_ids.contains(registration.manifest.module_id.as_str()) {
+            if loader_states
+                .get(registration.manifest.module_id.as_str())
+                .is_some_and(|state| !module_loader_state_is_routable(state))
+            {
                 continue;
             }
             for route in &registration.surfaces.object_rpc_routes {
@@ -962,10 +957,21 @@ impl AgentModuleToolProjection {
                     "type": "object",
                     "description": "Route-specific object-RPC response payload."
                 }));
-                descriptors.push(descriptor);
+                bindings.push(AgentModuleToolBinding {
+                    descriptor,
+                    route: route.route.clone(),
+                    category: route.category.clone(),
+                });
             }
         }
-        descriptors
+        bindings
+    }
+
+    pub fn project_descriptors(&self) -> Vec<AgentToolDescriptor> {
+        self.project_bindings()
+            .into_iter()
+            .map(|binding| binding.descriptor)
+            .collect()
     }
 }
 
@@ -1552,20 +1558,14 @@ mod tests {
                 .require_local_permission("remote-management"),
             ),
         );
-        let projection = AgentModuleToolProjection::new()
-            .with_registration(registration)
-            .with_loader_state(sinomo_runtime::core::ModuleLoaderState {
-                module_id,
-                active_artifact_id: TaskId::generate(),
-                previous_artifact_id: None,
-                shadow_artifact_id: None,
-                candidate_artifact_id: None,
-                hot_swap_state: sinomo_runtime::core::HotSwapState::Stable,
-            });
+        let projection = AgentModuleToolProjection::new().with_registration(registration);
 
         let descriptors = projection.project_descriptors();
+        let bindings = projection.project_bindings();
 
         assert_eq!(descriptors.len(), 1);
+        assert_eq!(bindings[0].route, "/permission/test/status");
+        assert_eq!(bindings[0].category, "permission-test");
         assert_eq!(
             descriptors[0].required_local_permissions,
             vec!["remote-management".to_string()]
