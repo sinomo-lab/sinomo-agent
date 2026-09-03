@@ -844,6 +844,14 @@ enum AgentChatSifsProvider {
     ClusterNode(NodeId),
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct FilesystemProviderDiscovery {
+    providers: Vec<NodeId>,
+    service_ids: Vec<String>,
+    provider_capabilities: Vec<String>,
+    instance_count: usize,
+}
+
 impl AgentChatSifsStorage {
     pub fn new(
         data_dir: SinomoDataDir,
@@ -891,14 +899,52 @@ impl AgentChatSifsStorage {
         let read: sinomo_runtime::kv::KvLocalRead<Vec<sinomo_runtime::kv::KvEntry>> = response
             .decode_body()
             .map_err(|error| format!("cannot decode filesystem provider discovery: {error}"))?;
-        let providers = filesystem_provider_node_ids(&read.value, &cluster.node_id)?;
-        if providers.is_empty() {
+        let discovery = filesystem_provider_discovery(&read.value, &cluster.node_id)?;
+        if discovery.providers.is_empty() {
+            tracing::warn!(
+                required_capability = SIFS_PATH_ACCESS_CAPABILITY,
+                local_node_id = %cluster.node_id,
+                daemon_address = %self.address,
+                catalog_revision = read.revision.0,
+                catalog_observed_term = read.observed_term,
+                catalog_applied_index = read.applied_index,
+                catalog_known_leader = ?read.known_leader,
+                catalog_entry_count = read.value.len(),
+                decoded_instance_count = discovery.instance_count,
+                advertised_service_ids = ?discovery.service_ids,
+                advertised_provider_capabilities = ?discovery.provider_capabilities,
+                "cluster SIFS provider discovery found no matching capability"
+            );
+            let service_ids = if discovery.service_ids.is_empty() {
+                "none".to_string()
+            } else {
+                discovery.service_ids.join(", ")
+            };
+            let provider_capabilities = if discovery.provider_capabilities.is_empty() {
+                "none".to_string()
+            } else {
+                discovery.provider_capabilities.join(", ")
+            };
             return Err(format!(
-                "no cluster service instance provides {SIFS_PATH_ACCESS_CAPABILITY}"
+                "no cluster service instance provides {SIFS_PATH_ACCESS_CAPABILITY} \
+                 (catalog revision {}, {} entries, {} decoded instances; services: [{}]; \
+                 provider capabilities: [{}])",
+                read.revision.0,
+                read.value.len(),
+                discovery.instance_count,
+                service_ids,
+                provider_capabilities,
             ));
         }
+        tracing::debug!(
+            required_capability = SIFS_PATH_ACCESS_CAPABILITY,
+            local_node_id = %cluster.node_id,
+            catalog_revision = read.revision.0,
+            provider_node_ids = ?discovery.providers,
+            "discovered cluster SIFS path-access providers"
+        );
         let mut failures = Vec::new();
-        for node_id in providers {
+        for node_id in discovery.providers {
             match SifsBrowser::open_daemon_node_on_runtime(
                 self.data_dir.clone(),
                 &self.address,
@@ -952,12 +998,33 @@ impl AgentChatSifsStorage {
     }
 }
 
+#[cfg(test)]
 fn filesystem_provider_node_ids(
     entries: &[sinomo_runtime::kv::KvEntry],
     local_node_id: &NodeId,
 ) -> Result<Vec<NodeId>, String> {
+    filesystem_provider_discovery(entries, local_node_id).map(|discovery| discovery.providers)
+}
+
+fn filesystem_provider_discovery(
+    entries: &[sinomo_runtime::kv::KvEntry],
+    local_node_id: &NodeId,
+) -> Result<FilesystemProviderDiscovery, String> {
     let instances = sinomo_runtime::service::service_instances_from_entries(entries)
         .map_err(|error| format!("cannot decode filesystem provider records: {error}"))?;
+    let service_ids = instances
+        .iter()
+        .map(|instance| instance.service_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let provider_capabilities = instances
+        .iter()
+        .flat_map(|instance| instance.provider_capabilities.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let instance_count = instances.len();
     let mut providers = sinomo_runtime::service::service_instances_providing_capability(
         instances,
         SIFS_PATH_ACCESS_CAPABILITY,
@@ -968,7 +1035,12 @@ fn filesystem_provider_node_ids(
     providers.sort();
     providers.dedup();
     providers.sort_by_key(|provider| provider != local_node_id);
-    Ok(providers)
+    Ok(FilesystemProviderDiscovery {
+        providers,
+        service_ids,
+        provider_capabilities,
+        instance_count,
+    })
 }
 
 /// SIFS-backed channel store used by the app chat runtime.
@@ -9544,6 +9616,30 @@ mod tests {
             filesystem_provider_node_ids(&entries, &local).expect("provider selection"),
             vec![local, remote]
         );
+    }
+
+    #[test]
+    fn filesystem_provider_discovery_summarizes_missing_capability() {
+        let local = NodeId::from_legacy_named("node_app_sifs_diagnostics_local").expect("local");
+        let mut record = sinomo_runtime::service::ServiceInstanceRecord::new("dfs", local.clone());
+        record.routes = vec![sinomo_runtime::dfs::DFS_STATUS_ROUTE.to_string()];
+        record.provider_capabilities = vec!["dfs.status.read".to_string()];
+        let entry = sinomo_runtime::kv::KvEntry {
+            key: sinomo_runtime::service::cluster_service_instance_key("dfs", &local),
+            value: sinomo_runtime::kv::encode_kv_value(&record).expect("encode service"),
+            create_revision: sinomo_runtime::kv::KvRevision(1),
+            modify_revision: sinomo_runtime::kv::KvRevision(1),
+            version: sinomo_runtime::kv::KvVersion(1),
+            lease_id: None,
+        };
+
+        let discovery =
+            filesystem_provider_discovery(&[entry], &local).expect("provider diagnostics");
+
+        assert!(discovery.providers.is_empty());
+        assert_eq!(discovery.service_ids, ["dfs"]);
+        assert_eq!(discovery.provider_capabilities, ["dfs.status.read"]);
+        assert_eq!(discovery.instance_count, 1);
     }
 
     #[test]
