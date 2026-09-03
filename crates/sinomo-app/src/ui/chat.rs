@@ -425,6 +425,35 @@ fn activate_transcript_recovery_action(shared: &Shared, action: RecoveryCardActi
     }
 }
 
+fn transcript_recovery_action_button(
+    shared: &Shared,
+    action: RecoveryCardAction,
+    primary: bool,
+) -> sui::Button {
+    let activation_shared = shared.clone();
+    let theme_shared = shared.clone();
+    sui::Button::new(action.label())
+        .description(action.description())
+        .icon(action.icon())
+        .min_width(TranscriptView::recovery_card_action_width(action))
+        .min_height(28.0)
+        .theme_when(move || theme_shared.theme().with_size(ControlSize::Small))
+        .appearance(if primary {
+            sui::ButtonAppearance::Filled
+        } else {
+            sui::ButtonAppearance::Tonal
+        })
+        .tone(match action {
+            RecoveryCardAction::OpenConnectionSettings if !primary => SemanticTone::Warning,
+            _ if primary => SemanticTone::Accent,
+            _ => SemanticTone::Neutral,
+        })
+        .on_press_with_ctx(move |ctx| {
+            activate_transcript_recovery_action(&activation_shared, action);
+            TranscriptView::request_recovery_action_refresh(ctx);
+        })
+}
+
 fn activate_transcript_runtime_action(shared: &Shared, action: &RuntimeTranscriptAction) {
     match action {
         RuntimeTranscriptAction::ToggleToolChain => {
@@ -13889,6 +13918,13 @@ struct TranscriptRichMessageLayout {
     bubble_w: f32,
     bubble_h: f32,
     document_h: f32,
+    composed_card: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TranscriptMessagePresentation {
+    is_user: bool,
+    kind: ChatMessageKind,
     action: Option<RecoveryCardAction>,
 }
 
@@ -13897,8 +13933,10 @@ struct RetainedTranscriptDocument {
     model: RichDocumentModel,
     state: RichDocumentViewState,
     theme: DefaultTheme,
+    presentation: TranscriptMessagePresentation,
     pod: WidgetPod,
     command_target: sui::WidgetId,
+    selection_owner: Rc<Cell<Option<sui::WidgetId>>>,
     bounds: Rect,
 }
 
@@ -13906,6 +13944,7 @@ struct ChatRichDocumentHost {
     state: RichDocumentViewState,
     selection_scope: SelectionScope,
     published_selection: RefCell<Option<String>>,
+    selection_owner: Rc<Cell<Option<sui::WidgetId>>>,
     child: WidgetPod,
 }
 
@@ -13914,16 +13953,19 @@ impl ChatRichDocumentHost {
         child: WidgetPod,
         state: RichDocumentViewState,
         selection_scope: SelectionScope,
+        selection_owner: Rc<Cell<Option<sui::WidgetId>>>,
     ) -> Self {
         Self {
             state,
             selection_scope,
             published_selection: RefCell::new(None),
+            selection_owner,
             child,
         }
     }
 
     fn sync_published_selection(&self, owner: sui::WidgetId) -> bool {
+        self.selection_owner.set(Some(owner));
         let selected = self.state.selected_text();
         if *self.published_selection.borrow() == selected {
             return false;
@@ -14070,20 +14112,49 @@ impl TranscriptView {
         state: &RichDocumentViewState,
         theme: DefaultTheme,
         selection_scope: &SelectionScope,
-    ) -> (WidgetPod, sui::WidgetId) {
+        shared: &Shared,
+        presentation: TranscriptMessagePresentation,
+    ) -> (WidgetPod, sui::WidgetId, Rc<Cell<Option<sui::WidgetId>>>) {
         let view = RichDocumentView::new(model.clone())
             .state(state.clone())
             .theme(theme);
         let document = WidgetPod::new(view);
         let command_target = document.id();
-        (
-            WidgetPod::new(ChatRichDocumentHost::new(
-                document,
-                state.clone(),
-                selection_scope.clone(),
-            )),
-            command_target,
-        )
+        let selection_owner = Rc::new(Cell::new(None));
+        let host = ChatRichDocumentHost::new(
+            document,
+            state.clone(),
+            selection_scope.clone(),
+            Rc::clone(&selection_owner),
+        );
+        let pod = if let Some(action) = presentation.action {
+            let body = Flex::vertical()
+                .main_gap(10.0)
+                .align_items(Alignment::Stretch)
+                .with_child(host)
+                .with_item(
+                    transcript_recovery_action_button(shared, action, true),
+                    FlexItem::new().align_self(Alignment::Start),
+                );
+            let theme_shared = shared.clone();
+            WidgetPod::new(
+                Surface::panel(body)
+                    .appearance(SurfaceAppearance::Soft)
+                    .tone(SemanticTone::Danger)
+                    .radius(theme.radius._2xl.min(14.0))
+                    .padding(Insets {
+                        left: 12.0,
+                        top: 10.0,
+                        right: 12.0,
+                        bottom: 10.0,
+                    })
+                    .fill_width()
+                    .theme_when(move || theme_shared.theme()),
+            )
+        } else {
+            WidgetPod::new(host)
+        };
+        (pod, command_target, selection_owner)
     }
 
     fn sync_rich_message_documents(&mut self) -> Vec<ChatMessage> {
@@ -14095,6 +14166,11 @@ impl TranscriptView {
         for (index, message) in messages.iter().enumerate() {
             let key = transcript_message_selection_key(index, message);
             let source = Self::rich_message_source(message);
+            let presentation = TranscriptMessagePresentation {
+                is_user: message.role == ChatRole::User,
+                kind: message.kind,
+                action: transcript_message_recovery_action(message),
+            };
             live.insert(key);
             order.push(key);
             if let Some(retained) = self.message_documents.get_mut(&key) {
@@ -14108,25 +14184,37 @@ impl TranscriptView {
                     }
                     retained.source = source;
                 }
-                if retained.theme != theme {
-                    self.selection_scope.clear_owner(retained.pod.id());
+                if retained.theme != theme || retained.presentation != presentation {
+                    if let Some(owner) = retained.selection_owner.get() {
+                        self.selection_scope.clear_owner(owner);
+                    }
                     retained.theme = theme;
-                    let (pod, command_target) = Self::rich_document_pod(
+                    retained.presentation = presentation;
+                    let (pod, command_target, selection_owner) = Self::rich_document_pod(
                         &retained.model,
                         &retained.state,
                         theme,
                         &self.selection_scope,
+                        &self.shared,
+                        presentation,
                     );
                     retained.pod = pod;
                     retained.command_target = command_target;
+                    retained.selection_owner = selection_owner;
                 }
                 continue;
             }
 
             let model = RichDocumentModel::from_markdown(source.clone());
             let state = RichDocumentViewState::new();
-            let (pod, command_target) =
-                Self::rich_document_pod(&model, &state, theme, &self.selection_scope);
+            let (pod, command_target, selection_owner) = Self::rich_document_pod(
+                &model,
+                &state,
+                theme,
+                &self.selection_scope,
+                &self.shared,
+                presentation,
+            );
             self.message_documents.insert(
                 key,
                 RetainedTranscriptDocument {
@@ -14134,8 +14222,10 @@ impl TranscriptView {
                     model,
                     state,
                     theme,
+                    presentation,
                     pod,
                     command_target,
+                    selection_owner,
                     bounds: Rect::ZERO,
                 },
             );
@@ -14144,7 +14234,11 @@ impl TranscriptView {
         let removed = self
             .message_documents
             .iter()
-            .filter_map(|(key, retained)| (!live.contains(key)).then_some(retained.pod.id()))
+            .filter_map(|(key, retained)| {
+                (!live.contains(key))
+                    .then(|| retained.selection_owner.get())
+                    .flatten()
+            })
             .collect::<Vec<_>>();
         for owner in removed {
             self.selection_scope.clear_owner(owner);
@@ -14173,23 +14267,32 @@ impl TranscriptView {
             let Some(retained) = self.message_documents.get_mut(&message_key) else {
                 continue;
             };
+            let composed_card = retained.presentation.action.is_some();
+            let measured_width = if composed_card {
+                max_bubble
+            } else {
+                document_width
+            };
             let measured = retained.pod.measure(
                 ctx,
                 Constraints::new(
-                    Size::new(document_width, 0.0),
-                    Size::new(document_width, f32::INFINITY),
+                    Size::new(measured_width, 0.0),
+                    Size::new(measured_width, f32::INFINITY),
                 ),
             );
             let document_h = measured.height.max(theme.text.base.line_height + 4.0);
-            let action = transcript_message_recovery_action(message);
             layouts.push(TranscriptRichMessageLayout {
                 message_key,
                 is_user: message.role == ChatRole::User,
                 kind: message.kind,
                 bubble_w: max_bubble,
-                bubble_h: document_h + 20.0 + if action.is_some() { 38.0 } else { 0.0 },
+                bubble_h: if composed_card {
+                    document_h
+                } else {
+                    document_h + 20.0
+                },
                 document_h,
-                action,
+                composed_card,
             });
         }
         layouts
@@ -15282,7 +15385,6 @@ struct TranscriptRuntimeControlSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TranscriptControlSignature {
     empty: Option<TranscriptEmptyControlState>,
-    message_actions: Vec<RecoveryCardAction>,
     runtime_actions: Vec<TranscriptRuntimeControlSpec>,
 }
 
@@ -15312,11 +15414,6 @@ impl TranscriptControlSignature {
             };
         }
 
-        let message_actions = chat
-            .messages
-            .iter()
-            .filter_map(transcript_message_recovery_action)
-            .collect();
         let mut runtime_actions = Vec::new();
         if !chat.visible_work_trace().is_empty() {
             let chain_expanded = chat.tool_chain_expanded();
@@ -15350,7 +15447,6 @@ impl TranscriptControlSignature {
 
         Self {
             empty: None,
-            message_actions,
             runtime_actions,
         }
     }
@@ -15365,8 +15461,6 @@ struct TranscriptControls {
     empty_body_rect: Rect,
     empty_actions: Vec<WidgetPod>,
     empty_action_rects: Vec<Option<Rect>>,
-    message_actions: Vec<WidgetPod>,
-    message_action_rects: Vec<Option<Rect>>,
     runtime_actions: Vec<WidgetPod>,
     runtime_action_rects: Vec<Option<Rect>>,
 }
@@ -15386,8 +15480,6 @@ impl TranscriptControls {
             empty_body_rect: Rect::ZERO,
             empty_actions: Vec::new(),
             empty_action_rects: Vec::new(),
-            message_actions: Vec::new(),
-            message_action_rects: Vec::new(),
             runtime_actions: Vec::new(),
             runtime_action_rects: Vec::new(),
         }
@@ -15514,29 +15606,7 @@ impl TranscriptControls {
         action: RecoveryCardAction,
         primary: bool,
     ) -> WidgetPod {
-        let activation_shared = shared.clone();
-        WidgetPod::new(
-            sui::Button::new(action.label())
-                .description(action.description())
-                .icon(action.icon())
-                .min_width(TranscriptView::recovery_card_action_width(action))
-                .min_height(28.0)
-                .theme_when(Self::button_theme(shared))
-                .appearance(if primary {
-                    sui::ButtonAppearance::Filled
-                } else {
-                    sui::ButtonAppearance::Tonal
-                })
-                .tone(match action {
-                    RecoveryCardAction::OpenConnectionSettings if !primary => SemanticTone::Warning,
-                    _ if primary => SemanticTone::Accent,
-                    _ => SemanticTone::Neutral,
-                })
-                .on_press_with_ctx(move |ctx| {
-                    activate_transcript_recovery_action(&activation_shared, action);
-                    Self::refresh_after_activation(ctx);
-                }),
-        )
+        WidgetPod::new(transcript_recovery_action_button(shared, action, primary))
     }
 
     fn build_runtime_action(shared: &Shared, spec: &TranscriptRuntimeControlSpec) -> WidgetPod {
@@ -15593,7 +15663,6 @@ impl TranscriptControls {
 
         self.empty_body = None;
         self.empty_actions.clear();
-        self.message_actions.clear();
         self.runtime_actions.clear();
         if let Some(empty) = &signature.empty {
             match empty {
@@ -15643,19 +15712,12 @@ impl TranscriptControls {
                 }
             }
         }
-        self.message_actions = signature
-            .message_actions
-            .iter()
-            .copied()
-            .map(|action| Self::build_recovery_action(&self.shared, action, true))
-            .collect();
         self.runtime_actions = signature
             .runtime_actions
             .iter()
             .map(|spec| Self::build_runtime_action(&self.shared, spec))
             .collect();
         self.empty_action_rects = vec![None; self.empty_actions.len()];
-        self.message_action_rects = vec![None; self.message_actions.len()];
         self.runtime_action_rects = vec![None; self.runtime_actions.len()];
         self.signature = signature;
     }
@@ -15677,7 +15739,6 @@ impl TranscriptControls {
         area: Rect,
         runtime_action_sizes: &[Size],
     ) {
-        self.message_action_rects.fill(None);
         self.runtime_action_rects.fill(None);
         let theme = self.shared.theme();
         let pal = palette(&self.shared);
@@ -15715,25 +15776,7 @@ impl TranscriptControls {
         };
 
         let mut y = area.y() + PAD - scroll + timeline_header_h;
-        let mut message_slot = 0usize;
         for item in &laid {
-            if let Some(action) = item.action {
-                let (container, content_x, content_w, _) =
-                    TranscriptView::rich_message_content_geometry(area, item, y, layout_mode);
-                let action_w = TranscriptView::recovery_card_action_width(action).min(content_w);
-                let rect = Rect::new(
-                    content_x,
-                    container.y() + item.bubble_h - 38.0,
-                    action_w,
-                    28.0,
-                );
-                if let Some(slot) = self.message_action_rects.get_mut(message_slot)
-                    && Self::rect_is_visible(area, rect)
-                {
-                    *slot = Some(rect);
-                }
-                message_slot += 1;
-            }
             y += item.bubble_h + message_gap;
         }
 
@@ -15904,11 +15947,6 @@ impl Widget for TranscriptControls {
             .iter_mut()
             .zip(self.empty_action_rects.iter().copied())
             .chain(
-                self.message_actions
-                    .iter_mut()
-                    .zip(self.message_action_rects.iter().copied()),
-            )
-            .chain(
                 self.runtime_actions
                     .iter_mut()
                     .zip(self.runtime_action_rects.iter().copied()),
@@ -15933,11 +15971,6 @@ impl Widget for TranscriptControls {
             .iter_mut()
             .zip(self.empty_action_rects.iter().copied())
             .chain(
-                self.message_actions
-                    .iter_mut()
-                    .zip(self.message_action_rects.iter().copied()),
-            )
-            .chain(
                 self.runtime_actions
                     .iter_mut()
                     .zip(self.runtime_action_rects.iter().copied()),
@@ -15959,7 +15992,6 @@ impl Widget for TranscriptControls {
             .empty_actions
             .iter()
             .zip(self.empty_action_rects.iter())
-            .chain(self.message_actions.iter().zip(&self.message_action_rects))
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
         {
             if rect.is_some() {
@@ -15976,7 +16008,6 @@ impl Widget for TranscriptControls {
             .empty_actions
             .iter()
             .zip(self.empty_action_rects.iter())
-            .chain(self.message_actions.iter().zip(&self.message_action_rects))
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
         {
             if rect.is_some() {
@@ -15993,7 +16024,6 @@ impl Widget for TranscriptControls {
             .empty_actions
             .iter()
             .zip(self.empty_action_rects.iter())
-            .chain(self.message_actions.iter().zip(&self.message_action_rects))
             .chain(self.runtime_actions.iter().zip(&self.runtime_action_rects))
         {
             if rect.is_some() {
@@ -16010,11 +16040,6 @@ impl Widget for TranscriptControls {
             .empty_actions
             .iter_mut()
             .zip(self.empty_action_rects.iter())
-            .chain(
-                self.message_actions
-                    .iter_mut()
-                    .zip(&self.message_action_rects),
-            )
             .chain(
                 self.runtime_actions
                     .iter_mut()
@@ -16175,8 +16200,11 @@ impl Widget for TranscriptView {
         for item in &layouts {
             let (container, content_x, content_w, _) =
                 Self::rich_message_content_geometry(bounds, item, y, layout_mode);
-            let document_bounds =
-                Rect::new(content_x, container.y() + 10.0, content_w, item.document_h);
+            let document_bounds = if item.composed_card {
+                container
+            } else {
+                Rect::new(content_x, container.y() + 10.0, content_w, item.document_h)
+            };
             if let Some(retained) = self.message_documents.get_mut(&item.message_key) {
                 retained.bounds = document_bounds;
                 retained.pod.arrange(ctx, document_bounds);
@@ -16273,15 +16301,17 @@ impl Widget for TranscriptView {
                 });
                 let (_, _, _, row_mode) =
                     Self::rich_message_content_geometry(area, item, y, layout_mode);
-                Self::paint_message_surface(
-                    ctx,
-                    &pal,
-                    &theme,
-                    row_bounds,
-                    item.is_user,
-                    item.kind,
-                    row_mode,
-                );
+                if !item.composed_card {
+                    Self::paint_message_surface(
+                        ctx,
+                        &pal,
+                        &theme,
+                        row_bounds,
+                        item.is_user,
+                        item.kind,
+                        row_mode,
+                    );
+                }
                 if let Some(retained) = self.message_documents.get(&item.message_key) {
                     retained.pod.paint(ctx);
                 }
@@ -23904,6 +23934,104 @@ mod tests {
         assert_eq!(
             shared.settings().selected,
             Some(SettingsSection::Connection)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_actions_scroll_inside_their_message_cards() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        {
+            let mut chat = shared.chat_mut();
+            chat.models_loading = false;
+            chat.messages = (0..8)
+                .map(|index| {
+                    ChatMessage::system_error(format!(
+                        "Error: chat unavailable: daemon connection failed ({index})"
+                    ))
+                })
+                .collect();
+            chat.stick_bottom = false;
+            chat.scroll = 200.0;
+        }
+
+        let mut runtime = sui::Application::new()
+            .window(
+                sui::WindowBuilder::new()
+                    .title("Scrolling recovery cards")
+                    .root(
+                        SizedBox::new()
+                            .size(Size::new(700.0, 320.0))
+                            .with_child(TranscriptView::new(shared, SelectionScope::new())),
+                    ),
+            )
+            .build()?;
+        let window_id = runtime.window_ids()[0];
+        runtime.render(window_id)?;
+
+        let assert_actions_are_inside_cards = |output: &sui::RenderOutput| {
+            let cards = output
+                .semantics
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::ListItem
+                        && node
+                            .name
+                            .as_deref()
+                            .is_some_and(|name| name.starts_with("System: Connection issue"))
+                })
+                .collect::<Vec<_>>();
+            let actions = output
+                .semantics
+                .iter()
+                .filter(|node| {
+                    node.role == SemanticsRole::Button
+                        && node.name.as_deref() == Some("Connection settings")
+                })
+                .collect::<Vec<_>>();
+            assert!(!actions.is_empty(), "expected visible recovery actions");
+            for action in actions {
+                assert!(
+                    cards.iter().any(|card| {
+                        action.bounds.x() >= card.bounds.x()
+                            && action.bounds.max_x() <= card.bounds.max_x()
+                            && action.bounds.y() >= card.bounds.y()
+                            && action.bounds.max_y() <= card.bounds.max_y()
+                    }),
+                    "recovery action {:?} must remain inside its message card; cards: {:?}",
+                    action.bounds,
+                    cards.iter().map(|card| card.bounds).collect::<Vec<_>>()
+                );
+            }
+        };
+
+        let initial = runtime.render(window_id)?;
+        assert_actions_are_inside_cards(&initial);
+        let initial_action_positions = initial
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Connection settings")
+            })
+            .map(|node| (node.id, node.bounds.y()))
+            .collect::<Vec<_>>();
+
+        let mut scroll = sui::PointerEvent::new(PointerEventKind::Scroll, Point::new(350.0, 160.0));
+        scroll.scroll_delta = Some(ScrollDelta::Pixels(sui::Vector::new(0.0, 48.0)));
+        runtime.handle_event(window_id, Event::Pointer(scroll))?;
+        let scrolled = runtime.render(window_id)?;
+        assert_actions_are_inside_cards(&scrolled);
+        assert!(
+            scrolled.semantics.iter().any(|node| {
+                node.role == SemanticsRole::Button
+                    && node.name.as_deref() == Some("Connection settings")
+                    && initial_action_positions
+                        .iter()
+                        .any(|(id, y)| *id == node.id && (node.bounds.y() - *y).abs() > 1.0)
+            }),
+            "at least one retained recovery action should move with the scrolled card"
         );
 
         Ok(())
