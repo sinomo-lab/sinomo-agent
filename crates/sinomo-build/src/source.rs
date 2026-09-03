@@ -175,12 +175,7 @@ pub fn create_source_repo_bundle(source_repo: &Path, bundle_path: &Path) -> Resu
         })?;
     }
     let _ = fs::remove_file(bundle_path);
-    let output = crate::process::noninteractive_command("git")
-        .arg("-C")
-        .arg(source_repo)
-        .args(["bundle", "create"])
-        .arg(bundle_path)
-        .arg("HEAD")
+    let output = source_bundle_command(source_repo, bundle_path)
         .output()
         .map_err(|source| BuildError::Io {
             path: "git bundle create".to_string(),
@@ -199,6 +194,22 @@ pub fn create_source_repo_bundle(source_repo: &Path, bundle_path: &Path) -> Resu
     }
     run_git_paths(source_repo, &["bundle", "verify"], &[bundle_path])?;
     Ok(())
+}
+
+fn source_bundle_command(source_repo: &Path, bundle_path: &Path) -> std::process::Command {
+    // A bundle is both the transport payload and the source identity in the
+    // v1 build key. Git's parallel pack writer may make different, equally
+    // valid delta choices for the same object graph, so force one pack thread
+    // to keep repeated bundles of the same commit byte-for-byte stable.
+    let mut command = crate::process::noninteractive_command("git");
+    command
+        .args(["-c", "pack.threads=1"])
+        .arg("-C")
+        .arg(source_repo)
+        .args(["bundle", "create"])
+        .arg(bundle_path)
+        .arg("HEAD");
+    command
 }
 
 pub fn deploy_managed_source_repo(
@@ -541,5 +552,28 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.source_bundle.is_file());
         assert!(first.source_bundle.starts_with(&paths.sources));
+    }
+
+    #[test]
+    fn source_bundle_command_forces_deterministic_pack_generation() {
+        let command = source_bundle_command(Path::new("source"), Path::new("source.bundle"));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "pack.threads=1",
+                "-C",
+                "source",
+                "bundle",
+                "create",
+                "source.bundle",
+                "HEAD",
+            ]
+        );
     }
 }
