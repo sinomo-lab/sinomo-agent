@@ -1561,6 +1561,24 @@ mod tests {
         let factory = component_factory().expect("DFS component factory");
         let scope = factory.mount(&context).expect("mount DFS component");
 
+        let browser_route = scope
+            .services()
+            .route(crate::DAEMON_DFS_BROWSER_STATUS_ROUTE)
+            .expect("DFS browser status route");
+        let browser_route = sinomo_module::service_route_with_component_identity(
+            browser_route,
+            factory.descriptor(),
+        );
+        let discovery = browser_route
+            .discovery
+            .expect("path-access discovery identity");
+        assert_eq!(discovery.service_id, crate::SIFS_PATH_ACCESS_CAPABILITY);
+        assert_eq!(discovery.interface_id, "sinomo.sifs.path-access");
+        assert_eq!(
+            discovery.provider_capabilities,
+            [crate::SIFS_PATH_ACCESS_CAPABILITY]
+        );
+
         for route in [
             crate::DFS_STATUS_ROUTE,
             crate::DFS_DATA_READ_ROUTE,

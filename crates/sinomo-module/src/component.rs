@@ -900,10 +900,21 @@ pub fn service_route_with_component_identity(
     descriptor: &ComponentDescriptor,
 ) -> sinomo_core::service::ServiceRoute {
     let route_category = route.category.clone();
-    let offer = descriptor.offers.iter().find(|offer| {
-        offer.routes.iter().any(|offered| offered == &route.route)
-            || offer.service_id == route.category
-    });
+    // A component may expose a broad service whose id matches the transport
+    // category alongside a narrower logical service on one of that category's
+    // routes. Resolve every exact route offer before falling back to the
+    // category identity; otherwise declaration order can hide the narrower
+    // service and its provider capabilities from cluster discovery.
+    let offer = descriptor
+        .offers
+        .iter()
+        .find(|offer| offer.routes.iter().any(|offered| offered == &route.route))
+        .or_else(|| {
+            descriptor
+                .offers
+                .iter()
+                .find(|offer| offer.service_id == route.category)
+        });
     let operation_offer = offer.and_then(|offer| {
         offer
             .operations
@@ -1255,6 +1266,31 @@ mod tests {
         assert_eq!(third.reused.len(), 2);
         assert_eq!(provider_mounts.load(Ordering::SeqCst), 1);
         assert_eq!(consumer_mounts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn exact_route_offer_precedes_transport_category_fallback() {
+        let descriptor = ComponentDescriptor::new("fixture.provider", "1.0.0")
+            .with_offer(
+                ServiceOffer::new("daemon", "sinomo.daemon", "1.0.0")
+                    .cluster_visible()
+                    .with_route("/daemon/general")
+                    .with_provider_capability("daemon.general"),
+            )
+            .with_offer(
+                ServiceOffer::new("path-access", "sinomo.path-access", "1.0.0")
+                    .cluster_visible()
+                    .with_route("/daemon/path/read")
+                    .with_provider_capability("path.read"),
+            );
+        let route = sinomo_core::service::ServiceRoute::new("/daemon/path/read", "daemon");
+
+        let decorated = service_route_with_component_identity(route, &descriptor);
+        let discovery = decorated.discovery.expect("discovery identity");
+
+        assert_eq!(discovery.service_id, "path-access");
+        assert_eq!(discovery.interface_id, "sinomo.path-access");
+        assert_eq!(discovery.provider_capabilities, ["path.read"]);
     }
 
     #[test]

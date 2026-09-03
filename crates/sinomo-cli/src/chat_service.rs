@@ -494,12 +494,22 @@ fn spawn_chat_worker(
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name(format!("sinomo-chat-{client_id}"))
-        .spawn(move || chat_worker(data_dir, runtime_control, storage, command_rx, events))
+        .spawn(move || {
+            chat_worker(
+                client_id,
+                data_dir,
+                runtime_control,
+                storage,
+                command_rx,
+                events,
+            )
+        })
         .map(|_| ())
         .map_err(|error| format!("spawn daemon chat worker: {error}"))
 }
 
 fn chat_worker(
+    client_id: String,
     data_dir: sinomo_runtime::local::SinomoDataDir,
     runtime_control: AgentRuntimeControlRegistry,
     storage: local::AgentChatSifsStorage,
@@ -514,6 +524,11 @@ fn chat_worker(
     ) {
         Ok(chat) => chat,
         Err(error) => {
+            tracing::warn!(
+                client_id = %client_id,
+                error = %error,
+                "daemon chat worker initialization failed"
+            );
             events.push(wire::ChatEvent::Error {
                 session_id: None,
                 error: format!("chat unavailable: {error}"),

@@ -1,5 +1,6 @@
 //! Lifecycle-owned publication of live service-registry generations.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -116,13 +117,50 @@ struct ComponentServiceCatalogPublisherHost {
     local_node_id: sinomo_core::node::NodeId,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ServiceCatalogLogSummary {
+    service_ids: Vec<String>,
+    provider_capabilities: Vec<String>,
+    route_count: usize,
+}
+
+fn service_catalog_log_summary(
+    records: &[sinomo_core::service::ServiceInstanceRecord],
+) -> ServiceCatalogLogSummary {
+    let service_ids = records
+        .iter()
+        .map(|record| record.service_id.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let provider_capabilities = records
+        .iter()
+        .flat_map(|record| record.provider_capabilities.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let route_count = records.iter().map(|record| record.routes.len()).sum();
+    ServiceCatalogLogSummary {
+        service_ids,
+        provider_capabilities,
+        route_count,
+    }
+}
+
 impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
     fn publish<'a>(
         &'a self,
         snapshot: Arc<ServiceRegistrySnapshot>,
     ) -> ServiceCatalogPublishFuture<'a> {
         Box::pin(async move {
-            sinomo_core::service::publish_local_service_instances(
+            let records = sinomo_core::service::service_instance_records_from_registry(
+                snapshot.registry(),
+                &self.local_node_id,
+                snapshot.version(),
+                time::OffsetDateTime::now_utc(),
+            );
+            let summary = service_catalog_log_summary(&records);
+            let publication = sinomo_core::service::publish_local_service_instances(
                 self.cluster.as_ref(),
                 snapshot.registry(),
                 &self.local_node_id,
@@ -130,8 +168,20 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
                 time::OffsetDateTime::now_utc(),
             )
             .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+            tracing::info!(
+                node_id = %self.local_node_id,
+                registry_version = snapshot.version(),
+                registry_route_count = snapshot.registry().route_count(),
+                published_route_count = summary.route_count,
+                published_service_count = summary.service_ids.len(),
+                published_provider_capability_count = summary.provider_capabilities.len(),
+                catalog_changed = publication.is_some(),
+                published_service_ids = ?summary.service_ids,
+                published_provider_capabilities = ?summary.provider_capabilities,
+                "reconciled component service catalog"
+            );
+            Ok(())
         })
     }
 }
@@ -273,6 +323,27 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    #[test]
+    fn catalog_log_summary_lists_published_services_and_provider_capabilities() {
+        let node = sinomo_core::node::NodeId::from_legacy_named("catalog_log_summary_node")
+            .expect("node id");
+        let mut first = sinomo_core::service::ServiceInstanceRecord::new("alpha", node.clone());
+        first.routes = vec!["/alpha/read".to_string(), "/alpha/write".to_string()];
+        first.provider_capabilities = vec!["alpha.write".to_string(), "alpha.read".to_string()];
+        let mut second = sinomo_core::service::ServiceInstanceRecord::new("beta", node);
+        second.routes = vec!["/beta/read".to_string()];
+        second.provider_capabilities = vec!["alpha.read".to_string(), "beta.read".to_string()];
+
+        let summary = service_catalog_log_summary(&[second, first]);
+
+        assert_eq!(summary.service_ids, ["alpha", "beta"]);
+        assert_eq!(
+            summary.provider_capabilities,
+            ["alpha.read", "alpha.write", "beta.read"]
+        );
+        assert_eq!(summary.route_count, 3);
     }
 
     #[tokio::test]
