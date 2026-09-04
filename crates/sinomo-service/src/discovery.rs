@@ -353,6 +353,25 @@ pub async fn publish_local_service_instances(
     registry_version: u64,
     now: OffsetDateTime,
 ) -> Result<Option<ClusterKvTxnCompactCommitResult>, ServiceError> {
+    publish_local_service_instances_with_force(
+        cluster,
+        registry,
+        node_id,
+        registry_version,
+        now,
+        false,
+    )
+    .await
+}
+
+pub async fn publish_local_service_instances_with_force(
+    cluster: &dyn ClusterAccess,
+    registry: &ServiceRegistry,
+    node_id: &NodeId,
+    registry_version: u64,
+    now: OffsetDateTime,
+    force_current_records: bool,
+) -> Result<Option<ClusterKvTxnCompactCommitResult>, ServiceError> {
     let records = service_instance_records_from_registry(registry, node_id, registry_version, now);
     let mut existing_by_key: std::collections::BTreeMap<String, KvEntry> = cluster
         .kv_range_prefix_local(CLUSTER_SERVICES_KV_PREFIX)?
@@ -364,12 +383,16 @@ pub async fn publish_local_service_instances(
     let mut ops = Vec::new();
     for record in records {
         let key = cluster_service_instance_key(&record.service_id, node_id);
-        let unchanged = existing_by_key.remove(&key).is_some_and(|entry| {
-            service_instance_record_has_rolling_compatible_wire(&entry.value)
-                && entry
-                    .decode::<ServiceInstanceRecord>()
-                    .is_ok_and(|stored| stored.stable_eq(&record))
-        });
+        let unchanged = !force_current_records
+            && existing_by_key.remove(&key).is_some_and(|entry| {
+                service_instance_record_has_rolling_compatible_wire(&entry.value)
+                    && entry
+                        .decode::<ServiceInstanceRecord>()
+                        .is_ok_and(|stored| stored.stable_eq(&record))
+            });
+        if force_current_records {
+            existing_by_key.remove(&key);
+        }
         if unchanged {
             continue;
         }
@@ -897,6 +920,33 @@ mod tests {
             cluster.committed_requests().is_empty(),
             "an unchanged applied source-owned record must not produce a Raft transaction"
         );
+    }
+
+    #[tokio::test]
+    async fn forced_publication_reasserts_an_unchanged_local_instance() {
+        let local = node("node_publish_forced");
+        let registry = published_registry(&["/dfs/read"]);
+        let cluster =
+            RecordingClusterAccess::with_instances([published_instance(&local, ["/dfs/read"])]);
+
+        let result = publish_local_service_instances_with_force(
+            &cluster,
+            &registry,
+            &local,
+            2,
+            OffsetDateTime::UNIX_EPOCH,
+            true,
+        )
+        .await
+        .expect("force-publish unchanged instance");
+
+        assert!(result.is_some());
+        let commits = cluster.committed_requests();
+        assert_eq!(commits.len(), 1);
+        let [KvOp::Put { key, .. }] = commits[0].txn.success.as_slice() else {
+            panic!("forced publication should reassert the current local record");
+        };
+        assert_eq!(key, &cluster_service_instance_key("dfs", &local));
     }
 
     #[tokio::test]

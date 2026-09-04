@@ -43,6 +43,7 @@ pub trait ServiceCatalogPublisherHost: Send + Sync {
     fn publish<'a>(
         &'a self,
         snapshot: Arc<ServiceRegistrySnapshot>,
+        force_current_records: bool,
     ) -> ServiceCatalogPublishFuture<'a>;
 }
 
@@ -157,6 +158,7 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
     fn publish<'a>(
         &'a self,
         snapshot: Arc<ServiceRegistrySnapshot>,
+        force_current_records: bool,
     ) -> ServiceCatalogPublishFuture<'a> {
         Box::pin(async move {
             let records = sinomo_core::service::service_instance_records_from_registry(
@@ -166,12 +168,13 @@ impl ServiceCatalogPublisherHost for ComponentServiceCatalogPublisherHost {
                 time::OffsetDateTime::now_utc(),
             );
             let summary = service_catalog_log_summary(&records);
-            let publication = sinomo_core::service::publish_local_service_instances(
+            let publication = sinomo_core::service::publish_local_service_instances_with_force(
                 self.cluster.as_ref(),
                 snapshot.registry(),
                 &self.local_node_id,
                 snapshot.version(),
                 time::OffsetDateTime::now_utc(),
+                force_current_records,
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -237,7 +240,11 @@ async fn run_service_catalog_publisher_with_timing(
         let snapshot = registry.active_snapshot();
         let publication = match tokio::time::timeout(
             timing.publish_timeout,
-            host.publish(snapshot.clone()),
+            host.publish(
+                snapshot.clone(),
+                startup_reconcile_deadline
+                    .is_none_or(|deadline| deadline > tokio::time::Instant::now()),
+            ),
         )
         .await
         {
@@ -335,6 +342,7 @@ mod tests {
         fn publish<'a>(
             &'a self,
             _snapshot: Arc<ServiceRegistrySnapshot>,
+            _force_current_records: bool,
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 self.0.fetch_add(1, Ordering::SeqCst);
@@ -349,6 +357,7 @@ mod tests {
         fn publish<'a>(
             &'a self,
             _snapshot: Arc<ServiceRegistrySnapshot>,
+            _force_current_records: bool,
         ) -> ServiceCatalogPublishFuture<'a> {
             Box::pin(async move {
                 let call = self.0.fetch_add(1, Ordering::SeqCst);
