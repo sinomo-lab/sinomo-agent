@@ -4235,6 +4235,63 @@ mod lazy_replica_slot_tests {
     }
 
     #[test]
+    fn completed_replica_handoff_fence_does_not_report_local_authoritative_outage() {
+        let root = sinomo_testdir::TestDir::new("dfs-completed-replica-handoff-fence");
+        let metadata_root = root.path().join("metadata");
+        let local_node_id = node("completed-replica-handoff-local");
+        let primary_node_id = node("completed-replica-handoff-primary");
+        let shard_id = DfsMetadataShardId::new("root");
+        let mut shard = configs(&local_node_id)
+            .into_iter()
+            .find(|config| config.shard_id == shard_id.0)
+            .expect("root config");
+        shard.primary_node_id = primary_node_id.clone();
+        shard.replica_node_ids = vec![local_node_id.clone()];
+        shard.epoch = 70;
+
+        let mut backend = LocalShardedMetadataBackend::new_with_replica_repair(
+            &metadata_root,
+            vec![shard],
+            &local_node_id,
+        )
+        .expect("open replica-aware sharded backend");
+        let handoff_id = "completed-replica-handoff";
+        {
+            let replica = backend
+                .shard_backend_mut(&shard_id)
+                .expect("open replica shard");
+            replica
+                .put_file_system(&distributed_sifs(primary_node_id))
+                .expect("seed exact replica prefix");
+            replica
+                .freeze_metadata_shard_for_membership_handoff(&shard_id, handoff_id, 69)
+                .expect("persist retiring replica fence");
+            replica
+                .mark_metadata_shard_membership_handoff_activated(&shard_id, handoff_id, 70)
+                .expect("record successor activation");
+            assert!(
+                replica
+                    .metadata_shard_authoritative_writes_frozen(&shard_id)
+                    .expect("inspect shard-local fence"),
+                "the unbound replica backend must retain the durable ingest fence"
+            );
+        }
+
+        assert!(
+            !backend
+                .metadata_shard_authoritative_writes_frozen(&shard_id)
+                .expect("project node-local authoritative availability"),
+            "a retained fence on a non-primary replica must not report a local authoritative outage"
+        );
+        let freeze = backend
+            .metadata_shard_write_freeze(&shard_id)
+            .expect("read retained replica fence")
+            .expect("replica fence remains durable");
+        assert_eq!(freeze.handoff_id, handoff_id);
+        assert_eq!(freeze.activated_epoch, Some(70));
+    }
+
+    #[test]
     fn resident_handles_share_instance_local_handoff_authority() {
         let root = sinomo_testdir::TestDir::new("dfs-resident-shard-handoff-authority");
         let metadata_root = root.path().join("metadata");
@@ -7454,6 +7511,15 @@ impl DfsMetadataBackend for LocalShardedMetadataBackend {
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<bool> {
+        // Retired replicas deliberately retain completed handoff markers as
+        // durable ingest fences. Those markers do not describe this node's
+        // authoritative-write availability once another node is primary.
+        // The shard-local backend still exposes and enforces the marker for
+        // replica ingest; only the node-scoped authoritative projection is
+        // primary-specific.
+        if !self.shard_is_local_authoritative_primary(shard_id) {
+            return Ok(false);
+        }
         self.shard_backend(shard_id)?
             .metadata_shard_authoritative_writes_frozen(shard_id)
     }
