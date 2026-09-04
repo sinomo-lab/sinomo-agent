@@ -55,6 +55,46 @@ impl EvolutionClient {
         .call(contract::EVOLUTION_DECISION_ROUTE, &request)
     }
 
+    pub fn create_goal(
+        &self,
+        request: contract::EvolutionGoalCreateRequest,
+    ) -> Result<contract::EvolutionGoalCreateResponse, DaemonApiError> {
+        Self {
+            daemon: self.daemon.clone().with_timeout(EVOLUTION_MUTATION_TIMEOUT),
+        }
+        .call(contract::EVOLUTION_GOAL_CREATE_ROUTE, &request)
+    }
+
+    pub fn record_revision(
+        &self,
+        request: contract::EvolutionRevisionRecordRequest,
+    ) -> Result<contract::EvolutionRevisionRecordResponse, DaemonApiError> {
+        Self {
+            daemon: self.daemon.clone().with_timeout(EVOLUTION_MUTATION_TIMEOUT),
+        }
+        .call(contract::EVOLUTION_REVISION_RECORD_ROUTE, &request)
+    }
+
+    pub fn control_goal(
+        &self,
+        request: contract::EvolutionGoalControlRequest,
+    ) -> Result<contract::EvolutionMutationResponse, DaemonApiError> {
+        Self {
+            daemon: self.daemon.clone().with_timeout(EVOLUTION_MUTATION_TIMEOUT),
+        }
+        .call(contract::EVOLUTION_GOAL_CONTROL_ROUTE, &request)
+    }
+
+    pub fn update_workflow(
+        &self,
+        request: contract::EvolutionWorkflowUpdateRequest,
+    ) -> Result<contract::EvolutionMutationResponse, DaemonApiError> {
+        Self {
+            daemon: self.daemon.clone().with_timeout(EVOLUTION_MUTATION_TIMEOUT),
+        }
+        .call(contract::EVOLUTION_WORKFLOW_UPDATE_ROUTE, &request)
+    }
+
     fn call<Req, Resp>(&self, route: &str, request: &Req) -> Result<Resp, DaemonApiError>
     where
         Req: Serialize,

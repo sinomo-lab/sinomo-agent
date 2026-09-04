@@ -6,6 +6,7 @@ mod module_widget;
 
 pub mod chat;
 pub mod cluster;
+pub mod evolution;
 pub mod files;
 pub mod media_setup;
 pub mod settings;

@@ -4641,7 +4641,7 @@ where
         })?;
 
         let mut config = AgentConfig::new(self.provider.clone(), self.model.clone())
-            .with_agent_definition(crate::evolution_agent_definition())
+            .with_agent_definition(crate::evolution_implementer_agent_definition())
             .with_workspace_root(&workspace.path)
             .with_context_budget(AgentContextBudget::for_loaded_model(
                 &self.provider,
@@ -4663,13 +4663,13 @@ where
         let tool_registry = AgentToolRegistry::local_workspace_with_config(workspace_config);
         if let Some(data_dir) = &self.local_permission_data_dir {
             tool_registry.set_local_permission_data_dir(data_dir.root());
-            let memory_backend =
-                sinomo_agent::SifsMemoryNoteBackend::new(data_dir, crate::EVOLUTION_AGENT_ID)
-                    .map_err(|source| MutationModelError::Agent {
-                        detail: format!(
-                            "configure evolution-agent Markdown memory notes: {source}"
-                        ),
-                    })?;
+            let memory_backend = sinomo_agent::SifsMemoryNoteBackend::new(
+                data_dir,
+                crate::EVOLUTION_IMPLEMENTER_AGENT_ID,
+            )
+            .map_err(|source| MutationModelError::Agent {
+                detail: format!("configure evolution-agent Markdown memory notes: {source}"),
+            })?;
             sinomo_agent::memory_notes::register_tools(
                 &tool_registry,
                 sinomo_agent::MemoryNoteAgentToolConfig::from_backend(memory_backend),
@@ -4682,7 +4682,7 @@ where
             self.model.clone(),
         )
         .with_config(config)
-        .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Evolution))
+        .with_tool_surface(AgentToolSurface::default_for_role(AgentRole::Deliberation))
         .with_tool_registry(tool_registry)
         .with_trace_store(FileAgentTraceStore::new(
             storage_paths.trace_path_for_session(&session.session_id),
@@ -4699,7 +4699,7 @@ where
         };
         let runtime = AgentSessionRuntime::new(
             agent,
-            AgentSession::new(input.session.session_id.clone(), AgentRole::Evolution),
+            AgentSession::new(input.session.session_id.clone(), AgentRole::Deliberation),
         );
         let op = AgentOp::start_turn(input);
         let op_id = op.op_id.clone();

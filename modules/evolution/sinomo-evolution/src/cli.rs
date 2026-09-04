@@ -18,6 +18,10 @@ pub enum EvolveCliCommand {
     Tick(Vec<String>),
     Decide(CandidateDecisionOutcome, Vec<String>),
     Status(Vec<String>),
+    Graph(Vec<String>),
+    Goal(Vec<String>),
+    Revision(Vec<String>),
+    Workflow(Vec<String>),
     Show(Vec<String>),
     Verify(Vec<String>),
     Packet(Vec<String>),
@@ -166,6 +170,14 @@ pub fn parse_evolve_command(args: &[String]) -> Result<EvolveCliCommand, CliPars
             rest.to_vec(),
         )),
         Some((command, rest)) if command == "status" => Ok(EvolveCliCommand::Status(rest.to_vec())),
+        Some((command, rest)) if command == "graph" => Ok(EvolveCliCommand::Graph(rest.to_vec())),
+        Some((command, rest)) if command == "goal" => Ok(EvolveCliCommand::Goal(rest.to_vec())),
+        Some((command, rest)) if command == "revision" => {
+            Ok(EvolveCliCommand::Revision(rest.to_vec()))
+        }
+        Some((command, rest)) if command == "workflow" => {
+            Ok(EvolveCliCommand::Workflow(rest.to_vec()))
+        }
         Some((command, rest)) if command == "show" => Ok(EvolveCliCommand::Show(rest.to_vec())),
         Some((command, rest)) if command == "verify" => Ok(EvolveCliCommand::Verify(rest.to_vec())),
         Some((command, rest)) if command == "packet" => Ok(EvolveCliCommand::Packet(rest.to_vec())),
@@ -898,6 +910,18 @@ mod tests {
         assert!(matches!(
             parse_evolve_command(&["models".to_string(), "list".to_string()]),
             Ok(EvolveCliCommand::Models(args)) if args == vec!["list"]
+        ));
+        assert!(matches!(
+            parse_evolve_command(&["graph".to_string(), "--json".to_string()]),
+            Ok(EvolveCliCommand::Graph(args)) if args == vec!["--json"]
+        ));
+        assert!(matches!(
+            parse_evolve_command(&["goal".to_string(), "create".to_string()]),
+            Ok(EvolveCliCommand::Goal(args)) if args == vec!["create"]
+        ));
+        assert!(matches!(
+            parse_evolve_command(&["workflow".to_string(), "update".to_string()]),
+            Ok(EvolveCliCommand::Workflow(args)) if args == vec!["update"]
         ));
     }
 

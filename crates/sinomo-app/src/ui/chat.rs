@@ -6930,6 +6930,19 @@ impl ChatState {
         });
     }
 
+    /// Start a fresh direct chat with a specific catalog agent. Cross-surface
+    /// navigation uses this instead of mutating the visible agent key without
+    /// going through the normal session and worker transition.
+    pub fn start_agent_chat(&mut self, agent_key: &str) -> bool {
+        let Some(index) = self.agents.iter().position(|agent| agent.key == agent_key) else {
+            self.notice = Some(format!("agent `{agent_key}` is not available"));
+            return false;
+        };
+        self.new_session();
+        self.select_agent(index);
+        self.info.agent == agent_key
+    }
+
     /// Whether `index` is the currently-active agent (matched by key or display name).
     fn is_active_agent(&self, index: usize) -> bool {
         self.active_agent_index() == Some(index)

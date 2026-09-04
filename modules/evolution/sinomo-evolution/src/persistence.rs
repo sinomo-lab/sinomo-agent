@@ -6,10 +6,17 @@ use crate::{
     CampaignDecision, CampaignDecisionKind, CampaignScheduleDecision,
     CandidateApprovalPreflightReport, CandidateBundleManifest, CandidateBundleSifsMirrorFile,
     CandidateBundleSifsMirrorReport, CandidateDecision, CandidateDecisionOutcome,
-    CandidateEvolutionLessonRecord, CandidateRegressionEvidenceSummary, EvolutionCampaign,
-    EvolutionCampaignStatus, EvolutionJob, EvolutionJobId, EvolutionJobStatus,
-    EvolutionLessonMemoryRecord, EvolutionRegressionGateMemoryRecord, EvolutionReport,
-    ResourceSchedulerDryRun, ScheduledIterationPlan, StageEvaluationUpdate,
+    CandidateEvolutionLessonRecord, CandidateRegressionEvidenceSummary,
+    CandidateResourceUsageSummary, EvolutionAgentRole, EvolutionAgentRunRecord,
+    EvolutionAgentRunStatus, EvolutionArtifact, EvolutionArtifactRole, EvolutionCampaign,
+    EvolutionCampaignStatus, EvolutionEventProvenance, EvolutionEventRouting, EvolutionGoalGraph,
+    EvolutionGoalStatus, EvolutionGraphError, EvolutionGraphEvent, EvolutionJob, EvolutionJobId,
+    EvolutionJobStatus, EvolutionLessonMemoryRecord, EvolutionMetricDefinition,
+    EvolutionMetricDirection, EvolutionMetricObservation, EvolutionMetricValue,
+    EvolutionRegressionGateMemoryRecord, EvolutionReport, EvolutionResourceRecord,
+    EvolutionRevision, EvolutionRevisionStatus, EvolutionTaskRecord, EvolutionTaskStatus,
+    ResourceSchedulerDryRun, RevisionContentIdentity, ScheduledIterationPlan,
+    StageEvaluationUpdate,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -20,7 +27,7 @@ use sinomo_runtime::config::{
     ConfigClusterMode, ConfigDefinition, ConfigError, ConfigRegistry, ConfigRegistryBuilder,
     ConfigStore, ConfigValueType, ConfigWriteTarget,
 };
-use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard};
+use sinomo_runtime::core::{EvaluationOutcome, EvaluationScorecard, MetricValue};
 use sinomo_runtime::dfs::{
     AsyncDfsPeerTransport, DfsMetadataJournalReplicationOptions, DfsMetadataShardConfig,
     DfsNodeTransport, DfsObjectRpcSendOptions, DfsPeerTransport, DfsPeerTransportError,
@@ -112,6 +119,7 @@ pub struct EvolutionPaths {
     pub data_dir: PathBuf,
     pub root: PathBuf,
     pub jobs: PathBuf,
+    pub goals: PathBuf,
     pub campaigns: PathBuf,
     pub memory: PathBuf,
     pub lesson_memory_dir: PathBuf,
@@ -130,6 +138,7 @@ impl EvolutionPaths {
         Self {
             data_dir: data_dir_root.clone(),
             jobs: root.join("jobs"),
+            goals: root.join("goals"),
             campaigns: root.join("campaigns"),
             memory: root.join("memory"),
             lesson_memory_dir: root.join("memory").join("lessons"),
@@ -154,6 +163,7 @@ impl EvolutionPaths {
         for path in [
             &self.root,
             &self.jobs,
+            &self.goals,
             &self.campaigns,
             &self.memory,
             &self.lesson_memory_dir,
@@ -179,6 +189,14 @@ impl EvolutionPaths {
 
     pub fn job_path(&self, job_id: &EvolutionJobId) -> PathBuf {
         self.job_dir(job_id).join("record.json")
+    }
+
+    pub fn goal_dir(&self, goal_id: &str) -> PathBuf {
+        self.goals.join(safe_file_stem(goal_id))
+    }
+
+    pub fn goal_graph_path(&self, goal_id: &str) -> PathBuf {
+        self.goal_dir(goal_id).join("graph.json")
     }
 }
 
@@ -566,7 +584,772 @@ pub fn write_stored_job(
     paths: &EvolutionPaths,
     record: &StoredEvolutionJob,
 ) -> Result<(), EvolutionPersistenceError> {
-    write_json(&paths.job_path(&record.job.job_id), record)
+    write_json(&paths.job_path(&record.job.job_id), record)?;
+    sync_stored_job_graph(paths, record)
+}
+
+/// Read one persisted goal graph. Graphs are stored separately from mutable
+/// job records so a goal can contain branches, merges, and revisions produced
+/// by different kinds of workers.
+pub fn read_evolution_goal_graph(
+    paths: &EvolutionPaths,
+    goal_id: &str,
+) -> Result<EvolutionGoalGraph, EvolutionPersistenceError> {
+    let graph: EvolutionGoalGraph = read_json_file(&paths.goal_graph_path(goal_id))?;
+    graph.validate()?;
+    Ok(graph)
+}
+
+pub fn list_evolution_goal_graphs(
+    paths: &EvolutionPaths,
+) -> Result<Vec<EvolutionGoalGraph>, EvolutionPersistenceError> {
+    let mut graphs = Vec::new();
+    for entry in list_dir_vfs(&paths.goals)? {
+        if entry.kind != VfsObjectKind::Directory {
+            continue;
+        }
+        let graph_path = entry.path.join("graph.json");
+        if path_exists_vfs(&graph_path)? {
+            let graph: EvolutionGoalGraph = read_json_file(&graph_path)?;
+            graph.validate()?;
+            graphs.push(graph);
+        }
+    }
+    graphs.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    Ok(graphs)
+}
+
+pub fn write_evolution_goal_graph(
+    paths: &EvolutionPaths,
+    graph: &EvolutionGoalGraph,
+) -> Result<(), EvolutionPersistenceError> {
+    graph.validate()?;
+    create_dir_all_vfs(&paths.goal_dir(&graph.goal_id))?;
+    write_json(&paths.goal_graph_path(&graph.goal_id), graph)
+}
+
+/// Project the existing candidate/evidence lifecycle into the generic goal
+/// DAG. The baseline is a git commit when one is available. Candidate content
+/// is identified by the immutable base revision plus the recorded patch
+/// artifact, rather than by its still-mutable worktree path.
+fn sync_stored_job_graph(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+) -> Result<(), EvolutionPersistenceError> {
+    let goal_id = goal_id_for_job(record);
+    let now = current_rfc3339();
+    let graph_path = paths.goal_graph_path(&goal_id);
+    let mut graph = if path_exists_vfs(&graph_path)? {
+        read_evolution_goal_graph(paths, &goal_id)?
+    } else {
+        EvolutionGoalGraph::new(
+            goal_id.clone(),
+            goal_objective(paths, record, &goal_id),
+            crate::EVOLUTION_AGENT_ID,
+            now.clone(),
+        )
+    };
+    graph.status = goal_status_for_record(paths, record, &goal_id);
+    graph.updated_at = now.clone();
+
+    let governor_run_id = stable_graph_id("agent", &[&goal_id, crate::EVOLUTION_AGENT_ID]);
+    graph.upsert_agent_run(EvolutionAgentRunRecord {
+        agent_run_id: governor_run_id.clone(),
+        agent_id: crate::EVOLUTION_AGENT_ID.to_string(),
+        role: EvolutionAgentRole::Governor,
+        status: governor_status_for_goal(&graph.status),
+        parent_agent_run_id: None,
+        task_id: None,
+        session_ref: None,
+        summary: "owns goal planning, task assignment, evidence review, and workflow decisions"
+            .to_string(),
+        started_at: graph.created_at.clone(),
+        finished_at: matches!(
+            graph.status,
+            EvolutionGoalStatus::Complete
+                | EvolutionGoalStatus::Failed
+                | EvolutionGoalStatus::Cancelled
+        )
+        .then_some(now.clone()),
+    });
+
+    let baseline_revision_id = baseline_revision_id(record);
+    if !graph
+        .revisions
+        .iter()
+        .any(|revision| revision.revision_id == baseline_revision_id)
+    {
+        let parent_revision_ids = graph
+            .revisions
+            .iter()
+            .filter(|revision| revision.status == EvolutionRevisionStatus::Selected)
+            .map(|revision| revision.revision_id.clone())
+            .collect::<Vec<_>>();
+        graph.upsert_revision(EvolutionRevision {
+            revision_id: baseline_revision_id.clone(),
+            parent_revision_ids,
+            content: baseline_content_identity(record),
+            artifacts: Vec::new(),
+            metrics: Vec::new(),
+            status: EvolutionRevisionStatus::Baseline,
+            summary: "source revision used to create the candidate".to_string(),
+            created_at: record
+                .bundle
+                .created_at
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| now.clone()),
+            job_id: None,
+            proposed_by_agent_run_id: None,
+        })?;
+    }
+
+    // A mutable path alone is not a frozen candidate identity. Wait until the
+    // candidate bundle contains a diff or a finalized content manifest.
+    if record.bundle.diff_path.is_none() && record.bundle.bundle_content_hash.is_none() {
+        append_goal_created_event(&mut graph, &now);
+        return write_evolution_goal_graph(paths, &graph);
+    }
+
+    let revision_id = stable_graph_id("revision", &[&goal_id, record.job.job_id.as_str()]);
+    let implementer_run_id = stable_graph_id("agent", &[record.job.job_id.as_str(), "implementer"]);
+    let task_id = format!("task_{}", record.job.job_id.as_str());
+    let (patch_artifact, candidate_digest) = candidate_patch_artifact(record)?;
+    let scorecard = record
+        .bundle
+        .scorecard_path
+        .as_deref()
+        .map(Path::new)
+        .filter(|path| path_exists_vfs(path).unwrap_or(false))
+        .map(read_json_file::<EvaluationScorecard>)
+        .transpose()?;
+    let scorecard_artifact_id = stable_graph_id("artifact", &[&revision_id, "scorecard"]);
+    let mut artifacts = vec![patch_artifact];
+    artifacts.extend(bundle_artifacts(record, &revision_id)?);
+    let metrics = scorecard
+        .as_ref()
+        .map(|scorecard| {
+            scorecard
+                .metrics
+                .iter()
+                .map(|metric| EvolutionMetricObservation {
+                    metric_id: metric.name.clone(),
+                    value: graph_metric_value(&metric.value),
+                    sample_count: metric.sample_count,
+                    outcome: Some(format!("{:?}", scorecard.outcome).to_ascii_lowercase()),
+                    evaluator: "sinomo.eval".to_string(),
+                    artifact_id: scorecard_artifact_id.clone(),
+                    measured_at: now.clone(),
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for metric in &metrics {
+        graph.upsert_metric_definition(EvolutionMetricDefinition {
+            metric_id: metric.metric_id.clone(),
+            label: humanize_metric_name(&metric.metric_id),
+            direction: EvolutionMetricDirection::Observe,
+            unit: metric_unit(&metric.value),
+            target: None,
+            required: false,
+        });
+    }
+    graph.upsert_revision(EvolutionRevision {
+        revision_id: revision_id.clone(),
+        parent_revision_ids: vec![baseline_revision_id.clone()],
+        content: RevisionContentIdentity::Composite {
+            base_revision_id: baseline_revision_id.clone(),
+            patch_artifact_id: artifacts[0].artifact_id.clone(),
+            digest: candidate_digest,
+        },
+        artifacts,
+        metrics,
+        status: revision_status_for_job(&record.job.status),
+        summary: record.job.objective.clone(),
+        created_at: record
+            .bundle
+            .created_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| now.clone()),
+        job_id: Some(record.job.job_id.to_string()),
+        proposed_by_agent_run_id: Some(implementer_run_id.clone()),
+    })?;
+    graph.upsert_task(EvolutionTaskRecord {
+        task_id: task_id.clone(),
+        title: record.job.objective.clone(),
+        status: task_status_for_job(&record.job.status),
+        revision_id: Some(revision_id.clone()),
+        parent_task_id: None,
+        dependency_task_ids: Vec::new(),
+        subgoals: record
+            .job
+            .required_gates
+            .iter()
+            .map(|gate| format!("pass {gate:?}"))
+            .collect(),
+        assigned_agent_run_id: Some(implementer_run_id.clone()),
+        updated_at: now.clone(),
+    });
+    graph.upsert_agent_run(EvolutionAgentRunRecord {
+        agent_run_id: implementer_run_id.clone(),
+        agent_id: crate::EVOLUTION_IMPLEMENTER_AGENT_ID.to_string(),
+        role: EvolutionAgentRole::Implementer,
+        status: agent_status_for_job(&record.job.status),
+        parent_agent_run_id: Some(governor_run_id),
+        task_id: Some(task_id.clone()),
+        session_ref: record.bundle.agent_run_path.clone(),
+        summary: "implemented and verified one candidate revision in an isolated workspace"
+            .to_string(),
+        started_at: record
+            .bundle
+            .created_at
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| now.clone()),
+        finished_at: is_terminal_status(&record.job.status).then_some(now.clone()),
+    });
+    sync_resource_records(
+        &mut graph,
+        record,
+        &revision_id,
+        &task_id,
+        &implementer_run_id,
+    )?;
+    append_goal_created_event(&mut graph, &now);
+    append_revision_event(
+        &mut graph,
+        record,
+        &revision_id,
+        &task_id,
+        &implementer_run_id,
+        &now,
+    );
+    append_orchestration_events(
+        &mut graph,
+        record,
+        &revision_id,
+        &task_id,
+        &implementer_run_id,
+        &now,
+    );
+    write_evolution_goal_graph(paths, &graph)
+}
+
+fn goal_id_for_job(record: &StoredEvolutionJob) -> String {
+    record
+        .job
+        .objective
+        .strip_prefix("Campaign ")
+        .and_then(|objective| objective.split_whitespace().next())
+        .filter(|campaign_id| !campaign_id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("goal_{}", record.job.job_id))
+}
+
+fn goal_objective(paths: &EvolutionPaths, record: &StoredEvolutionJob, goal_id: &str) -> String {
+    read_campaign(paths, goal_id)
+        .map(|campaign| campaign.objective_card.human_text)
+        .unwrap_or_else(|_| record.job.objective.clone())
+}
+
+fn baseline_revision_id(record: &StoredEvolutionJob) -> String {
+    let identity = record
+        .candidate_workspace
+        .source_revision
+        .as_deref()
+        .unwrap_or(&record.job.edit_scope.workspace_root);
+    stable_graph_id(
+        "revision",
+        &["baseline", &record.job.edit_scope.workspace_root, identity],
+    )
+}
+
+fn baseline_content_identity(record: &StoredEvolutionJob) -> RevisionContentIdentity {
+    if let Some(commit) = &record.candidate_workspace.source_revision {
+        RevisionContentIdentity::GitCommit {
+            repository: record.job.edit_scope.workspace_root.clone(),
+            commit: commit.clone(),
+        }
+    } else {
+        RevisionContentIdentity::DirectorySnapshot {
+            path: record.job.edit_scope.workspace_root.clone(),
+            digest: stable_digest(&[
+                "directory-snapshot",
+                &record.job.edit_scope.workspace_root,
+                record.job.job_id.as_str(),
+            ]),
+            manifest_ref: None,
+        }
+    }
+}
+
+fn candidate_patch_artifact(
+    record: &StoredEvolutionJob,
+) -> Result<(EvolutionArtifact, String), EvolutionPersistenceError> {
+    let patch_bytes = record
+        .bundle
+        .diff_path
+        .as_deref()
+        .map(Path::new)
+        .map(read_optional_bytes_file)
+        .transpose()?
+        .flatten()
+        .unwrap_or_default();
+    let patch_digest = format!("blake3:{}", blake3::hash(&patch_bytes).to_hex());
+    let base_hash = baseline_content_identity(record).content_hash();
+    let candidate_digest = stable_digest(&[&base_hash, &patch_digest]);
+    let artifact_id = stable_graph_id("artifact", &[record.job.job_id.as_str(), "patch"]);
+    Ok((
+        EvolutionArtifact {
+            artifact_id,
+            kind: "source-patch".to_string(),
+            uri: record
+                .bundle
+                .diff_path
+                .clone()
+                .unwrap_or_else(|| format!("{}#empty-patch", record.bundle.bundle_path)),
+            content_hash: patch_digest,
+            media_type: "text/x-diff".to_string(),
+            schema: String::new(),
+            role: EvolutionArtifactRole::CandidateContent,
+        },
+        candidate_digest,
+    ))
+}
+
+fn bundle_artifacts(
+    record: &StoredEvolutionJob,
+    revision_id: &str,
+) -> Result<Vec<EvolutionArtifact>, EvolutionPersistenceError> {
+    let candidates = [
+        (
+            "scorecard",
+            record.bundle.scorecard_path.as_deref(),
+            "application/json",
+            "sinomo.evolution.scorecard/v1",
+            EvolutionArtifactRole::EvaluationOutput,
+        ),
+        (
+            "content-manifest",
+            record.bundle.content_manifest_path.as_deref(),
+            "application/json",
+            "sinomo.evolution.bundle-content/v1",
+            EvolutionArtifactRole::Provenance,
+        ),
+        (
+            "attestation",
+            record.bundle.attestation_path.as_deref(),
+            "application/json",
+            "in-toto-statement",
+            EvolutionArtifactRole::Provenance,
+        ),
+        (
+            "agent-run",
+            record.bundle.agent_run_path.as_deref(),
+            "application/json",
+            "sinomo.agent.run/v1",
+            EvolutionArtifactRole::AgentTrace,
+        ),
+        (
+            "resource-usage",
+            record.bundle.resource_usage_path.as_deref(),
+            "application/json",
+            "sinomo.evolution.resource-usage/v1",
+            EvolutionArtifactRole::ResourceEvidence,
+        ),
+    ];
+    let mut artifacts = Vec::new();
+    for (kind, path, media_type, schema, role) in candidates {
+        let Some(path) = path else {
+            continue;
+        };
+        let bytes = read_optional_bytes_file(Path::new(path))?.unwrap_or_default();
+        artifacts.push(EvolutionArtifact {
+            artifact_id: stable_graph_id("artifact", &[revision_id, kind]),
+            kind: kind.to_string(),
+            uri: path.to_string(),
+            content_hash: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+            media_type: media_type.to_string(),
+            schema: schema.to_string(),
+            role,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn sync_resource_records(
+    graph: &mut EvolutionGoalGraph,
+    record: &StoredEvolutionJob,
+    revision_id: &str,
+    task_id: &str,
+    agent_run_id: &str,
+) -> Result<(), EvolutionPersistenceError> {
+    let Some(path) = record.bundle.resource_usage_path.as_deref() else {
+        return Ok(());
+    };
+    if !path_exists_vfs(Path::new(path))? {
+        return Ok(());
+    }
+    let summary: CandidateResourceUsageSummary = read_json_file(Path::new(path))?;
+    for usage in summary.records {
+        graph.upsert_resource(EvolutionResourceRecord {
+            record_id: stable_graph_id(
+                "resource",
+                &[record.job.job_id.as_str(), &usage.resource, &usage.source],
+            ),
+            revision_id: Some(revision_id.to_string()),
+            task_id: Some(task_id.to_string()),
+            agent_run_id: Some(agent_run_id.to_string()),
+            resource: usage.resource,
+            quantity: usage.units,
+            unit: usage.unit,
+            monetary_microunits: None,
+            currency: None,
+            confidence: format!("{:?}", usage.confidence).to_ascii_lowercase(),
+            evidence_ref: path.to_string(),
+            recorded_at: summary.generated_at.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn append_goal_created_event(graph: &mut EvolutionGoalGraph, now: &str) {
+    let event_id = stable_graph_id(
+        "event",
+        &[&graph.goal_id, crate::EVOLUTION_GOAL_CREATED_EVENT_KIND],
+    );
+    graph.append_event(EvolutionGraphEvent {
+        event_id,
+        kind: crate::EVOLUTION_GOAL_CREATED_EVENT_KIND.to_string(),
+        occurred_at: graph.created_at.clone(),
+        goal_id: graph.goal_id.clone(),
+        revision_id: None,
+        task_id: None,
+        agent_run_id: None,
+        provenance: EvolutionEventProvenance {
+            source: "sinomo-evolution".to_string(),
+            actor: crate::EVOLUTION_AGENT_ID.to_string(),
+            node_id: None,
+        },
+        evidence_refs: Vec::new(),
+        caused_by_event_ids: Vec::new(),
+        routing: durable_goal_routing(),
+    });
+    graph.updated_at = now.to_string();
+}
+
+fn append_revision_event(
+    graph: &mut EvolutionGoalGraph,
+    record: &StoredEvolutionJob,
+    revision_id: &str,
+    task_id: &str,
+    agent_run_id: &str,
+    now: &str,
+) {
+    let kind = match record.job.status {
+        EvolutionJobStatus::Evaluated | EvolutionJobStatus::Verified => {
+            crate::EVOLUTION_REVISION_EVALUATED_EVENT_KIND
+        }
+        EvolutionJobStatus::AwaitingApproval => {
+            crate::EVOLUTION_REVISION_AWAITING_DECISION_EVENT_KIND
+        }
+        EvolutionJobStatus::Approved
+        | EvolutionJobStatus::PolicyApproved
+        | EvolutionJobStatus::Promoted => crate::EVOLUTION_REVISION_SELECTED_EVENT_KIND,
+        EvolutionJobStatus::Failed
+        | EvolutionJobStatus::BuildFailed
+        | EvolutionJobStatus::EvalFailed
+        | EvolutionJobStatus::Denied
+        | EvolutionJobStatus::Rejected => crate::EVOLUTION_REVISION_FAILED_EVENT_KIND,
+        EvolutionJobStatus::Restored
+        | EvolutionJobStatus::RolledBack
+        | EvolutionJobStatus::Reverted => crate::EVOLUTION_REVISION_RECOVERED_EVENT_KIND,
+        _ => crate::EVOLUTION_REVISION_PROPOSED_EVENT_KIND,
+    };
+    let event_id = stable_graph_id("event", &[revision_id, kind]);
+    let evidence_refs = record
+        .bundle
+        .scorecard_path
+        .iter()
+        .chain(record.bundle.diff_path.iter())
+        .cloned()
+        .collect();
+    graph.append_event(EvolutionGraphEvent {
+        event_id,
+        kind: kind.to_string(),
+        occurred_at: now.to_string(),
+        goal_id: graph.goal_id.clone(),
+        revision_id: Some(revision_id.to_string()),
+        task_id: Some(task_id.to_string()),
+        agent_run_id: Some(agent_run_id.to_string()),
+        provenance: EvolutionEventProvenance {
+            source: "sinomo-evolution".to_string(),
+            actor: crate::EVOLUTION_AGENT_ID.to_string(),
+            node_id: None,
+        },
+        evidence_refs,
+        caused_by_event_ids: Vec::new(),
+        routing: durable_goal_routing(),
+    });
+}
+
+fn append_orchestration_events(
+    graph: &mut EvolutionGoalGraph,
+    record: &StoredEvolutionJob,
+    revision_id: &str,
+    task_id: &str,
+    agent_run_id: &str,
+    now: &str,
+) {
+    let provenance = EvolutionEventProvenance {
+        source: "sinomo-evolution".to_string(),
+        actor: crate::EVOLUTION_AGENT_ID.to_string(),
+        node_id: None,
+    };
+    graph.append_event(EvolutionGraphEvent {
+        event_id: stable_graph_id(
+            "event",
+            &[
+                task_id,
+                crate::EVOLUTION_TASK_UPDATED_EVENT_KIND,
+                &format!("{:?}", record.job.status),
+            ],
+        ),
+        kind: crate::EVOLUTION_TASK_UPDATED_EVENT_KIND.to_string(),
+        occurred_at: now.to_string(),
+        goal_id: graph.goal_id.clone(),
+        revision_id: Some(revision_id.to_string()),
+        task_id: Some(task_id.to_string()),
+        agent_run_id: Some(agent_run_id.to_string()),
+        provenance: provenance.clone(),
+        evidence_refs: Vec::new(),
+        caused_by_event_ids: Vec::new(),
+        routing: durable_goal_routing(),
+    });
+    graph.append_event(EvolutionGraphEvent {
+        event_id: stable_graph_id(
+            "event",
+            &[
+                agent_run_id,
+                crate::EVOLUTION_AGENT_UPDATED_EVENT_KIND,
+                &format!("{:?}", record.job.status),
+            ],
+        ),
+        kind: crate::EVOLUTION_AGENT_UPDATED_EVENT_KIND.to_string(),
+        occurred_at: now.to_string(),
+        goal_id: graph.goal_id.clone(),
+        revision_id: Some(revision_id.to_string()),
+        task_id: Some(task_id.to_string()),
+        agent_run_id: Some(agent_run_id.to_string()),
+        provenance: provenance.clone(),
+        evidence_refs: record.bundle.agent_run_path.iter().cloned().collect(),
+        caused_by_event_ids: Vec::new(),
+        routing: durable_goal_routing(),
+    });
+    let resources = graph
+        .resources
+        .iter()
+        .filter(|resource| resource.revision_id.as_deref() == Some(revision_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for resource in resources {
+        graph.append_event(EvolutionGraphEvent {
+            event_id: stable_graph_id(
+                "event",
+                &[
+                    &resource.record_id,
+                    crate::EVOLUTION_RESOURCE_RECORDED_EVENT_KIND,
+                ],
+            ),
+            kind: crate::EVOLUTION_RESOURCE_RECORDED_EVENT_KIND.to_string(),
+            occurred_at: resource.recorded_at,
+            goal_id: graph.goal_id.clone(),
+            revision_id: Some(revision_id.to_string()),
+            task_id: Some(task_id.to_string()),
+            agent_run_id: Some(agent_run_id.to_string()),
+            provenance: provenance.clone(),
+            evidence_refs: vec![resource.evidence_ref],
+            caused_by_event_ids: Vec::new(),
+            routing: durable_goal_routing(),
+        });
+    }
+}
+
+fn durable_goal_routing() -> EvolutionEventRouting {
+    EvolutionEventRouting {
+        scope: "evolution-goal".to_string(),
+        retention: "durable".to_string(),
+    }
+}
+
+fn stable_graph_id(prefix: &str, parts: &[&str]) -> String {
+    let digest = stable_digest(parts);
+    format!(
+        "{prefix}_{}",
+        digest
+            .trim_start_matches("blake3:")
+            .chars()
+            .take(20)
+            .collect::<String>()
+    )
+}
+
+fn stable_digest(parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
+}
+
+fn graph_metric_value(value: &MetricValue) -> EvolutionMetricValue {
+    match value {
+        MetricValue::Bool(value) => EvolutionMetricValue::Boolean(*value),
+        MetricValue::Integer(value) => EvolutionMetricValue::Integer(*value),
+        MetricValue::DecimalBasisPoints(value) => EvolutionMetricValue::Decimal(value.to_string()),
+        MetricValue::Text(value) => EvolutionMetricValue::Text(value.clone()),
+    }
+}
+
+fn metric_unit(value: &EvolutionMetricValue) -> String {
+    match value {
+        EvolutionMetricValue::Boolean(_) => "boolean",
+        EvolutionMetricValue::Integer(_) => "count",
+        EvolutionMetricValue::Decimal(_) => "basis-points",
+        EvolutionMetricValue::Text(_) => "text",
+    }
+    .to_string()
+}
+
+fn humanize_metric_name(name: &str) -> String {
+    name.replace(['-', '_', '.'], " ")
+}
+
+fn goal_status_for_job(status: &EvolutionJobStatus) -> EvolutionGoalStatus {
+    match status {
+        EvolutionJobStatus::AwaitingApproval => EvolutionGoalStatus::AwaitingDecision,
+        EvolutionJobStatus::Approved | EvolutionJobStatus::Promoted => {
+            EvolutionGoalStatus::Complete
+        }
+        EvolutionJobStatus::Failed
+        | EvolutionJobStatus::BuildFailed
+        | EvolutionJobStatus::EvalFailed
+        | EvolutionJobStatus::Denied => EvolutionGoalStatus::Failed,
+        EvolutionJobStatus::Rejected | EvolutionJobStatus::Reverted => {
+            EvolutionGoalStatus::Cancelled
+        }
+        _ => EvolutionGoalStatus::Running,
+    }
+}
+
+fn goal_status_for_record(
+    paths: &EvolutionPaths,
+    record: &StoredEvolutionJob,
+    goal_id: &str,
+) -> EvolutionGoalStatus {
+    let Ok(campaign) = read_campaign(paths, goal_id) else {
+        return goal_status_for_job(&record.job.status);
+    };
+    goal_status_for_campaign(&campaign.status)
+}
+
+fn goal_status_for_campaign(status: &EvolutionCampaignStatus) -> EvolutionGoalStatus {
+    match status {
+        EvolutionCampaignStatus::Draft => EvolutionGoalStatus::Planning,
+        EvolutionCampaignStatus::AwaitingApproval | EvolutionCampaignStatus::PausedHuman => {
+            EvolutionGoalStatus::AwaitingDecision
+        }
+        EvolutionCampaignStatus::PausedBudget | EvolutionCampaignStatus::PausedPolicy => {
+            EvolutionGoalStatus::Paused
+        }
+        EvolutionCampaignStatus::Approved
+        | EvolutionCampaignStatus::Scheduled
+        | EvolutionCampaignStatus::Running
+        | EvolutionCampaignStatus::StageComplete => EvolutionGoalStatus::Running,
+        EvolutionCampaignStatus::Complete => EvolutionGoalStatus::Complete,
+        EvolutionCampaignStatus::Cancelled | EvolutionCampaignStatus::Superseded => {
+            EvolutionGoalStatus::Cancelled
+        }
+        EvolutionCampaignStatus::FailedExhausted => EvolutionGoalStatus::Failed,
+    }
+}
+
+fn governor_status_for_goal(status: &EvolutionGoalStatus) -> EvolutionAgentRunStatus {
+    match status {
+        EvolutionGoalStatus::Planning | EvolutionGoalStatus::Running => {
+            EvolutionAgentRunStatus::Running
+        }
+        EvolutionGoalStatus::AwaitingDecision | EvolutionGoalStatus::Paused => {
+            EvolutionAgentRunStatus::Waiting
+        }
+        EvolutionGoalStatus::Complete => EvolutionAgentRunStatus::Complete,
+        EvolutionGoalStatus::Failed => EvolutionAgentRunStatus::Failed,
+        EvolutionGoalStatus::Cancelled => EvolutionAgentRunStatus::Cancelled,
+    }
+}
+
+fn revision_status_for_job(status: &EvolutionJobStatus) -> EvolutionRevisionStatus {
+    match status {
+        EvolutionJobStatus::AwaitingApproval => EvolutionRevisionStatus::AwaitingDecision,
+        EvolutionJobStatus::Approved
+        | EvolutionJobStatus::PolicyApproved
+        | EvolutionJobStatus::Promoted => EvolutionRevisionStatus::Selected,
+        EvolutionJobStatus::Rejected | EvolutionJobStatus::Denied => {
+            EvolutionRevisionStatus::Rejected
+        }
+        EvolutionJobStatus::Failed
+        | EvolutionJobStatus::BuildFailed
+        | EvolutionJobStatus::EvalFailed => EvolutionRevisionStatus::Failed,
+        EvolutionJobStatus::RolledBack
+        | EvolutionJobStatus::Reverted
+        | EvolutionJobStatus::Restored => EvolutionRevisionStatus::RolledBack,
+        EvolutionJobStatus::Verified | EvolutionJobStatus::Evaluated => {
+            EvolutionRevisionStatus::AwaitingDecision
+        }
+        EvolutionJobStatus::MutationStarted
+        | EvolutionJobStatus::MutationFinished
+        | EvolutionJobStatus::Implemented
+        | EvolutionJobStatus::Built => EvolutionRevisionStatus::Evaluating,
+        _ => EvolutionRevisionStatus::Proposed,
+    }
+}
+
+fn task_status_for_job(status: &EvolutionJobStatus) -> EvolutionTaskStatus {
+    match status {
+        EvolutionJobStatus::Created | EvolutionJobStatus::Observed | EvolutionJobStatus::Scoped => {
+            EvolutionTaskStatus::Planned
+        }
+        EvolutionJobStatus::PacketWritten | EvolutionJobStatus::Proposed => {
+            EvolutionTaskStatus::Ready
+        }
+        EvolutionJobStatus::AwaitingApproval
+        | EvolutionJobStatus::Verified
+        | EvolutionJobStatus::Evaluated => EvolutionTaskStatus::AwaitingDecision,
+        EvolutionJobStatus::Approved
+        | EvolutionJobStatus::Promoted
+        | EvolutionJobStatus::Restored
+        | EvolutionJobStatus::RolledBack
+        | EvolutionJobStatus::Reverted => EvolutionTaskStatus::Complete,
+        EvolutionJobStatus::Rejected | EvolutionJobStatus::Denied => EvolutionTaskStatus::Cancelled,
+        EvolutionJobStatus::Failed
+        | EvolutionJobStatus::BuildFailed
+        | EvolutionJobStatus::EvalFailed => EvolutionTaskStatus::Failed,
+        _ => EvolutionTaskStatus::Running,
+    }
+}
+
+fn agent_status_for_job(status: &EvolutionJobStatus) -> EvolutionAgentRunStatus {
+    match task_status_for_job(status) {
+        EvolutionTaskStatus::Planned | EvolutionTaskStatus::Ready => {
+            EvolutionAgentRunStatus::Queued
+        }
+        EvolutionTaskStatus::Running | EvolutionTaskStatus::AwaitingEvidence => {
+            EvolutionAgentRunStatus::Running
+        }
+        EvolutionTaskStatus::AwaitingDecision => EvolutionAgentRunStatus::Waiting,
+        EvolutionTaskStatus::Complete => EvolutionAgentRunStatus::Complete,
+        EvolutionTaskStatus::Failed => EvolutionAgentRunStatus::Failed,
+        EvolutionTaskStatus::Cancelled => EvolutionAgentRunStatus::Cancelled,
+    }
 }
 
 pub fn record_candidate_decision(
@@ -1084,7 +1867,86 @@ pub fn write_campaign_bundle(
         &campaign.approval_checkpoint,
     )?;
     write_jsonl(&bundle.decisions_jsonl, &campaign.decisions)?;
+    sync_campaign_graph(paths, campaign)?;
     Ok(bundle)
+}
+
+fn sync_campaign_graph(
+    paths: &EvolutionPaths,
+    campaign: &EvolutionCampaign,
+) -> Result<(), EvolutionPersistenceError> {
+    let now = current_rfc3339();
+    let graph_path = paths.goal_graph_path(&campaign.campaign_id);
+    let mut graph = if path_exists_vfs(&graph_path)? {
+        read_evolution_goal_graph(paths, &campaign.campaign_id)?
+    } else {
+        EvolutionGoalGraph::new(
+            campaign.campaign_id.clone(),
+            campaign.objective_card.human_text.clone(),
+            crate::EVOLUTION_AGENT_ID,
+            campaign.created_at.clone(),
+        )
+    };
+    graph.objective = campaign.objective_card.human_text.clone();
+    graph.status = goal_status_for_campaign(&campaign.status);
+    graph.updated_at = campaign.updated_at.clone();
+    let governor_run_id =
+        stable_graph_id("agent", &[&campaign.campaign_id, crate::EVOLUTION_AGENT_ID]);
+    graph.upsert_agent_run(EvolutionAgentRunRecord {
+        agent_run_id: governor_run_id,
+        agent_id: crate::EVOLUTION_AGENT_ID.to_string(),
+        role: EvolutionAgentRole::Governor,
+        status: governor_status_for_goal(&graph.status),
+        parent_agent_run_id: None,
+        task_id: None,
+        session_ref: None,
+        summary: "owns campaign planning, scheduling, evidence review, and checkpoints".to_string(),
+        started_at: campaign.created_at.clone(),
+        finished_at: matches!(
+            graph.status,
+            EvolutionGoalStatus::Complete
+                | EvolutionGoalStatus::Failed
+                | EvolutionGoalStatus::Cancelled
+        )
+        .then_some(now.clone()),
+    });
+    for task in &campaign.near_term_tasks {
+        graph.upsert_task(EvolutionTaskRecord {
+            task_id: task.task_id.clone(),
+            title: task.title.clone(),
+            status: campaign_task_status(&campaign.status),
+            revision_id: None,
+            parent_task_id: None,
+            dependency_task_ids: Vec::new(),
+            subgoals: task.required_evidence.clone(),
+            assigned_agent_run_id: None,
+            updated_at: campaign.updated_at.clone(),
+        });
+    }
+    append_goal_created_event(&mut graph, &now);
+    write_evolution_goal_graph(paths, &graph)
+}
+
+fn campaign_task_status(status: &EvolutionCampaignStatus) -> EvolutionTaskStatus {
+    match status {
+        EvolutionCampaignStatus::Draft | EvolutionCampaignStatus::AwaitingApproval => {
+            EvolutionTaskStatus::Planned
+        }
+        EvolutionCampaignStatus::Approved | EvolutionCampaignStatus::Scheduled => {
+            EvolutionTaskStatus::Ready
+        }
+        EvolutionCampaignStatus::Running | EvolutionCampaignStatus::StageComplete => {
+            EvolutionTaskStatus::Running
+        }
+        EvolutionCampaignStatus::PausedBudget
+        | EvolutionCampaignStatus::PausedPolicy
+        | EvolutionCampaignStatus::PausedHuman => EvolutionTaskStatus::AwaitingDecision,
+        EvolutionCampaignStatus::Complete => EvolutionTaskStatus::Complete,
+        EvolutionCampaignStatus::Cancelled | EvolutionCampaignStatus::Superseded => {
+            EvolutionTaskStatus::Cancelled
+        }
+        EvolutionCampaignStatus::FailedExhausted => EvolutionTaskStatus::Failed,
+    }
 }
 
 pub fn read_campaign(
@@ -2598,6 +3460,36 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn stored_candidate_projects_to_frozen_goal_revision_graph() {
+        let root = temp_dir("goal-revision-graph");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(root.path());
+        let paths = EvolutionPaths::new(&data_dir);
+        paths.ensure().expect("paths");
+        let mut record = stored_record_fixture(root.path(), EvolutionJobStatus::AwaitingApproval);
+        let bundle_root = PathBuf::from(&record.bundle.bundle_path);
+        fs::create_dir_all(&bundle_root).expect("bundle root");
+        let diff_path = bundle_root.join("candidate.diff");
+        fs::write(&diff_path, "diff --git a/README.md b/README.md\n").expect("candidate diff");
+        record.bundle.diff_path = Some(diff_path.display().to_string());
+        record.bundle.bundle_content_hash = Some(format!("blake3:{}", "1".repeat(64)));
+
+        write_stored_job(&paths, &record).expect("stored record and graph");
+        let graphs = list_evolution_goal_graphs(&paths).expect("graphs");
+        assert_eq!(graphs.len(), 1);
+        let graph = &graphs[0];
+        assert_eq!(graph.status, EvolutionGoalStatus::AwaitingDecision);
+        assert_eq!(graph.revisions.len(), 2);
+        assert_eq!(graph.edges().len(), 1);
+        assert_eq!(graph.tasks.len(), 1);
+        assert_eq!(graph.agent_runs.len(), 2);
+        assert!(matches!(
+            graph.revisions[1].content,
+            RevisionContentIdentity::Composite { .. }
+        ));
+        graph.validate().expect("valid persisted DAG");
+    }
+
     fn temp_dir(name: &str) -> sinomo_testdir::TestDir {
         sinomo_testdir::TestDir::new(&format!("sinomo-evolution-persistence-{name}"))
     }
@@ -3036,6 +3928,8 @@ pub enum EvolutionPersistenceError {
     Sifs { path: String, detail: String },
     #[error("missing evolution artifact: {artifact}")]
     MissingArtifact { artifact: String },
+    #[error(transparent)]
+    Graph(#[from] EvolutionGraphError),
 }
 
 #[derive(Debug, Error)]

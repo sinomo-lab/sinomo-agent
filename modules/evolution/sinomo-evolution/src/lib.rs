@@ -5,6 +5,7 @@ mod app_api;
 pub mod cli;
 mod cli_runtime;
 mod engine;
+mod graph;
 mod module_abi;
 pub mod module_evidence;
 pub mod persistence;
@@ -13,11 +14,19 @@ mod test_cases;
 pub mod tools;
 mod types;
 
-pub use agent_package::{EVOLUTION_AGENT_ID, evolution_agent_definition};
-pub use app_api::{app_evolution_dashboard, run_app_evolution_decision, run_app_evolution_job};
+pub use agent_package::{
+    EVOLUTION_AGENT_ID, EVOLUTION_EVALUATOR_AGENT_ID, EVOLUTION_IMPLEMENTER_AGENT_ID,
+    EVOLUTION_PROPOSER_AGENT_ID, evolution_agent_definition, evolution_evaluator_agent_definition,
+    evolution_implementer_agent_definition, evolution_proposer_agent_definition,
+};
+pub use app_api::{
+    app_evolution_dashboard, run_app_control_goal, run_app_create_goal, run_app_evolution_decision,
+    run_app_evolution_job, run_app_record_revision, run_app_update_workflow,
+};
 pub use cli::*;
 pub use cli_runtime::*;
 pub use engine::*;
+pub use graph::*;
 pub use module_abi::evolution_native_module_descriptor;
 pub use module_evidence::*;
 pub use persistence::*;

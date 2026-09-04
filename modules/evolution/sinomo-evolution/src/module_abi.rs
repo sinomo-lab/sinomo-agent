@@ -12,10 +12,11 @@ use sinomo_module_api::{
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::agent_package::{evolution_agent_export, evolution_agent_resources};
+use crate::agent_package::{evolution_agent_exports, evolution_agent_resources};
 use crate::{
-    app_evolution_dashboard, evolution_config_definition, evolution_data_dir,
-    run_app_evolution_decision, run_app_evolution_job, run_evolve_command_captured,
+    app_evolution_dashboard, evolution_config_definition, evolution_data_dir, run_app_control_goal,
+    run_app_create_goal, run_app_evolution_decision, run_app_evolution_job,
+    run_app_record_revision, run_app_update_workflow, run_evolve_command_captured,
     with_evolution_data_dir,
 };
 
@@ -135,11 +136,27 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
                     contract::EVOLUTION_DECISION_OPERATION,
                 ),
                 long_running_route(
+                    contract::EVOLUTION_GOAL_CREATE_ROUTE,
+                    contract::EVOLUTION_GOAL_CREATE_OPERATION,
+                ),
+                long_running_route(
+                    contract::EVOLUTION_REVISION_RECORD_ROUTE,
+                    contract::EVOLUTION_REVISION_RECORD_OPERATION,
+                ),
+                long_running_route(
+                    contract::EVOLUTION_GOAL_CONTROL_ROUTE,
+                    contract::EVOLUTION_GOAL_CONTROL_OPERATION,
+                ),
+                long_running_route(
+                    contract::EVOLUTION_WORKFLOW_UPDATE_ROUTE,
+                    contract::EVOLUTION_WORKFLOW_UPDATE_OPERATION,
+                ),
+                long_running_route(
                     contract::EVOLUTION_CLI_ROUTE,
                     contract::EVOLUTION_CLI_OPERATION,
                 ),
             ],
-            agent_definitions: vec![evolution_agent_export()],
+            agent_definitions: evolution_agent_exports(),
             declarative_resources: evolution_agent_resources(),
             storage_owners: vec![contract::EVOLUTION_MODULE_OWNER.to_string()],
             capability_imports: CAPABILITY_IMPORTS
@@ -177,6 +194,22 @@ pub fn evolution_native_module_descriptor() -> NativeModuleDescriptor {
             .with_operation(operation_offer(
                 contract::EVOLUTION_DECISION_OPERATION,
                 contract::EVOLUTION_DECISION_ROUTE,
+            ))
+            .with_operation(operation_offer(
+                contract::EVOLUTION_GOAL_CREATE_OPERATION,
+                contract::EVOLUTION_GOAL_CREATE_ROUTE,
+            ))
+            .with_operation(operation_offer(
+                contract::EVOLUTION_REVISION_RECORD_OPERATION,
+                contract::EVOLUTION_REVISION_RECORD_ROUTE,
+            ))
+            .with_operation(operation_offer(
+                contract::EVOLUTION_GOAL_CONTROL_OPERATION,
+                contract::EVOLUTION_GOAL_CONTROL_ROUTE,
+            ))
+            .with_operation(operation_offer(
+                contract::EVOLUTION_WORKFLOW_UPDATE_OPERATION,
+                contract::EVOLUTION_WORKFLOW_UPDATE_ROUTE,
             ))
             .with_operation(operation_offer(
                 contract::EVOLUTION_CLI_OPERATION,
@@ -246,6 +279,18 @@ fn invoke_operation_inner(request: NativeModuleInvocationRequest) -> NativeModul
         contract::EVOLUTION_DECISION_OPERATION => {
             invoke_serialized(|| invoke_decision(&request.operation, &request.payload_sobj))
         }
+        contract::EVOLUTION_GOAL_CREATE_OPERATION => {
+            invoke_serialized(|| invoke_goal_create(&request.operation, &request.payload_sobj))
+        }
+        contract::EVOLUTION_REVISION_RECORD_OPERATION => {
+            invoke_serialized(|| invoke_revision_record(&request.operation, &request.payload_sobj))
+        }
+        contract::EVOLUTION_GOAL_CONTROL_OPERATION => {
+            invoke_serialized(|| invoke_goal_control(&request.operation, &request.payload_sobj))
+        }
+        contract::EVOLUTION_WORKFLOW_UPDATE_OPERATION => {
+            invoke_serialized(|| invoke_workflow_update(&request.operation, &request.payload_sobj))
+        }
         contract::EVOLUTION_CLI_OPERATION => {
             invoke_serialized(|| invoke_cli(&request.operation, &request.payload_sobj))
         }
@@ -284,26 +329,55 @@ fn invoke_dashboard(operation: &str, payload: &[u8]) -> NativeModuleResponse {
 }
 
 fn invoke_start(operation: &str, payload: &[u8]) -> NativeModuleResponse {
-    invoke_mutation::<contract::EvolutionStartRequest>(operation, payload, |request| {
+    invoke_mutation::<contract::EvolutionStartRequest, _>(operation, payload, |request| {
         run_app_evolution_job(request)
             .map(|()| contract::EvolutionMutationResponse { accepted: true })
     })
 }
 
 fn invoke_decision(operation: &str, payload: &[u8]) -> NativeModuleResponse {
-    invoke_mutation::<contract::EvolutionDecisionRequest>(operation, payload, |request| {
+    invoke_mutation::<contract::EvolutionDecisionRequest, _>(operation, payload, |request| {
         run_app_evolution_decision(request)
             .map(|()| contract::EvolutionMutationResponse { accepted: true })
     })
 }
 
-fn invoke_mutation<Request>(
+fn invoke_goal_create(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+    invoke_mutation::<contract::EvolutionGoalCreateRequest, _>(operation, payload, |request| {
+        let data_dir = evolution_data_dir()?;
+        run_app_create_goal(&data_dir, request)
+    })
+}
+
+fn invoke_revision_record(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+    invoke_mutation::<contract::EvolutionRevisionRecordRequest, _>(operation, payload, |request| {
+        let data_dir = evolution_data_dir()?;
+        run_app_record_revision(&data_dir, request)
+    })
+}
+
+fn invoke_goal_control(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+    invoke_mutation::<contract::EvolutionGoalControlRequest, _>(operation, payload, |request| {
+        let data_dir = evolution_data_dir()?;
+        run_app_control_goal(&data_dir, request)
+    })
+}
+
+fn invoke_workflow_update(operation: &str, payload: &[u8]) -> NativeModuleResponse {
+    invoke_mutation::<contract::EvolutionWorkflowUpdateRequest, _>(operation, payload, |request| {
+        let data_dir = evolution_data_dir()?;
+        run_app_update_workflow(&data_dir, request)
+    })
+}
+
+fn invoke_mutation<Request, Response>(
     operation: &str,
     payload: &[u8],
-    run: impl FnOnce(Request) -> Result<contract::EvolutionMutationResponse, crate::CliError>,
+    run: impl FnOnce(Request) -> Result<Response, crate::CliError>,
 ) -> NativeModuleResponse
 where
     Request: serde::de::DeserializeOwned,
+    Response: serde::Serialize,
 {
     match decode_sobj::<Request>(payload) {
         Ok(request) => match run(request) {
@@ -413,12 +487,12 @@ mod tests {
             contract::EVOLUTION_RPC_ROUTES.len()
         );
         assert_eq!(descriptor.surfaces.settings.len(), 1);
-        assert_eq!(descriptor.surfaces.agent_definitions.len(), 1);
+        assert_eq!(descriptor.surfaces.agent_definitions.len(), 4);
         assert_eq!(
             descriptor.surfaces.agent_definitions[0].id,
             crate::EVOLUTION_AGENT_ID
         );
-        assert_eq!(descriptor.surfaces.declarative_resources.len(), 2);
+        assert_eq!(descriptor.surfaces.declarative_resources.len(), 3);
         assert!(
             descriptor
                 .surfaces
@@ -465,6 +539,33 @@ mod tests {
             dashboard.dashboard.source,
             root.path().join("evolution").display().to_string()
         );
+
+        let create = invoke_operation(NativeModuleInvocationRequest {
+            operation: contract::EVOLUTION_GOAL_CREATE_OPERATION.to_string(),
+            payload_sobj: encode_sobj(&contract::EvolutionGoalCreateRequest {
+                objective: "improve a generic artifact".to_string(),
+                evolution_agent_id: None,
+                metrics: vec![contract::EvolutionMetricDefinitionInput {
+                    id: "quality".to_string(),
+                    label: "Quality".to_string(),
+                    direction: "maximize".to_string(),
+                    unit: "points".to_string(),
+                    target: None,
+                    required: true,
+                }],
+            })
+            .expect("goal create request"),
+            host_data_dir_root: Some(root.path().display().to_string()),
+            cancellation_wait_handle: None,
+            request_body: None,
+            response_body_path: None,
+        });
+        let NativeModuleResponse::Invocation(create) = create else {
+            panic!("goal creation failed: {create:?}");
+        };
+        let create: contract::EvolutionGoalCreateResponse =
+            decode_sobj(&create.payload_sobj).expect("goal create response");
+        assert!(create.accepted);
 
         let cli = invoke_operation(NativeModuleInvocationRequest {
             operation: contract::EVOLUTION_CLI_OPERATION.to_string(),

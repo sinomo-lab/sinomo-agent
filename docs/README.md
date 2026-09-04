@@ -20,6 +20,7 @@ Start with the [user and operator guide](user/README.md).
 | Manage processes, health, observation, backups, permissions, and incidents | [Operating Sinomo](user/operations.md) |
 | Create, join, inspect, migrate, leave, or recover a cluster | [Cluster operations](user/cluster-operations.md) |
 | Build, stage, activate, diagnose, or recover an update | [Rollout operations](user/rollout-operations.md) |
+| Create, inspect, and control metric-driven evolution goals | [Evolution goals](user/evolution.md) |
 | Diagnose common local, cluster, provider, DFS, rollout, and sandbox failures | [Troubleshooting](user/troubleshooting.md) |
 | Understand the shared filesystem and placement policies | [SIFS reference](sifs.md) |
 
@@ -77,7 +78,7 @@ trust model, state ownership, execution model, and invariants.
 | Windows SIFS projection, hydration, writeback, reconciliation, and recovery | [Windows Cloud Files](cloud-files-architecture.md) |
 | Indexed-file memory, retrieval, overlays, maintenance, and scope | [Memory](memory-architecture.md) |
 | Module identity, compatibility, activation, observation, and replacement | [Module lifecycle](module-lifecycle-architecture.md) |
-| Candidate generation, evaluation, promotion, rollback, and risk rings | [Self-evolution](self-evolution-architecture.md) |
+| Goal revision DAGs, agents, evaluation, promotion, rollback, and risk rings | [Evolution framework](self-evolution-architecture.md) |
 | Logs, metrics, traces, profiling, and observation routes | [Observability](observability-architecture.md) |
 | Local data-directory ownership and format policy | [Storage](storage-architecture.md) |
 

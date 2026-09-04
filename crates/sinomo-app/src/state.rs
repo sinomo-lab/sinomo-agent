@@ -24,6 +24,7 @@ use crate::rendering::{AppRenderMode, resolve_render_options};
 use crate::theme::{AppTextScale, AppThemeMode, resolve_theme_with_preferences};
 use crate::ui::chat::{ChatState, ChatStructureKey};
 use crate::ui::cluster::{ClusterState, ClusterStructureKey};
+use crate::ui::evolution::EvolutionState;
 use crate::ui::files::{FilesState, FilesStructureKey};
 use crate::ui::settings::{
     SettingsSection, SettingsState, SettingsStructureKey, settings_structure_key,
@@ -36,6 +37,8 @@ pub enum Tab {
     Sinomo,
     /// Cluster topology graph.
     Cluster,
+    /// Goal-directed evolution revision DAG and agent activity.
+    Evolution,
     /// SIFS distributed file browser.
     Files,
     /// App + cluster settings.
@@ -43,14 +46,21 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Sinomo, Tab::Cluster, Tab::Files, Tab::Settings];
+    pub const ALL: [Tab; 5] = [
+        Tab::Sinomo,
+        Tab::Cluster,
+        Tab::Evolution,
+        Tab::Files,
+        Tab::Settings,
+    ];
 
     pub fn index(self) -> usize {
         match self {
             Tab::Sinomo => 0,
             Tab::Cluster => 1,
-            Tab::Files => 2,
-            Tab::Settings => 3,
+            Tab::Evolution => 2,
+            Tab::Files => 3,
+            Tab::Settings => 4,
         }
     }
 
@@ -58,6 +68,7 @@ impl Tab {
         match self {
             Tab::Sinomo => "Chat",
             Tab::Cluster => "Cluster",
+            Tab::Evolution => "Evolution",
             Tab::Files => "Files",
             Tab::Settings => "Settings",
         }
@@ -228,6 +239,7 @@ pub struct ReadyState {
     pub backend: Backend,
     pub chat: ChatState,
     pub cluster: ClusterState,
+    pub evolution: EvolutionState,
     pub files: FilesState,
     pub settings: SettingsState,
 }
@@ -270,6 +282,8 @@ impl ReadyState {
         let cluster = ClusterState::new(&backend);
         progress("Preparing the file browser…");
         let files = FilesState::new(&backend);
+        progress("Reading evolution goals…");
+        let evolution = EvolutionState::new(&backend);
         progress("Reading settings…");
         let settings = if interactive {
             SettingsState::new_lightweight(&backend)
@@ -280,6 +294,7 @@ impl ReadyState {
             backend,
             chat,
             cluster,
+            evolution,
             files,
             settings,
         }
@@ -396,6 +411,7 @@ pub struct AppSignals {
     pub health_structure: Signal<HealthStructureKey>,
     pub loading_stall_lines: Signal<[Option<String>; 2]>,
     pub cluster_structure: Signal<ClusterStructureKey>,
+    pub evolution_revision: Signal<u64>,
     pub files_structure: Signal<FilesStructureKey>,
     pub files_thumbnail_revision: Signal<u64>,
     pub settings_structure: Signal<SettingsStructureKey>,
@@ -424,6 +440,14 @@ impl AppSignals {
                     state.theme(),
                     state.ready.as_ref().map(|ready| &ready.cluster),
                 ),
+            ),
+            evolution_revision: Signal::named(
+                "evolution dashboard revision",
+                state
+                    .ready
+                    .as_ref()
+                    .map(|ready| ready.evolution.revision)
+                    .unwrap_or_default(),
             ),
             files_structure: Signal::named(
                 "files structure",
@@ -698,6 +722,22 @@ impl Shared {
         )
     }
 
+    pub fn evolution(&self) -> Ref<'_, EvolutionState> {
+        Ref::map(self.state.borrow(), |state| {
+            &state.ready.as_ref().expect("app is ready").evolution
+        })
+    }
+
+    pub fn evolution_mut(&self) -> PublishedRefMut<'_, EvolutionState> {
+        let shared = self.clone();
+        PublishedRefMut::new(
+            RefMut::map(self.state.borrow_mut(), |state| {
+                &mut state.ready.as_mut().expect("app is ready").evolution
+            }),
+            move || shared.publish_evolution_signals(),
+        )
+    }
+
     pub fn settings(&self) -> Ref<'_, SettingsState> {
         Ref::map(self.state.borrow(), |s| {
             &s.ready.as_ref().expect("app is ready").settings
@@ -744,6 +784,9 @@ impl Shared {
                 crate::ui::cluster::request_refresh(self);
                 crate::ui::cluster::request_observation(self);
             }
+            if tab == Tab::Evolution {
+                crate::ui::evolution::request_refresh(self);
+            }
         }
         self.signals.active_tab.set(tab);
         true
@@ -788,6 +831,17 @@ impl Shared {
         if self.signals.files_structure.set(structure) {
             self.publish_health_signals();
         }
+    }
+
+    pub fn publish_evolution_signals(&self) {
+        let revision = self
+            .state
+            .borrow()
+            .ready
+            .as_ref()
+            .map(|ready| ready.evolution.revision)
+            .unwrap_or_default();
+        self.signals.evolution_revision.set(revision);
     }
 
     pub fn publish_settings_signals(&self) {
@@ -861,6 +915,7 @@ impl Shared {
             return;
         }
         self.publish_cluster_signals();
+        self.publish_evolution_signals();
         self.publish_files_signals();
         self.publish_settings_signals();
         self.publish_chat_signals();
