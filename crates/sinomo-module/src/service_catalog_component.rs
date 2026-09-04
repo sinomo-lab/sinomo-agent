@@ -14,12 +14,16 @@ pub const SERVICE_CATALOG_PUBLISHER_COMPONENT_ID: &str = "sinomo.cluster.service
 const SERVICE_CATALOG_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const SERVICE_CATALOG_RETRY_MAX: Duration = Duration::from_secs(30);
 const SERVICE_CATALOG_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
+const SERVICE_CATALOG_STARTUP_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const SERVICE_CATALOG_STARTUP_RECONCILE_WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy)]
 struct ServiceCatalogPublisherTiming {
     publish_timeout: Duration,
     retry_initial: Duration,
     retry_max: Duration,
+    startup_reconcile_interval: Duration,
+    startup_reconcile_window: Duration,
 }
 
 impl ServiceCatalogPublisherTiming {
@@ -27,6 +31,8 @@ impl ServiceCatalogPublisherTiming {
         publish_timeout: SERVICE_CATALOG_PUBLISH_TIMEOUT,
         retry_initial: SERVICE_CATALOG_RETRY_INITIAL,
         retry_max: SERVICE_CATALOG_RETRY_MAX,
+        startup_reconcile_interval: SERVICE_CATALOG_STARTUP_RECONCILE_INTERVAL,
+        startup_reconcile_window: SERVICE_CATALOG_STARTUP_RECONCILE_WINDOW,
     };
 }
 
@@ -208,6 +214,7 @@ async fn run_service_catalog_publisher_with_timing(
 ) {
     let mut versions = registry.subscribe_versions();
     let mut retry = timing.retry_initial;
+    let mut startup_reconcile_deadline = None;
     if registry.active_snapshot().version() == 1 {
         tokio::select! {
             changed = versions.changed() => {
@@ -243,20 +250,48 @@ async fn run_service_catalog_publisher_with_timing(
         match publication {
             Ok(()) => {
                 retry = timing.retry_initial;
+                // A retiring main can publish its teardown registry after the
+                // replacement main has already published the same node-scoped
+                // records. Reconcile the surviving registry for a bounded
+                // overlap window so that late deletion is repaired without
+                // turning steady-state service discovery into a polling loop.
+                let startup_reconcile_deadline =
+                    *startup_reconcile_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + timing.startup_reconcile_window
+                    });
                 tracing::debug!(
                     version = snapshot.version(),
                     "published component service catalog generation"
                 );
-                tokio::select! {
-                    changed = versions.changed() => {
-                        if changed.is_err() {
-                            break;
+                if let Some(remaining) =
+                    startup_reconcile_deadline.checked_duration_since(tokio::time::Instant::now())
+                {
+                    tokio::select! {
+                        _ = tokio::time::sleep(timing.startup_reconcile_interval.min(remaining)) => {}
+                        changed = versions.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let _ = versions.borrow_and_update();
                         }
-                        let _ = versions.borrow_and_update();
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
                     }
-                    changed = shutdown.changed() => {
-                        if changed.is_err() || *shutdown.borrow() {
-                            break;
+                } else {
+                    tokio::select! {
+                        changed = versions.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                            let _ = versions.borrow_and_update();
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -421,6 +456,8 @@ mod tests {
                 publish_timeout: Duration::from_millis(10),
                 retry_initial: Duration::from_millis(1),
                 retry_max: Duration::from_millis(2),
+                startup_reconcile_interval: Duration::from_secs(1),
+                startup_reconcile_window: Duration::from_secs(1),
             },
         ));
         registry
@@ -434,6 +471,50 @@ mod tests {
         })
         .await
         .expect("publisher retried after cancelling the stuck attempt");
+
+        shutdown_tx.send_replace(true);
+        task.await.expect("publisher task");
+    }
+
+    #[tokio::test]
+    async fn stable_registry_is_reconciled_during_process_replacement_window() {
+        let host = Arc::new(CountingHost(AtomicUsize::new(0)));
+        let registry = sinomo_core::service::ServiceRegistrySnapshotStore::default();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let reconcile_interval = Duration::from_millis(5);
+        let reconcile_window = Duration::from_millis(20);
+        let task = tokio::spawn(run_service_catalog_publisher_with_timing(
+            host.clone(),
+            registry.clone(),
+            shutdown_rx,
+            ServiceCatalogPublisherTiming {
+                publish_timeout: Duration::from_secs(1),
+                retry_initial: Duration::from_millis(1),
+                retry_max: Duration::from_millis(2),
+                startup_reconcile_interval: reconcile_interval,
+                startup_reconcile_window: reconcile_window,
+            },
+        ));
+        registry
+            .replace_registry(sinomo_core::service::ServiceRegistry::default())
+            .expect("publish reconciled registry");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while host.0.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stable startup registry was reconciled again");
+
+        tokio::time::sleep(reconcile_window + reconcile_interval).await;
+        let settled_count = host.0.load(Ordering::SeqCst);
+        tokio::time::sleep(reconcile_interval.saturating_mul(3)).await;
+        assert_eq!(
+            host.0.load(Ordering::SeqCst),
+            settled_count,
+            "the publisher must park again after the process-replacement window"
+        );
 
         shutdown_tx.send_replace(true);
         task.await.expect("publisher task");
