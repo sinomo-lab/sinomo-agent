@@ -25,6 +25,7 @@ use sinomo_core::service::{
     ServiceRoute,
 };
 use std::collections::{BTreeMap, VecDeque};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -833,6 +834,117 @@ pub(crate) fn configured_build_executor(
     )
 }
 
+const AARCH64_LINUX_GNU_TARGET: &str = "aarch64-unknown-linux-gnu";
+const AARCH64_GNU_CROSS_BIN_ENV: &str = "SINOMO_BUILD_AARCH64_GNU_BIN";
+
+fn command_version(program: &Path) -> Result<String, String> {
+    let output = crate::process::noninteractive_command(program)
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("run {} --version: {error}", program.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version failed: {}",
+            program.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn default_aarch64_gnu_cross_bin() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os(AARCH64_GNU_CROSS_BIN_ENV) {
+        return Some(PathBuf::from(configured));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/lib/sinomo-cross/aarch64-linux-gnu/usr/bin"))
+}
+
+fn discover_aarch64_gnu_cross_environment(
+    host_target: &str,
+    base_toolchain_fingerprint: &str,
+) -> Result<Option<(String, Vec<(OsString, OsString)>)>, String> {
+    if host_target != "x86_64-unknown-linux-gnu" {
+        return Ok(None);
+    }
+    let Some(bin) = default_aarch64_gnu_cross_bin() else {
+        return Ok(None);
+    };
+    let gcc = bin.join("aarch64-linux-gnu-gcc");
+    let gxx = bin.join("aarch64-linux-gnu-g++");
+    let ar = bin.join("aarch64-linux-gnu-ar");
+    let ranlib = bin.join("aarch64-linux-gnu-ranlib");
+    if ![&gcc, &gxx, &ar, &ranlib]
+        .into_iter()
+        .all(|program| program.is_file())
+    {
+        return Ok(None);
+    }
+    let gcc_version = command_version(&gcc)?;
+    let gxx_version = command_version(&gxx)?;
+    let ar_version = command_version(&ar)?;
+    let ranlib_version = command_version(&ranlib)?;
+    let sysroot_output = crate::process::noninteractive_command(&gcc)
+        .arg("-print-sysroot")
+        .output()
+        .map_err(|error| format!("inspect {} sysroot: {error}", gcc.display()))?;
+    if !sysroot_output.status.success() {
+        return Err(format!("{} could not report its sysroot", gcc.display()));
+    }
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&sysroot_output.stdout).trim());
+    let crt1 = sysroot.join("lib/crt1.o");
+    let libc_linker_script = sysroot.join("lib/libc.so");
+    let libc = sysroot.join("lib/libc.so.6");
+    for required in [&crt1, &libc_linker_script, &libc] {
+        if !required.is_file() {
+            return Err(format!(
+                "AArch64 GNU cross sysroot is incomplete: {} is missing",
+                required.display()
+            ));
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(base_toolchain_fingerprint.as_bytes());
+    hasher.update(AARCH64_LINUX_GNU_TARGET.as_bytes());
+    hasher.update(gcc_version.as_bytes());
+    hasher.update(gxx_version.as_bytes());
+    hasher.update(ar_version.as_bytes());
+    hasher.update(ranlib_version.as_bytes());
+    for required in [&crt1, &libc_linker_script, &libc] {
+        let bytes = fs::read(required)
+            .map_err(|error| format!("fingerprint {}: {error}", required.display()))?;
+        hasher.update(&bytes);
+    }
+    let fingerprint = format!(
+        "cargo-cross-toolchain-blake3:{}",
+        hasher.finalize().to_hex()
+    );
+    let environment = vec![
+        (
+            OsString::from("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"),
+            gcc.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("CC_aarch64_unknown_linux_gnu"),
+            gcc.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("CXX_aarch64_unknown_linux_gnu"),
+            gxx.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("AR_aarch64_unknown_linux_gnu"),
+            ar.as_os_str().to_os_string(),
+        ),
+        (
+            OsString::from("RANLIB_aarch64_unknown_linux_gnu"),
+            ranlib.as_os_str().to_os_string(),
+        ),
+    ];
+    Ok(Some((fingerprint, environment)))
+}
+
 fn build_executor_for_targets(
     cargo_program: &Path,
     rustc_program: &Path,
@@ -847,6 +959,21 @@ fn build_executor_for_targets(
                 .map_err(|error| format!("parse SINOMO_BUILD_TARGETS: {error}"))?,
         );
     }
+    let mut aarch64_cross =
+        discover_aarch64_gnu_cross_environment(&toolchain.host_target, &toolchain.fingerprint)
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "ignoring unusable optional AArch64 GNU cross toolchain");
+                None
+            });
+    if aarch64_cross.is_some() {
+        match crate::inspect_rust_target(rustc_program, AARCH64_LINUX_GNU_TARGET) {
+            Ok(_) => triples.push(AARCH64_LINUX_GNU_TARGET.to_string()),
+            Err(error) => {
+                tracing::warn!(%error, "ignoring AArch64 GNU cross toolchain without Rust target std");
+                aarch64_cross = None;
+            }
+        }
+    }
     triples.sort();
     triples.dedup();
     let capabilities = triples
@@ -854,19 +981,41 @@ fn build_executor_for_targets(
         .map(|triple| {
             let target = crate::inspect_rust_target(rustc_program, &triple)
                 .map_err(|error| format!("inspect configured build target {triple}: {error}"))?;
+            let toolchain_fingerprint = if triple == AARCH64_LINUX_GNU_TARGET {
+                aarch64_cross
+                    .as_ref()
+                    .map(|(fingerprint, _)| fingerprint.clone())
+                    .unwrap_or_else(|| toolchain.fingerprint.clone())
+            } else {
+                toolchain.fingerprint.clone()
+            };
             Ok(BuildTargetCapability {
                 target,
                 artifact_kinds: vec![
                     BuildArtifactKind::Binary,
                     BuildArtifactKind::NativeDylibModule,
                 ],
-                toolchain_fingerprint: toolchain.fingerprint.clone(),
+                toolchain_fingerprint,
                 supports_source_identity_hash: true,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    CargoBuildExecutor::new(cargo_program, capabilities)
-        .map_err(|error| format!("configure Cargo build executor: {error}"))
+    let mut executor = CargoBuildExecutor::new(cargo_program, capabilities)
+        .map_err(|error| format!("configure Cargo build executor: {error}"))?;
+    if let Some((fingerprint, environment)) = aarch64_cross
+        && let Some(capability) = executor
+            .supported_targets()
+            .iter()
+            .find(|capability| {
+                capability.target.rust_target.as_deref() == Some(AARCH64_LINUX_GNU_TARGET)
+            })
+            .cloned()
+    {
+        executor = executor
+            .with_target_environment(capability.target, fingerprint, environment)
+            .map_err(|error| format!("configure AArch64 GNU cross environment: {error}"))?;
+    }
+    Ok(executor)
 }
 
 fn local_build_node_id(data_dir_root: &Path) -> NodeId {
@@ -942,6 +1091,17 @@ mod tests {
                 .iter()
                 .all(|capability| capability.supports_source_identity_hash)
         );
+        let toolchain = crate::inspect_cargo_toolchain("rustc", "cargo").expect("toolchain");
+        let discovered =
+            discover_aarch64_gnu_cross_environment(&toolchain.host_target, &toolchain.fingerprint)
+                .expect("cross-toolchain discovery");
+        let advertised = executor.supported_targets().iter().find(|capability| {
+            capability.target.rust_target.as_deref() == Some(AARCH64_LINUX_GNU_TARGET)
+        });
+        assert_eq!(advertised.is_some(), discovered.is_some());
+        if let (Some(advertised), Some((fingerprint, _))) = (advertised, discovered) {
+            assert_eq!(advertised.toolchain_fingerprint, fingerprint);
+        }
     }
 
     #[test]

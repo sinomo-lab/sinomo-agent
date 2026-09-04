@@ -5,7 +5,7 @@ use crate::{
 };
 use serde_json::Value;
 use sinomo_module::ModuleId;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -369,6 +369,7 @@ pub struct CargoBuildResult {
 pub struct CargoBuildExecutor {
     cargo_program: PathBuf,
     supported_targets: Vec<BuildTargetCapability>,
+    target_environments: BTreeMap<(BuildTarget, String), Vec<(OsString, OsString)>>,
 }
 
 impl CargoBuildExecutor {
@@ -409,7 +410,32 @@ impl CargoBuildExecutor {
         Ok(Self {
             cargo_program: cargo_program.into(),
             supported_targets,
+            target_environments: BTreeMap::new(),
         })
+    }
+
+    pub fn with_target_environment(
+        mut self,
+        target: BuildTarget,
+        toolchain_fingerprint: impl Into<String>,
+        environment: Vec<(OsString, OsString)>,
+    ) -> Result<Self> {
+        let toolchain_fingerprint = toolchain_fingerprint.into();
+        let supported = self.supported_targets.iter().any(|capability| {
+            capability.target == target && capability.toolchain_fingerprint == toolchain_fingerprint
+        });
+        if !supported {
+            return Err(BuildError::InvalidValue {
+                detail: format!(
+                    "Cargo target environment does not match advertised target {} with toolchain {}",
+                    target.path_key(),
+                    toolchain_fingerprint
+                ),
+            });
+        }
+        self.target_environments
+            .insert((target, toolchain_fingerprint), environment);
+        Ok(self)
     }
 
     pub fn supported_targets(&self) -> &[BuildTargetCapability] {
@@ -489,20 +515,24 @@ impl CargoBuildExecutor {
                 features.into_iter().collect::<Vec<_>>().join(","),
             ));
         }
+        let mut env = self
+            .target_environments
+            .get(&(
+                plan.input.target.clone(),
+                plan.input.toolchain_fingerprint.clone(),
+            ))
+            .cloned()
+            .unwrap_or_default();
+        env.extend(plan.input.source_revision.iter().map(|revision| {
+            (
+                OsString::from(CARGO_BUILD_COMMIT_OVERRIDE_ENV),
+                OsString::from(revision),
+            )
+        }));
         Ok(CargoBuildCommand {
             program: self.cargo_program.clone(),
             args,
-            env: plan
-                .input
-                .source_revision
-                .iter()
-                .map(|revision| {
-                    (
-                        OsString::from(CARGO_BUILD_COMMIT_OVERRIDE_ENV),
-                        OsString::from(revision),
-                    )
-                })
-                .collect(),
+            env,
             current_dir: source_repo,
             target_dir,
         })
@@ -921,7 +951,17 @@ mod tests {
             },
         )
         .expect("plan");
-        let executor = CargoBuildExecutor::new("cargo", vec![capability]).expect("executor");
+        let executor = CargoBuildExecutor::new("cargo", vec![capability])
+            .expect("executor")
+            .with_target_environment(
+                target.clone(),
+                "rustc-windows",
+                vec![(
+                    OsString::from("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
+                    OsString::from("cross-link.exe"),
+                )],
+            )
+            .expect("target environment");
         let source = std::env::current_dir().expect("cwd");
         let command = executor
             .plan_command(&source, &plan, "/tmp/build-target")
@@ -933,6 +973,10 @@ mod tests {
                 .iter()
                 .any(|arg| arg == "x86_64-pc-windows-msvc")
         );
+        assert!(command.env.contains(&(
+            OsString::from("CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER"),
+            OsString::from("cross-link.exe")
+        )));
         assert_eq!(
             cargo_output_path(
                 "/tmp/build-target",
