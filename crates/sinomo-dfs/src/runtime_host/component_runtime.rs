@@ -3,6 +3,8 @@ use super::*;
 const DFS_MAINTENANCE_TASK_COMPLETION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DFS_STORAGE_DIRTY_SETTLE_DELAY: Duration = Duration::from_secs(2);
 const DFS_STORAGE_REFRESH_ERROR_RETRY_DELAY: Duration = Duration::from_secs(30);
+const DFS_REMOTE_PLACEMENT_STARTUP_RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const DFS_REMOTE_PLACEMENT_STARTUP_RECONCILE_WINDOW: Duration = Duration::from_secs(60);
 
 pub(crate) fn mount_dfs_runtime_tasks(
     context: &sinomo_module::ComponentContext,
@@ -335,6 +337,23 @@ async fn run_component_remote_placement_observation(
             None
         }
     };
+    let reconcile_deadline = Instant::now() + DFS_REMOTE_PLACEMENT_STARTUP_RECONCILE_WINDOW;
+    while let Some(remaining) = reconcile_deadline.checked_duration_since(Instant::now()) {
+        tokio::select! {
+            _ = tokio::time::sleep(
+                DFS_REMOTE_PLACEMENT_STARTUP_RECONCILE_INTERVAL.min(remaining)
+            ) => {
+                if let Err(error) = refresh_daemon_dfs_remote_placement_observation(&paths) {
+                    tracing::warn!(target: "sinomo.dfs.placement", %error, "DFS remote placement startup reconciliation failed");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
             return;

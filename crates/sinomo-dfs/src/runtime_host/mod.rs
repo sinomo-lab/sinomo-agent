@@ -1599,6 +1599,7 @@ use placement_environment::{
 pub(crate) use placement_environment::{
     cached_daemon_dfs_placement_snapshot_cache, daemon_dfs_storage_environment_dirty_generation,
     daemon_dfs_storage_environment_notify, notify_daemon_dfs_storage_environment_dirty,
+    refresh_daemon_dfs_remote_placement_observation,
     refresh_daemon_dfs_storage_environment_with_resources_on_runtime,
     subscribe_daemon_dfs_remote_placement_observation,
 };

@@ -511,22 +511,39 @@ pub(crate) fn subscribe_daemon_dfs_remote_placement_observation(
     );
     // Register before seeding. The revision fence makes a callback that races
     // this read win over an older snapshot, while the latest observed read
-    // closes the registration gap without a periodic filesystem scan.
-    match sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
-        &cluster_paths,
-    ) {
-        Ok(Some(snapshot)) => observe_daemon_dfs_remote_placement_snapshot(
-            &data_dir,
-            &cluster_paths,
-            &local_node_id,
-            snapshot.as_ref(),
-        ),
-        Ok(None) => {}
-        Err(error) => tracing::warn!(
+    // closes the registration gap. The component runtime repeats this seed
+    // only during its bounded process-replacement window, when the first
+    // observed snapshot may still be behind the surviving daemon's view.
+    if let Err(error) = refresh_daemon_dfs_remote_placement_observation(paths) {
+        tracing::warn!(
             "DFS remote placement subscription started without an initial projection: {error}"
-        ),
+        );
     }
     Ok(Some(subscription))
+}
+
+pub(crate) fn refresh_daemon_dfs_remote_placement_observation(
+    paths: &DaemonPaths,
+) -> Result<bool, DaemonError> {
+    let Some((data_dir, cluster_paths, local_node_id)) =
+        prepare_daemon_dfs_remote_placement_subscription(paths)?
+    else {
+        return Ok(false);
+    };
+    let Some(snapshot) =
+        sinomo_core::cluster::read_cluster_kv_latest_observed_snapshot_arc_if_present(
+            &cluster_paths,
+        )?
+    else {
+        return Ok(false);
+    };
+    observe_daemon_dfs_remote_placement_snapshot(
+        &data_dir,
+        &cluster_paths,
+        &local_node_id,
+        snapshot.as_ref(),
+    );
+    Ok(true)
 }
 
 fn daemon_advertisement_semantics_equal(
