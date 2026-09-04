@@ -2,10 +2,10 @@ use super::*;
 use sinomo_runtime::build::{
     BuildArtifactKind, BuildArtifactRequest, BuildArtifactResponse, BuildArtifactSetManifest,
     BuildCandidate, BuildCapabilitiesRequest, BuildCapabilitiesResponse, BuildJobState,
-    BuildKeyInput, BuildOutputRequest, BuildPlan, BuildSource, BuildStatusRequest,
-    BuildStatusResponse, BuildSubmitRequest, BuildSubmitResponse, BuildTarget,
-    BuildTargetCapability, NativeModuleSelection, build_content_hash,
-    discover_native_dylib_outputs, rank_build_candidates,
+    BuildKeyInput, BuildOutputRequest, BuildPaths, BuildPlacementRequirements, BuildPlan,
+    BuildStatusRequest, BuildStatusResponse, BuildSubmitRequest, BuildSubmitResponse, BuildTarget,
+    BuildTargetCapability, NativeModuleSelection, discover_native_dylib_outputs,
+    prepare_build_source, rank_build_candidates_with_requirements,
 };
 use sinomo_runtime::cli_registry::{
     CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError,
@@ -273,7 +273,10 @@ fn rollout_cli_spec() -> CliCommandSpec {
     cluster_options.extend([
         option("--binary", "prebuilt binary path", "path"),
         option("--target", "explicit rollout target", "host:port").repeatable(),
-        CliOptionSpec::flag("--remote-build", "build on a remote target"),
+        CliOptionSpec::flag(
+            "--remote-build",
+            "compatibility alias for build-service scheduling",
+        ),
         option("--remote-repo", "remote source repository", "path"),
         CliOptionSpec::flag("--skip-local", "exclude the local node"),
         CliOptionSpec::flag(
@@ -1481,7 +1484,7 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         }
     };
     if let Err(error) =
-        reconcile_rollout_native_dylib_platforms(&data_dir.root(), &rollout_plan.build_dir)
+        reconcile_rollout_native_dylib_platforms(&data_dir.root(), &rollout_plan.source_repo)
     {
         if let Err(rollback_error) = restore_native_dylib_loader_state_for_activation(
             &data_dir.root(),
@@ -1541,7 +1544,7 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
         wait_for_local_shadow_rollout_completion(&data_dir, &options)?;
     }
     println!("rollout applied");
-    println!("  source: {}", rollout_plan.build_dir.display());
+    println!("  source: {}", rollout_plan.source_repo.display());
     println!(
         "  main binary: {}",
         rollout_plan.install_main_binary.display()
@@ -1560,15 +1563,17 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
-    if options.remote_build
-        || options.binary.is_some()
-        || options.remote_repo.is_some()
-        || options.skip_native_modules
-        || options.force_source_overwrite
-    {
+    if rollout_cluster_uses_compatibility_transport(&options) {
         return rollout_cluster_legacy(options);
     }
     rollout_cluster_via_build_service(options)
+}
+
+fn rollout_cluster_uses_compatibility_transport(options: &RolloutOptions) -> bool {
+    options.binary.is_some()
+        || options.remote_repo.is_some()
+        || options.skip_native_modules
+        || options.force_source_overwrite
 }
 
 #[derive(Clone, Debug)]
@@ -1577,13 +1582,7 @@ struct ClusterBuildTargetGroup {
     rollout_targets: Vec<RolloutTarget>,
 }
 
-#[derive(Clone, Debug)]
-struct ClusterBuildSourceInput {
-    source: BuildSource,
-    source_repo: PathBuf,
-    source_bundle: PathBuf,
-    lockfile_hash: String,
-}
+type ClusterBuildSourceInput = sinomo_runtime::build::PreparedBuildSource;
 
 #[derive(Clone, Debug)]
 struct ClusterBuilderPlan {
@@ -1896,11 +1895,6 @@ fn cluster_build_outputs_for_target(
         ClusterBuildOutputSelection::FullRollout => (NativeModuleSelection::Default, true),
         ClusterBuildOutputSelection::NativeDylibModule(_) => (NativeModuleSelection::All, false),
     };
-    // A standalone Sinomo source checkout may not have the optional sibling
-    // GUI workspace. Plan against the same temporary workspace view used by
-    // the remote Cargo executor so output discovery cannot diverge by host.
-    let _source_guards = sinomo_runtime::rollout::prepare_rollout_build_source(source_repo)
-        .map_err(CliError::from)?;
     let mut modules =
         discover_native_dylib_outputs(Path::new("cargo"), source_repo, target, module_selection)
             .map_err(build_service_cli_error)?;
@@ -1956,46 +1950,8 @@ fn prepare_cluster_build_source_input(
     options: &RolloutOptions,
 ) -> Result<ClusterBuildSourceInput, CliError> {
     let repo = rollout_source_repo_from_options(options)?;
-    let rollout_paths = rollout_paths_from_defaults()?;
-    ensure_rollout_layout(&rollout_paths)?;
-    let (source_bundle, source_head) = rollout_source_bundle(options)?;
-    let source_hash = build_content_hash(&source_bundle);
-    let source_key = source_hash
-        .strip_prefix("blake3:")
-        .unwrap_or(source_hash.as_str());
-    let source_dir = rollout_paths.root.join("staged").join("build-sources");
-    fs::create_dir_all(&source_dir).map_err(|source| CliError::Io {
-        path: source_dir.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    let source_bundle_path = source_dir.join(format!("{source_key}.bundle"));
-    let existing_matches = fs::read(&source_bundle_path)
-        .map(|existing| {
-            existing.len() == source_bundle.len() && build_content_hash(&existing) == source_hash
-        })
-        .unwrap_or(false);
-    if !existing_matches {
-        fs::write(&source_bundle_path, &source_bundle).map_err(|source| CliError::Io {
-            path: source_bundle_path.display().to_string(),
-            detail: source.to_string(),
-        })?;
-    }
-    let lockfile_path = repo.join("Cargo.lock");
-    let lockfile = fs::read(&lockfile_path).map_err(|source| CliError::Io {
-        path: lockfile_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
-    Ok(ClusterBuildSourceInput {
-        source: BuildSource {
-            label: repo.display().to_string(),
-            revision: Some(source_head),
-            bundle_hash: source_hash,
-            bundle_bytes: source_bundle.len() as u64,
-        },
-        source_repo: repo,
-        source_bundle: source_bundle_path,
-        lockfile_hash: build_content_hash(&lockfile),
-    })
+    let data_dir = SinomoDataDir::from_env_or_home()?;
+    prepare_build_source(&BuildPaths::new(data_dir.root()), &repo).map_err(build_service_cli_error)
 }
 
 fn rank_cluster_builder_plans(
@@ -2003,9 +1959,14 @@ fn rank_cluster_builder_plans(
     artifact_kinds: &[BuildArtifactKind],
     mut plans: Vec<ClusterBuilderPlan>,
 ) -> Vec<ClusterBuilderPlan> {
-    let ranked = rank_build_candidates(
+    let requirements = plans
+        .first()
+        .map(|plan| BuildPlacementRequirements::for_source_bytes(plan.plan.source.bundle_bytes))
+        .unwrap_or_default();
+    let ranked = rank_build_candidates_with_requirements(
         requested_target,
         artifact_kinds,
+        requirements,
         plans.iter().map(|plan| BuildCandidate {
             capabilities: plan.capabilities.capabilities.clone(),
             cache_hit: plan.cache_hit,
@@ -2162,6 +2123,14 @@ fn submit_cluster_build_and_wait(
             .available_slots(),
         builder.capabilities.capabilities.resources.queue_depth
     );
+    if let Some(disk_available_mb) = builder
+        .capabilities
+        .capabilities
+        .resources
+        .disk_available_mb
+    {
+        println!("  disk available: {disk_available_mb} MiB");
+    }
     let request = BuildSubmitRequest {
         plan: builder.plan.clone(),
     };
@@ -2675,8 +2644,8 @@ fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliE
 mod cluster_build_service_tests {
     use super::*;
     use sinomo_runtime::build::{
-        BUILD_PROTOCOL, BuildResourceSnapshot, BuildServiceCapabilities,
-        NativeDylibArtifactMetadata,
+        BUILD_PROTOCOL, BuildResourceSnapshot, BuildServiceCapabilities, BuildSource,
+        NativeDylibArtifactMetadata, build_content_hash,
     };
 
     fn exact_linux_target() -> BuildTarget {
@@ -2729,6 +2698,8 @@ mod cluster_build_service_tests {
                 memory_total_mb: Some(u64::from(cpu_threads) * 2_048),
                 memory_available_mb: Some(u64::from(cpu_threads) * 1_024),
                 cpu_load_milli: Some(0),
+                disk_total_mb: Some(256 * 1_024),
+                disk_available_mb: Some(128 * 1_024),
                 active_jobs,
                 max_jobs: 1,
                 queue_depth,
@@ -2778,6 +2749,30 @@ mod cluster_build_service_tests {
 
         assert_eq!(plan.input.profile, CLUSTER_ROLLOUT_BUILD_PROFILE);
         assert_eq!(plan.input.profile, "release");
+    }
+
+    #[test]
+    fn remote_build_flag_uses_the_canonical_build_service() {
+        let remote_build = RolloutOptions {
+            remote_build: true,
+            ..RolloutOptions::default()
+        };
+        assert!(!rollout_cluster_uses_compatibility_transport(&remote_build));
+
+        let target_local_checkout = RolloutOptions {
+            remote_build: true,
+            remote_repo: Some(PathBuf::from("/srv/sinomo")),
+            ..RolloutOptions::default()
+        };
+        assert!(rollout_cluster_uses_compatibility_transport(
+            &target_local_checkout
+        ));
+
+        let binary = RolloutOptions {
+            binary: Some(PathBuf::from("sinomo")),
+            ..RolloutOptions::default()
+        };
+        assert!(rollout_cluster_uses_compatibility_transport(&binary));
     }
 
     #[test]
@@ -3101,7 +3096,7 @@ fn rollout_cluster_legacy(options: RolloutOptions) -> Result<(), CliError> {
         };
         let platform = (target_os.clone(), target_arch.clone());
         if !binary_requests.contains_key(&platform) {
-            let artifacts = rollout_prepare_dev_artifacts(&options)?;
+            let artifacts = rollout_prepare_artifacts(&options)?;
             println!(
                 "cluster rollout binary: {}",
                 artifacts.built_binary.display()
@@ -3433,13 +3428,13 @@ pub(crate) fn rollout_source_bundle(
     prepare_rollout_source_bundle(&paths, &repo).map_err(Into::into)
 }
 
-pub(crate) fn rollout_prepare_dev_artifacts(
+pub(crate) fn rollout_prepare_artifacts(
     options: &RolloutOptions,
 ) -> Result<sinomo_runtime::rollout::RolloutBuiltArtifacts, CliError> {
     let repo = rollout_source_repo_from_options(options)?;
     let paths = rollout_paths_from_defaults()?;
     if options.skip_native_modules {
-        let built_binary = sinomo_runtime::rollout::prepare_rollout_dev_binary(
+        let built_binary = sinomo_runtime::rollout::prepare_rollout_binary(
             &paths,
             &repo,
             options.binary.as_deref(),
@@ -3449,7 +3444,7 @@ pub(crate) fn rollout_prepare_dev_artifacts(
             native_dylib_modules: Vec::new(),
         });
     }
-    prepare_rollout_dev_artifacts(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
+    prepare_rollout_artifacts(&paths, &repo, options.binary.as_deref()).map_err(Into::into)
 }
 
 pub(crate) fn rollout_source_repo_from_options(

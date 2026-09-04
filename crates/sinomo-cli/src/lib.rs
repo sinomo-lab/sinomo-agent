@@ -232,7 +232,7 @@ use sinomo_runtime::rollout::{
     install_local_rollout_native_dylib_modules as rollout_install_local_rollout_native_dylib_modules,
     managed_source_status, prepare_cluster_rollout_binary_manifest_for_target,
     prepare_cluster_rollout_build_request, prepare_cluster_rollout_native_dylib_module_request,
-    prepare_local_rollout_artifacts_with_options, prepare_rollout_dev_artifacts,
+    prepare_local_rollout_artifacts_with_options, prepare_rollout_artifacts,
     prepare_rollout_source_bundle, read_rollout_runtime_state, read_rollout_telemetry_gate_config,
     reconcile_rollout_native_dylib_platforms, restore_native_dylib_loader_state_for_activation,
     rollout_source_head, rollout_status_view, shadow_telemetry_scorecard_from_event_store,

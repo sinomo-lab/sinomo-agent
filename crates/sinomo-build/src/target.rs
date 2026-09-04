@@ -154,9 +154,43 @@ pub struct BuildResourceSnapshot {
     pub memory_available_mb: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_load_milli: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_total_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_available_mb: Option<u64>,
     pub active_jobs: u16,
     pub max_jobs: u16,
     pub queue_depth: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub struct BuildPlacementRequirements {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_memory_available_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_disk_available_mb: Option<u64>,
+}
+
+impl BuildPlacementRequirements {
+    pub fn for_source_bytes(source_bytes: u64) -> Self {
+        let source_mb = source_bytes.saturating_add(1_048_575) / 1_048_576;
+        Self {
+            minimum_memory_available_mb: Some(2_048),
+            minimum_disk_available_mb: Some(2_048_u64.max(source_mb.saturating_mul(8))),
+        }
+    }
+
+    pub fn is_satisfied_by(self, resources: &BuildResourceSnapshot) -> bool {
+        self.minimum_memory_available_mb.is_none_or(|minimum| {
+            resources
+                .memory_available_mb
+                .is_none_or(|available| available >= minimum)
+        }) && self.minimum_disk_available_mb.is_none_or(|minimum| {
+            resources
+                .disk_available_mb
+                .is_none_or(|available| available >= minimum)
+        })
+    }
 }
 
 impl BuildResourceSnapshot {
@@ -209,6 +243,20 @@ pub fn rank_build_candidates(
     artifact_kinds: &[BuildArtifactKind],
     candidates: impl IntoIterator<Item = BuildCandidate>,
 ) -> Vec<RankedBuildCandidate> {
+    rank_build_candidates_with_requirements(
+        target,
+        artifact_kinds,
+        BuildPlacementRequirements::default(),
+        candidates,
+    )
+}
+
+pub fn rank_build_candidates_with_requirements(
+    target: &BuildTarget,
+    artifact_kinds: &[BuildArtifactKind],
+    requirements: BuildPlacementRequirements,
+    candidates: impl IntoIterator<Item = BuildCandidate>,
+) -> Vec<RankedBuildCandidate> {
     let requested_kinds = artifact_kinds.iter().copied().collect::<BTreeSet<_>>();
     let requested_kinds = requested_kinds.into_iter().collect::<Vec<_>>();
     let mut candidates = candidates
@@ -217,6 +265,8 @@ pub fn rank_build_candidates(
             candidate.capabilities.protocol == crate::BUILD_PROTOCOL
                 && candidate.capabilities.resources.cpu_threads > 0
                 && candidate.capabilities.resources.max_jobs > 0
+                && (candidate.cache_hit
+                    || requirements.is_satisfied_by(&candidate.capabilities.resources))
                 && candidate.capabilities.supports(target, &requested_kinds)
         })
         .collect::<Vec<_>>();
@@ -264,6 +314,20 @@ fn compare_build_candidates(left: &BuildCandidate, right: &BuildCandidate) -> Or
                         .unwrap_or(u16::MAX),
                 )
         })
+        .then_with(|| {
+            right
+                .capabilities
+                .resources
+                .disk_available_mb
+                .unwrap_or_default()
+                .cmp(
+                    &left
+                        .capabilities
+                        .resources
+                        .disk_available_mb
+                        .unwrap_or_default(),
+                )
+        })
         .then_with(|| left.transfer_cost.cmp(&right.transfer_cost))
         .then_with(|| {
             right
@@ -295,9 +359,10 @@ fn candidate_rank_reason(candidate: &BuildCandidate) -> String {
         return "exact build artifact cache hit".to_string();
     }
     format!(
-        "{} available build slot(s), {} CPU thread(s), {} queued job(s)",
+        "{} available build slot(s), {} CPU thread(s), {} MiB disk available, {} queued job(s)",
         resources.available_slots(),
         resources.cpu_threads,
+        resources.disk_available_mb.unwrap_or_default(),
         resources.queue_depth
     )
 }
@@ -332,6 +397,8 @@ mod tests {
                     memory_total_mb: Some(memory_mb),
                     memory_available_mb: Some(memory_mb),
                     cpu_load_milli: Some(0),
+                    disk_total_mb: Some(256 * 1_024),
+                    disk_available_mb: Some(128 * 1_024),
                     active_jobs: 0,
                     max_jobs: 2,
                     queue_depth: 0,
@@ -390,6 +457,39 @@ mod tests {
             [candidate("linux", 64, 131_072)],
         );
         assert!(ranked.is_empty());
+    }
+
+    #[test]
+    fn low_disk_cache_miss_is_rejected_but_exact_hit_remains_eligible() {
+        let target = BuildTarget::new("linux", "aarch64")
+            .expect("target")
+            .with_family("unix")
+            .expect("family");
+        let mut low_disk = candidate("low-disk", 16, 32_768);
+        low_disk.capabilities.resources.disk_available_mb = Some(512);
+        let requirements = BuildPlacementRequirements::for_source_bytes(1024);
+
+        assert!(
+            rank_build_candidates_with_requirements(
+                &target,
+                &[BuildArtifactKind::Binary],
+                requirements,
+                [low_disk.clone()],
+            )
+            .is_empty()
+        );
+
+        low_disk.cache_hit = true;
+        assert_eq!(
+            rank_build_candidates_with_requirements(
+                &target,
+                &[BuildArtifactKind::Binary],
+                requirements,
+                [low_disk],
+            )
+            .len(),
+            1
+        );
     }
 
     #[test]

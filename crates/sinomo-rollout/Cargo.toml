@@ -25,6 +25,7 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 sinomo-core = { path = "../sinomo-core" }
+sinomo-build = { path = "../sinomo-build" }
 sinomo-config = { path = "../sinomo-config" }
 sinomo-module = { path = "../sinomo-module" }
 sinomo-registry = { path = "../sinomo-registry" }

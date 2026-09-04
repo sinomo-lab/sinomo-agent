@@ -11,26 +11,52 @@ pub struct BuildPaths {
     pub jobs: PathBuf,
     pub work: PathBuf,
     pub cache: PathBuf,
+    pub sources: PathBuf,
+    pub checkouts: PathBuf,
+    pub incremental: PathBuf,
+    pub managed_source: PathBuf,
+    pub local_log: PathBuf,
 }
 
 impl BuildPaths {
     /// Constructs the build-service layout beneath a Sinomo data-directory root.
     pub fn new(data_dir_root: impl Into<PathBuf>) -> Self {
-        Self::from_build_root(data_dir_root.into().join("build"))
+        let data_dir_root = data_dir_root.into();
+        Self::from_roots(
+            data_dir_root.join("build"),
+            data_dir_root.join("source").join("sinomo"),
+        )
     }
 
     pub fn from_build_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
+        let data_dir_root = root.parent().unwrap_or(&root);
+        Self::from_roots(root.clone(), data_dir_root.join("source").join("sinomo"))
+    }
+
+    fn from_roots(root: PathBuf, managed_source: PathBuf) -> Self {
         Self {
             jobs: root.join("jobs"),
             work: root.join("work"),
             cache: root.join("cache"),
+            sources: root.join("sources"),
+            checkouts: root.join("checkouts"),
+            incremental: root.join("incremental"),
+            local_log: root.join("local.log"),
+            managed_source,
             root,
         }
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
-        for path in [&self.jobs, &self.work, &self.cache] {
+        for path in [
+            &self.jobs,
+            &self.work,
+            &self.cache,
+            &self.sources,
+            &self.checkouts,
+            &self.incremental,
+        ] {
             fs::create_dir_all(path).map_err(|source| BuildError::Io {
                 path: path.display().to_string(),
                 detail: source.to_string(),
@@ -78,6 +104,38 @@ impl BuildPaths {
     pub fn cache_artifacts_dir(&self, build_key: &BuildKey) -> PathBuf {
         self.cache_entry_dir(build_key).join("artifacts")
     }
+
+    pub fn source_bundle(&self, source_hash: &str) -> Result<PathBuf> {
+        let digest =
+            source_hash
+                .strip_prefix("blake3:")
+                .ok_or_else(|| BuildError::InvalidValue {
+                    detail: "source bundle key must use the blake3:<hex> format".to_string(),
+                })?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(BuildError::InvalidValue {
+                detail: "source bundle key must contain a 64-character BLAKE3 digest".to_string(),
+            });
+        }
+        Ok(self
+            .sources
+            .join(format!("{}.bundle", digest.to_ascii_lowercase())))
+    }
+
+    pub fn incremental_target_dir(&self, plan: &crate::BuildPlan) -> PathBuf {
+        let toolchain = blake3::hash(plan.input.toolchain_fingerprint.as_bytes())
+            .to_hex()
+            .to_string();
+        self.incremental
+            .join(plan.input.target.path_key())
+            .join(&toolchain[..16])
+            .join(&plan.input.profile)
+    }
+
+    pub fn checkout_root(&self, source_label: &str) -> PathBuf {
+        let source = blake3::hash(source_label.as_bytes()).to_hex().to_string();
+        self.checkouts.join(&source[..16])
+    }
 }
 
 pub fn register_storage_paths(
@@ -100,6 +158,35 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "build/cache",
         "content-addressed verified artifact sets keyed by build key",
+    )?;
+    layout.register_escape_path(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "build/sources",
+        "content-addressed immutable source bundles prepared for local and cluster builds",
+    )?;
+    layout.register_escape_path(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "build/checkouts",
+        "stable locked compiler checkouts refreshed from verified source bundles",
+    )?;
+    layout.register_escape_path(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "build/incremental",
+        "reusable target and dependency outputs partitioned by target, toolchain, and profile",
+    )?;
+    layout.register_escape_path(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "source",
+        "build-managed reviewed source checkouts",
+    )?;
+    layout.register_human_text(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "build/local.log",
     )?;
     layout.register_sinomo_object(
         SINOMO_BUILD_MODULE_OWNER,
@@ -172,6 +259,11 @@ mod tests {
             paths.cache_manifest(&build_key),
             root.join(format!("build/cache/{}/manifest.sobj", "a".repeat(64)))
         );
+        assert_eq!(paths.managed_source, root.join("source/sinomo"));
+        assert_eq!(paths.sources, root.join("build/sources"));
+        assert_eq!(paths.checkouts, root.join("build/checkouts"));
+        assert_eq!(paths.incremental, root.join("build/incremental"));
+        assert_eq!(paths.local_log, root.join("build/local.log"));
     }
 
     #[test]
@@ -179,7 +271,7 @@ mod tests {
         let mut layout = StorageLayout::new();
         register_storage_paths(&mut layout).expect("register");
 
-        assert_eq!(layout.escape_paths.len(), 3);
+        assert_eq!(layout.escape_paths.len(), 7);
         assert!(
             layout
                 .escape_paths

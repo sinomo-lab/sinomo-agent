@@ -12,9 +12,14 @@ package, verify, cache, and publish an artifact. It cannot select rollout lanes,
 change desired state, activate an artifact, promote a candidate, or approve its
 own output. Those decisions remain with rollout policy and the target node.
 
-The first implementation delivers authenticated live capability RPCs, a
-node-local durable queue, exact target-aware Cargo execution, a verified
-node-local artifact cache, and CLI scheduling/distribution. Expiring
+The implementation delivers authenticated live capability RPCs, a node-local
+durable queue, exact target-aware Cargo execution, a verified node-local
+artifact cache, build-owned managed-source handling, and CLI
+scheduling/distribution. Local apply and target-local recovery use the same
+planner, executor, cache publisher, and verification path as queued service
+jobs. Supplying `--binary` bypasses binary compilation; unless the operator also
+selects the explicit binary-only bootstrap mode, any requested native modules
+still flow through the build service. Expiring
 advertisements and leases in cluster KV, shared registry/DFS artifact lookup,
 signing, and historical reliability estimates are the next distributed
 coordination layer described by this document; operators should not assume
@@ -92,7 +97,7 @@ The scheduler resolves work in this order:
 3. Coalesce concurrent requests for the same build key into one queued or
    running job.
 4. Filter workers by trust, policy, fresh liveness, target and toolchain
-   support, route availability, and sufficient resource headroom.
+   support, route availability, and sufficient memory and disk headroom.
 5. Rank eligible workers by estimated time to a usable artifact, including
    queue delay, expected build duration, cache locality, transfer cost,
    resource pressure, and recent reliability.
@@ -113,9 +118,13 @@ build; it does not remove an already published immutable artifact.
 
 A worker materializes the identified source and dependencies in an isolated
 workspace, verifies the request and policy, performs the build and required
-checks, packages the output, and publishes the artifact and manifest. A job is
-successful only after the published bytes can be retrieved and independently
-verified by content digest.
+checks, packages the output, and publishes the artifact and manifest. Cargo
+target directories are reusable but partitioned by concrete target, toolchain,
+and profile and protected by a cross-process lock. Parallel compiler jobs are
+bounded by CPU headroom and available memory. Known insufficient disk or memory
+blocks a cache miss before source upload, while an already verified exact cache
+hit remains usable. A job is successful only after the published bytes can be
+retrieved and independently verified by content digest.
 
 Artifacts are distributed from the best authorized source, not necessarily the
 worker that produced them. Registry, DFS, peer, and node-local caches may all

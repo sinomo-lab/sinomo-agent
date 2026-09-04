@@ -515,12 +515,38 @@ impl CargoBuildExecutor {
         artifact_root: impl AsRef<Path>,
     ) -> Result<CargoBuildResult> {
         let artifact_root = artifact_root.as_ref();
+        self.execute_with_target_dir(
+            source_repo,
+            plan,
+            artifact_root,
+            artifact_root.join(".cargo-target"),
+            None,
+        )
+    }
+
+    pub fn execute_with_target_dir(
+        &self,
+        source_repo: impl AsRef<Path>,
+        plan: &BuildPlan,
+        artifact_root: impl AsRef<Path>,
+        target_dir: impl Into<PathBuf>,
+        cargo_jobs: Option<u16>,
+    ) -> Result<CargoBuildResult> {
+        let artifact_root = artifact_root.as_ref();
         fs::create_dir_all(artifact_root).map_err(|source| BuildError::Io {
             path: artifact_root.display().to_string(),
             detail: source.to_string(),
         })?;
-        let target_dir = artifact_root.join(".cargo-target");
-        let command = self.plan_command(source_repo, plan, &target_dir)?;
+        let target_dir = target_dir.into();
+        fs::create_dir_all(&target_dir).map_err(|source| BuildError::Io {
+            path: target_dir.display().to_string(),
+            detail: source.to_string(),
+        })?;
+        let mut command = self.plan_command(source_repo, plan, &target_dir)?;
+        if let Some(cargo_jobs) = cargo_jobs {
+            command.args.push(OsString::from("--jobs"));
+            command.args.push(OsString::from(cargo_jobs.to_string()));
+        }
         let mut process = noninteractive_command(&command.program);
         process
             .args(&command.args)

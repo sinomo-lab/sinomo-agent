@@ -75,8 +75,8 @@ ownership rules:
 | DFS metadata and content | Owned dynamic subtrees registered by DFS. |
 | Workspaces and exposed files | Reasoned escape paths because contents are intentionally arbitrary. |
 | Evolution jobs and review artifacts | Higher-ring subtrees intended for operator and agent inspection. |
-| Build inputs, workspaces, caches, and job evidence | Build-service-owned paths with isolated workspace and immutable cache rules. |
-| Installed or staged binaries and managed source | Install and rollout-owned paths with explicit activation lifecycle rules. |
+| Build inputs, managed source, workspaces, caches, and job evidence | Build-service-owned paths with isolated workspace and immutable cache rules. |
+| Installed or staged binaries | Install and rollout-owned paths with explicit activation lifecycle rules. |
 
 Cluster-wide configuration belongs in cluster KV or a shared configuration
 document according to the owning subsystem. A local file must not quietly become
@@ -85,11 +85,11 @@ an alternate source of authority for distributed settings.
 ## Build, Artifact, and Activation Storage
 
 Build storage and activation storage have different owners. The build service
-owns isolated per-job workspaces, fetched source and dependency material,
-compiler caches, build logs, and locally retained immutable outputs. Rollout and
-the module loader own staged candidates, installed binaries, active module
-references, and recovery state. A build workspace or cache path is never an
-activation path.
+owns the reviewed managed checkout, immutable source bundles, isolated per-job
+workspaces, fetched dependency material, compiler caches, build logs, and
+locally retained immutable outputs. Rollout and the module loader own staged
+candidates, installed binaries, active module references, and recovery state. A
+build workspace or cache path is never an activation path.
 
 Immutable source bundles, binary and module artifacts, and manifests are
 content addressed when cached. The initial build service publishes them to a
