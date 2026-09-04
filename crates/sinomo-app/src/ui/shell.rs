@@ -34,7 +34,7 @@ use sui_lucide::LucideIcon;
 use crate::state::ShellStatus;
 use crate::state::{ConnectionPhase, HealthIssue, HealthStructureKey, HealthSurface, Shared, Tab};
 use crate::theme::Palette;
-use crate::ui::{chat, cluster, files, settings, widgets};
+use crate::ui::{chat, cluster, evolution, files, settings, widgets};
 
 pub const TOPBAR_HEIGHT: f32 = 44.0;
 
@@ -61,6 +61,7 @@ impl BackgroundWorkController {
             self.shared
                 .settings_mut()
                 .begin_initial_load(backend.clone(), waker.clone());
+            evolution::request_refresh(&self.shared);
             {
                 let mut chat = self.shared.chat_mut();
                 chat.start_provider_list_load(backend.config.clone(), waker.clone());
@@ -87,6 +88,7 @@ impl BackgroundWorkController {
         let settings_operations_changed =
             ready && settings::pump_background_operations(&self.shared);
         let files_changed = ready && self.shared.files_mut().pump_load();
+        let evolution_changed = ready && evolution::pump_refresh(&self.shared);
         let files_attachment_changed = ready && drain_files_chat_attachment(&self.shared);
         let connection_changed = self.shared.pump_connection_probe();
         let cluster_changed = cluster::pump_refresh(&self.shared);
@@ -128,6 +130,7 @@ impl BackgroundWorkController {
         let layout_changed = became_ready
             || device_changed
             || files_changed
+            || evolution_changed
             || files_attachment_changed
             || connection_changed
             || cluster_changed
@@ -202,6 +205,7 @@ const HEALTH_ISSUE_ESTIMATED_H: f32 = 104.0;
 const HEALTH_ACTION_H: f32 = 30.0;
 const HEALTH_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const CLUSTER_OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
+const EVOLUTION_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Stock spinner shown in the centered launch-progress surface.
 const LOADING_SPINNER_SIZE: f32 = 24.0;
 /// Loading screen: show the per-step elapsed time once a launch step has been in
@@ -243,6 +247,8 @@ pub struct Shell {
     health_probe_timer: Cell<Option<TimerToken>>,
     /// Five-second live metrics cadence while Cluster / Overview is visible.
     cluster_observe_timer: Cell<Option<TimerToken>>,
+    /// Five-second goal/DAG refresh while the Evolution surface is visible.
+    evolution_refresh_timer: Cell<Option<TimerToken>>,
     window_occluded: Cell<bool>,
     body_rect: Rect,
 }
@@ -283,6 +289,7 @@ impl Shell {
             connect_status_timer: Cell::new(None),
             health_probe_timer: Cell::new(None),
             cluster_observe_timer: Cell::new(None),
+            evolution_refresh_timer: Cell::new(None),
             window_occluded: Cell::new(false),
             body_rect: Rect::ZERO,
         };
@@ -335,6 +342,20 @@ impl Shell {
         );
         self.cluster_observe_timer
             .set(Some(ctx.schedule_timer_after(interval.as_secs_f64())));
+    }
+
+    fn schedule_evolution_refresh_timer(&self, ctx: &mut EventCtx) {
+        if !crate::mobile_runtime::interactive()
+            || self.window_occluded.get()
+            || self.shared.active_tab() != Tab::Evolution
+            || self.evolution_refresh_timer.get().is_some()
+            || self.shared.borrow().waker.is_none()
+        {
+            return;
+        }
+        self.evolution_refresh_timer.set(Some(
+            ctx.schedule_timer_after(EVOLUTION_REFRESH_INTERVAL.as_secs_f64()),
+        ));
     }
 
     fn sync_render_options(&self, ctx: &mut EventCtx) {
@@ -418,6 +439,7 @@ impl Shell {
         }
         match self.shared.active_tab() {
             Tab::Cluster => self.shared.cluster_mut().navigate_back(),
+            Tab::Evolution => false,
             Tab::Settings => self.shared.settings_mut().navigate_back(),
             Tab::Files => {
                 let waker = { self.shared.borrow().waker.clone() };
@@ -574,6 +596,7 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
         match tab {
             Tab::Sinomo => "Chat",
             Tab::Cluster => Tab::Cluster.title(),
+            Tab::Evolution => "Evolve",
             Tab::Files => Tab::Files.title(),
             Tab::Settings => "Prefs",
         }
@@ -582,7 +605,7 @@ fn tab_label(tab: Tab, compact: bool) -> &'static str {
     }
 }
 
-pub(crate) fn tab_icons() -> [LucideIcon; 4] {
+pub(crate) fn tab_icons() -> [LucideIcon; 5] {
     Tab::ALL.map(tab_icon)
 }
 
@@ -590,6 +613,7 @@ fn tab_icon(tab: Tab) -> LucideIcon {
     match tab {
         Tab::Sinomo => LucideIcon::MessagesSquare,
         Tab::Cluster => LucideIcon::Cloudy,
+        Tab::Evolution => LucideIcon::GitBranch,
         Tab::Files => LucideIcon::Folders,
         Tab::Settings => LucideIcon::Settings,
     }
@@ -609,6 +633,7 @@ fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
             .selected_from(selected)
             .with_child(chat::view(shared.clone()))
             .with_child(cluster::view(shared.clone()))
+            .with_child(evolution::view(shared.clone()))
             .with_child(files::view(shared.clone()))
             .with_child(settings::view(shared)),
     )
@@ -810,6 +835,7 @@ impl Widget for Shell {
                 self.schedule_connect_status_timer(ctx);
                 self.schedule_health_probe_timer(ctx);
                 self.schedule_cluster_observe_timer(ctx);
+                self.schedule_evolution_refresh_timer(ctx);
                 if let Some(waker) = self.shared.borrow().waker.clone() {
                     waker.wake();
                 }
@@ -888,10 +914,24 @@ impl Widget for Shell {
             self.schedule_cluster_observe_timer(ctx);
             return;
         }
+        if let Event::Wake(sui::WakeEvent::Timer { token, .. }) = event
+            && self.evolution_refresh_timer.get() == Some(*token)
+        {
+            self.evolution_refresh_timer.set(None);
+            if crate::mobile_runtime::interactive()
+                && !self.window_occluded.get()
+                && self.shared.active_tab() == Tab::Evolution
+            {
+                evolution::request_refresh(&self.shared);
+            }
+            self.schedule_evolution_refresh_timer(ctx);
+            return;
+        }
         if matches!(event, Event::Window(WindowEvent::RedrawRequested)) {
             self.schedule_connect_status_timer(ctx);
             self.schedule_health_probe_timer(ctx);
             self.schedule_cluster_observe_timer(ctx);
+            self.schedule_evolution_refresh_timer(ctx);
             self.sync_render_options(ctx);
         }
     }
@@ -2136,10 +2176,11 @@ mod tests {
         assert_eq!(tab_label(Tab::Sinomo, true), "Chat");
         assert_eq!(
             Tab::ALL.map(Tab::title),
-            ["Chat", "Cluster", "Files", "Settings"]
+            ["Chat", "Cluster", "Evolution", "Files", "Settings"]
         );
         assert_eq!(tab_icon(Tab::Sinomo).name(), "messages-square");
         assert_eq!(tab_icon(Tab::Cluster).name(), "cloudy");
+        assert_eq!(tab_icon(Tab::Evolution).name(), "git-branch");
         assert_eq!(tab_icon(Tab::Files).name(), "folders");
         assert_eq!(tab_icon(Tab::Settings).name(), "settings");
     }

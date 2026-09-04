@@ -1,25 +1,67 @@
-# Sinomo Self-Evolution Architecture
+# Sinomo Evolution Framework Architecture
 
 ## Purpose
 
-Self-evolution is Sinomo's controlled live-mutation loop. The same machinery can
-target Sinomo itself or another git-backed project. The system observes runtime
-behavior, proposes bounded improvements, implements candidates in isolated
-workspaces, evaluates them against replayable evidence, rolls approved artifacts
-out progressively when the target supports rollout, and rolls back when evidence
-degrades.
+Evolution is Sinomo's generic, goal-directed improvement framework. A goal may
+describe software, a prompt, a model, a dataset, a design, a policy, or any other
+object whose revisions can establish immutable content identity and produce
+evaluatable artifacts. The framework repeatedly proposes revisions, evaluates
+their artifacts against explicit metrics and guardrails, and uses the evidence to
+choose the next branch of work.
+
+Self-evolution is one application of this framework. When the target is Sinomo or
+another repository, the same machinery isolates workspaces, evaluates replayable
+evidence, and may hand approved artifacts to the separate rollout authority.
 
 This document defines the stable architecture and invariants. Current
 implementation status is tracked by the code, readiness gates, rollout
 operations, and test evidence rather than by separate plan documents.
 
-Self-evolution complements the event-centric distributed runtime in
+Evolution complements the event-centric distributed runtime in
 [architecture.md](architecture.md). It is another control plane: it consumes
 events, traces, metrics, workspaces, scorecards, policy decisions, and rollout
 telemetry, then emits candidate bundles, artifacts, desired-state changes when
 applicable, and audit events. Sinomo self-mutation is the default target when no
 repository is supplied; `sinomo evolve ... --repo <path>` uses the same
-candidate, verification, and evidence lifecycle for another project.
+candidate, verification, and evidence lifecycle for another project. Non-git
+targets provide an equivalent immutable content identity and evaluator contract.
+
+## Goal And Revision Model
+
+An evolution goal is the durable unit of intent. It owns:
+
+- the user objective, non-goals, constraints, and approval checkpoints;
+- metric definitions, directions, targets, and absolute guardrails;
+- a revision directed acyclic graph (DAG);
+- tasks, subgoals, dependencies, and agent assignments;
+- artifact-bound metric observations;
+- resource and monetary cost records with provenance and confidence;
+- the attributable event history used for audit, replay, and interaction.
+
+Every graph node is a revision. A revision is immutable once admitted to the
+graph and identifies its content using one of these forms:
+
+- a repository plus an immutable commit identity;
+- a frozen directory snapshot plus its digest and optional manifest;
+- inline raw contents plus media type and digest;
+- a composite identity binding an immutable base revision to a content-addressed
+  patch artifact.
+
+A mutable path alone is not a revision identity. The system must snapshot its
+contents, store the raw contents, or bind it to another immutable identity before
+evaluation evidence can be attributed to it.
+
+Revision parent links form the DAG. Multiple children represent competing
+candidates; multiple parents represent an explicit merge. Selection never
+rewrites graph history. Rejected, failed, superseded, and rolled-back revisions
+remain inspectable with their evidence.
+
+Artifacts belong to exact revisions and are the only inputs from which metric
+observations are established. Examples include evaluation datasets, result
+tables, scorecards, traces, patches, binaries, images, and provenance manifests.
+Each observation names the metric, evaluator, artifact, sample count when
+applicable, time, and outcome. Missing or incomparable observations stay missing;
+the governor does not impute them.
 
 ## Runtime Boundary
 
@@ -83,21 +125,30 @@ require stronger gates.
 | R4 disposable workspaces | candidate branches, test sandboxes, generated fixtures, traces | Fully automated, isolated, and disposable. |
 | R5 model providers | local or remote LLMs used for proposal, implementation, critique, review | No direct authority; can only produce artifacts or judgments. |
 
-## Control Plane
+## Agent-Governed Control Plane
 
-The self-evolution control plane is a delivery pipeline.
+The evolution agent is the goal governor. It interprets the objective, maintains
+the DAG and metric contract, creates subgoals and tasks, allocates bounded work,
+reviews evidence, and recommends the next experiment. It delegates proposal,
+implementation, and evaluation to separately identified subagents. Those
+subagents receive only their task inputs and allowed capabilities, and cannot
+select or promote their own outputs.
+
+The control plane is an iterative evidence loop.
 
 ```text
-events / metrics / incidents / traces / scorecards
-  -> opportunity detector
-  -> evolution planner
-  -> mutation worker
-  -> build and evaluation harness
-  -> policy gate
-  -> artifact registry
-  -> rollout controller
-  -> node-local loader
-  -> telemetry and rollback
+goal / user interaction / events / metrics / incidents
+  -> evolution governor
+  -> subgoal and task DAG
+  -> proposal and implementation subagents
+  -> immutable revision + evaluatable artifacts
+  -> evaluation subagents and trusted harnesses
+  -> metric comparison + resource/cost ledger
+  -> next branch, user checkpoint, completion, or policy handoff
+
+software target only, after approval:
+  -> artifact registry -> rollout controller -> node-local loader
+  -> telemetry -> rollback evidence -> evolution governor
 ```
 
 Core responsibilities:
@@ -105,6 +156,10 @@ Core responsibilities:
 - Detect improvement opportunities from incidents, regressions, replay failures,
   stale scorecards, and user corrections.
 - Convert each opportunity into a scoped evolution job.
+- Maintain immutable revision identities, parent edges, artifacts, metrics, and
+  task/agent/resource state for every goal.
+- Keep the governor, implementers, and evaluators as separate attributable agent
+  runs with explicit parent-child relationships.
 - Run mutation in an isolated candidate workspace.
 - Preserve complete candidate evidence.
 - Evaluate candidate behavior against fixed and trace-derived gates.
@@ -134,7 +189,20 @@ authority required to ship a change.
 
 ## Lifecycle
 
-Each candidate moves through a small state machine:
+The goal lifecycle is iterative rather than a single linear delivery state
+machine:
+
+```text
+plan goal + metrics
+  -> establish baseline revision
+  -> create subgoal/task
+  -> spawn bounded proposal/implementation work
+  -> record candidate revision and artifacts
+  -> evaluate and compare
+  -> select next branch / merge / retry / ask user / complete
+```
+
+Within one revision attempt, the existing candidate state machine remains:
 
 ```text
 observed
@@ -164,6 +232,32 @@ promoted -> reverted
 
 Every state transition appends an event. The event log is both the audit trail
 and the debugging substrate.
+
+## User Interface
+
+The application and CLI consume the stable evolution contract rather than
+linking the module implementation. The interface contract covers:
+
+- a goal list with status, governor, active task, and budget state;
+- a revision DAG with branch, merge, selected, failed, and rollback
+  states;
+- per-revision content identity, artifacts, metric observations, and comparable
+  deltas;
+- task/subgoal dependencies and live governor/subagent activity;
+- resource quantities, token/compute/wall-time usage, and monetary cost where
+  known;
+- the attributable event and conversation timeline;
+- policy-checked controls to pause, resume, cancel, approve, reject, retry,
+  branch, merge, or reprioritize work.
+
+Reads may be eventually refreshed projections. Mutations cross the authenticated
+daemon/module service route and remain subject to the same policy and authority
+checks as CLI operations.
+
+The current graphical slice renders a live goal list and revision-edge view,
+metric/artifact summaries, task and agent activity, costs, recent events, and
+pause/resume/complete/cancel controls. Rich graph navigation and additional
+branch/merge/reprioritization controls can evolve behind the same contract.
 
 ## Candidate Bundle
 

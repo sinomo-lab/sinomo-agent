@@ -15,6 +15,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use sinomo_app_contract::evolution as evolution_contract;
 use sinomo_lm::{
     LM_PROVIDER_CONFIG_KEY, LanguageModelError, ModelConfig, model_config_definition,
     model_config_from_cluster_kv_snapshot, model_config_store, normalize_model_id_for_provider,
@@ -322,6 +323,15 @@ fn evolve_cli_help() -> CliCommandHelp {
             "      Record that the operator restored from the selected candidate.",
             "  sinomo evolve status [--job evojob_...]",
             "      Show one job or all stored jobs.",
+            "  sinomo evolve graph [--goal <goal_id>] [--json]",
+            "      Show goal revision DAGs, metrics, tasks, agents, and resource usage.",
+            "  sinomo evolve goal create \"<objective>\" --metric <id:direction:unit[:target]> ...",
+            "  sinomo evolve goal pause|resume|complete|cancel <goal_id> [--note <text>]",
+            "      Create and control generic evolution goals without assuming a git target.",
+            "  sinomo evolve revision record <request.json>",
+            "      Record a content-identified revision and its evaluatable artifacts/metrics.",
+            "  sinomo evolve workflow update <request.json>",
+            "      Update goal tasks, subagent runs, resource usage, and monetary costs.",
             "  sinomo evolve show [--diff|--scorecard|--decision|--packet|--regression-evidence|--lesson|--evidence-summary] [--job evojob_...]",
             "      Print a stored job artifact.",
             "  sinomo evolve verify [--job evojob_...]",
@@ -712,6 +722,10 @@ pub(crate) fn run_evolve_cli_command(command: EvolveCliCommand) -> Result<(), Cl
         EvolveCliCommand::Tick(args) => evolve_tick(&args),
         EvolveCliCommand::Decide(outcome, args) => evolve_decide(&args, outcome),
         EvolveCliCommand::Status(args) => evolve_status(&args),
+        EvolveCliCommand::Graph(args) => evolve_graph(&args),
+        EvolveCliCommand::Goal(args) => evolve_goal(&args),
+        EvolveCliCommand::Revision(args) => evolve_revision(&args),
+        EvolveCliCommand::Workflow(args) => evolve_workflow(&args),
         EvolveCliCommand::Show(args) => evolve_show(&args),
         EvolveCliCommand::Verify(args) => evolve_verify(&args),
         EvolveCliCommand::Packet(args) => evolve_show_packet(&args),
@@ -1853,6 +1867,182 @@ pub(crate) fn evolve_status(args: &[String]) -> Result<(), CliError> {
         print_job_status(record);
     }
     Ok(())
+}
+
+pub(crate) fn evolve_graph(args: &[String]) -> Result<(), CliError> {
+    let data_dir = evolution_data_dir()?;
+    let paths = EvolutionPaths::new(&data_dir);
+    paths.ensure()?;
+    let selected_goal = flag_value(args, "--goal");
+    let graphs = if let Some(goal_id) = selected_goal {
+        vec![read_evolution_goal_graph(&paths, &goal_id)?]
+    } else {
+        list_evolution_goal_graphs(&paths)?
+    };
+    if has_flag(args, "--json") {
+        return print_json("evolution goal graphs", &graphs);
+    }
+    if graphs.is_empty() {
+        println!("no evolution goals");
+        return Ok(());
+    }
+    for graph in graphs {
+        println!("goal: {}", graph.goal_id);
+        println!("status: {:?}", graph.status);
+        println!("objective: {}", graph.objective);
+        println!("governor: {}", graph.evolution_agent_id);
+        println!("revisions: {}", graph.revisions.len());
+        println!("heads: {}", graph.head_revision_ids().join(", "));
+        println!("metrics: {}", graph.metric_definitions.len());
+        println!("tasks: {}", graph.tasks.len());
+        println!("agent runs: {}", graph.agent_runs.len());
+        println!("resource records: {}", graph.resources.len());
+        for revision in &graph.revisions {
+            let parents = if revision.parent_revision_ids.is_empty() {
+                "root".to_string()
+            } else {
+                revision.parent_revision_ids.join(",")
+            };
+            println!(
+                "  {} <- {} [{:?}] {} metrics, {} artifacts",
+                revision.revision_id,
+                parents,
+                revision.status,
+                revision.metrics.len(),
+                revision.artifacts.len()
+            );
+        }
+        println!();
+    }
+    Ok(())
+}
+
+pub(crate) fn evolve_goal(args: &[String]) -> Result<(), CliError> {
+    let Some((command, rest)) = args.split_first() else {
+        return Err(CliError::Usage);
+    };
+    let data_dir = evolution_data_dir()?;
+    match command.as_str() {
+        "create" => {
+            let objective = rest
+                .iter()
+                .find(|arg| !arg.starts_with("--"))
+                .cloned()
+                .ok_or(CliError::Usage)?;
+            let metrics = repeated_flag_values(rest, "--metric")
+                .into_iter()
+                .map(parse_goal_metric_spec)
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = run_app_create_goal(
+                &data_dir,
+                evolution_contract::EvolutionGoalCreateRequest {
+                    objective,
+                    evolution_agent_id: None,
+                    metrics,
+                },
+            )?;
+            println!("goal: {}", response.goal_id);
+            println!("accepted: {}", response.accepted);
+            Ok(())
+        }
+        "pause" | "resume" | "complete" | "cancel" => {
+            let goal_id = rest
+                .iter()
+                .find(|arg| !arg.starts_with("--"))
+                .cloned()
+                .ok_or(CliError::Usage)?;
+            let action = match command.as_str() {
+                "pause" => evolution_contract::EvolutionGoalControlAction::Pause,
+                "resume" => evolution_contract::EvolutionGoalControlAction::Resume,
+                "complete" => evolution_contract::EvolutionGoalControlAction::Complete,
+                _ => evolution_contract::EvolutionGoalControlAction::Cancel,
+            };
+            let response = run_app_control_goal(
+                &data_dir,
+                evolution_contract::EvolutionGoalControlRequest {
+                    goal_id: goal_id.clone(),
+                    action,
+                    note: flag_value(rest, "--note").unwrap_or_default(),
+                },
+            )?;
+            println!("goal: {goal_id}");
+            println!("accepted: {}", response.accepted);
+            Ok(())
+        }
+        _ => Err(CliError::Usage),
+    }
+}
+
+pub(crate) fn evolve_revision(args: &[String]) -> Result<(), CliError> {
+    let [command, request_path] = args else {
+        return Err(CliError::Usage);
+    };
+    if command != "record" {
+        return Err(CliError::Usage);
+    }
+    let request_path = PathBuf::from(request_path);
+    let request: evolution_contract::EvolutionRevisionRecordRequest =
+        read_json_file(&request_path)?;
+    let data_dir = evolution_data_dir()?;
+    let response = run_app_record_revision(&data_dir, request)?;
+    println!("revision: {}", response.revision_id);
+    println!("accepted: {}", response.accepted);
+    Ok(())
+}
+
+pub(crate) fn evolve_workflow(args: &[String]) -> Result<(), CliError> {
+    let [command, request_path] = args else {
+        return Err(CliError::Usage);
+    };
+    if command != "update" {
+        return Err(CliError::Usage);
+    }
+    let request_path = PathBuf::from(request_path);
+    let request: evolution_contract::EvolutionWorkflowUpdateRequest =
+        read_json_file(&request_path)?;
+    let data_dir = evolution_data_dir()?;
+    let response = run_app_update_workflow(&data_dir, request)?;
+    println!("accepted: {}", response.accepted);
+    Ok(())
+}
+
+fn parse_goal_metric_spec(
+    spec: String,
+) -> Result<evolution_contract::EvolutionMetricDefinitionInput, CliError> {
+    let parts = spec.split(':').collect::<Vec<_>>();
+    let (id, direction, unit, target) = match parts.as_slice() {
+        [id, direction, unit] => (*id, *direction, *unit, None),
+        [id, direction, unit, target] => (
+            *id,
+            *direction,
+            *unit,
+            Some(evolution_contract::EvolutionMetricValueInput::Decimal(
+                (*target).to_string(),
+            )),
+        ),
+        _ => {
+            return Err(CliError::Parse {
+                detail: format!(
+                    "invalid metric `{spec}`; expected <id>:<maximize|minimize|target|constraint|observe>:<unit>[:target]"
+                ),
+            });
+        }
+    };
+    Ok(evolution_contract::EvolutionMetricDefinitionInput {
+        id: id.to_string(),
+        label: id.replace(['-', '_', '.'], " "),
+        direction: direction.to_string(),
+        unit: unit.to_string(),
+        target,
+        required: true,
+    })
+}
+
+fn repeated_flag_values(args: &[String], flag: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 pub(crate) fn evolve_show(args: &[String]) -> Result<(), CliError> {
