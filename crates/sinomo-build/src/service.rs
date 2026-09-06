@@ -231,7 +231,7 @@ impl BuildQueueHost {
         let cargo_program = std::env::var_os("CARGO")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("cargo"));
-        let executor = configured_build_executor(&cargo_program);
+        let executor = configured_build_executor(&cargo_program, &paths);
         let executor_error = executor.as_ref().err().cloned();
         let executor = executor.ok();
         let initialization_error = layout_error.or(executor_error);
@@ -820,6 +820,7 @@ fn run_queued_build(host: &BuildQueueHost, job: QueuedBuildJob) {
 
 pub(crate) fn configured_build_executor(
     cargo_program: &Path,
+    paths: &crate::BuildPaths,
 ) -> Result<CargoBuildExecutor, String> {
     let rustc_program = std::env::var_os("RUSTC")
         .map(PathBuf::from)
@@ -828,6 +829,7 @@ pub(crate) fn configured_build_executor(
     build_executor_for_targets(
         cargo_program,
         &rustc_program,
+        &paths.aarch64_gnu_cross_bin(),
         configured_targets
             .as_deref()
             .map(|value| value.to_string_lossy()),
@@ -852,25 +854,22 @@ fn command_version(program: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn default_aarch64_gnu_cross_bin() -> Option<PathBuf> {
+fn aarch64_gnu_cross_bin(default_bin: &Path) -> PathBuf {
     if let Some(configured) = std::env::var_os(AARCH64_GNU_CROSS_BIN_ENV) {
-        return Some(PathBuf::from(configured));
+        return PathBuf::from(configured);
     }
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".local/lib/sinomo-cross/aarch64-linux-gnu/usr/bin"))
+    default_bin.to_path_buf()
 }
 
 fn discover_aarch64_gnu_cross_environment(
     host_target: &str,
     base_toolchain_fingerprint: &str,
+    default_bin: &Path,
 ) -> Result<Option<(String, Vec<(OsString, OsString)>)>, String> {
     if host_target != "x86_64-unknown-linux-gnu" {
         return Ok(None);
     }
-    let Some(bin) = default_aarch64_gnu_cross_bin() else {
-        return Ok(None);
-    };
+    let bin = aarch64_gnu_cross_bin(default_bin);
     let gcc = bin.join("aarch64-linux-gnu-gcc");
     let gxx = bin.join("aarch64-linux-gnu-g++");
     let ar = bin.join("aarch64-linux-gnu-ar");
@@ -948,6 +947,7 @@ fn discover_aarch64_gnu_cross_environment(
 fn build_executor_for_targets(
     cargo_program: &Path,
     rustc_program: &Path,
+    aarch64_gnu_cross_bin: &Path,
     configured_targets: Option<std::borrow::Cow<'_, str>>,
 ) -> Result<CargoBuildExecutor, String> {
     let toolchain = crate::inspect_cargo_toolchain(rustc_program, cargo_program)
@@ -959,12 +959,15 @@ fn build_executor_for_targets(
                 .map_err(|error| format!("parse SINOMO_BUILD_TARGETS: {error}"))?,
         );
     }
-    let mut aarch64_cross =
-        discover_aarch64_gnu_cross_environment(&toolchain.host_target, &toolchain.fingerprint)
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "ignoring unusable optional AArch64 GNU cross toolchain");
-                None
-            });
+    let mut aarch64_cross = discover_aarch64_gnu_cross_environment(
+        &toolchain.host_target,
+        &toolchain.fingerprint,
+        aarch64_gnu_cross_bin,
+    )
+    .unwrap_or_else(|error| {
+        tracing::warn!(%error, "ignoring unusable optional AArch64 GNU cross toolchain");
+        None
+    });
     if aarch64_cross.is_some() {
         match crate::inspect_rust_target(rustc_program, AARCH64_LINUX_GNU_TARGET) {
             Ok(_) => triples.push(AARCH64_LINUX_GNU_TARGET.to_string()),
@@ -1076,8 +1079,15 @@ mod tests {
 
     #[test]
     fn build_service_executor_advertises_concrete_host_target() {
-        let executor = build_executor_for_targets(Path::new("cargo"), Path::new("rustc"), None)
-            .expect("executor");
+        let root = sinomo_testdir::TestDir::new("sinomo-build-capability-paths");
+        let paths = crate::BuildPaths::new(&root);
+        let executor = build_executor_for_targets(
+            Path::new("cargo"),
+            Path::new("rustc"),
+            &paths.aarch64_gnu_cross_bin(),
+            None,
+        )
+        .expect("executor");
         assert!(!executor.supported_targets().is_empty());
         assert!(
             executor
@@ -1092,9 +1102,12 @@ mod tests {
                 .all(|capability| capability.supports_source_identity_hash)
         );
         let toolchain = crate::inspect_cargo_toolchain("rustc", "cargo").expect("toolchain");
-        let discovered =
-            discover_aarch64_gnu_cross_environment(&toolchain.host_target, &toolchain.fingerprint)
-                .expect("cross-toolchain discovery");
+        let discovered = discover_aarch64_gnu_cross_environment(
+            &toolchain.host_target,
+            &toolchain.fingerprint,
+            &paths.aarch64_gnu_cross_bin(),
+        )
+        .expect("cross-toolchain discovery");
         let advertised = executor.supported_targets().iter().find(|capability| {
             capability.target.rust_target.as_deref() == Some(AARCH64_LINUX_GNU_TARGET)
         });

@@ -55,7 +55,7 @@ pub fn execute_local_build_with_profile(
     let cargo_program = std::env::var_os("CARGO")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("cargo"));
-    let executor = crate::service::configured_build_executor(&cargo_program)
+    let executor = crate::service::configured_build_executor(&cargo_program, paths)
         .map_err(|detail| BuildError::InvalidValue { detail })?;
     let requested_host = crate::BuildTarget::host();
     let capability = executor

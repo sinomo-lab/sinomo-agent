@@ -14,6 +14,7 @@ pub struct BuildPaths {
     pub sources: PathBuf,
     pub checkouts: PathBuf,
     pub incremental: PathBuf,
+    pub toolchains: PathBuf,
     pub managed_source: PathBuf,
     pub local_log: PathBuf,
 }
@@ -42,6 +43,7 @@ impl BuildPaths {
             sources: root.join("sources"),
             checkouts: root.join("checkouts"),
             incremental: root.join("incremental"),
+            toolchains: root.join("toolchains"),
             local_log: root.join("local.log"),
             managed_source,
             root,
@@ -56,6 +58,7 @@ impl BuildPaths {
             &self.sources,
             &self.checkouts,
             &self.incremental,
+            &self.toolchains,
         ] {
             fs::create_dir_all(path).map_err(|source| BuildError::Io {
                 path: path.display().to_string(),
@@ -132,6 +135,10 @@ impl BuildPaths {
             .join(&plan.input.profile)
     }
 
+    pub fn aarch64_gnu_cross_bin(&self) -> PathBuf {
+        self.toolchains.join("aarch64-linux-gnu/usr/bin")
+    }
+
     pub fn checkout_root(&self, source_label: &str) -> PathBuf {
         let source = blake3::hash(source_label.as_bytes()).to_hex().to_string();
         self.checkouts.join(&source[..16])
@@ -176,6 +183,12 @@ pub fn register_storage_paths(
         StorageRing::R1,
         "build/incremental",
         "reusable target and dependency outputs partitioned by target, toolchain, and profile",
+    )?;
+    layout.register_escape_path(
+        SINOMO_BUILD_MODULE_OWNER,
+        StorageRing::R1,
+        "build/toolchains",
+        "node-local compiler toolchains and target sysroots used by managed builds",
     )?;
     layout.register_escape_path(
         SINOMO_BUILD_MODULE_OWNER,
@@ -263,6 +276,11 @@ mod tests {
         assert_eq!(paths.sources, root.join("build/sources"));
         assert_eq!(paths.checkouts, root.join("build/checkouts"));
         assert_eq!(paths.incremental, root.join("build/incremental"));
+        assert_eq!(paths.toolchains, root.join("build/toolchains"));
+        assert_eq!(
+            paths.aarch64_gnu_cross_bin(),
+            root.join("build/toolchains/aarch64-linux-gnu/usr/bin")
+        );
         assert_eq!(paths.local_log, root.join("build/local.log"));
     }
 
@@ -271,7 +289,7 @@ mod tests {
         let mut layout = StorageLayout::new();
         register_storage_paths(&mut layout).expect("register");
 
-        assert_eq!(layout.escape_paths.len(), 7);
+        assert_eq!(layout.escape_paths.len(), 8);
         assert!(
             layout
                 .escape_paths
