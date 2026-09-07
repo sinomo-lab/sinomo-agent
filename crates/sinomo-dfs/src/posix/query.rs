@@ -184,7 +184,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_stat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
-            let requested = normalize_posix_path(path)?;
+            let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, true)?;
             service.stat_resolved_posix_path(&path)
@@ -192,7 +192,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_stat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.with_metadata_lookup_cache_mut(|service| {
                 service.check_cancelled("distributed stat")?;
@@ -215,7 +215,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub fn posix_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
-            let requested = normalize_posix_path(path)?;
+            let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, false)?;
             service.stat_resolved_posix_path(&path)
@@ -238,7 +238,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let requested = normalize_posix_path(path)?;
+        let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
@@ -257,7 +257,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// all link records before performing a follow operation.
     pub fn posix_namespace_lstat(&self, path: &str) -> Result<DfsStat> {
         self.with_metadata_lookup_cache(|service| {
-            let requested = normalize_posix_path(path)?;
+            let requested = self.resolve_posix_dot_components(path)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
             let path = service.resolve_existing_posix_path(path, false)?;
             service.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
@@ -272,7 +272,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_namespace_lstat_distributed(&mut self, path: &str) -> Result<DfsStat> {
-        let requested = normalize_posix_path(path)?;
+        let requested = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &requested)?;
         let (path, object) = self.lookup_sifs_path_distributed_synced(path, false)?;
         self.ensure_path_not_in_cross_shard_flight(&sifs_file_system_id(), &path)?;
@@ -301,7 +301,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_list_dir_distributed(&mut self, path: &str) -> Result<Vec<DfsDirEntry>> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.check_cancelled("distributed list")?;
             let path = service.resolve_existing_posix_path_distributed(&path, true)?;

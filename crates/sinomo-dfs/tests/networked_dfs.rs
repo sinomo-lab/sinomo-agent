@@ -4541,6 +4541,17 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
     dfs.posix_mkdir_all("/services/paths")
         .expect("mkdir services paths");
 
+    assert!(matches!(
+        dfs.posix_write_file(
+            "/services/paths/tmp/../file.txt",
+            b"missing component must not be skipped",
+            sinomo_dfs::DfsWriteOptions::replicated_eventual(vec![owner.clone()]),
+        ),
+        Err(sinomo_dfs::DfsPosixError::NotFound { .. })
+    ));
+    dfs.posix_mkdir("/services/paths/tmp")
+        .expect("parent traversal requires an existing directory");
+
     let stat = dfs
         .posix_write_file(
             "/services/paths/tmp/../file.txt",
@@ -4562,6 +4573,8 @@ fn posix_paths_resolve_parent_components_within_sifs_root() {
         ),
         "parent components must be resolved instead of becoming path data"
     );
+    dfs.posix_rmdir("/services/paths/tmp")
+        .expect("the intermediate directory stays empty");
     assert_eq!(
         dfs.posix_list_dir("/services/paths/../paths")
             .expect("list normalized path")

@@ -180,6 +180,21 @@ pub(crate) fn namespace_transaction_id_for_object(
     )
 }
 
+/// Bind a namespace mutation to the resulting generation. A stable inode may
+/// visit the same path repeatedly; only retries of one generation share an id.
+pub(crate) fn namespace_transaction_id_for_versioned_path(
+    kind: &str,
+    object_id: &DfsObjectId,
+    version: &DfsVersion,
+    path: &str,
+) -> String {
+    format!(
+        "namespace_{}_{}",
+        kind,
+        blake3::hash(format!("{object_id}\0{version}\0{path}").as_bytes()).to_hex()
+    )
+}
+
 pub(crate) fn namespace_transaction_id_for_batch(
     kind: &str,
     file_system_id: &DfsFileSystemId,

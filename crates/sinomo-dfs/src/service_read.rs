@@ -586,6 +586,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 0,
                 usize::MAX,
             )
+            && bytes.len() as u64 == size_bytes
         {
             return Ok(NetworkedDfsReadOutcome::Found {
                 data: DfsReadData {
@@ -1160,13 +1161,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Err(DfsError::ContentHashMismatch {
                 expected: expected_hash.to_string(),
                 actual: actual_hash.clone(),
-            });
-        }
-        let actual_hash = content_hash(&data.bytes);
-        if actual_hash != expected_hash {
-            return Err(DfsError::ContentHashMismatch {
-                expected: expected_hash.to_string(),
-                actual: actual_hash,
             });
         }
         let size_bytes = data.bytes.len() as u64;

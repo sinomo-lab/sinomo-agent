@@ -10,7 +10,7 @@ use super::{
     POSIX_RENAME_MOVE_TRANSACTION_MAX_PATH_BYTES, namespace_job_id, now_unix_nanos,
 };
 use crate::namespace::{
-    namespace_transaction_id_for_batch, namespace_transaction_id_for_path, next_version,
+    namespace_transaction_id_for_batch, namespace_transaction_id_for_versioned_path, next_version,
 };
 use crate::posix_model::{
     DfsNamespaceJobFailure, DfsNamespaceJobMaintenanceReport, DfsPosixError, Result,
@@ -38,7 +38,9 @@ pub(super) fn namespace_job_kind_is_cross_shard(kind: &DfsNamespaceJobKind) -> b
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_clear_dir_recursive(&mut self, path: &str) -> Result<()> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             return self.route_namespace_operation(
                 primary,
@@ -67,7 +69,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, true)?;
         let job = self.clear_dir_recursive_job_for_path(&path)?;
         self.persist_namespace_job(&job)?;
@@ -251,8 +253,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         to: &str,
         max_steps: usize,
     ) -> Result<DfsNamespaceJobRecord> {
-        let normalized_from = normalize_posix_path(from)?;
-        let normalized_to = normalize_posix_path(to)?;
+        let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
+        let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
         let mut primaries = self
             .routed_namespace_primaries_for_paths_fresh([
                 normalized_from.as_str(),
@@ -589,9 +591,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 promoted.changed_at_unix_nanos = now_unix_nanos();
                 promoted.version = next_version(&promoted.version);
                 self.apply_namespace_transaction(DfsNamespaceTransaction {
-                    transaction_id: namespace_transaction_id_for_path(
+                    transaction_id: namespace_transaction_id_for_versioned_path(
                         "clear-hardlink",
                         &promoted.object_id,
+                        &promoted.version,
                         &promoted.path,
                     ),
                     file_system_id: promoted.file_system_id.clone(),
@@ -726,7 +729,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .ok_or_else(|| DfsPosixError::InvalidPath {
                 path: job.job_id.clone(),
             })
-            .and_then(|path| normalize_posix_path(path))?;
+            .and_then(|path| self.resolve_posix_dot_components_distributed(path))?;
         let source_prefix = subtree_prefix(&source_root);
         let target_prefix = subtree_prefix(&target_root);
         let mut steps = 0usize;
@@ -949,9 +952,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction_objects.insert(0, old_path_tombstone);
         transaction_objects.insert(1, source.clone());
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &source.object_id,
+                &source.version,
                 &source.path,
             ),
             file_system_id: source.file_system_id.clone(),
@@ -999,7 +1003,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn apply_rename_directory_job_move_batch(
         &mut self,
-        file_system_id: &crate::DfsFileSystemId,
+        job: &DfsNamespaceJobRecord,
         moved_objects: Vec<DfsObjectMetadata>,
     ) -> Result<u64> {
         if moved_objects.is_empty() {
@@ -1007,17 +1011,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let moved_count = moved_objects.len() as u64;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_batch(
-                "rename-child-batch",
-                file_system_id,
-                &moved_objects,
-                &[],
+            // Descendants retain their inode generation when an ancestor is
+            // renamed. Visiting the same destination in another job therefore
+            // needs a distinct id even when the child payload is identical.
+            transaction_id: format!(
+                "{}:{}",
+                namespace_transaction_id_for_batch(
+                    "rename-child-batch",
+                    &job.file_system_id,
+                    &moved_objects,
+                    &[],
+                ),
+                job.job_id
             ),
-            file_system_id: file_system_id.clone(),
+            file_system_id: job.file_system_id.clone(),
             objects: moved_objects,
             versions: Vec::new(),
             advisory_lock_states: Vec::new(),
-            created_at: time::OffsetDateTime::now_utc(),
+            created_at: job.created_at,
         })?;
         Ok(moved_count)
     }
@@ -1041,7 +1052,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let remaining = pending_moves.split_off(batch_len);
             let moved = self.apply_rename_directory_job_move_batch(
-                &job.file_system_id,
+                job,
                 std::mem::replace(pending_moves, remaining),
             )?;
             job.processed_object_count = job.processed_object_count.saturating_add(moved);

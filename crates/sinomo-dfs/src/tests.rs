@@ -3440,7 +3440,7 @@ async fn direct_read_rpc_keeps_blob_in_the_session_attachment() {
 }
 
 #[tokio::test]
-async fn direct_read_stream_exposes_chunks_before_incremental_digest_finalization() {
+async fn direct_read_stream_checks_length_without_rehashing_bytes() {
     let object_id = DfsObjectId::generate();
     let version = DfsVersion::generate();
     let expected = (0..(512 * 1024))
@@ -3481,12 +3481,12 @@ async fn direct_read_stream_exposes_chunks_before_incremental_digest_finalizatio
         .expect("non-empty stream");
     assert!(!first.is_empty());
     assert!(data.stream.completion().is_none());
-    let error = data
+    let completion = data
         .stream
         .finish()
         .await
-        .expect_err("corruption is rejected by the EOF finalizer");
-    assert!(error.to_string().contains("hash mismatch"));
+        .expect("same-size bytes are not rehashed");
+    assert!(completion.verified_content_hash.is_none());
 }
 
 #[tokio::test]
@@ -3737,11 +3737,7 @@ async fn stream_native_read_is_bounded_for_direct_and_relayed_results() {
             }
             Ok::<(), NetworkError>(())
         });
-        let completion = data
-            .stream
-            .finish()
-            .await
-            .expect("incremental DFS digest finalizer");
+        let completion = data.stream.finish().await.expect("DFS length finalizer");
         producer
             .await
             .expect("join test body producer")
@@ -3753,10 +3749,7 @@ async fn stream_native_read_is_bounded_for_direct_and_relayed_results() {
                 .expect("forward one-hop body");
         }
         assert_eq!(completion.content_size_bytes, expected.len());
-        assert_eq!(
-            completion.verified_content_hash.as_deref(),
-            Some(expected_hash.as_str())
-        );
+        assert!(completion.verified_content_hash.is_none());
     }
 }
 
@@ -27073,7 +27066,7 @@ fn object_version_record_normalizes_duplicate_locations() {
 }
 
 #[test]
-fn remote_read_content_mismatch_prunes_stale_location() {
+fn remote_read_content_identity_mismatch_prunes_stale_location() {
     let root = temp_root("remote-read-mismatch-prunes-location");
     let reader = NodeId::from_legacy_named("node_read_mismatch_reader").expect("node");
     let source = NodeId::from_legacy_named("node_read_mismatch_source").expect("node");
@@ -27114,7 +27107,7 @@ fn remote_read_content_mismatch_prunes_stale_location() {
                 result: DfsReadResult::Found(DfsReadData {
                     object_id: object_id.clone(),
                     version: version.clone(),
-                    content_hash: Some(expected_hash),
+                    content_hash: Some(content_hash(b"corrupt remote bytes")),
                     bytes: b"corrupt remote bytes".to_vec(),
                 }),
             },
@@ -27129,7 +27122,7 @@ fn remote_read_content_mismatch_prunes_stale_location() {
             ..
         } if completed_request_id == request_id
             && source_node_id == source
-            && reason.contains("content hash mismatch")
+            && reason.contains("expected content hash")
     ));
     assert!(!dfs.pending_reads.contains_key(&request_id));
     let object = dfs
@@ -27137,7 +27130,7 @@ fn remote_read_content_mismatch_prunes_stale_location() {
         .expect("current metadata");
     assert!(
         !object.current_locations.contains(&source),
-        "source that returned bytes failing content validation should be pruned"
+        "source that returned a different content identity should be pruned"
     );
     assert_eq!(
         dfs.request_remote_object_read(&object_id)
@@ -27267,7 +27260,7 @@ fn remote_range_rejects_wrong_total_size() {
 }
 
 #[test]
-fn remote_range_rejects_wrong_content_hash() {
+fn remote_range_does_not_rehash_bytes_with_matching_identity() {
     assert_malformed_remote_range_rejected(
         "range_wrong_hash",
         |data| data.content_hash = Some("blake3:wrong-range-hash".to_string()),
@@ -27311,7 +27304,7 @@ fn complete_remote_range_content_mismatch_prunes_stale_location() {
         },
     );
 
-    let error = dfs
+    let event = dfs
         .handle_networked_read_response(
             source.clone(),
             DfsReadResponse {
@@ -27327,20 +27320,23 @@ fn complete_remote_range_content_mismatch_prunes_stale_location() {
                 }),
             },
         )
-        .expect_err("mismatched complete range must retain its typed error");
+        .expect("matching identity and length are accepted without rehashing");
 
     assert!(matches!(
-        error,
-        DfsError::ContentHashMismatch { expected, .. } if expected == content_hash(&expected_bytes)
+        event,
+        NetworkedDfsServiceEvent::RemoteReadCompleted {
+            result: DfsReadResult::RangeFound(_),
+            ..
+        }
     ));
     assert!(!dfs.pending_reads.contains_key(&request_id));
     assert!(
-        !dfs.current_read_object_metadata(&object_id)
+        dfs.current_read_object_metadata(&object_id)
             .expect("current metadata")
             .current_locations
-            .contains(&source),
-        "source returning same-size corrupt range bytes must be pruned"
+            .contains(&source)
     );
+
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -30548,7 +30544,7 @@ fn read_current_object_range_uses_bounded_hash_addressed_blob_slice() {
 }
 
 #[test]
-fn exact_size_local_prefix_read_rejects_corrupt_content_addressed_blob() {
+fn exact_size_local_prefix_read_does_not_rehash_content() {
     let root = temp_root("local-prefix-read-rejects-corrupt-blob");
     let node_id = NodeId::from_legacy_named("node_local_prefix_corrupt").expect("node");
     let path = "/services/local-prefix-corrupt.txt";
@@ -30566,15 +30562,12 @@ fn exact_size_local_prefix_read_rejects_corrupt_content_addressed_blob() {
     let blob_path = root.join("content").join("blobs").join(&hex[..2]).join(hex);
     let mut corrupt_bytes = bytes.clone();
     corrupt_bytes[0] ^= 0xff;
-    std::fs::write(&blob_path, corrupt_bytes).expect("corrupt local blob in place");
+    std::fs::write(&blob_path, &corrupt_bytes).expect("corrupt local blob in place");
 
-    let error = dfs
+    let read = dfs
         .posix_read_file_prefix_distributed(path, bytes.len())
-        .expect_err("complete local prefix must verify the committed content hash");
-    assert!(matches!(
-        error,
-        DfsPosixError::Dfs(DfsError::ContentHashMismatch { expected, .. }) if expected == hash
-    ));
+        .expect("ordinary prefix reads do not rehash content");
+    assert_eq!(read.bytes, corrupt_bytes);
 
     std::fs::remove_dir_all(root).ok();
 }
@@ -31645,6 +31638,7 @@ fn conditional_unlink_keeps_its_operation_id_after_response_loss_and_primary_mov
         let old_stop = Arc::clone(&stop);
         let new_stop = Arc::clone(&stop);
         let promotion_ready = Arc::clone(&durable_promotion_ready);
+        let retiring_promotion_ready = Arc::clone(&durable_promotion_ready);
         let receipt_requester = requester_node.clone();
         let receipt_operation_id = operation_id.clone();
         let old_pump = scope.spawn(move || {
@@ -31652,9 +31646,16 @@ fn conditional_unlink_keeps_its_operation_id_after_response_loss_and_primary_mov
                 old_primary
                     .process_incoming()
                     .expect("old primary conditional unlink pump");
-                old_primary
-                    .replicate_configured_metadata_shards(&sifs_file_system_id())
-                    .expect("publish terminal conditional unlink receipt");
+                match old_primary.replicate_configured_metadata_shards(&sifs_file_system_id()) {
+                    Ok(_) => {}
+                    // The test deliberately promotes the successor as soon as
+                    // this receipt is durable. A retiring pump can observe the
+                    // new epoch before its stop flag; fencing is the expected
+                    // result of that race, not a failed unlink publication.
+                    Err(DfsError::StaleOwnerEpoch { .. })
+                        if retiring_promotion_ready.load(Ordering::SeqCst) => {}
+                    Err(error) => panic!("publish terminal conditional unlink receipt: {error}"),
+                }
                 if !old_stop.load(Ordering::SeqCst) {
                     let _ = old_primary
                         .transport
@@ -48932,7 +48933,7 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
         .join(corrupt_hex);
     let mut corrupted_bytes = corrupt_source_bytes.clone();
     corrupted_bytes[0] ^= 0xff;
-    std::fs::write(&corrupt_blob_path, corrupted_bytes)
+    std::fs::write(&corrupt_blob_path, &corrupted_bytes)
         .expect("corrupt primary blob without changing its size");
 
     let stop_primary = Arc::new(AtomicBool::new(false));
@@ -48979,14 +48980,10 @@ fn sifs_non_replica_prefix_read_reuses_authoritative_metadata_for_remote_range()
     assert!(empty.bytes.is_empty());
     assert!(!empty.truncated);
 
-    let corrupt_error = observer
+    let corrupt_read = observer
         .posix_read_file_prefix_distributed(corrupt_path, corrupt_source_bytes.len())
-        .expect_err("complete chunked range must verify the committed whole-object hash");
-    assert!(matches!(
-        corrupt_error,
-        DfsPosixError::Dfs(DfsError::ContentHashMismatch { expected, .. })
-            if expected == corrupt_hash
-    ));
+        .expect("remote complete ranges do not rehash stored content");
+    assert_eq!(corrupt_read.bytes, corrupted_bytes);
 
     stop_primary.store(true, Ordering::SeqCst);
     primary_thread.join().expect("primary thread");
@@ -50645,4 +50642,44 @@ fn recovered_stage_response_committed_work_tracks_remaining_repairs_only() {
 
         std::fs::remove_dir_all(root).ok();
     }
+}
+
+#[test]
+fn sifs_cross_primary_dot_paths_route_to_the_resolved_namespace() {
+    let SifsTwoPrimaryCluster {
+        root,
+        replica_node,
+        users_primary,
+        services_primary,
+        mut replica,
+        ..
+    } = sifs_two_primary_cluster("sifs-dot-component-routing");
+    let stop = Arc::new(AtomicBool::new(false));
+    let users_stop = Arc::clone(&stop);
+    let services_stop = Arc::clone(&stop);
+    let users_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(users_primary, users_stop));
+    let services_thread =
+        std::thread::spawn(move || pump_sifs_service_until_stop(services_primary, services_stop));
+    let result = (|| -> Result<_, DfsPosixError> {
+        let options = DfsWriteOptions::replicated_eventual(vec![replica_node]);
+        replica.posix_mkdir("/services/sub")?;
+        replica.posix_symlink("/services/sub", "/users/link", options.clone())?;
+        replica.posix_write_file("/users/victim", b"must survive", options.clone())?;
+        replica.posix_write_file("/services/victim", b"resolved target", options)?;
+        let read = replica.posix_read_file_distributed("/users/link/../victim")?;
+        replica.posix_rename("/users/link/../victim", "/users/link/../renamed")?;
+        replica.posix_hardlink("/users/link/../renamed", "/users/link/../alias")?;
+        replica.posix_unlink("/users/link/../alias")?;
+        replica.posix_unlink("/users/link/../renamed")?;
+        let survivor = replica.posix_read_file_distributed("/users/victim")?;
+        Ok((read, survivor))
+    })();
+    stop.store(true, Ordering::SeqCst);
+    users_thread.join().expect("users primary pump");
+    services_thread.join().expect("services primary pump");
+    let (read, survivor) = result.expect("dot paths resolve before shard admission");
+    assert_eq!(read, b"resolved target");
+    assert_eq!(survivor, b"must survive");
+    std::fs::remove_dir_all(root).ok();
 }
