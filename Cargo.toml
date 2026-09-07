@@ -162,3 +162,9 @@ v4l = "0.14.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 windows-collections = "0.3.2"
 windows = "0.62.2"
+
+# Joint SUI fixes under review; use the sibling checkout until published upstream.
+[patch."https://github.com/sinomo-lab/sui.git"]
+sinomo-ui = { path = "../sui/crates/sui" }
+sinomo-ui-lucide = { path = "../sui/crates/sui-lucide" }
+sinomo-ui-testing = { path = "../sui/crates/sui-testing" }

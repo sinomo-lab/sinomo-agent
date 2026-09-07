@@ -11154,6 +11154,14 @@ impl RetainedSessionRow {
 }
 
 impl Widget for RetainedSessionRow {
+    fn layer_options(&self) -> sui::LayerOptions {
+        // Hover/focus changes belong to this row, not the entire scroll contents.
+        sui::LayerOptions {
+            paint_boundary: sui::PaintBoundaryMode::Explicit,
+            ..sui::LayerOptions::default()
+        }
+    }
+
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
         if ctx.phase() == EventPhase::Capture || ctx.is_handled() {
             return;
@@ -11697,8 +11705,16 @@ fn session_row_content(
 
     let labels = Flex::vertical()
         .align_items(Alignment::Start)
-        .with_child(Label::new(session.title.clone()).style(title_style))
-        .with_child(Label::new(session_meta_label(&session)).style(meta_style));
+        .with_child(
+            Label::new(session.title.clone())
+                .single_line()
+                .style(title_style),
+        )
+        .with_child(
+            Label::new(session_meta_label(&session))
+                .single_line()
+                .style(meta_style),
+        );
     let body = Flex::horizontal()
         .main_gap(7.0)
         .align_items(Alignment::Center)
@@ -22665,6 +22681,57 @@ mod tests {
             "selecting a chat rebuilds the sidebar but should preserve scroll position: before_select={after_y}, after_select={selected_y}"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_titles_stay_on_one_line_in_narrow_rows() -> sui::Result<()> {
+        let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+        let title = "Validate and finish the Todo app already present in this workspace.";
+        shared.chat_mut().sessions = (0..3)
+            .map(|index| SessionRef {
+                id: SessionId::generate().to_string(),
+                title: format!("{title} {index}"),
+                kind: ConversationKind::Chat,
+                updated_unix: 1,
+                participant_count: 1,
+                participant_names: vec![],
+            })
+            .collect();
+        let reader: ThemeReader = {
+            let shared = shared.clone();
+            Rc::new(move || shared.theme())
+        };
+        let window = test_window(
+            "Single-line conversation titles",
+            sessions_scroll_rebuild(&shared, &reader, &ScrollState::new()),
+            Size::new(220.0, 200.0),
+        )?;
+        let snapshot = window.snapshot()?;
+        let titles: Vec<_> = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.role == SemanticsRole::Text
+                    && node
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with(title))
+            })
+            .collect();
+        assert_eq!(titles.len(), 3);
+        for node in titles {
+            assert!(
+                node.bounds.height() <= 20.0,
+                "conversation title must occupy one line: {:?}",
+                node.bounds
+            );
+            assert!(
+                node.bounds.max_x() < 200.0,
+                "title must leave room for the edit button"
+            );
+        }
         Ok(())
     }
 

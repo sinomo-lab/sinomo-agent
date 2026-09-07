@@ -2,6 +2,8 @@
 
 mod chat_render;
 mod files_thumbnail;
+#[cfg(test)]
+mod hover_tests;
 mod module_widget;
 
 pub mod chat;

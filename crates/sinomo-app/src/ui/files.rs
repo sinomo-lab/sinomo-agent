@@ -41,7 +41,7 @@ use sui::{
     MenuItem, NumberInput, Observable, PaintCtx, PanelSection, PlacementBadgePaint, Point,
     PointerButton, PointerEventKind, Popover, PopoverAlignment, RadioButton, RebuildOnChange, Rect,
     RegisteredImage, RichText, ScrollDelta, ScrollState, ScrollView, SectionLabel,
-    SegmentedControl, SegmentedControlItem, Select, SemanticRegion, SemanticTone, SemanticsAction,
+    SegmentedControl, SegmentedControlItem, SemanticRegion, SemanticTone, SemanticsAction,
     SemanticsActionRequest, SemanticsCtx, SemanticsNode, SemanticsRole, SemanticsValue, Separator,
     SideSheet, SideSheetPlacement, Size, SizedBox, SplitView, Stack, StackHostOptions, StatusBadge,
     StatusBar, StatusBarSegment, Surface, SurfaceBorder, SurfaceRole, SwitchView, TextAlign,
@@ -11414,6 +11414,10 @@ fn header(shared: &Shared, reader: &ThemeReader) -> impl Widget + use<> {
                 reader,
             ),
             FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            files_action_bar(shared, reader, false),
+            FlexItem::new().no_shrink(),
         );
 
     Stack::vertical()
@@ -11543,6 +11547,10 @@ fn picker_first_header(shared: &Shared, reader: &ThemeReader) -> impl Widget + u
                 refresh,
                 reader,
             ),
+            FlexItem::new().no_shrink(),
+        )
+        .with_item(
+            files_action_bar(shared, reader, false),
             FlexItem::new().no_shrink(),
         );
 
@@ -11760,9 +11768,8 @@ fn files_action_bar_content(
             shared,
             reader,
             FileContextMenuTarget::Create,
-            sui::Button::new("New")
-                .icon(IconGlyph::Add)
-                .min_height(32.0)
+            IconButton::new(IconGlyph::Add, "New")
+                .size(32.0)
                 .appearance(ButtonAppearance::Tonal)
                 .tone(SemanticTone::Accent)
                 .theme_when(clone_reader(reader)),
@@ -11772,9 +11779,8 @@ fn files_action_bar_content(
             shared,
             reader,
             FileContextMenuTarget::Import,
-            sui::Button::new("Import")
-                .icon(IconGlyph::Download)
-                .min_height(32.0)
+            IconButton::new(IconGlyph::Download, "Import")
+                .size(32.0)
                 .appearance(ButtonAppearance::Ghost)
                 .theme_when(clone_reader(reader)),
         );
@@ -11790,32 +11796,65 @@ fn files_action_bar_content(
         Flex::horizontal()
             .gap(6.0)
             .align_items(Alignment::Center)
-            .with_child(new)
-            .with_child(import)
-            .with_child(more)
+            .with_child(toolbar_tooltip("New", new, reader))
+            .with_child(toolbar_tooltip("Import", import, reader))
+            .with_child(toolbar_tooltip("More folder actions", more, reader))
     };
 
-    let view_control = {
-        let selected = current_view_mode.selected_index();
-        let s = shared.clone();
-        Select::new("File view")
-            .options(FilesViewMode::OPTIONS)
-            .selected(selected)
-            .theme_when(clone_reader(reader))
-            .on_change(move |index, _label| {
-                s.files_mut()
-                    .set_view_mode(FilesViewMode::from_selected_index(index));
-            })
-    };
+    let s = shared.clone();
+    let view_control = ContextMenu::new(
+        "files-view-menu",
+        IconButton::new(IconGlyph::Monitor, "File view")
+            .size(32.0)
+            .theme_when(clone_reader(reader)),
+    )
+    .items(
+        FilesViewMode::OPTIONS
+            .iter()
+            .enumerate()
+            .map(|(index, label)| {
+                MenuItem::new(if index == current_view_mode.selected_index() {
+                    format!("✓ {label}")
+                } else {
+                    label.to_string()
+                })
+            }),
+    )
+    .theme_when(clone_reader(reader))
+    .activation_button(PointerButton::Primary)
+    .on_activate(move |index, _item| {
+        s.files_mut()
+            .set_view_mode(FilesViewMode::from_selected_index(index));
+    });
     let mut view_commands = Flex::horizontal().gap(6.0).align_items(Alignment::Center);
     if current_view_mode != FilesViewMode::Details {
-        view_commands = view_commands.with_child(files_sort_menu(shared, reader));
+        view_commands = view_commands.with_child(toolbar_tooltip(
+            "Sort",
+            files_sort_menu(shared, reader),
+            reader,
+        ));
     }
-    view_commands = view_commands.with_child(SizedBox::new().width(140.0).with_child(view_control));
+    view_commands = view_commands.with_child(toolbar_tooltip(
+        format!(
+            "File view: {}",
+            FilesViewMode::OPTIONS[current_view_mode.selected_index()]
+        ),
+        view_control,
+        reader,
+    ));
+    if !contextual_selection {
+        return WidgetPod::new(
+            Flex::horizontal()
+                .gap(6.0)
+                .align_items(Alignment::Center)
+                .with_item(controls, FlexItem::new().no_shrink())
+                .with_item(view_commands, FlexItem::new().no_shrink()),
+        );
+    }
     let view_commands_width = if current_view_mode == FilesViewMode::Details {
-        140.0
+        32.0
     } else {
-        204.0
+        70.0
     };
 
     WidgetPod::new(
@@ -11860,10 +11899,8 @@ fn files_sort_menu(shared: &Shared, reader: &ThemeReader) -> ContextMenu {
             label.to_string()
         })
     });
-    let trigger = sui::Button::new("Sort")
-        .icon(IconGlyph::ChevronDown)
-        .semantic_name("Sort icon view")
-        .min_height(32.0)
+    let trigger = IconButton::new(IconGlyph::ChevronDown, "Sort icon view")
+        .size(32.0)
         .appearance(ButtonAppearance::Ghost)
         .theme_when(clone_reader(reader));
     let s = shared.clone();
@@ -12360,6 +12397,7 @@ fn files_list_body_table(
                 .sort_direction(sort_mode.name_sort_direction()),
             VirtualTableColumn::new("Availability")
                 .key(3)
+                .min_width(COMPACT_FILE_PLACEMENT_W)
                 .width(if show_details {
                     156.0
                 } else {
@@ -16987,10 +17025,12 @@ fn list_column(
     let r = Rc::clone(reader);
     let ss = scroll_state.clone();
     let listing = RebuildOnChange::new_observable(source, move |_key| listing(&s, &r, &ss));
-    Dock::new(listing).top(
-        FILE_ACTION_BAR_H,
-        files_action_bar(shared, reader, contextual_selection),
-    )
+    let dock = Dock::new(listing);
+    if contextual_selection {
+        dock.top(FILE_ACTION_BAR_H, files_action_bar(shared, reader, true))
+    } else {
+        dock
+    }
 }
 
 /// Wide split: header docked on top, with independently resizable Locations and Inspector
@@ -21832,13 +21872,42 @@ mod tests {
             .window(
                 sui::WindowBuilder::new()
                     .title("Visible Files actions")
-                    .root(files_action_bar(&shared, &reader, false)),
+                    .root(
+                        SizedBox::new()
+                            .width(800.0)
+                            .with_child(picker_first_header(&shared, &reader)),
+                    ),
             )
             .build()?;
         let app = sui_testing::TestApp::from_runtime(runtime)?;
         let window = app.main_window()?;
 
-        for name in ["New", "Import", "More folder actions"] {
+        let snapshot = window.snapshot()?;
+        let back = snapshot
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| node.role == SemanticsRole::Button && node.name.as_deref() == Some("Back"))
+            .unwrap()
+            .bounds;
+        for name in ["New", "Import", "More folder actions", "File view"] {
+            let bounds = snapshot
+                .accessibility
+                .nodes
+                .iter()
+                .find(|node| {
+                    node.role == SemanticsRole::Button && node.name.as_deref() == Some(name)
+                })
+                .unwrap()
+                .bounds;
+            assert!(
+                (bounds.y() - back.y()).abs() < 4.0,
+                "{name} must share the location row"
+            );
+            assert!(
+                bounds.max_x() <= 800.0 && bounds.width() <= 36.0,
+                "{name} must be an icon button within the header"
+            );
             window
                 .get_by_role(SemanticsRole::Button)
                 .with_name(name)
@@ -25161,7 +25230,7 @@ mod tests {
                     .root(
                         SizedBox::new()
                             .width(1_200.0)
-                            .height(720.0)
+                            .height(480.0)
                             .with_child(view(shared.clone())),
                     ),
             )
@@ -25223,10 +25292,30 @@ mod tests {
                 + divider * 0.5,
             locations_divider.y() + locations_divider.height() * 0.5,
         );
+        let scrollbar = before
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| node.role == SemanticsRole::Slider && node.bounds.x() < locations_start.x)
+            .expect("short viewport should expose the Locations scrollbar");
+        let scrollbar_id = scrollbar.id;
+        let scrollbar_x = scrollbar.bounds.x();
         drag_splitter(
             locations_start,
             Point::new(locations_start.x + 90.0, locations_start.y),
         )?;
+        let after = window.snapshot()?;
+        let scrollbar_after = after
+            .accessibility
+            .nodes
+            .iter()
+            .find(|node| node.id == scrollbar_id)
+            .expect("resizing preserves the scrollbar");
+        assert!(
+            (scrollbar_after.bounds.x() - scrollbar_x - 90.0).abs() < 2.0,
+            "scrollbar must move with the divider on the resize frame: before={scrollbar_x}, after={:?}",
+            scrollbar_after.bounds
+        );
         let places_after_drag = shared.files().places_sidebar_ratio;
         assert!(
             places_after_drag > initial_places_ratio + 0.05,
