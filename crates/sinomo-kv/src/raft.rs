@@ -11637,21 +11637,34 @@ impl DurableRaftKvNode {
 
     pub fn restore_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
         self.ensure_healthy()?;
-        let retain_resident = self.begin_resident_mutation();
         let mut metric =
             KvStorageMetricGuard::start("snapshot_restore", "sinomo.kv.snapshot.restore.us");
-        let node_before = self.node.clone();
-        let hard_state_before = node_before.hard_state.clone();
-        write_object_file(&self.paths.snapshot, &snapshot)?;
-        self.node.install_snapshot(snapshot)?;
-        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
-            self.node = node_before;
+        // Prepare the complete replacement before publishing any durable file.
+        // Resource bounds alone are insufficient: restoring also checks request
+        // identities and builds the state-machine indexes. Serialize once before
+        // consuming the snapshot so validation needs no extra snapshot clone.
+        let content =
+            sinomo_object_serde::to_bytes(&snapshot, KV_WAL_OBJECT_VERSION_ID, LengthMode::U32)
+                .map_err(kv_object_error)?;
+        let mut restored = self.node.clone();
+        restored.install_snapshot(snapshot)?;
+        let retain_resident = self.begin_resident_mutation();
+        let persisted = (|| {
+            write_object_file_bytes_if_changed(&self.paths.snapshot, &content)?;
+            rewrite_wal_entries(&self.paths.wal, &restored.log)?;
+            if restored.hard_state != self.node.hard_state {
+                self.paths.write_persisted_hard_state(&restored.hard_state)?;
+            }
+            Ok::<(), KvError>(())
+        })();
+        if let Err(error) = persisted {
+            // A replacement or its directory sync may already have succeeded.
+            // The old in-memory state cannot safely resume writes against that
+            // generation; cold replay reconciles the snapshot and remaining WAL.
+            self.poisoned = true;
             return Err(error);
         }
-        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
-            self.node = node_before;
-            return Err(error);
-        }
+        self.node = restored;
         self.record_live_metrics();
         metric.succeed();
         self.finish_resident_mutation(retain_resident);

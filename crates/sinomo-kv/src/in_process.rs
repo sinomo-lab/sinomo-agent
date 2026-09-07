@@ -3022,11 +3022,13 @@ impl ReplicatedKvNode {
             .last()
             .map(|entry| entry.index)
             .unwrap_or(self.snapshot_index)
+            .max(self.snapshot_index)
     }
 
     pub(crate) fn last_log_term(&self) -> u64 {
         self.log
             .last()
+            .filter(|entry| entry.index > self.snapshot_index)
             .map(|entry| entry.term)
             .unwrap_or(self.snapshot_term)
     }
@@ -3091,7 +3093,7 @@ impl ReplicatedKvNode {
         Some(RaftAppendEntriesResponse {
             term: self.hard_state.current_term,
             success: true,
-            match_index: self.last_log_index(),
+            match_index: request.prev_log_index,
         })
     }
 
@@ -3150,6 +3152,27 @@ impl ReplicatedKvNode {
             }
         }
         self.log.sort_by_key(|entry| entry.index);
+        // Snapshot publication and WAL replacement are separate durability
+        // steps. After a crash the WAL can still describe the superseded log.
+        // Reconcile only after processing all append-only conflict replacements:
+        // a later WAL record may supply the matching snapshot boundary.
+        if self.snapshot_index > 0 {
+            match self.log_entry_at(self.snapshot_index) {
+                Some(entry) if entry.term != self.snapshot_term => {
+                    self.log.clear();
+                    truncated = true;
+                }
+                None => {
+                    // A WAL ending before the installed boundary cannot prove
+                    // a replication prefix. A rewritten WAL may instead start
+                    // with the valid suffix immediately after that boundary.
+                    let before = self.log.len();
+                    self.log.retain(|entry| entry.index > self.snapshot_index);
+                    truncated |= self.log.len() != before;
+                }
+                Some(_) => {}
+            }
+        }
         let second_pending_config_index = self
             .log
             .iter()
@@ -3335,18 +3358,24 @@ impl ReplicatedKvNode {
                 commit_index: None,
             });
         }
-        let prospective_last_log_index = entries
+        // Only the prefix matched by this request is safe to acknowledge or
+        // commit. An empty heartbeat proves prev_log_index, not any extra
+        // uncommitted entries left over from an earlier leader.
+        let matched_log_index = entries
             .last()
             .map(|entry| entry.index)
-            .unwrap_or_else(|| self.last_log_index());
-        let commit_index = leader_commit.min(prospective_last_log_index);
-        self.validate_single_pending_config_after_append(&entries, commit_index)?;
+            .unwrap_or(prev_log_index);
+        let commit_index = leader_commit.min(matched_log_index);
+        self.validate_single_pending_config_after_append(
+            &entries,
+            self.hard_state.commit_index.max(commit_index),
+        )?;
         let appended_entries = self.append_entries(entries)?;
         Ok(RaftAppendEntriesPreparation {
             response: RaftAppendEntriesResponse {
                 term: self.hard_state.current_term,
                 success: true,
-                match_index: self.last_log_index(),
+                match_index: matched_log_index,
             },
             appended_entries,
             commit_index: Some(commit_index),
@@ -3802,13 +3831,19 @@ impl ReplicatedKvNode {
     }
 
     pub(crate) fn install_snapshot(&mut self, snapshot: RaftSnapshot) -> Result<(), KvError> {
+        let retain_suffix =
+            self.term_at(snapshot.last_included_index) == Some(snapshot.last_included_term);
         self.store = InProcessKvStore::restore(snapshot.kv)?;
         self.snapshot_index = snapshot.last_included_index;
         self.snapshot_term = snapshot.last_included_term;
         self.applied_index = snapshot.last_included_index;
         self.hard_state.commit_index = snapshot.last_included_index;
-        self.log
-            .retain(|entry| entry.index > snapshot.last_included_index);
+        if retain_suffix {
+            self.log
+                .retain(|entry| entry.index > snapshot.last_included_index);
+        } else {
+            self.log.clear();
+        }
         self.txn_responses.clear();
         Ok(())
     }
