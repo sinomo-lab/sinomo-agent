@@ -1707,6 +1707,16 @@ mod windows_file {
         const DOT: u16 = b'.' as u16;
         let already_device_path = wide.starts_with(&[BACKSLASH, BACKSLASH, QUESTION, BACKSLASH])
             || wide.starts_with(&[BACKSLASH, BACKSLASH, DOT, BACKSLASH]);
+        if !already_device_path {
+            // Ordinary Win32 paths accept either separator. Adding the
+            // verbatim prefix disables that normalization, so perform it
+            // before promoting a drive or UNC path to extended length.
+            for unit in &mut wide {
+                if *unit == b'/' as u16 {
+                    *unit = BACKSLASH;
+                }
+            }
+        }
         if !already_device_path && wide.len() >= 3 && wide[1] == COLON && wide[2] == BACKSLASH {
             wide.splice(0..0, [BACKSLASH, BACKSLASH, QUESTION, BACKSLASH]);
         } else if !already_device_path && wide.starts_with(&[BACKSLASH, BACKSLASH]) {
@@ -2218,6 +2228,17 @@ mod tests {
             fs::read(&path).expect("read truncated file"),
             b"first-third"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn atomic_replace_normalizes_regular_windows_path_separators() {
+        let root = sinomo_testdir::TestDir::new("storage-windows-mixed-separators");
+        let path = root.join("nested/metadata/record.sobj");
+        let options = DurableAtomicFileOptions::new("record.sobj", "tmp").sync_all();
+        write_file_atomic(&path, b"first", options).expect("create through mixed separators");
+        write_file_atomic(&path, b"second", options).expect("replace through mixed separators");
+        assert_eq!(fs::read(path).expect("read replaced file"), b"second");
     }
 
     #[cfg(windows)]
