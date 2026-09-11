@@ -1,7 +1,10 @@
+mod output;
+pub(crate) use output::AgentProcessOutput;
+
 use crate::{AgentCancellationToken, TaskId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -11,6 +14,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Default)]
 pub struct AgentProcessManager {
     processes: Arc<Mutex<HashMap<String, Arc<AgentProcessState>>>>,
+    output_directory: Option<PathBuf>,
 }
 
 impl AgentProcessManager {
@@ -18,11 +22,43 @@ impl AgentProcessManager {
         Self::default()
     }
 
+    pub fn with_output_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.output_directory = Some(directory.into());
+        self
+    }
+
+    pub(crate) fn captured_output(
+        &self,
+        process_id: &str,
+    ) -> Result<AgentProcessOutput, AgentProcessError> {
+        Ok(self.process(process_id)?.output.clone())
+    }
+
     pub fn start(
         &self,
         spec: AgentProcessStart,
         max_output_bytes: usize,
     ) -> Result<AgentProcessSnapshot, AgentProcessError> {
+        let process_id = TaskId::generate().to_string();
+        let output_directory =
+            match &self.output_directory {
+                Some(directory) => directory.clone(),
+                None => {
+                    let data_dir = sinomo_runtime::local::SinomoDataDir::from_env_or_home()
+                        .map_err(|error| AgentProcessError::Spawn {
+                            command: spec.command.clone(),
+                            detail: error.to_string(),
+                        })?;
+                    crate::AgentStoragePaths::from_data_dir(&data_dir)
+                        .evidence_dir
+                        .join("process-capture")
+                }
+            };
+        let (output, stdout, stderr) = AgentProcessOutput::create(&output_directory, &process_id)
+            .map_err(|error| AgentProcessError::Spawn {
+            command: spec.command.clone(),
+            detail: format!("create process output capture: {error}"),
+        })?;
         let mut command = Command::new(&spec.program);
         command
             .args(&spec.args)
@@ -32,17 +68,14 @@ impl AgentProcessManager {
             } else {
                 Stdio::null()
             })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
         configure_process_group(&mut command);
         let mut child = command.spawn().map_err(|source| AgentProcessError::Spawn {
             command: spec.command.clone(),
             detail: source.to_string(),
         })?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
         let stdin = child.stdin.take();
-        let process_id = TaskId::generate().to_string();
         let process = Arc::new(AgentProcessState {
             process_id: process_id.clone(),
             command: spec.command,
@@ -54,18 +87,15 @@ impl AgentProcessManager {
             cancellation_token: spec.cancellation_token,
             child: Mutex::new(Some(child)),
             stdin: Mutex::new(stdin),
-            stdout: Arc::new(Mutex::new(Vec::new())),
-            stderr: Arc::new(Mutex::new(Vec::new())),
+            output,
             status: Mutex::new(AgentProcessStatus::running()),
         });
-        spawn_process_reader(stdout, process.stdout.clone());
-        spawn_process_reader(stderr, process.stderr.clone());
         spawn_process_waiter(process.clone());
         self.processes
             .lock()
             .expect("agent process manager lock poisoned")
             .insert(process_id, process.clone());
-        Ok(process.snapshot(0, 0, max_output_bytes))
+        process.snapshot(0, 0, max_output_bytes)
     }
 
     pub fn snapshot(
@@ -76,7 +106,7 @@ impl AgentProcessManager {
         max_output_bytes: usize,
     ) -> Result<AgentProcessSnapshot, AgentProcessError> {
         let process = self.process(process_id)?;
-        Ok(process.snapshot(stdout_offset, stderr_offset, max_output_bytes))
+        process.snapshot(stdout_offset, stderr_offset, max_output_bytes)
     }
 
     pub fn write_stdin(
@@ -210,8 +240,7 @@ struct AgentProcessState {
     cancellation_token: AgentCancellationToken,
     child: Mutex<Option<Child>>,
     stdin: Mutex<Option<ChildStdin>>,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
+    output: AgentProcessOutput,
     status: Mutex<AgentProcessStatus>,
 }
 
@@ -221,27 +250,23 @@ impl AgentProcessState {
         stdout_offset: usize,
         stderr_offset: usize,
         max_output_bytes: usize,
-    ) -> AgentProcessSnapshot {
+    ) -> Result<AgentProcessSnapshot, AgentProcessError> {
         let status = self
             .status
             .lock()
             .expect("agent process status lock poisoned")
             .clone();
-        let stdout = self
-            .stdout
-            .lock()
-            .expect("agent process stdout lock poisoned")
-            .clone();
-        let stderr = self
-            .stderr
-            .lock()
-            .expect("agent process stderr lock poisoned")
-            .clone();
-        let stdout_offset = stdout_offset.min(stdout.len());
-        let stderr_offset = stderr_offset.min(stderr.len());
-        let stdout_delta = truncate_utf8_lossy(&stdout[stdout_offset..], max_output_bytes);
-        let stderr_delta = truncate_utf8_lossy(&stderr[stderr_offset..], max_output_bytes);
-        AgentProcessSnapshot {
+        let read = |stderr, offset| {
+            self.output
+                .window(stderr, offset, max_output_bytes)
+                .map_err(|error| AgentProcessError::Output {
+                    process_id: self.process_id.clone(),
+                    detail: error.to_string(),
+                })
+        };
+        let stdout = read(false, stdout_offset)?;
+        let stderr = read(true, stderr_offset)?;
+        Ok(AgentProcessSnapshot {
             process_id: self.process_id.clone(),
             command: self.command.clone(),
             program: self.program.clone(),
@@ -254,15 +279,15 @@ impl AgentProcessState {
             error: status.error,
             elapsed_ms: self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             timeout_ms: self.timeout_ms,
-            stdout: stdout_delta.text,
-            stderr: stderr_delta.text,
-            stdout_offset: stdout_offset + stdout_delta.consumed_bytes,
-            stderr_offset: stderr_offset + stderr_delta.consumed_bytes,
-            stdout_total_bytes: stdout.len(),
-            stderr_total_bytes: stderr.len(),
-            stdout_truncated: stdout_delta.truncated,
-            stderr_truncated: stderr_delta.truncated,
-        }
+            stdout: String::from_utf8_lossy(&stdout.bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr.bytes).into_owned(),
+            stdout_offset: stdout.offset,
+            stderr_offset: stderr.offset,
+            stdout_total_bytes: stdout.total_bytes,
+            stderr_total_bytes: stderr.total_bytes,
+            stdout_truncated: stdout.offset < stdout.total_bytes,
+            stderr_truncated: stderr.offset < stderr.total_bytes,
+        })
     }
 }
 
@@ -349,6 +374,8 @@ pub struct AgentProcessCancellation {
 
 #[derive(Debug, thiserror::Error, Clone, Eq, PartialEq)]
 pub enum AgentProcessError {
+    #[error("failed to read output for agent process `{process_id}`: {detail}")]
+    Output { process_id: String, detail: String },
     #[error("unknown agent process `{process_id}`")]
     UnknownProcess { process_id: String },
     #[error("failed to spawn `{command}`: {detail}")]
@@ -357,27 +384,6 @@ pub enum AgentProcessError {
     StdinClosed { process_id: String },
     #[error("failed to write stdin for agent process `{process_id}`: {detail}")]
     StdinWrite { process_id: String, detail: String },
-}
-
-fn spawn_process_reader(pipe: Option<impl Read + Send + 'static>, buffer: Arc<Mutex<Vec<u8>>>) {
-    let Some(mut pipe) = pipe else {
-        return;
-    };
-    thread::spawn(move || {
-        let mut chunk = [0_u8; 8192];
-        loop {
-            match pipe.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(count) => {
-                    buffer
-                        .lock()
-                        .expect("agent process output lock poisoned")
-                        .extend_from_slice(&chunk[..count]);
-                }
-                Err(_) => break,
-            }
-        }
-    });
 }
 
 fn spawn_process_waiter(process: Arc<AgentProcessState>) {
@@ -475,22 +481,6 @@ fn spawn_process_waiter(process: Arc<AgentProcessState>) {
     });
 }
 
-struct TruncatedText {
-    text: String,
-    truncated: bool,
-    consumed_bytes: usize,
-}
-
-fn truncate_utf8_lossy(bytes: &[u8], max_bytes: usize) -> TruncatedText {
-    let truncated = bytes.len() > max_bytes;
-    let consumed_bytes = bytes.len().min(max_bytes);
-    TruncatedText {
-        text: String::from_utf8_lossy(&bytes[..consumed_bytes]).to_string(),
-        truncated,
-        consumed_bytes,
-    }
-}
-
 fn configure_process_group(command: &mut Command) {
     configure_command_process_group(command);
 }
@@ -569,7 +559,7 @@ mod tests {
     #[test]
     fn process_manager_streams_stdin_output_and_cancels() {
         let root = sinomo_testdir::TestDir::new("sinomo-agent-process-manager");
-        let manager = AgentProcessManager::new();
+        let manager = AgentProcessManager::new().with_output_directory(root.join("capture"));
         let initial = manager
             .start(
                 AgentProcessStart::new(

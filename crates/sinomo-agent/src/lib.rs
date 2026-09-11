@@ -47,6 +47,7 @@ pub const AGENT_DEFINITION_SIFS_ROOT: &str = "/services/sinomo/agents";
 #[derive(Clone, Debug, Default)]
 pub struct AgentCancellationToken {
     cancelled: Arc<AtomicBool>,
+    deadline: Option<std::time::Instant>,
 }
 
 impl AgentCancellationToken {
@@ -59,7 +60,25 @@ impl AgentCancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.cancel();
+        }
         self.cancelled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn with_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        if let Some(deadline) = timeout_ms.and_then(|timeout| {
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout))
+        }) {
+            self.deadline = Some(
+                self.deadline
+                    .map_or(deadline, |previous| previous.min(deadline)),
+            );
+        }
+        self
     }
 
     fn language_model_cancellation(&self) -> LanguageModelCancellation {
