@@ -1323,8 +1323,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if shard.is_none()
                 && !transaction.objects.is_empty()
                 && let Some(context) = self
-                    .active_namespace_operation_context
-                    .as_ref()
+                    .namespace_execution
+                    .context()
                     .filter(|context| context.file_system_id == transaction.file_system_id)
             {
                 let shards = Self::namespace_transaction_shards_from_snapshot(
@@ -1549,7 +1549,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 );
             if completed_request.is_none()
                 && completed_request_completion.is_none()
-                && let Some(active_request) = self.active_durable_namespace_request.clone()
+                && let Some(active_request) = self.namespace_execution.request().cloned()
                 && self
                     .metadata_backend
                     .as_ref()
@@ -1623,7 +1623,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })?;
             if prepare.completed_request.is_some() || prepare.completed_request_completion.is_some()
             {
-                self.active_durable_namespace_prepare_recorded = true;
+                self.namespace_execution.record_prepare();
             }
             if prepare_entry.shard_id != prepare.shard_id {
                 return Err(DfsError::Metadata {

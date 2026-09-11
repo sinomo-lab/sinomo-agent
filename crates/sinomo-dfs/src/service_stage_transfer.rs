@@ -560,7 +560,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             &updated_intent.intent_id,
                             &response.object_id,
                         )?;
-                        if let Some(pending) = service.pending_writes.get_mut(&response.intent_id) {
+                        if let Some(pending) =
+                            service.writes.pending_writes.get_mut(&response.intent_id)
+                        {
                             pending
                                 .stage_inflight_request_ids
                                 .remove(&response.replica_node_id);
@@ -617,7 +619,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         response: &DfsStageBlobResponse,
     ) -> Result<(), DfsError> {
-        let Some(pending) = self.pending_writes.get(&response.intent_id) else {
+        let Some(pending) = self.writes.pending_writes.get(&response.intent_id) else {
             return Err(DfsError::Distributed {
                 message: format!(
                     "missing pending write for stage response: {}",
@@ -671,6 +673,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         self.ensure_stage_response_request_matches_pending(response)?;
         let pending = self
+            .writes
             .pending_writes
             .get(&response.intent_id)
             .expect("pending write validated");

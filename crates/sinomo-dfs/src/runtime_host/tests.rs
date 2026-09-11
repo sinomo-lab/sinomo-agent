@@ -4392,7 +4392,7 @@ fn daemon_data_plane_replica_ingress_reuses_one_resident_shard() {
         .expect("typed stale-context response");
     assert!(matches!(
         stale.result,
-        DfsMetadataJournalBatchResult::Rejected { ref reason }
+        DfsMetadataJournalBatchResult::Rejected { ref reason , ..}
             if reason.contains("authority context is stale")
     ));
     assert_eq!(
@@ -4663,7 +4663,7 @@ fn daemon_dfs_metadata_journal_batch_rejects_non_primary_source() {
 
     assert!(matches!(
         response.result,
-        DfsMetadataJournalBatchResult::Rejected { ref reason }
+        DfsMetadataJournalBatchResult::Rejected { ref reason , ..}
             if reason.contains(&format!("source {stale} is not shard root primary {primary}"))
     ));
     let target = LocalSobjMetadataBackend::new(
@@ -7639,6 +7639,7 @@ fn daemon_dfs_metadata_journal_publish_stops_after_replica_rejection() {
             verified_authority_probe_id: None,
             result: DfsMetadataJournalBatchResult::Rejected {
                 reason: "replica already has a conflicting journal entry".to_string(),
+                code: None,
             },
         })
     });
@@ -7748,6 +7749,7 @@ fn daemon_dfs_metadata_journal_publish_repairs_sequence_conflict_with_snapshot()
                     "metadata journal sequence {} already exists with a different entry while replaying shard root",
                     command.batch.next_after_sequence
                 ),
+                code: None,
             },
         })
     });

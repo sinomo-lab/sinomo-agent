@@ -99,7 +99,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         content_hash: &str,
     ) -> Result<(), DfsError> {
-        if let Some(stage) = self.active_replica_stages.get(object_id)
+        if let Some(stage) = self.writes.active_replica_stages.get(object_id)
             && active_replica_stage_conflicts(
                 &stage.intent_id,
                 &stage.version,
@@ -122,7 +122,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        for (pending_intent_id, pending) in &self.pending_writes {
+        for (pending_intent_id, pending) in &self.writes.pending_writes {
             if pending.object_id != *object_id {
                 continue;
             }

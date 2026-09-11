@@ -19,6 +19,29 @@ pub(crate) struct DfsBestEffortMessageSendOutcome {
 /// Refinement of `StageFanoutCap` in the verified repair-content model.
 pub(crate) const DFS_REPLICA_BODY_FANOUT_CAP: usize = 2;
 
+#[derive(Clone, Copy)]
+enum ReplicaTransferKind {
+    Stage,
+    Repair,
+}
+
+struct ReplicaTransfer<'a> {
+    intent_id: &'a str,
+    file_system_id: &'a DfsFileSystemId,
+    object_id: &'a DfsObjectId,
+    expected_base_version: Option<DfsVersion>,
+    version: &'a DfsVersion,
+    content_hash: &'a str,
+    total_size_bytes: u64,
+    object_metadata: Option<DfsObjectMetadata>,
+    kind: ReplicaTransferKind,
+}
+
+struct PreparedReplicaSends {
+    requests: Vec<DfsRoutedSend>,
+    expected_targets: Vec<NodeId>,
+}
+
 fn validate_replica_body_fanout_outcomes(
     expected_targets: &[NodeId],
     outcomes: Vec<DfsRoutedSendOutcome>,
@@ -126,40 +149,23 @@ where
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
-        let mut requests = Vec::with_capacity(targets.len());
-        for (target_node_id, request_id) in targets {
-            let (_, reader) = self.open_content_hash_stream(
+        let PreparedReplicaSends {
+            requests,
+            expected_targets,
+        } = self.prepare_replica_attachments(
+            targets,
+            ReplicaTransfer {
+                intent_id,
+                file_system_id,
                 object_id,
+                expected_base_version,
                 version,
                 content_hash,
-                Some(total_size_bytes),
-            )?;
-            let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                request_id: request_id.clone(),
-                intent_id: intent_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: expected_base_version.clone(),
-                version: version.clone(),
-                content_hash: content_hash.to_string(),
-                bytes: Vec::new(),
-                object_metadata: object_metadata.clone(),
-                authority_shard: authority_shard.clone(),
-            });
-            let routed_message = self.next_dfs_routed_message(target_node_id, message);
-            requests.push(DfsRoutedSend::new(
-                target_node_id.clone(),
-                DfsRoutedCall::with_attachment(
-                    routed_message,
-                    DfsOutboundAttachment::from_reader(reader, total_size_bytes, content_hash),
-                ),
-            ));
-        }
-        let expected_targets = targets
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect::<Vec<_>>();
+                total_size_bytes,
+                object_metadata,
+                kind: ReplicaTransferKind::Stage,
+            },
+        )?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
@@ -184,40 +190,23 @@ where
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
-        let mut requests = Vec::with_capacity(targets.len());
-        for (target_node_id, request_id) in targets {
-            let (_, reader) = self.open_content_hash_stream(
+        let PreparedReplicaSends {
+            requests,
+            expected_targets,
+        } = self.prepare_replica_attachments(
+            targets,
+            ReplicaTransfer {
+                intent_id,
+                file_system_id,
                 object_id,
+                expected_base_version,
                 version,
                 content_hash,
-                Some(total_size_bytes),
-            )?;
-            let message = DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
-                request_id: request_id.clone(),
-                intent_id: intent_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: expected_base_version.clone(),
-                version: version.clone(),
-                content_hash: content_hash.to_string(),
-                bytes: Vec::new(),
-                object_metadata: object_metadata.clone(),
-                authority_shard: authority_shard.clone(),
-            });
-            let routed_message = self.next_dfs_routed_message(target_node_id, message);
-            requests.push(DfsRoutedSend::new(
-                target_node_id.clone(),
-                DfsRoutedCall::with_attachment(
-                    routed_message,
-                    DfsOutboundAttachment::from_reader(reader, total_size_bytes, content_hash),
-                ),
-            ));
-        }
-        let expected_targets = targets
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect::<Vec<_>>();
+                total_size_bytes,
+                object_metadata,
+                kind: ReplicaTransferKind::Repair,
+            },
+        )?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded_async(requests, DFS_REPLICA_BODY_FANOUT_CAP)
@@ -289,6 +278,84 @@ where
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
+    fn prepare_replica_attachments(
+        &mut self,
+        targets: &[(NodeId, String)],
+        transfer: ReplicaTransfer<'_>,
+    ) -> Result<PreparedReplicaSends, DfsError> {
+        let ReplicaTransfer {
+            intent_id,
+            file_system_id,
+            object_id,
+            expected_base_version,
+            version,
+            content_hash,
+            total_size_bytes,
+            object_metadata,
+            kind,
+        } = transfer;
+        if targets.is_empty() {
+            return Ok(PreparedReplicaSends {
+                requests: Vec::new(),
+                expected_targets: Vec::new(),
+            });
+        }
+        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
+        let mut requests = Vec::with_capacity(targets.len());
+        for (target_node_id, request_id) in targets {
+            let (_, reader) = self.open_content_hash_stream(
+                object_id,
+                version,
+                content_hash,
+                Some(total_size_bytes),
+            )?;
+            let message = match kind {
+                ReplicaTransferKind::Stage => DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
+                    request_id: request_id.clone(),
+                    intent_id: intent_id.to_string(),
+                    file_system_id: file_system_id.clone(),
+                    object_id: object_id.clone(),
+                    expected_base_version: expected_base_version.clone(),
+                    version: version.clone(),
+                    content_hash: content_hash.to_string(),
+                    bytes: Vec::new(),
+                    object_metadata: object_metadata.clone(),
+                    authority_shard: authority_shard.clone(),
+                }),
+                ReplicaTransferKind::Repair => {
+                    DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
+                        request_id: request_id.clone(),
+                        intent_id: intent_id.to_string(),
+                        file_system_id: file_system_id.clone(),
+                        object_id: object_id.clone(),
+                        expected_base_version: expected_base_version.clone(),
+                        version: version.clone(),
+                        content_hash: content_hash.to_string(),
+                        bytes: Vec::new(),
+                        object_metadata: object_metadata.clone(),
+                        authority_shard: authority_shard.clone(),
+                    })
+                }
+            };
+            let routed_message = self.next_dfs_routed_message(target_node_id, message);
+            requests.push(DfsRoutedSend::new(
+                target_node_id.clone(),
+                DfsRoutedCall::with_attachment(
+                    routed_message,
+                    DfsOutboundAttachment::from_reader(reader, total_size_bytes, content_hash),
+                ),
+            ));
+        }
+        let expected_targets = targets
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect::<Vec<_>>();
+        Ok(PreparedReplicaSends {
+            requests,
+            expected_targets,
+        })
+    }
+
     pub(crate) fn send_dfs_message_if_routable(
         &mut self,
         target_node_id: &NodeId,
@@ -385,40 +452,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
-        let mut requests = Vec::with_capacity(targets.len());
-        for (target_node_id, request_id) in targets {
-            let (_, reader) = self.open_content_hash_stream(
+        let PreparedReplicaSends {
+            requests,
+            expected_targets,
+        } = self.prepare_replica_attachments(
+            targets,
+            ReplicaTransfer {
+                intent_id,
+                file_system_id,
                 object_id,
+                expected_base_version,
                 version,
                 content_hash,
-                Some(total_size_bytes),
-            )?;
-            let message = DfsNetworkMessage::StageBlob(DfsStageBlobCommand {
-                request_id: request_id.clone(),
-                intent_id: intent_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: expected_base_version.clone(),
-                version: version.clone(),
-                content_hash: content_hash.to_string(),
-                bytes: Vec::new(),
-                object_metadata: object_metadata.clone(),
-                authority_shard: authority_shard.clone(),
-            });
-            let routed_message = self.next_dfs_routed_message(target_node_id, message);
-            requests.push(DfsRoutedSend::new(
-                target_node_id.clone(),
-                DfsRoutedCall::with_attachment(
-                    routed_message,
-                    DfsOutboundAttachment::from_reader(reader, total_size_bytes, content_hash),
-                ),
-            ));
-        }
-        let expected_targets = targets
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect::<Vec<_>>();
+                total_size_bytes,
+                object_metadata,
+                kind: ReplicaTransferKind::Stage,
+            },
+        )?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)
@@ -442,40 +492,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let authority_shard = self.command_authority_shard_for_object(object_metadata.as_ref())?;
-        let mut requests = Vec::with_capacity(targets.len());
-        for (target_node_id, request_id) in targets {
-            let (_, reader) = self.open_content_hash_stream(
+        let PreparedReplicaSends {
+            requests,
+            expected_targets,
+        } = self.prepare_replica_attachments(
+            targets,
+            ReplicaTransfer {
+                intent_id,
+                file_system_id,
                 object_id,
+                expected_base_version,
                 version,
                 content_hash,
-                Some(total_size_bytes),
-            )?;
-            let message = DfsNetworkMessage::RepairReplica(DfsRepairReplicaCommand {
-                request_id: request_id.clone(),
-                intent_id: intent_id.to_string(),
-                file_system_id: file_system_id.clone(),
-                object_id: object_id.clone(),
-                expected_base_version: expected_base_version.clone(),
-                version: version.clone(),
-                content_hash: content_hash.to_string(),
-                bytes: Vec::new(),
-                object_metadata: object_metadata.clone(),
-                authority_shard: authority_shard.clone(),
-            });
-            let routed_message = self.next_dfs_routed_message(target_node_id, message);
-            requests.push(DfsRoutedSend::new(
-                target_node_id.clone(),
-                DfsRoutedCall::with_attachment(
-                    routed_message,
-                    DfsOutboundAttachment::from_reader(reader, total_size_bytes, content_hash),
-                ),
-            ));
-        }
-        let expected_targets = targets
-            .iter()
-            .map(|(target, _)| target.clone())
-            .collect::<Vec<_>>();
+                total_size_bytes,
+                object_metadata,
+                kind: ReplicaTransferKind::Repair,
+            },
+        )?;
         let outcomes = self
             .transport
             .send_routed_calls_bounded(requests, DFS_REPLICA_BODY_FANOUT_CAP)

@@ -64,31 +64,42 @@ where
     async fn flush_deferred_untracked_routed_write_responses_async(
         &mut self,
     ) -> Result<(), DfsError> {
-        if self.deferred_untracked_routed_write_responses.is_empty() {
+        if self
+            .writes
+            .deferred_untracked_routed_write_responses
+            .is_empty()
+        {
             return Ok(());
         }
         let pending = self
+            .writes
             .deferred_untracked_routed_write_responses
             .iter()
             .map(|(intent_id, object_id)| (intent_id.clone(), object_id.clone()))
             .collect::<Vec<_>>();
         for (intent_id, object_id) in pending {
             let Some(intent) = self.coordinator.intent(&intent_id).cloned() else {
-                self.deferred_untracked_routed_write_responses
+                self.writes
+                    .deferred_untracked_routed_write_responses
                     .remove(&intent_id);
                 continue;
             };
             if !matches!(intent.state, DfsWriteIntentState::Committed)
                 || intent.requesting_node_id == self.node_id
-                || self.pending_remote_write_responses.contains_key(&intent_id)
+                || self
+                    .writes
+                    .pending_remote_write_responses
+                    .contains_key(&intent_id)
             {
-                self.deferred_untracked_routed_write_responses
+                self.writes
+                    .deferred_untracked_routed_write_responses
                     .remove(&intent_id);
                 continue;
             }
             let outcome = self.write_outcome(&intent_id)?;
             if !matches!(outcome, NetworkedDfsWriteOutcome::Committed { .. }) {
-                self.deferred_untracked_routed_write_responses
+                self.writes
+                    .deferred_untracked_routed_write_responses
                     .remove(&intent_id);
                 continue;
             }
@@ -111,7 +122,8 @@ where
                 )
                 .await?;
             if sent {
-                self.deferred_untracked_routed_write_responses
+                self.writes
+                    .deferred_untracked_routed_write_responses
                     .remove(&intent_id);
             }
         }

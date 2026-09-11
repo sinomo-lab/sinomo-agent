@@ -704,6 +704,7 @@ impl Service for DfsService {
                                         .map(ToString::to_string)
                                         .unwrap_or_else(|| "<missing>".to_string())
                                 ),
+                                code: None,
                             },
                         };
                         ctx.respond_value(DFS_METADATA_JOURNAL_BATCH_ROUTE, response)?;
@@ -790,6 +791,7 @@ impl Service for DfsService {
                                     "authenticated metadata snapshot caller {authenticated_source_node_id} does not match claimed source {}",
                                     command.source_node_id
                                 ),
+                                code: None,
                             },
                         };
                         ctx.respond_value(DFS_METADATA_SNAPSHOT_INSTALL_ROUTE, response)?;
@@ -1429,6 +1431,7 @@ mod tests {
                         verified_authority_probe_id: None,
                         result: crate::DfsMetadataJournalBatchResult::Rejected {
                             reason: "missing or stale hosted replica context".to_string(),
+                            code: None,
                         },
                     });
                 }
@@ -1475,6 +1478,7 @@ mod tests {
                         next_after_sequence: command.next_after_sequence,
                         result: DfsMetadataSnapshotInstallResult::Rejected {
                             reason: "missing or stale hosted replica context".to_string(),
+                            code: None,
                         },
                     });
                 }
@@ -2884,7 +2888,7 @@ mod tests {
         let response: DfsMetadataJournalBatchResponse = response.decode_body().expect("decode");
         assert!(matches!(
             response.result,
-            crate::DfsMetadataJournalBatchResult::Rejected { ref reason }
+            crate::DfsMetadataJournalBatchResult::Rejected { ref reason , ..}
                 if reason.contains("authenticated metadata journal caller")
                     && reason.contains(claimed.as_str())
         ));
@@ -2919,7 +2923,7 @@ mod tests {
             response.decode_body().expect("decode snapshot response");
         assert!(matches!(
             response.result,
-            DfsMetadataSnapshotInstallResult::Rejected { ref reason }
+            DfsMetadataSnapshotInstallResult::Rejected { ref reason , ..}
                 if reason.contains("authenticated metadata snapshot caller")
                     && reason.contains(claimed.as_str())
         ));

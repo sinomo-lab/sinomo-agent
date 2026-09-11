@@ -363,7 +363,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: NodeId,
         response: DfsReadResponse,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
-        let Some(pending) = self.pending_reads.get(&response.request_id).cloned() else {
+        let Some(pending) = self.reads.pending_reads.get(&response.request_id).cloned() else {
             return Ok(NetworkedDfsServiceEvent::RemoteReadCompleted {
                 request_id: response.request_id,
                 object_id: response.object_id,
@@ -385,7 +385,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 result: DfsReadResult::Rejected { reason },
             });
         }
-        self.pending_reads.remove(&response.request_id);
+        self.reads.pending_reads.remove(&response.request_id);
         if pending.object_id != response.object_id {
             self.mark_remote_read_location_missing(
                 &pending.object_id,

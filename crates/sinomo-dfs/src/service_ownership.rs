@@ -52,6 +52,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .coordinator
                     .downgrade_intent_policy(intent_id, policy)?;
                 let content_hash = self
+                    .writes
                     .pending_writes
                     .get(intent_id)
                     .map(|pending| pending.content_hash.clone());
@@ -117,6 +118,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
     ) -> Result<DistributedWriteIntent, DfsError> {
         let content_hash = self
+            .writes
             .pending_writes
             .get(intent_id)
             .map(|pending| pending.content_hash.clone());

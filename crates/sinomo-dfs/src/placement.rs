@@ -1965,8 +1965,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn current_placement_file_system_config(&mut self) -> Result<DfsFileSystemConfig, DfsError> {
         let file_system_id = crate::sifs_file_system_id();
         if let Some(config) = self
-            .active_namespace_operation_context
-            .as_ref()
+            .namespace_execution
+            .context()
             .filter(|context| context.file_system_id == file_system_id)
             .and_then(|context| context.placement_config.clone())
         {
@@ -1987,8 +1987,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 })?
         };
         if let Some(context) = self
-            .active_namespace_operation_context
-            .as_mut()
+            .namespace_execution
+            .context_mut()
             .filter(|context| context.file_system_id == file_system_id)
         {
             context.placement_config = Some(config.clone());
@@ -3541,6 +3541,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let mut held_permit = authority.map(|(_, _, permit)| permit);
 
         let content_hash = self
+            .writes
             .pending_writes
             .get(intent_id)
             .map(|pending| pending.content_hash.clone())

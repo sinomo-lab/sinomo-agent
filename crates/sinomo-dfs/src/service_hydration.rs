@@ -264,8 +264,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.transient_metadata_object_ids.clear();
         self.transient_metadata_predecessor_object_ids.clear();
         self.coordinator = DistributedEventualCoordinator::new();
-        self.pending_writes.clear();
-        self.pending_reads.clear();
+        self.writes.pending_writes.clear();
+        self.reads.pending_reads.clear();
         self.clear_metadata_lookup_cache();
     }
 
@@ -300,7 +300,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.reset_reconstructable_metadata_projection();
         // A replacement snapshot is an authoritative cursor reset. Do not let
         // the previous generation's in-memory high-water mark win via `max`.
-        self.local_metadata_journal_cursors.remove(&exact_shard_id);
+        self.replication
+            .local_metadata_journal_cursors
+            .remove(&exact_shard_id);
         self.hydrate_file_systems_from_metadata_backend()
     }
 
@@ -328,10 +330,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let file_systems = std::mem::take(&mut self.metadata.filesystems);
         self.reset_reconstructable_metadata_projection();
         self.metadata.filesystems = file_systems;
-        self.active_namespace_operation_context = None;
-        self.active_durable_namespace_request = None;
-        self.active_durable_namespace_prepare_recorded = false;
-        self.active_durable_namespace_job_recorded = false;
+        self.namespace_execution.clear();
         self.routed_namespace_settle_depth = 0;
         self.restore_durable_intent_counter_floor()
     }
@@ -377,6 +376,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         for status in backend.metadata_shard_statuses()? {
             let cursor = self
+                .replication
                 .local_metadata_journal_cursors
                 .entry(status.shard_id)
                 .or_insert(0);
@@ -934,7 +934,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     // write commit-ready, immediately before finalizing it.
                     self.add_transient_object_metadata(object)?;
                 }
-                self.pending_writes.insert(
+                self.writes.pending_writes.insert(
                     intent_record.intent_id.clone(),
                     PendingNetworkedWrite::new(
                         intent_record.object_id.clone(),
@@ -1331,6 +1331,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let cursor = self
+            .replication
             .local_metadata_journal_cursors
             .entry(batch.shard_id.clone())
             .or_insert(0);
@@ -1371,6 +1372,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
 
         let cursor = self
+            .replication
             .local_metadata_journal_cursors
             .entry(batch.shard_id.clone())
             .or_insert(0);
@@ -1874,7 +1876,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 | DfsWriteIntentStatus::ReceiptsPending
                 | DfsWriteIntentStatus::Committed
         ) && let Some(content_hash) = intent_record.content_hash.clone()
-            && !self.pending_writes.contains_key(&intent_record.intent_id)
+            && !self
+                .writes
+                .pending_writes
+                .contains_key(&intent_record.intent_id)
         {
             let size_bytes = self
                 .pending_write_size_hint(
@@ -1883,7 +1888,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     &content_hash,
                 )?
                 .unwrap_or(0);
-            self.pending_writes.insert(
+            self.writes.pending_writes.insert(
                 intent_record.intent_id.clone(),
                 PendingNetworkedWrite::new(
                     intent_record.object_id.clone(),

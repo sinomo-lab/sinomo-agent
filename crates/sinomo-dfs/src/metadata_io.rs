@@ -300,3 +300,36 @@ pub(crate) fn metadata_durable_file_error(
         source: io::Error::new(error.kind(), error.detail().to_string()),
     }
 }
+/// Stable Windows file identity. Unlike timestamps, this distinguishes an
+/// atomic replacement even when NTFS preserves the old creation time.
+#[cfg(windows)]
+pub(crate) fn windows_file_identity(file: &std::fs::File) -> Option<(u32, u64)> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    // SAFETY: the file owns a live handle and the output has the exact Win32
+    // structure size. The structure is read only after the call succeeds.
+    if unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    } == 0
+    {
+        return None;
+    }
+    // SAFETY: the successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Some((information.dwVolumeSerialNumber, index))
+}
+
+#[cfg(windows)]
+pub(crate) fn windows_path_identity(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let (volume, index) = windows_file_identity(&file)?;
+    Some(format!("windows:{volume}:{index}"))
+}

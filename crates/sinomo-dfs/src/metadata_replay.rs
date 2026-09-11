@@ -284,42 +284,7 @@ pub(crate) fn require_replica_journal_entry_file_system<'a>(
     expected: &DfsFileSystemId,
 ) -> Result<Option<DfsNamespacePreparePayloadRef<'a>>> {
     let namespace_prepare = require_journal_entry_replay_payloads(entry)?;
-    let outer_file_system_id = match &entry.mutation {
-        DfsMetadataMutation::PutFileSystem { file_system_id, .. }
-        | DfsMetadataMutation::PutObject { file_system_id, .. }
-        | DfsMetadataMutation::PutVersion { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
-        | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
-        | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
-        | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
-        | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
-        | DfsMetadataMutation::PutReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutIntent { file_system_id, .. }
-        | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
-        | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
-        | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
-        | DfsMetadataMutation::PutConflict { file_system_id, .. }
-        | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
-        | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
-        | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
-            file_system_id
-        }
-    };
+    let outer_file_system_id = entry.mutation.file_system_id();
     require_replica_record_file_system(entry, "outer mutation", outer_file_system_id, expected)?;
 
     match &entry.mutation {

@@ -241,7 +241,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return false;
         }
         let now = Instant::now();
-        self.recent_namespace_freshness_syncs
+        self.replication
+            .recent_namespace_freshness_syncs
             .retain(|_, attempted_at| {
                 now.duration_since(*attempted_at) < POSIX_READ_FRESHNESS_SYNC_CACHE_TTL
             });
@@ -250,14 +251,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsMetadataShardId::new(shard.shard_id.clone()),
             shard.primary_node_id.clone(),
         );
-        match self.recent_namespace_freshness_syncs.get(&key) {
+        match self.replication.recent_namespace_freshness_syncs.get(&key) {
             Some(attempted_at)
                 if now.duration_since(*attempted_at) < POSIX_READ_FRESHNESS_SYNC_CACHE_TTL =>
             {
                 false
             }
             _ => {
-                self.recent_namespace_freshness_syncs.insert(key, now);
+                self.replication
+                    .recent_namespace_freshness_syncs
+                    .insert(key, now);
                 true
             }
         }
@@ -283,6 +286,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let shard_id = DfsMetadataShardId::new(shard.shard_id);
         Ok(self
+            .replication
             .local_metadata_journal_cursors
             .get(&shard_id)
             .copied()

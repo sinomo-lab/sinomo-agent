@@ -1,5 +1,15 @@
 //! Networked DFS service state, outcome, event, and pending-state types.
 
+mod namespace;
+mod writes;
+pub(crate) use writes::DfsWriteState;
+mod reads;
+pub(crate) use reads::DfsReadState;
+mod replication;
+pub(crate) use replication::DfsReplicationState;
+
+pub(crate) use namespace::DfsNamespaceExecution;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -471,57 +481,24 @@ pub struct NetworkedDfsService<T> {
     pub(crate) metadata_lookup_cache:
         Mutex<BTreeMap<(DfsFileSystemId, String), Option<DfsObjectMetadata>>>,
     pub(crate) metadata_lookup_cache_depth: Mutex<usize>,
-    pub(crate) active_replica_stages: BTreeMap<DfsObjectId, ActiveReplicaStage>,
-    pub(crate) pending_writes: BTreeMap<String, PendingNetworkedWrite>,
     /// Wall-clock starts for passive repair/fetch throughput observations.
     /// Retry ticks remain the durable scheduling clock; these instants are
     /// deliberately process-local measurement evidence only.
     pub(crate) passive_fetch_started_at: BTreeMap<(String, NodeId), Instant>,
-    pub(crate) pending_reads: BTreeMap<String, PendingNetworkedRead>,
     pub(crate) repair_attempt_records: BTreeMap<(String, NodeId), DfsRepairAttemptRecord>,
-    pub(crate) transient_remote_read_pruned_locations:
-        BTreeMap<(DfsObjectId, DfsVersion, Option<String>), BTreeSet<NodeId>>,
-    pub(crate) local_metadata_journal_cursors: BTreeMap<DfsMetadataShardId, u64>,
-    pub(crate) metadata_replication_cursors: BTreeMap<(NodeId, DfsMetadataShardId), u64>,
-    pub(crate) recent_namespace_freshness_syncs:
-        BTreeMap<(DfsFileSystemId, DfsMetadataShardId, NodeId), Instant>,
     /// Whether a failed read-only authority lookup may fall back to applying
     /// the primary's journal locally. Mounted clients disable this and bracket
     /// their explicit directory refreshes with a durable host handoff.
     pub(crate) implicit_read_replica_ingest_enabled: bool,
-    pub(crate) pending_metadata_replications: BTreeMap<String, PendingMetadataReplication>,
-    pub(crate) pending_metadata_authority_probes: BTreeMap<String, PendingMetadataAuthorityProbe>,
-    pub(crate) metadata_authority_probe_results: BTreeMap<String, bool>,
-    pub(crate) pending_routed_writes: BTreeMap<String, PendingRoutedWrite>,
-    pub(crate) pending_remote_write_responses: BTreeMap<String, PendingRemoteWriteResponse>,
-    pub(crate) deferred_routed_create_parent_touches: BTreeSet<String>,
-    pub(crate) deferred_untracked_routed_write_responses: BTreeMap<String, DfsObjectId>,
     pub(crate) pending_routed_namespace_ops: BTreeMap<String, PendingRoutedNamespaceOp>,
-    pub(crate) stable_write_reconciliation_results:
-        BTreeMap<String, DfsStableWriteOperationReconciliation>,
-    pub(crate) stable_write_reconciliation_targets: BTreeMap<String, NodeId>,
     pub(crate) stable_namespace_reconciliation_results:
         BTreeMap<String, DfsStableNamespaceOperationReconciliation>,
     pub(crate) stable_namespace_reconciliation_targets: BTreeMap<String, NodeId>,
-    pub(crate) active_namespace_operation_context: Option<DfsNamespaceOperationContext>,
+    pub(crate) namespace_execution: DfsNamespaceExecution,
     /// In-memory round-robin cursor for bounded pending-request maintenance.
     /// Durable request status remains the recovery source of truth.
     pub(crate) pending_namespace_request_recovery_cursor:
         Option<DfsPendingNamespaceRequestPageCursor>,
-    /// Routed request whose exact transaction is currently being planned.
-    /// `apply_namespace_transaction_with_selected_shard` uses this context to
-    /// place the terminal request result in the same durable prepare commit.
-    pub(crate) active_durable_namespace_request: Option<DfsNamespaceRequestRecord>,
-    /// Set once the active request has written a hidden request-owned prepare.
-    /// Any later error is outcome-ambiguous: recovery owns that exact prepare,
-    /// so the request admission must remain pending rather than recording a
-    /// contradictory terminal rejection.
-    pub(crate) active_durable_namespace_prepare_recorded: bool,
-    /// Set once the active request owns a durable running or completed
-    /// namespace job. A later coordination/sync error cannot prove the
-    /// operation did not apply; exact replay must resume or reconcile that job
-    /// before the outer request becomes terminal.
-    pub(crate) active_durable_namespace_job_recorded: bool,
     pub(crate) routed_namespace_settle_depth: usize,
     pub(crate) cross_shard_namespace_locks: DfsCrossShardNamespaceLockRegistry,
     pub(crate) last_events: Vec<NetworkedDfsServiceEvent>,
@@ -533,6 +510,9 @@ pub struct NetworkedDfsService<T> {
     pub(crate) next_message_id: u64,
     pub(crate) next_request_id: u64,
     pub(crate) cancellation: Option<DfsCancellationFlag>,
+    pub(crate) writes: DfsWriteState,
+    pub(crate) reads: DfsReadState,
+    pub(crate) replication: DfsReplicationState,
 }
 
 /// Result from serving one DFS message command through a networked service.

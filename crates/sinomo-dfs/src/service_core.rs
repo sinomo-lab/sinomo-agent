@@ -1,6 +1,6 @@
 //! Core construction, accessors, routing helpers, and metrics for the networked DFS service.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use sinomo_core::network::NetworkError;
 use sinomo_core::node::NodeId;
@@ -47,6 +47,9 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
         metadata.add_file_system(DfsFileSystem::sifs(node_id.clone()));
         Self {
             node_id,
+            writes: Default::default(),
+            reads: Default::default(),
+            replication: Default::default(),
             metadata,
             tombstones_by_metadata_path: BTreeMap::new(),
             transient_metadata_object_ids: Default::default(),
@@ -59,33 +62,14 @@ impl<T: DfsTransportIdentity> NetworkedDfsService<T> {
             metadata_backend: None,
             metadata_lookup_cache: std::sync::Mutex::new(BTreeMap::new()),
             metadata_lookup_cache_depth: std::sync::Mutex::new(0),
-            active_replica_stages: BTreeMap::new(),
-            pending_writes: BTreeMap::new(),
             passive_fetch_started_at: BTreeMap::new(),
-            pending_reads: BTreeMap::new(),
             repair_attempt_records: BTreeMap::new(),
-            transient_remote_read_pruned_locations: BTreeMap::new(),
-            local_metadata_journal_cursors: BTreeMap::new(),
-            metadata_replication_cursors: BTreeMap::new(),
-            recent_namespace_freshness_syncs: BTreeMap::new(),
             implicit_read_replica_ingest_enabled: true,
-            pending_metadata_replications: BTreeMap::new(),
-            pending_metadata_authority_probes: BTreeMap::new(),
-            metadata_authority_probe_results: BTreeMap::new(),
-            pending_routed_writes: BTreeMap::new(),
-            pending_remote_write_responses: BTreeMap::new(),
-            deferred_routed_create_parent_touches: BTreeSet::new(),
-            deferred_untracked_routed_write_responses: BTreeMap::new(),
             pending_routed_namespace_ops: BTreeMap::new(),
-            stable_write_reconciliation_results: BTreeMap::new(),
-            stable_write_reconciliation_targets: BTreeMap::new(),
             stable_namespace_reconciliation_results: BTreeMap::new(),
             stable_namespace_reconciliation_targets: BTreeMap::new(),
-            active_namespace_operation_context: None,
+            namespace_execution: Default::default(),
             pending_namespace_request_recovery_cursor: None,
-            active_durable_namespace_request: None,
-            active_durable_namespace_prepare_recorded: false,
-            active_durable_namespace_job_recorded: false,
             routed_namespace_settle_depth: 0,
             cross_shard_namespace_locks: Default::default(),
             last_events: Vec::new(),
@@ -212,7 +196,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// crash-safe mounted-mutation handoff around that call.
     pub fn disable_implicit_read_replica_ingest(&mut self) {
         self.implicit_read_replica_ingest_enabled = false;
-        self.recent_namespace_freshness_syncs.clear();
+        self.replication.recent_namespace_freshness_syncs.clear();
     }
 
     /// Add a cancellation source without replacing one already installed by
@@ -467,7 +451,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             transport,
             content,
             cross_shard_namespace_locks,
-            metadata_replication_cursors,
+            replication,
             implicit_read_replica_ingest_enabled,
             pending_namespace_request_recovery_cursor,
             committed_work_tracker,
@@ -485,7 +469,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // the same live job-owned admission projection after explicit disaster
         // recovery collapses its fully hydrated service back to lazy state.
         service.cross_shard_namespace_locks = cross_shard_namespace_locks;
-        service.metadata_replication_cursors = metadata_replication_cursors;
+        service.replication = replication.into_lazy();
         service.implicit_read_replica_ingest_enabled = implicit_read_replica_ingest_enabled;
         // This cursor is tiny but provides bounded-scan fairness across routine
         // maintenance ticks. Restarting at the first durable page after every
@@ -532,22 +516,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .all(|record| !record.in_flight);
 
         metadata_lookup_scope_quiescent
-            && self.active_replica_stages.is_empty()
-            && self.pending_writes.is_empty()
-            && self.pending_reads.is_empty()
+            && self.writes.is_quiescent()
+            && self.reads.is_quiescent()
             && repair_attempts_are_not_in_flight
-            && self.pending_metadata_replications.is_empty()
-            && self.pending_metadata_authority_probes.is_empty()
-            && self.metadata_authority_probe_results.is_empty()
-            && self.pending_routed_writes.is_empty()
-            && self.pending_remote_write_responses.is_empty()
-            && self.deferred_routed_create_parent_touches.is_empty()
-            && self.deferred_untracked_routed_write_responses.is_empty()
+            && self.replication.is_quiescent()
             && self.pending_routed_namespace_ops.is_empty()
-            && self.active_namespace_operation_context.is_none()
-            && self.active_durable_namespace_request.is_none()
-            && !self.active_durable_namespace_prepare_recorded
-            && !self.active_durable_namespace_job_recorded
+            && self.namespace_execution.is_quiescent()
             && self.routed_namespace_settle_depth == 0
             && committed_work_has_durable_owner
     }
@@ -570,9 +544,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // not owners of an in-flight request. `pending_writes` above is the
         // exact live owner for an executable repair and prevents this reset.
         self.repair_attempt_records.clear();
-        self.transient_remote_read_pruned_locations.clear();
-        self.local_metadata_journal_cursors.clear();
-        self.recent_namespace_freshness_syncs.clear();
+        self.reads.transient_remote_read_pruned_locations.clear();
+        self.replication.local_metadata_journal_cursors.clear();
+        self.replication.recent_namespace_freshness_syncs.clear();
         self.last_events.clear();
         self.message_committed_work = DfsMessageCommittedWork::default();
         // Re-seed the exact durable cursor after clearing a possibly stale
@@ -673,31 +647,37 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .sum();
         let stage_retry_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.stage_retries.len())
             .sum();
         let repair_retry_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.repair_retries.len())
             .sum();
         let stage_inflight_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.stage_inflight_request_ids.len())
             .sum();
         let repair_inflight_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.repair_inflight_request_ids.len())
             .sum();
         let fetch_inflight_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.fetch_inflight_from.len())
             .sum();
         let fetch_failed_source_count = self
+            .writes
             .pending_writes
             .values()
             .map(|pending| pending.fetch_failed_from.len())
@@ -714,19 +694,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             coordinator_committed_version_count: self.coordinator.committed_version_count(),
             repair_job_count: self.coordinator.repair_jobs().len(),
             repair_attempt_count: self.active_repair_attempt_records().len(),
-            pending_write_count: self.pending_writes.len(),
-            pending_read_count: self.pending_reads.len(),
+            pending_write_count: self.writes.pending_writes.len(),
+            pending_read_count: self.reads.pending_reads.len(),
             stage_retry_count,
             repair_retry_count,
             stage_inflight_count,
             repair_inflight_count,
             fetch_inflight_count,
             fetch_failed_source_count,
-            active_replica_stage_count: self.active_replica_stages.len(),
-            metadata_replication_cursor_count: self.metadata_replication_cursors.len(),
-            pending_metadata_replication_count: self.pending_metadata_replications.len(),
-            pending_routed_write_count: self.pending_routed_writes.len(),
-            pending_remote_write_response_count: self.pending_remote_write_responses.len(),
+            active_replica_stage_count: self.writes.active_replica_stages.len(),
+            metadata_replication_cursor_count: self.replication.metadata_replication_cursors.len(),
+            pending_metadata_replication_count: self
+                .replication
+                .pending_metadata_replications
+                .len(),
+            pending_routed_write_count: self.writes.pending_routed_writes.len(),
+            pending_remote_write_response_count: self.writes.pending_remote_write_responses.len(),
             pending_routed_namespace_op_count: self.pending_routed_namespace_ops.len(),
             cross_shard_namespace_lock_count: self.cross_shard_namespace_locks.len(),
             authoritative_write_frozen_shard_count,
@@ -775,7 +758,7 @@ mod projection_release_tests {
         let mut service = service_at(&root, node);
         assert!(service.can_release_hydrated_metadata_projection());
 
-        service.pending_writes.insert(
+        service.writes.pending_writes.insert(
             "intent-live".to_string(),
             PendingNetworkedWrite::new(
                 DfsObjectId::from_legacy_named("object_projection_release").expect("object"),
@@ -790,20 +773,21 @@ mod projection_release_tests {
                 .release_hydrated_metadata_projection_if_quiescent()
                 .expect("blocked release")
         );
-        service.pending_writes.clear();
+        service.writes.pending_writes.clear();
 
         service
+            .writes
             .deferred_routed_create_parent_touches
             .insert("request-parent-touch".to_string());
         assert!(!service.can_release_hydrated_metadata_projection());
-        service.deferred_routed_create_parent_touches.clear();
+        service.writes.deferred_routed_create_parent_touches.clear();
 
-        service.active_durable_namespace_prepare_recorded = true;
+        service.namespace_execution.record_prepare();
         assert!(!service.can_release_hydrated_metadata_projection());
-        service.active_durable_namespace_prepare_recorded = false;
-        service.active_durable_namespace_job_recorded = true;
+        service.namespace_execution.finish_request();
+        service.namespace_execution.record_job();
         assert!(!service.can_release_hydrated_metadata_projection());
-        service.active_durable_namespace_job_recorded = false;
+        service.namespace_execution.finish_request();
         assert!(service.can_release_hydrated_metadata_projection());
 
         service.pending_namespace_request_recovery_cursor =
@@ -900,14 +884,15 @@ mod projection_release_tests {
                 last_error: Some("retry later".to_string()),
             },
         );
-        service.transient_remote_read_pruned_locations.insert(
+        service.reads.transient_remote_read_pruned_locations.insert(
             (object.object_id.clone(), object.version.clone(), None),
             BTreeSet::from([replica.clone()]),
         );
         service
+            .replication
             .local_metadata_journal_cursors
             .insert(shard_id.clone(), 91);
-        service.recent_namespace_freshness_syncs.insert(
+        service.replication.recent_namespace_freshness_syncs.insert(
             (file_system_id.clone(), shard_id.clone(), replica.clone()),
             Instant::now(),
         );
@@ -923,6 +908,7 @@ mod projection_release_tests {
                 reason: "retained observation".to_string(),
             });
         service
+            .replication
             .metadata_replication_cursors
             .insert((replica.clone(), shard_id.clone()), 92);
         let committed_work_tracker = DfsCommittedWorkTracker::new();
@@ -942,12 +928,25 @@ mod projection_release_tests {
         assert!(service.metadata().object(&object.object_id).is_none());
         assert!(service.metadata.filesystems.contains_key(&file_system_id));
         assert!(service.repair_attempt_records.is_empty());
-        assert!(service.transient_remote_read_pruned_locations.is_empty());
+        assert!(
+            service
+                .reads
+                .transient_remote_read_pruned_locations
+                .is_empty()
+        );
         assert_eq!(
-            service.local_metadata_journal_cursors.get(&shard_id),
+            service
+                .replication
+                .local_metadata_journal_cursors
+                .get(&shard_id),
             Some(&0)
         );
-        assert!(service.recent_namespace_freshness_syncs.is_empty());
+        assert!(
+            service
+                .replication
+                .recent_namespace_freshness_syncs
+                .is_empty()
+        );
         assert_eq!(
             service
                 .pending_namespace_request_recovery_cursor
@@ -958,6 +957,7 @@ mod projection_release_tests {
         assert!(service.last_events.is_empty());
         assert_eq!(
             service
+                .replication
                 .metadata_replication_cursors
                 .get(&(replica, shard_id)),
             Some(&92)

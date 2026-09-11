@@ -1,0 +1,251 @@
+//! Namespace prepare regression tests.
+
+use super::*;
+
+#[test]
+fn clustered_w2_foreground_create_commits_the_exact_authorized_namespace_prepare() {
+    let root = temp_root("clustered-w2-foreground-exact-create-prepare");
+    let local = NodeId::from_legacy_named("node_clustered_w2_create_local").expect("local");
+    let remote = NodeId::from_legacy_named("node_clustered_w2_create_remote").expect("remote");
+    let stage_calls = Arc::new(Mutex::new(Vec::new()));
+    let stage_calls_for_sender = Arc::clone(&stage_calls);
+    let sender: DfsMessageSender = Arc::new(move |_target_node_id, command, _timeout| {
+        let DfsNetworkMessage::StageBlob(stage) = &command.routed_message.message else {
+            return Ok(DfsMessageResponse {
+                request_id: command.request_id.clone(),
+                outbound_messages: Vec::new(),
+            });
+        };
+        stage_calls_for_sender
+            .lock()
+            .expect("stage calls")
+            .push(stage.request_id.clone());
+        Ok(DfsMessageResponse {
+            request_id: command.request_id.clone(),
+            outbound_messages: vec![DfsRoutedMessage {
+                source_node_id: command.routed_message.target_node_id.clone(),
+                target_node_id: command.routed_message.source_node_id.clone(),
+                frame_id: 101,
+                message_id: 101,
+                message: DfsNetworkMessage::StageBlobResponse(DfsStageBlobResponse {
+                    request_id: stage.request_id.clone(),
+                    intent_id: stage.intent_id.clone(),
+                    file_system_id: stage.file_system_id.clone(),
+                    object_id: stage.object_id.clone(),
+                    version: stage.version.clone(),
+                    replica_node_id: command.routed_message.target_node_id.clone(),
+                    result: DfsBlobTransferResult::Durable {
+                        content_hash: stage.content_hash.clone(),
+                    },
+                }),
+            }],
+        })
+    });
+    let transport = node_transport_with_canonical_message_peer(
+        local.clone(),
+        vec![remote.clone()],
+        Duration::from_millis(1),
+        sender,
+    );
+    let shared_kv = SharedDfsControlPlaneKvClient::new(InProcessKvStore::new());
+    shared_kv.with_client(|kv| {
+        let mut control = DfsControlPlaneStore::new(kv);
+        control
+            .put_file_system_config(&DfsFileSystemConfig::from(&distributed_sifs(local.clone())))
+            .expect("filesystem config");
+        control
+            .put_metadata_shard(&DfsMetadataShardConfig {
+                file_system_id: sifs_file_system_id(),
+                shard_id: "root".to_string(),
+                primary_node_id: local.clone(),
+                replica_node_ids: Vec::new(),
+                epoch: 1,
+                assignment: DfsMetadataShardAssignment::Root,
+                namespace_prepare_codec: Default::default(),
+                default_policy: DfsObjectPolicy::ReplicatedEventual,
+            })
+            .expect("metadata shard");
+    });
+    let mut dfs = NetworkedDfsService::new(
+        transport,
+        LocalContentStore::new(root.join("content")).expect("content"),
+    )
+    .with_control_plane(shared_kv)
+    .with_metadata_backend(
+        open_root_local_metadata_backend(root.join("metadata")).expect("metadata"),
+    )
+    .expect("metadata backend");
+    dfs.bootstrap_distributed_sifs().expect("bootstrap SIFS");
+
+    let stat = dfs
+        .posix_write_file(
+            "/services/clustered-w2-create.txt",
+            b"two durable replicas",
+            DfsWriteOptions {
+                policy: DfsReplicationPolicy::new(2, 2).expect("W2 policy"),
+                replica_candidates: vec![local.clone(), remote.clone()],
+                wait_for_commit: true,
+                foreground_replica_repair: true,
+            },
+        )
+        .expect("clustered W2 create");
+
+    assert_eq!(stage_calls.lock().expect("stage calls").len(), 1);
+    let backend = dfs.metadata_backend.as_ref().expect("metadata backend");
+    let intent = backend
+        .all_intents()
+        .expect("write intents")
+        .into_iter()
+        .find(|intent| intent.object_id == stat.object_id)
+        .expect("committed create intent");
+    assert_eq!(intent.status, DfsWriteIntentStatus::Committed);
+    let operation_id = format!("namespace:create:{}", intent.intent_id);
+    assert!(
+        backend
+            .get_namespace_prepare(&operation_id)
+            .expect("read create prepare")
+            .is_none(),
+        "the committed create prepare must retain only compact retry evidence"
+    );
+    let journal = backend.journal_since(0).expect("create journal");
+    let prepare_entry = journal
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.mutation,
+                DfsMetadataMutation::PutNamespacePrepare {
+                    operation_id: candidate,
+                    status: DfsNamespacePrepareStatus::Prepared,
+                    ..
+                } if candidate == &operation_id
+            )
+        })
+        .expect("authoritative create prepare entry");
+    let prepare = prepare_entry
+        .mutation
+        .namespace_prepare_payload()
+        .expect("decode create prepare")
+        .expect("create prepare payload")
+        .into_owned();
+    assert_eq!(
+        prepare.operation_digest,
+        crate::service_replica::metadata_namespace_prepare_payload_digest(&prepare)
+            .expect("prepare digest")
+    );
+    let visible_object = backend
+        .get_object(&stat.object_id)
+        .expect("read visible object")
+        .expect("visible object");
+    assert!(
+        prepare
+            .transaction
+            .objects
+            .iter()
+            .any(|object| object == &visible_object),
+        "the visible child must be byte-for-byte the authorized prepared child"
+    );
+    assert!(
+        prepare
+            .transaction
+            .objects
+            .iter()
+            .any(|object| object.path == SIFS_SERVICES_PATH),
+        "the exact create prepare must include its parent touch"
+    );
+
+    let mut child_only = file_metadata(local.clone());
+    child_only.object_id =
+        DfsObjectId::from_legacy_named("obj_clustered_w2_child_only").expect("object");
+    child_only.path = "/services/clustered-w2-child-only.txt".to_string();
+    child_only.file_system_id = sifs_file_system_id();
+    child_only.owner_node_id = local.clone();
+    child_only.current_locations = vec![local.clone()];
+    child_only.policy = DfsObjectPolicy::ReplicatedEventual;
+    let child_only_base = child_only.version.clone();
+    let child_only_target = crate::namespace::next_version(&child_only_base);
+    let child_only_id = child_only.object_id.clone();
+    dfs.add_transient_object_metadata(child_only)
+        .expect("child-only transient metadata");
+    let mut child_only_outcome = dfs
+        .write_distributed_eventual_with_base(
+            DfsWriteRequest {
+                file_system_id: sifs_file_system_id(),
+                object_id: child_only_id.clone(),
+                target_version: child_only_target,
+                requesting_node_id: local.clone(),
+            },
+            Some(child_only_base),
+            b"child-only first publication".to_vec(),
+            vec![local, remote],
+            DfsReplicationPolicy::new(2, 2).expect("child-only W2 policy"),
+        )
+        .expect("clustered child-only W2 create");
+    if let NetworkedDfsWriteOutcome::Pending { intent_id, .. } = &child_only_outcome {
+        let intent_id = intent_id.clone();
+        for _ in 0..4 {
+            dfs.process_incoming()
+                .expect("process child-only replica receipt");
+            child_only_outcome = dfs
+                .write_outcome(&intent_id)
+                .expect("child-only write outcome");
+            if !matches!(child_only_outcome, NetworkedDfsWriteOutcome::Pending { .. }) {
+                break;
+            }
+        }
+    }
+    assert!(
+        matches!(
+            &child_only_outcome,
+            NetworkedDfsWriteOutcome::Committed { .. }
+        ),
+        "child-only first publication must commit: {child_only_outcome:?}"
+    );
+    assert_eq!(stage_calls.lock().expect("stage calls").len(), 2);
+    let backend = dfs.metadata_backend.as_ref().expect("metadata backend");
+    let child_only_intent = backend
+        .all_intents()
+        .expect("write intents")
+        .into_iter()
+        .find(|intent| intent.object_id == child_only_id)
+        .expect("child-only create intent");
+    let child_only_operation_id = format!("namespace:create:{}", child_only_intent.intent_id);
+    assert!(
+        backend
+            .get_namespace_prepare(&child_only_operation_id)
+            .expect("read child-only prepare")
+            .is_none()
+    );
+    let child_only_journal = backend.journal_since(0).expect("child-only journal");
+    let child_only_prepare = child_only_journal
+        .iter()
+        .find(|entry| {
+            matches!(
+                &entry.mutation,
+                DfsMetadataMutation::PutNamespacePrepare {
+                    operation_id: candidate,
+                    status: DfsNamespacePrepareStatus::Prepared,
+                    ..
+                } if candidate == &child_only_operation_id
+            )
+        })
+        .expect("authoritative child-only prepare entry")
+        .mutation
+        .namespace_prepare_payload()
+        .expect("decode child-only prepare")
+        .expect("child-only prepare payload")
+        .into_owned();
+    let child_only_visible = backend
+        .get_object(&child_only_id)
+        .expect("read child-only object")
+        .expect("visible child-only object");
+    assert_eq!(
+        child_only_prepare.status,
+        DfsNamespacePrepareStatus::Prepared
+    );
+    assert_eq!(
+        child_only_prepare.transaction.objects,
+        vec![child_only_visible]
+    );
+
+    std::fs::remove_dir_all(root).ok();
+}

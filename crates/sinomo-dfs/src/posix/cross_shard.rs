@@ -236,8 +236,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     job_id,
                     file_system_id: source.file_system_id.clone(),
                     origin: self
-                        .active_durable_namespace_request
-                        .as_ref()
+                        .namespace_execution
+                        .request()
                         .map(DfsNamespaceJobOrigin::from_request),
                     kind: DfsNamespaceJobKind::RenameObjectAcrossShardPrimaries,
                     status: DfsNamespaceJobStatus::Running,
@@ -294,8 +294,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     job_id,
                     file_system_id: source.file_system_id.clone(),
                     origin: self
-                        .active_durable_namespace_request
-                        .as_ref()
+                        .namespace_execution
+                        .request()
                         .map(DfsNamespaceJobOrigin::from_request),
                     kind: DfsNamespaceJobKind::RenameDirectoryAcrossShardPrimaries,
                     status: DfsNamespaceJobStatus::Running,
@@ -500,7 +500,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 path: path.to_string(),
             }))
         };
-        for (intent_id, pending) in &self.pending_writes {
+        for (intent_id, pending) in &self.writes.pending_writes {
             if pending.object_id != object.object_id {
                 continue;
             }
@@ -1042,8 +1042,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     job_id,
                     file_system_id: target.file_system_id.clone(),
                     origin: self
-                        .active_durable_namespace_request
-                        .as_ref()
+                        .namespace_execution
+                        .request()
                         .map(DfsNamespaceJobOrigin::from_request),
                     kind: DfsNamespaceJobKind::HardlinkAcrossShardPrimaries,
                     status: DfsNamespaceJobStatus::Running,
@@ -1144,7 +1144,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             &alias.object_id,
             &alias.version,
         );
-        let active_request = self.active_durable_namespace_request.clone().ok_or_else(|| {
+        let active_request = self.namespace_execution.request().cloned().ok_or_else(|| {
             DfsPosixError::Dfs(DfsError::Distributed {
                 message: format!(
                     "cross-primary hardlink alias mutation for {source_path} has no durable outer namespace admission"
@@ -1291,12 +1291,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             })
         })?;
-        let previous_active_request = self.active_durable_namespace_request.take();
+        let previous_active_request = self.namespace_execution.take_request();
         if previous_active_request
             .as_ref()
             .is_some_and(|request| !origin.matches_request(request))
         {
-            self.active_durable_namespace_request = previous_active_request;
+            self.namespace_execution
+                .restore_request(previous_active_request);
             return Err(DfsPosixError::Dfs(DfsError::Busy {
                 path: job.root_path.clone(),
             }));
@@ -1307,7 +1308,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // canonical target frame commits and the complete job returns.
         let outcome = self
             .apply_namespace_transaction_with_feed_provenance_only(transaction, &origin.request_id);
-        self.active_durable_namespace_request = previous_active_request;
+        self.namespace_execution
+            .restore_request(previous_active_request);
         outcome
     }
 
@@ -1316,13 +1318,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: DfsNamespaceTransaction,
         operation_id: &str,
     ) -> Result<()> {
-        let previous_prepare_recorded = self.active_durable_namespace_prepare_recorded;
-        self.active_durable_namespace_prepare_recorded = false;
-        let active_request = self.active_durable_namespace_request.take();
+        let saved_execution = self.namespace_execution.suspend_request_prepare();
         let outcome =
             self.apply_namespace_transaction_with_journal_operation_id(transaction, operation_id);
-        self.active_durable_namespace_request = active_request;
-        self.active_durable_namespace_prepare_recorded = previous_prepare_recorded;
+        self.namespace_execution
+            .restore_request_prepare(saved_execution);
         outcome.map_err(DfsPosixError::from)
     }
 
@@ -2250,7 +2250,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         )? {
             return Ok(true);
         }
-        let Some(request) = self.active_durable_namespace_request.clone() else {
+        let Some(request) = self.namespace_execution.request().cloned() else {
             return Ok(false);
         };
         self.completed_cross_shard_namespace_job_for_paths_since(

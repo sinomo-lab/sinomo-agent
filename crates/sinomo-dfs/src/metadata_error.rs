@@ -19,6 +19,11 @@ pub enum MetadataBackendError {
     Io { path: PathBuf, source: io::Error },
     #[error("metadata serialization error: {0}")]
     Serde(String),
+    #[error("metadata serialization error: {message}")]
+    Rejected {
+        code: crate::DfsMetadataRejectionCode,
+        message: String,
+    },
     #[error("bounded metadata status unavailable: {reason}")]
     StatusUnavailable { reason: String },
     #[error("resident metadata shard {shard_id:?} is not hydrated for bounded status")]
@@ -51,3 +56,19 @@ pub enum MetadataBackendError {
 }
 
 pub type Result<T> = std::result::Result<T, MetadataBackendError>;
+
+impl MetadataBackendError {
+    pub(crate) fn rejection_code(&self) -> crate::DfsMetadataRejectionCode {
+        match self {
+            Self::Rejected { code, .. } => *code,
+            _ => crate::DfsMetadataRejectionCode::Other,
+        }
+    }
+
+    pub(crate) fn replica_diverged(message: String) -> Self {
+        Self::Rejected {
+            code: crate::DfsMetadataRejectionCode::ReplicaDiverged,
+            message,
+        }
+    }
+}

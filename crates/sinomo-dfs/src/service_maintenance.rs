@@ -468,7 +468,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: &DfsFileSystemId,
         shard_id: &str,
     ) -> Result<Vec<DfsMetadataReplicationOutcome>, DfsError> {
-        self.pending_metadata_replications
+        self.replication
+            .pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < std::time::Duration::from_secs(60));
         let Some(control_plane) = self.control_plane.as_mut() else {
             return Ok(Vec::new());
@@ -498,18 +499,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .filter(|target_node_id| target_node_id != &local_node_id)
         {
             let cursor_key = (target_node_id.clone(), shard_id.clone());
-            let after_sequence =
-                if let Some(after_sequence) = self.metadata_replication_cursors.get(&cursor_key) {
-                    *after_sequence
-                } else if let Some(backend) = self.metadata_backend.as_ref() {
-                    let after_sequence =
-                        backend.metadata_replication_cursor(&target_node_id, &shard_id)?;
-                    self.metadata_replication_cursors
-                        .insert(cursor_key.clone(), after_sequence);
-                    after_sequence
-                } else {
-                    0
-                };
+            let after_sequence = if let Some(after_sequence) = self
+                .replication
+                .metadata_replication_cursors
+                .get(&cursor_key)
+            {
+                *after_sequence
+            } else if let Some(backend) = self.metadata_backend.as_ref() {
+                let after_sequence =
+                    backend.metadata_replication_cursor(&target_node_id, &shard_id)?;
+                self.replication
+                    .metadata_replication_cursors
+                    .insert(cursor_key.clone(), after_sequence);
+                after_sequence
+            } else {
+                0
+            };
             let Some(batch) =
                 self.metadata_journal_batch_for_shard_since(&shard_id, after_sequence)?
             else {
@@ -521,6 +526,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             };
             let pending_next_after_sequence = self
+                .replication
                 .pending_metadata_replications
                 .values()
                 .filter(|pending| {
@@ -541,7 +547,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let entries = batch.entries.len();
             let next_after_sequence = batch.next_after_sequence;
             let request_id = self.next_request_id();
-            self.pending_metadata_replications.insert(
+            self.replication.pending_metadata_replications.insert(
                 request_id.clone(),
                 PendingMetadataReplication {
                     target_node_id: target_node_id.clone(),
@@ -575,7 +581,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     next_after_sequence,
                 });
             } else {
-                self.pending_metadata_replications.remove(&request_id);
+                self.replication
+                    .pending_metadata_replications
+                    .remove(&request_id);
                 outcomes.push(DfsMetadataReplicationOutcome::Unroutable {
                     target_node_id,
                     shard_id: shard_id.clone(),

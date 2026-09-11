@@ -77,6 +77,11 @@ pub enum DfsError {
     },
     #[error("metadata backend error: {message}")]
     Metadata { message: String },
+    #[error("metadata backend error: {message}")]
+    MetadataRejection {
+        code: crate::DfsMetadataRejectionCode,
+        message: String,
+    },
     #[error("invalid DFS replication policy: {message}")]
     InvalidReplicationPolicy { message: String },
     #[error("content hash mismatch: expected {expected}, actual {actual}")]
@@ -134,6 +139,13 @@ pub enum DfsError {
 }
 
 impl DfsError {
+    pub(crate) fn metadata_rejection_code(&self) -> crate::DfsMetadataRejectionCode {
+        match self {
+            Self::MetadataRejection { code, .. } => *code,
+            _ => crate::DfsMetadataRejectionCode::Other,
+        }
+    }
+
     pub(crate) fn from_network(error: sinomo_core::network::NetworkError) -> Self {
         let message = error.to_string();
         match error.delivery_state() {
@@ -240,6 +252,10 @@ impl From<DfsDistributedError> for DfsError {
 impl From<MetadataBackendError> for DfsError {
     fn from(error: MetadataBackendError) -> Self {
         match error {
+            error @ MetadataBackendError::Rejected { .. } => Self::MetadataRejection {
+                code: error.rejection_code(),
+                message: error.to_string(),
+            },
             MetadataBackendError::AlreadyExists { path } => Self::AlreadyExists { path },
             MetadataBackendError::DirectoryNotEmpty { path } => Self::DirectoryNotEmpty { path },
             error => Self::Metadata {

@@ -1473,14 +1473,24 @@ pub struct DfsMessageResponse {
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataJournalBatchResult {
     Applied,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<crate::DfsMetadataRejectionCode>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DfsMetadataSnapshotInstallResult {
-    Installed { archived_existing: bool },
-    Rejected { reason: String },
+    Installed {
+        archived_existing: bool,
+    },
+    Rejected {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<crate::DfsMetadataRejectionCode>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1527,6 +1537,52 @@ pub enum DfsNetworkMessage {
     MetadataSnapshotInstallResponse(DfsMetadataSnapshotInstallResponse),
     ContentRootCatalogPageRequest(DfsContentRootCatalogPageRequest),
     ContentRootCatalogPageResponse(DfsContentRootCatalogPage),
+}
+
+impl DfsMetadataJournalBatchResult {
+    pub fn from_rejection(rejection: impl Into<crate::DfsMetadataRejection>) -> Self {
+        let rejection = rejection.into();
+        Self::rejected(rejection.code, rejection.reason)
+    }
+
+    pub fn rejected(code: crate::DfsMetadataRejectionCode, reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            code: Some(code),
+        }
+    }
+
+    pub fn rejection_code(&self) -> Option<crate::DfsMetadataRejectionCode> {
+        match self {
+            Self::Rejected { reason, code } => {
+                Some(crate::DfsMetadataRejectionCode::resolve(*code, reason))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl DfsMetadataSnapshotInstallResult {
+    pub fn from_rejection(rejection: impl Into<crate::DfsMetadataRejection>) -> Self {
+        let rejection = rejection.into();
+        Self::rejected(rejection.code, rejection.reason)
+    }
+
+    pub fn rejected(code: crate::DfsMetadataRejectionCode, reason: impl Into<String>) -> Self {
+        Self::Rejected {
+            reason: reason.into(),
+            code: Some(code),
+        }
+    }
+
+    pub fn rejection_code(&self) -> Option<crate::DfsMetadataRejectionCode> {
+        match self {
+            Self::Rejected { reason, code } => {
+                Some(crate::DfsMetadataRejectionCode::resolve(*code, reason))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

@@ -320,31 +320,11 @@ impl JournalSegmentFileIdentity {
         }
         #[cfg(windows)]
         {
-            use std::mem::MaybeUninit;
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::HANDLE;
-            use windows_sys::Win32::Storage::FileSystem::{
-                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-            };
-
-            let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-            // SAFETY: `file` owns a live OS handle and `information` points to
-            // writable storage for the exact structure required by Win32.
-            let has_information = unsafe {
-                GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
-                    != 0
-            };
-            let information = has_information.then(|| unsafe { information.assume_init() });
-
+            let identity = crate::metadata_io::windows_file_identity(file);
             Self {
                 created: metadata.created().ok(),
-                volume_serial_number: information
-                    .as_ref()
-                    .map(|information| information.dwVolumeSerialNumber),
-                file_index: information.as_ref().map(|information| {
-                    (u64::from(information.nFileIndexHigh) << 32)
-                        | u64::from(information.nFileIndexLow)
-                }),
+                volume_serial_number: identity.map(|(volume, _)| volume),
+                file_index: identity.map(|(_, index)| index),
             }
         }
         #[cfg(not(any(unix, windows)))]
@@ -1438,7 +1418,7 @@ pub(crate) fn persist_replayed_journal_entry(
         if existing == *entry {
             return Ok(Some(entry.sequence));
         }
-        return Err(MetadataBackendError::Serde(format!(
+        return Err(MetadataBackendError::replica_diverged(format!(
             "metadata journal sequence {} already exists with a different entry while replaying shard {}",
             entry.sequence, entry.shard_id.0
         )));
@@ -1478,12 +1458,12 @@ pub(crate) fn persist_replayed_journal_entries(
                 if existing == *entry {
                     continue;
                 }
-                return Err(MetadataBackendError::Serde(format!(
+                return Err(MetadataBackendError::replica_diverged(format!(
                     "metadata journal sequence {} already exists with a different entry while replaying shard {}",
                     entry.sequence, entry.shard_id.0
                 )));
             }
-            return Err(MetadataBackendError::Serde(format!(
+            return Err(MetadataBackendError::replica_diverged(format!(
                 "metadata journal sequence {} is within durable prefix {} but is missing while replaying shard {}",
                 entry.sequence, persisted_through_sequence, entry.shard_id.0
             )));
@@ -1532,13 +1512,13 @@ pub(crate) fn persist_replayed_journal_frames(
             }
             let existing = read_segmented_journal_frame_at_sequence(root, entry.sequence)?
                 .ok_or_else(|| {
-                    MetadataBackendError::Serde(format!(
+                    MetadataBackendError::replica_diverged(format!(
                         "metadata journal sequence {} is within durable prefix {} but is missing while replaying shard {}",
                         entry.sequence, persisted_through_sequence, entry.shard_id.0
                     ))
                 })?;
             if existing.exact_bytes() != frame.exact_bytes.as_ref() {
-                return Err(MetadataBackendError::Serde(format!(
+                return Err(MetadataBackendError::replica_diverged(format!(
                     "metadata journal sequence {} already exists with different exact bytes while replaying shard {}",
                     entry.sequence, entry.shard_id.0
                 )));
@@ -2331,7 +2311,7 @@ fn read_next_segmented_journal_frame(
             return Ok(None);
         }
         Err(source) => {
-            return Err(MetadataBackendError::Serde(format!(
+            return Err(MetadataBackendError::replica_diverged(format!(
                 "failed to decode segmented journal entry at {}: {source}",
                 path.display()
             )));

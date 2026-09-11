@@ -488,7 +488,7 @@ fn project_namespace_change_batch(
 
 impl NamespaceChangeProjector<'_> {
     fn project_entry(&self, entry: &DfsMetadataJournalEntry) -> Result<ProjectedEntry> {
-        let mutation_file_system_id = mutation_file_system_id(&entry.mutation);
+        let mutation_file_system_id = entry.mutation.file_system_id();
         if mutation_file_system_id != &self.cursor.file_system_id {
             return Ok(ProjectedEntry::Events(Vec::new()));
         }
@@ -818,45 +818,6 @@ impl NamespaceChangeProjector<'_> {
             }
         };
         Ok(ProjectedEntry::Events(vec![event]))
-    }
-}
-
-fn mutation_file_system_id(mutation: &DfsMetadataMutation) -> &DfsFileSystemId {
-    match mutation {
-        DfsMetadataMutation::PutFileSystem { file_system_id, .. }
-        | DfsMetadataMutation::PutObject { file_system_id, .. }
-        | DfsMetadataMutation::PutVersion { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
-        | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
-        | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
-        | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
-        | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
-        | DfsMetadataMutation::PutReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutIntent { file_system_id, .. }
-        | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
-        | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
-        | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
-        | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
-        | DfsMetadataMutation::PutConflict { file_system_id, .. }
-        | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
-        | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
-        | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
-        | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
-        | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
-            file_system_id
-        }
     }
 }
 

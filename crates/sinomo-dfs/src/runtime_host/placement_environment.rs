@@ -619,7 +619,7 @@ fn sample_os_network_metering() -> sinomo_dfs::DfsNetworkMetering {
     }
     #[cfg(target_os = "windows")]
     {
-        return sample_windows_network_metering();
+        sample_windows_network_metering()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {

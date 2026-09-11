@@ -8017,14 +8017,14 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     /// finish that finite local queue here before returning the lightweight
     /// worker whose retry outbox is shared across service generations.
     pub fn detach_message_deferred_work(&mut self) -> DfsNodeDetachedSendWorker {
-        while !self.deferred_routed_create_parent_touches.is_empty() {
+        while !self.writes.deferred_routed_create_parent_touches.is_empty() {
             self.drain_deferred_routed_create_parent_touches();
         }
         self.transport.node_transport.fork_detached_send_worker()
     }
 
     pub fn message_deferred_work_pending(&self) -> Result<bool, DfsError> {
-        if !self.deferred_routed_create_parent_touches.is_empty() {
+        if !self.writes.deferred_routed_create_parent_touches.is_empty() {
             return Ok(true);
         }
         self.transport
@@ -8236,7 +8236,8 @@ impl NetworkedDfsService<DfsNodeServedMessageTransport> {
     }
 
     fn foreground_remote_write_intent_ids_for_request(&self, request_id: &str) -> BTreeSet<String> {
-        self.pending_remote_write_responses
+        self.writes
+            .pending_remote_write_responses
             .iter()
             .filter(|(_, pending)| {
                 pending.foreground_replica_repair && pending.request_id == request_id

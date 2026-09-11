@@ -6,6 +6,9 @@
 //! created objects. Generic inbound message dispatch remains in
 //! `service_protocol`.
 
+use crate::service_write::{
+    DfsDistributedWriteOptions, DfsWriteCreation, DfsWriteDispatch, DfsWriteRepair,
+};
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
@@ -229,12 +232,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let started = std::time::Instant::now();
         loop {
             self.process_incoming()?;
-            if let Some(result) = self.stable_write_reconciliation_results.remove(request_id) {
-                self.stable_write_reconciliation_targets.remove(request_id);
+            if let Some(result) = self
+                .writes
+                .stable_write_reconciliation_results
+                .remove(request_id)
+            {
+                self.writes
+                    .stable_write_reconciliation_targets
+                    .remove(request_id);
                 return Ok(result);
             }
             if started.elapsed() >= timeout {
-                self.stable_write_reconciliation_targets.remove(request_id);
+                self.writes
+                    .stable_write_reconciliation_targets
+                    .remove(request_id);
                 return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
                     reason: format!(
                         "stable write reconciliation {request_id} timed out before the current authority replied"
@@ -303,7 +314,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         let request_id = self.next_request_id();
         let authority_node_id = authority_shard.primary_node_id.clone();
-        self.stable_write_reconciliation_targets
+        self.writes
+            .stable_write_reconciliation_targets
             .insert(request_id.clone(), authority_node_id.clone());
         let sent = self.send_dfs_message_if_routable(
             &authority_node_id,
@@ -321,7 +333,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             ),
         )?;
         if !sent {
-            self.stable_write_reconciliation_targets.remove(&request_id);
+            self.writes
+                .stable_write_reconciliation_targets
+                .remove(&request_id);
             return Ok(DfsStableWriteOperationReconciliation::AmbiguousOrExpired {
                 reason: format!(
                     "stable write reconciliation authority {authority_node_id} is unroutable"
@@ -418,6 +432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         response: DfsStableWriteReconciliationResponse,
     ) -> Result<NetworkedDfsServiceEvent, DfsError> {
         let Some(expected_authority) = self
+            .writes
             .stable_write_reconciliation_targets
             .get(&response.request_id)
         else {
@@ -436,7 +451,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 ),
             });
         }
-        self.stable_write_reconciliation_results
+        self.writes
+            .stable_write_reconciliation_results
             .insert(response.request_id.clone(), response.reconciliation);
         Ok(NetworkedDfsServiceEvent::StableReconciliationCompleted {
             request_id: response.request_id,
@@ -762,7 +778,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_content_hash: &str,
         expected_size_bytes: u64,
     ) -> Result<bool, DfsError> {
-        if let Some(pending) = self.pending_writes.get(&intent.intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get(&intent.intent_id) {
             return Ok(pending.content_hash == expected_content_hash
                 && pending.size_bytes == expected_size_bytes);
         }
@@ -963,8 +979,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             };
             match authority_validation.and(manifest).and_then(|manifest| {
                 let exclusive_create_event_id = routed_exclusive_create_event_id(&command);
-                self
-                .ensure_routed_write_object_metadata(
+                self.ensure_routed_write_object_metadata(
                     &command.request,
                     command.object_metadata.as_ref(),
                     command.exclusive_create,
@@ -977,42 +992,75 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                     if let Some((content_hash, content_size_bytes)) = manifest {
                         if command.requester_blob_pre_staged {
-                            self.write_distributed_eventual_from_remote_manifest_with_base_and_parent_touch_and_operation_id(
+                            self.write_stable_remote_distributed_manifest(
                                 command.request,
                                 command.expected_base_version,
                                 content_hash,
                                 content_size_bytes,
                                 command.desired_replica_nodes,
                                 command.policy,
-                                created_object_path.is_some(),
-                                command.exclusive_create,
-                                write_foreground_replica_repair,
                                 request_id.clone(),
+                                DfsDistributedWriteOptions {
+                                    touch_parent_on_create: created_object_path.is_some(),
+                                    creation: if command.exclusive_create {
+                                        DfsWriteCreation::Exclusive
+                                    } else {
+                                        DfsWriteCreation::Upsert
+                                    },
+                                    repair: if write_foreground_replica_repair {
+                                        DfsWriteRepair::Foreground
+                                    } else {
+                                        DfsWriteRepair::Background
+                                    },
+                                    ..DfsDistributedWriteOptions::default()
+                                },
                             )
                         } else if let Some(blob) = preingested_blob.take() {
-                            self.write_distributed_eventual_from_quarantined_blob_with_base_and_parent_touch_and_operation_id(
+                            self.write_stable_quarantined_distributed_blob(
                                 command.request,
                                 command.expected_base_version,
                                 blob,
                                 command.desired_replica_nodes,
                                 command.policy,
-                                created_object_path.is_some(),
-                                command.exclusive_create,
-                                write_foreground_replica_repair,
                                 request_id.clone(),
+                                DfsDistributedWriteOptions {
+                                    touch_parent_on_create: created_object_path.is_some(),
+                                    creation: if command.exclusive_create {
+                                        DfsWriteCreation::Exclusive
+                                    } else {
+                                        DfsWriteCreation::Upsert
+                                    },
+                                    repair: if write_foreground_replica_repair {
+                                        DfsWriteRepair::Foreground
+                                    } else {
+                                        DfsWriteRepair::Background
+                                    },
+                                    ..DfsDistributedWriteOptions::default()
+                                },
                             )
                         } else {
-                            self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch_and_operation_id(
+                            self.write_stable_ingested_distributed_manifest(
                                 command.request,
                                 command.expected_base_version,
                                 content_hash,
                                 content_size_bytes,
                                 command.desired_replica_nodes,
                                 command.policy,
-                                created_object_path.is_some(),
-                                command.exclusive_create,
-                                write_foreground_replica_repair,
                                 request_id.clone(),
+                                DfsDistributedWriteOptions {
+                                    touch_parent_on_create: created_object_path.is_some(),
+                                    creation: if command.exclusive_create {
+                                        DfsWriteCreation::Exclusive
+                                    } else {
+                                        DfsWriteCreation::Upsert
+                                    },
+                                    repair: if write_foreground_replica_repair {
+                                        DfsWriteRepair::Foreground
+                                    } else {
+                                        DfsWriteRepair::Background
+                                    },
+                                    ..DfsDistributedWriteOptions::default()
+                                },
                             )
                         }
                     } else if !command.requester_blob_pre_staged {
@@ -1025,31 +1073,52 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             command.request.target_version.as_str(),
                             &command.bytes,
                         )?;
-                        self.write_distributed_eventual_from_ingested_manifest_with_base_and_parent_touch_and_operation_id(
+                        self.write_stable_ingested_distributed_manifest(
                             command.request,
                             command.expected_base_version,
                             manifest.content_hash,
                             manifest.size_bytes,
                             command.desired_replica_nodes,
                             command.policy,
-                            created_object_path.is_some(),
-                            command.exclusive_create,
-                            write_foreground_replica_repair,
                             request_id.clone(),
+                            DfsDistributedWriteOptions {
+                                touch_parent_on_create: created_object_path.is_some(),
+                                creation: if command.exclusive_create {
+                                    DfsWriteCreation::Exclusive
+                                } else {
+                                    DfsWriteCreation::Upsert
+                                },
+                                repair: if write_foreground_replica_repair {
+                                    DfsWriteRepair::Foreground
+                                } else {
+                                    DfsWriteRepair::Background
+                                },
+                                ..DfsDistributedWriteOptions::default()
+                            },
                         )
                     } else {
-                        self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
+                        self.write_distributed_bytes_with_base(
                             command.request,
                             command.expected_base_version,
                             command.bytes,
                             command.desired_replica_nodes,
                             command.policy,
-                            created_object_path.is_some(),
-                            command.exclusive_create,
-                            write_foreground_replica_repair,
-                            false,
-                            true,
-                            Some(request_id.clone()),
+                            DfsDistributedWriteOptions {
+                                touch_parent_on_create: created_object_path.is_some(),
+                                creation: if command.exclusive_create {
+                                    DfsWriteCreation::Exclusive
+                                } else {
+                                    DfsWriteCreation::Upsert
+                                },
+                                repair: if write_foreground_replica_repair {
+                                    DfsWriteRepair::Foreground
+                                } else {
+                                    DfsWriteRepair::Background
+                                },
+                                dispatch: DfsWriteDispatch::AwaitResponse,
+                                replay_response_journal: true,
+                                operation_id: Some(request_id.clone()),
+                            },
                         )
                     }
                 })
@@ -1076,7 +1145,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             && !repair_jobs.is_empty()
                             && !self
                                 .transport
-                                .can_return_committed_foreground_response_before_replica_repair() =>
+                                .can_return_committed_foreground_response_before_replica_repair(
+                                ) =>
                         {
                             self.track_pending_remote_write_response(
                                 intent_id,
@@ -1109,11 +1179,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 Err(error) => {
                     let failed_intent = self
                         .coordinator
-                        .claimed_intent_for_target(
-                            &file_system_id,
-                            &object_id,
-                            &target_version,
-                        )
+                        .claimed_intent_for_target(&file_system_id, &object_id, &target_version)
                         .cloned();
                     let committed = failed_intent.as_ref().is_some_and(|intent| {
                         matches!(intent.state, DfsWriteIntentState::Committed)
@@ -1123,24 +1189,23 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         let mut cleanup_completed = true;
                         if let Some(intent) = failed_intent {
                             let content_hash = self
+                                .writes
                                 .pending_writes
                                 .get(&intent.intent_id)
                                 .map(|pending| pending.content_hash.clone());
-                            let aborted = if matches!(
-                                intent.state,
-                                DfsWriteIntentState::AwaitingReceipts
-                            ) {
-                                match self.coordinator.abort_intent(&intent.intent_id) {
-                                    Ok(aborted) => Some(aborted),
-                                    Err(source) => {
-                                        cleanup_error = Some(source.to_string());
-                                        cleanup_completed = false;
-                                        None
+                            let aborted =
+                                if matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
+                                    match self.coordinator.abort_intent(&intent.intent_id) {
+                                        Ok(aborted) => Some(aborted),
+                                        Err(source) => {
+                                            cleanup_error = Some(source.to_string());
+                                            cleanup_completed = false;
+                                            None
+                                        }
                                     }
-                                }
-                            } else {
-                                Some(intent.clone())
-                            };
+                                } else {
+                                    Some(intent.clone())
+                                };
                             if let Some(aborted) = aborted {
                                 if let Err(source) =
                                     self.put_metadata_intent(&aborted, content_hash.as_deref())
@@ -1148,7 +1213,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     cleanup_error = Some(source.to_string());
                                     cleanup_completed = false;
                                 } else {
-                                    self.pending_writes.remove(&intent.intent_id);
+                                    self.writes.pending_writes.remove(&intent.intent_id);
                                 }
                             }
                         }
@@ -1247,7 +1312,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(intent) = self.coordinator.intent(intent_id).cloned() else {
             return Ok(());
         };
-        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+        let Some(pending) = self.writes.pending_writes.get(intent_id).cloned() else {
             return Ok(());
         };
         let _ = self.request_stage_blob_from_alternate(&intent, &pending)?;
@@ -1264,7 +1329,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         created_object_path: Option<String>,
         foreground_replica_repair: bool,
     ) {
-        if let Some(existing) = self.pending_remote_write_responses.get_mut(intent_id) {
+        if let Some(existing) = self
+            .writes
+            .pending_remote_write_responses
+            .get_mut(intent_id)
+        {
             if existing.requester_node_id == *requester_node_id
                 && existing.request_id == request_id
                 && existing.object_id == *object_id
@@ -1279,7 +1348,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             return;
         }
-        self.pending_remote_write_responses.insert(
+        self.writes.pending_remote_write_responses.insert(
             intent_id.to_string(),
             PendingRemoteWriteResponse {
                 requester_node_id: requester_node_id.clone(),
@@ -1368,16 +1437,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn canonical_pending_routed_write_request_id(&self, request_id: &str) -> Option<String> {
-        self.pending_routed_writes
+        self.writes
+            .pending_routed_writes
             .get(request_id)
             .map(|pending| pending.canonical_request_id.clone())
     }
 
     fn track_pending_routed_write_alias(&mut self, canonical_request_id: &str, alias: String) {
-        if alias == canonical_request_id || self.pending_routed_writes.contains_key(&alias) {
+        if alias == canonical_request_id || self.writes.pending_routed_writes.contains_key(&alias) {
             return;
         }
-        let Some(canonical) = self.pending_routed_writes.get(canonical_request_id) else {
+        let Some(canonical) = self.writes.pending_routed_writes.get(canonical_request_id) else {
             return;
         };
         let alias_pending = PendingRoutedWrite {
@@ -1393,7 +1463,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             result: canonical.result.clone(),
             compact_retained_at: canonical.compact_retained_at,
         };
-        self.pending_routed_writes.insert(alias, alias_pending);
+        self.writes
+            .pending_routed_writes
+            .insert(alias, alias_pending);
     }
 
     /// Replace every requester-side copy of an unresolved routed command with
@@ -1406,6 +1478,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Option<RoutedWriteManifestPublicationReceipt> {
         let canonical_request_id = self.canonical_pending_routed_write_request_id(request_id)?;
         let publication = self
+            .writes
             .pending_routed_writes
             .get(&canonical_request_id)
             .map(|pending| RoutedWriteManifestPublicationReceipt {
@@ -1417,6 +1490,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .unwrap_or_else(|| pending.object_id.clone()),
             });
         for pending in self
+            .writes
             .pending_routed_writes
             .values_mut()
             .filter(|pending| pending.canonical_request_id == canonical_request_id)
@@ -1436,7 +1510,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         else {
             return;
         };
-        self.pending_routed_writes
+        self.writes
+            .pending_routed_writes
             .retain(|_, pending| pending.canonical_request_id != canonical_request_id);
     }
 
@@ -1452,16 +1527,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // identity. Preserve only that final lookup identity before releasing
         // the payload, replica list, metadata body, and all other retry state.
         let publication_object_id = self
+            .writes
             .pending_routed_writes
             .get(&canonical_request_id)
             .and_then(|pending| pending.command.as_ref())
             .map(|command| command.request.object_id.clone())
             .or_else(|| {
-                self.pending_routed_writes
+                self.writes
+                    .pending_routed_writes
                     .get(&canonical_request_id)
                     .map(|pending| pending.object_id.clone())
             });
         for pending in self
+            .writes
             .pending_routed_writes
             .values_mut()
             .filter(|pending| pending.canonical_request_id == canonical_request_id)
@@ -1480,6 +1558,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     /// key can never point at an evicted operation.
     pub(crate) fn prune_retained_routed_writes(&mut self) {
         let mut compact_requests = self
+            .writes
             .pending_routed_writes
             .iter()
             .filter_map(|(request_id, pending)| {
@@ -1514,7 +1593,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if expired.is_empty() {
             return;
         }
-        self.pending_routed_writes
+        self.writes
+            .pending_routed_writes
             .retain(|_, pending| !expired.contains(&pending.canonical_request_id));
     }
 
@@ -1538,7 +1618,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         // settled, timed out, or was retried against another primary) are
         // discarded; a stray frame must never fail the whole event loop.
         let (canonical_request_id, expected_authority_shard) = {
-            let Some(tracked) = self.pending_routed_writes.get(&response.request_id) else {
+            let Some(tracked) = self.writes.pending_routed_writes.get(&response.request_id) else {
                 return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                     request_id: response.request_id,
                     source_node_id: primary_node_id,
@@ -1546,7 +1626,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 });
             };
             let canonical_request_id = tracked.canonical_request_id.clone();
-            let Some(pending) = self.pending_routed_writes.get(&canonical_request_id) else {
+            let Some(pending) = self.writes.pending_routed_writes.get(&canonical_request_id) else {
                 return Ok(NetworkedDfsServiceEvent::RemoteResponseDiscarded {
                     request_id: response.request_id,
                     source_node_id: primary_node_id,
@@ -1644,6 +1724,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         } = &response.result
         {
             let redirect = self
+                .writes
                 .pending_routed_writes
                 .get(&canonical_request_id)
                 .and_then(|pending| {
@@ -1798,12 +1879,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         }
                     };
                     if routed {
-                        self.pending_routed_writes.retain(|request_id, pending| {
-                            request_id == &canonical_request_id
-                                || pending.canonical_request_id != canonical_request_id
-                        });
-                        if let Some(pending) =
-                            self.pending_routed_writes.get_mut(&canonical_request_id)
+                        self.writes
+                            .pending_routed_writes
+                            .retain(|request_id, pending| {
+                                request_id == &canonical_request_id
+                                    || pending.canonical_request_id != canonical_request_id
+                            });
+                        if let Some(pending) = self
+                            .writes
+                            .pending_routed_writes
+                            .get_mut(&canonical_request_id)
                         {
                             pending.object_id = command.request.object_id.clone();
                             pending.primary_node_id = current_primary_node_id.clone();
@@ -1854,6 +1939,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     },
             } => {
                 let pending = self
+                    .writes
                     .pending_routed_writes
                     .get_mut(&canonical_request_id)
                     .expect("pending routed write was validated before metadata replay");
@@ -1894,6 +1980,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             DfsDistributedWriteResult::Rejected { reason, .. } => {
                 let remote_intent_id = self
+                    .writes
                     .pending_routed_writes
                     .get(&canonical_request_id)
                     .and_then(|pending| pending.remote_intent_id.clone());
@@ -1984,10 +2071,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         events: &mut Vec<NetworkedDfsServiceEvent>,
     ) -> Result<(), DfsError> {
-        if self.pending_remote_write_responses.is_empty() {
+        if self.writes.pending_remote_write_responses.is_empty() {
             return Ok(());
         }
         let intent_ids = self
+            .writes
             .pending_remote_write_responses
             .keys()
             .cloned()
@@ -2005,7 +2093,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     }
                 }
             };
-            let Some(pending) = self.pending_remote_write_responses.get(&intent_id).cloned() else {
+            let Some(pending) = self
+                .writes
+                .pending_remote_write_responses
+                .get(&intent_id)
+                .cloned()
+            else {
                 continue;
             };
             let committed_foreground_with_repairs = pending.foreground_replica_repair
@@ -2057,7 +2150,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // detached outbox.
                 continue;
             }
-            self.pending_remote_write_responses.remove(&intent_id);
+            self.writes
+                .pending_remote_write_responses
+                .remove(&intent_id);
             events.push(NetworkedDfsServiceEvent::RemoteWriteServed {
                 request_id: pending.request_id,
                 object_id: pending.object_id,
@@ -2074,7 +2169,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
         if !self.transport.can_send_synchronously() {
-            self.deferred_untracked_routed_write_responses
+            self.writes
+                .deferred_untracked_routed_write_responses
                 .insert(intent_id.to_string(), object_id.clone());
             return Ok(());
         }
@@ -2083,7 +2179,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         if !matches!(intent.state, DfsWriteIntentState::Committed)
             || intent.requesting_node_id == self.node_id
-            || self.pending_remote_write_responses.contains_key(intent_id)
+            || self
+                .writes
+                .pending_remote_write_responses
+                .contains_key(intent_id)
         {
             return Ok(());
         }
@@ -2235,17 +2334,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn drain_deferred_routed_create_parent_touches(&mut self) {
-        if self.deferred_routed_create_parent_touches.is_empty() {
+        if self.writes.deferred_routed_create_parent_touches.is_empty() {
             return;
         }
         let paths = self
+            .writes
             .deferred_routed_create_parent_touches
             .iter()
             .take(DFS_DEFERRED_PARENT_TOUCH_DRAIN_LIMIT)
             .cloned()
             .collect::<Vec<_>>();
         for path in paths {
-            self.deferred_routed_create_parent_touches.remove(&path);
+            self.writes
+                .deferred_routed_create_parent_touches
+                .remove(&path);
             self.touch_routed_create_parent_directory(&path);
         }
     }

@@ -19,19 +19,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         file_system_id: DfsFileSystemId,
         shards: Vec<DfsMetadataShardConfig>,
     ) -> Option<DfsNamespaceOperationContext> {
-        self.active_namespace_operation_context
-            .replace(DfsNamespaceOperationContext {
+        self.namespace_execution
+            .replace_context(Some(DfsNamespaceOperationContext {
                 file_system_id,
                 shards,
                 placement_config: None,
-            })
+            }))
     }
 
     pub(crate) fn restore_namespace_operation_context(
         &mut self,
         previous: Option<DfsNamespaceOperationContext>,
     ) {
-        self.active_namespace_operation_context = previous;
+        self.namespace_execution.replace_context(previous);
     }
 
     pub(crate) fn metadata_shard_config_snapshot(

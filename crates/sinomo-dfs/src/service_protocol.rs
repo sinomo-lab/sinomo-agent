@@ -27,6 +27,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         timeout: Duration,
     ) -> Result<Vec<NetworkedDfsServiceEvent>, DfsError> {
         let pending_request_ids = self
+            .writes
             .pending_routed_writes
             .iter()
             .filter(|(request_id, pending)| *request_id == &pending.canonical_request_id)
@@ -49,7 +50,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             let mut all_ready = true;
             for request_id in &pending_request_ids {
-                if !self.pending_routed_writes.contains_key(request_id) {
+                if !self.writes.pending_routed_writes.contains_key(request_id) {
                     continue;
                 }
                 if matches!(
@@ -305,7 +306,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let flush_ms = flush_started.elapsed().as_millis();
         if drain_deferred_parent_touches {
             let drain_started = Instant::now();
-            let deferred_parent_touches = self.deferred_routed_create_parent_touches.len();
+            let deferred_parent_touches = self.writes.deferred_routed_create_parent_touches.len();
             self.drain_deferred_routed_create_parent_touches();
             let drain_ms = drain_started.elapsed().as_millis();
             if flush_ms > 0 || drain_ms > 0 || deferred_parent_touches > 0 {
@@ -319,11 +320,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn prune_expired_pending_remote_reads(&mut self) {
-        if self.pending_reads.is_empty() {
+        if self.reads.pending_reads.is_empty() {
             return;
         }
         let now = Instant::now();
         let expired_request_ids = self
+            .reads
             .pending_reads
             .iter()
             .filter_map(|(request_id, pending)| {
@@ -335,7 +337,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
             .collect::<Vec<_>>();
         for request_id in expired_request_ids {
-            self.pending_reads.remove(&request_id);
+            self.reads.pending_reads.remove(&request_id);
         }
     }
 }

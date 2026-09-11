@@ -919,6 +919,14 @@ The network data plane uses typed object RPC and stream extensions owned by
 deadline. Optional per-chunk hashes detect corruption before final manifest
 validation.
 
+Metadata journal and snapshot rejections carry an optional typed recovery code
+alongside their diagnostic text. New receivers preserve that code from backend
+validation through RPC and durable replication-suppression records. Snapshot
+repair and epoch-scoped suppression use the code; diagnostic wording cannot
+override it. One compatibility adapter interprets text only when an older peer
+or stored record omits the code. Unknown future codes fail closed. Source,
+assignment, epoch, and exact-prefix checks still authorize every repair.
+
 Repair is manifest-based rather than an arbitrary directory scan:
 
 1. Compare current metadata and receipts with locally available manifests.

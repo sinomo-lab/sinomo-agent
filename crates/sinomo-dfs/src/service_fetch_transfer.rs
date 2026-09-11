@@ -189,7 +189,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
         }
         self.restore_pending_write_for_intent_if_missing(&response.intent_id, &response.object_id)?;
-        let Some(pending) = self.pending_writes.get(&response.intent_id).cloned() else {
+        let Some(pending) = self.writes.pending_writes.get(&response.intent_id).cloned() else {
             let reason = format!(
                 "distributed DFS error: missing pending write for fetched blob: {}",
                 response.intent_id
@@ -239,7 +239,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let transfer_started_at = self
             .passive_fetch_started_at
             .remove(&(response.intent_id.clone(), frame_source_node_id.clone()));
-        if let Some(pending) = self.pending_writes.get_mut(&response.intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(&response.intent_id) {
             pending.fetch_inflight_from.remove(&frame_source_node_id);
             pending
                 .fetch_inflight_request_ids
@@ -420,7 +420,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         size_bytes: u64,
     ) -> Result<(), DfsError> {
-        if let Some(pending) = self.pending_writes.get_mut(intent_id)
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id)
             && pending.size_bytes == 0
         {
             pending.size_bytes = size_bytes;
@@ -487,7 +487,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn wake_pending_retries_after_fetch_success(&mut self, intent_id: &str) {
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             for state in pending.repair_retries.values_mut() {
                 wake_repair_retry_state(state);
                 state.inflight = false;
@@ -509,11 +509,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         source_node_id: &NodeId,
     ) {
         let stale_request_id = self
+            .writes
             .pending_writes
             .get_mut(intent_id)
             .and_then(|pending| pending.fetch_inflight_request_ids.remove(source_node_id));
         let _ = stale_request_id;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             pending.fetch_inflight_from.remove(source_node_id);
             pending.fetch_inflight_started_ticks.remove(source_node_id);
             pending.fetch_failed_from.insert(source_node_id.clone());

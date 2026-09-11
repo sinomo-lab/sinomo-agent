@@ -470,7 +470,7 @@ pub fn dfs_response_committed_visible_mutation(response: &crate::DfsDataPlaneRes
 
 pub fn dfs_metadata_journal_rejection(
     command: &crate::DfsMetadataJournalBatchCommand,
-    reason: impl Into<String>,
+    reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataJournalBatchResponse {
     dfs_metadata_journal_rejection_for(
         command.request_id.clone(),
@@ -484,7 +484,7 @@ pub fn dfs_metadata_journal_rejection_for(
     request_id: String,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
-    reason: impl Into<String>,
+    reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataJournalBatchResponse {
     crate::DfsMetadataJournalBatchResponse {
         request_id,
@@ -493,15 +493,13 @@ pub fn dfs_metadata_journal_rejection_for(
         applied_entries: 0,
         verified_prefix_only: false,
         verified_authority_probe_id: None,
-        result: crate::DfsMetadataJournalBatchResult::Rejected {
-            reason: reason.into(),
-        },
+        result: crate::DfsMetadataJournalBatchResult::from_rejection(reason),
     }
 }
 
 pub fn dfs_metadata_snapshot_rejection(
     command: &crate::DfsMetadataSnapshotInstallCommand,
-    reason: impl Into<String>,
+    reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataSnapshotInstallResponse {
     dfs_metadata_snapshot_rejection_for(
         command.request_id.clone(),
@@ -515,15 +513,13 @@ pub fn dfs_metadata_snapshot_rejection_for(
     request_id: String,
     shard_id: DfsMetadataShardId,
     next_after_sequence: u64,
-    reason: impl Into<String>,
+    reason: impl Into<crate::DfsMetadataRejection>,
 ) -> crate::DfsMetadataSnapshotInstallResponse {
     crate::DfsMetadataSnapshotInstallResponse {
         request_id,
         shard_id,
         next_after_sequence,
-        result: crate::DfsMetadataSnapshotInstallResult::Rejected {
-            reason: reason.into(),
-        },
+        result: crate::DfsMetadataSnapshotInstallResult::from_rejection(reason),
     }
 }
 

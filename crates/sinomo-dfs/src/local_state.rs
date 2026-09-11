@@ -91,7 +91,9 @@ fn dfs_metadata_inspection_file_generation(
             metadata.ctime_nsec()
         ))
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let platform_identity = crate::metadata_io::windows_path_identity(path);
+    #[cfg(not(any(unix, windows)))]
     let platform_identity = None;
     Ok(Some(DfsMetadataInspectionFileGeneration {
         is_file: metadata.is_file(),

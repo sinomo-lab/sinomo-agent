@@ -148,6 +148,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             false,
         )?;
         Ok(self
+            .reads
             .pending_reads
             .iter()
             .filter(|(_, pending)| {
@@ -213,7 +214,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     requested.push(node_id.clone());
                     break;
                 }
-                self.pending_reads.remove(&request_id);
+                self.reads.pending_reads.remove(&request_id);
                 expired_candidates.push(node_id.clone());
                 continue;
             }
@@ -267,13 +268,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             DfsNetworkMessage::ReadRequest(read_request),
         )?;
         if sent {
-            self.pending_reads.insert(request_id, pending);
+            self.reads.pending_reads.insert(request_id, pending);
         }
         Ok(sent)
     }
 
     fn prune_pending_remote_reads_to_removed_locations(&mut self, object: &DfsObjectMetadata) {
         let request_ids = self
+            .reads
             .pending_reads
             .iter()
             .filter(|(_, pending)| {
@@ -283,7 +285,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|(request_id, _)| request_id.clone())
             .collect::<Vec<_>>();
         for request_id in request_ids {
-            self.pending_reads.remove(&request_id);
+            self.reads.pending_reads.remove(&request_id);
         }
     }
 
@@ -313,7 +315,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         object: &DfsObjectMetadata,
     ) -> Option<Instant> {
-        self.pending_reads
+        self.reads
+            .pending_reads
             .values()
             .filter(|pending| {
                 pending.object_id == object.object_id
@@ -334,7 +337,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         offset: u64,
         max_bytes: usize,
     ) -> Option<Instant> {
-        self.pending_reads
+        self.reads
+            .pending_reads
             .values()
             .filter(|pending| {
                 pending.object_id == object.object_id
@@ -359,7 +363,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Option<(String, PendingNetworkedRead)> {
         let range_offset = range.map(|(offset, _)| offset);
         let range_max_bytes = range.map(|(_, max_bytes)| max_bytes);
-        self.pending_reads
+        self.reads
+            .pending_reads
             .iter()
             .find(|(_, pending)| {
                 pending.object_id == object.object_id
@@ -427,7 +432,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             object.version.clone(),
             object.content_hash.clone(),
         );
-        if let Some(pruned) = self.transient_remote_read_pruned_locations.get(&key) {
+        if let Some(pruned) = self.reads.transient_remote_read_pruned_locations.get(&key) {
             object
                 .current_locations
                 .retain(|node_id| !pruned.contains(node_id));
@@ -441,7 +446,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &Option<String>,
         source_node_id: &NodeId,
     ) {
-        self.transient_remote_read_pruned_locations
+        self.reads
+            .transient_remote_read_pruned_locations
             .entry((object_id.clone(), version.clone(), content_hash.clone()))
             .or_default()
             .insert(source_node_id.clone());
@@ -453,7 +459,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
         content_hash: &Option<String>,
     ) {
-        self.transient_remote_read_pruned_locations.remove(&(
+        self.reads.transient_remote_read_pruned_locations.remove(&(
             object_id.clone(),
             version.clone(),
             content_hash.clone(),
@@ -516,7 +522,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn has_pending_write_targeting(&self, object_id: &DfsObjectId, version: &DfsVersion) -> bool {
-        self.pending_writes
+        self.writes
+            .pending_writes
             .values()
             .any(|pending| &pending.object_id == object_id && &pending.version == version)
     }
@@ -1071,6 +1078,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &Option<String>,
     ) {
         let request_ids: Vec<String> = self
+            .reads
             .pending_reads
             .iter()
             .filter(|(_, pending)| {
@@ -1081,7 +1089,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map(|(request_id, _)| request_id.clone())
             .collect();
         for request_id in request_ids {
-            self.pending_reads.remove(&request_id);
+            self.reads.pending_reads.remove(&request_id);
         }
     }
 

@@ -6,6 +6,9 @@
 //! behavior over SIFS while the lower DFS layers handle placement, receipts,
 //! repair, and metadata journaling.
 
+use crate::service_write::{
+    DfsDistributedWriteOptions, DfsWriteCreation, DfsWriteDispatch, DfsWriteRepair,
+};
 mod attrs;
 mod cross_shard;
 #[cfg(test)]
@@ -3312,35 +3315,60 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             requesting_node_id: self.node_id.clone(),
         };
         let outcome = if streamed_remote_primary_write {
-            self.write_distributed_eventual_with_base_and_parent_touch_and_repair_mode_and_operation_id(
+            self.write_distributed_bytes_with_base(
                 request,
                 Some(object.version.clone()),
                 bytes.to_vec(),
                 candidates,
                 options.policy,
-                touch_parent_on_create,
-                exclusive_create,
-                options.foreground_replica_repair,
-                detach_request,
-                replay_response_journal,
-                operation_id.map(ToOwned::to_owned),
+                DfsDistributedWriteOptions {
+                    touch_parent_on_create,
+                    creation: if exclusive_create {
+                        DfsWriteCreation::Exclusive
+                    } else {
+                        DfsWriteCreation::Upsert
+                    },
+                    repair: if options.foreground_replica_repair {
+                        DfsWriteRepair::Foreground
+                    } else {
+                        DfsWriteRepair::Background
+                    },
+                    dispatch: if detach_request {
+                        DfsWriteDispatch::Detached
+                    } else {
+                        DfsWriteDispatch::AwaitResponse
+                    },
+                    replay_response_journal,
+                    operation_id: operation_id.map(ToOwned::to_owned),
+                },
             )
         } else {
             let manifest = manifest
                 .as_ref()
                 .expect("local metadata-primary write published a blob-only manifest");
-            self.write_distributed_eventual_from_local_manifest_with_candidates_and_parent_touch_and_operation_id(
+            self.write_distributed_manifest_with_candidates(
                 request,
                 Some(object.version.clone()),
                 manifest.content_hash.clone(),
                 manifest.size_bytes,
                 candidates,
                 options.policy,
-                touch_parent_on_create,
-                options.foreground_replica_repair,
-                detach_request,
-                replay_response_journal,
-                operation_id.map(ToOwned::to_owned),
+                DfsDistributedWriteOptions {
+                    touch_parent_on_create,
+                    creation: DfsWriteCreation::Upsert,
+                    repair: if options.foreground_replica_repair {
+                        DfsWriteRepair::Foreground
+                    } else {
+                        DfsWriteRepair::Background
+                    },
+                    dispatch: if detach_request {
+                        DfsWriteDispatch::Detached
+                    } else {
+                        DfsWriteDispatch::AwaitResponse
+                    },
+                    replay_response_journal,
+                    operation_id: operation_id.map(ToOwned::to_owned),
+                },
             )
         };
         let outcome = match outcome {
@@ -3733,26 +3761,44 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         .to_string(),
                 })
             })?;
-            self.write_distributed_eventual_from_reader_with_candidates_and_base_and_parent_touch_and_operation_id_and_mode(
+            self.write_stable_distributed_reader(
                 request,
                 Some(object.version.clone()),
                 reader,
                 candidates,
                 options.policy,
-                touch_parent_on_create,
-                exclusive_create,
-                options.foreground_replica_repair,
                 operation_id,
+                DfsDistributedWriteOptions {
+                    touch_parent_on_create,
+                    creation: if exclusive_create {
+                        DfsWriteCreation::Exclusive
+                    } else {
+                        DfsWriteCreation::Upsert
+                    },
+                    repair: if options.foreground_replica_repair {
+                        DfsWriteRepair::Foreground
+                    } else {
+                        DfsWriteRepair::Background
+                    },
+                    ..DfsDistributedWriteOptions::default()
+                },
             )
         } else {
-            self.write_distributed_eventual_from_reader_with_candidates_and_parent_touch_and_operation_id(
+            self.write_distributed_reader_with_candidates(
                 request,
                 reader,
                 candidates,
                 options.policy,
-                touch_parent_on_create,
-                options.foreground_replica_repair,
-                operation_id,
+                DfsDistributedWriteOptions {
+                    touch_parent_on_create,
+                    repair: if options.foreground_replica_repair {
+                        DfsWriteRepair::Foreground
+                    } else {
+                        DfsWriteRepair::Background
+                    },
+                    operation_id,
+                    ..DfsDistributedWriteOptions::default()
+                },
             )
         };
         let outcome = match outcome {
@@ -4041,14 +4087,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         };
         let mut overlay = RangedWriteOverlayReader::new(current, offset, reader);
-        let outcome = self.write_distributed_eventual_from_reader_with_base_and_parent_touch(
+        let outcome = self.write_distributed_reader_with_base(
             request,
             Some(base_version),
             &mut overlay,
             plan.desired_replica_nodes,
             options.policy,
-            false,
-            options.foreground_replica_repair,
+            DfsDistributedWriteOptions {
+                touch_parent_on_create: false,
+                repair: if options.foreground_replica_repair {
+                    DfsWriteRepair::Foreground
+                } else {
+                    DfsWriteRepair::Background
+                },
+                operation_id: None,
+                ..DfsDistributedWriteOptions::default()
+            },
         )?;
         let result_size = overlay
             .result_size_bytes()
@@ -4262,13 +4316,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         current[start..end].copy_from_slice(bytes);
         let result_size = current.len() as u64;
-        let outcome = self.write_distributed_eventual_with_base_and_repair_mode(
+        let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),
             current,
             plan.desired_replica_nodes,
             options.policy,
-            options.foreground_replica_repair,
+            DfsDistributedWriteOptions {
+                touch_parent_on_create: false,
+                creation: DfsWriteCreation::Upsert,
+                repair: if options.foreground_replica_repair {
+                    DfsWriteRepair::Foreground
+                } else {
+                    DfsWriteRepair::Background
+                },
+                dispatch: DfsWriteDispatch::AwaitResponse,
+                replay_response_journal: true,
+                operation_id: None,
+            },
         )?;
         let outcome = if options.wait_for_commit {
             self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?
@@ -4396,13 +4461,24 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let plan =
             self.plan_distributed_eventual_replicas(&request, candidates, options.policy.clone())?;
-        let outcome = self.write_distributed_eventual_with_base_and_repair_mode(
+        let outcome = self.write_distributed_bytes_with_base(
             request,
             Some(base_version),
             current,
             plan.desired_replica_nodes,
             options.policy,
-            options.foreground_replica_repair,
+            DfsDistributedWriteOptions {
+                touch_parent_on_create: false,
+                creation: DfsWriteCreation::Upsert,
+                repair: if options.foreground_replica_repair {
+                    DfsWriteRepair::Foreground
+                } else {
+                    DfsWriteRepair::Background
+                },
+                dispatch: DfsWriteDispatch::AwaitResponse,
+                replay_response_journal: true,
+                operation_id: None,
+            },
         )?;
         let outcome = if options.wait_for_commit {
             self.settle_ready_write_outcome(outcome, options.foreground_replica_repair)?

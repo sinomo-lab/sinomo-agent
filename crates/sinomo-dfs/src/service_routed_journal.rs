@@ -14,7 +14,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         shard_id: &DfsMetadataShardId,
     ) -> Result<Option<u64>, DfsError> {
-        if let Some(after_sequence) = self.local_metadata_journal_cursors.get(shard_id) {
+        if let Some(after_sequence) = self
+            .replication
+            .local_metadata_journal_cursors
+            .get(shard_id)
+        {
             return Ok(Some(*after_sequence));
         }
         self.metadata_journal_last_sequence_for_shard(shard_id)
@@ -105,7 +109,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     Ok(applied_entries) => applied_entries,
                     Err(error) => {
                         let reason = error.to_string();
-                        if metadata_journal_rejection_allows_snapshot_repair(&reason) {
+                        if error.rejection_code().allows_snapshot_repair() {
                             self.request_metadata_snapshot_repair_from_primary(
                                 primary_node_id,
                                 &batch.shard_id,
@@ -160,7 +164,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 applied_entries: 0,
                 verified_prefix_only: false,
                 verified_authority_probe_id: None,
-                result: DfsMetadataJournalBatchResult::Rejected { reason },
+                result: DfsMetadataJournalBatchResult::rejected(
+                    DfsMetadataRejectionCode::ReplicaDiverged,
+                    reason,
+                ),
             }),
         )?;
         Ok(())

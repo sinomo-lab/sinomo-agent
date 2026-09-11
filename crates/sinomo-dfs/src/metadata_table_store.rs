@@ -204,32 +204,7 @@ fn metadata_table_file_platform_identity(_path: &Path, metadata: &fs::Metadata) 
 
 #[cfg(windows)]
 fn metadata_table_file_platform_identity(path: &Path, _metadata: &fs::Metadata) -> Option<String> {
-    use std::mem::MaybeUninit;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let file = fs::File::open(path).ok()?;
-    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-    // SAFETY: `file` owns a live OS handle and `information` points to writable
-    // storage for the exact structure required by GetFileInformationByHandle.
-    let has_information = unsafe {
-        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr()) != 0
-    };
-    if !has_information {
-        return None;
-    }
-    // SAFETY: a successful GetFileInformationByHandle call initialized the
-    // complete BY_HANDLE_FILE_INFORMATION value.
-    let information = unsafe { information.assume_init() };
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Some(format!(
-        "windows:{}:{file_index}",
-        information.dwVolumeSerialNumber
-    ))
+    crate::metadata_io::windows_path_identity(path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -614,7 +589,7 @@ fn read_metadata_table_snapshot(
                 ))
             })?;
         if &actual != expected {
-            return Err(MetadataBackendError::Serde(format!(
+            return Err(MetadataBackendError::replica_diverged(format!(
                 "DFS metadata table snapshot semantic checksum mismatch at {}",
                 path.display()
             )));

@@ -1281,6 +1281,8 @@ pub struct DfsRepairAttemptSnapshot {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct DfsMetadataReplicationSuppressionRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<crate::DfsMetadataRejectionCode>,
     pub target_node_id: NodeId,
     pub shard_id: DfsMetadataShardId,
     pub shard_epoch: u64,

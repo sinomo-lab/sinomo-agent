@@ -1825,7 +1825,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: &DfsNamespaceTransaction,
         shard_id: &DfsMetadataShardId,
     ) -> Option<DfsNamespaceRequestRecord> {
-        let active = self.active_durable_namespace_request.as_ref()?;
+        let active = self.namespace_execution.request()?;
         if &active.authority_shard_id != shard_id
             || matches!(
                 active.operation,
@@ -1849,7 +1849,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         transaction: &DfsNamespaceTransaction,
         shard_id: &DfsMetadataShardId,
     ) -> Option<DfsNamespaceRequestCompletion> {
-        let active = self.active_durable_namespace_request.as_ref()?;
+        let active = self.namespace_execution.request()?;
         if &active.authority_shard_id != shard_id
             || !matches!(
                 active.operation,
@@ -2340,8 +2340,6 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 }
                             }
                             durable_execute => {
-                                self.active_durable_namespace_prepare_recorded = false;
-                                self.active_durable_namespace_job_recorded = false;
                                 let replaying_pending_request = durable_execute.as_ref().and_then(
                                     |admission| match admission {
                                         DurableNamespaceRequestAdmission::Execute {
@@ -2354,16 +2352,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                         | DurableNamespaceRequestAdmission::Reject { .. } => None,
                                     },
                                 );
-                                self.active_durable_namespace_request = durable_execute
-                                    .as_ref()
-                                    .and_then(|admission| match admission {
-                                        DurableNamespaceRequestAdmission::Execute {
-                                            record,
-                                            ..
-                                        } => Some(record.clone()),
-                                        DurableNamespaceRequestAdmission::Replay { .. }
-                                        | DurableNamespaceRequestAdmission::Reject { .. } => None,
-                                    });
+                                self.namespace_execution.begin_request(
+                                    durable_execute.as_ref().and_then(
+                                        |admission| match admission {
+                                            DurableNamespaceRequestAdmission::Execute {
+                                                record,
+                                                ..
+                                            } => Some(record.clone()),
+                                            DurableNamespaceRequestAdmission::Replay { .. }
+                                            | DurableNamespaceRequestAdmission::Reject { .. } => {
+                                                None
+                                            }
+                                        },
+                                    ),
+                                );
                                 let execute_started = Instant::now();
                                 let previous_operation_context = if foreign_shard.is_none() {
                                     self.replace_namespace_operation_context(
@@ -2375,7 +2377,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                     // refresh authority and may pump nested
                                     // requests while settling. They must never
                                     // inherit an outer local planning snapshot.
-                                    self.active_namespace_operation_context.take()
+                                    self.namespace_execution.replace_context(None)
                                 };
                                 let outcome = match (&foreign_shard, &mut command.operation) {
                                     (
@@ -2502,13 +2504,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                                 self.restore_namespace_operation_context(
                                     previous_operation_context,
                                 );
-                                let durable_prepare_recorded =
-                                    self.active_durable_namespace_prepare_recorded;
-                                let durable_job_recorded =
-                                    self.active_durable_namespace_job_recorded;
-                                self.active_durable_namespace_request = None;
-                                self.active_durable_namespace_prepare_recorded = false;
-                                self.active_durable_namespace_job_recorded = false;
+                                let durability = self.namespace_execution.finish_request();
+                                let durable_prepare_recorded = durability.prepare_recorded;
+                                let durable_job_recorded = durability.job_recorded;
                                 trace_execute_ms = execute_started.elapsed().as_millis();
                                 let retryable_error = outcome.as_ref().err().is_some_and(|error| {
                                     namespace_execution_must_remain_pending(
@@ -3174,6 +3172,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
     ) -> Result<Vec<DfsNamespaceShardCursor>, DfsError> {
         Ok(self
+            .replication
             .local_metadata_journal_cursors
             .iter()
             .map(|(shard_id, after_sequence)| DfsNamespaceShardCursor {

@@ -335,8 +335,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             job_id,
             file_system_id: directory.file_system_id,
             origin: self
-                .active_durable_namespace_request
-                .as_ref()
+                .namespace_execution
+                .request()
                 .map(DfsNamespaceJobOrigin::from_request),
             kind: DfsNamespaceJobKind::ClearDirectoryRecursive,
             status: DfsNamespaceJobStatus::Running,
@@ -381,12 +381,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             });
             if job.status != DfsNamespaceJobStatus::Failed
                 && job.origin.as_ref().is_some_and(|origin| {
-                    self.active_durable_namespace_request
-                        .as_ref()
+                    self.namespace_execution
+                        .request()
                         .is_some_and(|request| origin.matches_request(request))
                 })
             {
-                self.active_durable_namespace_job_recorded = true;
+                self.namespace_execution.record_job();
             }
         }
         if namespace_job_kind_is_cross_shard(&job.kind) {
@@ -691,8 +691,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             job_id,
             file_system_id: source.file_system_id.clone(),
             origin: self
-                .active_durable_namespace_request
-                .as_ref()
+                .namespace_execution
+                .request()
                 .map(DfsNamespaceJobOrigin::from_request),
             kind: DfsNamespaceJobKind::RenameDirectory,
             status: DfsNamespaceJobStatus::Running,

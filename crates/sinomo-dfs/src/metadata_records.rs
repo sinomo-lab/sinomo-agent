@@ -1371,6 +1371,47 @@ fn require_prepare_outer_file_system(
 }
 
 impl DfsMetadataMutation {
+    /// Filesystem named by the mutation routing envelope. Embedded records
+    /// still require independent validation before replica ingestion.
+    pub fn file_system_id(&self) -> &DfsFileSystemId {
+        match self {
+            DfsMetadataMutation::PutFileSystem { file_system_id, .. }
+            | DfsMetadataMutation::PutObject { file_system_id, .. }
+            | DfsMetadataMutation::PutVersion { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
+            | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
+            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
+            | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
+            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
+            | DfsMetadataMutation::PutReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
+            | DfsMetadataMutation::PutIntent { file_system_id, .. }
+            | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
+            | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
+            | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
+            | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
+            | DfsMetadataMutation::PutConflict { file_system_id, .. }
+            | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
+            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
+            | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
+            | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
+            | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
+                file_system_id
+            }
+        }
+    }
+
     /// Whether applying this mutation can change the object row that determines
     /// visible path-to-shard placement.
     ///
@@ -3528,44 +3569,8 @@ pub(crate) fn metadata_journal_batch_file_system_id(
 ) -> Option<DfsFileSystemId> {
     batch
         .entries
-        .iter()
-        .map(|entry| match &entry.mutation {
-            DfsMetadataMutation::PutFileSystem { file_system_id, .. }
-            | DfsMetadataMutation::PutObject { file_system_id, .. }
-            | DfsMetadataMutation::PutVersion { file_system_id, .. }
-            | DfsMetadataMutation::RemoveVersion { file_system_id, .. }
-            | DfsMetadataMutation::PutVersionPin { file_system_id, .. }
-            | DfsMetadataMutation::RemoveVersionPin { file_system_id, .. }
-            | DfsMetadataMutation::ReconcileCrossShardPinTransfer { file_system_id, .. }
-            | DfsMetadataMutation::RemoveCrossShardPinTransfer { file_system_id, .. }
-            | DfsMetadataMutation::FinalizeCrossShardSourceEviction { file_system_id, .. }
-            | DfsMetadataMutation::PutReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveReceipt { file_system_id, .. }
-            | DfsMetadataMutation::PutIntent { file_system_id, .. }
-            | DfsMetadataMutation::PutIntentReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveIntentReceipt { file_system_id, .. }
-            | DfsMetadataMutation::MergeIntentReceiptRetention { file_system_id, .. }
-            | DfsMetadataMutation::CommitVisibleVersion { file_system_id, .. }
-            | DfsMetadataMutation::RemoveVisibleCommit { file_system_id, .. }
-            | DfsMetadataMutation::PutConflict { file_system_id, .. }
-            | DfsMetadataMutation::PutAdvisoryLockState { file_system_id, .. }
-            | DfsMetadataMutation::ApplyNamespaceTransaction { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceTransactionReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveNamespaceTransactionReceipt { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespacePrepare { file_system_id, .. }
-            | DfsMetadataMutation::CommitNamespacePrepare { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespacePrepareReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveNamespacePrepareReceipt { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceJob { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceJobReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveNamespaceJobReceipt { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceRequest { file_system_id, .. }
-            | DfsMetadataMutation::PutNamespaceRequestReceipt { file_system_id, .. }
-            | DfsMetadataMutation::RemoveNamespaceRequestReceipt { file_system_id, .. } => {
-                file_system_id.clone()
-            }
-        })
-        .next()
+        .first()
+        .map(|entry| entry.mutation.file_system_id().clone())
 }
 
 pub(crate) fn read_conflicts_reason(conflicts: Vec<DfsConflictReadView>) -> String {

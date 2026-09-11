@@ -180,13 +180,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 message: format!("intent {intent_id} is not ready to commit"),
             });
         }
-        let pending =
-            self.pending_writes
-                .get(intent_id)
-                .cloned()
-                .ok_or_else(|| DfsError::Distributed {
-                    message: format!("missing pending write for committed intent: {intent_id}"),
-                })?;
+        let pending = self
+            .writes
+            .pending_writes
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!("missing pending write for committed intent: {intent_id}"),
+            })?;
         // PendingNetworkedWrite retains the effective primary execution mode.
         // Every path that crosses W, including fetch completion and recovery,
         // must use this same value rather than supplying a call-site default.
@@ -535,7 +536,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !matches!(intent.state, DfsWriteIntentState::Committed) {
             return Ok(());
         }
-        let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+        let Some(pending) = self.writes.pending_writes.get(intent_id).cloned() else {
             return Ok(());
         };
         if replica_node_id == &self.node_id || replica_node_id == &intent.requesting_node_id {
@@ -638,7 +639,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         content_hash: &str,
         requester_node_id: &NodeId,
     ) {
-        self.active_replica_stages.insert(
+        self.writes.active_replica_stages.insert(
             object_id.clone(),
             ActiveReplicaStage {
                 intent_id: intent_id.to_string(),
@@ -655,11 +656,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         version: &DfsVersion,
     ) {
         if self
+            .writes
             .active_replica_stages
             .get(object_id)
             .is_some_and(|stage| &stage.version == version)
         {
-            self.active_replica_stages.remove(object_id);
+            self.writes.active_replica_stages.remove(object_id);
         }
     }
 
@@ -668,7 +670,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         object_id: &DfsObjectId,
     ) -> Result<(), DfsError> {
-        if self.pending_writes.contains_key(intent_id) {
+        if self.writes.pending_writes.contains_key(intent_id) {
             return Ok(());
         }
         let Some(record) = (match self.metadata_backend.as_ref() {
@@ -744,7 +746,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .pending_write_size_hint(&record.object_id, &record.target_version, &content_hash)?
             .or(local_manifest_size)
             .unwrap_or(0);
-        self.pending_writes.insert(
+        self.writes.pending_writes.insert(
             intent_id.to_string(),
             PendingNetworkedWrite::new(
                 record.object_id,
@@ -1950,7 +1952,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return self.local_write_outcome(intent_id, intent);
         }
-        if let Some(pending) = self.pending_routed_writes.get(intent_id) {
+        if let Some(pending) = self.writes.pending_routed_writes.get(intent_id) {
             match &pending.result {
                 Some(Ok(outcome)) => return Ok(outcome.clone()),
                 Some(Err(error)) => return Err(error.clone()),
@@ -1958,6 +1960,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             if pending.canonical_request_id != intent_id
                 && let Some(canonical) = self
+                    .writes
                     .pending_routed_writes
                     .get(&pending.canonical_request_id)
             {
@@ -2002,7 +2005,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent: &DistributedWriteIntent,
     ) -> Result<NetworkedDfsWriteOutcome, DfsError> {
         if matches!(intent.state, DfsWriteIntentState::Committed) {
-            let pending = self.pending_writes.get(intent_id);
+            let pending = self.writes.pending_writes.get(intent_id);
             let content_hash = pending
                 .map(|pending| pending.content_hash.clone())
                 .or_else(|| {
@@ -2041,7 +2044,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             })
         } else {
             let _pending =
-                self.pending_writes
+                self.writes
+                    .pending_writes
                     .get(intent_id)
                     .ok_or_else(|| DfsError::Distributed {
                         message: format!("missing pending write: {intent_id}"),

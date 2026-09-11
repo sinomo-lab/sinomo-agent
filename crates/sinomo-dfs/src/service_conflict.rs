@@ -387,7 +387,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             return Ok(DfsInvisibleCreateRecovery::Preserve);
         }
         self.add_transient_object_metadata(base_object)?;
-        self.pending_writes.insert(
+        self.writes.pending_writes.insert(
             observed_intent.intent_id.clone(),
             PendingNetworkedWrite::new(
                 observed_intent.object_id.clone(),

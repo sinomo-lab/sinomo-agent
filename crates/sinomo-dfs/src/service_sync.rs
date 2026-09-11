@@ -1335,7 +1335,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .chain(pending_catchup_batches.keys())
             .chain(pending_checkpoint_snapshots.keys())
         {
-            self.pending_metadata_replications.remove(request_id);
+            self.replication
+                .pending_metadata_replications
+                .remove(request_id);
         }
         pending_prefix_probes.clear();
         pending_catchup_batches.clear();
@@ -1357,7 +1359,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         probe_barrier_id: &str,
         pending_catchup_batches: &mut BTreeMap<String, NodeId>,
     ) -> Result<BTreeSet<NodeId>, DfsError> {
-        self.pending_metadata_replications
+        self.replication
+            .pending_metadata_replications
             .retain(|_, pending| pending.created_at.elapsed() < Duration::from_secs(60));
         let Some(backend) = self.metadata_backend.as_deref() else {
             return Ok(BTreeSet::new());
@@ -1392,11 +1395,16 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if target_node_id == self.node_id || after_sequence >= target.journal_sequence {
                 continue;
             }
-            if self.pending_metadata_replications.values().any(|pending| {
-                pending.target_node_id == target_node_id
-                    && pending.shard_id == target.shard_id
-                    && !pending.verify_prefix_only
-            }) {
+            if self
+                .replication
+                .pending_metadata_replications
+                .values()
+                .any(|pending| {
+                    pending.target_node_id == target_node_id
+                        && pending.shard_id == target.shard_id
+                        && !pending.verify_prefix_only
+                })
+            {
                 continue;
             }
             let prepared_batch =
@@ -1509,7 +1517,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         let Some(pending) = pending_by_response.remove(&response_key) else {
                             continue;
                         };
-                        self.pending_metadata_replications
+                        self.replication
+                            .pending_metadata_replications
                             .insert(response.request_id.clone(), pending);
                         let event = self.handle_metadata_journal_batch_response(
                             source_node_id.clone(),
@@ -1551,7 +1560,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // Preserve the same request identity and enqueue every omitted
             // target on the canonical routed path so a slow first handshake
             // cannot livelock a durability barrier.
-            self.pending_metadata_replications
+            self.replication
+                .pending_metadata_replications
                 .insert(request_id.clone(), pending);
             pending_catchup_batches.insert(request_id.clone(), target_node_id.clone());
             let sent = self.send_best_effort_message_if_routable(
@@ -1559,7 +1569,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 DfsNetworkMessage::MetadataJournalBatch(command),
             )?;
             if !sent {
-                self.pending_metadata_replications.remove(&request_id);
+                self.replication
+                    .pending_metadata_replications
+                    .remove(&request_id);
                 pending_catchup_batches.remove(&request_id);
             }
         }
@@ -1716,7 +1728,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             {
                 continue;
             }
-            self.pending_metadata_replications.insert(
+            self.replication.pending_metadata_replications.insert(
                 request_id.clone(),
                 PendingMetadataReplication {
                     target_node_id: target_node_id.clone(),
@@ -1784,7 +1796,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if outcome.result.is_ok() {
                 pending_prefix_probes.insert(request_id, expected_target_node_id);
             } else {
-                self.pending_metadata_replications.remove(&request_id);
+                self.replication
+                    .pending_metadata_replications
+                    .remove(&request_id);
             }
         }
         Ok(rejected_node_ids)
@@ -1872,7 +1886,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     target.state_fingerprint
                 ),
             };
-            self.pending_metadata_replications.insert(
+            self.replication.pending_metadata_replications.insert(
                 request_id.clone(),
                 PendingMetadataReplication {
                     target_node_id: target_node_id.clone(),
@@ -1892,7 +1906,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             // when no route exists. Only an exact target refresh clears it.
             pending_checkpoint_snapshots.insert(request_id.clone(), attempt);
             if !sent {
-                self.pending_metadata_replications.remove(&request_id);
+                self.replication
+                    .pending_metadata_replications
+                    .remove(&request_id);
             }
         }
         Ok(())
@@ -2053,11 +2069,13 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let catchup_prefix = format!("dfs_sync_catchup_{probe_barrier_id}_");
         let probe_prefix = format!("dfs_sync_probe_{probe_barrier_id}_");
         let checkpoint_prefix = format!("dfs_sync_checkpoint_{probe_barrier_id}_");
-        self.pending_metadata_replications.retain(|request_id, _| {
-            !request_id.starts_with(&catchup_prefix)
-                && !request_id.starts_with(&probe_prefix)
-                && !request_id.starts_with(&checkpoint_prefix)
-        });
+        self.replication
+            .pending_metadata_replications
+            .retain(|request_id, _| {
+                !request_id.starts_with(&catchup_prefix)
+                    && !request_id.starts_with(&probe_prefix)
+                    && !request_id.starts_with(&checkpoint_prefix)
+            });
     }
 }
 
@@ -2613,6 +2631,7 @@ mod tests {
                             result: if rejected {
                                 DfsMetadataJournalBatchResult::Rejected {
                                     reason: "test metadata journal rejection".to_string(),
+                                    code: None,
                                 }
                             } else {
                                 DfsMetadataJournalBatchResult::Applied
@@ -2629,6 +2648,7 @@ mod tests {
                             result: if self.reject_snapshot_installs {
                                 DfsMetadataSnapshotInstallResult::Rejected {
                                     reason: "test snapshot rejection".to_string(),
+                                    code: None,
                                 }
                             } else {
                                 DfsMetadataSnapshotInstallResult::Installed {
@@ -2787,6 +2807,7 @@ mod tests {
                                 } else {
                                     DfsMetadataJournalBatchResult::Rejected {
                                         reason: "direct prefix mismatch".to_string(),
+                                        code: None,
                                     }
                                 },
                             },
@@ -3120,7 +3141,13 @@ mod tests {
             fixture.service.transport.catchup_rpc_requests.is_empty(),
             "the canonical direct batch must avoid the sequential routed fallback"
         );
-        assert!(fixture.service.pending_metadata_replications.is_empty());
+        assert!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .is_empty()
+        );
         let backend = fixture
             .service
             .metadata_backend
@@ -3175,7 +3202,11 @@ mod tests {
             "only direct omissions should use the routed fallback"
         );
         assert_eq!(
-            fixture.service.pending_metadata_replications.len(),
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .len(),
             replicas.len() - 1,
             "routed omissions must remain request-scoped until their replies arrive"
         );
@@ -3198,7 +3229,13 @@ mod tests {
                 "direct and routed siblings must converge on the same frozen prefix"
             );
         }
-        assert!(fixture.service.pending_metadata_replications.is_empty());
+        assert!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3247,7 +3284,11 @@ mod tests {
         );
         assert_eq!(pending_prefix_probes.len(), replicas.len() - 1);
         assert_eq!(
-            fixture.service.pending_metadata_replications.len(),
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .len(),
             replicas.len() - 1
         );
     }
@@ -3338,7 +3379,14 @@ mod tests {
             1,
             "response completion without the exact durable confirmation must not suppress fallback"
         );
-        assert_eq!(fixture.service.pending_metadata_replications.len(), 1);
+        assert_eq!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .len(),
+            1
+        );
         assert_eq!(
             fixture
                 .service
@@ -3365,7 +3413,13 @@ mod tests {
                 .expect("replica cursor after routed acknowledgement"),
             target.journal_sequence
         );
-        assert!(fixture.service.pending_metadata_replications.is_empty());
+        assert!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3397,6 +3451,7 @@ mod tests {
         ] {
             fixture
                 .service
+                .replication
                 .pending_metadata_replications
                 .insert(request_id.to_string(), pending.clone());
         }
@@ -3405,10 +3460,18 @@ mod tests {
             .service
             .clear_pending_metadata_sync_replications_for_barrier("owned-barrier");
 
-        assert_eq!(fixture.service.pending_metadata_replications.len(), 1);
+        assert_eq!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .len(),
+            1
+        );
         assert!(
             fixture
                 .service
+                .replication
                 .pending_metadata_replications
                 .contains_key("unrelated_same_shard_replication"),
             "cleanup must remove only request identities owned by this barrier"
@@ -5669,7 +5732,13 @@ mod tests {
         assert_eq!(metadata_sync_snapshot_build_calls(), 1);
         assert_eq!(attempts.len(), 1);
         assert_eq!(fixture.service.transport.snapshot_install_count, 0);
-        assert!(fixture.service.pending_metadata_replications.is_empty());
+        assert!(
+            fixture
+                .service
+                .replication
+                .pending_metadata_replications
+                .is_empty()
+        );
 
         fixture
             .service

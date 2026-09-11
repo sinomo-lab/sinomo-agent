@@ -856,7 +856,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             .expect("authority request carries probe"),
                     )
                     .expect("prepared authority probe has an exact prefix confirmation");
-                    self.pending_metadata_authority_probes.insert(
+                    self.replication.pending_metadata_authority_probes.insert(
                         request_id.clone(),
                         PendingMetadataAuthorityProbe {
                             target_node_id: target_node_id.clone(),
@@ -874,7 +874,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         Err(error) => return Err(error),
                     };
                     if !sent {
-                        self.pending_metadata_authority_probes.remove(&request_id);
+                        self.replication
+                            .pending_metadata_authority_probes
+                            .remove(&request_id);
                         continue;
                     }
                     request_ids.push(request_id.clone());
@@ -884,7 +886,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     self.process_incoming()?;
                     let mut unresolved = false;
                     for (request_id, target_node_id) in &request_targets {
-                        match self.metadata_authority_probe_results.get(request_id) {
+                        match self
+                            .replication
+                            .metadata_authority_probe_results
+                            .get(request_id)
+                        {
                             Some(true) => {
                                 acknowledged_node_ids.insert(target_node_id.clone());
                             }
@@ -953,6 +959,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let durable_replicated_through_sequence =
             backend.metadata_replication_cursor(target_node_id, &prepared_batch.shard_id)?;
         let replicated_through_sequence = self
+            .replication
             .metadata_replication_cursors
             .get(&(target_node_id.clone(), prepared_batch.shard_id.clone()))
             .copied()
@@ -1025,6 +1032,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) {
         let acknowledged_sequence = {
             let cursor = self
+                .replication
                 .metadata_replication_cursors
                 .entry((target_node_id.clone(), shard_id.clone()))
                 .or_insert(0);
@@ -1056,8 +1064,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn clear_metadata_authority_probe_requests(&mut self, request_ids: &[String]) {
         for request_id in request_ids {
-            self.pending_metadata_authority_probes.remove(request_id);
-            self.metadata_authority_probe_results.remove(request_id);
+            self.replication
+                .pending_metadata_authority_probes
+                .remove(request_id);
+            self.replication
+                .metadata_authority_probe_results
+                .remove(request_id);
         }
     }
 
@@ -2100,6 +2112,7 @@ mod authority_probe_tests {
                         } else {
                             DfsMetadataJournalBatchResult::Rejected {
                                 reason: "stale authority".to_string(),
+                                code: None,
                             }
                         },
                     },
@@ -2147,6 +2160,7 @@ mod authority_probe_tests {
                 } else {
                     DfsMetadataJournalBatchResult::Rejected {
                         reason: "stale authority".to_string(),
+                        code: None,
                     }
                 },
             }))
@@ -2816,8 +2830,18 @@ mod authority_probe_tests {
             .expect("fresh full-shard authority");
 
         assert_eq!(txn_calls.load(Ordering::SeqCst), 0);
-        assert!(service.pending_metadata_authority_probes.is_empty());
-        assert!(service.metadata_authority_probe_results.is_empty());
+        assert!(
+            service
+                .replication
+                .pending_metadata_authority_probes
+                .is_empty()
+        );
+        assert!(
+            service
+                .replication
+                .metadata_authority_probe_results
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3080,6 +3104,7 @@ mod authority_probe_tests {
         );
         assert_eq!(
             service
+                .replication
                 .metadata_replication_cursors
                 .get(&(replica, prepared_batch.shard_id.clone())),
             Some(&prepared_batch.next_after_sequence),
@@ -3115,8 +3140,18 @@ mod authority_probe_tests {
             "the unavailable member must force the explicit degraded-path authorization"
         );
         assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
-        assert!(service.pending_metadata_authority_probes.is_empty());
-        assert!(service.metadata_authority_probe_results.is_empty());
+        assert!(
+            service
+                .replication
+                .pending_metadata_authority_probes
+                .is_empty()
+        );
+        assert!(
+            service
+                .replication
+                .metadata_authority_probe_results
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3493,8 +3528,18 @@ mod authority_probe_tests {
             );
 
             assert_eq!(txn_calls.load(Ordering::SeqCst), 1);
-            assert!(service.pending_metadata_authority_probes.is_empty());
-            assert!(service.metadata_authority_probe_results.is_empty());
+            assert!(
+                service
+                    .replication
+                    .pending_metadata_authority_probes
+                    .is_empty()
+            );
+            assert!(
+                service
+                    .replication
+                    .metadata_authority_probe_results
+                    .is_empty()
+            );
         }
     }
 

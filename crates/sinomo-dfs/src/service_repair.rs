@@ -89,7 +89,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let now = dfs_now_unix_nanos();
         let mut records = BTreeMap::new();
         for job in self.coordinator.take_message_repair_jobs() {
-            let Some(pending) = self.pending_writes.get(&job.intent_id) else {
+            let Some(pending) = self.writes.pending_writes.get(&job.intent_id) else {
                 continue;
             };
             records.insert(
@@ -188,21 +188,27 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         replica_node_id: &NodeId,
     ) -> bool {
-        self.pending_writes.get(intent_id).is_some_and(|pending| {
-            pending
-                .stage_inflight_request_ids
-                .contains_key(replica_node_id)
-                && !self.stage_retry_is_due(intent_id, replica_node_id)
-        })
+        self.writes
+            .pending_writes
+            .get(intent_id)
+            .is_some_and(|pending| {
+                pending
+                    .stage_inflight_request_ids
+                    .contains_key(replica_node_id)
+                    && !self.stage_retry_is_due(intent_id, replica_node_id)
+            })
     }
 
     fn repair_request_is_active(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
-        self.pending_writes.get(intent_id).is_some_and(|pending| {
-            pending
-                .repair_inflight_request_ids
-                .contains_key(replica_node_id)
-                && !self.repair_retry_is_due(intent_id, replica_node_id)
-        })
+        self.writes
+            .pending_writes
+            .get(intent_id)
+            .is_some_and(|pending| {
+                pending
+                    .repair_inflight_request_ids
+                    .contains_key(replica_node_id)
+                    && !self.repair_retry_is_due(intent_id, replica_node_id)
+            })
     }
 
     /// Reserve a committed target for RepairReplica only after any StageBlob
@@ -212,7 +218,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if self.stage_request_is_active(intent_id, replica_node_id) {
             return false;
         }
-        if let Some(pending) = self.pending_writes.get_mut(intent_id)
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id)
             && pending
                 .stage_inflight_request_ids
                 .remove(replica_node_id)
@@ -331,6 +337,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) -> Result<(), DfsError> {
         self.ensure_repair_response_request_matches_pending(response)?;
         let pending = self
+            .writes
             .pending_writes
             .get(&response.intent_id)
             .expect("pending write validated");
@@ -350,7 +357,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &self,
         response: &DfsRepairReplicaResponse,
     ) -> Result<(), DfsError> {
-        let Some(pending) = self.pending_writes.get(&response.intent_id) else {
+        let Some(pending) = self.writes.pending_writes.get(&response.intent_id) else {
             return Err(DfsError::Distributed {
                 message: format!(
                     "missing pending write for repair response: {}",
@@ -589,7 +596,7 @@ where
         self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
-        if self.pending_writes.is_empty() || max_scheduled == 0 {
+        if self.writes.pending_writes.is_empty() || max_scheduled == 0 {
             return Ok(Vec::new());
         }
         self.repair_retry_tick = self.repair_retry_tick.saturating_add(1);
@@ -621,7 +628,7 @@ where
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
-            let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
+            let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
@@ -721,6 +728,7 @@ where
                     .prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
             {
                 let companion_pending = self
+                    .writes
                     .pending_writes
                     .get(&companion.intent_id)
                     .cloned()
@@ -789,7 +797,12 @@ where
         budget: &mut DfsRepairMaintenanceBudget,
         execution_exclusions: &DfsMaintenanceExecutionExclusions,
     ) -> Result<(), DfsError> {
-        let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
+        let pending_intent_ids = self
+            .writes
+            .pending_writes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
             if budget.is_exhausted() {
                 break;
@@ -800,7 +813,7 @@ where
             if !matches!(intent.state, DfsWriteIntentState::AwaitingReceipts) {
                 continue;
             }
-            while let Some(pending) = self.pending_writes.get(&intent_id).cloned() {
+            while let Some(pending) = self.writes.pending_writes.get(&intent_id).cloned() {
                 let durable_nodes = self
                     .coordinator
                     .receipts_for_intent(&intent_id)
@@ -979,7 +992,7 @@ where
             }
         }
         if skipped_failed_source
-            && let Some(pending) = self.pending_writes.get_mut(&intent.intent_id)
+            && let Some(pending) = self.writes.pending_writes.get_mut(&intent.intent_id)
         {
             pending.fetch_failed_from.clear();
         }
@@ -1049,7 +1062,8 @@ where
                 last_error = send_outcome.last_error;
             }
         }
-        if skipped_failed_source && let Some(pending) = self.pending_writes.get_mut(&job.intent_id)
+        if skipped_failed_source
+            && let Some(pending) = self.writes.pending_writes.get_mut(&job.intent_id)
         {
             pending.fetch_failed_from.clear();
         }
@@ -1076,8 +1090,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.prune_retained_routed_writes();
         // Requesters give up on routed writes after their settle timeout;
         // response obligations they will never consume must not accumulate.
-        if !self.pending_remote_write_responses.is_empty() {
-            self.pending_remote_write_responses
+        if !self.writes.pending_remote_write_responses.is_empty() {
+            self.writes
+                .pending_remote_write_responses
                 .retain(|_, pending| pending.created_at.elapsed() <= DFS_REMOTE_WRITE_RESPONSE_TTL);
         }
     }
@@ -1132,7 +1147,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         self.restore_pending_writes_for_repair_attempt_records(repair_attempts)?;
         self.restore_pending_writes_for_repair_jobs()?;
         self.restore_repair_attempt_records(repair_attempts);
-        if self.pending_writes.is_empty()
+        if self.writes.pending_writes.is_empty()
             || max_scheduled == 0
             || intent_filter.is_some_and(BTreeSet::is_empty)
         {
@@ -1166,7 +1181,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if !self.prepare_repair_target(&job.intent_id, &job.missing_replica_node_id) {
                 continue;
             }
-            let Some(pending) = self.pending_writes.get(&job.intent_id).cloned() else {
+            let Some(pending) = self.writes.pending_writes.get(&job.intent_id).cloned() else {
                 continue;
             };
             if !self.repair_retry_is_due(&job.intent_id, &job.missing_replica_node_id) {
@@ -1261,6 +1276,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     .prepare_repair_target(&companion.intent_id, &companion.missing_replica_node_id)
             {
                 let companion_pending = self
+                    .writes
                     .pending_writes
                     .get(&companion.intent_id)
                     .cloned()
@@ -1323,7 +1339,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn remove_pending_write_state(&mut self, intent_id: &str) {
-        self.pending_writes.remove(intent_id);
+        self.writes.pending_writes.remove(intent_id);
     }
 
     pub(crate) fn cleanup_committed_pending_write_if_repaired(&mut self, intent_id: &str) {
@@ -1342,12 +1358,17 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if has_repair_jobs {
             return;
         }
-        if self.pending_writes.get(intent_id).is_some_and(|pending| {
-            pending
-                .repair_retries
-                .values()
-                .any(|state| state.inflight || state.next_retry_tick > self.repair_retry_tick)
-        }) {
+        if self
+            .writes
+            .pending_writes
+            .get(intent_id)
+            .is_some_and(|pending| {
+                pending
+                    .repair_retries
+                    .values()
+                    .any(|state| state.inflight || state.next_retry_tick > self.repair_retry_tick)
+            })
+        {
             return;
         }
         self.remove_pending_write_state(intent_id);
@@ -1358,7 +1379,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_filter: Option<&BTreeSet<String>>,
         budget: &mut DfsRepairMaintenanceBudget,
     ) -> Result<(), DfsError> {
-        let pending_intent_ids = self.pending_writes.keys().cloned().collect::<Vec<_>>();
+        let pending_intent_ids = self
+            .writes
+            .pending_writes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
         for intent_id in pending_intent_ids {
             if budget.is_exhausted() {
                 break;
@@ -1373,6 +1399,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 continue;
             }
             let Some(object_id) = self
+                .writes
                 .pending_writes
                 .get(&intent_id)
                 .map(|pending| pending.object_id.clone())
@@ -1430,7 +1457,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             if budget.is_exhausted() {
                 break;
             }
-            let Some(pending) = self.pending_writes.get(intent_id).cloned() else {
+            let Some(pending) = self.writes.pending_writes.get(intent_id).cloned() else {
                 break;
             };
             let durable_nodes = self
@@ -1585,7 +1612,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         if skipped_failed_source
-            && let Some(pending) = self.pending_writes.get_mut(&intent.intent_id)
+            && let Some(pending) = self.writes.pending_writes.get_mut(&intent.intent_id)
         {
             pending.fetch_failed_from.clear();
         }
@@ -1625,7 +1652,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             (intent_id.to_string(), source_node_id.clone()),
             std::time::Instant::now(),
         );
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             pending.fetch_inflight_from.insert(source_node_id.clone());
             pending
                 .fetch_inflight_request_ids
@@ -1644,7 +1671,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn expire_stale_fetch_requests(&mut self) {
         let tick = self.repair_retry_tick;
-        for (intent_id, pending) in &mut self.pending_writes {
+        for (intent_id, pending) in &mut self.writes.pending_writes {
             let expired_sources = pending
                 .fetch_inflight_started_ticks
                 .iter()
@@ -1675,7 +1702,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn stage_retry_is_due(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
-        self.pending_writes
+        self.writes
+            .pending_writes
             .get(intent_id)
             .and_then(|pending| pending.stage_retries.get(replica_node_id))
             .is_none_or(|state| state.next_retry_tick <= self.repair_retry_tick)
@@ -1688,7 +1716,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request_id: String,
     ) {
         let tick = self.repair_retry_tick;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             let state = pending
                 .stage_retries
                 .entry(replica_node_id.clone())
@@ -1709,7 +1737,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         replica_node_id: &NodeId,
     ) {
         let tick = self.repair_retry_tick;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             let state = pending
                 .stage_retries
                 .entry(replica_node_id.clone())
@@ -1728,7 +1756,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         replica_node_id: &NodeId,
     ) {
-        if let Some(pending) = self.pending_writes.get_mut(intent_id)
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id)
             && let Some(patch) = pending.patch.as_mut()
         {
             patch
@@ -1739,11 +1767,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     pub(crate) fn repair_retry_is_due(&self, intent_id: &str, replica_node_id: &NodeId) -> bool {
         if self
+            .writes
             .pending_remote_write_responses
             .get(intent_id)
             .is_some_and(|pending| pending.foreground_replica_repair)
         {
-            let Some(pending_write) = self.pending_writes.get(intent_id) else {
+            let Some(pending_write) = self.writes.pending_writes.get(intent_id) else {
                 return false;
             };
             return pending_write
@@ -1762,7 +1791,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         {
             return false;
         }
-        self.pending_writes
+        self.writes
+            .pending_writes
             .get(intent_id)
             .and_then(|pending| pending.repair_retries.get(replica_node_id))
             .is_none_or(|state| {
@@ -1791,7 +1821,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 // from stale retry/backoff bookkeeping.
                 continue;
             }
-            let Some(pending) = self.pending_writes.get_mut(&record.intent_id) else {
+            let Some(pending) = self.writes.pending_writes.get_mut(&record.intent_id) else {
                 continue;
             };
             if pending.object_id != record.object_id
@@ -1850,7 +1880,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     fn repair_queue_records(&self, include_unattempted: bool) -> Vec<DfsRepairAttemptRecord> {
         let now = dfs_now_unix_nanos();
         let mut records = Vec::new();
-        for (intent_id, pending) in &self.pending_writes {
+        for (intent_id, pending) in &self.writes.pending_writes {
             for (replica_node_id, state) in &pending.repair_retries {
                 let key = (intent_id.clone(), replica_node_id.clone());
                 if repair_retry_state_is_suppressed(state) {
@@ -1923,7 +1953,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 if !recorded_targets.insert(key) {
                     continue;
                 }
-                let Some(pending) = self.pending_writes.get(&job.intent_id) else {
+                let Some(pending) = self.writes.pending_writes.get(&job.intent_id) else {
                     continue;
                 };
                 records.push(DfsRepairAttemptRecord {
@@ -2005,7 +2035,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     if let Some(record) = self.repair_attempt_records.get_mut(&key) {
                         record.in_flight = false;
                         record.last_error = Some(reason.clone());
-                    } else if let Some(pending) = self.pending_writes.get(intent_id) {
+                    } else if let Some(pending) = self.writes.pending_writes.get(intent_id) {
                         let state = pending.repair_retries.get(replica_node_id);
                         let attempts = state.map(|state| state.attempts).unwrap_or(1).max(1);
                         let next_retry_unix_nanos = if state
@@ -2089,7 +2119,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         request_id: String,
     ) {
         let tick = self.repair_retry_tick;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             let state = pending
                 .repair_retries
                 .entry(replica_node_id.clone())
@@ -2112,7 +2142,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
 
     fn record_repair_fetch_inflight(&mut self, intent_id: &str, replica_node_id: &NodeId) {
         let tick = self.repair_retry_tick;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             let state = pending
                 .repair_retries
                 .entry(replica_node_id.clone())
@@ -2144,7 +2174,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     ) {
         let tick = self.repair_retry_tick;
         let mut record_update = None;
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             let state = pending
                 .repair_retries
                 .entry(replica_node_id.clone())
@@ -2212,10 +2242,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if let Some(replica_node_id) = response_replica_node_id {
             replica_node_ids.insert(replica_node_id.clone());
         }
-        if let Some(pending) = self.pending_writes.get(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get(intent_id) {
             replica_node_ids.extend(pending.repair_retries.keys().cloned());
         }
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             for replica_node_id in replica_node_ids {
                 let state = pending
                     .repair_retries
@@ -2231,7 +2261,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             pending.fetch_failed_from.clear();
         }
         if remove_committed_pending_write {
-            self.pending_writes.remove(intent_id);
+            self.writes.pending_writes.remove(intent_id);
         }
     }
 
@@ -2240,7 +2270,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         intent_id: &str,
         replica_node_id: &NodeId,
     ) {
-        if let Some(pending) = self.pending_writes.get_mut(intent_id) {
+        if let Some(pending) = self.writes.pending_writes.get_mut(intent_id) {
             // Receipt persistence, coordinator convergence, and the visible
             // location update all completed before this point. Keeping a
             // timeout-only retry record would retain the whole pending blob
@@ -2309,7 +2339,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                 last_error = send_outcome.last_error;
             }
         }
-        if skipped_failed_source && let Some(pending) = self.pending_writes.get_mut(&job.intent_id)
+        if skipped_failed_source
+            && let Some(pending) = self.writes.pending_writes.get_mut(&job.intent_id)
         {
             pending.fetch_failed_from.clear();
         }

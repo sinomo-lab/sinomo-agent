@@ -52,6 +52,7 @@ mod metadata_prepare_codec;
 mod metadata_read_snapshot;
 mod metadata_receipt;
 mod metadata_records;
+mod metadata_rejection;
 mod metadata_replay;
 mod metadata_replication;
 mod metadata_shard_index;
@@ -480,6 +481,12 @@ pub(crate) use metadata_records::{
     put_visible_version_record_if_changed, read_conflicts_reason,
     remote_read_rejection_prunes_location,
 };
+pub use metadata_rejection::{DfsMetadataRejection, DfsMetadataRejectionCode};
+#[cfg(test)]
+pub(crate) use metadata_rejection::{
+    metadata_journal_rejection_allows_snapshot_repair,
+    metadata_replication_rejection_is_topology_mismatch,
+};
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub use metadata_replication::process_cluster_dfs_metadata_journal_batch_with_replica_context_for_test;
@@ -528,12 +535,10 @@ pub(crate) use metadata_replication::{
     async_dfs_metadata_snapshot_install_sender_from_peer_transport,
     dfs_metadata_journal_batch_sender_from_peer_transport,
     dfs_metadata_snapshot_install_sender_from_peer_transport,
-    metadata_journal_rejection_allows_snapshot_repair,
     schedule_dfs_metadata_publish_async_on_runtime_owned,
 };
 #[cfg(test)]
 pub(crate) use metadata_replication::{
-    metadata_replication_rejection_is_topology_mismatch,
     prepare_dfs_metadata_journal_publish_with_host,
     prepare_dfs_metadata_journal_publish_with_host_and_execution_exclusions,
 };

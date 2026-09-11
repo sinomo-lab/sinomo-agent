@@ -463,13 +463,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if !has_durable_create_prepare {
             return self.apply_committed_intent(intent_id);
         }
-        let pending =
-            self.pending_writes
-                .get(intent_id)
-                .cloned()
-                .ok_or_else(|| DfsError::Distributed {
-                    message: format!("missing pending recovered create intent: {intent_id}"),
-                })?;
+        let pending = self
+            .writes
+            .pending_writes
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| DfsError::Distributed {
+                message: format!("missing pending recovered create intent: {intent_id}"),
+            })?;
         let base_object = self.current_read_object_metadata(&intent.object_id)?;
         self.commit_ready_intent_batched(
             &intent,
