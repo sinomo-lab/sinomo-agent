@@ -28,16 +28,16 @@ pub(crate) fn append_posix_components(path: String, components: &[String]) -> Re
     for component in components {
         current = join_posix_path(&current, component);
     }
-    normalize_posix_path(&current)
+    normalize_posix_walk_path(&current)
 }
 
 pub(crate) fn resolve_posix_symlink_target(link_path: &str, target: &str) -> Result<String> {
     validate_posix_symlink_target(target)?;
     if target.starts_with('/') {
-        return normalize_posix_path(target);
+        return normalize_posix_walk_path(target);
     }
     let parent = parent_posix_path(link_path).unwrap_or_else(|| "/".to_string());
-    normalize_posix_path(&join_posix_path(&parent, target))
+    normalize_posix_walk_path(&join_posix_path(&parent, target))
 }
 
 /// Returns the canonical POSIX path key used to index objects by path, or
@@ -76,9 +76,48 @@ pub(crate) fn normalize_posix_path(path: &str) -> Result<String> {
 }
 
 pub(crate) fn normalize_posix_path_with_trailing_directory(path: &str) -> Result<(String, bool)> {
-    let normalized = normalize_posix_path(path)?;
+    let normalized = normalize_posix_walk_path(path)?;
     let requires_directory = normalized != "/" && path.ends_with('/');
     Ok((normalized, requires_directory))
+}
+
+pub(crate) fn posix_path_has_dot_components(path: &str) -> bool {
+    path.split('/').any(|part| matches!(part, "." | ".."))
+}
+
+/// Route dot-containing requests by their resolved path while preserving the
+/// trailing-directory requirement. Canonical requests retain their exact wire
+/// spelling, including for durable operation-id retries.
+pub(crate) fn path_after_dot_resolution<'a>(
+    path: &'a str,
+    resolved: &str,
+) -> std::borrow::Cow<'a, str> {
+    if !posix_path_has_dot_components(path) {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    std::borrow::Cow::Owned(if path.ends_with('/') && resolved != "/" {
+        format!("{resolved}/")
+    } else {
+        resolved.to_string()
+    })
+}
+
+/// Validate an operation path without discarding components that must be
+/// interpreted after following symlinks. Metadata keys still use the lexical
+/// normalizer, but only after the operation's component walk has completed.
+pub(crate) fn normalize_posix_walk_path(path: &str) -> Result<String> {
+    if !path.starts_with('/') || path.bytes().any(|byte| byte == 0) {
+        return Err(DfsPosixError::InvalidPath {
+            path: path.to_string(),
+        });
+    }
+    Ok(format!(
+        "/{}",
+        path.split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("/")
+    ))
 }
 
 pub(crate) fn validate_posix_symlink_target(target: &str) -> Result<()> {

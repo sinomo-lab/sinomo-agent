@@ -5,7 +5,7 @@
 //! timestamp updates, and routed namespace wrappers.
 
 use super::{POSIX_RECURSIVE_CLEAR_JOB_BATCH_STEPS, now_unix_nanos};
-use crate::namespace::{namespace_transaction_id_for_path, next_version};
+use crate::namespace::{namespace_transaction_id_for_versioned_path, next_version};
 use crate::posix_model::{DfsPosixError, DfsStat, Result};
 use crate::posix_path::{
     hidden_alias_tombstone_path, normalize_posix_path,
@@ -144,7 +144,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation_with_request_id(
                 operation_id,
@@ -359,7 +361,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: String,
         expected: DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation_with_request_id(
                 operation_id,
@@ -391,7 +395,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_rmdir_local(&mut self, path: &str) -> Result<DfsStat> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         if path == "/" {
@@ -439,7 +443,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         expected: &DfsNamespaceObjectPrecondition,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
         let resolved = self.resolve_posix_path_distributed(&normalized, false)?;
         let current = self.lookup_sifs_path(&resolved)?;
         if current.as_ref().is_none_or(|object| {
@@ -457,8 +461,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_rename(&mut self, from: &str, to: &str) -> Result<DfsStat> {
-        let normalized_from = normalize_posix_path(from)?;
-        let normalized_to = normalize_posix_path(to)?;
+        let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
+        let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
+        let from = dispatch_from.as_ref();
+        let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
+        let dispatch_to = crate::posix_path::path_after_dot_resolution(to, &normalized_to);
+        let to = dispatch_to.as_ref();
         let mut primaries = self
             .routed_namespace_primaries_for_paths_fresh([
                 normalized_from.as_str(),
@@ -507,8 +515,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: &str,
     ) -> Result<DfsStat> {
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
-        let normalized_from = normalize_posix_path(from)?;
-        let normalized_to = normalize_posix_path(to)?;
+        let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
+        let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
+        let from = dispatch_from.as_ref();
+        let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
+        let dispatch_to = crate::posix_path::path_after_dot_resolution(to, &normalized_to);
+        let to = dispatch_to.as_ref();
         let operation = DfsNamespaceOperation::Rename {
             from: from.to_string(),
             to: to.to_string(),
@@ -570,8 +582,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         expected_source: DfsNamespaceObjectPrecondition,
         expected_destination: DfsNamespaceDestinationPrecondition,
     ) -> Result<DfsStat> {
-        let normalized_from = normalize_posix_path(from)?;
-        let normalized_to = normalize_posix_path(to)?;
+        let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
+        let dispatch_from = crate::posix_path::path_after_dot_resolution(from, &normalized_from);
+        let from = dispatch_from.as_ref();
+        let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
+        let dispatch_to = crate::posix_path::path_after_dot_resolution(to, &normalized_to);
+        let to = dispatch_to.as_ref();
         let mut primaries = self
             .routed_namespace_primaries_for_paths_fresh([
                 normalized_from.as_str(),
@@ -649,8 +665,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         from: &str,
         to: &str,
     ) -> Result<DfsStat> {
-        let normalized_from = normalize_posix_path(from)?;
-        let normalized_to = normalize_posix_path(to)?;
+        let normalized_from = self.resolve_posix_dot_components_distributed(from)?;
+        let normalized_to = self.resolve_posix_dot_components_distributed(to)?;
         let shard_snapshot = self.refresh_sifs_metadata_shards()?;
         let selected_shard = if let Some(shards) = shard_snapshot.as_deref() {
             let from_shard =
@@ -928,9 +944,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
         }
         let transaction = DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &source.object_id,
+                &source.version,
                 &source.path,
             ),
             file_system_id: source.file_system_id.clone(),
@@ -1037,9 +1054,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         object.version = next_version(&object.version);
 
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_versioned_path(
                 "unlink-hardlink",
                 &object.object_id,
+                &object.version,
                 old_path,
             ),
             file_system_id: object.file_system_id.clone(),

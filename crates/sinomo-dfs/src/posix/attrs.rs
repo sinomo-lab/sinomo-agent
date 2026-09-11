@@ -8,7 +8,6 @@
 use super::now_unix_nanos;
 use crate::namespace::next_version;
 use crate::posix_model::{DfsPosixError, DfsStat, Result};
-use crate::posix_path::normalize_posix_path;
 use crate::{
     DfsMessageTransport, DfsNamespaceOperation, DfsObjectKind, DfsObjectMetadata,
     NetworkedDfsService,
@@ -16,7 +15,9 @@ use crate::{
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     pub fn posix_set_mode(&mut self, path: &str, mode: u32) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,
@@ -58,7 +59,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_set_symlink_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,
@@ -111,7 +114,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,
@@ -142,7 +147,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         accessed_at_unix_nanos: Option<u64>,
         modified_at_unix_nanos: Option<u64>,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,

@@ -53,32 +53,24 @@ pub enum DfsDirectReadClientResult {
     Rejected { reason: String },
 }
 
-/// Successful completion proof for one incrementally consumed DFS read.
-///
-/// Stream consumers must not publish externally visible effects derived from
-/// the bytes until this proof has been returned. Full-object reads verify the
-/// immutable DFS content digest; range reads verify their declared transfer
-/// length because a subset cannot reproduce the full-object digest.
+/// Successful length and framing validation for an incrementally consumed read.
+/// Content corruption is detected by scrub; reads do not rehash stored bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DfsReadStreamCompletion {
     pub content_size_bytes: usize,
+    /// Retained for API compatibility. Ordinary reads return `None` because
+    /// the advertised content identity is not a proof of the received bytes.
     pub verified_content_hash: Option<String>,
 }
 
-/// Stream-native DFS response body with incremental application-level
-/// integrity verification.
-///
-/// Transport framing proves ordered delivery and length. DFS additionally
-/// owns immutable object identity, so full-object reads update one BLAKE3
-/// hasher as the application consumes transport-owned chunks and compare it at
-/// EOF. No contiguous whole-body buffer is retained by this type.
+/// Stream-native DFS response body with incremental length validation.
+/// No content rehashing or contiguous whole-body buffer is needed.
 #[derive(Debug)]
 pub struct DfsVerifiedReadStream {
     body: ObjectRpcIncomingBody,
     expected_size_bytes: usize,
     expected_content_hash: Option<String>,
     observed_size_bytes: usize,
-    hasher: Option<blake3::Hasher>,
     completion: Option<DfsReadStreamCompletion>,
 }
 
@@ -99,9 +91,6 @@ impl DfsVerifiedReadStream {
         Ok(Self {
             body,
             expected_size_bytes,
-            hasher: expected_content_hash
-                .as_ref()
-                .map(|_| blake3::Hasher::new()),
             expected_content_hash,
             observed_size_bytes: 0,
             completion: None,
@@ -126,9 +115,8 @@ impl DfsVerifiedReadStream {
 
     /// Returns the next ownership-bearing transport chunk.
     ///
-    /// The chunk is hashed before it is returned, but the digest is not trusted
-    /// until EOF. Call [`Self::finish`] (or read through EOF) before committing
-    /// effects derived from the stream.
+    /// Call [`Self::finish`] (or read through EOF) to validate the complete
+    /// declared length and terminal transport framing.
     pub async fn next_chunk(&mut self) -> Result<Option<ObjectRpcBodyChunk>, NetworkError> {
         if self.completion.is_some() {
             return Ok(None);
@@ -157,14 +145,11 @@ impl DfsVerifiedReadStream {
                 self.expected_size_bytes
             )));
         }
-        if let Some(hasher) = self.hasher.as_mut() {
-            hasher.update(chunk.as_ref());
-        }
         self.observed_size_bytes = next_size_bytes;
         Ok(Some(chunk))
     }
 
-    /// Drains any unread chunks and returns the terminal DFS integrity proof.
+    /// Drains any unread chunks and returns the terminal length validation.
     pub async fn finish(mut self) -> Result<DfsReadStreamCompletion, NetworkError> {
         while self.next_chunk().await?.is_some() {}
         Ok(self
@@ -210,25 +195,9 @@ impl DfsVerifiedReadStream {
                 self.observed_size_bytes, self.expected_size_bytes
             )));
         }
-        let verified_content_hash = match (
-            self.expected_content_hash.as_ref(),
-            self.hasher.as_ref(),
-        ) {
-            (Some(expected), Some(hasher)) => {
-                let actual = format!("blake3:{}", hasher.finalize().to_hex());
-                if &actual != expected {
-                    return Err(dfs_network_serialization_error(format!(
-                        "DFS read attachment hash mismatch: expected {expected}, actual {actual}"
-                    )));
-                }
-                Some(expected.clone())
-            }
-            (None, None) => None,
-            _ => unreachable!("DFS read verifier hash state is constructed together"),
-        };
         self.completion = Some(DfsReadStreamCompletion {
             content_size_bytes: self.observed_size_bytes,
-            verified_content_hash,
+            verified_content_hash: None,
         });
         Ok(())
     }
@@ -263,10 +232,7 @@ impl DfsDirectReadClientResponse {
             DfsDirectReadClientResult::Found(data) => {
                 let (bytes, completion) =
                     data.stream.collect_to_vec(data.content_size_bytes).await?;
-                debug_assert_eq!(
-                    completion.verified_content_hash.as_deref(),
-                    Some(data.content_hash.as_str())
-                );
+                debug_assert!(completion.verified_content_hash.is_none());
                 DfsReadResult::Found(DfsReadData {
                     object_id: data.object_id,
                     version: data.version,

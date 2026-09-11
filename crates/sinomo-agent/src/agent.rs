@@ -5722,7 +5722,9 @@ impl AgentSessionControlPlane {
         let action = op.action.kind().to_string();
         let is_turn = op.action.is_turn();
         let timeout_ms = op.timeout_ms;
-        let cancellation_token = is_turn.then(AgentCancellationToken::new);
+        let started = std::time::Instant::now();
+        let cancellation_token =
+            is_turn.then(|| AgentCancellationToken::new().with_timeout_ms(timeout_ms));
         let mut events = vec![agent_session_event(
             &op_id,
             &self.session.session_id,
@@ -5791,73 +5793,102 @@ impl AgentSessionControlPlane {
             }
         }
 
-        let started = std::time::Instant::now();
         let outcome = agent.handle_op_with_cancellation(
             &mut self.session,
             op,
             cancellation_token.unwrap_or_else(AgentCancellationToken::new),
-        )?;
-        events.extend(outcome.events.iter().cloned());
-
+        );
+        let timed_out = is_turn
+            && timeout_ms.is_some_and(|timeout| {
+                started.elapsed() >= std::time::Duration::from_millis(timeout)
+            });
         if is_turn {
             self.active_turn = None;
             self.active_turn_cancellation = None;
-            if let Some(task) = task {
-                let timed_out = timeout_ms
-                    .map(|timeout_ms| {
-                        started.elapsed() >= std::time::Duration::from_millis(timeout_ms)
-                    })
-                    .unwrap_or(false);
-                if timed_out && let Some(timeout_ms) = timeout_ms {
-                    events.push(agent_session_event(
+        }
+        if timed_out && let Some(timeout_ms) = timeout_ms {
+            events.push(agent_session_event(
+                &op_id,
+                &self.session.session_id,
+                AgentEventPayload::TurnTimedOut {
+                    sequence,
+                    active_op_id: op_id.clone(),
+                    timeout_ms,
+                    reason: "turn exceeded configured timeout".to_string(),
+                },
+            ));
+        }
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                events.push(agent_session_event(
+                    &op_id,
+                    &self.session.session_id,
+                    AgentEventPayload::OperationRejected {
+                        sequence,
+                        action,
+                        reason: format!("turn execution failed: {error}"),
+                    },
+                ));
+                if let Some(task) = task {
+                    events.push(self.set_task_status(
                         &op_id,
-                        &self.session.session_id,
-                        AgentEventPayload::TurnTimedOut {
-                            sequence,
-                            active_op_id: op_id.clone(),
-                            timeout_ms,
-                            reason: "turn exceeded configured timeout".to_string(),
+                        task,
+                        if timed_out {
+                            AgentTaskLifecycleStatus::TimedOut
+                        } else {
+                            AgentTaskLifecycleStatus::Failed
                         },
+                        Some(error.to_string()),
+                        None,
+                        None,
+                        Vec::new(),
                     ));
                 }
-                let status = if timed_out {
-                    AgentTaskLifecycleStatus::TimedOut
-                } else {
-                    task_status_for_run(&outcome.run)
-                };
-                let progress_summary = outcome.run.as_ref().map(|run| {
-                    format!(
-                        "turn completed with {:?} after {} model turn(s) and {} tool result(s)",
-                        run.stop_reason,
-                        run.model_turns.len(),
-                        run.tool_results.len()
-                    )
-                });
-                let result_ref = outcome
-                    .run
-                    .as_ref()
-                    .and_then(|run| run.candidate_evidence_bundle.as_ref())
-                    .map(|bundle| bundle.bundle_id.as_str().to_string());
-                let event_ids = outcome
-                    .run
-                    .as_ref()
-                    .map(|run| {
-                        run.events
-                            .iter()
-                            .map(|event| event.event_id.clone())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                events.push(self.set_task_status(
-                    &op_id,
-                    task,
-                    status,
-                    progress_summary,
-                    None,
-                    result_ref,
-                    event_ids,
-                ));
+                self.events.extend(events);
+                return Err(error);
             }
+        };
+        events.extend(outcome.events.iter().cloned());
+
+        if is_turn && let Some(task) = task {
+            let status = if timed_out {
+                AgentTaskLifecycleStatus::TimedOut
+            } else {
+                task_status_for_run(&outcome.run)
+            };
+            let progress_summary = outcome.run.as_ref().map(|run| {
+                format!(
+                    "turn completed with {:?} after {} model turn(s) and {} tool result(s)",
+                    run.stop_reason,
+                    run.model_turns.len(),
+                    run.tool_results.len()
+                )
+            });
+            let result_ref = outcome
+                .run
+                .as_ref()
+                .and_then(|run| run.candidate_evidence_bundle.as_ref())
+                .map(|bundle| bundle.bundle_id.as_str().to_string());
+            let event_ids = outcome
+                .run
+                .as_ref()
+                .map(|run| {
+                    run.events
+                        .iter()
+                        .map(|event| event.event_id.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            events.push(self.set_task_status(
+                &op_id,
+                task,
+                status,
+                progress_summary,
+                None,
+                result_ref,
+                event_ids,
+            ));
         }
 
         self.events.extend(events.iter().cloned());
@@ -6429,8 +6460,9 @@ where
             return Ok(result);
         }
 
+        let worker_started = std::time::Instant::now();
         let task = self.agent.config.run_context.task.clone();
-        let cancellation_token = AgentCancellationToken::new();
+        let cancellation_token = AgentCancellationToken::new().with_timeout_ms(timeout_ms);
         state.control.active_turn = Some(AgentActiveTurn::new(
             op_id.clone(),
             sequence,
@@ -6500,7 +6532,6 @@ where
         let worker_action = action;
         let persist_worker_action = worker_action.clone();
         let worker_task = task;
-        let worker_started = std::time::Instant::now();
         let progress_sink = AgentToolProgressSink::new(move |event| {
             if let Ok(mut state) = progress_state.lock() {
                 state.push_runtime_event(AgentRuntimeEventPayload::ToolProgress {
@@ -6539,7 +6570,23 @@ where
             let mut state = worker_state
                 .lock()
                 .expect("agent session runtime lock poisoned");
-            let persist_completed_session = outcome.is_ok();
+            let session_persistence = if outcome.is_ok() {
+                let in_flight = std::mem::take(&mut state.in_flight_input_ids);
+                state.replace_session_preserving_live_inputs(
+                    completed_session,
+                    base_state_revision,
+                    &in_flight,
+                );
+                worker_agent.save_session(&state.control.session)
+            } else {
+                Ok(())
+            };
+            let outcome = match &session_persistence {
+                Ok(()) => outcome,
+                Err(error) => Err(AgentError::SessionStore {
+                    detail: format!("persist merged completed agent session failed: {error}"),
+                }),
+            };
             let control_result = state.finish_turn(AgentSessionRuntimeTurnCompletion {
                 sequence,
                 op_id: worker_op_id,
@@ -6547,8 +6594,6 @@ where
                 task: worker_task,
                 timeout_ms,
                 started: worker_started,
-                completed_session,
-                base_state_revision,
                 outcome,
             });
             let control_persistence = worker_agent.persist_control_result(&control_result);
@@ -6560,18 +6605,8 @@ where
                     detail: format!("persist agent control history failed: {error}"),
                 });
             }
-            if persist_completed_session
-                && let Err(error) = worker_agent.save_session(&state.control.session)
-            {
-                state.push_runtime_event(AgentRuntimeEventPayload::WorkerFailed {
-                    sequence,
-                    op_id: persist_worker_op_id,
-                    action: persist_worker_action,
-                    detail: format!("persist merged completed agent session failed: {error}"),
-                });
-            }
             drop(state);
-            control_persistence
+            session_persistence.and(control_persistence)
         });
         state.worker = Some(worker);
         Ok(result)
@@ -6612,8 +6647,6 @@ struct AgentSessionRuntimeTurnCompletion {
     task: Option<AgentTaskRef>,
     timeout_ms: Option<u64>,
     started: std::time::Instant,
-    completed_session: AgentSession,
-    base_state_revision: u64,
     outcome: Result<AgentOpOutcome, AgentError>,
 }
 
@@ -6664,14 +6697,23 @@ impl AgentSessionRuntimeState {
         self.control.active_turn_cancellation = None;
         let sequence = completion.sequence;
         let mut events = Vec::new();
+        let timed_out = completion.timeout_ms.is_some_and(|timeout| {
+            completion.started.elapsed() >= std::time::Duration::from_millis(timeout)
+        });
+        if timed_out && let Some(timeout_ms) = completion.timeout_ms {
+            events.push(agent_session_event(
+                &completion.op_id,
+                &self.control.session.session_id,
+                AgentEventPayload::TurnTimedOut {
+                    sequence,
+                    active_op_id: completion.op_id.clone(),
+                    timeout_ms,
+                    reason: "turn exceeded configured timeout".to_string(),
+                },
+            ));
+        }
         match completion.outcome {
             Ok(outcome) => {
-                let in_flight_input_ids = std::mem::take(&mut self.in_flight_input_ids);
-                self.replace_session_preserving_live_inputs(
-                    completion.completed_session,
-                    completion.base_state_revision,
-                    &in_flight_input_ids,
-                );
                 events.extend(outcome.events.iter().cloned());
                 let stop_reason = outcome
                     .run
@@ -6690,9 +6732,7 @@ impl AgentSessionRuntimeState {
                     self.append_terminal_task_status(
                         &mut events,
                         &completion.op_id,
-                        completion.sequence,
-                        completion.timeout_ms,
-                        completion.started,
+                        timed_out,
                         task,
                         &outcome,
                     );
@@ -6721,7 +6761,11 @@ impl AgentSessionRuntimeState {
                     events.push(self.control.set_task_status(
                         &completion.op_id,
                         task,
-                        AgentTaskLifecycleStatus::Failed,
+                        if timed_out {
+                            AgentTaskLifecycleStatus::TimedOut
+                        } else {
+                            AgentTaskLifecycleStatus::Failed
+                        },
                         Some(detail.clone()),
                         None,
                         None,
@@ -6782,27 +6826,10 @@ impl AgentSessionRuntimeState {
         &mut self,
         events: &mut Vec<AgentEvent>,
         op_id: &TaskId,
-        sequence: u64,
-        timeout_ms: Option<u64>,
-        started: std::time::Instant,
+        timed_out: bool,
         task: AgentTaskRef,
         outcome: &AgentOpOutcome,
     ) {
-        let timed_out = timeout_ms
-            .map(|timeout_ms| started.elapsed() >= std::time::Duration::from_millis(timeout_ms))
-            .unwrap_or(false);
-        if timed_out && let Some(timeout_ms) = timeout_ms {
-            events.push(agent_session_event(
-                op_id,
-                &self.control.session.session_id,
-                AgentEventPayload::TurnTimedOut {
-                    sequence,
-                    active_op_id: op_id.clone(),
-                    timeout_ms,
-                    reason: "turn exceeded configured timeout".to_string(),
-                },
-            ));
-        }
         let status = if timed_out {
             AgentTaskLifecycleStatus::TimedOut
         } else {
@@ -8632,6 +8659,7 @@ impl<M: InteractionModel> Agent<M> {
         model_progress_sink: AgentModelProgressSink,
         persist_completed_turn: bool,
     ) -> Result<AgentOpOutcome, AgentError> {
+        let cancellation_token = cancellation_token.with_timeout_ms(op.timeout_ms);
         let op_id = op.op_id;
         let session_id = session.session_id.clone();
         let mut events = Vec::new();

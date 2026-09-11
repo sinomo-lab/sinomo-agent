@@ -16,8 +16,8 @@ use crate::posix_model::{DfsPosixError, DfsStat, Result, read_conflict_error};
 use crate::posix_object::{object_mode_or_default, object_timestamp_or_default};
 use crate::posix_path::{
     append_posix_components, join_posix_path, normalize_posix_path,
-    normalize_posix_path_with_trailing_directory, parent_posix_path,
-    posix_path_is_at_or_under_prefix, resolve_posix_symlink_target,
+    normalize_posix_path_with_trailing_directory, normalize_posix_walk_path, parent_posix_path,
+    posix_path_has_dot_components, posix_path_is_at_or_under_prefix, resolve_posix_symlink_target,
 };
 use crate::{
     DfsDirectoryPage, DfsDirectoryPageCursor, DfsFileSystemId, DfsMessageTransport,
@@ -193,9 +193,30 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .map_err(Into::into)
     }
 
+    /// Resolve dot components before using an input as a metadata or routing key.
+    /// Ordinary canonical paths retain their existing lookup-free fast path.
+    pub(super) fn resolve_posix_dot_components(&self, path: &str) -> Result<String> {
+        if posix_path_has_dot_components(path) {
+            self.resolve_posix_path(path, false)
+        } else {
+            normalize_posix_path(path)
+        }
+    }
+
+    pub(super) fn resolve_posix_dot_components_distributed(
+        &mut self,
+        path: &str,
+    ) -> Result<String> {
+        if posix_path_has_dot_components(path) {
+            self.resolve_posix_path_distributed(path, false)
+        } else {
+            normalize_posix_path(path)
+        }
+    }
+
     pub(super) fn resolve_posix_path(&self, path: &str, follow_final: bool) -> Result<String> {
         let file_system_id = sifs_file_system_id();
-        let mut current = normalize_posix_path(path)?;
+        let mut current = normalize_posix_walk_path(path)?;
         for _ in 0..40 {
             let components = current
                 .trim_start_matches('/')
@@ -207,9 +228,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut known_live_ancestors = false;
             let mut restarted = false;
             for (index, component) in components.iter().enumerate() {
-                let candidate = join_posix_path(&resolved, component);
+                let dot_component = matches!(component.as_str(), "." | "..");
+                let candidate = match component.as_str() {
+                    "." => resolved.clone(),
+                    ".." => parent_posix_path(&resolved).unwrap_or_else(|| "/".to_string()),
+                    _ => join_posix_path(&resolved, component),
+                };
                 let final_component = index + 1 == components.len();
-                if final_component && !follow_final {
+                if final_component && !follow_final && !dot_component {
                     resolved = candidate;
                     continue;
                 }
@@ -219,10 +245,22 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     known_live_ancestors,
                 )?
                 else {
+                    if components[index + 1..]
+                        .iter()
+                        .any(|part| matches!(part.as_str(), "." | ".."))
+                    {
+                        return Err(DfsPosixError::NotFound { path: candidate });
+                    }
                     resolved = append_posix_components(candidate, &components[index + 1..])?;
                     return Ok(resolved);
                 };
                 if object.kind == DfsObjectKind::Tombstone {
+                    if components[index + 1..]
+                        .iter()
+                        .any(|part| matches!(part.as_str(), "." | ".."))
+                    {
+                        return Err(DfsPosixError::NotFound { path: candidate });
+                    }
                     resolved = append_posix_components(candidate, &components[index + 1..])?;
                     return Ok(resolved);
                 }
@@ -234,9 +272,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     for rest in &components[index + 1..] {
                         current = join_posix_path(&current, rest);
                     }
-                    current = normalize_posix_path(&current)?;
+                    current = normalize_posix_walk_path(&current)?;
                     restarted = true;
                     break;
+                }
+                if !final_component && object.kind != DfsObjectKind::Directory {
+                    return Err(DfsPosixError::NotDirectory { path: candidate });
                 }
                 resolved = candidate;
             }
@@ -295,9 +336,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         capture_components: bool,
     ) -> Result<ResolvedPosixPath> {
         let file_system_id = sifs_file_system_id();
-        let mut current = normalize_posix_path(path)?;
+        let mut current = normalize_posix_walk_path(path)?;
         let mut followed_symlink = None::<String>;
-        let mut target_shard_snapshot = None;
+        let resolve_authoritatively = posix_path_has_dot_components(path);
+        let mut target_shard_snapshot = if resolve_authoritatively {
+            self.refresh_sifs_metadata_shards()?
+        } else {
+            None
+        };
         for _ in 0..40 {
             let components = current
                 .trim_start_matches('/')
@@ -310,9 +356,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let mut observed = capture_components.then(|| Vec::with_capacity(components.len()));
             let mut restarted = false;
             for (index, component) in components.iter().enumerate() {
-                let candidate = join_posix_path(&resolved, component);
+                let dot_component = matches!(component.as_str(), "." | "..");
+                let candidate = match component.as_str() {
+                    "." => resolved.clone(),
+                    ".." => parent_posix_path(&resolved).unwrap_or_else(|| "/".to_string()),
+                    _ => join_posix_path(&resolved, component),
+                };
                 let final_component = index + 1 == components.len();
-                if final_component && !follow_final {
+                if final_component && !follow_final && !dot_component {
                     resolved = candidate;
                     continue;
                 }
@@ -340,6 +391,11 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                             return Err(error);
                         }
                     }
+                } else if resolve_authoritatively {
+                    self.lookup_sifs_path_direct_distributed_synced_from_snapshot(
+                        &candidate,
+                        target_shard_snapshot.as_deref(),
+                    )?
                 } else {
                     self.lookup_metadata_path_with_known_live_ancestors(
                         &file_system_id,
@@ -348,6 +404,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     )?
                 };
                 let Some(object) = object else {
+                    if components[index + 1..]
+                        .iter()
+                        .any(|part| matches!(part.as_str(), "." | ".."))
+                    {
+                        return Err(DfsPosixError::NotFound { path: candidate });
+                    }
                     if let Some(link_path) = followed_symlink.as_deref() {
                         tracing::debug!(
                             target: "sinomo.dfs.posix",
@@ -378,6 +440,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     });
                 };
                 if object.kind == DfsObjectKind::Tombstone {
+                    if components[index + 1..]
+                        .iter()
+                        .any(|part| matches!(part.as_str(), "." | ".."))
+                    {
+                        return Err(DfsPosixError::NotFound { path: candidate });
+                    }
                     let terminal_object = final_component.then(|| object.clone());
                     if let Some(observed) = observed.as_mut() {
                         observed.push(ResolvedPosixPathComponent {
@@ -399,6 +467,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     });
                 }
                 if let Some(observed) = observed.as_mut() {
+                    if dot_component {
+                        observed.retain(|entry: &ResolvedPosixPathComponent| {
+                            entry.path != candidate
+                                && posix_path_is_at_or_under_prefix(&candidate, &entry.path)
+                        });
+                    }
                     observed.push(ResolvedPosixPathComponent {
                         path: candidate.clone(),
                         object: Some(object.clone()),
@@ -414,9 +488,12 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     for rest in &components[index + 1..] {
                         current = join_posix_path(&current, rest);
                     }
-                    current = normalize_posix_path(&current)?;
+                    current = normalize_posix_walk_path(&current)?;
                     restarted = true;
                     break;
+                }
+                if !final_component && object.kind != DfsObjectKind::Directory {
+                    return Err(DfsPosixError::NotDirectory { path: candidate });
                 }
                 let terminal_object = final_component.then_some(object);
                 resolved = candidate;

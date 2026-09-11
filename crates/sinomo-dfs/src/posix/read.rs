@@ -132,7 +132,7 @@ fn distributed_file_range_content_outcome(
 ) -> Result<DfsPosixDistributedFileReadOutcome> {
     match outcome {
         NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-            validate_complete_posix_range_content_hash(object, &data)?;
+            validate_posix_range_content_identity(object, &data)?;
             Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: data.bytes })
         }
         NetworkedDfsRangeReadOutcome::PendingReplication {
@@ -181,7 +181,7 @@ fn distributed_file_prefix_content_outcome(
     match outcome {
         NetworkedDfsRangeReadOutcome::Found { data, .. } => {
             let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-            validate_complete_posix_range_content_hash(object, &data)?;
+            validate_posix_range_content_identity(object, &data)?;
             Ok(DfsPosixDistributedFilePrefixReadOutcome::Found {
                 read: DfsPosixFilePrefixRead {
                     bytes: data.bytes,
@@ -254,25 +254,32 @@ fn legacy_distributed_file_prefix_read_result(
     }
 }
 
-fn validate_complete_posix_range_content_hash(
+fn validate_posix_range_content_identity(
     object: &DfsObjectMetadata,
     data: &DfsReadRangeData,
 ) -> std::result::Result<(), DfsError> {
-    // Truncated ranges have no whole-object content proof. When a range covers
-    // the complete object, preserve full-read integrity by hashing the bytes
-    // against the authoritative metadata before exposing them to the caller.
-    if data.offset != 0 || u64::try_from(data.bytes.len()).ok() != Some(data.total_size_bytes) {
-        return Ok(());
-    }
-    let actual_hash = crate::content_hash(&data.bytes);
-    let expected_hash = object
-        .content_hash
-        .as_deref()
-        .unwrap_or("committed content hash");
-    if actual_hash != expected_hash {
+    // Reads validate the selected immutable identity and length. Scrub verifies
+    // stored bytes; rehashing complete reads would make full and ranged reads
+    // have different integrity and throughput behavior.
+    if data.content_hash != object.content_hash {
         return Err(DfsError::ContentHashMismatch {
-            expected: expected_hash.to_string(),
-            actual: actual_hash,
+            expected: object
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+            actual: data
+                .content_hash
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        });
+    }
+    if object
+        .content_size_bytes
+        .is_some_and(|size| size != data.total_size_bytes)
+        || data.bytes.len() as u64 > data.total_size_bytes.saturating_sub(data.offset)
+    {
+        return Err(DfsError::Distributed {
+            message: "read range does not match committed content size".to_string(),
         });
     }
     Ok(())
@@ -321,7 +328,7 @@ fn validate_inline_namespace_range(
             ),
         });
     }
-    validate_complete_posix_range_content_hash(object, data)
+    validate_posix_range_content_identity(object, data)
 }
 
 impl<T: DfsMessageTransport> NetworkedDfsService<T> {
@@ -638,7 +645,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<DfsPosixDistributedFileReadOutcome> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.posix_read_file_distributed_outcome_from_snapshot(&path, shard_snapshot)
         })
@@ -705,7 +712,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         max_bytes: usize,
     ) -> Result<DfsPosixDistributedFilePrefixReadOutcome> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         self.with_local_primary_metadata_read_snapshot(&path, |service, shard_snapshot| {
             service.posix_read_file_prefix_distributed_outcome_from_snapshot(
                 &path,
@@ -884,7 +891,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             .read_object_metadata_range_or_fetch_remote_without_cache(&object, offset, max_bytes)?
         {
             NetworkedDfsRangeReadOutcome::Found { data, .. } => {
-                validate_complete_posix_range_content_hash(&object, &data)?;
+                validate_posix_range_content_identity(&object, &data)?;
                 Ok(data.bytes)
             }
             NetworkedDfsRangeReadOutcome::PendingReplication { .. }
@@ -1273,13 +1280,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                         ),
                     }));
                 }
-                let actual_hash = crate::content_hash(&data.bytes);
-                if actual_hash != pending.content_hash {
-                    return Err(DfsPosixError::Dfs(DfsError::ContentHashMismatch {
-                        expected: pending.content_hash.clone(),
-                        actual: actual_hash,
-                    }));
-                }
+
                 Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: data.bytes })
             }
             DfsReadResult::RangeFound(_) => Err(DfsPosixError::Dfs(DfsError::Distributed {
@@ -1506,7 +1507,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         if max_bytes == 0 {
             return Ok(DfsPosixDistributedFileReadOutcome::Found { bytes: Vec::new() });
         }
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         if opened.kind == DfsObjectKind::Tombstone {
             return Ok(DfsPosixDistributedFileReadOutcome::NotFound { path });
         }
@@ -1821,9 +1822,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
                     } if request_ids.contains(&request_id)
                         && event_object_id == object.object_id =>
                     {
-                        if let Err(error) =
-                            validate_complete_posix_range_content_hash(&object, &data)
-                        {
+                        if let Err(error) = validate_posix_range_content_identity(&object, &data) {
                             self.mark_remote_read_location_missing(
                                 &object.object_id,
                                 &object.version,

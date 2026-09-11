@@ -672,7 +672,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_mkdir(&mut self, path: &str) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,
@@ -697,7 +699,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: &str,
     ) -> Result<DfsStat> {
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         let operation = DfsNamespaceOperation::Mkdir {
             path: path.to_string(),
         };
@@ -731,7 +735,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             self.route_namespace_operation(
                 primary,
@@ -755,7 +761,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         operation_id: &str,
     ) -> Result<DfsStat> {
         crate::service_routed_namespace::validate_namespace_operation_id(operation_id)?;
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         let operation = DfsNamespaceOperation::MkdirWithAttrs {
             path: path.to_string(),
             attrs,
@@ -854,7 +862,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         let path = self.resolve_posix_path_distributed(&path, false)?;
         self.posix_mkdir_local_at_normalized_path(&path, attrs)
     }
@@ -901,7 +909,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         path: &str,
         attrs: DfsPosixCreateAttrs,
     ) -> Result<DfsStat> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         self.ensure_resolved_path_not_in_cross_shard_flight(&path)?;
         self.ensure_parent_directory(&path)?;
         if let Some(mut object) = self.lookup_sifs_path(&path)? {
@@ -948,7 +956,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn posix_mkdir_all_with_current_deadline(&mut self, path: &str) -> Result<()> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
             match self.route_namespace_operation(
@@ -984,7 +994,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         &mut self,
         path: &str,
     ) -> Result<()> {
-        let normalized = normalize_posix_path(path)?;
+        let normalized = self.resolve_posix_dot_components_distributed(path)?;
+        let dispatch_path = crate::posix_path::path_after_dot_resolution(path, &normalized);
+        let path = dispatch_path.as_ref();
         if let Some(primary) = self.routed_namespace_primary_for_path(&normalized)? {
             let local_chain_exists = self.posix_mkdir_all_chain_exists_locally(&normalized)?;
             match self.route_namespace_operation_without_local_replay(
@@ -1143,7 +1155,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     fn posix_mkdir_all_chain_exists_locally(&self, path: &str) -> Result<bool> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components(path)?;
         if path == "/" {
             return Ok(true);
         }
@@ -1168,7 +1180,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub(crate) fn posix_mkdir_all_local(&mut self, path: &str) -> Result<()> {
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components_distributed(path)?;
         let resolved = self.resolve_posix_path_distributed_for_mkdir_all(&path)?;
         let path = resolved.path;
         if path == "/" {

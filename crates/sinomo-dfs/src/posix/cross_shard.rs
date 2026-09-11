@@ -12,8 +12,8 @@ use super::{
 };
 use crate::metadata_pages::{try_walk_metadata_pages, walk_metadata_pages};
 use crate::namespace::{
-    initial_version, namespace_transaction_id_for_batch, namespace_transaction_id_for_path,
-    next_version, object_id_for_path,
+    initial_version, namespace_transaction_id_for_batch,
+    namespace_transaction_id_for_versioned_path, next_version,
 };
 use crate::posix_model::{DfsPosixError, Result};
 use crate::posix_path::{
@@ -996,14 +996,8 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             }
             _ => {}
         }
-        let alias_object_id = {
-            let candidate = object_id_for_path(&link_path);
-            if candidate == target.object_id {
-                DfsObjectId::generate()
-            } else {
-                candidate
-            }
-        };
+        // The durable job retains this id across retries and restarts.
+        let alias_object_id = DfsObjectId::generate();
         let alias = DfsObjectMetadata {
             object_id: alias_object_id,
             file_system_id: target.file_system_id.clone(),
@@ -1820,9 +1814,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             let old_path_tombstone =
                 self.tombstone_path_object_at(old_path_tombstone, old_path.clone());
             self.apply_namespace_transaction(DfsNamespaceTransaction {
-                transaction_id: namespace_transaction_id_for_path(
+                transaction_id: namespace_transaction_id_for_versioned_path(
                     "rename-cross-shard",
                     &moved_object.object_id,
+                    &moved_object.version,
                     &old_path,
                 ),
                 file_system_id: moved_object.file_system_id.clone(),
@@ -2032,9 +2027,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
             transaction_objects.push(object.clone());
             let visible_version = cross_shard_object_version_record(object);
             self.apply_namespace_transaction(DfsNamespaceTransaction {
-                transaction_id: namespace_transaction_id_for_path(
+                transaction_id: namespace_transaction_id_for_versioned_path(
                     "adopt-cross-shard",
                     &object.object_id,
+                    &object.version,
                     &path,
                 ),
                 file_system_id: object.file_system_id.clone(),
@@ -2199,9 +2195,10 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         }
         self.ensure_parent_directory(&path)?;
         self.apply_namespace_transaction(DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_versioned_path(
                 "adopt-hardlink-cross-shard",
                 &alias.object_id,
+                &alias.version,
                 &path,
             ),
             file_system_id: alias.file_system_id.clone(),
@@ -2395,7 +2392,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(backend) = self.metadata_backend.as_ref() else {
             return Ok(());
         };
-        let path = normalize_posix_path(path)?;
+        let path = self.resolve_posix_dot_components(path)?;
         let mut blocked = false;
         try_walk_metadata_pages(|cursor| {
             let page = backend

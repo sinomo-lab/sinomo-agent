@@ -21,7 +21,9 @@ use crate::metadata_records::{
     DfsNamespaceTransaction,
 };
 use crate::model::{DfsObjectKind, DfsObjectMetadata, DfsTombstoneProvenance};
-use crate::namespace::namespace_transaction_id_for_path;
+use crate::namespace::{
+    namespace_transaction_id_for_path, namespace_transaction_id_for_versioned_path,
+};
 use crate::posix_path::posix_path_is_at_or_under_prefix;
 use crate::{DfsError, DfsFileSystemId, DfsNodeId, DfsObjectId, DfsVersion};
 
@@ -870,8 +872,19 @@ fn same_shard_rename_indices(transaction: &DfsNamespaceTransaction) -> Option<(u
         .skip(1)
         .filter(|(_, object)| {
             object.kind != DfsObjectKind::Tombstone
-                && transaction.transaction_id
-                    == namespace_transaction_id_for_path("rename", &object.object_id, &object.path)
+                && (transaction.transaction_id
+                    == namespace_transaction_id_for_versioned_path(
+                        "rename",
+                        &object.object_id,
+                        &object.version,
+                        &object.path,
+                    )
+                    || transaction.transaction_id
+                        == namespace_transaction_id_for_path(
+                            "rename",
+                            &object.object_id,
+                            &object.path,
+                        ))
         });
     let (moved_index, moved) = candidates.next()?;
     if candidates.next().is_some() || old.path == moved.path {
@@ -1404,9 +1417,10 @@ mod tests {
         replaced.content_hash = None;
         replaced.content_size_bytes = None;
         let transaction = DfsNamespaceTransaction {
-            transaction_id: namespace_transaction_id_for_path(
+            transaction_id: namespace_transaction_id_for_versioned_path(
                 "rename",
                 &moved.object_id,
+                &moved.version,
                 &moved.path,
             ),
             file_system_id: cursor.file_system_id.clone(),
@@ -1415,6 +1429,14 @@ mod tests {
             advisory_lock_states: Vec::new(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         };
+        let mut legacy = transaction.clone();
+        legacy.transaction_id =
+            namespace_transaction_id_for_path("rename", &moved.object_id, &moved.path);
+        assert_eq!(
+            same_shard_rename_indices(&legacy),
+            Some((0, 1)),
+            "old journal entries retain their semantic projection"
+        );
         let journal_batch = batch(
             "root",
             vec![DfsMetadataJournalEntry {

@@ -636,10 +636,29 @@ struct LocalCommandExecution {
 }
 
 struct LocalCommandOutput {
+    // Native commands retain only a preview here; their full bytes stay in the capture.
+    captured: Option<crate::process::AgentProcessOutput>,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     status_code: Option<i32>,
     success: bool,
+}
+
+impl LocalCommandOutput {
+    fn stdout_full(&self) -> Result<std::borrow::Cow<'_, [u8]>, AgentToolResult> {
+        match &self.captured {
+            Some(captured) => captured
+                .window(false, 0, usize::MAX)
+                .map(|window| std::borrow::Cow::Owned(window.bytes))
+                .map_err(|error| {
+                    AgentToolResult::failed(
+                        format!("read complete command output: {error}"),
+                        serde_json::json!({"error":"command_output_read_failed"}),
+                    )
+                }),
+            None => Ok(std::borrow::Cow::Borrowed(&self.stdout)),
+        }
+    }
 }
 
 fn execute_local_command(
@@ -701,7 +720,10 @@ fn execute_local_process_command(
         .chain(args.iter().cloned())
         .collect::<Vec<_>>()
         .join(" ");
-    let manager = AgentProcessManager::new();
+    let mut manager = AgentProcessManager::new();
+    if let Some(directory) = &config.evidence_dir {
+        manager = manager.with_output_directory(directory.join("process-capture"));
+    }
     let process = manager
         .start(
             AgentProcessStart::new(command_text, program.to_string(), args.iter().cloned(), &cwd)
@@ -761,17 +783,34 @@ fn execute_local_process_command(
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let full_snapshot = manager
-        .snapshot(&process.process_id, 0, 0, usize::MAX)
-        .unwrap_or(final_snapshot);
-    let timed_out = full_snapshot.timed_out;
-    let cancelled = full_snapshot.cancel_requested
-        || full_snapshot.status == AgentProcessLifecycleStatus::Cancelled;
-    let success = full_snapshot.status == AgentProcessLifecycleStatus::Completed;
-    let status_code = full_snapshot.exit_code;
+    let captured = manager
+        .captured_output(&process.process_id)
+        .map_err(|error| {
+            AgentToolResult::failed(
+                error.to_string(),
+                serde_json::json!({"error":"command_output_read_failed"}),
+            )
+        })?;
+    let read_preview = |stderr| {
+        captured
+            .window(stderr, 0, config.max_command_output_bytes)
+            .map(|window| window.bytes)
+            .map_err(|error| {
+                AgentToolResult::failed(
+                    error.to_string(),
+                    serde_json::json!({"error":"command_output_read_failed"}),
+                )
+            })
+    };
+    let timed_out = final_snapshot.timed_out;
+    let cancelled = final_snapshot.cancel_requested
+        || final_snapshot.status == AgentProcessLifecycleStatus::Cancelled;
+    let success = final_snapshot.status == AgentProcessLifecycleStatus::Completed;
+    let status_code = final_snapshot.exit_code;
     let output = LocalCommandOutput {
-        stdout: full_snapshot.stdout.into_bytes(),
-        stderr: full_snapshot.stderr.into_bytes(),
+        stdout: read_preview(false)?,
+        stderr: read_preview(true)?,
+        captured: Some(captured),
         status_code,
         success,
     };
@@ -955,6 +994,7 @@ fn execute_simple_sandbox_command(
                 .map(|result| result.summary);
         let cleanup_pending = lifecycle_cleanup_failure.is_some();
         let output = LocalCommandOutput {
+            captured: None,
             stdout: Vec::new(),
             stderr: command_stderr_with_cleanup_failure(
                 b"command cancelled before sandbox start".to_vec(),
@@ -1076,6 +1116,7 @@ fn execute_simple_sandbox_command(
                 root,
                 cwd,
                 output: LocalCommandOutput {
+                    captured: None,
                     stdout: outcome.stdout,
                     stderr,
                     status_code,
@@ -1119,6 +1160,7 @@ fn execute_simple_sandbox_command(
                 root,
                 cwd,
                 output: LocalCommandOutput {
+                    captured: None,
                     stdout: Vec::new(),
                     stderr,
                     status_code: None,
@@ -1170,6 +1212,7 @@ fn execute_simple_sandbox_command(
                 root,
                 cwd,
                 output: LocalCommandOutput {
+                    captured: None,
                     stdout: Vec::new(),
                     stderr,
                     status_code: None,
@@ -2021,13 +2064,38 @@ fn local_command_result_from_output(
     changed_files: Vec<String>,
     summary_override: Option<String>,
 ) -> AgentToolResult {
-    let stdout = truncate_utf8_lossy(&output.stdout, config.max_command_output_bytes);
-    let stderr = truncate_utf8_lossy(&output.stderr, config.max_command_output_bytes);
+    let mut stdout = truncate_utf8_lossy(&output.stdout, config.max_command_output_bytes);
+    let mut stderr = truncate_utf8_lossy(&output.stderr, config.max_command_output_bytes);
+    if let Some(captured) = &output.captured {
+        let sizes = captured.window(false, 0, 0).and_then(|out| {
+            captured
+                .window(true, 0, 0)
+                .map(|err| (out.total_bytes, err.total_bytes))
+        });
+        match sizes {
+            Ok((stdout_size, stderr_size)) => {
+                stdout.truncated = stdout_size > output.stdout.len();
+                stderr.truncated = stderr_size > output.stderr.len();
+            }
+            Err(error) => {
+                return AgentToolResult::failed(
+                    format!("inspect command output: {error}"),
+                    serde_json::json!({"error":"command_output_read_failed"}),
+                );
+            }
+        }
+    }
+    let save_stream = |is_stderr, extension, bytes: &[u8]| match &output.captured {
+        Some(captured) => {
+            write_captured_evidence(config, evidence_tool_name, extension, captured, is_stderr)
+        }
+        None => write_local_evidence(config, evidence_tool_name, extension, bytes),
+    };
     let status = output.status_code;
     let succeeded = !timed_out && !cancelled && !cleanup_pending && output.success;
     let cwd_display = display_workspace_path(config, &cwd);
     let stdout_ref = if stdout.truncated {
-        write_local_evidence(config, evidence_tool_name, "stdout.txt", &output.stdout).map(|uri| {
+        save_stream(false, "stdout.txt", &output.stdout).map(|uri| {
             AgentToolArtifactRef::new("stdout", uri)
                 .with_label("complete stdout")
                 .with_media_type("text/plain; charset=utf-8")
@@ -2036,7 +2104,7 @@ fn local_command_result_from_output(
         None
     };
     let stderr_ref = if stderr.truncated {
-        write_local_evidence(config, evidence_tool_name, "stderr.txt", &output.stderr).map(|uri| {
+        save_stream(true, "stderr.txt", &output.stderr).map(|uri| {
             AgentToolArtifactRef::new("stderr", uri)
                 .with_label("complete stderr")
                 .with_media_type("text/plain; charset=utf-8")
@@ -2099,18 +2167,24 @@ fn local_command_result_from_output(
         "changed_files": changed_files.clone(),
     });
     let full_output_ref = if stdout.truncated || stderr.truncated {
-        let payload = serde_json::json!({
-            "program": program,
-            "args": args,
-            "cwd": cwd_display,
-            "duration_ms": duration_ms,
-            "timed_out": timed_out,
-            "cancelled": cancelled,
-            "cleanup_pending": cleanup_pending,
-            "timeout_ms": timeout_ms,
-            "stdout": String::from_utf8_lossy(&output.stdout),
-            "stderr": String::from_utf8_lossy(&output.stderr),
-        });
+        let payload = if output.captured.is_some() {
+            // Complete streams are separate artifacts. Do not rebuild them in
+            // RAM just to duplicate their text into the outcome metadata file.
+            payload.clone()
+        } else {
+            serde_json::json!({
+                "program": program,
+                "args": args,
+                "cwd": cwd_display,
+                "duration_ms": duration_ms,
+                "timed_out": timed_out,
+                "cancelled": cancelled,
+                "cleanup_pending": cleanup_pending,
+                "timeout_ms": timeout_ms,
+                "stdout": String::from_utf8_lossy(&output.stdout),
+                "stderr": String::from_utf8_lossy(&output.stderr),
+            })
+        };
         serde_json::to_vec_pretty(&payload)
             .ok()
             .and_then(|bytes| write_local_evidence(config, evidence_tool_name, "json", &bytes))
@@ -2232,6 +2306,33 @@ fn existing_path_anchor(path: &Path) -> Option<PathBuf> {
         ancestor = candidate.parent();
     }
     None
+}
+
+fn write_captured_evidence(
+    config: &LocalWorkspaceAgentConfig,
+    tool_name: &str,
+    extension: &str,
+    captured: &crate::process::AgentProcessOutput,
+    stderr: bool,
+) -> Option<String> {
+    let name = format!(
+        "{}-{}.{}",
+        sanitize_evidence_component(tool_name),
+        TaskId::generate(),
+        sanitize_evidence_component(extension)
+    );
+    let copy = |directory: &Path| {
+        fs::create_dir_all(directory).ok()?;
+        let path = directory.join(&name);
+        captured.copy_to(stderr, &path).ok()?;
+        Some(path)
+    };
+    let local = config.evidence_dir.as_deref().and_then(copy);
+    let sifs = config
+        .sifs_evidence
+        .as_ref()
+        .and_then(|sifs| copy(&sifs.mount_dir).map(|_| sifs.sifs_uri_for_file(&name)));
+    sifs.or_else(|| local.map(|path| path.display().to_string()))
 }
 
 fn write_local_evidence(
@@ -3305,6 +3406,7 @@ mod tests {
             "true",
             &[],
             &LocalCommandOutput {
+                captured: None,
                 stdout: Vec::new(),
                 stderr,
                 status_code: Some(0),

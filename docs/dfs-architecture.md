@@ -902,9 +902,11 @@ Reads prefer the closest valid copy:
 5. a routed or relayed source.
 
 Every result exposes freshness: current, stale, pending repair, unavailable,
-or policy-blocked. A local hash must match the selected immutable version before
-bytes are returned. Metadata watches mark cached objects stale when the visible
-version changes.
+or policy-blocked. Reads validate the selected immutable object identity, version,
+content-hash metadata, range bounds, and declared length without rehashing stored
+bytes. Scrub owns byte-level corruption detection. Hashing newly ingested content
+still establishes its immutable content address. Metadata watches mark cached
+objects stale when the visible version changes.
 
 Automatic caches are useful for mobile inspection and collaborative review.
 Evicting a cache never changes authoritative metadata or the durable receipt

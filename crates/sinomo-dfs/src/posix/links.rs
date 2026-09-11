@@ -5,14 +5,13 @@
 //! they share hardlink promotion and tombstone transaction handling.
 
 use super::now_unix_nanos;
-use crate::namespace::{initial_version, next_version, object_id_for_path};
+use crate::namespace::{initial_version, next_version};
 use crate::posix_model::{DfsPosixCreateAttrs, DfsPosixError, DfsStat, DfsWriteOptions, Result};
 use crate::posix_object::{
     apply_posix_create_attrs, new_posix_metadata_object, recreated_posix_metadata_object,
 };
 use crate::posix_path::{
-    normalize_posix_path, normalize_posix_path_with_trailing_directory,
-    validate_posix_symlink_target,
+    normalize_posix_path_with_trailing_directory, validate_posix_symlink_target,
 };
 use crate::{
     DfsMessageTransport, DfsNamespaceOperation, DfsObjectId, DfsObjectKind, DfsObjectMetadata,
@@ -180,8 +179,14 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
     }
 
     pub fn posix_hardlink(&mut self, existing_path: &str, link_path: &str) -> Result<DfsStat> {
-        let normalized_existing = normalize_posix_path(existing_path)?;
-        let normalized_link = normalize_posix_path(link_path)?;
+        let normalized_existing = self.resolve_posix_dot_components_distributed(existing_path)?;
+        let dispatch_existing_path =
+            crate::posix_path::path_after_dot_resolution(existing_path, &normalized_existing);
+        let existing_path = dispatch_existing_path.as_ref();
+        let normalized_link = self.resolve_posix_dot_components_distributed(link_path)?;
+        let dispatch_link_path =
+            crate::posix_path::path_after_dot_resolution(link_path, &normalized_link);
+        let link_path = dispatch_link_path.as_ref();
         let mut primaries = self
             .routed_namespace_primaries_for_paths_fresh([
                 normalized_existing.as_str(),
@@ -278,14 +283,9 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         target.changed_at_unix_nanos = now_unix_nanos();
         target.version = next_version(&target.version);
         self.add_object_metadata(target.clone())?;
-        let alias_object_id = {
-            let candidate = object_id_for_path(&link_path);
-            if candidate == target.object_id {
-                DfsObjectId::generate()
-            } else {
-                candidate
-            }
-        };
+        // A path-derived id may still belong to an inode renamed elsewhere.
+        // Each new directory entry needs its own identity, even at a tombstone.
+        let alias_object_id = DfsObjectId::generate();
         let alias = DfsObjectMetadata {
             object_id: alias_object_id,
             file_system_id: target.file_system_id.clone(),

@@ -2018,7 +2018,11 @@ impl LocalContentStore {
                     .unwrap_or_else(|_| self.root.join("blobs")),
                 source,
             })?;
-        ensure_bytes_match_hash(hash, &bytes)?;
+        if bytes.len() as u64 != reader.size_bytes() {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "blob read ended before its declared size".to_string(),
+            });
+        }
         Ok(bytes)
     }
 
@@ -2040,58 +2044,13 @@ impl LocalContentStore {
         Ok(bytes)
     }
 
+    /// Opens a blob without rehashing stored bytes. Scrub owns content verification.
     pub fn open_blob_reader(&self, hash: &str) -> Result<BlobReader> {
-        if hash == intrinsic_empty_content_hash() {
-            return Ok(BlobReader::empty());
-        }
-        let path = self.blob_path(hash)?;
-        if path.is_file() {
-            let (actual_hash, size_bytes) = file_content_hash_and_size(&path)?;
-            if actual_hash != hash {
-                return Err(ContentStoreError::BlobHashMismatch {
-                    expected: hash.to_owned(),
-                    actual: actual_hash,
-                });
-            }
-            let file =
-                fs::File::open(&path).map_err(|source| ContentStoreError::Io { path, source })?;
-            return Ok(BlobReader::new(file, size_bytes));
-        }
-        let Some((location, mut reader)) = self.open_packed_blob_reader(hash, 0, usize::MAX)?
-        else {
-            return Err(ContentStoreError::Io {
-                path,
-                source: io::Error::new(io::ErrorKind::NotFound, "blob not found"),
-            });
-        };
-        let mut bytes =
-            Vec::with_capacity(usize::try_from(reader.size_bytes()).unwrap_or(usize::MAX));
-        reader
-            .read_to_end(&mut bytes)
-            .map_err(|source| ContentStoreError::Io {
-                path: self.packed_blob_location_path(&location),
-                source,
-            })?;
-        ensure_bytes_match_hash(hash, &bytes)?;
-        self.open_packed_blob_reader(hash, 0, usize::MAX)?
-            .map(|(_, reader)| reader)
-            .ok_or_else(|| ContentStoreError::Io {
-                path: self.packed_blob_location_path(&location),
-                source: io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "packed blob disappeared after verification",
-                ),
-            })
+        self.open_blob_stream(hash)
     }
 
-    /// Opens a blob for streaming using a single read pass.
-    ///
-    /// Unlike [`Self::open_blob_reader`], this does not perform a separate
-    /// full-file hash pass to verify the content address before returning. The
-    /// blob size is taken from filesystem metadata. This is intended for serving
-    /// content-addressed bytes to a remote peer that verifies the assembled hash
-    /// itself (and rotates to another source on mismatch), where the extra read
-    /// pass would simply double the I/O for large blobs.
+    /// Opens a blob for a single read pass, validating its stored length only.
+    /// Content digests are checked by scrub, not by foreground reads.
     pub fn open_blob_stream(&self, hash: &str) -> Result<BlobReader> {
         #[cfg(test)]
         self.blob_stream_open_count.fetch_add(1, Ordering::Relaxed);
@@ -2122,10 +2081,8 @@ impl LocalContentStore {
     /// Opens a bounded range of a content-addressed blob for streaming.
     ///
     /// This has the same trust model as [`Self::open_blob_stream`]: the path is
-    /// derived from the validated content hash, and callers that need full
-    /// integrity verification must validate the assembled object hash at a
-    /// higher layer. The important property here is bounded memory and no
-    /// full-blob read before serving a range.
+    /// derived from the validated content identity. Scrub verifies stored bytes;
+    /// ordinary reads use bounded memory without a full-blob verification pass.
     pub fn open_blob_range_stream(
         &self,
         hash: &str,
@@ -2235,7 +2192,11 @@ impl LocalContentStore {
                 path: self.manifest_path(object_id, version),
                 source,
             })?;
-        ensure_bytes_match_hash(&manifest.content_hash, &bytes)?;
+        if bytes.len() as u64 != manifest.size_bytes {
+            return Err(ContentStoreError::InvalidContentLayout {
+                message: "object read ended before its manifest size".to_string(),
+            });
+        }
         Ok((manifest, bytes))
     }
 
@@ -2376,7 +2337,12 @@ impl LocalContentStore {
 
     pub fn manifest_content_available(&self, manifest: &ContentManifest) -> Result<bool> {
         if manifest.extents.is_empty() {
-            return self.has_blob(&manifest.content_hash);
+            if manifest.content_hash == intrinsic_empty_content_hash() {
+                return Ok(manifest.size_bytes == 0);
+            }
+            return Ok(
+                self.readable_blob_size(&manifest.content_hash)? == Some(manifest.size_bytes)
+            );
         }
         let extents = self.logical_extents_for_manifest(manifest)?;
         self.extents_readable(&extents)
@@ -9037,10 +9003,10 @@ mod tests {
             "the bounded availability probe should check addressability and size only"
         );
         assert!(
-            !store
+            store
                 .manifest_content_available(&manifest)
-                .expect("full verification"),
-            "the explicit integrity probe should still detect the corrupted bytes"
+                .expect("manifest availability"),
+            "manifest availability checks length without rehashing content"
         );
 
         cleanup(&root);
@@ -9451,7 +9417,7 @@ mod tests {
     }
 
     #[test]
-    fn open_blob_reader_validates_hash_and_streams_bytes() {
+    fn open_blob_reader_streams_without_rehashing_bytes() {
         let root = temp_root("open_blob_reader_validates_hash_and_streams_bytes");
         let store = LocalContentStore::new(&root).expect("create store");
         let manifest = store
@@ -9468,10 +9434,20 @@ mod tests {
 
         let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
         write_file_atomic(&blob_path, b"corrupt reader bytes").expect("corrupt blob");
-        assert!(matches!(
-            store.open_blob_reader(&manifest.content_hash),
-            Err(ContentStoreError::BlobHashMismatch { .. })
-        ));
+        let mut reader = store
+            .open_blob_reader(&manifest.content_hash)
+            .expect("read without rehashing");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).expect("read bytes");
+        assert_eq!(bytes, b"corrupt reader bytes");
+        assert!(
+            store
+                .scrub()
+                .expect("scrub")
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, ContentStoreScrubIssue::CorruptBlob { .. }))
+        );
 
         cleanup(&root);
     }
@@ -9493,8 +9469,7 @@ mod tests {
         reader.read_to_end(&mut bytes).expect("read blob stream");
         assert_eq!(bytes, payload);
 
-        // The streaming reader does not verify the content address itself; that is
-        // enforced end-to-end by the consuming peer. A missing blob still errors.
+        // Reads leave byte verification to scrub. Invalid identities still error.
         assert!(matches!(
             store.open_blob_stream("blake3:not-a-real-hash"),
             Err(ContentStoreError::InvalidHash(_))
@@ -12015,7 +11990,7 @@ mod tests {
     }
 
     #[test]
-    fn read_blob_rejects_content_address_mismatch() {
+    fn read_blob_defers_content_address_verification_to_scrub() {
         let root = temp_root("read_blob_rejects_content_address_mismatch");
         let store = LocalContentStore::new(&root).expect("create store");
         let manifest = store
@@ -12024,14 +11999,18 @@ mod tests {
         let blob_path = store.blob_path(&manifest.content_hash).expect("blob path");
         write_file_atomic(&blob_path, b"corrupt bytes").expect("corrupt blob");
 
-        let error = store
-            .read_blob(&manifest.content_hash)
-            .expect_err("corrupt blob must not be returned");
-        assert!(matches!(
-            error,
-            ContentStoreError::BlobHashMismatch { expected, .. }
-                if expected == manifest.content_hash
-        ));
+        assert_eq!(
+            store.read_blob(&manifest.content_hash).expect("read bytes"),
+            b"corrupt bytes"
+        );
+        assert!(
+            store
+                .scrub()
+                .expect("scrub")
+                .issues
+                .iter()
+                .any(|issue| matches!(issue, ContentStoreScrubIssue::CorruptBlob { .. }))
+        );
         assert!(
             !store.has_blob(&manifest.content_hash).expect("has blob"),
             "corrupt content-addressed blobs must not count as locally available"

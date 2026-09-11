@@ -1305,6 +1305,29 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let current = match self.current_object_for_write(&command.request.object_id) {
             Ok(current) => current,
+            Err(DfsError::UnknownObject { .. })
+                if !command.exclusive_create && path_object.content_hash.is_none() =>
+            {
+                // A requester that has not received a newly created hardlink
+                // may propose a new path-derived inode. Resolve that blind
+                // write through the primary's actual alias identity; aliases
+                // need not share the requester's provisional object id.
+                let current = match self.metadata_backend.as_ref() {
+                    Some(backend) => backend
+                        .get_object_by_path(&command.request.file_system_id, &path_object.path)?,
+                    None => self
+                        .metadata
+                        .object_by_normalized_posix_path(
+                            &command.request.file_system_id,
+                            &path_object.path,
+                        )
+                        .cloned(),
+                };
+                match current {
+                    Some(current) if current.kind == DfsObjectKind::Hardlink => current,
+                    _ => return Ok(()),
+                }
+            }
             Err(DfsError::UnknownObject { .. }) => return Ok(()),
             Err(error) => return Err(error),
         };
@@ -1913,6 +1936,7 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         outcome: &NetworkedDfsWriteOutcome,
     ) {
         let NetworkedDfsWriteOutcome::Committed {
+            intent_id,
             version,
             content_hash,
             ..
@@ -1930,12 +1954,19 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         };
         let size_bytes = blob.size_bytes();
         drop(blob);
+        let committed_object_id = self
+            .coordinator
+            .intent(intent_id)
+            .map(|intent| intent.object_id.clone());
+        let publication_object_id = committed_object_id
+            .as_ref()
+            .unwrap_or(&publication.object_id);
         let object_id = self
-            .current_read_object_metadata(&publication.object_id)
+            .current_read_object_metadata(publication_object_id)
             .ok()
             .and_then(|object| self.resolve_hardlink_target(&object).ok())
             .map(|object| object.object_id)
-            .unwrap_or_else(|| publication.object_id.clone());
+            .unwrap_or_else(|| publication_object_id.clone());
         if let Err(error) = self.content.put_blob_only_manifest(
             object_id.as_str(),
             version.as_str(),

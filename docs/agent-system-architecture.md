@@ -303,6 +303,17 @@ storage and optional SIFS-backed evidence use the same ownership contract, and
 the agent subsystem registers its entire durable subtree through the shared
 storage registry.
 
+Native process output is captured in private files under the agent evidence
+root. Polls read only the requested byte window. Normal command results retain
+bounded previews and refer to complete stdout/stderr artifacts; they do not
+collect the full streams again to construct outcome metadata. Temporary captures
+are removed when their process/evidence owner is released.
+
+A completed turn's merged resume snapshot is saved before successful runtime
+completion is published. A snapshot failure is reported through both the failed
+runtime event and the worker join result, while the merged state stays available
+in memory for a later save attempt.
+
 Agent homes are outside the session evidence subtree and are keyed by agent id.
 They use SIFS so a newly placed or explicitly migrated session sees the same
 home instead of receiving a new node-local directory. A runtime that cannot
@@ -570,8 +581,12 @@ never becomes the owner of the underlying model session.
 
 Cancellation is explicit and follows one operation identity across registries,
 subprocesses, sandboxes, gateways, object RPC, and cancel-aware modules. A
-caller can cancel before execution or while work is active. Once cancellation
-is accepted, a later transport or worker error is classified as cancellation
+caller can cancel before execution or while work is active. Turn-operation
+timeouts set a monotonic deadline on the same cancellation token observed by
+model, tool, and process execution. Deadline expiry requests cooperative
+cancellation; it does not pretend that a non-cooperative call has already stopped.
+Both synchronous and worker-driven turns clear their active state after an
+execution failure. Once cancellation is accepted, a later transport or worker error is classified as cancellation
 rather than an unrelated failure.
 
 Components that cannot stop active work must report that limitation. They must

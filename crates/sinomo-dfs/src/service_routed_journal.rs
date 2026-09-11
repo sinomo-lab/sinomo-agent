@@ -30,14 +30,20 @@ impl<T: DfsMessageTransport> NetworkedDfsService<T> {
         let Some(after_sequence) = after_sequence else {
             return Ok(Vec::new());
         };
-        if !matches!(
-            result,
-            DfsDistributedWriteResult::Outcome {
-                outcome: NetworkedDfsWriteOutcome::Committed { .. }
-            }
-        ) {
+        let DfsDistributedWriteResult::Outcome {
+            outcome: NetworkedDfsWriteOutcome::Committed { intent_id, .. },
+        } = result
+        else {
             return Ok(Vec::new());
-        }
+        };
+        // A blind path write may have been rebound to a hardlink's canonical
+        // inode. Keep the original id on the response envelope, but select
+        // its journal using the inode the authoritative intent actually wrote.
+        let committed_object_id = self
+            .coordinator
+            .intent(intent_id)
+            .map(|intent| intent.object_id.clone());
+        let object_id = committed_object_id.as_ref().unwrap_or(object_id);
         let object = self.current_read_object_metadata(object_id)?;
         let Some(shard) = self.select_metadata_shard_for_object(&object)? else {
             return Ok(Vec::new());

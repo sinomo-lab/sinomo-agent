@@ -57,7 +57,11 @@ impl AgentTool for ChangedFilesTool {
                 Some("git status".to_string()),
             );
         }
-        let changed = parse_git_status_porcelain_z(&execution.output.stdout, include_untracked);
+        let stdout = match execution.output.stdout_full() {
+            Ok(stdout) => stdout,
+            Err(error) => return error,
+        };
+        let changed = parse_git_status_porcelain_z(&stdout, include_untracked);
         let paths = changed
             .iter()
             .map(|file| file.path.clone())

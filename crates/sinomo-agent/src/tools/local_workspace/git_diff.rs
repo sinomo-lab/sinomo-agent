@@ -76,9 +76,25 @@ impl AgentTool for GitDiffTool {
             Err(result) => return result,
         };
 
-        let diff = String::from_utf8_lossy(&diff_output.output.stdout).to_string();
-        let stat = String::from_utf8_lossy(&stat_output.output.stdout).to_string();
-        let changed_files = String::from_utf8_lossy(&names_output.output.stdout)
+        let complete_output = |execution: &LocalCommandExecution| {
+            execution
+                .output
+                .stdout_full()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let diff = match complete_output(&diff_output) {
+            Ok(output) => output,
+            Err(error) => return error,
+        };
+        let stat = match complete_output(&stat_output) {
+            Ok(output) => output,
+            Err(error) => return error,
+        };
+        let names = match complete_output(&names_output) {
+            Ok(output) => output,
+            Err(error) => return error,
+        };
+        let changed_files = names
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(str::to_string)

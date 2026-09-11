@@ -1260,14 +1260,7 @@ fn atomic_write_text_file(
     let parent = target
         .parent()
         .ok_or_else(|| format!("path `{}` has no parent directory", target.display()))?;
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let temp = parent.join(format!(
-        ".{file_name}.sinomo-write-{}",
-        TaskId::generate().as_str()
-    ));
+    let temp = parent.join(format!(".sinomo-write-{}", TaskId::generate().as_str()));
     let write_result = (|| -> Result<(), String> {
         let mut file = fs::OpenOptions::new()
             .write(true)
