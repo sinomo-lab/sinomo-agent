@@ -190,6 +190,13 @@ impl Service for BuildService {
                     let response = host.status(&payload)?;
                     ctx.respond_value(BUILD_STATUS_ROUTE, response)?;
                 }
+                crate::BUILD_LOG_ROUTE => {
+                    let payload: crate::BuildLogRequest = ctx.decode_request_body(&request).await?;
+                    let status = host.read_status(&payload.job_id)?;
+                    let response = crate::log::read_build_job_log(&host.paths, &payload, &status)
+                        .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    ctx.respond_value(crate::BUILD_LOG_ROUTE, response)?;
+                }
                 BUILD_ARTIFACT_ROUTE => {
                     let payload: BuildArtifactRequest = ctx.decode_request_body(&request).await?;
                     let (response, body) = host.artifact(&payload)?;

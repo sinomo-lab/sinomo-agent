@@ -14,6 +14,12 @@ pub enum DaemonError {
     Parse { detail: String },
     #[error("network error at {address}: {detail}")]
     Network { address: String, detail: String },
+    #[error("network delivery error at {address} ({delivery_state:?}): {detail}")]
+    NetworkDelivery {
+        address: String,
+        detail: String,
+        delivery_state: sinomo_core::network::NetworkDeliveryState,
+    },
     #[error("sinomo daemon is already running or locked at {lock_file}: {detail}")]
     AlreadyRunning { lock_file: String, detail: String },
     #[error("sinomo daemon is not running: {detail}")]
@@ -40,9 +46,21 @@ impl From<sinomo_api::DaemonApiError> for DaemonError {
             sinomo_api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }
-            sinomo_api::DaemonApiError::NetworkDelivery { detail, .. } => Self::Network {
+            sinomo_api::DaemonApiError::NetworkDelivery {
+                detail,
+                delivery_state,
+            } => Self::NetworkDelivery {
                 address: "daemon RPC".to_string(),
                 detail,
+                delivery_state,
+            },
+            sinomo_api::DaemonApiError::ForwardNetwork {
+                detail,
+                delivery_state: Some(delivery_state),
+            } => Self::NetworkDelivery {
+                address: "daemon object RPC forward".to_string(),
+                detail,
+                delivery_state,
             },
             sinomo_api::DaemonApiError::ForwardNetwork { detail, .. } => Self::Network {
                 address: "daemon object RPC forward".to_string(),
@@ -94,6 +112,13 @@ impl From<sinomo_core::node::NodeIdentityError> for DaemonError {
 
 impl From<sinomo_core::network::NetworkError> for DaemonError {
     fn from(error: sinomo_core::network::NetworkError) -> Self {
+        if let Some(delivery_state) = error.delivery_state() {
+            return Self::NetworkDelivery {
+                address: "daemon RPC".into(),
+                detail: error.to_string(),
+                delivery_state,
+            };
+        }
         match error {
             sinomo_core::network::NetworkError::AuthDenied => Self::AuthDenied,
             sinomo_core::network::NetworkError::AuthExpired => Self::AuthExpired,

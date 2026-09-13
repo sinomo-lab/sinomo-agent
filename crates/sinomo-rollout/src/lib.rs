@@ -6,6 +6,7 @@ mod binary_ingress;
 mod client_protocol;
 mod cluster_kv;
 mod controller;
+mod coordinator;
 mod desired_reactor;
 mod error;
 mod module_load;
@@ -32,6 +33,7 @@ pub const SINOMO_ROLLOUT_NATIVE_REGISTRATION_KEY: &str = "sinomo-rollout";
 pub const ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND: &str = "rollout.transition.completed";
 pub const ROLLOUT_RPC_CATEGORY: &str = "rollout";
 pub const ROLLOUT_DIAGNOSTICS_ROUTE: &str = "/rollout/diagnostics";
+pub const ROLLOUT_UPLOAD_STATUS_ROUTE: &str = "/rollout/upload/status";
 pub const ROLLOUT_BINARY_ROUTE: &str = "/rollout/binary";
 pub const ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE: &str = "/rollout/native-dylib-module";
 pub const ROLLOUT_BUILD_ROUTE: &str = "/rollout/build";
@@ -43,6 +45,7 @@ pub const SHADOW_MAIN_BINARY_ENV: &str = "SINOMO_SHADOW_MAIN_BINARY";
 pub const SHADOW_START_DELAY_MS_ENV: &str = "SINOMO_SHADOW_START_DELAY_MS";
 pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_DIAGNOSTICS_ROUTE,
+    ROLLOUT_UPLOAD_STATUS_ROUTE,
     ROLLOUT_BINARY_ROUTE,
     ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
     ROLLOUT_BUILD_ROUTE,
@@ -68,10 +71,11 @@ pub use artifact::{
     stage_rollout_file_with_retry,
 };
 pub use binary_ingress::{
-    PreparedRolloutBinaryActivation, RolloutBinaryIngress, complete_rollout_binary_activation,
-    receive_rollout_binary_ingress, rollout_upload_artifact_path, rollout_upload_manifest_path,
-    validate_rollout_binary_manifest, validate_rollout_upload_component,
-    verify_rollout_uploaded_artifact, verify_rollout_uploaded_module,
+    PreparedRolloutBinaryActivation, RolloutBinaryIngress, RolloutUploadStatus,
+    complete_rollout_binary_activation, read_rollout_upload_status, receive_rollout_binary_ingress,
+    rollout_upload_artifact_path, rollout_upload_manifest_path, validate_rollout_binary_manifest,
+    validate_rollout_upload_component, verify_rollout_uploaded_artifact,
+    verify_rollout_uploaded_module,
 };
 pub use client_protocol::{rollout_binary_rpc_call, rollout_build_rpc_call};
 pub use cluster_kv::{
@@ -90,6 +94,12 @@ pub use controller::{
     canary_telemetry_scorecard_from_event_store, canary_telemetry_scorecard_from_events,
     rollout_telemetry_event_kind_is_relevant, shadow_telemetry_scorecard_from_event_store,
     shadow_telemetry_scorecard_from_events,
+};
+pub use coordinator::{
+    RolloutArtifactSource, RolloutCoordinatorPlan, RolloutCoordinatorTarget,
+    cache_rollout_coordinator_artifact, load_rollout_coordinator_plan, lock_rollout_coordinator,
+    rollout_coordinator_plan_path, save_rollout_coordinator_plan,
+    unfinished_rollout_coordinator_plan_ids,
 };
 pub use desired_reactor::{
     DESIRED_ROLLOUT_RETRY_MAX, DESIRED_ROLLOUT_RETRY_MIN,
@@ -225,6 +235,12 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
     use sinomo_module::{ModuleObjectRpcRoute, ModuleRouteAuth, ModuleSurfaces};
 
     let mut surfaces = ModuleSurfaces::default()
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            ROLLOUT_UPLOAD_STATUS_ROUTE,
+            ROLLOUT_RPC_CATEGORY,
+            "rollout.diagnostics.read",
+            ModuleRouteAuth::Admin,
+        ))
         .with_object_rpc_route(ModuleObjectRpcRoute::new(
             ROLLOUT_DIAGNOSTICS_ROUTE,
             ROLLOUT_RPC_CATEGORY,
@@ -387,6 +403,10 @@ pub fn register_storage_paths(
     for (relative_path, reason) in [
         ("bin", "installed runtime binaries"),
         ("rollout/staged", "staged rollout build artifacts"),
+        (
+            "rollout/coordinator",
+            "durable rollout plans and coordinator admission lock",
+        ),
         (
             "rollout/logs",
             "operator-readable rollout logs and diagnostics",

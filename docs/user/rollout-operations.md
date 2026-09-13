@@ -22,6 +22,26 @@ Command syntax can change with the installed binary. Use
 Before rollout, commit or otherwise preserve the intended source, run the
 relevant tests, and confirm the current cluster is healthy.
 
+## Prepare Committed Dependencies
+
+Rollout source must be self-contained. This repository keeps the sibling SUI
+revision in `rollout-source.json`; raw sibling paths remain available to local
+debug builds. Prepare a deployment checkout from the committed source and pins:
+
+```sh
+sinomo rollout prepare-source --repo "$PWD" --output /path/to/new-deployment-source \
+  --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-msvc
+sinomo rollout import-source --repo /path/to/new-deployment-source
+```
+
+The output directory must be new. Preparation excludes uncommitted source and
+dependency edits, embeds the exact pinned Git trees, rewrites dependency paths
+inside the isolated checkout, and validates locked Cargo metadata. It records
+the source and dependency provenance in `deployment-source.json` and commits the
+prepared snapshot. Builds reject external path dependencies and inconsistent
+prepared pins. Update and commit the pin and matching lockfile before preparing
+a different dependency version. Preparation never publishes a repository.
+
 ## Cluster Build and Rollout
 
 Cluster build and rollout is the normal source-based workflow. Rollout discovers
@@ -48,7 +68,7 @@ Import the reviewed checkout into managed source, then request cluster build
 resolution and rollout:
 
 ```sh
-sinomo rollout import-source --repo "$PWD"
+sinomo rollout import-source --repo /path/to/new-deployment-source
 sinomo rollout cluster
 sinomo cluster health
 ```
@@ -68,6 +88,13 @@ combine it with `--remote-repo`; this bypasses cluster placement but still uses
 the same build-owned executor, cache, resource admission, and artifact
 verification. `--force-source` applies only while importing a managed source
 checkout.
+
+When omitted, `--repo` resolves to the managed source checkout, independently of
+the invoking current directory. An explicit target list is the complete target
+set; `--skip-local` affects automatic discovery. Each selected node retains its
+existing main and shadow ports. Port flags provide connection/bootstrap defaults;
+they do not relocate an existing listener. `--host` remains an explicit bind-host
+change and is checked after activation.
 
 Each build server advertises its installed host target automatically. To let a
 server build for additional installed Rust targets, set a comma-separated list
@@ -161,7 +188,55 @@ less recovery coverage.
 The main daemon remains the normal rollout endpoint. The shadow endpoint is a
 repair surface for cases where the main control path is unavailable.
 
+For containers where shadow is PID 1, the updated entrypoint launches an
+authorized staged shadow after restart. Rollout-owned boot recovery promotes it
+atomically, retains the previous binary, consumes the stage, and re-executes from
+the stable path with the recorded listener settings. Container images must carry
+that entrypoint; a binary-only rollout does not update image scripts.
+
 ## Verify a Rollout
+
+Cluster source and binary rollouts save their exact targets, upload manifests,
+artifact paths, and progress under `$SINOMO_DATA_DIR/rollout/coordinator/` before
+uploading. The printed rollout ID identifies that plan. The local coordinator
+stays last even when targets use different platforms.
+
+```sh
+sinomo rollout verify                 # inspect every target in the latest plan
+sinomo rollout resume                 # reconcile and continue that same plan
+sinomo rollout resume --id ROLLOUT_ID
+```
+
+Resume checks completed targets again, observes an activation already in
+progress, and reuses the original upload identity when transfer must continue.
+Receiver-side activation claims and receipts prevent duplicate activation. An
+unknown outcome on an older daemon without upload-status support fails closed;
+it is never treated as proof that the request was not sent. Another voter cannot
+advance until the preceding voter has regained current-term quorum-backed KV
+readiness for five seconds. A failed or ambiguous activation leaves the plan
+unfinished and blocks starting a replacement cluster plan.
+
+Use `sinomo rollout cancel --id ROLLOUT_ID` when deliberately abandoning a settled
+plan. Cancellation requires terminal receipts, explicit proof that no replacements
+are pending, and stable readiness of the affected nodes. It retires the local plan;
+it does not stop an active deployment or undo completed updates. Missing evidence,
+including an older daemon that cannot report pending state, fails closed. A new
+plan can begin once the old one is complete or safely cancelled.
+
+For a deployment made before saved plans were available, verification can use
+explicit targets and an expected source commit:
+
+```sh
+sinomo rollout verify --target NODE_ID --commit FULL_COMMIT --repo /path/to/source
+```
+
+Matching full commit IDs do not require a local source checkout. `--repo` is
+needed to resolve abbreviated IDs reported by older binaries.
+
+These commands perform the normal identity, runtime revision, finalized handoff,
+and Raft-readiness checks through Sinomo RPC. Verification does not activate or
+clear rollout state. Explicit target-local source recovery (`--remote-repo`) and
+the local `apply` handoff retain their existing recovery paths.
 
 Check both rollout state and live node health:
 
@@ -175,7 +250,26 @@ For a remote target:
 
 ```sh
 sinomo rollout diagnostics --target 192.168.1.154:21353
+sinomo rollout diagnostics --target NODE_ID --json
 ```
+
+Diagnostics return per-target runtime observations, observation timestamps,
+rollout reports, and errors. The command exits nonzero if a requested target's
+diagnostics or runtime status cannot be read. Cluster health displays published
+observations, which can briefly lag a restarted process; direct diagnostics read
+the actual daemon.
+
+Compiler output is written to the build job's log while the process runs. Use
+the build server and job ID printed during resolution to inspect that job:
+
+```sh
+sinomo rollout build-log --target BUILDER_NODE_ID --job JOB_ID --follow
+```
+
+Log reads are bounded, support cursors across worker restarts, and require the
+build log's administrator capability. They use the build service and do not
+require remote shell or filesystem consent. A log from an older local build in
+the diagnostic report does not describe a current cluster build job.
 
 Diagnostics include rollout state, the latest local build-service log, and
 candidate output tails. Cluster-build job records, source bundles, logs,

@@ -25,7 +25,10 @@ use crate::{
     rollout_module_surfaces,
 };
 
-const ROLLOUT_ROUTES: &[&str] = &[ROLLOUT_DIAGNOSTICS_ROUTE];
+const ROLLOUT_ROUTES: &[&str] = &[
+    ROLLOUT_DIAGNOSTICS_ROUTE,
+    crate::ROLLOUT_UPLOAD_STATUS_ROUTE,
+];
 const ROLLOUT_HOST_ROUTES: &[&str] = &[
     ROLLOUT_BINARY_ROUTE,
     ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE,
@@ -114,12 +117,26 @@ impl Service for RolloutService {
     }
 
     fn route_categories(&self) -> Vec<ServiceRoute> {
-        vec![rollout_service_route(ROLLOUT_DIAGNOSTICS_ROUTE)]
+        self.routes()
+            .iter()
+            .copied()
+            .map(rollout_service_route)
+            .collect()
     }
 
     fn handle(&self, mut ctx: ServiceContext, request: ObjectRpcRequest) -> ServiceFuture<'_> {
         Box::pin(async move {
             match request.route.as_str() {
+                crate::ROLLOUT_UPLOAD_STATUS_ROUTE => {
+                    let manifest = ctx.decode_request_body(&request).await?;
+                    let status = crate::read_rollout_upload_status(
+                        &SelfRolloutPaths::new(&ctx.data_dir.root()),
+                        &manifest,
+                    )
+                    .map_err(|error| ServiceError::Service(error.to_string()))?;
+                    ctx.respond_value(crate::ROLLOUT_UPLOAD_STATUS_ROUTE, status)?;
+                    Ok(ServiceDisposition::Continue)
+                }
                 ROLLOUT_DIAGNOSTICS_ROUTE => {
                     let _: () = ctx.decode_request_body(&request).await?;
                     let rollout_paths = SelfRolloutPaths::new(&ctx.data_dir.root());
@@ -173,24 +190,43 @@ impl Service for HostedRolloutService {
                     let ingress =
                         receive_rollout_binary_ingress(&ctx.data_dir.root(), payload, &mut body)
                             .await;
+                    let mut activated = false;
                     let result = match ingress {
                         Err(error) => Err(error.to_string()),
                         Ok(RolloutBinaryIngress::Complete(response)) => Ok(response),
                         Ok(RolloutBinaryIngress::Activate(prepared)) => {
+                            activated = true;
                             match host.activate_binary(prepared.manifest.clone()).await {
                                 Ok(response) => {
                                     complete_rollout_binary_activation(&prepared, &response)
                                         .map(|()| response)
                                         .map_err(|error| error.to_string())
                                 }
-                                Err(error) => Err(error),
+                                Err(error) => {
+                                    let response = ClusterRolloutBinaryResponse {
+                                        status: "failed".to_string(),
+                                        detail: error,
+                                        main_binary: PathBuf::new(),
+                                        shadow_binary: PathBuf::new(),
+                                        source_head: None,
+                                    };
+                                    complete_rollout_binary_activation(&prepared, &response)
+                                        .map(|()| response)
+                                        .map_err(|error| error.to_string())
+                                }
                             }
                         }
                     };
                     let service = HostedRolloutService { host };
                     let (response, disposition) = service.finish(result);
                     ctx.respond_value(route, response)?;
-                    Ok(disposition)
+                    // Reading an existing receipt must not stop the replacement
+                    // main daemon that already completed this operation.
+                    Ok(if activated {
+                        disposition
+                    } else {
+                        ServiceDisposition::Continue
+                    })
                 }
                 ROLLOUT_NATIVE_DYLIB_MODULE_ROUTE => {
                     let payload = ctx.decode_request_body(&request).await?;

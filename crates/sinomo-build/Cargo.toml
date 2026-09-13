@@ -12,10 +12,12 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+dunce.workspace = true
 blake3.workspace = true
 fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml_edit.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 time.workspace = true

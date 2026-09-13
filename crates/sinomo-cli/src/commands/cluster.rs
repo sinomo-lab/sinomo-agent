@@ -2590,17 +2590,11 @@ pub(crate) fn cluster_role(options: ClusterRoleOptions) -> Result<(), CliError> 
 pub(crate) fn cluster_state_authority_role(
     options: ClusterStateAuthorityOptions,
 ) -> Result<(), CliError> {
-    let paths = cluster_paths_from_defaults()?;
-    refresh_cluster_kv_from_local_daemon(&paths)?;
-    let state = cluster::read_cluster_state(&paths)?;
-    let update = cluster::update_cluster_state_authority_with_host(
-        &paths,
-        state,
-        options.node_id.clone(),
-        options.role.clone(),
-        OffsetDateTime::now_utc(),
-        &mut CliClusterMemberMutationHost,
-    )?;
+    let client = cluster_control_daemon_client("state-authority <node-id> <role>")?;
+    let update = client.cluster_state_authority(cluster::ClusterControlStateAuthorityRequest {
+        node_id: options.node_id,
+        role: options.role,
+    })?;
     if !update.changed {
         println!(
             "cluster member {} already has state authority role {}",

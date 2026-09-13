@@ -34,6 +34,7 @@ pub fn build_module_capabilities() -> ModuleCapabilities {
             build_capability("build.capabilities.read"),
             build_capability("build.job.submit"),
             build_capability("build.job.status.read"),
+            build_capability("build.job.log.read"),
             build_capability("build.artifact.read"),
             build_capability("build.job.record"),
         ],
@@ -67,6 +68,12 @@ pub fn build_module_surfaces() -> ModuleSurfaces {
             ModuleRouteAuth::ClusterMember,
         ))
         .with_storage_owner(SINOMO_BUILD_MODULE_OWNER)
+        .with_object_rpc_route(ModuleObjectRpcRoute::new(
+            crate::BUILD_LOG_ROUTE,
+            BUILD_RPC_CATEGORY,
+            "build.job.log.read",
+            ModuleRouteAuth::Admin,
+        ))
         .with_event_kind_name(BUILD_JOB_QUEUED_EVENT_KIND)
         .with_event_kind_name(BUILD_JOB_STARTED_EVENT_KIND)
         .with_event_kind_name(BUILD_JOB_SUCCEEDED_EVENT_KIND)
@@ -134,7 +141,7 @@ mod tests {
     }
 
     #[test]
-    fn only_submit_requires_admin_while_cluster_members_can_fetch_results() {
+    fn submit_and_logs_require_admin_while_cluster_members_can_fetch_results() {
         let surfaces = build_module_surfaces();
         let auth = |route: &str| {
             surfaces
@@ -144,6 +151,7 @@ mod tests {
                 .map(|candidate| candidate.auth)
         };
         assert_eq!(auth(BUILD_SUBMIT_ROUTE), Some(ModuleRouteAuth::Admin));
+        assert_eq!(auth(crate::BUILD_LOG_ROUTE), Some(ModuleRouteAuth::Admin));
         assert_eq!(
             auth(BUILD_ARTIFACT_ROUTE),
             Some(ModuleRouteAuth::ClusterMember)

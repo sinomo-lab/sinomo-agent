@@ -279,6 +279,7 @@ pub(crate) fn run_shadow_daemon(options: DaemonRunOptions) -> Result<(), CliErro
     let shadow_paths = DaemonPaths::for_shadow(&data_dir);
     let main_paths = DaemonPaths::new(&data_dir);
     let rollout_paths = SelfRolloutPaths::new(&data_dir.root());
+    sinomo_runtime::rollout_host::resume_pending_pid1_shadow_boot(&rollout_paths, &options)?;
     let main_options = daemon_shadow_main_options_from_env()?;
     let main_binary = daemon_shadow_main_binary_from_env(&rollout_paths);
     let registration = daemon_cluster_registration_if_initialized(daemon_cluster_registration(

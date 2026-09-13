@@ -118,6 +118,8 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+dunce = "1.0.5"
+toml_edit = "0.25.13"
 arc-swap = "1.9.2"
 base64 = "0.22.1"
 blake3 = "1.8.5"

@@ -28,6 +28,8 @@ pub const CLUSTER_CONTROL_INVITE_ROUTE: &str = "/cluster/control/invite";
 pub const CLUSTER_CONTROL_RENAME_ROUTE: &str = "/cluster/control/rename";
 /// Change a cluster member's node role.
 pub const CLUSTER_CONTROL_ROLE_ROUTE: &str = "/cluster/control/role";
+/// Change committed Raft membership through the daemon that owns the Raft node.
+pub const CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE: &str = "/cluster/control/state-authority";
 /// Remove cluster members.
 pub const CLUSTER_CONTROL_REMOVE_ROUTE: &str = "/cluster/control/remove";
 /// Leave the current cluster and re-initialize as a single-node cluster.
@@ -42,6 +44,7 @@ pub const CLUSTER_CONTROL_RPC_ROUTES: &[&str] = &[
     CLUSTER_CONTROL_INVITE_ROUTE,
     CLUSTER_CONTROL_RENAME_ROUTE,
     CLUSTER_CONTROL_ROLE_ROUTE,
+    CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
     CLUSTER_CONTROL_REMOVE_ROUTE,
     CLUSTER_CONTROL_LEAVE_ROUTE,
 ];
@@ -85,6 +88,10 @@ pub const CLUSTER_CONTROL_RPC_ROUTE_POLICIES: &[ClusterControlRoutePolicy] = &[
     ),
     cluster_control_mutation_policy(
         CLUSTER_CONTROL_ROLE_ROUTE,
+        ClusterKvRouteAuth::LocalOrRaftVoter,
+    ),
+    cluster_control_mutation_policy(
+        CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
         ClusterKvRouteAuth::LocalOrRaftVoter,
     ),
     cluster_control_mutation_policy(
@@ -229,6 +236,14 @@ pub struct ClusterControlRoleRequest {
     pub node_id: NodeId,
     pub role: ClusterNodeRole,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ClusterControlStateAuthorityRequest {
+    pub node_id: NodeId,
+    pub role: ClusterMemberRole,
+}
+
+pub type ClusterControlStateAuthorityResponse = crate::ClusterStateAuthorityUpdate;
 
 /// Result of a member role change.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -395,6 +410,16 @@ cluster_control_rpc_codec!(
 );
 
 cluster_control_rpc_codec!(
+    CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
+    ClusterControlStateAuthorityRequest,
+    ClusterControlStateAuthorityResponse,
+    cluster_control_state_authority_rpc_payload,
+    decode_cluster_control_state_authority_rpc_request_body,
+    cluster_control_state_authority_response_rpc_payload,
+    decode_cluster_control_state_authority_rpc_response_body,
+);
+
+cluster_control_rpc_codec!(
     CLUSTER_CONTROL_REMOVE_ROUTE,
     ClusterControlRemoveRequest,
     ClusterControlRemoveResponse,
@@ -431,6 +456,7 @@ mod tests {
             CLUSTER_CONTROL_INVITE_ROUTE,
             CLUSTER_CONTROL_RENAME_ROUTE,
             CLUSTER_CONTROL_ROLE_ROUTE,
+            CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
             CLUSTER_CONTROL_REMOVE_ROUTE,
         ] {
             assert!(!cluster_control_route_requires_runtime_restart(route));
@@ -450,6 +476,25 @@ mod tests {
             assert_eq!(policy.category, CLUSTER_CONTROL_RPC_CATEGORY);
             assert!(route.starts_with("/cluster/control/"));
         }
+    }
+
+    #[test]
+    fn state_authority_route_preserves_typed_membership_and_voter_authorization() {
+        let request = ClusterControlStateAuthorityRequest {
+            node_id: NodeId::generate(),
+            role: ClusterMemberRole::Voter,
+        };
+        let payload = cluster_control_state_authority_rpc_payload(&request).unwrap();
+        assert_eq!(
+            decode_cluster_control_state_authority_rpc_request_body(&payload.body).unwrap(),
+            request
+        );
+        let policy =
+            cluster_control_rpc_route_policy(CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE).unwrap();
+        assert_eq!(policy.auth, ClusterKvRouteAuth::LocalOrRaftVoter);
+        assert!(!cluster_control_route_requires_runtime_restart(
+            CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE
+        ));
     }
 
     #[test]

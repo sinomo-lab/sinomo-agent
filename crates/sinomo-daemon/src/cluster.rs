@@ -5999,6 +5999,33 @@ pub(crate) fn handle_daemon_cluster_control_role_with_authority_on_runtime(
     })
 }
 
+/// `/cluster/control/state-authority`: change committed Raft membership.
+pub(crate) fn handle_daemon_cluster_control_state_authority_on_runtime(
+    daemon_paths: &DaemonPaths,
+    request: sinomo_core::cluster::ClusterControlStateAuthorityRequest,
+    runtime: &tokio::runtime::Handle,
+    remote_authority: Option<RemoteClusterControlAuthorityFence>,
+) -> Result<sinomo_core::cluster::ClusterControlStateAuthorityResponse, DaemonError> {
+    let paths = cluster_paths_from_daemon_paths(daemon_paths)?;
+    let state = daemon_cluster_control_state(&paths)?;
+    let mut host = DaemonClusterMemberMutationHost::new_on_runtime(runtime)
+        .with_remote_control_authority(remote_authority);
+    let update = sinomo_core::cluster::update_cluster_state_authority_with_host(
+        &paths,
+        state,
+        request.node_id,
+        request.role,
+        OffsetDateTime::now_utc(),
+        &mut host,
+    )?;
+    if update.changed {
+        crate::control::request_daemon_cluster_maintenance(
+            crate::control::DaemonClusterMaintenanceReason::RoleChanged,
+        );
+    }
+    Ok(update)
+}
+
 /// `/cluster/control/remove`: remove members by node id.
 pub(crate) fn handle_daemon_cluster_control_remove_with_authority_on_runtime(
     daemon_paths: &DaemonPaths,

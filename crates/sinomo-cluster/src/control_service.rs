@@ -61,6 +61,12 @@ pub trait ClusterControlServiceHost: Send + Sync + 'static {
         authority: Option<RemoteClusterControlAuthorityFence>,
     ) -> ClusterControlServiceFuture<'_, ClusterControlRoleResponse>;
 
+    fn state_authority(
+        &self,
+        request: crate::ClusterControlStateAuthorityRequest,
+        authority: Option<RemoteClusterControlAuthorityFence>,
+    ) -> ClusterControlServiceFuture<'_, crate::ClusterControlStateAuthorityResponse>;
+
     fn remove(
         &self,
         request: ClusterControlRemoveRequest,
@@ -273,6 +279,13 @@ impl Service for HostedClusterControlService {
                         host.role(payload, authority).await?,
                     )?;
                 }
+                crate::CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE => {
+                    let payload = ctx.decode_request_body(&request).await?;
+                    ctx.respond_value(
+                        crate::CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
+                        host.state_authority(payload, authority).await?,
+                    )?;
+                }
                 CLUSTER_CONTROL_REMOVE_ROUTE => {
                     let payload: ClusterControlRemoveRequest =
                         ctx.decode_request_body(&request).await?;
@@ -311,6 +324,13 @@ mod tests {
     struct TestHost;
 
     impl ClusterControlServiceHost for TestHost {
+        fn state_authority(
+            &self,
+            _request: crate::ClusterControlStateAuthorityRequest,
+            _authority: Option<RemoteClusterControlAuthorityFence>,
+        ) -> ClusterControlServiceFuture<'_, crate::ClusterControlStateAuthorityResponse> {
+            unused()
+        }
         fn authoritative_snapshot(
             &self,
         ) -> ClusterControlServiceFuture<'_, KvAuthoritativeRead<KvSnapshot>> {

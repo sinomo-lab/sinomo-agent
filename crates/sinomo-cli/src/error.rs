@@ -2,6 +2,11 @@ use super::*;
 
 #[derive(Debug)]
 pub enum CliError {
+    NetworkDelivery {
+        address: String,
+        detail: String,
+        delivery_state: network::NetworkDeliveryState,
+    },
     Usage,
     AuthDenied,
     AuthExpired,
@@ -302,6 +307,13 @@ impl From<KvError> for CliError {
 
 impl From<network::NetworkError> for CliError {
     fn from(error: network::NetworkError) -> Self {
+        if let Some(delivery_state) = error.delivery_state() {
+            return Self::NetworkDelivery {
+                address: "object RPC".into(),
+                detail: error.to_string(),
+                delivery_state,
+            };
+        }
         match error {
             network::NetworkError::AuthDenied => Self::AuthDenied,
             network::NetworkError::AuthExpired => Self::AuthExpired,
@@ -331,6 +343,15 @@ impl From<network::NetworkError> for CliError {
 impl From<sinomo_runtime::daemon::DaemonError> for CliError {
     fn from(error: sinomo_runtime::daemon::DaemonError) -> Self {
         match error {
+            sinomo_runtime::daemon::DaemonError::NetworkDelivery {
+                address,
+                detail,
+                delivery_state,
+            } => Self::NetworkDelivery {
+                address,
+                detail,
+                delivery_state,
+            },
             sinomo_runtime::daemon::DaemonError::AuthDenied => Self::AuthDenied,
             sinomo_runtime::daemon::DaemonError::AuthExpired => Self::AuthExpired,
             sinomo_runtime::daemon::DaemonError::Io { path, detail } => Self::Io { path, detail },
@@ -368,9 +389,21 @@ impl From<sinomo_runtime::api::DaemonApiError> for CliError {
             sinomo_runtime::api::DaemonApiError::Network { address, detail } => {
                 Self::Network { address, detail }
             }
-            sinomo_runtime::api::DaemonApiError::NetworkDelivery { detail, .. } => Self::Network {
+            sinomo_runtime::api::DaemonApiError::NetworkDelivery {
+                detail,
+                delivery_state,
+            } => Self::NetworkDelivery {
                 address: "daemon RPC".to_string(),
                 detail,
+                delivery_state,
+            },
+            sinomo_runtime::api::DaemonApiError::ForwardNetwork {
+                detail,
+                delivery_state: Some(delivery_state),
+            } => Self::NetworkDelivery {
+                address: "daemon object RPC forward".to_string(),
+                detail,
+                delivery_state,
             },
             sinomo_runtime::api::DaemonApiError::UnknownRoute { route } => Self::Network {
                 address: "daemon RPC".to_string(),
@@ -463,6 +496,14 @@ impl From<sinomo_runtime::eval::EvalError> for CliError {
 impl std::fmt::Display for CliError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NetworkDelivery {
+                address,
+                detail,
+                delivery_state,
+            } => write!(
+                formatter,
+                "network delivery error at {address} ({delivery_state:?}): {detail}"
+            ),
             Self::Usage => write!(formatter, "unknown command; run `sinomo help`"),
             Self::AuthDenied => write!(formatter, "device authorization was denied"),
             Self::AuthExpired => write!(formatter, "device authorization expired"),

@@ -1254,6 +1254,33 @@ impl DaemonClusterControlServiceHost {
 }
 
 impl sinomo_core::cluster::ClusterControlServiceHost for DaemonClusterControlServiceHost {
+    fn state_authority(
+        &self,
+        request: sinomo_core::cluster::ClusterControlStateAuthorityRequest,
+        authority: Option<RemoteClusterControlAuthorityFence>,
+    ) -> sinomo_core::cluster::ClusterControlServiceFuture<
+        '_,
+        sinomo_core::cluster::ClusterControlStateAuthorityResponse,
+    > {
+        let paths = self.paths.clone();
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            let runtime =
+                require_service_runtime(runtime.as_ref(), "cluster control state authority")?
+                    .clone();
+            run_blocking_service_task(
+                sinomo_core::cluster::CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
+                "cluster control state authority",
+                move || {
+                    crate::cluster::handle_daemon_cluster_control_state_authority_on_runtime(
+                        &paths, request, &runtime, authority,
+                    )
+                    .map_err(daemon_error)
+                },
+            )
+            .await
+        })
+    }
     fn authoritative_snapshot(
         &self,
     ) -> sinomo_core::cluster::ClusterControlServiceFuture<

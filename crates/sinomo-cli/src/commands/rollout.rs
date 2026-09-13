@@ -1,4 +1,6 @@
 use super::*;
+mod build_log;
+mod recovery;
 use sinomo_runtime::build::{
     BuildArtifactKind, BuildArtifactRequest, BuildArtifactResponse, BuildArtifactSetManifest,
     BuildCandidate, BuildCapabilitiesRequest, BuildCapabilitiesResponse, BuildJobState,
@@ -20,6 +22,15 @@ pub(crate) enum RolloutCliCommand {
     ApplyExternal(RolloutOptions),
     Apply(RolloutOptions),
     Cluster(RolloutOptions),
+    Verify(recovery::RecoveryOptions),
+    Resume(recovery::RecoveryOptions),
+    Cancel(recovery::RecoveryOptions),
+    BuildLog(build_log::BuildLogOptions),
+    PrepareSource {
+        repo: PathBuf,
+        output: PathBuf,
+        targets: Vec<String>,
+    },
     ModuleNativeDylib(RolloutModuleNativeDylibOptions),
     Advance(RolloutAdvanceOptions),
     TelemetryGatesShow,
@@ -31,6 +42,7 @@ pub(crate) enum RolloutCliCommand {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct RolloutOptions {
+    pub(crate) json: bool,
     pub(crate) repo: Option<PathBuf>,
     pub(crate) binary: Option<PathBuf>,
     pub(crate) remote_repo: Option<PathBuf>,
@@ -51,6 +63,7 @@ pub(crate) struct RolloutOptions {
 impl Default for RolloutOptions {
     fn default() -> Self {
         Self {
+            json: false,
             repo: None,
             binary: None,
             remote_repo: None,
@@ -208,6 +221,18 @@ fn validate_rollout_runtime_source_identity(
             ),
         });
     }
+    // Full object IDs are already unambiguous. Resuming a retained artifact
+    // must not require that its original source checkout still exists. Older
+    // daemons reporting abbreviated IDs still require repository resolution.
+    let full_commit = |value: &str| {
+        matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    };
+    if full_commit(observed)
+        && full_commit(expected.revision)
+        && observed.eq_ignore_ascii_case(expected.revision)
+    {
+        return Ok(());
+    }
     let expected_commit = sinomo_runtime::rollout::resolve_rollout_source_commit(
         expected.repo,
         expected.revision,
@@ -296,9 +321,26 @@ fn rollout_cli_spec() -> CliCommandSpec {
         .with_children([
             CliCommandSpec::new("init-source", "initialize the managed source repository")
                 .with_options(source_options()),
-            CliCommandSpec::new("import-source", "merge external source into managed source")
-                .with_aliases(["sync-from-external"])
-                .with_options(source_options()),
+            CliCommandSpec::new(
+                "prepare-source",
+                "prepare committed dependency pins in an isolated deployment checkout",
+            )
+            .with_options([
+                option("--repo", "source Git repository", "path"),
+                option("--output", "new deployment checkout directory", "path"),
+                option(
+                    "--target",
+                    "Rust target triple for locked metadata validation",
+                    "triple",
+                )
+                .repeatable(),
+            ]),
+            CliCommandSpec::new(
+                "import-source",
+                "align managed source to an external committed snapshot",
+            )
+            .with_aliases(["sync-from-external"])
+            .with_options(source_options()),
             CliCommandSpec::new(
                 "export-source",
                 "merge managed source into an external repo",
@@ -316,6 +358,49 @@ fn rollout_cli_spec() -> CliCommandSpec {
             CliCommandSpec::new("cluster", "roll out to cluster targets")
                 .with_aliases(["apply-cluster"])
                 .with_options(cluster_options),
+            CliCommandSpec::new(
+                "verify",
+                "verify runtime identity and stable Raft readiness",
+            )
+            .with_options([
+                option("--id", "saved rollout ID (defaults to latest)", "id"),
+                option(
+                    "--target",
+                    "target to verify without a saved plan",
+                    "node|host:port",
+                )
+                .repeatable(),
+                option("--commit", "expected runtime source commit", "commit"),
+                option(
+                    "--repo",
+                    "repository for resolving the expected commit",
+                    "path",
+                ),
+            ]),
+            CliCommandSpec::new("resume", "reconcile and resume the original saved rollout")
+                .with_options([option(
+                    "--id",
+                    "saved rollout ID (defaults to latest)",
+                    "id",
+                )]),
+            CliCommandSpec::new(
+                "cancel",
+                "retire a settled plan after proving node readiness",
+            )
+            .with_options([option(
+                "--id",
+                "saved rollout ID (defaults to latest)",
+                "id",
+            )]),
+            CliCommandSpec::new(
+                "build-log",
+                "read or follow one build job's compiler output",
+            )
+            .with_options([
+                option("--job", "build job ID", "id"),
+                option("--target", "build server", "node|host:port"),
+                CliOptionSpec::flag("--follow", "wait for new output until the job finishes"),
+            ]),
             CliCommandSpec::new("module", "roll out native modules").with_children([
                 CliCommandSpec::new("native-dylib", "roll out one native dynamic module")
                     .with_options(module_options)
@@ -372,7 +457,10 @@ fn rollout_cli_spec() -> CliCommandSpec {
                 ]),
             CliCommandSpec::new("diagnostics", "fetch rollout diagnostics")
                 .with_aliases(["diag"])
-                .with_options([option("--target", "rollout target", "host:port").repeatable()]),
+                .with_options([
+                    option("--target", "rollout target", "node|host:port").repeatable(),
+                    CliOptionSpec::flag("--json", "structured per-target diagnostics"),
+                ]),
             CliCommandSpec::new("clear-status", "clear stale rollout status")
                 .with_aliases(["clear-state"])
                 .with_options([option("--target", "rollout target", "host:port").repeatable()]),
@@ -410,6 +498,7 @@ fn rollout_options_from_matches(
         .transpose()?
         .unwrap_or(defaults.shadow_port);
     Ok(RolloutOptions {
+        json: matches.contains("--json"),
         repo: matches.value("--repo").map(PathBuf::from),
         binary: matches.value("--binary").map(PathBuf::from),
         remote_repo: matches.value("--remote-repo").map(PathBuf::from),
@@ -432,6 +521,33 @@ fn parse_rollout_matches(matches: &CliCommandMatches) -> Result<RolloutCliComman
         .map(String::as_str)
         .collect::<Vec<_>>();
     match path.as_slice() {
+        ["rollout", "prepare-source"] => {
+            Ok(RolloutCliCommand::PrepareSource {
+                repo: PathBuf::from(matches.value("--repo").ok_or_else(|| {
+                    CliParseError::Parse {
+                        detail: "prepare-source requires --repo".into(),
+                    }
+                })?),
+                output: PathBuf::from(matches.value("--output").ok_or_else(|| {
+                    CliParseError::Parse {
+                        detail: "prepare-source requires --output".into(),
+                    }
+                })?),
+                targets: matches.values("--target").map(str::to_owned).collect(),
+            })
+        }
+        ["rollout", "verify"] => Ok(RolloutCliCommand::Verify(recovery::RecoveryOptions::parse(
+            matches,
+        )?)),
+        ["rollout", "resume"] => Ok(RolloutCliCommand::Resume(recovery::RecoveryOptions::parse(
+            matches,
+        )?)),
+        ["rollout", "cancel"] => Ok(RolloutCliCommand::Cancel(recovery::RecoveryOptions::parse(
+            matches,
+        )?)),
+        ["rollout", "build-log"] => Ok(RolloutCliCommand::BuildLog(
+            build_log::BuildLogOptions::parse(matches)?,
+        )),
         ["rollout", "init-source"] => {
             rollout_options_from_matches(matches).map(RolloutCliCommand::InitSource)
         }
@@ -730,6 +846,23 @@ pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), 
         RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
+        RolloutCliCommand::Verify(options) => recovery::verify(options),
+        RolloutCliCommand::Resume(options) => recovery::resume(options),
+        RolloutCliCommand::Cancel(options) => recovery::cancel(options),
+        RolloutCliCommand::BuildLog(options) => build_log::run(options),
+        RolloutCliCommand::PrepareSource {
+            repo,
+            output,
+            targets,
+        } => {
+            let commit = sinomo_runtime::build::prepare_deployment_source(&repo, &output, &targets)
+                .map_err(build_service_cli_error)?;
+            println!(
+                "prepared deployment source: {}\ncommit: {commit}",
+                output.display()
+            );
+            Ok(())
+        }
         RolloutCliCommand::ModuleNativeDylib(options) => rollout_module_native_dylib(options),
         RolloutCliCommand::Advance(options) => rollout_advance(options),
         RolloutCliCommand::TelemetryGatesShow => rollout_telemetry_gates_show(),
@@ -1367,14 +1500,62 @@ pub(crate) fn rollout_diagnostics(options: RolloutOptions) -> Result<(), CliErro
                 .unwrap_or_else(|| daemon_connect_address(&options.host, options.port)),
         )]
     } else {
-        explicit_rollout_targets(options.targets)
+        rollout_cluster_targets(&options)?
     };
+    let mut reports = Vec::new();
+    let mut failures = Vec::new();
     for target in targets {
-        println!("== {} ==", target.label());
-        match send_daemon_rollout_diagnostics(&target) {
-            Ok(response) => print!("{response}"),
-            Err(error) => println!("failed: {error}"),
+        let observed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .unwrap_or_default();
+        let report = send_daemon_rollout_diagnostics(&target);
+        let runtime = read_rollout_target_status(&target);
+        let mut errors = Vec::new();
+        if let Err(error) = &report {
+            errors.push(error.to_string());
         }
+        if let Err(error) = &runtime {
+            errors.push(error.to_string());
+        }
+        if !errors.is_empty() {
+            failures.push(target.label().to_string());
+        }
+        if !options.json {
+            println!("== {} (observed {}) ==", target.label(), observed_at);
+            match &report {
+                Ok(report) => print!("{report}"),
+                Err(error) => println!("failed: {error}"),
+            }
+            match &runtime {
+                Ok(runtime) => println!(
+                    "live runtime: pid={} commit={:?}",
+                    runtime.pid, runtime.commit
+                ),
+                Err(error) => println!("live runtime failed: {error}"),
+            }
+        }
+        reports.push(serde_json::json!({
+            "target": target.label(), "observed_at": observed_at,
+            "runtime": runtime.ok(), "report": report.ok(), "errors": errors,
+        }));
+    }
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"targets": reports, "failed_targets": failures})
+            )
+            .map_err(|error| CliError::Json {
+                path: "rollout diagnostics".into(),
+                detail: error.to_string()
+            })?
+        );
+    }
+    if !failures.is_empty() {
+        return Err(CliError::Network {
+            address: failures.join(", "),
+            detail: "one or more requested rollout diagnostics failed".into(),
+        });
     }
     Ok(())
 }
@@ -1563,6 +1744,9 @@ pub(crate) fn rollout_apply(options: RolloutOptions) -> Result<(), CliError> {
 }
 
 pub(crate) fn rollout_cluster(options: RolloutOptions) -> Result<(), CliError> {
+    if options.binary.is_some() || (options.skip_native_modules && options.remote_repo.is_none()) {
+        return recovery::start_binary(options);
+    }
     if rollout_cluster_uses_compatibility_transport(&options) {
         return rollout_cluster_legacy(options);
     }
@@ -2472,6 +2656,8 @@ fn build_service_cli_error(error: impl std::fmt::Display) -> CliError {
 
 fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliError> {
     validate_cluster_native_module_skip(&options)?;
+    let coordinator_paths = rollout_paths_from_defaults()?;
+    let _coordinator_lock = recovery::lock_for_new(&coordinator_paths)?;
     let targets = rollout_cluster_targets(&options)?;
     if targets.is_empty() {
         return Err(CliError::Parse {
@@ -2554,105 +2740,21 @@ fn rollout_cluster_via_build_service(options: RolloutOptions) -> Result<(), CliE
             Ok((group.group, prepared))
         })
         .collect::<Result<Vec<_>, CliError>>()?;
-    let runtime_source_revision =
-        source
-            .source
-            .revision
-            .as_deref()
-            .ok_or_else(|| CliError::Parse {
-                detail: "cluster build source has no revision for runtime acceptance".to_string(),
-            })?;
-    let runtime_source = Some(RolloutRuntimeSourceIdentity {
-        repo: &source.source_repo,
-        revision: runtime_source_revision,
-    });
-    for (group, prepared) in prepared {
-        for target in &group.rollout_targets {
-            let preflight = match read_rollout_target_status_before_cluster_activation(target) {
-                Ok(status) => status,
-                Err(error) => {
-                    println!("{}: failed: {error}", target.label());
-                    outcomes.record_failure(target.label(), "failed", error.to_string());
-                    return outcomes.finish();
-                }
-            };
-            match send_prepared_daemon_rollout_binary(target, &prepared, &preflight.cluster_target)
-            {
-                Ok(response) => {
-                    println!("{}: {}", target.label(), response.status);
-                    if response.status != "accepted" {
-                        outcomes.record_failure(
-                            target.label(),
-                            &response.status,
-                            response.detail.clone(),
-                        );
-                    }
-                    if !response.detail.is_empty() {
-                        println!("  {}", response.detail);
-                    }
-                    if let Err(error) = ensure_rollout_target_authority_ready_after_acceptance(
-                        target,
-                        preflight.authority_target.as_ref(),
-                        runtime_source,
-                        prepared.manifest.host_override.as_deref(),
-                        prepared.manifest.port,
-                        &response,
-                    ) {
-                        println!("{}: authority handoff failed: {error}", target.label());
-                        outcomes.record_failure(
-                            target.label(),
-                            "authority-not-ready",
-                            error.to_string(),
-                        );
-                        return outcomes.finish();
-                    }
-                    if let Err(error) = ensure_cluster_rollout_host_convergence_after_acceptance(
-                        target,
-                        &preflight.cluster_target,
-                        preflight.authority_target.as_ref(),
-                        runtime_source,
-                        prepared.manifest.host_override.as_deref(),
-                        &response,
-                        &prepared.manifest.requested_at,
-                        prepared.manifest.port,
-                        prepared.manifest.shadow_port,
-                        |restart_target, requested_at| {
-                            let mut retry = prepared.clone();
-                            retry.manifest.requested_at = requested_at;
-                            retry.manifest.upload_id = host_convergence_upload_id();
-                            send_prepared_daemon_rollout_binary(
-                                restart_target,
-                                &retry,
-                                &preflight.cluster_target,
-                            )
-                        },
-                    ) {
-                        println!("{}: bind convergence failed: {error}", target.label());
-                        outcomes.record_failure(
-                            target.label(),
-                            "bind-not-converged",
-                            error.to_string(),
-                        );
-                        return outcomes.finish();
-                    }
-                }
-                Err(error) => {
-                    println!("{}: failed: {error}", target.label());
-                    outcomes.record_failure(target.label(), "failed", error.to_string());
-                    if rollout_indeterminate_activation_requires_stop(
-                        preflight.authority_target.as_ref(),
-                    ) {
-                        println!(
-                            "{}: activation outcome is indeterminate for a Raft voter; refusing to advance to another cluster authority",
-                            target.label()
-                        );
-                        return outcomes.finish();
-                    }
-                }
-            }
-        }
-    }
-    outcomes.finish()
+    let targets = prepared
+        .into_iter()
+        .flat_map(|(group, prepared)| {
+            group
+                .rollout_targets
+                .into_iter()
+                .map(move |target| (target, prepared.clone()))
+        })
+        .collect();
+    recovery::start(
+        &coordinator_paths,
+        source.source_repo,
+        source.source.revision,
+        targets,
+    )
 }
 
 #[cfg(test)]
@@ -3527,12 +3629,11 @@ pub(crate) fn rollout_prepare_artifacts(
 pub(crate) fn rollout_source_repo_from_options(
     options: &RolloutOptions,
 ) -> Result<PathBuf, CliError> {
-    options.repo.clone().map(Ok).unwrap_or_else(|| {
-        env::current_dir().map_err(|source| CliError::Io {
-            path: ".".to_string(),
-            detail: source.to_string(),
-        })
-    })
+    options
+        .repo
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| Ok(rollout_paths_from_defaults()?.source_repo))
 }
 
 pub(crate) fn rollout_cluster_targets(
@@ -4421,7 +4522,10 @@ where
             match result_rx.recv_timeout(timing.poll_interval) {
                 Ok(Ok(response)) => {
                     worker_finished = true;
-                    if response.status == "accepted" {
+                    if response.status == "in-progress" {
+                        // A replay found the original durable activation claim.
+                        // Only matching terminal progress can complete it.
+                    } else if response.status == "accepted" {
                         // The activation RPC can acknowledge after the new main
                         // daemon is staged while its shadow is still restarting.
                         // Keep the single request result, but do not advance to
@@ -4436,6 +4540,15 @@ where
                     }
                 }
                 Ok(Err(error)) => {
+                    if matches!(
+                        &error,
+                        CliError::NetworkDelivery {
+                            delivery_state: network::NetworkDeliveryState::DefinitelyNotSent,
+                            ..
+                        }
+                    ) {
+                        return Err(error);
+                    }
                     worker_finished = true;
                     pending_error = Some(error);
                     pending_error_started_at = Some(Instant::now());
@@ -4495,6 +4608,14 @@ where
                 status
             }
             Err(error) => {
+                if !matches!(
+                    &error,
+                    CliError::Network { .. }
+                        | CliError::NetworkDelivery { .. }
+                        | CliError::DaemonNotRunning { .. }
+                ) {
+                    return Err(error);
+                }
                 let last_status = last_matching_status
                     .as_ref()
                     .filter(|status| rollout_terminal_response(status, &expectation).is_none())
@@ -4584,17 +4705,6 @@ where
                     last_matching_status = Some(status.clone());
                     Some(status)
                 } else {
-                    let Some(last_status) = last_status else {
-                        if emit_progress && drew_progress {
-                            println!();
-                        }
-                        return Err(rollout_status_probe_error(
-                            target,
-                            operation,
-                            &effective_error,
-                            None,
-                        ));
-                    };
                     if error_started_at.elapsed() >= timing.active_status_error_grace {
                         if emit_progress && drew_progress {
                             println!();
@@ -4603,11 +4713,15 @@ where
                             target,
                             operation,
                             &effective_error,
-                            Some(&last_status),
+                            last_status.as_ref(),
                         ));
                     }
+                    // The activation may restart main before our first poll,
+                    // with shadow unreachable from this coordinator. Observe
+                    // the same request for a bounded window without resending
+                    // it or treating connectivity loss as acceptance.
                     status_probe_error_detail = Some(effective_error.to_string());
-                    Some(last_status)
+                    last_status
                 }
             }
         };
@@ -4619,8 +4733,9 @@ where
                 started.elapsed(),
             );
             if let Some(error) = status_probe_error_detail.as_deref() {
+                let summary: String = error.chars().take(240).collect();
                 line.push_str(&format!(
-                    "; status probe failed ({error}); retrying for at most {}ms because matching active progress was observed (each restart-evidence probe is bounded to {}ms)",
+                    "; reconciling original request after status probe failure ({summary}); bounded to {}ms (each restart-evidence probe is bounded to {}ms)",
                     timing.active_status_error_grace.as_millis(),
                     timing.status_probe_error_grace.as_millis()
                 ));
@@ -4647,7 +4762,9 @@ where
             }
             return Ok(response);
         }
-        let pending_error_grace = if rollout_status.is_none() && has_seen_matching_status {
+        let pending_error_grace = if active_status_error_started_at.is_some()
+            || (rollout_status.is_none() && has_seen_matching_status)
+        {
             timing.active_status_error_grace
         } else {
             rollout_pending_error_grace_with_timing(rollout_status.as_ref(), &expectation, timing)
@@ -5000,10 +5117,11 @@ fn read_rollout_target_status_before_cluster_activation(
             ),
         });
     }
-    let authority_target = match &member.role {
-        ClusterMemberRole::Voter => Some(identity.clone()),
-        ClusterMemberRole::Learner | ClusterMemberRole::NonVoting => None,
-    };
+    let (_, _, committed_voters) =
+        read_rollout_authoritative_raft_config(&identity, DAEMON_CLUSTER_KV_TXN_TIMEOUT)?;
+    let authority_target = (member.role == ClusterMemberRole::Voter
+        || committed_voters.contains(&identity.node_id))
+    .then(|| identity.clone());
     if status
         .cluster
         .as_ref()
@@ -5011,7 +5129,7 @@ fn read_rollout_target_status_before_cluster_activation(
         != authority_target.is_some()
     {
         eprintln!(
-            "warning: {} reported stale member role {:?}; durable routing membership controls rollout preflight classification",
+            "warning: {} reported stale member role {:?}; committed Raft configuration and durable membership control rollout preflight classification",
             target.label(),
             status.cluster.as_ref().map(|cluster| &cluster.member_role)
         );
@@ -5036,7 +5154,7 @@ fn rejected_rollout_response_requires_authority_stop(
     authority_target.is_some() && response.status != "accepted"
 }
 
-fn rollout_authority_status_pid(
+fn rollout_main_status_pid(
     expected: &RolloutAuthorityTarget,
     status: &DaemonStatus,
 ) -> Result<u32, String> {
@@ -5055,6 +5173,14 @@ fn rollout_authority_status_pid(
             cluster.process
         ));
     }
+    Ok(status.pid)
+}
+
+fn rollout_authority_status_pid(
+    expected: &RolloutAuthorityTarget,
+    status: &DaemonStatus,
+) -> Result<u32, String> {
+    let pid = rollout_main_status_pid(expected, status)?;
     let rollout = status.rollout.as_ref().ok_or_else(|| {
         "replacement daemon no longer reports the accepted rollout handoff".to_string()
     })?;
@@ -5065,10 +5191,38 @@ fn rollout_authority_status_pid(
             rollout.phase.as_deref().unwrap_or("unknown")
         ));
     }
-    Ok(status.pid)
+    Ok(pid)
 }
 
 fn wait_for_rollout_authority_readiness_with_probes<S, A, N, W>(
+    target_label: &str,
+    expected: &RolloutAuthorityTarget,
+    timing: RolloutAuthorityReadinessTiming,
+    status_probe: S,
+    authority_probe: A,
+    now: N,
+    wait: W,
+) -> Result<(), CliError>
+where
+    S: FnMut(Duration) -> Result<DaemonStatus, CliError>,
+    A: FnMut(Duration) -> Result<(), CliError>,
+    N: FnMut() -> Instant,
+    W: FnMut(Duration),
+{
+    wait_for_rollout_readiness_with_validator(
+        target_label,
+        expected,
+        timing,
+        status_probe,
+        authority_probe,
+        now,
+        wait,
+        rollout_authority_status_pid,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_rollout_readiness_with_validator<S, A, N, W>(
     target_label: &str,
     expected: &RolloutAuthorityTarget,
     timing: RolloutAuthorityReadinessTiming,
@@ -5076,6 +5230,7 @@ fn wait_for_rollout_authority_readiness_with_probes<S, A, N, W>(
     mut authority_probe: A,
     mut now: N,
     mut wait: W,
+    validate_status: fn(&RolloutAuthorityTarget, &DaemonStatus) -> Result<u32, String>,
 ) -> Result<(), CliError>
 where
     S: FnMut(Duration) -> Result<DaemonStatus, CliError>,
@@ -5086,7 +5241,7 @@ where
     let started_at = now();
     let deadline = started_at.checked_add(timing.timeout).unwrap_or(started_at);
     let mut stable_since = None;
-    let mut stable_pid = None;
+    let mut stable_generation = None;
     let mut last_failure = "cluster KV readiness has not been observed".to_string();
 
     loop {
@@ -5099,7 +5254,7 @@ where
             .min(remaining)
             .max(Duration::from_millis(1));
         match status_probe(probe_timeout) {
-            Ok(status) => match rollout_authority_status_pid(expected, &status) {
+            Ok(status) => match validate_status(expected, &status) {
                 Ok(pid) => {
                     let remaining = deadline.saturating_duration_since(now());
                     if remaining.is_zero() {
@@ -5115,8 +5270,9 @@ where
                     match authority_probe(authority_probe_timeout) {
                         Ok(()) => {
                             let healthy_at = now();
-                            if stable_pid != Some(pid) {
-                                stable_pid = Some(pid);
+                            let generation = (pid, status.started_at.clone());
+                            if stable_generation.as_ref() != Some(&generation) {
+                                stable_generation = Some(generation);
                                 stable_since = Some(healthy_at);
                             }
                             let stable_for = stable_since
@@ -5133,20 +5289,20 @@ where
                         }
                         Err(error) => {
                             stable_since = None;
-                            stable_pid = None;
+                            stable_generation = None;
                             last_failure = error.to_string();
                         }
                     }
                 }
                 Err(detail) => {
                     stable_since = None;
-                    stable_pid = None;
+                    stable_generation = None;
                     last_failure = detail;
                 }
             },
             Err(error) => {
                 stable_since = None;
-                stable_pid = None;
+                stable_generation = None;
                 last_failure = error.to_string();
             }
         }
@@ -5160,7 +5316,7 @@ where
 
     Err(CliError::ClusterReadOnly {
         detail: format!(
-            "rollout target {target_label} accepted and shadow-finalized its replacement process, but Raft voter {} did not regain stable cluster KV authority readiness within {}s; refusing to advance to another cluster authority; last probe: {last_failure}",
+            "rollout target {target_label} did not satisfy stable readiness for node {} within {}s; refusing to advance to another cluster authority; last probe: {last_failure}",
             expected.node_id,
             timing.timeout.as_secs()
         ),
@@ -6608,6 +6764,22 @@ mod rollout_authority_readiness_tests {
     }
 
     #[test]
+    fn full_runtime_commit_verification_survives_source_checkout_removal() {
+        let root = sinomo_testdir::TestDir::new("rollout-removed-source");
+        let repo = root.join("removed-checkout");
+        let revision = "0123456789abcdef0123456789abcdef01234567";
+        let mut status = accepted_voter_status(42);
+        status.commit = Some(revision.into());
+        let expected = RolloutRuntimeSourceIdentity {
+            repo: &repo,
+            revision,
+        };
+        validate_rollout_runtime_source_identity("target", expected, &status).unwrap();
+        status.commit = Some("ffffffffffffffffffffffffffffffffffffffff".into());
+        assert!(validate_rollout_runtime_source_identity("target", expected, &status).is_err());
+    }
+
+    #[test]
     fn explicit_host_status_refresh_routes_by_identity_then_uses_new_listener() {
         let explicit_host = "10.22.0.9";
         let stale_address = "10.22.0.8:21353";
@@ -7046,6 +7218,64 @@ mod rollout_authority_readiness_tests {
 
         assert_eq!(elapsed.get(), Duration::from_secs(2));
         assert_eq!(authority_probes.get(), 3);
+    }
+
+    #[test]
+    fn authority_window_restarts_when_container_reuses_a_pid() {
+        let status = accepted_voter_status(42);
+        let expected = rollout_cluster_target_from_status(&status).unwrap();
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        wait_for_rollout_authority_readiness_with_probes(
+            "container:21353",
+            &expected,
+            test_timing(Duration::from_secs(6), Duration::from_secs(2)),
+            |_| {
+                let mut current = status.clone();
+                current.started_at = if elapsed.get().is_zero() {
+                    "first start"
+                } else {
+                    "replacement start"
+                }
+                .into();
+                Ok(current)
+            },
+            |_| Ok(()),
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        )
+        .unwrap();
+        assert_eq!(elapsed.get(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn retiring_failed_rollout_still_requires_stable_current_authority() {
+        let mut status = accepted_voter_status(42);
+        status.rollout.as_mut().unwrap().status = "failed".into();
+        let expected = rollout_cluster_target_from_status(&status).unwrap();
+        assert!(rollout_authority_status_pid(&expected, &status).is_err());
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        wait_for_rollout_readiness_with_validator(
+            "target",
+            &expected,
+            test_timing(Duration::from_secs(6), Duration::from_secs(1)),
+            |_| Ok(status.clone()),
+            |_| {
+                if elapsed.get() < Duration::from_secs(2) {
+                    Err(CliError::ClusterReadOnly {
+                        detail: "not caught up".into(),
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+            rollout_main_status_pid,
+        )
+        .unwrap();
+        assert_eq!(elapsed.get(), Duration::from_secs(3));
     }
 
     #[test]
@@ -7668,6 +7898,15 @@ fn send_prepared_daemon_rollout_binary(
             artifact.artifact_id
         );
         let response = send_daemon_rollout_binary_direct(target, &request, &artifact.path)?;
+        if response.status == "in-progress" {
+            return send_rollout_request_with_progress(
+                target,
+                "binary rollout",
+                expectation.clone(),
+                restart_evidence.clone(),
+                move |_| Ok(response),
+            );
+        }
         if response.status == "accepted" {
             return wait_for_accepted_rollout_response_with_progress(
                 target,

@@ -7,7 +7,9 @@
 
 mod artifact;
 mod client_protocol;
+mod deployment_source;
 mod executor;
+mod log;
 mod manager;
 mod module;
 mod paths;
@@ -20,7 +22,12 @@ mod target;
 
 pub use artifact::*;
 pub use client_protocol::*;
+pub use deployment_source::{
+    DeploymentDependencyPin, DeploymentSourcePins, prepare_deployment_source,
+    validate_deployment_source,
+};
 pub use executor::*;
+pub use log::{BUILD_LOG_MAX_BYTES, BUILD_LOG_ROUTE, BuildLogRequest, BuildLogResponse};
 pub use manager::*;
 pub use module::*;
 pub use paths::*;

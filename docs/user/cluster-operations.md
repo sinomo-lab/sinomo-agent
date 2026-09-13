@@ -97,6 +97,10 @@ membership. Keep an odd number of reliable authority nodes when possible;
 intermittent laptops and mobile devices should normally not be required for
 quorum.
 
+`state-authority` and `promote` execute through the running daemon's cluster-control
+service. The CLI does not open daemon-owned Raft state. Promotion retains the
+existing learner catch-up proof and committed configuration-change checks.
+
 The `state-authority` command uses operator-facing tokens that map to the
 underlying membership roles:
 

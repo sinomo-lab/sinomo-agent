@@ -19,13 +19,60 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 const ROLLOUT_BODY_BUFFER_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RolloutUploadStatus {
+    pub activation_started: bool,
+    pub receipt: Option<ClusterRolloutBinaryResponse>,
+    #[serde(default)]
+    pub pending_activation: Option<bool>,
+}
+
+/// Read-only reconciliation by the complete immutable manifest, including the
+/// upload ID. An unsupported route on an older daemon is not absence evidence.
+pub fn read_rollout_upload_status(
+    paths: &SelfRolloutPaths,
+    manifest: &ClusterRolloutBinaryManifest,
+) -> Result<RolloutUploadStatus, RolloutError> {
+    validate_rollout_binary_manifest(manifest)?;
+    let path = rollout_upload_manifest_path(paths, &manifest.upload_id)?;
+    if path.exists() {
+        let existing: ClusterRolloutBinaryManifest = read_object(&path)?;
+        if existing != *manifest {
+            return Err(RolloutError::InvalidArtifact {
+                detail: "upload status manifest mismatch".into(),
+            });
+        }
+    }
+    Ok(RolloutUploadStatus {
+        pending_activation: Some(
+            crate::rollout_main_activation_path(paths).exists()
+                || crate::rollout_shadow_finalize_path(paths).exists(),
+        ),
+        activation_started: rollout_upload_dir(paths, &manifest.upload_id)?
+            .join("activation-started.sobj")
+            .exists(),
+        receipt: read_rollout_binary_receipt(paths, manifest)?.map(|receipt| receipt.response),
+    })
+}
+
+impl RolloutUploadStatus {
+    pub fn can_retire(&self) -> bool {
+        self.pending_activation == Some(false)
+            && self.receipt.as_ref().is_some_and(|receipt| {
+                matches!(receipt.status.as_str(), "accepted" | "rejected" | "failed")
+            })
+    }
+}
+
+#[derive(Debug)]
 pub struct PreparedRolloutBinaryActivation {
     pub rollout_paths: SelfRolloutPaths,
     pub manifest: ClusterRolloutBinaryManifest,
+    // Serializes ingress and activation for this upload across daemon processes.
+    _upload_lock: fs::File,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum RolloutBinaryIngress {
     Complete(ClusterRolloutBinaryResponse),
     Activate(PreparedRolloutBinaryActivation),
@@ -58,6 +105,26 @@ where
         })?;
     let rollout_paths = SelfRolloutPaths::new(data_dir);
     ensure_rollout_layout(&rollout_paths)?;
+    let upload_dir = rollout_upload_dir(&rollout_paths, &request.manifest.upload_id)?;
+    fs::create_dir_all(&upload_dir).map_err(|error| RolloutError::Io {
+        path: upload_dir.display().to_string(),
+        detail: error.to_string(),
+    })?;
+    let lock_path = upload_dir.join("ingress.lock");
+    let upload_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| RolloutError::Io {
+            path: lock_path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    fs2::FileExt::try_lock_exclusive(&upload_lock).map_err(|error| RolloutError::Io {
+        path: lock_path.display().to_string(),
+        detail: format!("upload is already being received or activated: {error}"),
+    })?;
     ensure_rollout_upload_manifest(&rollout_paths, &request.manifest)?;
     receive_rollout_binary_artifact(&rollout_paths, &request.manifest, &artifact, body).await?;
 
@@ -68,6 +135,26 @@ where
             &artifact.artifact_id,
         )?);
         return Ok(RolloutBinaryIngress::Complete(receipt.response));
+    }
+
+    let activation_claim = upload_dir.join("activation-started.sobj");
+    if activation_claim.exists() {
+        let claimed: ClusterRolloutBinaryManifest = read_object(&activation_claim)?;
+        if claimed != request.manifest {
+            return Err(RolloutError::InvalidArtifact {
+                detail: "activation claim manifest mismatch".to_string(),
+            });
+        }
+        return Ok(RolloutBinaryIngress::Complete(
+            ClusterRolloutBinaryResponse {
+                status: "in-progress".to_string(),
+                detail: "this upload already started activation; reconcile its durable progress"
+                    .to_string(),
+                main_binary: rollout_paths.main_binary,
+                shadow_binary: rollout_paths.shadow_binary,
+                source_head: None,
+            },
+        ));
     }
 
     if !request.activate {
@@ -85,10 +172,27 @@ where
         ));
     }
 
+    // Validate the complete upload before claiming its one activation. The
+    // durable claim survives a lost reply or process restart. An unresolved
+    // claim must be observed/recovered, never executed a second time.
+    verify_rollout_uploaded_artifact(
+        &rollout_paths,
+        &request.manifest.upload_id,
+        &request.manifest.binary,
+    )?;
+    for module in &request.manifest.native_dylib_modules {
+        verify_rollout_uploaded_artifact(
+            &rollout_paths,
+            &request.manifest.upload_id,
+            &module.artifact,
+        )?;
+    }
+    write_object(&activation_claim, &request.manifest)?;
     Ok(RolloutBinaryIngress::Activate(
         PreparedRolloutBinaryActivation {
             rollout_paths,
             manifest: request.manifest,
+            _upload_lock: upload_lock,
         },
     ))
 }
@@ -422,7 +526,7 @@ pub fn verify_rollout_uploaded_artifact(
     Ok(path)
 }
 
-fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, RolloutError> {
+pub(crate) fn rollout_file_blake3(path: &Path) -> Result<Vec<u8>, RolloutError> {
     let mut file = fs::File::open(path).map_err(|source| RolloutError::Io {
         path: path.display().to_string(),
         detail: source.to_string(),
@@ -472,6 +576,97 @@ mod tests {
             artifact_id: "binary".to_string(),
             activate: false,
         }
+    }
+
+    #[tokio::test]
+    async fn interrupted_activation_claim_prevents_reactivation_after_process_restart() {
+        let root = sinomo_testdir::TestDir::new("rollout-interrupted-activation");
+        let bytes = b"candidate";
+        let mut upload = request(bytes);
+        upload.activate = true;
+        let first = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .expect("first upload");
+        assert!(matches!(&first, RolloutBinaryIngress::Activate(_)));
+        // Drop the process-owned lock without a receipt, as if activation lost
+        // its process. The durable claim still forbids another activation.
+        drop(first);
+        let replay = receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+            .await
+            .expect("replay");
+        let RolloutBinaryIngress::Complete(response) = replay else {
+            panic!("must not reactivate")
+        };
+        assert_eq!(response.status, "in-progress");
+        let status = read_rollout_upload_status(&SelfRolloutPaths::new(&root), &upload.manifest)
+            .expect("status");
+        assert!(status.activation_started);
+        assert!(status.receipt.is_none());
+        upload.manifest.requested_at = "another request".into();
+        assert!(
+            read_rollout_upload_status(&SelfRolloutPaths::new(&root), &upload.manifest).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_upload_replays_receipt_without_activation() {
+        let root = sinomo_testdir::TestDir::new("rollout-completed-replay");
+        let bytes = b"candidate";
+        let mut upload = request(bytes);
+        upload.activate = true;
+        let RolloutBinaryIngress::Activate(first) =
+            receive_rollout_binary_ingress(&root, upload.clone(), &mut bytes.as_slice())
+                .await
+                .expect("upload")
+        else {
+            panic!("activation")
+        };
+        let expected = ClusterRolloutBinaryResponse {
+            status: "accepted".into(),
+            detail: "staged".into(),
+            main_binary: PathBuf::new(),
+            shadow_binary: PathBuf::new(),
+            source_head: None,
+        };
+        complete_rollout_binary_activation(&first, &expected).expect("receipt");
+        drop(first);
+        let RolloutBinaryIngress::Complete(replayed) =
+            receive_rollout_binary_ingress(&root, upload, &mut bytes.as_slice())
+                .await
+                .expect("replay")
+        else {
+            panic!("must not activate")
+        };
+        assert_eq!(replayed, expected);
+    }
+
+    #[test]
+    fn plan_retirement_requires_terminal_receipt_and_explicit_no_pending_proof() {
+        let receipt = ClusterRolloutBinaryResponse {
+            status: "failed".into(),
+            detail: "candidate rejected".into(),
+            main_binary: PathBuf::new(),
+            shadow_binary: PathBuf::new(),
+            source_head: None,
+        };
+        let mut status = RolloutUploadStatus {
+            activation_started: true,
+            receipt: Some(receipt),
+            pending_activation: None,
+        };
+        assert!(
+            !status.can_retire(),
+            "older replies cannot prove absence of pending replacements"
+        );
+        status.pending_activation = Some(true);
+        assert!(!status.can_retire());
+        status.pending_activation = Some(false);
+        assert!(status.can_retire());
+        status.receipt = None;
+        assert!(
+            !status.can_retire(),
+            "an unknown operation may still activate"
+        );
     }
 
     #[tokio::test]

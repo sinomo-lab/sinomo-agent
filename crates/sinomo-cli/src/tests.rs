@@ -13276,7 +13276,7 @@ fn rollout_progress_waits_for_terminal_status_after_handoff_route_gap() {
 }
 
 #[test]
-fn rollout_progress_surfaces_first_status_probe_timeout_without_active_evidence() {
+fn rollout_progress_bounds_first_status_probe_failure_without_active_evidence() {
     let target = RolloutTarget::address("replica.test:21353".to_string());
     let started = std::time::Instant::now();
     let error = send_rollout_request_with_progress_for_test(
@@ -13302,17 +13302,68 @@ fn rollout_progress_surfaces_first_status_probe_timeout_without_active_evidence(
         RolloutProgressTiming {
             poll_interval: Duration::from_millis(1),
             terminal_status_grace: Duration::from_secs(30),
-            active_status_error_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_millis(25),
             status_probe_error_grace: Duration::from_millis(10),
         },
     )
-    .expect_err("a status timeout without matching progress must fail immediately");
+    .expect_err("an unresolved activation must fail after bounded reconciliation");
 
+    assert!(started.elapsed() >= Duration::from_millis(25));
     assert!(started.elapsed() < Duration::from_secs(1));
     let detail = error.to_string();
     assert!(detail.contains("status idle timeout after 1500ms"));
     assert!(detail.contains("no matching active rollout progress"));
     assert!(detail.contains("rollout diagnostics"));
+}
+
+#[test]
+fn rollout_progress_recovers_first_poll_reset_without_a_reachable_shadow() {
+    let sends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sent = Arc::clone(&sends);
+    let mut polls = 0;
+    let response = send_rollout_request_with_restart_progress_for_test(
+        &RolloutTarget::address("replica.test:21353".to_string()),
+        "binary rollout",
+        RolloutProgressExpectation {
+            source: "repo-a".to_string(),
+            requested_at: "2026-08-04T00:00:01Z".to_string(),
+            source_head: Some("head-new".to_string()),
+        },
+        move |_| {
+            sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CliError::Network {
+                address: "replica.test:21353".to_string(),
+                detail: "activation reply lost".to_string(),
+            })
+        },
+        |_| {
+            polls += 1;
+            if polls < 4 {
+                Err(CliError::Network {
+                    address: "replica.test:21353".to_string(),
+                    detail: "main restarting".to_string(),
+                })
+            } else {
+                Ok(Some(rollout_tracker_status(
+                    "accepted",
+                    "shadow-finalized",
+                    5,
+                    "finished",
+                )))
+            }
+        },
+        |_, _| Ok(None),
+        RolloutProgressTiming {
+            poll_interval: Duration::from_millis(1),
+            terminal_status_grace: Duration::from_millis(1),
+            active_status_error_grace: Duration::from_millis(100),
+            status_probe_error_grace: Duration::from_millis(1),
+        },
+    )
+    .expect("observe returning main without another activation");
+    assert_eq!(response.status, "accepted");
+    assert_eq!(sends.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(polls, 4);
 }
 
 #[test]
@@ -13948,13 +13999,13 @@ fn rollout_progress_rejects_stale_shadow_evidence_on_the_first_main_probe_error(
         RolloutProgressTiming {
             poll_interval: Duration::from_millis(1),
             terminal_status_grace: Duration::from_secs(30),
-            active_status_error_grace: Duration::from_secs(30),
+            active_status_error_grace: Duration::from_millis(15),
             status_probe_error_grace: Duration::from_millis(2),
         },
     )
     .expect_err("stale shadow progress cannot establish the current activation outcome");
 
-    assert_eq!(restart_polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(restart_polls.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     let detail = error.to_string();
     assert!(detail.contains("non-authoritative rollout main-staged/main-staged"));
     assert!(detail.contains("no matching active rollout progress was observed"));
@@ -15500,8 +15551,18 @@ fn rollout_advance_with_data_dir_records_persisted_runtime_transition() {
         500
     );
     let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
-    assert!(transition.contains("manual://promotion-review"));
-    assert!(transition.contains(&format!("scorecard:{}", scorecard_path.display())));
+    let transition: sinomo_runtime::rollout::RolloutTransitionRecord =
+        serde_json::from_str(&transition).expect("decode transition");
+    assert!(
+        transition
+            .triggering_evidence_refs
+            .contains(&"manual://promotion-review".to_string())
+    );
+    assert!(
+        transition
+            .triggering_evidence_refs
+            .contains(&format!("scorecard:{}", scorecard_path.display()))
+    );
     assert_eq!(applied.module_state.traffic_weight_bps, 500);
     assert_eq!(
         read_module_loader_runtime_state(&root, &applied.module_state.module_id)
@@ -15581,7 +15642,13 @@ fn rollout_advance_with_data_dir_accepts_module_replay_report_evidence() {
     assert_eq!(applied.transition.active_artifact_id, active_artifact_id);
     assert_eq!(applied.transition.candidate_artifact_id, Some(artifact_id));
     let transition = std::fs::read_to_string(&applied.transition_path).expect("transition record");
-    assert!(transition.contains(&format!("module-replay-report:{}", report_path.display())));
+    let transition: sinomo_runtime::rollout::RolloutTransitionRecord =
+        serde_json::from_str(&transition).expect("decode transition");
+    assert!(
+        transition
+            .triggering_evidence_refs
+            .contains(&format!("module-replay-report:{}", report_path.display()))
+    );
 }
 
 #[test]

@@ -2575,7 +2575,10 @@ mod tests {
 
         match error {
             crate::RolloutError::MissingArtifact { artifact } => {
-                assert!(artifact.ends_with("rollout/runtime-state.sobj"));
+                assert!(
+                    std::path::Path::new(&artifact)
+                        .ends_with(std::path::Path::new("rollout").join("runtime-state.sobj"))
+                );
             }
             other => panic!("unexpected error: {other}"),
         }

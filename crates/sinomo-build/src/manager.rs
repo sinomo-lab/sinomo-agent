@@ -231,6 +231,24 @@ pub(crate) fn execute_and_cache_build(
     executor: &CargoBuildExecutor,
     cargo_program: &Path,
 ) -> Result<BuildArtifactSetManifest> {
+    let log_path = paths.job_log(job_id);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| BuildError::Io {
+            path: parent.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    }
+    fs::write(
+        &log_path,
+        format!(
+            "job: {job_id}\nbuild key: {}\nsource revision: {:?}\npreparing committed source\n",
+            plan.key, plan.source.revision
+        ),
+    )
+    .map_err(|error| BuildError::Io {
+        path: log_path.display().to_string(),
+        detail: error.to_string(),
+    })?;
     let work_dir = paths.job_work_dir(job_id);
     if work_dir.exists() {
         fs::remove_dir_all(&work_dir).map_err(|source| BuildError::Io {
@@ -258,33 +276,21 @@ pub(crate) fn execute_and_cache_build(
             });
         }
     }
+    crate::validate_deployment_source(&source_repo)?;
     verify_build_lockfile(&source_repo, plan)?;
     validate_requested_outputs(cargo_program, &source_repo, plan)?;
 
     let target_dir = paths.incremental_target_dir(plan);
     let _incremental_lock = BuildPathLock::acquire(&target_dir.join(".sinomo-build.lock"))?;
     let artifact_root = work_dir.join("artifact-set");
-    let result = executor.execute_with_target_dir(
+    let result = executor.execute_with_target_dir_and_log(
         &source_repo,
         plan,
         &artifact_root,
         &target_dir,
         Some(policy.cargo_jobs),
+        Some(&log_path),
     )?;
-    let log = format!(
-        "command: {}\nrepo: {}\nbuild key: {}\ncargo jobs: {}\nincremental target: {}\n\nstdout:\n{}\n\nstderr:\n{}\n",
-        result.command.display(),
-        source_repo.display(),
-        plan.key,
-        policy.cargo_jobs,
-        target_dir.display(),
-        result.stdout,
-        result.stderr
-    );
-    fs::write(paths.job_log(job_id), log).map_err(|source| BuildError::Io {
-        path: paths.job_log(job_id).display().to_string(),
-        detail: source.to_string(),
-    })?;
     publish_artifact_cache(
         paths,
         plan,
@@ -358,6 +364,7 @@ pub(crate) fn materialize_build_source_bundle(
     })?;
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
+        .args(["--config", "core.autocrlf=false"])
         .arg(bundle_path)
         .arg(&source_repo)
         .output()

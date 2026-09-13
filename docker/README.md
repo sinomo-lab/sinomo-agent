@@ -196,6 +196,23 @@ shadow supervisor running as PID 1.
 
 ## Usage
 
+For rollout recovery verification, `docker/test-rollout-recovery.sh` uses this
+segmented topology with three voters. Supply compatible Linux baseline
+and candidate binaries at different commits. The baseline must support the
+daemon-mediated `cluster promote` control route
+used to establish the three-voter fixture. The harness creates a fresh project,
+disconnects a target during activation, interrupts and resumes a coordinator,
+checks that a completed node is not activated twice, and verifies custom main
+and shadow ports. It retains evidence and removes only its own project unless
+`SINOMO_ROLLOUT_TEST_KEEP=1` is set.
+
+```bash
+SINOMO_ROLLOUT_BASELINE=/absolute/path/to/baseline-sinomo \
+SINOMO_ROLLOUT_CANDIDATE=/absolute/path/to/candidate-sinomo \
+SINOMO_ROLLOUT_CANDIDATE_COMMIT=FULL_CANDIDATE_COMMIT \
+  bash docker/test-rollout-recovery.sh
+```
+
 The helper scripts under `docker/` export `COMPOSE_FILE` pointing at the dev
 cluster, so they work from any directory; plain `docker compose` commands need
 `-f docker/docker-compose.dev.yml` (shown as `-f …dev.yml` below):

@@ -65,7 +65,7 @@ pub struct ClusterNodeNameUpdate {
     pub changed: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ClusterStateAuthorityUpdate {
     pub node_id: NodeId,
     pub previous_role: ClusterMemberRole,

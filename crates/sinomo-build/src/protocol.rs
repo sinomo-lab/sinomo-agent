@@ -19,6 +19,7 @@ pub const BUILD_OBJECT_RPC_ROUTES: &[&str] = &[
     BUILD_SUBMIT_ROUTE,
     BUILD_STATUS_ROUTE,
     BUILD_ARTIFACT_ROUTE,
+    crate::BUILD_LOG_ROUTE,
 ];
 
 pub type BuildJobId = Id;

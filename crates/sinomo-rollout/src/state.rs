@@ -270,7 +270,12 @@ fn acquire_rollout_activation_file_guard(
         })?;
     match FileExt::try_lock_exclusive(&file) {
         Ok(()) => {}
-        Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+        Err(source)
+            if source.kind() == io::ErrorKind::WouldBlock
+                || source.raw_os_error().is_some_and(|code| {
+                    Some(code) == fs2::lock_contended_error().raw_os_error()
+                }) =>
+        {
             return Err(RolloutError::InvalidTransition {
                 detail: format!(
                     "another rollout activation or module mutation holds {}",

@@ -99,12 +99,23 @@ pub fn build_source_heads_match(actual: Option<&str>, expected: &str) -> bool {
 }
 
 pub fn prepare_build_source(paths: &BuildPaths, source_repo: &Path) -> Result<PreparedBuildSource> {
+    crate::validate_deployment_source(source_repo)?;
     let bundle = prepare_source_bundle(paths, source_repo)?;
     let lockfile_path = source_repo.join("Cargo.lock");
-    let lockfile = fs::read(&lockfile_path).map_err(|source| BuildError::Io {
-        path: lockfile_path.display().to_string(),
-        detail: source.to_string(),
-    })?;
+    let lockfile = crate::process::noninteractive_command("git")
+        .arg("-C")
+        .arg(source_repo)
+        .args(["show", &format!("{}:Cargo.lock", bundle.revision)])
+        .output()
+        .map_err(|source| BuildError::Io {
+            path: lockfile_path.display().to_string(),
+            detail: source.to_string(),
+        })?;
+    if !lockfile.status.success() {
+        return Err(BuildError::InvalidValue {
+            detail: "committed source has no readable Cargo.lock".into(),
+        });
+    }
     let identity_hash = build_source_identity_hash(&bundle.revision);
     Ok(PreparedBuildSource {
         source: BuildSource {
@@ -116,7 +127,7 @@ pub fn prepare_build_source(paths: &BuildPaths, source_repo: &Path) -> Result<Pr
         },
         source_repo: source_repo.to_path_buf(),
         source_bundle: bundle.path,
-        lockfile_hash: build_content_hash(&lockfile),
+        lockfile_hash: build_content_hash(&lockfile.stdout),
     })
 }
 
@@ -227,7 +238,7 @@ pub fn deploy_managed_source_repo(
     }
     if managed_repo.join(".git").exists() {
         require_git_repo(source_repo, "external source repo")?;
-        merge_repo_head(managed_repo, source_repo, options)?;
+        merge_repo_head(managed_repo, source_repo, options, true)?;
         return remove_all_git_remotes(managed_repo);
     }
     let parent = managed_repo.parent().ok_or_else(|| BuildError::Io {
@@ -244,6 +255,7 @@ pub fn deploy_managed_source_repo(
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
         .arg("--no-hardlinks")
+        .args(["--config", "core.autocrlf=false"])
         .arg(source_repo)
         .arg(&next)
         .output()
@@ -301,7 +313,7 @@ pub fn deploy_managed_source_bundle(
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
         }
-        update_managed_repo_to_fetched_head(managed_repo, options)?;
+        update_managed_repo_to_fetched_head(managed_repo, options, true)?;
         return remove_all_git_remotes(managed_repo);
     }
     let parent = managed_repo.parent().ok_or_else(|| BuildError::Io {
@@ -317,6 +329,7 @@ pub fn deploy_managed_source_bundle(
     remove_dir_if_exists(&next)?;
     let output = crate::process::noninteractive_command("git")
         .arg("clone")
+        .args(["--config", "core.autocrlf=false"])
         .arg(bundle_path)
         .arg(&next)
         .output()
@@ -342,6 +355,7 @@ pub fn sync_external_repo_from_managed(managed_repo: &Path, external_repo: &Path
         external_repo,
         managed_repo,
         ManagedSourceDeployOptions::default(),
+        false,
     )
 }
 
@@ -387,21 +401,26 @@ fn merge_repo_head(
     target_repo: &Path,
     source_repo: &Path,
     options: ManagedSourceDeployOptions,
+    canonical_checkout: bool,
 ) -> Result<()> {
     require_git_repo(target_repo, "target repo")?;
     require_git_repo(source_repo, "source repo")?;
     run_git_paths(target_repo, &["fetch"], &[source_repo])?;
-    update_managed_repo_to_fetched_head(target_repo, options)
+    update_managed_repo_to_fetched_head(target_repo, options, canonical_checkout)
 }
 
 fn update_managed_repo_to_fetched_head(
     repo: &Path,
     options: ManagedSourceDeployOptions,
+    canonical_checkout: bool,
 ) -> Result<()> {
     match ensure_clean_git_worktree(repo) {
         Ok(()) => {}
         Err(_) if options.force_overwrite => preserve_dirty_managed_source(repo)?,
         Err(error) => return Err(error),
+    }
+    if canonical_checkout {
+        run_git(repo, &["config", "core.autocrlf", "false"])?;
     }
     let head = git_one_line(repo, &["rev-parse", "HEAD"])?;
     let fetched = git_one_line(repo, &["rev-parse", "FETCH_HEAD"])?;

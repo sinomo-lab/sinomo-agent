@@ -1115,6 +1115,16 @@ impl DaemonApiClient {
         self.call_control_value(CLUSTER_CONTROL_ROLE_ROUTE, request)
     }
 
+    pub fn cluster_state_authority(
+        &self,
+        request: sinomo_core::cluster::ClusterControlStateAuthorityRequest,
+    ) -> Result<sinomo_core::cluster::ClusterControlStateAuthorityResponse, DaemonApiError> {
+        self.call_control_value(
+            sinomo_core::cluster::CLUSTER_CONTROL_STATE_AUTHORITY_ROUTE,
+            request,
+        )
+    }
+
     /// Removes cluster members by node id.
     pub fn cluster_remove(
         &self,

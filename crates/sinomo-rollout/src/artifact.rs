@@ -1,6 +1,6 @@
 use crate::RolloutError;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -195,15 +195,55 @@ pub fn binary_should_update(source: &Path, destination: &Path) -> Result<bool, R
     if same_path_if_exists(source, destination) {
         return Ok(false);
     }
-    let source_bytes = fs::read(source).map_err(|error| RolloutError::Io {
+    let mut source_file = fs::File::open(source).map_err(|error| RolloutError::Io {
         path: source.display().to_string(),
         detail: error.to_string(),
     })?;
-    let destination_bytes = fs::read(destination).map_err(|error| RolloutError::Io {
+    let mut destination_file = fs::File::open(destination).map_err(|error| RolloutError::Io {
         path: destination.display().to_string(),
         detail: error.to_string(),
     })?;
-    Ok(source_bytes != destination_bytes)
+    let length = source_file
+        .metadata()
+        .map_err(|error| RolloutError::Io {
+            path: source.display().to_string(),
+            detail: error.to_string(),
+        })?
+        .len();
+    if destination_file
+        .metadata()
+        .map_err(|error| RolloutError::Io {
+            path: destination.display().to_string(),
+            detail: error.to_string(),
+        })?
+        .len()
+        != length
+    {
+        return Ok(true);
+    }
+    let mut source_bytes = vec![0; 64 * 1024];
+    let mut destination_bytes = vec![0; source_bytes.len()];
+    let mut remaining = length;
+    while remaining > 0 {
+        let count = remaining.min(source_bytes.len() as u64) as usize;
+        source_file
+            .read_exact(&mut source_bytes[..count])
+            .map_err(|error| RolloutError::Io {
+                path: source.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        destination_file
+            .read_exact(&mut destination_bytes[..count])
+            .map_err(|error| RolloutError::Io {
+                path: destination.display().to_string(),
+                detail: error.to_string(),
+            })?;
+        if source_bytes[..count] != destination_bytes[..count] {
+            return Ok(true);
+        }
+        remaining -= count as u64;
+    }
+    Ok(false)
 }
 
 pub fn current_executable_should_update(destination: &Path) -> Result<bool, RolloutError> {
@@ -475,6 +515,20 @@ fn set_executable(_destination: &Path) -> Result<(), RolloutError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binary_comparison_detects_changes_beyond_the_first_chunk() {
+        let root = sinomo_testdir::TestDir::new("rollout-binary-comparison-chunks");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        let bytes = vec![42; 129 * 1024];
+        fs::write(&source, &bytes).unwrap();
+        fs::write(&destination, &bytes).unwrap();
+        assert!(!binary_should_update(&source, &destination).unwrap());
+        let mut changed = bytes;
+        *changed.last_mut().unwrap() = 43;
+        fs::write(&destination, changed).unwrap();
+        assert!(binary_should_update(&source, &destination).unwrap());
+    }
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;

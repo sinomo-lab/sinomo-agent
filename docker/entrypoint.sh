@@ -12,6 +12,8 @@
 # Per-node env (set in docker-compose.yml / docker/docker-compose.dev.yml):
 #   ROLE                seed | joiner
 #   NODE_NAME           cluster node name
+#   MAIN_PORT           main listener port (default 21353)
+#   SHADOW_PORT         shadow listener port (default 21354)
 #   CLUSTER_NAME        cluster name (seed only)
 #   INTRODUCER          reachable host:port to join through (joiners)
 #   JOIN_INVITE         invite file to read when joining (joiners)
@@ -39,6 +41,7 @@ JOIN_WAIT_INTERVAL="${JOIN_WAIT_INTERVAL:-0.1}"
 JOIN_WAIT_TICKS_PER_SECOND="${JOIN_WAIT_TICKS_PER_SECOND:-10}"
 CLUSTER_STATUS_TIMEOUT="${CLUSTER_STATUS_TIMEOUT:-5}"
 MAIN_PORT="${MAIN_PORT:-21353}"
+SHADOW_PORT="${SHADOW_PORT:-21354}"
 JOIN_READY_DIR="${JOIN_READY_DIR:-/shared}"
 WAIT_FOR_INTRODUCER_READY="${WAIT_FOR_INTRODUCER_READY:-0}"
 WAIT_FOR_JOIN_READY_NODES="${WAIT_FOR_JOIN_READY_NODES:-}"
@@ -90,16 +93,6 @@ if ! write_manual_endpoint_config; then
   exit 1
 fi
 
-# If Docker restarts the container after a rollout stops shadow-as-PID1, finish the
-# file-install part of shadow finalization before launching the next supervisor.
-if [ -f "$DATA/rollout/pending-shadow-rollout.sobj" ] && [ -x "$DATA/rollout/staged/sinomo-shadow" ] && [ ! -x "$DATA/bin/sinomo-shadow" ]; then
-  log "installing staged shadow binary before supervisor restart"
-  mkdir -p "$DATA/bin"
-  cp -f "$DATA/rollout/staged/sinomo-shadow" "$DATA/bin/sinomo-shadow.next"
-  chmod +x "$DATA/bin/sinomo-shadow.next"
-  mv -f "$DATA/bin/sinomo-shadow.next" "$DATA/bin/sinomo-shadow"
-fi
-
 # After a rollout, the stable binaries live in /data/bin. Prefer them on container
 # restart so a shadow-supervisor replacement can complete even though shadow is PID 1.
 BIN="$BOOTSTRAP_BIN"
@@ -109,6 +102,12 @@ fi
 SHADOW_BIN="$BIN"
 if [ -x "$DATA/bin/sinomo-shadow" ]; then
   SHADOW_BIN="$DATA/bin/sinomo-shadow"
+fi
+# A PID 1 replacement kills the old finalization helper with the container.
+# The staged image completes its authorized promotion through rollout-owned
+# boot recovery, retaining the previous binary and consuming the stage.
+if [ -f "$DATA/rollout/pending-shadow-rollout.sobj" ] && [ -x "$DATA/rollout/staged/sinomo-shadow" ]; then
+  SHADOW_BIN="$DATA/rollout/staged/sinomo-shadow"
 fi
 
 # Wait up to $2 seconds for a file to appear; returns 1 on timeout.
@@ -701,7 +700,7 @@ fi
 # Run the shadow supervisor as PID 1; it starts and supervises the main daemon.
 export SINOMO_SHADOW_MAIN_BINARY="$BIN"
 export SINOMO_SHADOW_MAIN_HOST=0.0.0.0
-export SINOMO_SHADOW_MAIN_PORT=21353
+export SINOMO_SHADOW_MAIN_PORT="$MAIN_PORT"
 export SINOMO_SHADOW_START_DELAY_MS=0
-log "starting shadow supervisor $SHADOW_BIN on 0.0.0.0:21354 (main $BIN on 0.0.0.0:21353, iroh disabled=$SINOMO_DISABLE_IROH)"
-exec "$SHADOW_BIN" daemon shadow run --host 0.0.0.0 --port 21354
+log "starting shadow supervisor $SHADOW_BIN on 0.0.0.0:$SHADOW_PORT (main $BIN on 0.0.0.0:$MAIN_PORT, iroh disabled=$SINOMO_DISABLE_IROH)"
+exec "$SHADOW_BIN" daemon shadow run --host 0.0.0.0 --port "$SHADOW_PORT"

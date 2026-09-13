@@ -300,16 +300,67 @@ async fn send_daemon_rollout_binary_to_target_async(
     let mut host = DaemonObjectRpcAsyncHost::new(&runtime, true).with_cluster_paths(&cluster_paths);
     let mut client =
         sinomo_core::network::ClusterObjectRpcClient::routed(&mut host, &cluster_paths);
-    let result = client
+    let options = sinomo_core::network::ClusterObjectRpcOptions::default()
+        .with_destination_process_affinity(
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+        );
+    let mut result = client
         .call_target(
             &state,
             &target_node_id,
             sinomo_rollout::rollout_binary_rpc_call(&request, &attachment_path)
                 .map_err(rollout_error)?,
-            sinomo_core::network::ClusterObjectRpcOptions::default(),
+            options,
         )
-        .await?;
-    decode_rollout_binary_rpc_result(result).await
+        .await;
+    // Retain the authenticated destination and operation ID. A route-connect
+    // failure proves no delivery, so a directly advertised endpoint may be
+    // tried. Never replay an ambiguous write or an authorization rejection.
+    if result.as_ref().is_err_and(|error| {
+        error.delivery_state()
+            == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+    }) {
+        let selector = sinomo_core::network::ClusterEndpointSelector::new(&cluster_paths, &state);
+        let endpoints =
+            selector.select(sinomo_core::network::ClusterEndpointSelectionPurpose::Rollout);
+        let candidates = selector.rollout_targets_for_main_with_command_endpoint(
+            &target_node_id,
+            None,
+            &endpoints,
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        for endpoint in candidates.into_iter().filter(|endpoint| {
+            endpoint.node_id == target_node_id
+                && sinomo_core::network::cluster_endpoint_can_carry_main_daemon_rpc(endpoint)
+                && !sinomo_core::network::is_loopback_connect_address(&endpoint.address)
+        }) {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let mut policy = sinomo_core::network::NetworkCallPolicy::default();
+            policy.health.connect_timeout = policy.health.connect_timeout.min(remaining);
+            result = client
+                .call_endpoint(
+                    &state,
+                    &endpoint,
+                    sinomo_rollout::rollout_binary_rpc_call(&request, &attachment_path)
+                        .map_err(rollout_error)?,
+                    sinomo_core::network::ClusterObjectRpcOptions::from_call_policy(policy)
+                        .with_destination_process_affinity(
+                            sinomo_core::network::DestinationProcessAffinity::MainDaemon,
+                        ),
+                )
+                .await;
+            if !result.as_ref().is_err_and(|error| {
+                error.delivery_state()
+                    == Some(sinomo_core::network::NetworkDeliveryState::DefinitelyNotSent)
+            }) {
+                break;
+            }
+        }
+    }
+    decode_rollout_binary_rpc_result(result?).await
 }
 
 pub fn send_daemon_rollout_native_dylib_module(

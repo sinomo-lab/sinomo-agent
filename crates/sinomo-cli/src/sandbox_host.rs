@@ -363,6 +363,9 @@ fn sandbox_cli_error_from_daemon(
     error: sinomo_runtime::daemon::DaemonError,
 ) -> sinomo_runtime::sandbox::SandboxCliError {
     match error {
+        sinomo_runtime::daemon::DaemonError::NetworkDelivery {
+            address, detail, ..
+        } => sinomo_runtime::sandbox::SandboxCliError::Network { address, detail },
         sinomo_runtime::daemon::DaemonError::AuthDenied => {
             sinomo_runtime::sandbox::SandboxCliError::AuthDenied
         }

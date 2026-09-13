@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const CARGO_BUILD_EXECUTOR_PROTOCOL: &str = "sinomo.cargo-build.v1";
+pub const CARGO_BUILD_EXECUTOR_PROTOCOL: &str = "sinomo.cargo-build.v2";
 pub const CARGO_BUILD_COMMIT_OVERRIDE_ENV: &str = "SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -562,6 +562,25 @@ impl CargoBuildExecutor {
         target_dir: impl Into<PathBuf>,
         cargo_jobs: Option<u16>,
     ) -> Result<CargoBuildResult> {
+        self.execute_with_target_dir_and_log(
+            source_repo,
+            plan,
+            artifact_root,
+            target_dir,
+            cargo_jobs,
+            None,
+        )
+    }
+
+    pub fn execute_with_target_dir_and_log(
+        &self,
+        source_repo: impl AsRef<Path>,
+        plan: &BuildPlan,
+        artifact_root: impl AsRef<Path>,
+        target_dir: impl Into<PathBuf>,
+        cargo_jobs: Option<u16>,
+        log_path: Option<&Path>,
+    ) -> Result<CargoBuildResult> {
         let artifact_root = artifact_root.as_ref();
         fs::create_dir_all(artifact_root).map_err(|source| BuildError::Io {
             path: artifact_root.display().to_string(),
@@ -584,15 +603,62 @@ impl CargoBuildExecutor {
         for (key, value) in &command.env {
             process.env(key, value);
         }
-        let output = process.output().map_err(|source| BuildError::Io {
-            path: command.program.display().to_string(),
-            detail: source.to_string(),
-        })?;
-        if !output.status.success() {
-            return Err(command_error(&command.program, &command.args, output));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let (stdout, stderr) = if let Some(path) = log_path {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            let io_error = |error: std::io::Error| BuildError::Io {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            };
+            let mut log = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(io_error)?;
+            writeln!(
+                log,
+                "command: {}\nrepo: {}\nbuild key: {}\n",
+                command.display(),
+                command.current_dir.display(),
+                plan.key
+            )
+            .map_err(io_error)?;
+            // The compiler writes directly to its job log while running; no
+            // unbounded process.output() buffer or detached reader is needed.
+            process.stdout(std::process::Stdio::from(
+                log.try_clone().map_err(io_error)?,
+            ));
+            process.stderr(std::process::Stdio::from(log));
+            let status = process.status().map_err(io_error)?;
+            let mut file = fs::File::open(path).map_err(io_error)?;
+            let length = file.metadata().map_err(io_error)?.len();
+            file.seek(SeekFrom::Start(length.saturating_sub(64 * 1024)))
+                .map_err(io_error)?;
+            let mut bytes = Vec::new();
+            file.take(64 * 1024)
+                .read_to_end(&mut bytes)
+                .map_err(io_error)?;
+            let tail = String::from_utf8_lossy(&bytes).into_owned();
+            if !status.success() {
+                return Err(BuildError::Process {
+                    command: command.display(),
+                    status: status.code().unwrap_or(-1),
+                    stderr: tail,
+                });
+            }
+            (tail, String::new())
+        } else {
+            let output = process.output().map_err(|source| BuildError::Io {
+                path: command.program.display().to_string(),
+                detail: source.to_string(),
+            })?;
+            if !output.status.success() {
+                return Err(command_error(&command.program, &command.args, output));
+            }
+            (
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
         let provenance = BuildProvenance::from_plan(plan)?;
         let mut artifacts = Vec::with_capacity(plan.input.outputs.len());
         for request in &plan.input.outputs {
@@ -1027,6 +1093,12 @@ version = "0.1.0"
     let revision = std::env::var("SINOMO_ROLLOUT_BUILD_COMMIT_OVERRIDE")
         .expect("keyed build revision");
     println!("cargo:rustc-env=FIXTURE_BUILD_REVISION={revision}");
+    let release = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("release-build");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !release.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(release.exists(), "test did not release the build script");
 }
 "#;
         const MAIN: &str = "fn main() { println!(\"{}\", env!(\"FIXTURE_BUILD_REVISION\")); }\n";
@@ -1078,9 +1150,37 @@ version = "0.1.0"
         let executor = CargoBuildExecutor::new("cargo", vec![capability]).expect("executor");
         let artifact_root = root.join("artifact-root");
 
-        let result = executor
-            .execute(&source_repo, &plan, &artifact_root)
-            .expect("execute Cargo build");
+        let log = root.join("build.log");
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                executor.execute_with_target_dir_and_log(
+                    &source_repo,
+                    &plan,
+                    &artifact_root,
+                    root.join("cargo-target"),
+                    None,
+                    Some(&log),
+                )
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            let mut output_visible_while_running = false;
+            while std::time::Instant::now() < deadline && !worker.is_finished() {
+                if fs::read_to_string(&log).is_ok_and(|text| text.contains("Compiling")) {
+                    output_visible_while_running = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Always release and reap the compiler before asserting, including
+            // the failure path, so the test cannot leak a background build.
+            fs::write(source_repo.join("release-build"), "continue").unwrap();
+            let result = worker.join().unwrap().expect("execute Cargo build");
+            assert!(
+                output_visible_while_running,
+                "compiler output was buffered until completion"
+            );
+            result
+        });
 
         result.artifact_set.validate().expect("artifact set");
         assert_eq!(result.artifact_set.provenance.build_key, plan.key);

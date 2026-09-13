@@ -701,6 +701,87 @@ fn complete_pending_shadow_rollout_after_start(
     Ok(())
 }
 
+/// Complete an authorized staged shadow installation when Docker restarts PID 1.
+pub fn resume_pending_pid1_shadow_boot(
+    paths: &SelfRolloutPaths,
+    options: &sinomo_daemon::DaemonRunOptions,
+) -> Result<(), DaemonError> {
+    #[cfg(unix)]
+    if std::process::id() == 1 {
+        let current = env::current_exe().map_err(|error| DaemonError::Io {
+            path: "current shadow executable".into(),
+            detail: error.to_string(),
+        })?;
+        if let Some(finalize) = install_pending_shadow_at_boot(paths, &current)? {
+            let mut shadow_options = options.clone();
+            shadow_options.host = finalize.shadow_host;
+            shadow_options.port = finalize.shadow_port;
+            let main_options = sinomo_daemon::DaemonRunOptions {
+                host: finalize.main_host,
+                port: finalize.main_port,
+                ..Default::default()
+            };
+            // Re-exec preserves PID 1 and adopts the original operation's
+            // stable binary paths and listener settings.
+            return Err(reexec_shadow_supervisor(
+                &finalize.shadow_binary,
+                &shadow_options,
+                &finalize.main_binary,
+                &main_options,
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (paths, options);
+    Ok(())
+}
+
+#[cfg(any(unix, test))]
+fn install_pending_shadow_at_boot(
+    paths: &SelfRolloutPaths,
+    current: &Path,
+) -> Result<Option<sinomo_rollout::PendingShadowRollout>, DaemonError> {
+    let Some(mut finalize) = read_pending_shadow_rollout(paths)? else {
+        return Ok(None);
+    };
+    let Some(staged) = finalize
+        .staged_shadow_binary
+        .as_ref()
+        .filter(|path| path.exists())
+    else {
+        return Ok(None);
+    };
+    if staged != &sinomo_rollout::rollout_staged_shadow_binary(paths)
+        || finalize.shadow_binary != paths.shadow_binary
+    {
+        return Err(DaemonError::Parse {
+            detail: "pending shadow boot has unexpected installation paths".into(),
+        });
+    }
+    if !sinomo_rollout::same_path_if_exists(current, staged) {
+        // Older entrypoints copied the candidate into place but left its stage.
+        // Identical installed bytes are required before consuming that stage.
+        if !sinomo_rollout::same_path_if_exists(current, &finalize.shadow_binary)
+            || sinomo_rollout::binary_should_update(staged, &finalize.shadow_binary)?
+        {
+            return Ok(None);
+        }
+        fs::remove_file(staged).map_err(|error| DaemonError::Io {
+            path: staged.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    } else if let Some(previous) =
+        sinomo_rollout::activate_staged_rollout_binary(staged, &finalize.shadow_binary)?
+    {
+        finalize.previous_shadow_binary = previous;
+        sinomo_rollout::write_object(
+            &sinomo_rollout::rollout_shadow_finalize_path(paths),
+            &finalize,
+        )?;
+    }
+    Ok(Some(finalize))
+}
+
 fn rehydrate_main_activation_if_staged_main_is_pending(
     paths: &DaemonPaths,
     rollout_paths: &SelfRolloutPaths,
@@ -4101,6 +4182,87 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn pending_boot_fixture(
+        root: &Path,
+    ) -> (SelfRolloutPaths, sinomo_rollout::PendingShadowRollout) {
+        let paths = SelfRolloutPaths::new(root);
+        let staged = sinomo_rollout::rollout_staged_shadow_binary(&paths);
+        fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        fs::create_dir_all(&paths.bin).unwrap();
+        fs::write(&staged, b"new shadow").unwrap();
+        fs::write(&paths.shadow_binary, b"old shadow").unwrap();
+        let pending = sinomo_rollout::PendingShadowRollout {
+            source: "committed source".into(),
+            main_binary: paths.main_binary.clone(),
+            shadow_binary: paths.shadow_binary.clone(),
+            staged_main_binary: None,
+            staged_shadow_binary: Some(staged),
+            previous_main_binary: None,
+            native_dylib_loader_rollback_generation: None,
+            previous_shadow_binary: paths.shadow_binary.with_extension("previous"),
+            main_host: "0.0.0.0".into(),
+            main_port: 24502,
+            shadow_host: "0.0.0.0".into(),
+            shadow_port: 24503,
+            requested_at: "request".into(),
+            main_healthy_at: "healthy".into(),
+            mode: "cluster-binary-push".into(),
+        };
+        sinomo_rollout::write_object(
+            &sinomo_rollout::rollout_shadow_finalize_path(&paths),
+            &pending,
+        )
+        .unwrap();
+        (paths, pending)
+    }
+
+    #[test]
+    fn pid1_shadow_boot_consumes_stage_and_retains_previous_binary() {
+        let root = sinomo_testdir::TestDir::new("pid1-shadow-boot");
+        let (paths, pending) = pending_boot_fixture(&root);
+        let staged = pending.staged_shadow_binary.as_ref().unwrap();
+        let installed = install_pending_shadow_at_boot(&paths, staged)
+            .unwrap()
+            .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&paths.shadow_binary).unwrap(), b"new shadow");
+        assert_eq!(
+            fs::read(&installed.previous_shadow_binary).unwrap(),
+            b"old shadow"
+        );
+        assert_eq!(installed.shadow_port, 24503);
+        assert_eq!(
+            read_pending_shadow_rollout(&paths).unwrap().unwrap(),
+            installed
+        );
+        assert!(
+            install_pending_shadow_at_boot(&paths, &paths.shadow_binary)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pid1_shadow_boot_requires_identical_bytes_for_legacy_copied_stage() {
+        let root = sinomo_testdir::TestDir::new("pid1-shadow-copied-stage");
+        let (paths, pending) = pending_boot_fixture(&root);
+        let staged = pending.staged_shadow_binary.as_ref().unwrap();
+        assert!(
+            install_pending_shadow_at_boot(&paths, &paths.shadow_binary)
+                .unwrap()
+                .is_none()
+        );
+        assert!(staged.exists());
+        fs::copy(staged, &paths.shadow_binary).unwrap();
+        let recovered = install_pending_shadow_at_boot(&paths, &paths.shadow_binary)
+            .unwrap()
+            .unwrap();
+        assert!(!staged.exists());
+        assert_eq!(
+            recovered.previous_shadow_binary,
+            pending.previous_shadow_binary
+        );
+    }
     use super::*;
 
     #[test]
