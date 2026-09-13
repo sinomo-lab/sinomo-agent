@@ -11274,7 +11274,8 @@ mod tests {
     #[test]
     fn app_chat_group_tool_runtime_update_preserves_empty_and_all_disabled_membership() {
         let root = sinomo_testdir::TestDir::new("sinomo-app-chat-channel-tool-runtime-empty");
-        let data_dir = SinomoDataDir::new(&root);
+        // Writable workspaces must be outside the protected Sinomo data root.
+        let data_dir = SinomoDataDir::new(root.join("data"));
         let store = SifsAgentChannelStore::open(&data_dir).expect("open channel store");
 
         for all_disabled in [false, true] {

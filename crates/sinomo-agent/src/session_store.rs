@@ -638,6 +638,10 @@ pub enum AgentSessionStoreRecordKind {
         item_count: usize,
         event_count: usize,
     },
+    TurnFailed {
+        detail: String,
+        item_count: usize,
+    },
     ItemsAppended {
         item_count: usize,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

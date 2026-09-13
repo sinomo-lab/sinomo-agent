@@ -314,6 +314,20 @@ completion is published. A snapshot failure is reported through both the failed
 runtime event and the worker join result, while the merged state stays available
 in memory for a later save attempt.
 
+An execution error preserves the turn's completed tool results and other recorded
+items in the resumable session, together with typed failure evidence. The worker
+merges that partial turn with inputs received during execution before saving it;
+only inputs already represented in the turn are consumed. Provider failures reach
+both the runtime failure event and the worker join result, without publishing a
+successful final decision. Continuation therefore sees completed operations even
+when the following model request failed.
+
+Control edits are prepared on a staged session and control state. Persistence
+errors leave the live session, input queues, revision, and published control events
+unchanged. Worker cancellation is signalled only after its control result has been
+persisted. Executed turn effects follow the partial-progress rule above rather
+than being rolled back as control edits.
+
 Agent homes are outside the session evidence subtree and are keyed by agent id.
 They use SIFS so a newly placed or explicitly migrated session sees the same
 home instead of receiving a new node-local directory. A runtime that cannot
@@ -615,6 +629,12 @@ before daemon startup so both readiness tags can complete without skips.
 ## Compaction
 
 Compaction has two separate concerns.
+
+Automatic compaction summarizes the current session projection together with
+items produced in the active turn. Earlier turns are supplied to the summarizer
+before their full text is removed from model context. The resulting projection
+and retained item identities are persisted for subsequent turns and resume;
+the raw transcript remains available as evidence.
 
 Deterministic runtime invariants live in `sinomo-agent` and are covered by local
 readiness:

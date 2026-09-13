@@ -488,7 +488,7 @@ fn agent_system_architecture_path(workspace_root: &Path) -> PathBuf {
 
 fn check_provider_boundary_smoke(workspace_root: &Path) -> AgentReadinessCheck {
     let agent_source_path = agent_source_file_path(workspace_root, "agent.rs");
-    let source = match fs::read_to_string(&agent_source_path) {
+    let source = match read_agent_implementation_source(&agent_source_path) {
         Ok(source) => source,
         Err(error) => {
             return failed(
@@ -544,6 +544,26 @@ fn check_provider_boundary_smoke(workspace_root: &Path) -> AgentReadinessCheck {
             }),
         )
     }
+}
+
+fn read_agent_implementation_source(agent_source_path: &Path) -> std::io::Result<String> {
+    let mut source = fs::read_to_string(agent_source_path)?;
+    // The public facade and its implementation modules form the provider
+    // boundary. Test fixtures may deliberately contain forbidden examples.
+    let module_dir = agent_source_path.with_extension("");
+    let mut module_paths = fs::read_dir(module_dir)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    module_paths.sort();
+    for path in module_paths {
+        if path.extension().is_some_and(|extension| extension == "rs")
+            && path.file_name().is_some_and(|name| name != "tests.rs")
+        {
+            source.push('\n');
+            source.push_str(&fs::read_to_string(path)?);
+        }
+    }
+    Ok(source)
 }
 
 fn agent_source_file_path(workspace_root: &Path, file_name: &str) -> PathBuf {

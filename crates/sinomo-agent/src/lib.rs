@@ -3387,7 +3387,7 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
-        assert!(!main_names.iter().any(|name| name == "cluster_status"));
+        assert!(main_names.iter().any(|name| name == "cluster_status"));
 
         let background_names = AgentDefinition::background()
             .tools
@@ -3413,7 +3413,12 @@ mod tests {
     fn main_agent_prompt_uses_available_tools_without_fictional_handoffs() {
         let prompt = AgentDefinition::main().system_prompt;
 
-        for expected in ["read_file", "list_files", "search", "configuration tools"] {
+        for expected in [
+            "tool_search",
+            "tool_describe",
+            "tool_call",
+            "inspection and configuration",
+        ] {
             assert!(
                 prompt.contains(expected),
                 "missing prompt guidance for {expected}"
@@ -3987,8 +3992,12 @@ mod tests {
             .load_catalog()
             .expect("confirmed missing skill catalog is empty");
         assert_eq!(skill_catalog, SkillCatalog::default());
-        let agent_catalog =
-            AgentCatalog::load_from_vfs(absent).expect("confirmed missing agent directory");
+        // Exercise namespace absence independently of the operator's active
+        // product modules, which the host merges after loading stored agents.
+        let agent_catalog = AgentCatalog::load_from_store(
+            AgentDefinitionSifsStore::from_vfs(absent).expect("memory agent store"),
+        )
+        .expect("confirmed missing agent directory");
         assert_eq!(
             agent_catalog.list().count(),
             AgentDefinition::built_ins().len(),
