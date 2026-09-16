@@ -5,7 +5,9 @@ workspace_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 sui_checkout_dir="${SUI_CHECKOUT_DIR:-$(dirname "${workspace_root}")/sui}"
 sui_ref="${SUI_REF:-main}"
 
-if [[ -f "${sui_checkout_dir}/crates/sui/Cargo.toml" ]]; then
+# Runner build directories survive jobs. Only a local developer checkout may
+# be reused without resolving the requested ref again.
+if [[ "${CI:-false}" != true && -f "${sui_checkout_dir}/crates/sui/Cargo.toml" ]]; then
   echo "Using existing SUI checkout at ${sui_checkout_dir}"
   exit 0
 fi
@@ -32,7 +34,12 @@ fi
 
 mkdir -p "$(dirname "${sui_checkout_dir}")"
 git init -q "${sui_checkout_dir}"
-git -C "${sui_checkout_dir}" remote add origin "${repository_url}"
+if git -C "${sui_checkout_dir}" remote get-url origin >/dev/null 2>&1; then
+  # CI_JOB_TOKEN changes between jobs, even when the checkout is reused.
+  git -C "${sui_checkout_dir}" remote set-url origin "${repository_url}"
+else
+  git -C "${sui_checkout_dir}" remote add origin "${repository_url}"
+fi
 
 if ! git -C "${sui_checkout_dir}" fetch --depth 1 origin "${sui_ref}"; then
   echo "Unable to fetch SUI ref '${sui_ref}'. Ensure the SUI project permits this project to use CI_JOB_TOKEN, or set SUI_REPOSITORY_URL." >&2

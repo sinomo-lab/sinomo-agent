@@ -46,6 +46,7 @@ build:cross-platform-cli:
       mingw-w64-x86-64-dev
       zip
     - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu
+    - bash ./scripts/ci/test-checkout-sui.sh
     - ./scripts/ci/checkout-sui.sh
   script:
     - ./scripts/ci/build-release-artifacts.sh
