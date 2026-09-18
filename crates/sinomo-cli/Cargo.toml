@@ -33,6 +33,7 @@ ring = "0.17.14"
 serde.workspace = true
 serde_json.workspace = true
 sinomo-agent = { path = "../sinomo-agent" }
+sinomo-client = { path = "../sinomo-client" }
 sinomo-audio = { path = "../sinomo-audio" }
 sinomo-dfs-fuse = { path = "../sinomo-dfs-fuse", optional = true, default-features = false }
 sinomo-lm = { path = "../sinomo-lm", features = ["test-cases"] }

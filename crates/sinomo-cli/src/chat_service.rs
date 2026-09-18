@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -24,6 +25,9 @@ use sinomo_runtime::service::{
 
 use crate::app_api as local;
 
+mod recovery;
+use recovery::CommandJournal;
+
 const CHAT_EVENT_RETENTION: usize = 8 * 1024;
 
 #[derive(Clone)]
@@ -34,6 +38,7 @@ struct ChatEventLog {
 #[derive(Default)]
 struct ChatEventLogState {
     next_sequence: u64,
+    generation: String,
     events: VecDeque<wire::SequencedChatEvent>,
 }
 
@@ -43,6 +48,7 @@ impl ChatEventLog {
             state: Arc::new((
                 Mutex::new(ChatEventLogState {
                     next_sequence: 1,
+                    generation: SessionId::generate().to_string(),
                     events: VecDeque::new(),
                 }),
                 Condvar::new(),
@@ -99,12 +105,19 @@ impl ChatEventLog {
         wire::ChatSessionEventsResponse {
             events,
             next_sequence,
+            first_available_sequence: state
+                .events
+                .front()
+                .map(|e| e.sequence)
+                .unwrap_or(state.next_sequence),
+            generation: state.generation.clone(),
+            execution_available: true,
         }
     }
 }
 
 enum WorkerCommand {
-    Chat(wire::ChatSessionCommand),
+    Chat(String, wire::ChatSessionCommand),
     Shutdown,
 }
 
@@ -112,6 +125,9 @@ struct HostedChatSession {
     command_tx: Sender<WorkerCommand>,
     events: ChatEventLog,
     storage: local::AgentChatSifsStorage,
+    journal: CommandJournal,
+    ready: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -119,6 +135,8 @@ pub struct HostedChatService {
     daemon_address: String,
     runtime_control: AgentRuntimeControlRegistry,
     sessions: Arc<Mutex<HashMap<String, HostedChatSession>>>,
+    clients: Arc<Mutex<HashMap<String, String>>>,
+    ephemeral_clients: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
 impl HostedChatService {
@@ -130,6 +148,8 @@ impl HostedChatService {
             daemon_address: daemon_address.into(),
             runtime_control,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            ephemeral_clients: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         }
     }
 
@@ -140,12 +160,31 @@ impl HostedChatService {
         request: wire::ChatSessionOpenRequest,
     ) -> Result<wire::ChatSessionOpenResponse, String> {
         validate_client_id(&request.client_id)?;
+        let ephemeral = request.execution_id.is_none();
+        let execution_id = request
+            .execution_id
+            .clone()
+            .unwrap_or_else(|| request.client_id.clone());
+        validate_client_id(&execution_id)?;
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| "chat session registry lock poisoned".to_string())?;
-        if !sessions.contains_key(&request.client_id) {
+        if sessions
+            .get(&execution_id)
+            .is_some_and(|host| !host.alive.load(Ordering::Acquire))
+        {
+            sessions.remove(&execution_id);
+        }
+        let attached = sessions.contains_key(&execution_id);
+        if !attached {
+            if sessions.len() >= 256 {
+                return Err("too many resident chat execution hosts".into());
+            }
+            let journal = CommandJournal::open(&data_dir.root(), &execution_id)?;
             let events = ChatEventLog::new();
+            let ready = Arc::new(AtomicBool::new(false));
+            let alive = Arc::new(AtomicBool::new(true));
             let (command_tx, command_rx) = channel();
             let storage = local::AgentChatSifsStorage::new(
                 data_dir.clone(),
@@ -153,25 +192,56 @@ impl HostedChatService {
                 &runtime,
             );
             spawn_chat_worker(
-                request.client_id.clone(),
-                data_dir,
-                self.runtime_control.clone(),
-                storage.clone(),
+                ChatWorkerContext {
+                    execution_id: execution_id.clone(),
+                    data_dir,
+                    runtime_control: self.runtime_control.clone(),
+                    storage: storage.clone(),
+                    events: events.clone(),
+                    journal: journal.clone(),
+                    ready: ready.clone(),
+                    alive: alive.clone(),
+                },
                 command_rx,
-                events.clone(),
             )?;
             sessions.insert(
-                request.client_id.clone(),
+                execution_id.clone(),
                 HostedChatSession {
                     command_tx,
                     events,
                     storage,
+                    journal,
+                    ready,
+                    alive,
                 },
             );
+        }
+        let runtime_ready = sessions[&execution_id].ready.load(Ordering::Acquire);
+        let generation = sessions[&execution_id]
+            .events
+            .state
+            .0
+            .lock()
+            .map_err(|_| "event log poisoned")?
+            .generation
+            .clone();
+        self.clients
+            .lock()
+            .map_err(|_| "chat subscription registry poisoned")?
+            .insert(request.client_id.clone(), execution_id);
+        if ephemeral {
+            self.ephemeral_clients
+                .lock()
+                .map_err(|_| "chat registry poisoned")?
+                .insert(request.client_id.clone());
         }
         Ok(wire::ChatSessionOpenResponse {
             client_id: request.client_id,
             next_event_sequence: 0,
+            attached,
+            generation,
+            runtime_ready,
+            handoff_protocol: wire::CHAT_HANDOFF_PROTOCOL_VERSION,
         })
     }
 
@@ -179,18 +249,28 @@ impl HostedChatService {
         &self,
         request: wire::ChatSessionCommandRequest,
     ) -> Result<wire::ChatSessionCommandResponse, String> {
-        let (command_tx, storage, events) = {
+        let execution_id = match self.execution_id(&request.client_id) {
+            Ok(id) => id,
+            Err(_) => {
+                return Ok(wire::ChatSessionCommandResponse {
+                    accepted: false,
+                    reattach_required: true,
+                });
+            }
+        };
+        let (command_tx, storage, events, journal) = {
             let sessions = self
                 .sessions
                 .lock()
                 .map_err(|_| "chat session registry lock poisoned".to_string())?;
             let session = sessions
-                .get(&request.client_id)
+                .get(&execution_id)
                 .ok_or_else(|| format!("unknown chat client `{}`", request.client_id))?;
             (
                 session.command_tx.clone(),
                 session.storage.clone(),
                 session.events.clone(),
+                session.journal.clone(),
             )
         };
         if matches!(request.command, wire::ChatSessionCommand::FetchAgents) {
@@ -202,46 +282,143 @@ impl HostedChatService {
                 ),
             };
             events.push(wire::ChatEvent::Agents { agents, warning });
-            return Ok(wire::ChatSessionCommandResponse { accepted: true });
+            return Ok(wire::ChatSessionCommandResponse {
+                accepted: true,
+                reattach_required: false,
+            });
         }
-        if handle_direct_control(&self.runtime_control, &storage, &events, &request.command)? {
-            return Ok(wire::ChatSessionCommandResponse { accepted: true });
+        if matches!(
+            request.command,
+            wire::ChatSessionCommand::ControlState { .. }
+        ) {
+            handle_direct_control(&self.runtime_control, &storage, &events, &request.command)?;
+            return Ok(wire::ChatSessionCommandResponse {
+                accepted: true,
+                reattach_required: false,
+            });
         }
-        command_tx
-            .send(WorkerCommand::Chat(request.command))
-            .map_err(|_| "daemon chat worker stopped".to_string())?;
-        Ok(wire::ChatSessionCommandResponse { accepted: true })
+        if matches!(
+            request.command,
+            wire::ChatSessionCommand::FetchModels { .. }
+        ) {
+            command_tx
+                .send(WorkerCommand::Chat(String::new(), request.command))
+                .map_err(|_| "chat worker stopped")?;
+            return Ok(wire::ChatSessionCommandResponse {
+                accepted: true,
+                reattach_required: false,
+            });
+        }
+        let id = request
+            .request_id
+            .unwrap_or_else(|| SessionId::generate().to_string());
+        if !journal.admit(&id, &request.command)? {
+            return Ok(wire::ChatSessionCommandResponse {
+                accepted: true,
+                reattach_required: false,
+            });
+        }
+        if matches!(
+            request.command,
+            wire::ChatSessionCommand::Steer { .. }
+                | wire::ChatSessionCommand::FollowUp { .. }
+                | wire::ChatSessionCommand::RemoveQueuedInput { .. }
+                | wire::ChatSessionCommand::Interrupt { .. }
+                | wire::ChatSessionCommand::ControlState { .. }
+        ) {
+            let _work = sinomo_runtime::rollout::acquire_runtime_control(&journal.data_dir())?;
+            journal.start(&id)?;
+            if let Err(error) =
+                handle_direct_control(&self.runtime_control, &storage, &events, &request.command)
+            {
+                journal.reject(&id, error.clone())?;
+                return Err(error);
+            }
+            journal.complete(&id, None)?;
+            return Ok(wire::ChatSessionCommandResponse {
+                accepted: true,
+                reattach_required: false,
+            });
+        }
+        let _ = command_tx.send(WorkerCommand::Chat(id, request.command));
+        Ok(wire::ChatSessionCommandResponse {
+            accepted: true,
+            reattach_required: false,
+        })
     }
 
     fn events(
         &self,
         request: wire::ChatSessionEventsRequest,
     ) -> Result<wire::ChatSessionEventsResponse, String> {
-        let events = self
+        let execution_id = self.execution_id(&request.client_id)?;
+        let (events, alive) = self
             .sessions
             .lock()
             .map_err(|_| "chat session registry lock poisoned".to_string())?
-            .get(&request.client_id)
-            .map(|session| session.events.clone())
+            .get(&execution_id)
+            .map(|session| (session.events.clone(), session.alive.clone()))
             .ok_or_else(|| format!("unknown chat client `{}`", request.client_id))?;
-        Ok(events.poll(&request))
+        let mut response = events.poll(&request);
+        response.execution_available = alive.load(Ordering::Acquire);
+        Ok(response)
     }
 
     fn close(
         &self,
         request: wire::ChatSessionCloseRequest,
     ) -> Result<wire::ChatSessionCloseResponse, String> {
-        let session = self
-            .sessions
+        let mut sessions = self.sessions.lock().map_err(|_| "chat registry poisoned")?;
+        let mut clients = self
+            .clients
             .lock()
-            .map_err(|_| "chat session registry lock poisoned".to_string())?
+            .map_err(|_| "chat subscription registry poisoned")?;
+        let execution_id = clients.remove(&request.client_id);
+        let ephemeral = self
+            .ephemeral_clients
+            .lock()
+            .map_err(|_| "chat registry poisoned")?
             .remove(&request.client_id);
-        if let Some(session) = session {
-            let _ = session.command_tx.send(WorkerCommand::Shutdown);
-            Ok(wire::ChatSessionCloseResponse { closed: true })
-        } else {
-            Ok(wire::ChatSessionCloseResponse { closed: false })
+        if ephemeral
+            && let Some(id) = &execution_id
+            && !clients.values().any(|other| other == id)
+        {
+            sessions.remove(id);
         }
+        // Durable execution outlives a subscribing window. Legacy clients retain their previous
+        // close semantics because they never negotiated a stable execution host.
+        Ok(wire::ChatSessionCloseResponse {
+            closed: execution_id.is_some(),
+        })
+    }
+
+    pub(crate) fn recover(
+        &self,
+        data_dir: sinomo_runtime::local::SinomoDataDir,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<(), String> {
+        for execution_id in CommandJournal::discover(&data_dir.root())? {
+            let client_id = format!("recovery-{}", SessionId::generate());
+            self.open(
+                data_dir.clone(),
+                runtime.clone(),
+                wire::ChatSessionOpenRequest {
+                    client_id: client_id.clone(),
+                    execution_id: Some(execution_id),
+                },
+            )?;
+            self.close(wire::ChatSessionCloseRequest { client_id })?;
+        }
+        Ok(())
+    }
+
+    fn execution_id(&self, client_id: &str) -> Result<String, String> {
+        self.clients
+            .lock()
+            .map_err(|_| "chat subscription registry poisoned")?
+            .get(client_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown chat client `{client_id}`"))
     }
 }
 
@@ -484,48 +661,68 @@ pub fn register_hosted_chat_service(
     builder.register(HostedChatService::new(daemon_address, runtime_control))
 }
 
-fn spawn_chat_worker(
-    client_id: String,
+impl Drop for HostedChatSession {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
+        let _ = self.command_tx.send(WorkerCommand::Shutdown);
+    }
+}
+
+struct ChatWorkerContext {
+    execution_id: String,
     data_dir: sinomo_runtime::local::SinomoDataDir,
     runtime_control: AgentRuntimeControlRegistry,
     storage: local::AgentChatSifsStorage,
-    command_rx: Receiver<WorkerCommand>,
     events: ChatEventLog,
+    journal: CommandJournal,
+    ready: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+}
+
+fn spawn_chat_worker(
+    context: ChatWorkerContext,
+    command_rx: Receiver<WorkerCommand>,
 ) -> Result<(), String> {
+    let recovered = context.journal.recovery()?;
     std::thread::Builder::new()
-        .name(format!("sinomo-chat-{client_id}"))
-        .spawn(move || {
-            chat_worker(
-                client_id,
-                data_dir,
-                runtime_control,
-                storage,
-                command_rx,
-                events,
-            )
-        })
+        .name(format!("sinomo-chat-{}", context.execution_id))
+        .spawn(move || chat_worker(context, command_rx, recovered))
         .map(|_| ())
-        .map_err(|error| format!("spawn daemon chat worker: {error}"))
+        .map_err(|e| format!("spawn daemon chat worker: {e}"))
 }
 
 fn chat_worker(
-    client_id: String,
-    data_dir: sinomo_runtime::local::SinomoDataDir,
-    runtime_control: AgentRuntimeControlRegistry,
-    storage: local::AgentChatSifsStorage,
+    context: ChatWorkerContext,
     command_rx: Receiver<WorkerCommand>,
-    events: ChatEventLog,
+    recovered: recovery::RecoveredCommands,
 ) {
-    let mut chat = match local::AgentChat::with_runtime_control_registry_and_sifs(
+    let ChatWorkerContext {
+        execution_id,
         data_dir,
-        true,
         runtime_control,
         storage,
+        events,
+        journal,
+        ready,
+        alive,
+    } = context;
+    struct WorkerLife(Arc<AtomicBool>);
+    impl Drop for WorkerLife {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+    let _life = WorkerLife(alive.clone());
+    let mut chat = match local::AgentChat::with_runtime_control_registry_and_sifs(
+        data_dir.clone(),
+        true,
+        runtime_control.clone(),
+        storage.clone(),
     ) {
         Ok(chat) => chat,
         Err(error) => {
             tracing::warn!(
-                client_id = %client_id,
+                execution_id = %execution_id,
                 error = %error,
                 "daemon chat worker initialization failed"
             );
@@ -536,6 +733,30 @@ fn chat_worker(
             return;
         }
     };
+    let (bootstrap, pending, interrupted) = recovered;
+    for command in bootstrap {
+        let result = match command {
+            wire::ChatSessionCommand::Resume { session_id, .. } => {
+                chat.resume_session(&session_id, &[])
+            }
+            wire::ChatSessionCommand::SetModel {
+                provider,
+                model,
+                account,
+            } => chat.set_model(provider, model, account).map(|_| ()),
+            _ => Err(crate::CliError::Parse {
+                detail: "unsupported chat recovery command".into(),
+            }),
+        };
+        if let Err(error) = result {
+            events.push(wire::ChatEvent::Error {
+                session_id: None,
+                error: format!("chat restoration failed: {error}"),
+            });
+            return;
+        }
+    }
+    ready.store(true, Ordering::Release);
     events.push(wire::ChatEvent::Ready {
         session_id: chat.session_id(),
         info: runtime_info(chat.runtime_info()),
@@ -543,13 +764,47 @@ fn chat_worker(
     events.push(wire::ChatEvent::ToolRuntime(tool_runtime(
         chat.tool_runtime(),
     )));
-
-    while let Ok(command) = command_rx.recv() {
-        match command {
-            WorkerCommand::Shutdown => break,
-            WorkerCommand::Chat(command) => {
-                run_worker_command(&mut chat, command, &events);
+    if let Ok(state) = chat.control_state() {
+        events.push(wire::ChatEvent::ControlState(control_state(state)));
+    }
+    if interrupted {
+        events.push(wire::ChatEvent::Notice { session_id: chat.session_id(), notice: "An operation was interrupted by daemon failure. Its result must be reconciled before retrying; inspect the durable tool evidence before retrying.".into() });
+    }
+    let mut pending = VecDeque::from(pending);
+    loop {
+        if !alive.load(Ordering::Acquire) {
+            break;
+        }
+        let (id, command) = if let Some(command) = pending.pop_front() {
+            command
+        } else {
+            match command_rx.recv() {
+                Ok(WorkerCommand::Chat(id, command)) => (id, command),
+                Ok(WorkerCommand::Shutdown) | Err(_) => break,
             }
+        };
+        let result = (|| {
+            let _work =
+                sinomo_runtime::rollout::acquire_runtime_work_until(&data_dir.root(), || {
+                    !alive.load(Ordering::Acquire)
+                })?;
+            if !id.is_empty() {
+                journal.start(&id)?;
+            }
+            if !handle_direct_control(&runtime_control, &storage, &events, &command)? {
+                run_worker_command(&mut chat, command.clone(), &events);
+            }
+            if id.is_empty() {
+                Ok(())
+            } else {
+                journal.complete(&id, recovery::resume_command(&command, chat.session_id()))
+            }
+        })();
+        if let Err(error) = result {
+            events.push(wire::ChatEvent::Error {
+                session_id: Some(chat.session_id()),
+                error,
+            });
         }
     }
 }
@@ -648,7 +903,9 @@ fn run_worker_command(
             session_id,
             key,
             history: _,
-        } => match chat.set_agent(&key) {
+        } => match ensure_session(chat, session_id.clone())
+            .and_then(|_| chat.set_agent(&key).map_err(|e| e.to_string()))
+        {
             Ok(info) => {
                 events.push(wire::ChatEvent::RuntimeInfo(runtime_info(info)));
                 events.push(wire::ChatEvent::ToolRuntime(tool_runtime(
@@ -1600,6 +1857,91 @@ mod tests {
             vec![3]
         );
         assert_eq!(second.next_sequence, 3);
+    }
+
+    #[test]
+    fn closing_a_subscription_keeps_execution_and_reconnect_replays_without_duplicate_commands() {
+        let root = sinomo_testdir::TestDir::new("chat-detached-execution");
+        let data_dir = sinomo_runtime::local::SinomoDataDir::new(&root);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = HostedChatService::new("127.0.0.1:1", AgentRuntimeControlRegistry::new());
+        let events = ChatEventLog::new();
+        events.push(notice(1));
+        let (command_tx, commands) = channel();
+        service.sessions.lock().unwrap().insert(
+            "durable-host".into(),
+            HostedChatSession {
+                command_tx,
+                events: events.clone(),
+                storage: local::AgentChatSifsStorage::new(
+                    data_dir.clone(),
+                    "127.0.0.1:1",
+                    runtime.handle(),
+                ),
+                journal: CommandJournal::open(&root, "durable-host").unwrap(),
+                ready: Arc::new(AtomicBool::new(true)),
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+        );
+        service
+            .clients
+            .lock()
+            .unwrap()
+            .insert("old-window".into(), "durable-host".into());
+        assert!(
+            service
+                .close(wire::ChatSessionCloseRequest {
+                    client_id: "old-window".into()
+                })
+                .unwrap()
+                .closed
+        );
+        assert!(
+            commands.try_recv().is_err(),
+            "detach must not send worker shutdown"
+        );
+        events.push(notice(2));
+        let open = service
+            .open(
+                data_dir,
+                runtime.handle().clone(),
+                wire::ChatSessionOpenRequest {
+                    client_id: "new-window".into(),
+                    execution_id: Some("durable-host".into()),
+                },
+            )
+            .unwrap();
+        assert!(open.attached);
+        let replay = service
+            .events(wire::ChatSessionEventsRequest {
+                client_id: "new-window".into(),
+                after_sequence: 1,
+                max_events: 20,
+                wait_ms: 0,
+            })
+            .unwrap();
+        assert_eq!(replay.events.len(), 1);
+        assert_eq!(replay.events[0].sequence, 2);
+        assert_eq!(replay.generation, open.generation);
+        let command = wire::ChatSessionCommandRequest {
+            client_id: "new-window".into(),
+            request_id: Some("same-operation".into()),
+            command: wire::ChatSessionCommand::Send {
+                session_id: "session".into(),
+                text: "continue".into(),
+                attachments: vec![],
+            },
+        };
+        assert!(service.command(command.clone()).unwrap().accepted);
+        assert!(service.command(command).unwrap().accepted);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            WorkerCommand::Chat(_, _)
+        ));
+        assert!(
+            commands.try_recv().is_err(),
+            "retry must not execute the command twice"
+        );
     }
 
     #[test]

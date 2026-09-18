@@ -353,7 +353,9 @@ fn rollout_host_service_route(route: &'static str) -> ServiceRoute {
 }
 
 pub fn register_services(builder: ServiceRegistryBuilder) -> ServiceRegistryBuilder {
-    builder.register(RolloutService::new())
+    builder
+        .register(RolloutService::new())
+        .register(crate::desktop::DesktopUpdateService)
 }
 
 pub fn register_host_services(
@@ -377,10 +379,13 @@ pub fn component_factory_with_telemetry(
 ) -> Result<sinomo_module::StaticComponentFactory, sinomo_module::ComponentError> {
     let descriptor = sinomo_module::component_descriptor_from_registration(
         &crate::rollout_module_registration(),
-    )?;
+    )?
+    .publish_event(crate::desktop::update_publication());
+    let caller = descriptor.clone();
     let label = label.into();
     Ok(
         sinomo_module::StaticComponentFactory::new(descriptor, move |context, scope| {
+            crate::desktop::observe_updates(context, scope, &caller)?;
             let builder = register_services(ServiceRegistryBuilder::default());
             scope.set_services(register_host_services(builder, Arc::clone(&host)).build());
             if telemetry_host.is_some() || context.runtime().is_some() {

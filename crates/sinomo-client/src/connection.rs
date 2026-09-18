@@ -5,7 +5,7 @@ use sinomo_runtime::local::SinomoDataDir;
 
 use crate::{
     OwnedDaemonHandle, StartAppDaemonOutcome, daemon_protocol_is_compatible,
-    incompatible_daemon_protocol_detail, start_app_owned_daemon,
+    incompatible_daemon_protocol_detail,
 };
 
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(400);
@@ -40,6 +40,14 @@ pub fn connect_or_start_local_daemon(
     data_dir: &SinomoDataDir,
     progress: &impl Fn(&str),
 ) -> Result<LocalDaemonConnection, String> {
+    connect_or_start_local_daemon_with_binary(data_dir, None, progress)
+}
+
+pub fn connect_or_start_local_daemon_with_binary(
+    data_dir: &SinomoDataDir,
+    binary: Option<&std::path::Path>,
+    progress: &impl Fn(&str),
+) -> Result<LocalDaemonConnection, String> {
     let paths = DaemonPaths::new(data_dir);
     progress("Looking for a daemon…");
     match probe_daemon_status(&paths, DAEMON_PROBE_TIMEOUT) {
@@ -49,7 +57,9 @@ pub fn connect_or_start_local_daemon(
         } => compatible_attached(status),
         DaemonProbeStatus::Locked { status: None } | DaemonProbeStatus::NotRunning => {
             progress("Starting a local daemon…");
-            match start_app_owned_daemon(&paths, progress)? {
+            match crate::daemon_process::start_app_owned_daemon_with_binary(
+                &paths, progress, binary,
+            )? {
                 StartAppDaemonOutcome::Started(status, handle) => {
                     Ok(LocalDaemonConnection::Owned { status, handle })
                 }

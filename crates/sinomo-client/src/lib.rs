@@ -8,10 +8,13 @@ pub mod app_status;
 pub mod chat;
 pub mod connection;
 pub mod daemon_process;
+mod desktop_session;
+pub use desktop_session::{AppDaemonSupervisor, connect_to_supervised_daemon};
 pub mod evolution;
 pub mod modules;
 pub mod sifs;
 pub mod skills;
+pub mod updates;
 
 pub use sinomo_runtime::api;
 pub use sinomo_runtime::api::app::agent as agent_contract;
@@ -22,12 +25,15 @@ pub use sinomo_runtime::api::app::skill as skill_contract;
 pub use agents::AgentManagementClient;
 pub use app_status::{AppClusterInvite, AppClusterStatus};
 pub use chat::{ChatDaemonClient, ChatHistoryClient};
-pub use connection::{LocalDaemonConnection, connect_or_start_local_daemon};
+pub use connection::{
+    LocalDaemonConnection, connect_or_start_local_daemon, connect_or_start_local_daemon_with_binary,
+};
 pub use daemon_process::{OwnedDaemonHandle, StartAppDaemonOutcome, start_app_owned_daemon};
 pub use evolution::EvolutionClient;
 pub use modules::{ModuleObservationsResponse, read_module_observations};
 pub use sifs::*;
 pub use skills::SkillClient;
+pub use updates::AppUpdateClient;
 
 pub fn daemon_protocol_is_compatible(status: &api::DaemonStatus) -> bool {
     status.api_protocol_version == api::SINOMO_DAEMON_API_PROTOCOL_VERSION

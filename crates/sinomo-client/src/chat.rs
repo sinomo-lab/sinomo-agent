@@ -120,10 +120,18 @@ impl ChatDaemonClient {
     }
 
     pub fn open(&self) -> Result<wire::ChatSessionOpenResponse, DaemonApiError> {
+        self.attach(None)
+    }
+
+    pub fn attach(
+        &self,
+        execution_id: Option<String>,
+    ) -> Result<wire::ChatSessionOpenResponse, DaemonApiError> {
         self.call(
             wire::CHAT_SESSION_OPEN_ROUTE,
             &wire::ChatSessionOpenRequest {
                 client_id: self.client_id.clone(),
+                execution_id,
             },
         )
     }
@@ -132,10 +140,19 @@ impl ChatDaemonClient {
         &self,
         command: wire::ChatSessionCommand,
     ) -> Result<wire::ChatSessionCommandResponse, DaemonApiError> {
+        self.command_with_id(command, None)
+    }
+
+    pub fn command_with_id(
+        &self,
+        command: wire::ChatSessionCommand,
+        request_id: Option<String>,
+    ) -> Result<wire::ChatSessionCommandResponse, DaemonApiError> {
         self.call(
             wire::CHAT_SESSION_COMMAND_ROUTE,
             &wire::ChatSessionCommandRequest {
                 client_id: self.client_id.clone(),
+                request_id,
                 command,
             },
         )

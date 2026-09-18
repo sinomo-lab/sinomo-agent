@@ -10,9 +10,11 @@ pub mod metrics;
 mod mobile_runtime;
 mod native_picker;
 pub mod rendering;
+mod restoration;
 pub mod state;
 pub mod theme;
 pub mod ui;
+mod updates;
 
 use sui::{App, Window, default_sui_logo_image};
 use sui_lucide::LucideIcon;
@@ -72,8 +74,24 @@ pub fn build_application(shared: Shared) -> sui::Result<App> {
             resources.image(logo_image_handle(), logo)
         })
         .map(|app| {
+            let placement = shared.borrow().window_placement;
+            let mut window = Window::new("Sinomo");
+            if let Some([width, height]) = placement.size
+                && width.is_finite()
+                && height.is_finite()
+                && width > 0.0
+                && height > 0.0
+            {
+                window = window.initial_size(sui::Size::new(width, height));
+            }
+            if let Some([x, y]) = placement.position
+                && x.is_finite()
+                && y.is_finite()
+            {
+                window = window.initial_position(sui::Point::new(x, y));
+            }
             app.window(
-                Window::new("Sinomo")
+                window
                     .controller(crate::ui::shell::BackgroundWorkController::new(
                         shared.clone(),
                     ))
@@ -115,7 +133,8 @@ pub fn run() -> sui::Result<()> {
     install_app_observability();
     let shared = Shared::new(AppState::connecting());
     let app = build_application(shared.clone())?;
-    app.run_with_handle(move |ui| {
+    let final_shared = shared.clone();
+    let result = app.run_with_handle(move |ui| {
         // Stash a waker so background work (e.g. provider device-login) can refresh the UI.
         shared.borrow_mut().waker = Some(ui.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -143,7 +162,13 @@ pub fn run() -> sui::Result<()> {
                 ui.wake();
             })
             .expect("spawn connect thread");
-    })
+    });
+    if final_shared.is_ready()
+        && let Err(error) = crate::restoration::save(&final_shared)
+    {
+        tracing::warn!(%error, "workspace save failed");
+    }
+    result
 }
 
 /// Build and run the Android application from the NativeActivity entrypoint.

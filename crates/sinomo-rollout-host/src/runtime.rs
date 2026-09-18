@@ -2260,6 +2260,15 @@ pub fn stage_rollout_main_activation(
     rollout_paths: &SelfRolloutPaths,
     activation: RolloutMainActivation,
 ) -> Result<RolloutActivationStrategy, DaemonError> {
+    // Hold the exclusive lease until the activation marker fences subsequent work. Existing
+    // turns finish with their durable results; queued commands are recovered by their owner.
+    let _work_drain = match sinomo_rollout::drain_runtime_work(data_dir, Duration::from_secs(300)) {
+        Ok(guard) => guard,
+        Err(error) => {
+            restore_native_dylib_loader_state_for_activation(data_dir, rollout_paths, &activation)?;
+            return Err(error.into());
+        }
+    };
     if rollout_main_activation_path(rollout_paths).exists()
         || rollout_shadow_finalize_path(rollout_paths).exists()
     {

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub const CHAT_RPC_CATEGORY: &str = "chat";
 pub const CHAT_ROUTE_AUTH_SCOPE: &str = "local-command";
 pub const CHAT_SESSION_OPEN_ROUTE: &str = "/chat/session/open";
+pub const CHAT_HANDOFF_PROTOCOL_VERSION: u32 = 1;
 pub const CHAT_SESSION_COMMAND_ROUTE: &str = "/chat/session/command";
 pub const CHAT_SESSION_EVENTS_ROUTE: &str = "/chat/session/events";
 pub const CHAT_SESSION_CLOSE_ROUTE: &str = "/chat/session/close";
@@ -731,6 +732,9 @@ pub enum ChatSessionCommand {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ChatEvent {
+    Reattached {
+        replay_gap: bool,
+    },
     Ready {
         session_id: String,
         info: RuntimeInfo,
@@ -847,7 +851,8 @@ impl ChatEvent {
                 session_id: Some(session_id),
                 ..
             } => Some(session_id),
-            Self::Ready { .. }
+            Self::Reattached { .. }
+            | Self::Ready { .. }
             | Self::RuntimeInfo(_)
             | Self::ToolRuntime(_)
             | Self::Models { .. }
@@ -869,23 +874,38 @@ pub struct SequencedChatEvent {
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatSessionOpenRequest {
     pub client_id: String,
+    /// Durable execution host identity, independent of this transport subscription.
+    #[serde(default)]
+    pub execution_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatSessionOpenResponse {
     pub client_id: String,
     pub next_event_sequence: u64,
+    #[serde(default)]
+    pub attached: bool,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub runtime_ready: bool,
+    #[serde(default)]
+    pub handoff_protocol: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatSessionCommandRequest {
     pub client_id: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
     pub command: ChatSessionCommand,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct ChatSessionCommandResponse {
     pub accepted: bool,
+    #[serde(default)]
+    pub reattach_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -900,6 +920,12 @@ pub struct ChatSessionEventsRequest {
 pub struct ChatSessionEventsResponse {
     pub events: Vec<SequencedChatEvent>,
     pub next_sequence: u64,
+    #[serde(default)]
+    pub first_available_sequence: u64,
+    #[serde(default)]
+    pub generation: String,
+    #[serde(default)]
+    pub execution_available: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]

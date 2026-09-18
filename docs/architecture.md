@@ -175,10 +175,11 @@ One installation contributes one normal cluster member. The main daemon owns
 cluster participation. The shadow daemon is a supervision and recovery endpoint
 and does not vote, own DFS data, or accept normal workload placement. A desktop
 graphical app attaches to that main daemon when it already exists; otherwise it
-starts the same full product in a sibling foreground process. The app keeps an
-inherited lifetime lease and exact child handle, so only the daemon instance it
-started is stopped with the app. The GUI process never hosts the daemon control
-loop or product component catalog.
+starts the same full product in a sibling foreground process. The desktop
+launcher keeps the inherited lifetime lease and exact child handle across GUI
+restarts. It stops only its own daemon when the desktop session finally closes;
+an installed daemon remains independent. The GUI process never hosts the daemon
+control loop or product component catalog.
 
 Desktop clients use the runtime facade's client profile. Shared app commands,
 DFS browser and placement values, model settings, module projections, and app
@@ -426,14 +427,32 @@ code must not retain an `AgentChat` or an executable tool context. Realtime
 media may hand a request to the regular agent through the chat RPC, but it does
 not execute ordinary agent tools in the app process.
 
-Each app surface opens a daemon chat client identity, submits commands, and
-long-polls an exclusive event cursor. The daemon retains a bounded per-client
-event tail and routes steering, follow-up, removal, interruption, and control
+Each app surface attaches a transport client identity to a durable execution
+host, submits commands with persistent request IDs, and long-polls an exclusive
+event cursor. Closing the subscription detaches presentation without cancelling
+execution. The daemon retains a bounded per-host event tail with an explicit
+generation and retention boundary, and routes steering, follow-up, removal, interruption, and control
 snapshots through its live runtime-control registry even while the chat worker
 is blocked in a model turn. Chat-session routes are local-command-only; cluster
 members use the separately authorized agent session APIs rather than guessing
-an app client identity. Closing the surface requests release of its session
-worker; closing the app releases the daemon process lease described below.
+an app client identity. Accepted commands are journaled before acknowledgement.
+Daemon startup restores canonical session bindings and executes commands that
+were durably pending. It does not replay completed commands, workspace grants,
+or ambiguous effects from a command already running at an unexpected crash.
+Planned daemon activation drains leased chat work before publishing its restart
+marker; pending commands wait for that marker to clear on the replacement host.
+
+Desktop bundles are immutable rollout artifacts. Their manifests bind file
+digests, source revision, platform, daemon protocol, and restoration schema.
+Installation selects a desktop or headless profile; desktop packages install
+stable launcher entries beside the runtime. The app observes rollout state
+through client-safe APIs and `app.update.changed` notifications, saves a
+versioned local presentation snapshot, and requests a supervised restart.
+Only a matching launch token's readiness acknowledgement promotes the candidate.
+Failed startup retains the previous bundle and the pre-update presentation
+snapshot, so an unsuccessful UI migration cannot overwrite the recovery state.
+UI snapshots restore drafts and event cursors; canonical conversations, tool authority, and execution receipts
+remain runtime-owned. Desktop updates do not replace the mobile embedded host.
 
 The same boundary applies to the rest of the desktop surface. The shared
 `sinomo-api::app` module namespaces agent, chat, evolution, and skill

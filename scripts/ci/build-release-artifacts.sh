@@ -19,6 +19,17 @@ build_id="${build_id//\//-}"
 read -r -a targets <<< "${SINOMO_RELEASE_TARGETS:-x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu}"
 mkdir -p "${dist_dir}"
 
+release_profile="${SINOMO_RELEASE_PROFILE:-headless}"
+case "${release_profile}" in
+  headless) ;;
+  desktop)
+    # A host-native CLI manifests cross-built artifacts without executing target code.
+    cargo build --locked --release -p sinomo
+    manifest_tool="${target_dir}/release/sinomo"
+    ;;
+  *) echo "Unsupported SINOMO_RELEASE_PROFILE: ${release_profile}" >&2; exit 1 ;;
+esac
+source_revision="${CI_COMMIT_SHA:-$(git rev-parse HEAD)}"
 archives=()
 for target in "${targets[@]}"; do
   case "${target}" in
@@ -44,7 +55,12 @@ for target in "${targets[@]}"; do
   esac
 
   echo "Building sinomo for ${target}"
-  cargo build --locked --release -p sinomo --target "${target}"
+  packages=(-p sinomo)
+  if [[ "${release_profile}" == desktop ]]; then
+    packages+=(-p sinomo-app -p sinomo-app-daemon -p sinomo-ui-extension-host)
+    archive_name="${archive_name/sinomo-/sinomo-desktop-}"
+  fi
+  cargo build --locked --release "${packages[@]}" --target "${target}"
 
   binary_path="${target_dir}/${target}/release/${binary_name}"
   if [[ ! -f "${binary_path}" ]]; then
@@ -53,10 +69,23 @@ for target in "${targets[@]}"; do
   fi
   file "${binary_path}"
 
+  release_directory="$(dirname "${binary_path}")"
+  archive_files=("${binary_name}")
+  if [[ "${release_profile}" == desktop ]]; then
+    artifact_os="linux"
+    suffix=""
+    artifact_arch="${target%%-*}"
+    if [[ "${target}" == *windows* ]]; then artifact_os="windows"; suffix=".exe"; fi
+    "${manifest_tool}" rollout app package --directory "${release_directory}" \
+      --revision "${source_revision}" --target-os "${artifact_os}" --target-arch "${artifact_arch}"
+    archive_files+=("sinomo-app${suffix}" "sinomo-app-daemon${suffix}" "sinomo-ui-extension-host${suffix}" desktop-release.json)
+  fi
   if [[ "${archive_name}" == *.zip ]]; then
-    zip -j -q "${dist_dir}/${archive_name}" "${binary_path}"
+    archive_paths=()
+    for name in "${archive_files[@]}"; do archive_paths+=("${release_directory}/${name}"); done
+    zip -j -q "${dist_dir}/${archive_name}" "${archive_paths[@]}"
   else
-    tar -C "$(dirname "${binary_path}")" -czf "${dist_dir}/${archive_name}" "${binary_name}"
+    tar -C "${release_directory}" -czf "${dist_dir}/${archive_name}" "${archive_files[@]}"
   fi
   archives+=("${archive_name}")
 done

@@ -5,6 +5,8 @@ use sinomo_runtime::cli_registry::{
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InstallOptions {
+    pub(crate) desktop: sinomo_runtime::installer::DesktopInstallProfile,
+    pub(crate) app_bundle: Option<PathBuf>,
     pub(crate) host: String,
     pub(crate) port: u16,
     pub(crate) shadow_port: u16,
@@ -16,6 +18,8 @@ pub(crate) struct InstallOptions {
 impl Default for InstallOptions {
     fn default() -> Self {
         Self {
+            desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
+            app_bundle: None,
             host: INSTALL_DEFAULT_HOST.to_string(),
             port: SINOMO_DAEMON_DEFAULT_PORT,
             shadow_port: SINOMO_SHADOW_DAEMON_DEFAULT_PORT,
@@ -59,6 +63,16 @@ pub(crate) fn uninstall_cli_command_handler() -> DeclarativeCommandHandler<Unins
 
 fn install_cli_spec() -> CliCommandSpec {
     CliCommandSpec::new("install", "install or update the local Sinomo runtime").with_options([
+        CliOptionSpec::flag(
+            "--desktop",
+            "install the bundled desktop app as well as the runtime",
+        ),
+        CliOptionSpec::flag("--headless", "install only the runtime"),
+        CliOptionSpec::value(
+            "--app-bundle",
+            "verified desktop release directory",
+            CliValueSpec::new("path", "path"),
+        ),
         CliOptionSpec::value(
             "--host",
             "daemon bind host",
@@ -94,6 +108,24 @@ fn uninstall_cli_spec() -> CliCommandSpec {
 
 fn parse_install_matches(matches: &CliCommandMatches) -> Result<InstallOptions, CliParseError> {
     let mut options = InstallOptions::default();
+    if matches.contains("--desktop") && matches.contains("--headless") {
+        return Err(CliParseError::Parse {
+            detail: "choose --desktop or --headless".into(),
+        });
+    }
+    options.desktop = if matches.contains("--headless") {
+        sinomo_runtime::installer::DesktopInstallProfile::Headless
+    } else if matches.contains("--desktop") {
+        sinomo_runtime::installer::DesktopInstallProfile::Desktop
+    } else {
+        sinomo_runtime::installer::DesktopInstallProfile::Auto
+    };
+    options.app_bundle = matches.value("--app-bundle").map(PathBuf::from);
+    if matches.contains("--headless") && options.app_bundle.is_some() {
+        return Err(CliParseError::Parse {
+            detail: "--headless cannot be combined with --app-bundle".into(),
+        });
+    }
     if let Some(host) = matches.value("--host") {
         options.host = host.to_string();
     }
@@ -236,6 +268,13 @@ pub(crate) fn install_with_layout(
     options: InstallOptions,
     layout: &InstallLayout,
 ) -> Result<(), CliError> {
+    let desktop = sinomo_runtime::installer::prepare_desktop_install(
+        options.desktop,
+        options.app_bundle.as_deref(),
+    )
+    .map_err(|detail| CliError::Parse { detail })?;
+    let _work_drain =
+        sinomo_runtime::rollout::drain_runtime_work(&layout.data_dir, Duration::from_secs(300))?;
     let managed_source_head_before = installed_managed_source_head(layout);
     let plan = daemon_prepare_installed_daemon_install_plan(
         layout,
@@ -257,6 +296,14 @@ pub(crate) fn install_with_layout(
     install_current_binary(&layout.shadow_binary)?;
     install_managed_source_repo(layout)?;
     let installed_modules = install_current_modules(layout)?;
+    if let Some(source) = desktop {
+        let status = sinomo_runtime::installer::install_desktop_bundle(layout, &source)
+            .map_err(|detail| CliError::Parse { detail })?;
+        println!(
+            "desktop app installed: {:?}; launch with sinomo-app",
+            status.phase
+        );
+    }
     let managed_source_updated =
         managed_source_head_before != installed_managed_source_head(layout);
     write_boot_entries(layout, &options)?;

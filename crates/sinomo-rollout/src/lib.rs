@@ -8,6 +8,7 @@ mod cluster_kv;
 mod controller;
 mod coordinator;
 mod desired_reactor;
+pub mod desktop;
 mod error;
 mod module_load;
 mod native_install;
@@ -22,6 +23,11 @@ mod state;
 mod supervision;
 mod target;
 mod telemetry;
+mod work;
+pub use work::{
+    RuntimeDrainGuard, acquire_runtime_control, acquire_runtime_work, acquire_runtime_work_until,
+    drain_runtime_work,
+};
 
 pub type RolloutPlanId = sinomo_core::Id;
 pub type ScorecardId = sinomo_core::Id;
@@ -51,6 +57,11 @@ pub const ROLLOUT_OBJECT_RPC_ROUTES: &[&str] = &[
     ROLLOUT_BUILD_ROUTE,
     ROLLOUT_FINALIZE_SHADOW_ROUTE,
     ROLLOUT_CLEAR_STATUS_ROUTE,
+    sinomo_api::app::update::APP_UPDATE_STATUS_ROUTE,
+    sinomo_api::app::update::APP_UPDATE_STAGE_ROUTE,
+    sinomo_api::app::update::APP_UPDATE_RESTART_ROUTE,
+    sinomo_api::app::update::APP_UPDATE_READY_ROUTE,
+    sinomo_api::app::update::APP_UPDATE_UPLOAD_ROUTE,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -279,6 +290,32 @@ pub fn rollout_module_surfaces() -> sinomo_module::ModuleSurfaces {
         ))
         .with_event_kind_name(ROLLOUT_TRANSITION_COMPLETED_EVENT_KIND)
         .with_storage_owner(SINOMO_ROLLOUT_MODULE_OWNER);
+    for route in sinomo_api::app::update::APP_UPDATE_ROUTES {
+        if *route == sinomo_api::app::update::APP_UPDATE_UPLOAD_ROUTE {
+            surfaces = surfaces.with_object_rpc_route(
+                ModuleObjectRpcRoute::new(
+                    *route,
+                    ROLLOUT_RPC_CATEGORY,
+                    "rollout.app.stage",
+                    ModuleRouteAuth::Admin,
+                )
+                .require_local_permission("remote-management")
+                .with_request_body_mode(sinomo_module_api::NativeModuleBodyMode::Required),
+            );
+            continue;
+        }
+        surfaces = surfaces.with_object_rpc_route(ModuleObjectRpcRoute::new(
+            *route,
+            ROLLOUT_RPC_CATEGORY,
+            if *route == sinomo_api::app::update::APP_UPDATE_STATUS_ROUTE {
+                "rollout.app.read"
+            } else {
+                "rollout.app.update"
+            },
+            ModuleRouteAuth::LocalCommand,
+        ));
+    }
+    surfaces = surfaces.with_event_kind_name(sinomo_api::app::update::APP_UPDATE_EVENT);
     surfaces = surfaces
         .with_config_definition(
             rollout_telemetry_gate_config_definition()
@@ -306,6 +343,9 @@ pub fn rollout_module_capabilities() -> sinomo_core::ModuleCapabilities {
             rollout_capability("rollout.shadow.finalize"),
             rollout_capability("rollout.status.clear"),
             rollout_capability("rollout.transition.record"),
+            rollout_capability("rollout.app.read"),
+            rollout_capability("rollout.app.update"),
+            rollout_capability("rollout.app.stage"),
         ],
     }
 }
@@ -402,7 +442,19 @@ pub fn register_storage_paths(
     )?;
     for (relative_path, reason) in [
         ("bin", "installed runtime binaries"),
+        (
+            "rollout/runtime-admission.lock",
+            "admission fence for planned daemon replacement",
+        ),
         ("rollout/staged", "staged rollout build artifacts"),
+        (
+            "rollout/desktop",
+            "immutable desktop bundles, activation journal, and launcher ownership",
+        ),
+        (
+            "rollout/runtime-work.lock",
+            "shared runtime work leases and exclusive daemon activation drain",
+        ),
         (
             "rollout/coordinator",
             "durable rollout plans and coordinator admission lock",

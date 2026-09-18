@@ -731,6 +731,25 @@ pub(crate) use commands::*;
 pub(crate) use completion::*;
 pub use skill_service::register_hosted_skill_service;
 
+/// Desktop launcher composition: rollout owns activation, while the existing client lifecycle
+/// handle owns the exact daemon child, inherited lease, and Windows kill-on-close job.
+pub fn run_desktop_app_supervisor(
+    data_dir: &SinomoDataDir,
+    app: &Path,
+    args: &[String],
+) -> Result<i32, String> {
+    sinomo_runtime::rollout::desktop::supervise_app(data_dir, app, args, |selected_app| {
+        let helper = selected_app.with_file_name(sinomo_runtime::rollout::executable_name(
+            "sinomo-app-daemon",
+        ));
+        let managed = sinomo_runtime::rollout::desktop::DesktopReleases::new(data_dir.root())
+            .status()?
+            .active_release
+            .is_some();
+        sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), managed.then_some(helper))
+    })
+}
+
 /// Application-host integration for one node-local supervised SIFS mount.
 ///
 /// Standalone and embedded main daemons register the same application-ring
@@ -750,7 +769,7 @@ pub fn hosted_agent_chat_component_factory(
     let daemon_address = daemon_address.into();
     let factory = sinomo_runtime::module::StaticComponentFactory::new(
         sinomo_runtime::module::ComponentDescriptor::new("sinomo-agent", env!("CARGO_PKG_VERSION")),
-        move |_, scope| {
+        move |context, scope| {
             let runtime_control = sinomo_agent::AgentRuntimeControlRegistry::new();
             let control_host: Arc<dyn sinomo_agent::AgentRuntimeControlHost> =
                 Arc::new(runtime_control.clone());
@@ -758,8 +777,20 @@ pub fn hosted_agent_chat_component_factory(
                 sinomo_runtime::service::ServiceRegistry::builder(),
                 control_host,
             );
-            let services =
-                register_hosted_chat_service(services, daemon_address.clone(), runtime_control);
+            let chat_service =
+                chat_service::HostedChatService::new(daemon_address.clone(), runtime_control);
+            let services = services.register(chat_service.clone());
+            let data_dir = SinomoDataDir::new(context.data_dir_root());
+            if let Some(runtime) = context.runtime().cloned() {
+                scope.on_host_ready(move || {
+                    let service = chat_service.clone();
+                    let data_dir = data_dir.clone();
+                    let runtime = runtime.clone();
+                    if let Err(error) = service.recover(data_dir, runtime) {
+                        tracing::error!(%error, "chat execution recovery failed");
+                    }
+                });
+            }
             let services = register_hosted_skill_service(services, daemon_address.clone());
             let services =
                 register_hosted_agent_management_service(services, daemon_address.clone());

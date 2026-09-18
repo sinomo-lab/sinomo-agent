@@ -127,7 +127,9 @@ impl BackgroundWorkController {
             (false, false, false)
         };
 
-        let layout_changed = became_ready
+        let update_changed = crate::updates::pump(&self.shared);
+        let layout_changed = update_changed
+            || became_ready
             || device_changed
             || files_changed
             || evolution_changed
@@ -628,14 +630,28 @@ fn build_shell_body(shared: Shared, ready: bool) -> WidgetPod {
         .signals()
         .active_tab
         .select_named("shell content selection", |tab| tab.index());
+    let busy = shared
+        .signals()
+        .app_update
+        .select_named("app update restart surface", |v| usize::from(v.busy));
+    let tabs = SwitchView::new()
+        .selected_from(selected)
+        .with_child(chat::view(shared.clone()))
+        .with_child(cluster::view(shared.clone()))
+        .with_child(evolution::view(shared.clone()))
+        .with_child(files::view(shared.clone()))
+        .with_child(settings::view(shared.clone()));
     WidgetPod::new(
-        SwitchView::new()
-            .selected_from(selected)
-            .with_child(chat::view(shared.clone()))
-            .with_child(cluster::view(shared.clone()))
-            .with_child(evolution::view(shared.clone()))
-            .with_child(files::view(shared.clone()))
-            .with_child(settings::view(shared)),
+        Flex::vertical()
+            .with_child(crate::updates::banner(shared))
+            .align_items(Alignment::Stretch)
+            .with_item(
+                SwitchView::new()
+                    .selected_from(busy)
+                    .with_child(tabs)
+                    .with_child(Label::new("Restoring your workspace after the update…")),
+                FlexItem::flex(1.0),
+            ),
     )
 }
 
@@ -823,6 +839,13 @@ impl Widget for Shell {
         self.tabs.paint(ctx);
 
         self.health_center.paint(ctx);
+        if self.shared.is_ready() {
+            self.shared
+                .borrow()
+                .updates
+                .rendered_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     fn event(&mut self, ctx: &mut EventCtx, event: &Event) {
@@ -859,6 +882,22 @@ impl Widget for Shell {
         }
         if ctx.phase() != EventPhase::Target {
             return;
+        }
+        match event {
+            Event::Window(WindowEvent::Resized(size))
+                if size.width.is_finite()
+                    && size.height.is_finite()
+                    && size.width > 0.0
+                    && size.height > 0.0 =>
+            {
+                self.shared.borrow_mut().window_placement.size = Some([size.width, size.height]);
+            }
+            Event::Window(WindowEvent::Moved(point))
+                if point.x.is_finite() && point.y.is_finite() =>
+            {
+                self.shared.borrow_mut().window_placement.position = Some([point.x, point.y]);
+            }
+            _ => {}
         }
         if let Event::Window(WindowEvent::Occluded(occluded)) = event {
             self.window_occluded.set(*occluded);

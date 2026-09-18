@@ -18,9 +18,98 @@ Command syntax can change with the installed binary. Use
 | Update only the current machine from managed source | Local apply |
 | Update compatible nodes from an existing artifact | Prebuilt artifact rollout |
 | Refresh installation and boot integration | Install |
+| Build or update the desktop client independently | Desktop app rollout |
 
 Before rollout, commit or otherwise preserve the intended source, run the
 relevant tests, and confirm the current cluster is healthy.
+
+## Desktop App Rollout
+
+A desktop release contains `sinomo`, `sinomo-app`, `sinomo-app-daemon`,
+`sinomo-ui-extension-host`, and `desktop-release.json`. Running `sinomo install` from that release installs the
+desktop app automatically. A runtime-only release remains headless. The explicit
+forms are:
+
+```sh
+sinomo install --desktop --app-bundle /path/to/desktop-release
+sinomo install --headless
+sinomo-app
+# Equivalent supervised launch through the CLI:
+sinomo rollout app launch
+```
+
+Build the local desktop platform through the existing cluster build service:
+
+```sh
+sinomo rollout app build --repo /path/to/prepared-source --directory /path/to/desktop-release
+sinomo rollout app stage --directory /path/to/desktop-release
+sinomo rollout app status
+```
+
+To build for another node's desktop platform and offer the update there:
+
+```sh
+sinomo rollout app build --repo /path/to/prepared-source --target NODE_ID --directory /path/to/desktop-release
+sinomo rollout app stage --directory /path/to/desktop-release --target NODE_ID
+```
+
+Staging accepts repeated explicit `--target` values for compatible nodes. It uses
+Sinomo's authenticated routed streams, checks each file's length and digest, and
+publishes the offer only after the complete bundle is durable. Interrupted
+transfers can be retried with the same bundle. Publication receipts prevent an
+old retry from replacing a newer offer. Remote staging requires the target's
+existing node-local remote-management consent; it never grants that consent or
+authorizes an automatic GUI restart.
+
+Build uses committed prepared source, compatible builder discovery, immutable
+build keys, and verified artifact downloads. It does not activate either the
+daemon or the app. Without `--target`, staging affects only the local installation: it verifies and copies
+the complete bundle into the data directory, then notifies the running app.
+Daemon/cluster rollout commands keep their existing target scope. App staging
+does not remotely launch a GUI or restart other nodes.
+
+For binaries already produced by a reviewed build, create the manifest with:
+
+```sh
+sinomo rollout app package --directory /path/to/desktop-release --revision FULL_COMMIT
+```
+
+Cross-build packaging additionally accepts `--target-os` and `--target-arch`.
+CI's `scripts/ci/build-release-artifacts.sh` retains its headless default; set
+`SINOMO_RELEASE_PROFILE=desktop` to include the GUI, helper, and manifest in
+separately named desktop archives. Desktop targets require the corresponding GUI
+and native-device development libraries as well as the Rust/linker toolchain.
+The Linux x86-64 desktop CI job installs those libraries and builds this profile
+using the committed SUI revision from `rollout-source.json`.
+
+The app offers **Restart and restore**, **When idle**, and **Later**. Its launcher
+keeps an app-owned daemon alive across GUI replacement. Chat work continues in
+the daemon; the new GUI restores the selected chat, drafts, attachments, visible
+tool progress, event cursor, and window size and position where supported by the
+window manager. An active voice/video call or file picker must finish before
+restarting because media devices are app-local.
+
+Candidates must use the supported daemon protocol and workspace schema. The
+launcher verifies immutable bytes before execution and waits up to 90 seconds
+for a readiness acknowledgement after connection, restoration, and an initial
+rendering health window. Failed startup
+or an interrupted activation returns to the previous release. Staging and
+readiness are distinct states; inspect `rollout app status` for the active and
+previous release identities and any rollback detail.
+
+Planned daemon replacement waits up to five minutes for leased chat work to reach
+a safe boundary. If work cannot drain, activation is deferred with an error;
+retry the existing rollout after that work completes. Accepted pending commands
+are recovered automatically by the replacement daemon. Unexpected process loss
+can leave a started external effect ambiguous: its request ID is retained and the
+runtime requires reconciliation instead of executing it again. An app update
+alone does not interrupt the daemon or require this recovery path.
+
+Desktop artifacts and activation records live under
+`$SINOMO_DATA_DIR/rollout/desktop/`; the presentation snapshot is
+`$SINOMO_DATA_DIR/configs/app/workspace.json`. Durable chat command receipts live
+under the agent-owned `events/agent/chat-hosts/` subtree. These files are owned by
+their services and must not be manually edited to force an activation.
 
 ## Prepare Committed Dependencies
 

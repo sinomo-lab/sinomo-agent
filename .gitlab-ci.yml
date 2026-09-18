@@ -55,3 +55,29 @@ build:cross-platform-cli:
     paths:
       - dist/
     expire_in: 3 days
+
+build:desktop-linux-x86_64:
+  stage: build
+  timeout: 2h
+  variables:
+    SINOMO_RELEASE_PROFILE: desktop
+    SINOMO_RELEASE_TARGETS: x86_64-unknown-linux-gnu
+  before_script:
+    - >-
+      apt-get update
+      && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+      ca-certificates file git zip build-essential pkg-config cmake clang python3
+      libssl-dev libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      libx11-dev libxrandr-dev libxi-dev libxext-dev libxcursor-dev libxinerama-dev
+      libvulkan-dev libv4l-dev
+    - bash ./scripts/ci/test-checkout-sui.sh
+    - >-
+      export SUI_REF="$(python3 -c 'import json; print(next(d["revision"] for d in json.load(open("rollout-source.json"))["dependencies"] if d["name"] == "sui"))')"
+    - ./scripts/ci/checkout-sui.sh
+  script:
+    - ./scripts/ci/build-release-artifacts.sh
+  artifacts:
+    name: "sinomo-desktop-$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/
+    expire_in: 3 days

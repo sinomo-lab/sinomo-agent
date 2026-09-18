@@ -15,6 +15,7 @@ use sinomo_runtime::api::{
 const CHILD_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const CHILD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const CHILD_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BOOTSTRAP_LAUNCH_SUFFIX: &str = ":bootstrap";
 static LAUNCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub enum StartAppDaemonOutcome {
@@ -34,6 +35,12 @@ pub struct OwnedDaemonHandle {
 }
 
 impl OwnedDaemonHandle {
+    pub fn has_exited(&self) -> Result<bool, String> {
+        self.child()
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(|error| format!("inspect app-owned daemon child: {error}"))
+    }
     pub fn pid(&self) -> u32 {
         self.child().id()
     }
@@ -106,14 +113,33 @@ pub fn start_app_owned_daemon(
     paths: &DaemonPaths,
     progress: &impl Fn(&str),
 ) -> Result<StartAppDaemonOutcome, String> {
+    start_app_owned_daemon_with_binary(paths, progress, None)
+}
+
+pub(crate) fn start_app_owned_daemon_with_binary(
+    paths: &DaemonPaths,
+    progress: &impl Fn(&str),
+    binary: Option<&Path>,
+) -> Result<StartAppDaemonOutcome, String> {
     let data_dir = paths.root.parent().ok_or_else(|| {
         format!(
             "app-owned daemon path {} has no data directory parent",
             paths.root.display()
         )
     })?;
-    let binary = app_daemon_binary()?;
-    let launch_id = next_launch_id();
+    let binary = match binary {
+        Some(path) => validate_app_daemon_binary(path.to_path_buf(), "desktop release")?,
+        None => app_daemon_binary()?,
+    };
+    let mut launch_id = next_launch_id();
+    // This is readiness evidence, not authority: the daemon still owns typed initialization.
+    // It prevents a GUI from attaching to a bootstrap process while init is draining it.
+    let cluster_paths = sinomo_runtime::network::ClusterPaths::new(
+        &sinomo_runtime::local::SinomoDataDir::new(data_dir),
+    );
+    if !cluster_paths.state.exists() {
+        launch_id.push_str(BOOTSTRAP_LAUNCH_SUFFIX);
+    }
     let (stdout, stderr) = app_daemon_log_files(data_dir)?;
     let options = DaemonRunOptions::main_from_environment()?;
     let mut command = Command::new(&binary);

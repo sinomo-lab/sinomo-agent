@@ -15,6 +15,27 @@ const LEASE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() -> ExitCode {
     install_build_info();
+    if std::env::args().nth(1).as_deref() == Some("--app-supervisor") {
+        let result = (|| {
+            let mut args = std::env::args().skip(2);
+            let app = args
+                .next()
+                .ok_or("--app-supervisor requires the app executable")?;
+            let data_dir = SinomoDataDir::from_env_or_home().map_err(|e| e.to_string())?;
+            sinomo_cli::run_desktop_app_supervisor(
+                &data_dir,
+                std::path::Path::new(&app),
+                &args.collect::<Vec<_>>(),
+            )
+        })();
+        return match result {
+            Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
+            Err(error) => {
+                eprintln!("sinomo-app supervisor: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let options = match parse_options(std::env::args().skip(1)) {
         Ok(options) => options,
         Err(error) => {

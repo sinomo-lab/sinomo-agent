@@ -11,6 +11,47 @@ use sinomo_runtime::local::SinomoDataDir;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
+#[cfg(unix)]
+#[test]
+fn desktop_supervisor_initializes_and_restarts_only_its_owned_runtime() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = sinomo_testdir::TestDir::new("desktop-supervisor-runtime");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    data_dir.ensure_root_layout().unwrap();
+    let wrapper = root.join("ephemeral-helper");
+    let port = available_loopback_port();
+    let executable = env!("CARGO_BIN_EXE_sinomo-app-daemon").replace('\'', "'\\''");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\nexec '{executable}' \"$@\" --host 127.0.0.1 --port {port}\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let supervisor =
+        sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), Some(wrapper)).unwrap();
+    let status = sinomo_client::connect_to_supervised_daemon(&data_dir, &|_| {}).unwrap();
+    assert!(
+        status.cluster.is_some(),
+        "the bootstrap helper must be replaced before frontend readiness"
+    );
+    assert!(status.app_launch_id.is_some());
+    let paths = DaemonPaths::new(&data_dir);
+    let original_pid = status.pid;
+    let borrowed = sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), None).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    drop(borrowed);
+    let same = sinomo_client::connect_to_supervised_daemon(&data_dir, &|_| {}).unwrap();
+    assert_eq!(
+        same.pid, original_pid,
+        "dropping an attaching GUI must not stop another owner's daemon"
+    );
+    drop(supervisor);
+    assert!(matches!(
+        probe_daemon_status(&paths, PROBE_TIMEOUT),
+        DaemonProbeStatus::NotRunning
+    ));
+}
+
 #[test]
 fn automatic_port_fallback_is_discovered_through_shared_status() {
     let occupied = TcpListener::bind(("127.0.0.1", SINOMO_DAEMON_DEFAULT_PORT)).ok();
@@ -42,6 +83,19 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
     data_dir.ensure_root_layout().expect("data layout");
     let port = available_loopback_port();
     let launch_id = format!("lifecycle-test-{}-{port}", std::process::id());
+    // DFS and history belong to the initialized product, not its bootstrap host.
+    let bootstrap_id = format!("bootstrap-{launch_id}");
+    let mut bootstrap = spawn_helper(&data_dir, port, &bootstrap_id);
+    let bootstrap_status =
+        wait_for_owned_status(&mut bootstrap, &DaemonPaths::new(&data_dir), &bootstrap_id);
+    DaemonApiClient::at_address(bootstrap_status.address)
+        .cluster_init(ClusterControlInitRequest {
+            cluster_name: "Lifecycle test".into(),
+            node_display_name: Some("Lifecycle test".into()),
+            node_role: None,
+        })
+        .expect("initialize lifecycle test cluster");
+    assert!(wait_for_exit(&mut bootstrap, Duration::from_secs(15)).success());
     let mut child = spawn_helper(&data_dir, port, &launch_id);
 
     let paths = DaemonPaths::new(&data_dir);
@@ -134,10 +188,8 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
     let _skills = sinomo_client::SkillClient::at_address(status.address.clone())
         .list(true)
         .expect("read skill catalog through daemon contract");
-    let evolution = sinomo_client::EvolutionClient::at_address(status.address.clone())
-        .dashboard()
-        .expect("read evolution dashboard through daemon contract");
-    assert!(evolution.jobs.is_empty());
+    // Evolution is a separately deployed native module. This base-product lifecycle fixture
+    // intentionally has no external module artifacts; those routes have their own integration tests.
 
     drop(child.stdin.take());
     let exit = wait_for_exit(&mut child, Duration::from_secs(15));

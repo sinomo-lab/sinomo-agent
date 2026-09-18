@@ -106,6 +106,114 @@ pub struct InstallLayout {
     pub shadow_boot_entry: PathBuf,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DesktopInstallProfile {
+    /// Desktop release archives include a manifest beside the invoking CLI.
+    #[default]
+    Auto,
+    Desktop,
+    Headless,
+}
+
+/// Resolve and verify the entire optional desktop package before stopping any installed host.
+pub fn prepare_desktop_install(
+    profile: DesktopInstallProfile,
+    bundle: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    if profile == DesktopInstallProfile::Headless {
+        if bundle.is_some() {
+            return Err("--headless cannot be combined with --app-bundle".into());
+        }
+        return Ok(None);
+    }
+    let source = match bundle {
+        Some(path) => path.to_path_buf(),
+        None => std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .parent()
+            .ok_or("installer has no parent directory")?
+            .to_path_buf(),
+    };
+    if !source
+        .join(sinomo_api::app::update::APP_BUNDLE_MANIFEST)
+        .is_file()
+    {
+        if profile == DesktopInstallProfile::Auto && bundle.is_none() {
+            return Ok(None);
+        }
+        return Err("desktop installation requires a complete desktop release; supply --app-bundle DIRECTORY".into());
+    }
+    let manifest = sinomo_rollout::desktop::read_manifest(&source)?;
+    sinomo_rollout::desktop::verify_bundle(&source, &manifest)?;
+    Ok(Some(source))
+}
+
+pub fn install_desktop_bundle(
+    layout: &InstallLayout,
+    source: &Path,
+) -> Result<sinomo_api::app::update::AppUpdateStatus, String> {
+    let releases = sinomo_rollout::desktop::DesktopReleases::new(&layout.data_dir);
+    let status = releases.install_initial(source)?;
+    // Stable launch entries are bootstrap hosts. Running images (notably Windows executables)
+    // are never overwritten; subsequent releases execute out of immutable version directories.
+    for stem in sinomo_rollout::desktop::DESKTOP_BINARY_STEMS {
+        let name = sinomo_rollout::executable_name(stem);
+        let destination = layout.bin_dir.join(&name);
+        if !destination.exists() {
+            sinomo_rollout::install_binary_atomically(&source.join(name), &destination)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(status)
+}
+
+#[cfg(test)]
+mod desktop_install_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_install_packages_both_binaries_and_later_install_offers_an_update() {
+        let root = sinomo_testdir::TestDir::new("desktop-install");
+        let layout = InstallLayout::new(&SinomoDataDir::new(root.join("data")), root.join("boot"));
+        let source = root.join("source");
+        fs::create_dir_all(&source).unwrap();
+        let files: Vec<_> = sinomo_rollout::desktop::DESKTOP_BINARY_STEMS
+            .into_iter()
+            .map(sinomo_rollout::executable_name)
+            .collect();
+        for name in &files {
+            fs::write(source.join(name), b"original").unwrap();
+        }
+        sinomo_rollout::desktop::write_bundle_manifest(&source, "original".into(), &files).unwrap();
+        assert_eq!(
+            prepare_desktop_install(DesktopInstallProfile::Desktop, Some(&source)).unwrap(),
+            Some(source.clone())
+        );
+        let first = install_desktop_bundle(&layout, &source).unwrap();
+        assert!(first.active_release.is_some());
+        for name in &files {
+            assert_eq!(fs::read(layout.bin_dir.join(name)).unwrap(), b"original");
+        }
+        for name in &files {
+            fs::write(source.join(name), b"replacement").unwrap();
+        }
+        sinomo_rollout::desktop::write_bundle_manifest(&source, "replacement".into(), &files)
+            .unwrap();
+        let offered = install_desktop_bundle(&layout, &source).unwrap();
+        assert_eq!(offered.active_release, first.active_release);
+        assert_eq!(
+            offered.phase,
+            sinomo_api::app::update::AppUpdatePhase::Ready
+        );
+        assert!(offered.candidate_release.is_some());
+        assert!(prepare_desktop_install(DesktopInstallProfile::Headless, Some(&source)).is_err());
+        assert_eq!(
+            prepare_desktop_install(DesktopInstallProfile::Headless, None).unwrap(),
+            None
+        );
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstalledDaemonStartSpec {
     pub binary: PathBuf,

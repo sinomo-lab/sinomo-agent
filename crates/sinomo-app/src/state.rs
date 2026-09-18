@@ -31,7 +31,7 @@ use crate::ui::settings::{
 };
 
 /// The top-level destinations shown in the title bar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Tab {
     /// AI chat with the Sinomo agent.
     Sinomo,
@@ -303,6 +303,8 @@ impl ReadyState {
 
 /// Root application state. Sub-tab state is held in dedicated modules.
 pub struct AppState {
+    pub(crate) window_placement: crate::restoration::WindowPlacement,
+    pub(crate) updates: crate::updates::AppUpdates,
     pub active_tab: Tab,
     pub theme_mode: AppThemeMode,
     pub text_scale: AppTextScale,
@@ -336,6 +338,12 @@ impl AppState {
         let text_scale = app_config::load_text_scale(&data_dir);
         let render_mode = app_config::load_render_mode(&data_dir);
         Self {
+            updates: crate::updates::AppUpdates::default(),
+            window_placement: crate::restoration::load(&data_dir)
+                .ok()
+                .flatten()
+                .map(|s| s.window)
+                .unwrap_or_default(),
             active_tab: Tab::Sinomo,
             theme_mode,
             text_scale,
@@ -360,6 +368,8 @@ impl AppState {
         let render_mode = app_config::load_render_mode(&data_dir);
         let connection_health = ConnectionHealth::from_backend(&backend);
         Self {
+            updates: crate::updates::AppUpdates::default(),
+            window_placement: crate::restoration::WindowPlacement::default(),
             active_tab: Tab::Sinomo,
             theme_mode,
             text_scale,
@@ -403,6 +413,7 @@ pub struct Shared {
 /// boundaries.
 #[derive(Clone)]
 pub struct AppSignals {
+    pub(crate) app_update: Signal<crate::updates::UpdateView>,
     pub active_tab: Signal<Tab>,
     pub ready: Signal<bool>,
     pub status_text: Signal<String>,
@@ -421,6 +432,7 @@ pub struct AppSignals {
 impl AppSignals {
     fn from_state(state: &AppState) -> Self {
         Self {
+            app_update: Signal::named("app update", state.updates.view.clone()),
             active_tab: Signal::named("app active tab", state.active_tab),
             ready: Signal::named("app ready", state.is_ready()),
             status_text: Signal::named("app status text", status_text_for(state)),
@@ -922,6 +934,9 @@ impl Shared {
     }
 
     fn publish_shell_signals(&self) {
+        self.signals
+            .app_update
+            .set(self.state.borrow().updates.view.clone());
         let (active_tab, ready, status_text, connection, theme) = {
             let state = self.state.borrow();
             (
@@ -994,6 +1009,9 @@ impl Shared {
                     state.theme_mode = theme_mode;
                     state.text_scale = text_scale;
                     state.render_mode = render_mode;
+                    if let Ok(Some(snapshot)) = crate::restoration::load(&data_dir) {
+                        state.active_tab = snapshot.active_tab;
+                    }
                     state.data_dir = data_dir;
                     state.status = ready.backend.mode_label();
                     state.status_since = None;

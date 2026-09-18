@@ -143,8 +143,8 @@ cargo run -p sinomo-app
 ```
 
 The app and CLI use the same selected data directory and daemon state. If no
-daemon is running, the desktop app starts the sibling `sinomo-app-daemon`
-process and bounds its lifetime to the app. An already-running daemon is merely
+daemon is running, the desktop launcher starts the sibling `sinomo-app-daemon`
+process and holds its lifetime lease across app updates. An already-running daemon is merely
 attached and is not stopped when the window closes.
 Custom module previews additionally use the sibling
 `sinomo-ui-extension-host`; it is started only for a selected custom surface

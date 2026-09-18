@@ -12,6 +12,8 @@ include = ["**/*.rs", "Cargo.toml"]
 ring = "r1"
 
 [dependencies]
+sinomo-api.workspace = true
+sinomo-module-api.workspace = true
 blake3.workspace = true
 base64.workspace = true
 fs2.workspace = true

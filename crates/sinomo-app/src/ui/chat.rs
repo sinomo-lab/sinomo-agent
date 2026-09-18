@@ -33,6 +33,8 @@
 //! a small signature of the state it renders; the provider/model/effort
 //! `Select`s live in the model popup above the field.
 
+mod restoration;
+pub(crate) use restoration::ChatWorkspaceSnapshot;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path as FsPath, PathBuf};
@@ -201,7 +203,7 @@ type ThemeReader = Rc<dyn Fn() -> DefaultTheme>;
 // ---------------------------------------------------------------------------
 
 /// One message in the visible transcript.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     pub text: String,
@@ -213,14 +215,14 @@ pub struct ChatMessage {
     sequence: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessageSource {
     User,
     Model,
     System,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ChatMessageKind {
     Message,
     Info,
@@ -506,7 +508,7 @@ impl RuntimeRecoveryTarget {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct ChatControlOverview {
     pub active_turn: bool,
     pub task_count: usize,
@@ -1220,7 +1222,7 @@ impl Default for ChatMediaCallState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ChatToolActivity {
     pub step_index: usize,
     pub call_index: Option<usize>,
@@ -1237,7 +1239,7 @@ pub struct ChatToolActivity {
     pub stderr: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ChatWorkTraceEntry {
     Reasoning {
         step_index: usize,
@@ -1269,7 +1271,7 @@ struct RuntimeHealth {
 }
 
 /// A previously-created chat or channel reference (sidebar list).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionRef {
     pub id: String,
     pub title: String,
@@ -1279,7 +1281,7 @@ pub struct SessionRef {
     pub participant_names: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ConversationKind {
     Chat,
     Channel,
@@ -1348,7 +1350,7 @@ enum ChannelAgentsStoreStatus {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct PendingChatAttachment {
     source: ChatAttachmentSource,
     file_name: String,
@@ -1450,7 +1452,7 @@ enum ComposerPopup {
 }
 
 /// How a mid-run composer submit rides into the active turn (Mesh: "steer, don't just stop").
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum QueuedTurnKind {
     /// Consumed by the next model step of the running turn.
     Steer,
@@ -1479,7 +1481,7 @@ impl From<ChatQueuedTurnInputKind> for QueuedTurnKind {
 /// A message queued into the active turn and not yet consumed by the runtime.
 /// Rendered as pending chips above the input; the transcript echo is the
 /// durable record, the chip is the "I already told it" status.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct QueuedTurnInput {
     kind: QueuedTurnKind,
     text: String,
@@ -1498,7 +1500,7 @@ impl From<&ChatQueuedTurnInput> for QueuedTurnInput {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 struct ConversationTimelineState {
     total_messages: u64,
     chunk_size: u64,
@@ -1624,7 +1626,7 @@ impl ConversationTimelineState {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 struct ConversationTimelineSegment {
     start_sequence: u64,
     end_sequence: u64,
@@ -1680,6 +1682,7 @@ pub struct ChatState {
     daemon_event_abort: Option<tokio::task::AbortHandle>,
     ui_waker: Option<sui::UiHandle>,
     pub handle: ChatHandle,
+    pub(crate) restoration_error: Option<String>,
     pub session_id: String,
     pub info: RuntimeInfo,
     pub tool_runtime: ChatToolRuntimeSelection,
@@ -2380,7 +2383,17 @@ impl ChatState {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
-        let handle = ChatHandle::spawn(daemon_address.clone(), event_wake);
+        let restored = crate::restoration::load(&backend.data_dir);
+        let restoration_error = restored.as_ref().err().cloned();
+        let restored = restored.ok().flatten();
+        let handle = ChatHandle::spawn_restored(
+            daemon_address.clone(),
+            event_wake,
+            restored
+                .as_ref()
+                .map(|s| s.chat.connection.clone())
+                .unwrap_or_default(),
+        );
 
         // The interactive app must not read the SIFS-backed agent catalog here: this
         // constructor runs on the connect thread while the window shows the launch
@@ -2433,6 +2446,7 @@ impl ChatState {
             daemon_event_abort,
             ui_waker: waker,
             handle,
+            restoration_error,
             session_id: String::new(),
             info: RuntimeInfo::default(),
             tool_runtime: ChatToolRuntimeSelection::default(),
@@ -2524,6 +2538,12 @@ impl ChatState {
             channel_agent_idx: 0,
             compact_drawer_open: false,
         };
+        if let Some(snapshot) = restored {
+            state.restore_workspace(snapshot.chat);
+        }
+        if let Some(error) = &state.restoration_error {
+            state.notice = Some(format!("Workspace restoration failed: {error}"));
+        }
         if let Some(detail) = session_list_error {
             state.notice = Some(format!("chat list failed: {detail}"));
             state.replace_activity("chat list", detail, ActivityTone::Warn);
@@ -2556,22 +2576,15 @@ impl ChatState {
             return false;
         }
 
-        let history = self.current_history();
-        let session_id = self.session_id.clone();
-        let agent = self.info.agent.clone();
-        let provider = self.info.provider.clone();
-        let model = self.info.model.clone();
-        let account = self
-            .info
-            .account
-            .clone()
-            .unwrap_or_else(|| "default".to_string());
-        let tool_runtime = self.tool_runtime.clone();
         let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
             let waker = waker.clone();
             Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
         });
-        let handle = ChatHandle::spawn(daemon_address.clone(), event_wake);
+        let handle = ChatHandle::spawn_restored(
+            daemon_address.clone(),
+            event_wake,
+            self.handle.connection_snapshot(),
+        );
 
         if let Some(abort) = self.daemon_event_abort.take() {
             abort.abort();
@@ -2643,30 +2656,8 @@ impl ChatState {
                 || !text_mentions_connection_problem(&entry.detail)
         });
 
-        if !session_id.trim().is_empty() {
-            if agent.trim().is_empty() {
-                self.handle.send_command(ChatCommand::Resume {
-                    session_id: session_id.clone(),
-                    history: history.clone(),
-                });
-            } else {
-                self.handle.send_command(ChatCommand::SetAgent {
-                    session_id: session_id.clone(),
-                    key: agent,
-                    history: history.clone(),
-                });
-            }
-        }
-        if !provider.trim().is_empty() && !model.trim().is_empty() {
-            self.handle.send_command(ChatCommand::SetModel {
-                provider,
-                model,
-                account,
-            });
-        }
-        self.handle.send_command(ChatCommand::SetToolRuntimeNode {
-            sandbox_node_id: tool_runtime.sandbox_node_id,
-        });
+        // The execution host restores canonical session/model bindings. A transport rebind
+        // only attaches and replays; stale UI state must not reapply agent or workspace edits.
         self.replace_activity(
             "connection",
             "Daemon connection restored; chat runtime rebound to the live endpoint",
@@ -2873,6 +2864,29 @@ impl ChatState {
             self.start_session_list_load(self.ui_waker.clone());
         }
         changed
+    }
+
+    pub(crate) fn reconnect_after_update_failure(&mut self) {
+        let event_wake: Option<ChatEventWake> = self.ui_waker.as_ref().map(|waker| {
+            let waker = waker.clone();
+            Arc::new(move || waker.broadcast_application(CHAT_WORK_READY, ())) as ChatEventWake
+        });
+        self.handle = ChatHandle::spawn_restored(
+            self.daemon_address.clone(),
+            event_wake,
+            self.handle.connection_snapshot(),
+        );
+    }
+
+    pub(crate) fn restoration_complete(&self) -> bool {
+        self.transcript_load_rx.is_none() && self.restoration_error.is_none()
+    }
+
+    pub(crate) fn can_checkpoint_workspace(&self) -> bool {
+        self.restoration_complete()
+            && self.pending_workspace_picker.is_none()
+            && self.pending_attachment_picker.is_none()
+            && self.pending_attachment_validations.is_empty()
     }
 
     pub fn pump_worker_events(&mut self) -> bool {
@@ -5545,6 +5559,25 @@ impl ChatState {
             }
         }
         match event {
+            ChatEvent::Reattached { replay_gap } => {
+                if replay_gap && !self.session_id.is_empty() {
+                    self.streaming = false;
+                    self.control = ChatControlOverview::default();
+                    if let Some(session) = self
+                        .sessions
+                        .iter()
+                        .find(|s| s.id == self.session_id)
+                        .cloned()
+                    {
+                        self.start_transcript_load(session, TranscriptLoadMode::ReconcileLatest);
+                    }
+                }
+                if !self.session_id.is_empty() {
+                    self.handle.send_command(ChatCommand::ControlState {
+                        session_id: self.session_id.clone(),
+                    });
+                }
+            }
             ChatEvent::Ready { session_id, info } => {
                 self.info = info;
                 self.sync_selection_from_info();

@@ -273,6 +273,11 @@ pub struct ComponentEventClient {
 }
 
 impl ComponentEventClient {
+    /// Host-bound provenance for constructing local envelopes without inventing a node identity.
+    pub fn origin_node_id(&self) -> Option<&Id> {
+        self.bus.origin_node_id.as_ref()
+    }
+
     pub(crate) fn new(caller: ComponentDescriptor, bus: ComponentEventBus) -> Self {
         Self { caller, bus }
     }

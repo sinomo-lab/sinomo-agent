@@ -1,5 +1,6 @@
 use super::*;
 mod build_log;
+mod desktop;
 mod recovery;
 use sinomo_runtime::build::{
     BuildArtifactKind, BuildArtifactRequest, BuildArtifactResponse, BuildArtifactSetManifest,
@@ -38,6 +39,7 @@ pub(crate) enum RolloutCliCommand {
     Diagnostics(RolloutOptions),
     ClearStatus(RolloutOptions),
     Status,
+    Desktop(desktop::DesktopOptions),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -319,6 +321,7 @@ fn rollout_cli_spec() -> CliCommandSpec {
     CliCommandSpec::new("rollout", "manage source, binary, and module rollout")
         .help_on_empty()
         .with_children([
+            desktop::spec(),
             CliCommandSpec::new("init-source", "initialize the managed source repository")
                 .with_options(source_options()),
             CliCommandSpec::new(
@@ -521,6 +524,7 @@ fn parse_rollout_matches(matches: &CliCommandMatches) -> Result<RolloutCliComman
         .map(String::as_str)
         .collect::<Vec<_>>();
     match path.as_slice() {
+        ["rollout", "app", _] => Ok(RolloutCliCommand::Desktop(desktop::parse(matches)?)),
         ["rollout", "prepare-source"] => {
             Ok(RolloutCliCommand::PrepareSource {
                 repo: PathBuf::from(matches.value("--repo").ok_or_else(|| {
@@ -846,6 +850,7 @@ pub(crate) fn run_rollout_cli_command(command: RolloutCliCommand) -> Result<(), 
         RolloutCliCommand::ApplyExternal(options) => rollout_apply_external(options),
         RolloutCliCommand::Apply(options) => rollout_apply(options),
         RolloutCliCommand::Cluster(options) => rollout_cluster(options),
+        RolloutCliCommand::Desktop(options) => desktop::run(options),
         RolloutCliCommand::Verify(options) => recovery::verify(options),
         RolloutCliCommand::Resume(options) => recovery::resume(options),
         RolloutCliCommand::Cancel(options) => recovery::cancel(options),
@@ -1780,12 +1785,14 @@ struct ClusterBuilderPlan {
 #[derive(Clone, Debug)]
 enum ClusterBuildOutputSelection {
     FullRollout,
+    Desktop,
     NativeDylibModule(String),
 }
 
 #[derive(Clone, Debug, Default)]
 struct DownloadedClusterBuildArtifacts {
     binary: Option<PathBuf>,
+    desktop_binaries: BTreeMap<String, PathBuf>,
     native_dylib_modules: Vec<LocalRolloutNativeDylibModuleArtifact>,
 }
 
@@ -2090,9 +2097,21 @@ fn cluster_build_outputs_for_target(
     target: &BuildTarget,
     selection: &ClusterBuildOutputSelection,
 ) -> Result<Vec<BuildOutputRequest>, CliError> {
+    if matches!(selection, ClusterBuildOutputSelection::Desktop) {
+        return Ok([
+            "sinomo",
+            "sinomo-app",
+            "sinomo-app-daemon",
+            "sinomo-ui-extension-host",
+        ]
+        .into_iter()
+        .map(|name| BuildOutputRequest::binary(name, name))
+        .collect());
+    }
     let (module_selection, include_binary) = match selection {
         ClusterBuildOutputSelection::FullRollout => (NativeModuleSelection::Default, true),
         ClusterBuildOutputSelection::NativeDylibModule(_) => (NativeModuleSelection::All, false),
+        ClusterBuildOutputSelection::Desktop => unreachable!("desktop outputs handled above"),
     };
     let mut modules =
         discover_native_dylib_outputs(Path::new("cargo"), source_repo, target, module_selection)
@@ -2193,6 +2212,7 @@ fn discover_cluster_builder_plans(
     selection: &ClusterBuildOutputSelection,
 ) -> Result<Vec<ClusterBuilderPlan>, CliError> {
     let artifact_kinds = match selection {
+        ClusterBuildOutputSelection::Desktop => vec![BuildArtifactKind::Binary],
         ClusterBuildOutputSelection::FullRollout => vec![
             BuildArtifactKind::Binary,
             BuildArtifactKind::NativeDylibModule,
@@ -2456,7 +2476,22 @@ fn download_cluster_build_artifacts(
         }
         match artifact.kind {
             BuildArtifactKind::Binary => {
-                if downloaded.binary.replace(destination).is_some() {
+                let duplicate = if artifact.name == "sinomo" {
+                    downloaded.binary.replace(destination).is_some()
+                } else if matches!(
+                    artifact.name.as_str(),
+                    "sinomo-app" | "sinomo-app-daemon" | "sinomo-ui-extension-host"
+                ) {
+                    downloaded
+                        .desktop_binaries
+                        .insert(artifact.name.clone(), destination)
+                        .is_some()
+                } else {
+                    return Err(CliError::Parse {
+                        detail: format!("unexpected binary output {}", artifact.name),
+                    });
+                };
+                if duplicate {
                     return Err(CliError::Parse {
                         detail: "build returned more than one binary artifact".to_string(),
                     });
@@ -2545,7 +2580,9 @@ fn validate_cluster_build_artifact_set(
         .iter()
         .filter(|output| output.kind == BuildArtifactKind::Binary)
         .count();
-    if usize::from(downloaded.binary.is_some()) != expected_binary_count {
+    if usize::from(downloaded.binary.is_some()) + downloaded.desktop_binaries.len()
+        != expected_binary_count
+    {
         return Err(CliError::Parse {
             detail: format!(
                 "downloaded build contained {} binary artifact(s), expected {expected_binary_count}",

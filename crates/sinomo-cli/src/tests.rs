@@ -6535,6 +6535,8 @@ fn install_parser_accepts_custom_daemon_ports() {
         ])
         .expect("install options"),
         InstallOptions {
+            desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
+            app_bundle: None,
             host: "127.0.0.1".to_string(),
             port: 21400,
             shadow_port: 21401,
@@ -7181,6 +7183,8 @@ fn install_writes_boot_entries_and_uninstall_retains_data_dir() {
 
     install_with_layout(
         InstallOptions {
+            desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
+            app_bundle: None,
             host: "127.0.0.1".to_string(),
             port: 21400,
             shadow_port: 21401,
@@ -7363,6 +7367,8 @@ fn install_reports_unregistered_storage_without_blocking_startup() {
 
     install_with_layout(
         InstallOptions {
+            desktop: sinomo_runtime::installer::DesktopInstallProfile::Auto,
+            app_bundle: None,
             host: "127.0.0.1".to_string(),
             port: 21410,
             shadow_port: 21411,

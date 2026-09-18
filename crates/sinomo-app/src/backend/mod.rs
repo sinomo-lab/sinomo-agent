@@ -886,6 +886,10 @@ fn connect_local_daemon(
     _agent_runtime_control: AppAgentRuntimeControl,
     _node_resources: sinomo_runtime::device::NodeResourceMonitor,
 ) -> Result<(DaemonStatus, Option<OwnedDaemonHandle>), String> {
+    if std::env::var_os(sinomo_client::api::app::update::APP_SUPERVISED_ENV).is_some() {
+        return sinomo_client::connect_to_supervised_daemon(data_dir, progress)
+            .map(|status| (status, None));
+    }
     sinomo_client::connect_or_start_local_daemon(data_dir, progress)
         .map(sinomo_client::LocalDaemonConnection::into_parts)
 }
