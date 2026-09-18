@@ -4093,6 +4093,9 @@ pub trait ClusterKvRaftCommandStorage {
         detail: &str,
     ) -> Result<(), Self::Error>;
 
+    /// Legacy cleanup hook. Implementations must preserve valid pending log
+    /// entries: they may already have been replicated by another proposal or
+    /// by background maintenance. Only relinquish local leadership.
     fn discard_cluster_raft_uncommitted_tail_and_clear_leader(&mut self)
     -> Result<(), Self::Error>;
 
@@ -7744,6 +7747,8 @@ impl ClusterKvRaftStore {
         read_resident_raft_read_index_probe(&self.wal_paths(node_id), node_id, request)
     }
 
+    /// Compatibility guard: opening succeeds only without a pending suffix.
+    /// Normal initialization and reads must use `open_node` and preserve it.
     pub fn open_node_discarding_uncommitted_tail(
         &self,
         node_id: &NodeId,
@@ -8811,7 +8816,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         request: KvCommandRequest,
     ) -> Result<ClusterKvRaftCommitResult, KvError> {
-        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let mut node = self.open_node(node_id)?;
         let _authority_lease = self.acquire_pending_higher_term_authority_lease(
             node_id,
             Some(node.hard_state().current_term),
@@ -8838,7 +8843,7 @@ impl ClusterKvRaftStore {
                 committed_request,
             });
         }
-        if let Err(error) = node.store().preflight_apply_command(&request.command) {
+        if let Err(error) = node.node.preflight_local_append_request(node.hard_state().current_term, &request) {
             let _ = mark_cluster_kv_request_rejected_before_commit(
                 &self.paths,
                 &request,
@@ -9056,7 +9061,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         command: KvCommand,
     ) -> Result<KvLogEntry, KvError> {
-        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let mut node = self.open_node(node_id)?;
         self.append_command_to_open_node(&mut node, command)
     }
 
@@ -9065,7 +9070,7 @@ impl ClusterKvRaftStore {
         node_id: &NodeId,
         request: &KvCommandRequest,
     ) -> Result<Option<(KvSnapshot, KvCommittedRequestRecord)>, KvError> {
-        let node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let node = self.open_node(node_id)?;
         let _authority_lease = self.acquire_pending_higher_term_authority_lease(
             node_id,
             Some(node.hard_state().current_term),
@@ -9111,7 +9116,7 @@ impl ClusterKvRaftStore {
             node_id,
             "append a local Raft proposal",
         )?;
-        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
+        let mut node = self.open_node(node_id)?;
         let preflight = (|| {
             let digest = request.digest()?;
             if node.store().request_id_expired(&request.request_id) {
@@ -9126,7 +9131,7 @@ impl ClusterKvRaftStore {
                     request_id: request.request_id.clone(),
                 });
             }
-            node.store().preflight_apply_command(&request.command)
+            node.node.preflight_local_append_request(node.hard_state().current_term, &request)
         })();
         if let Err(error) = preflight {
             let _ = mark_cluster_kv_request_rejected_before_commit(
@@ -9188,12 +9193,12 @@ impl ClusterKvRaftStore {
         Ok(discarded)
     }
 
+    /// Legacy step-down API; pending consensus history is always retained.
     pub fn discard_uncommitted_tail_and_clear_leader(
         &self,
         node_id: &NodeId,
     ) -> Result<KvSnapshot, KvError> {
-        let mut node = self.open_node_discarding_uncommitted_tail(node_id)?;
-        node.discard_uncommitted_tail()?;
+        let mut node = self.open_node(node_id)?;
         node.clear_known_leader()?;
         self.compact_node_if_needed(&mut node)?;
         node.store().try_snapshot()
@@ -9604,10 +9609,6 @@ where
 
     fn node_mut(&mut self) -> Result<&mut DurableRaftKvNode, KvError> {
         self.node_mut_with_open_mode(false)
-    }
-
-    fn node_mut_discarding_uncommitted_tail(&mut self) -> Result<&mut DurableRaftKvNode, KvError> {
-        self.node_mut_with_open_mode(true)
     }
 
     /// Checks the resident node back in while retaining the exact pending
@@ -10324,45 +10325,11 @@ where
         Ok(snapshot)
     }
 
-    /// Removes only the uncommitted WAL suffix and durable leader hint. The
-    /// committed KV state is unchanged, so quorum-failure cleanup must not
-    /// clone or rewrite the complete materialized keyspace.
+    /// Legacy failure-cleanup entrypoint. Preserve pending history even when
+    /// this caller did not observe transport: another request or maintenance
+    /// wave may have replicated the same prefix, or this is an adopted barrier.
     pub fn discard_uncommitted_tail_and_clear_leader_compact(&mut self) -> Result<(), KvError> {
-        self.last_snapshot_publish_wrote = None;
-        if let Some(pending) = self.pending_entry.clone() {
-            let local_node_id = self.node_id.clone();
-            let result: Result<bool, KvError> = (|| {
-                let node = self.node_mut()?;
-                // Once another term/leader owns the node, its log is no longer
-                // this failed proposal's cleanup domain. Leave the suffix and
-                // leader hint intact for normal follower reconciliation.
-                let still_owned_uncommitted = node.hard_state().current_term == pending.term
-                    && node.hard_state().leader_id.as_ref() == Some(&local_node_id)
-                    && node.hard_state().commit_index < pending.index
-                    && node.last_log_index() == pending.index
-                    && node.log_entry_at(pending.index) == Some(&pending);
-                if still_owned_uncommitted {
-                    if !node.discard_exact_uncommitted_tail_entry(&pending)? {
-                        return Ok(false);
-                    }
-                    node.clear_known_leader()?;
-                    node.refresh_resident_read_view();
-                    return Ok(true);
-                }
-                Ok(node.hard_state().commit_index >= pending.index
-                    || node.log_entry_at(pending.index) != Some(&pending))
-            })();
-            if result.as_ref().is_ok_and(|resolved| *resolved) {
-                self.pending_entry = None;
-            }
-            self.release_resident_node_and_operation_guard();
-            return result.map(|_| ());
-        }
-        let node = self.node_mut_discarding_uncommitted_tail()?;
-        node.discard_uncommitted_tail()?;
-        node.clear_known_leader()?;
-        node.refresh_resident_read_view();
-        Ok(())
+        self.step_down_preserving_pending_entry()
     }
 
     /// Ends an ambiguous proposal without truncating its durable log entry.
@@ -10373,9 +10340,12 @@ where
     pub fn step_down_preserving_pending_entry(&mut self) -> Result<(), KvError> {
         self.last_snapshot_publish_wrote = None;
         let local_node_id = self.node_id.clone();
+        let pending_term = self.pending_entry.as_ref().map(|entry| entry.term);
         let result = (|| {
             let node = self.node_mut()?;
-            if node.hard_state().leader_id.as_ref() == Some(&local_node_id) {
+            if node.hard_state().leader_id.as_ref() == Some(&local_node_id)
+                && pending_term.is_none_or(|term| term == node.hard_state().current_term)
+            {
                 node.clear_known_leader()?;
                 node.refresh_resident_read_view();
             }
@@ -10743,6 +10713,8 @@ impl DurableRaftKvNode {
         Self::open_nonresident_inner(node_id, paths, false, RAFT_NODE_LOCK_WAIT)
     }
 
+    /// Compatibility guard that refuses, rather than erases, pending entries.
+    /// Use `open` for normal restart and Raft reconciliation.
     pub fn open_discarding_uncommitted_tail(
         node_id: NodeId,
         paths: KvWalPaths,
@@ -10985,35 +10957,28 @@ impl DurableRaftKvNode {
                 "raft_open_wal_restore",
                 "sinomo.kv.raft.open.wal_restore.us",
             );
-            let committed_index = node.hard_state.commit_index.max(node.applied_index);
             let retain_after_index = node
                 .snapshot_index
                 .saturating_sub(RAFT_COMPACTION_RETAINED_ENTRIES);
             let WalRead { entries, truncated } = read_wal_entries(
                 &paths.wal,
-                discard_uncommitted_tail.then_some(committed_index),
+                None,
                 retain_after_index,
             )?;
             // Preserve the already-applied tail (kept by local_compact for incremental
             // replication) instead of discarding it as append_entries would.
             let load_truncated = node.load_persisted_entries(entries);
-            let mut repaired_hard_state = false;
             let max_committable_index = node.last_log_index();
             if node.hard_state.commit_index > max_committable_index {
-                eprintln!(
-                    "warning: repairing cluster kv hard-state commit index {} beyond local log {} in {}",
-                    node.hard_state.commit_index,
-                    max_committable_index,
-                    paths.root.display()
-                );
-                node.hard_state.commit_index = max_committable_index;
-                repaired_hard_state = true;
+                return Err(KvError::MissingCommittedEntry {
+                    index: max_committable_index.saturating_add(1),
+                });
+            }
+            if discard_uncommitted_tail {
+                node.ensure_no_uncommitted_tail()?;
             }
             let commit_index = node.hard_state.commit_index;
             node.commit_to(commit_index)?;
-            if repaired_hard_state {
-                paths.write_persisted_hard_state(&node.hard_state)?;
-            }
             if truncated || load_truncated {
                 rewrite_wal_entries(&paths.wal, &node.log)?;
             }
@@ -11500,60 +11465,13 @@ impl DurableRaftKvNode {
         Ok(entry)
     }
 
+    /// Refuse unilateral deletion of valid pending history. Local commit
+    /// knowledge cannot prove that an entry was never replicated or committed
+    /// elsewhere. Only a matching leader's AppendEntries may replace a suffix.
     pub fn discard_uncommitted_tail(&mut self) -> Result<bool, KvError> {
         self.ensure_healthy()?;
-        let retain_resident = self.begin_resident_mutation();
-        let hard_state_before = self.node.hard_state.clone();
-        let log_before = self.node.log.clone();
-        let txn_responses_before = self.node.txn_responses.clone();
-        if !self.node.discard_uncommitted_tail() {
-            self.finish_resident_mutation(retain_resident);
-            return Ok(false);
-        }
-        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
-            self.node.hard_state = hard_state_before;
-            self.node.log = log_before;
-            self.node.txn_responses = txn_responses_before;
-            return Err(error);
-        }
-        if let Err(error) = self.persist_hard_state_if_changed(&hard_state_before) {
-            self.node.hard_state = hard_state_before;
-            self.node.log = log_before;
-            self.node.txn_responses = txn_responses_before;
-            return Err(error);
-        }
-        self.record_live_metrics();
-        self.finish_resident_mutation(retain_resident);
-        Ok(true)
-    }
-
-    /// Removes only the expected final uncommitted entry.
-    ///
-    /// A newer proposal can follow an older ambiguous entry. Rolling back the
-    /// newer proposal before its first send must not truncate that preserved
-    /// prefix, because another voter may still commit it.
-    fn discard_exact_uncommitted_tail_entry(
-        &mut self,
-        expected: &KvLogEntry,
-    ) -> Result<bool, KvError> {
-        self.ensure_healthy()?;
-        let retain_resident = self.begin_resident_mutation();
-        if self.node.hard_state.commit_index >= expected.index
-            || self.node.log.last() != Some(expected)
-        {
-            self.finish_resident_mutation(retain_resident);
-            return Ok(false);
-        }
-
-        let log_before = self.node.log.clone();
-        self.node.log.pop();
-        if let Err(error) = rewrite_wal_entries(&self.paths.wal, &self.node.log) {
-            self.node.log = log_before;
-            return Err(error);
-        }
-        self.record_live_metrics();
-        self.finish_resident_mutation(retain_resident);
-        Ok(true)
+        self.node.ensure_no_uncommitted_tail()?;
+        Ok(false)
     }
 
     pub fn compact_event_history_to(&mut self, max_events: usize) {

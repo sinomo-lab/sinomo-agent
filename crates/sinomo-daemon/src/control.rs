@@ -1,6 +1,6 @@
 use crate::cluster::{
     ClusterNetworkMaintenance, DAEMON_CLUSTER_TICK_INTERVAL, cluster_paths_from_daemon_paths,
-    prune_local_cluster_raft_uncommitted_tail,
+    initialize_local_cluster_raft_resident,
 };
 use crate::{
     AuthenticatedDaemonCommand, DaemonClusterStatus, DaemonError, DaemonLock, DaemonPaths,
@@ -739,10 +739,12 @@ pub fn run_daemon_control_loop_with_prepared_listener(
         );
     }
     let startup_local_raft_resident_initialized =
-        match prune_local_cluster_raft_uncommitted_tail(&paths) {
+        match initialize_local_cluster_raft_resident(&paths) {
             Ok(initialized) => initialized,
             Err(error) => {
-                tracing::warn!("sinomo {label} cluster raft startup repair skipped: {error}");
+                tracing::warn!(
+                    "sinomo {label} cluster raft resident initialization deferred: {error}"
+                );
                 false
             }
         };

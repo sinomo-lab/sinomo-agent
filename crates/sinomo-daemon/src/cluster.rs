@@ -876,7 +876,9 @@ pub(crate) fn daemon_network_module_context_now(
     }))
 }
 
-pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
+/// Admit the canonical resident owner without discarding pending Raft entries.
+/// Local commit knowledge can lag a quorum across process replacement.
+pub(crate) fn initialize_local_cluster_raft_resident(
     paths: &DaemonPaths,
 ) -> Result<bool, DaemonError> {
     if crate::daemon_paths_are_shadow(paths) {
@@ -888,7 +890,7 @@ pub(crate) fn prune_local_cluster_raft_uncommitted_tail(
     };
     cluster_paths
         .kv_paths()
-        .locked_discard_raft_uncommitted_tail(&state.local_node_id)
+        .locked_initialize_raft_resident(&state.local_node_id)
         .map(|_| true)
         .map_err(Into::into)
 }
@@ -2254,7 +2256,7 @@ impl ClusterNetworkMaintenance {
                 .await;
             let retry_paths = paths.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let result = prune_local_cluster_raft_uncommitted_tail(&retry_paths);
+                let result = initialize_local_cluster_raft_resident(&retry_paths);
                 crate::control::request_daemon_cluster_maintenance(
                     crate::control::DaemonClusterMaintenanceReason::LifecycleWake,
                 );
@@ -9081,6 +9083,132 @@ mod tests {
     }
 
     #[test]
+    fn main_raft_startup_and_retry_preserve_peer_committed_pending_entry() {
+        use sinomo_core::kv::{
+            DurableRaftKvNode, KvCommand, KvOp, KvWalPaths, RaftAppendEntriesRequest,
+        };
+        for retry in [false, true] {
+            let (_root, paths, state) =
+                seeded_single_node_cluster_for_publish_cache_test(if retry {
+                    "startup_pending_retry"
+                } else {
+                    "startup_pending_direct"
+                });
+            let kv_paths = paths.kv_paths();
+            let wal_paths = kv_paths.raft_wal_paths(&state.local_node_id);
+            let daemon_paths = DaemonPaths::with_root(paths.root.parent().unwrap().join("daemon"));
+            let store = kv_paths.raft_store();
+            let (snapshot, pending, hard_before) = {
+                let mut node = store.open_node(&state.local_node_id).unwrap();
+                let term = node.hard_state().current_term;
+                node.become_leader(term).unwrap();
+                let snapshot = node.save_snapshot().unwrap();
+                let pending = node
+                    .append_local_command(
+                        term,
+                        KvCommand::Op(KvOp::Put {
+                            key: "/restart/accepted-before-crash".into(),
+                            value: b"preserve".to_vec(),
+                            lease_id: None,
+                        }),
+                    )
+                    .unwrap();
+                (snapshot, pending, node.hard_state().clone())
+            };
+            let mut peers = Vec::new();
+            for name in ["restart_peer_a", "restart_peer_b"] {
+                let mut peer = DurableRaftKvNode::open(
+                    NodeId::from_legacy_named(name).unwrap(),
+                    KvWalPaths::new(paths.root.join(name)),
+                )
+                .unwrap();
+                peer.restore_snapshot(snapshot.clone()).unwrap();
+                assert!(
+                    peer.append_entries(RaftAppendEntriesRequest {
+                        term: pending.term,
+                        leader_id: state.local_node_id.clone(),
+                        prev_log_index: snapshot.last_included_index,
+                        prev_log_term: snapshot.last_included_term,
+                        entries: vec![pending.clone()],
+                        leader_commit: pending.index,
+                    })
+                    .unwrap()
+                    .success
+                );
+                peers.push(peer);
+            }
+            // Both other voters committed the entry, but the old process died
+            // before learning that outcome. Its local commit index is behind.
+            assert!(sinomo_core::kv::evict_resident_raft_node_for_test(
+                &wal_paths
+            ));
+            if retry {
+                let runtime = daemon_cluster_test_runtime();
+                let mut maintenance =
+                    cluster_network_scheduler_maintenance_for_test(Instant::now());
+                drop(
+                    runtime
+                        .block_on(
+                            maintenance
+                                .retry_main_local_raft_resident_initialization(&daemon_paths),
+                        )
+                        .unwrap(),
+                );
+                assert!(maintenance.local_raft_resident_initialization.is_ready());
+            } else {
+                assert!(initialize_local_cluster_raft_resident(&daemon_paths).unwrap());
+            }
+            let mut node = store.open_node(&state.local_node_id).unwrap();
+            assert_eq!(
+                node.hard_state(),
+                &hard_before,
+                "startup must preserve term, vote and commit position"
+            );
+            assert_eq!(
+                node.log_entry_at(pending.index),
+                Some(&pending),
+                "startup must not erase an entry held by another quorum"
+            );
+            let next = node
+                .append_local_command(
+                    pending.term,
+                    KvCommand::Op(KvOp::Put {
+                        key: "/restart/after".into(),
+                        value: b"next".to_vec(),
+                        lease_id: None,
+                    }),
+                )
+                .unwrap();
+            assert_eq!(
+                next.index,
+                pending.index + 1,
+                "never reuse the old term/index"
+            );
+            for peer in &mut peers {
+                assert!(
+                    peer.append_entries(RaftAppendEntriesRequest {
+                        term: next.term,
+                        leader_id: state.local_node_id.clone(),
+                        prev_log_index: pending.index,
+                        prev_log_term: pending.term,
+                        entries: vec![next.clone()],
+                        leader_commit: next.index,
+                    })
+                    .unwrap()
+                    .success
+                );
+            }
+            node.commit_to(next.index).unwrap();
+            for peer in peers {
+                assert_eq!(
+                    node.store().try_snapshot().unwrap(),
+                    peer.store().try_snapshot().unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn main_raft_resident_initialization_retries_after_predecessor_lock_handoff() {
         let (_root, cluster_paths, state) = seeded_single_node_cluster_for_publish_cache_test(
             "main_raft_resident_initialization_handoff",
@@ -9098,13 +9226,13 @@ mod tests {
         );
 
         // Model the predecessor shadow that still owns node.lock while the
-        // replacement main performs its one-shot startup repair.
+        // replacement main initializes its resident Raft owner.
         let predecessor = sinomo_core::kv::DurableRaftKvNode::open(
             state.local_node_id.clone(),
             wal_paths.clone(),
         )
         .expect("predecessor raft holder");
-        let startup_error = prune_local_cluster_raft_uncommitted_tail(&daemon_paths)
+        let startup_error = initialize_local_cluster_raft_resident(&daemon_paths)
             .expect_err("startup initialization must observe the predecessor lock");
         assert!(
             matches!(
@@ -9383,7 +9511,7 @@ mod tests {
             .kv_paths()
             .raft_wal_paths(&state.local_node_id);
 
-        let startup_initialized = prune_local_cluster_raft_uncommitted_tail(&daemon_paths)
+        let startup_initialized = initialize_local_cluster_raft_resident(&daemon_paths)
             .expect("startup initializes the resident voter");
         assert!(startup_initialized);
         assert!(sinomo_core::kv::evict_resident_raft_node_for_test(

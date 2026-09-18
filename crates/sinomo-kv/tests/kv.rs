@@ -15142,7 +15142,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_kv_raft_local_command_storage_appends_commits_and_discards() {
+    fn cluster_kv_raft_local_command_storage_appends_commits_and_preserves_on_cleanup() {
         let root = temp_raft_root("sinomo-kv-local-command-storage");
         let node_id = NodeId::from_legacy_named("node_kv_local_command_storage").expect("node");
         let paths = ClusterKvPaths::new(root.to_path_buf());
@@ -15253,8 +15253,8 @@ mod tests {
             opened_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("resident reopen while command storage remains alive"),
-            1,
-            "a terminal command phase must check the durable node back in"
+            2,
+            "cleanup must return the resident owner with its pending entry intact"
         );
         drop(storage);
         concurrent_operation
@@ -15309,7 +15309,7 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_proposal_survives_replay_retry_and_newer_proposal_rollback() {
+    fn ambiguous_proposal_survives_replay_retry_and_newer_proposal_cleanup() {
         let root = temp_raft_root("sinomo-kv-ambiguous-proposal-retry");
         let node_id = NodeId::from_legacy_named("node_ambiguous_proposal_retry").expect("node");
         let paths = ClusterKvPaths::new(root.to_path_buf());
@@ -15360,18 +15360,19 @@ mod tests {
         assert_eq!(newer.index, pending.index + 1);
         storage
             .discard_uncommitted_tail_and_clear_leader_compact()
-            .expect("roll back only the unsent newer proposal");
+            .expect("preserve both pending proposals on failure cleanup");
 
         assert_eq!(
             storage
                 .replay_record_if_committed(&request)
-                .expect("retry replay after newer rollback"),
+                .expect("retry replay after newer cleanup"),
             None
         );
         storage.release_session_for_quorum();
         let node = store.open_node(&node_id).expect("inspect retry-safe log");
         assert_eq!(node.log_entry_at(pending.index), Some(&pending));
-        assert_eq!(node.last_log_index(), pending.index);
+        assert_eq!(node.log_entry_at(newer.index), Some(&newer));
+        assert_eq!(node.last_log_index(), newer.index);
         assert!(node.store().get("/proposal/ambiguous").is_none());
     }
 
@@ -16971,7 +16972,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_raft_open_repairs_commit_index_beyond_local_log() {
+    fn durable_raft_open_refuses_commit_index_beyond_local_log() {
         let root = temp_raft_root("sinomo-kv-repair-commit-beyond-log");
         let node_id = NodeId::from_legacy_named("node_repair_commit_beyond_log").expect("node");
         let paths = KvWalPaths::new(&root);
@@ -16984,22 +16985,14 @@ mod tests {
         )
         .expect("write impossible hard state");
 
-        {
-            let node = DurableRaftKvNode::open(node_id, paths.clone()).expect("open repairs");
-            assert_eq!(
-                node.hard_state().commit_index,
-                0,
-                "open should clamp persisted commit index to the available local log"
-            );
-        }
-
         assert_eq!(
-            paths
-                .read_persisted_hard_state()
-                .expect("read repaired hard state")
-                .commit_index,
-            0,
-            "repair should be durable so the next open stays cheap"
+            DurableRaftKvNode::open(node_id, paths.clone()).expect_err("missing committed log"),
+            KvError::MissingCommittedEntry { index: 1 }
+        );
+        assert_eq!(
+            paths.read_persisted_hard_state().unwrap().commit_index,
+            7,
+            "recovery must not erase durable knowledge of a committed prefix"
         );
     }
 
@@ -17283,7 +17276,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_raft_discard_uncommitted_tail_keeps_committed_prefix() {
+    fn durable_raft_local_truncation_refuses_pending_history() {
         let root = temp_raft_root("sinomo-kv-discard-uncommitted-tail");
         let node_id = NodeId::from_legacy_named("node_discard_uncommitted_tail").expect("node");
         let paths = KvWalPaths::new(&root);
@@ -17314,25 +17307,27 @@ mod tests {
             assert_eq!(node.last_log_index(), 2);
         }
 
+        assert!(matches!(
+            DurableRaftKvNode::open_discarding_uncommitted_tail(node_id.clone(), paths.clone()),
+            Err(KvError::RaftLogTruncationDenied {
+                commit_index: 1,
+                last_log_index: 2
+            })
+        ));
         {
             let mut node =
-                DurableRaftKvNode::open_discarding_uncommitted_tail(node_id.clone(), paths.clone())
-                    .expect("open and discard");
+                DurableRaftKvNode::open(node_id.clone(), paths.clone()).expect("preserving reopen");
             assert_eq!(node.hard_state().commit_index, 1);
-            assert_eq!(node.last_log_index(), 1);
+            assert_eq!(node.last_log_index(), 2);
             assert_eq!(
-                node.store()
-                    .get("/config/committed")
-                    .expect("committed value")
-                    .value,
+                node.store().get("/config/committed").unwrap().value,
                 b"kept"
             );
             assert!(node.store().get("/config/uncommitted").is_none());
-            assert!(
-                !node
-                    .discard_uncommitted_tail()
-                    .expect("second discard is a no-op")
-            );
+            assert!(matches!(
+                node.discard_uncommitted_tail(),
+                Err(KvError::RaftLogTruncationDenied { .. })
+            ));
             let replacement = node
                 .append_local_command(
                     1,
@@ -17343,11 +17338,11 @@ mod tests {
                     }),
                 )
                 .expect("append replacement");
-            assert_eq!(replacement.index, 2);
+            assert_eq!(replacement.index, 3);
         }
 
         let node = DurableRaftKvNode::open(node_id, paths).expect("reopen after discard");
-        assert_eq!(node.last_log_index(), 2);
+        assert_eq!(node.last_log_index(), 3);
         assert_eq!(node.hard_state().commit_index, 1);
         assert!(node.store().get("/config/replacement").is_none());
     }

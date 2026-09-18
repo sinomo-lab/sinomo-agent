@@ -1778,13 +1778,13 @@ fn cluster_network_maintenance_schedule_skips_discovery_without_socket() {
         connectivity_converged: true,
         startup_settle_until: None,
         last_publish: now
-            .checked_sub(Duration::from_secs(10))
+            .checked_sub(CLUSTER_NETWORK_PUBLISH_INTERVAL - Duration::from_secs(50))
             .expect("publish instant"),
         last_discovery: now
             .checked_sub(Duration::from_secs(59))
             .expect("discovery instant"),
         last_probe: now
-            .checked_sub(Duration::from_secs(20))
+            .checked_sub(CLUSTER_NETWORK_PROBE_INTERVAL - Duration::from_secs(40))
             .expect("probe instant"),
     };
 
@@ -1964,7 +1964,7 @@ fn cluster_connectivity_probe_policy_honors_role_cadence_startup_and_routes() {
         priority: 0,
         last_observed_latency_ms: None,
     };
-    let observed_at = now - time::Duration::seconds(100);
+    let observed_at = now - time::Duration::try_from(CLUSTER_NETWORK_PROBE_INTERVAL).unwrap();
     let refresh_deadline = now + time::Duration::seconds(300);
     let record = ClusterConnectivityRecord {
         cluster_id: cluster_id.clone(),

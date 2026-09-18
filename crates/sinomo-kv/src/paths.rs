@@ -518,6 +518,15 @@ impl ClusterKvPaths {
         self.raft_store().locked_clear_leader_compact(node_id)
     }
 
+    /// Initialize the process-resident owner without altering pending history.
+    /// Another voter may have accepted or committed entries beyond our local
+    /// commit position, including when a predecessor dies during quorum I/O.
+    pub fn locked_initialize_raft_resident(&self, node_id: &NodeId) -> Result<(), KvError> {
+        let _raft_guard = lock_cluster_kv_raft_operation_for_paths(self)?;
+        let _node = self.raft_store().open_node(node_id)?;
+        Ok(())
+    }
+
     pub fn locked_discard_raft_uncommitted_tail(&self, node_id: &NodeId) -> Result<bool, KvError> {
         let _raft_guard = lock_cluster_kv_raft_operation_for_paths(self)?;
         self.raft_store().discard_uncommitted_tail(node_id)

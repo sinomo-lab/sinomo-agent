@@ -337,7 +337,7 @@ fn cluster_replication_catchup_replicates_tail_to_snapshot_joined_learner() {
 }
 
 #[test]
-fn cluster_durable_restart_keeps_committed_state_and_drops_uncommitted_tail() {
+fn cluster_durable_restart_preserves_committed_and_pending_history() {
     let root = temp_root("sinomo-kv-cluster-durable-restart");
     let wal_paths = KvWalPaths::new(root.join("raft"));
     let local = node_id("kv_durable_restart");
@@ -355,10 +355,9 @@ fn cluster_durable_restart_keeps_committed_state_and_drops_uncommitted_tail() {
         assert!(uncommitted.index > committed.index);
     }
 
-    let node = DurableRaftKvNode::open_discarding_uncommitted_tail(local, wal_paths)
-        .expect("reopen durable node");
+    let node = DurableRaftKvNode::open(local, wal_paths).expect("reopen durable node");
     assert_eq!(node.hard_state().commit_index, 1);
-    assert_eq!(node.last_log_index(), 1);
+    assert_eq!(node.last_log_index(), 2);
     assert_eq!(
         node.store()
             .get("/cluster/restart/committed")

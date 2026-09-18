@@ -180,6 +180,21 @@ resident applied Raft index or a bounded daemon ReadIndex projection. Checkpoint
 publication happens only after Raft, commit-sequence, and resident-state locks
 have been released, so filesystem I/O cannot hold the authority path.
 
+Startup and resident-initialization retries preserve the valid durable Raft
+suffix, including entries above the locally recorded commit index. A predecessor
+may have replicated that suffix before learning its quorum outcome. Erasing it
+locally can reuse the same term/index for a different command. Only legitimate
+Raft conflict reconciliation may replace pending history; normal reads,
+proposal cleanup, and restart never truncate it. A durable commit position whose
+required log entries are missing fails closed instead of moving commit backwards.
+
+KV leases use logical ticks for expiry. The legacy `granted_at` wire
+field is retained for decoding existing snapshots; new leases use `UNIX_EPOCH`
+as an explicit absent-wall-clock value. Applying a grant or renewal never reads
+the local clock. Historical timestamp differences require state reconciliation;
+upgrading code alone does not rewrite existing snapshots. All participating
+replicas must be upgraded before deterministic lease-state equality is assumed.
+
 Public reads use one of two explicit consistency contracts:
 
 - A **local** read returns the best materialized or applied view available on
