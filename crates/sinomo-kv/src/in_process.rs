@@ -2925,10 +2925,6 @@ pub(crate) struct KvTxnResponseIndex {
 }
 
 impl KvTxnResponseIndex {
-    fn len(&self) -> usize {
-        self.responses.len()
-    }
-
     pub(crate) fn get(&self, index: u64) -> Option<&KvTxnResponse> {
         self.responses.get(&index)
     }
@@ -2949,10 +2945,6 @@ impl KvTxnResponseIndex {
         response: KvTxnResponse,
     ) -> Result<Option<KvTxnResponse>, KvError> {
         Ok(self.responses.insert(index, response))
-    }
-
-    fn retain_applied_through(&mut self, committed: u64) {
-        self.responses.retain(|index, _| *index <= committed);
     }
 
     fn retain_after(&mut self, cutoff: u64) {
@@ -3293,13 +3285,13 @@ impl ReplicatedKvNode {
         Ok(())
     }
 
-    pub(crate) fn discard_uncommitted_tail(&mut self) -> bool {
-        let committed = self.hard_state.commit_index.max(self.applied_index);
-        let old_log_len = self.log.len();
-        let old_response_len = self.txn_responses.len();
-        self.log.retain(|entry| entry.index <= committed);
-        self.txn_responses.retain_applied_through(committed);
-        old_log_len != self.log.len() || old_response_len != self.txn_responses.len()
+    pub(crate) fn ensure_no_uncommitted_tail(&self) -> Result<(), KvError> {
+        let commit_index = self.hard_state.commit_index.max(self.applied_index);
+        let last_log_index = self.last_log_index();
+        if last_log_index > commit_index {
+            return Err(KvError::RaftLogTruncationDenied { commit_index, last_log_index });
+        }
+        Ok(())
     }
 
     pub(crate) fn prepare_append_entries(

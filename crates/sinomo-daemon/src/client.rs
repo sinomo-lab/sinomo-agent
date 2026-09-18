@@ -2341,7 +2341,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                crate::DaemonError::Parse { ref detail }
+                crate::DaemonError::NetworkDelivery {
+                    ref detail,
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    ..
+                }
                     if detail == &sinomo_core::network::NetworkError::timeout(
                         "test object RPC value call",
                         sinomo_core::network::NetworkTimeoutPhase::Overall,
@@ -2402,7 +2406,11 @@ mod tests {
         assert!(
             matches!(
                 error,
-                crate::DaemonError::Parse { ref detail }
+                crate::DaemonError::NetworkDelivery {
+                    ref detail,
+                    delivery_state: sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+                    ..
+                }
                     if detail == &sinomo_core::network::NetworkError::timeout(
                         "test progress-active object RPC value call",
                         sinomo_core::network::NetworkTimeoutPhase::Overall,

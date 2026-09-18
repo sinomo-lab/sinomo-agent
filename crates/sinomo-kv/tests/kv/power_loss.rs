@@ -138,7 +138,7 @@ fn wal_tail_partial_and_corrupt_records_recover_safe_prefix() {
 }
 
 #[test]
-fn hard_state_commit_index_ahead_of_wal_is_repaired_on_reopen() {
+fn hard_state_commit_index_ahead_of_wal_fails_closed_on_reopen() {
     let root = temp_root("sinomo-kv-power-loss-hard-state-ahead");
     let paths = KvWalPaths::new(root.join("raft"));
     let local = node_id("kv_power_loss_hard_state_ahead");
@@ -159,21 +159,15 @@ fn hard_state_commit_index_ahead_of_wal_is_repaired_on_reopen() {
         .write_persisted_hard_state(&hard_state)
         .expect("write ahead hard state");
 
-    let recovered = DurableRaftKvNode::open(local, paths.clone()).expect("repair hard state");
-    assert_eq!(recovered.hard_state().commit_index, committed_index);
+    let original_wal = fs::read(&paths.wal).expect("original WAL");
     assert_eq!(
-        entry_value(recovered.store(), "/power-loss/hard-state/kept"),
-        b"kept"
+        DurableRaftKvNode::open(local, paths.clone()).expect_err("missing committed prefix"),
+        KvError::MissingCommittedEntry {
+            index: committed_index + 1
+        }
     );
-    drop(recovered);
-
-    assert_eq!(
-        paths
-            .read_persisted_hard_state()
-            .expect("read repaired hard state")
-            .commit_index,
-        committed_index
-    );
+    assert_eq!(paths.read_persisted_hard_state().unwrap(), hard_state);
+    assert_eq!(fs::read(&paths.wal).unwrap(), original_wal);
 }
 
 #[test]

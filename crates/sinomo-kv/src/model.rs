@@ -507,6 +507,9 @@ pub struct KvLease {
     pub lease_id: LeaseId,
     pub ttl_ticks: u64,
     pub remaining_ticks: u64,
+    /// Legacy wire field. New logical-tick leases use UNIX_EPOCH to mean
+    /// "no wall-clock grant time"; expiry depends only on remaining_ticks.
+    /// Historical snapshots retain their stored value when decoded.
     #[serde(with = "time::serde::rfc3339")]
     pub granted_at: OffsetDateTime,
 }
@@ -517,7 +520,7 @@ impl KvLease {
             lease_id,
             ttl_ticks,
             remaining_ticks: ttl_ticks,
-            granted_at: OffsetDateTime::now_utc(),
+            granted_at: OffsetDateTime::UNIX_EPOCH,
         }
     }
 }
@@ -1208,6 +1211,11 @@ pub enum KvError {
     QuorumUnavailable { online_voters: usize, quorum: usize },
     #[error("raft log gap: expected index {expected}, got {actual}")]
     LogGap { expected: u64, actual: u64 },
+    #[error("refusing to discard Raft log through {last_log_index} beyond local commit {commit_index}; pending entries require Raft reconciliation")]
+    RaftLogTruncationDenied {
+        commit_index: u64,
+        last_log_index: u64,
+    },
     #[error("conflicting raft log entry at index {index}")]
     ConflictingLogEntry { index: u64 },
     #[error("missing committed raft entry at index {index}")]
