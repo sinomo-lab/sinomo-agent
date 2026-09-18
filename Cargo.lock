@@ -9838,6 +9838,7 @@ dependencies = [
 name = "sinomo-dfs"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "fs2",
@@ -9846,6 +9847,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sinomo-api",
+ "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
  "sinomo-device",
@@ -10318,6 +10320,7 @@ dependencies = [
  "fs2",
  "serde_json",
  "sinomo-api",
+ "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
  "sinomo-daemon",
@@ -10481,6 +10484,8 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sinomo-api",
+ "sinomo-cli-registry",
  "sinomo-core",
  "thiserror 2.0.20",
 ]

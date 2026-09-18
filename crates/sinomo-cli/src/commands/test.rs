@@ -1,9 +1,11 @@
 use super::*;
 use serde::Serialize;
-use sinomo_runtime::cli_registry::{
-    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliOptionSpec, CliParseError,
-    CliPositionalSpec, CliValueSpec,
+#[cfg(test)]
+pub(crate) use sinomo_runtime::test::cli::test_command_requires_cluster_state;
+pub(crate) use sinomo_runtime::test::cli::{
+    TestCliCommand, TestListOptions, TestRunOptions, TestSmokeOptions,
 };
+
 #[allow(unused_imports)]
 use sinomo_runtime::cluster::ClusterKvPathsExt;
 use sinomo_runtime::test::{
@@ -11,42 +13,6 @@ use sinomo_runtime::test::{
     SinomoTestReport, SinomoTestStatus,
 };
 use std::collections::BTreeSet;
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum TestCliCommand {
-    List(TestListOptions),
-    Run(TestRunOptions),
-    Smoke(TestSmokeOptions),
-}
-
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub(crate) struct TestListOptions {
-    pub json: bool,
-    pub tag: Option<String>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct TestRunOptions {
-    pub id: Option<String>,
-    pub tag: Option<String>,
-    pub provider: Option<String>,
-    pub account: String,
-    pub model: Option<String>,
-    pub live: bool,
-    pub require_cluster: bool,
-    pub json: bool,
-    pub params: Vec<(String, String)>,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct TestSmokeOptions {
-    pub provider: String,
-    pub account: String,
-    pub model: Option<String>,
-    pub live: bool,
-    pub require_cluster: bool,
-    pub json: bool,
-}
 
 #[derive(Debug, Serialize)]
 struct SinomoTestSuiteReport {
@@ -159,102 +125,9 @@ pub(super) const fn cluster_test_has_expected_target_count(actual: usize, expect
     actual >= expected
 }
 
-pub(crate) fn test_cli_command_handler() -> DeclarativeCommandHandler<TestCliCommand> {
-    DeclarativeCommandHandler::new(
-        "test",
-        CliCommandPolicy::local_capable(),
-        test_cli_spec,
-        parse_test_matches,
-        run_test_command,
-    )
-    .with_parsed_policy(test_cli_policy)
-}
-
-fn test_cli_spec() -> CliCommandSpec {
-    let common_model_options = || {
-        [
-            CliOptionSpec::value(
-                "--provider",
-                "model provider",
-                CliValueSpec::new("provider", "provider id"),
-            ),
-            CliOptionSpec::value(
-                "--account",
-                "provider account",
-                CliValueSpec::new("account", "provider account"),
-            ),
-            CliOptionSpec::value(
-                "--model",
-                "model id",
-                CliValueSpec::new("model", "model id"),
-            ),
-            CliOptionSpec::flag("--live", "enable live external integration"),
-            CliOptionSpec::flag("--require-cluster", "require cluster state and quorum"),
-            CliOptionSpec::flag("--json", "print JSON output"),
-        ]
-    };
-    let mut run_options = common_model_options().to_vec();
-    run_options.extend([
-        CliOptionSpec::value(
-            "--tag",
-            "select tests by tag",
-            CliValueSpec::new("tag", "test tag"),
-        ),
-        CliOptionSpec::value(
-            "--param",
-            "test parameter key=value",
-            CliValueSpec::new("key=value", "test parameter"),
-        )
-        .repeatable(),
-    ]);
-    CliCommandSpec::new("test", "list and run registered Sinomo tests")
-        .help_on_empty()
-        .with_children([
-            CliCommandSpec::new("list", "list registered tests").with_options([
-                CliOptionSpec::flag("--json", "print JSON output"),
-                CliOptionSpec::value(
-                    "--tag",
-                    "filter by tag",
-                    CliValueSpec::new("tag", "test tag"),
-                ),
-            ]),
-            CliCommandSpec::new("run", "run a test or tagged test group")
-                .with_options(run_options)
-                .with_positionals([CliPositionalSpec::optional(CliValueSpec::new(
-                    "test-id", "test id",
-                ))]),
-            CliCommandSpec::new("smoke", "run the model smoke test")
-                .with_options(common_model_options()),
-        ])
-}
-
-fn parse_test_matches(matches: &CliCommandMatches) -> Result<TestCliCommand, CliParseError> {
-    match matches.command_name() {
-        "list" => Ok(TestCliCommand::List(TestListOptions {
-            json: matches.contains("--json"),
-            tag: matches.value("--tag").map(str::to_string),
-        })),
-        "run" => parse_test_run_matches(matches).map(TestCliCommand::Run),
-        "smoke" => Ok(TestCliCommand::Smoke(TestSmokeOptions {
-            provider: matches
-                .value("--provider")
-                .unwrap_or(DeepSeekProvider::PROVIDER_ID)
-                .to_string(),
-            account: normalize_provider_account_name(matches.value("--account")),
-            model: matches.value("--model").map(str::to_string),
-            live: matches.contains("--live"),
-            require_cluster: matches.contains("--require-cluster"),
-            json: matches.contains("--json"),
-        })),
-        _ => Err(CliParseError::Parse {
-            detail: "test requires a subcommand".to_string(),
-        }),
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn parse_test_schema_for_test(args: &[String]) -> Result<TestCliCommand, CliError> {
-    parse_schema_command_for_test(test_cli_spec(), args, parse_test_matches)
+    sinomo_runtime::test::cli::parse_test_command(args).map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -265,62 +138,6 @@ fn parse_test_run_schema_for_test(args: &[String]) -> Result<TestRunOptions, Cli
     match parse_test_schema_for_test(&args)? {
         TestCliCommand::Run(options) => Ok(options),
         _ => unreachable!("test run schema returned the wrong command"),
-    }
-}
-
-fn parse_test_run_matches(matches: &CliCommandMatches) -> Result<TestRunOptions, CliParseError> {
-    let id = matches.positionals().first().cloned();
-    let tag = matches.value("--tag").map(str::to_string);
-    let params = matches
-        .values("--param")
-        .map(|raw| {
-            let (key, value) = raw.split_once('=').ok_or_else(|| CliParseError::Parse {
-                detail: format!("--param expects key=value, got `{raw}`"),
-            })?;
-            if key.is_empty() {
-                return Err(CliParseError::Parse {
-                    detail: format!("--param expects a non-empty key, got `{raw}`"),
-                });
-            }
-            Ok((key.to_string(), value.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    if id.is_some() && tag.is_some() {
-        return Err(CliParseError::Parse {
-            detail: "test run accepts either <test-id> or --tag <tag>, not both".to_string(),
-        });
-    }
-    if id.is_none() && tag.is_none() {
-        return Err(CliParseError::Parse {
-            detail: "test run requires <test-id> or --tag <tag>".to_string(),
-        });
-    }
-    Ok(TestRunOptions {
-        id,
-        tag,
-        provider: matches.value("--provider").map(str::to_string),
-        account: normalize_provider_account_name(matches.value("--account")),
-        model: matches.value("--model").map(str::to_string),
-        live: matches.contains("--live"),
-        require_cluster: matches.contains("--require-cluster"),
-        json: matches.contains("--json"),
-        params,
-    })
-}
-
-pub(crate) fn test_command_requires_cluster_state(command: &TestCliCommand) -> bool {
-    match command {
-        TestCliCommand::Run(options) => options.require_cluster,
-        TestCliCommand::Smoke(options) => options.require_cluster,
-        TestCliCommand::List(_) => false,
-    }
-}
-
-fn test_cli_policy(command: &TestCliCommand) -> CliCommandPolicy {
-    if test_command_requires_cluster_state(command) {
-        CliCommandPolicy::cluster_required()
-    } else {
-        CliCommandPolicy::local_capable()
     }
 }
 

@@ -1,5 +1,7 @@
 //! Bounded interactive controller skeleton.
 
+pub mod cli;
+
 use serde::{Deserialize, Serialize};
 use sinomo_lm::{
     LanguageModelCancellation, LanguageModelError, LanguageModelMessage, LanguageModelProvider,

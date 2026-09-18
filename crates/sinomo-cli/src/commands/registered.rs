@@ -1,7 +1,8 @@
 use super::*;
-use sinomo_runtime::cli_registry::{
-    CliCommandMatches, CliCommandPolicy, CliCommandSpec, CliParseError,
-};
+#[cfg(test)]
+use sinomo_runtime::cli_registry::{CliCommandMatches, CliParseError};
+use sinomo_runtime::cli_registry::{CliCommandPolicy, CliCommandSpec};
+pub(crate) use sinomo_runtime::cli_registry::{required_positional, semantic_parse_error};
 
 #[derive(Debug)]
 pub(crate) struct TopLevelHelp;
@@ -22,34 +23,6 @@ pub(crate) fn help_cli_command_handler() -> DeclarativeCommandHandler<TopLevelHe
 
 fn help_cli_spec() -> CliCommandSpec {
     CliCommandSpec::new("help", "show top-level CLI help").with_aliases(["--help", "-h"])
-}
-
-pub(crate) fn semantic_parse_error(error: CliError) -> CliParseError {
-    CliParseError::Parse {
-        detail: error.to_string(),
-    }
-}
-
-pub(crate) fn required_option<'a>(
-    matches: &'a CliCommandMatches,
-    option: &str,
-) -> Result<&'a str, CliParseError> {
-    matches.value(option).ok_or_else(|| CliParseError::Parse {
-        detail: format!("declarative parser omitted required option `{option}`"),
-    })
-}
-
-pub(crate) fn required_positional(
-    matches: &CliCommandMatches,
-    index: usize,
-) -> Result<&str, CliParseError> {
-    matches
-        .positionals()
-        .get(index)
-        .map(String::as_str)
-        .ok_or_else(|| CliParseError::Parse {
-            detail: format!("declarative parser omitted required positional {index}"),
-        })
 }
 
 #[cfg(test)]

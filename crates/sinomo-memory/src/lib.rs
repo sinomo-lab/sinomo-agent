@@ -1,5 +1,7 @@
 //! Hot memory, immutable memory records, and memory context retrieval.
 
+pub mod cli;
+
 mod indexed;
 
 pub use indexed::*;

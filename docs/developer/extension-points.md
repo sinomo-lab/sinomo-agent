@@ -31,10 +31,30 @@ CLI library. The domain owner supplies its parser, help, completion, and runner.
 For linked commands, expose a registration function using `CliCommandHandler`
 or `DeclarativeCommandHandler` from `sinomo-cli-registry`. R2 owners import these
 through `sinomo-runtime` with `default-features = false, features = ["cli-client"]`.
-For example, `sinomo-lm::cli::register_cli_commands` owns the provider and usage
-grammars; the CLI supplies terminal adapters for local sign-in and rendering.
-Keep bootstrap/recovery commands and R0 command adapters above R0. Existing
-central domain parsers can migrate to this seam without adding crates.
+Each owner exposes `cli::register_cli_commands`, accepting execution callbacks
+from the host. The owner controls typed arguments, validation, command policy,
+help, completion, and aliases. The CLI supplies terminal, transport, and process
+adapters; it does not maintain a second copy of the domain grammar.
+
+| Commands | Parser and registration owner |
+|---|---|
+| `agent`, `skill` | `sinomo-agent::cli` |
+| `models`, `providers`, `usage`, `voice` | `sinomo-lm::cli` (optional `cli` feature) |
+| `memory` | `sinomo-memory::cli` |
+| `dfs` | `sinomo-dfs::cli` |
+| `rollout`, including recovery and build-log options | `sinomo-rollout-host::cli` |
+| `test` | `sinomo-test::cli` |
+
+Realtime call syntax belongs with the LM realtime contracts, while media
+devices and sign-in continue to execute locally. The `test` grammar uses the
+shared provider data contract rather than depending on the LM implementation.
+Bootstrap/recovery commands (`help`, `daemon`, `cluster`, `install`,
+`uninstall`, and `debug`) remain CLI-owned and available without dynamic
+modules. R0 commands keep their CLI adapters above R0.
+
+Parser ownership is separate from discovery: these linked modules register
+locally, and external modules use the daemon catalog below. Moving a grammar
+does not turn local execution into a daemon call. No extra crates are needed.
 
 A runtime module contributes a versioned `CliCommandDescriptor` to
 `sinomo.cli.commands/1.0.0` and offers `sinomo.cli.command/1.0.0` with a

@@ -4,6 +4,8 @@
 //! register explicit test cases; the CLI decides which runtime capabilities
 //! are available for a given invocation.
 
+pub mod cli;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

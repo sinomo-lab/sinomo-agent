@@ -1,35 +1,6 @@
 use super::*;
 use sinomo_runtime::rollout::{self as rollout, RolloutCoordinatorPlan, RolloutCoordinatorTarget};
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct RecoveryOptions {
-    id: Option<String>,
-    targets: Vec<String>,
-    commit: Option<String>,
-    repo: Option<PathBuf>,
-}
-
-impl RecoveryOptions {
-    pub(super) fn parse(matches: &CliCommandMatches) -> Result<Self, CliParseError> {
-        let options = Self {
-            id: matches.value("--id").map(str::to_owned),
-            targets: matches.values("--target").map(str::to_owned).collect(),
-            commit: matches.value("--commit").map(str::to_owned),
-            repo: matches.value("--repo").map(PathBuf::from),
-        };
-        if !options.targets.is_empty() && (options.commit.is_none() || options.id.is_some()) {
-            return Err(CliParseError::Parse {
-                detail: "verify --target requires --commit and cannot be combined with --id".into(),
-            });
-        }
-        if options.targets.is_empty() && (options.commit.is_some() || options.repo.is_some()) {
-            return Err(CliParseError::Parse {
-                detail: "--commit and --repo require explicit verification targets".into(),
-            });
-        }
-        Ok(options)
-    }
-}
+pub(crate) use sinomo_runtime::rollout_host::cli::RecoveryOptions;
 
 pub(super) fn lock_for_new(paths: &SelfRolloutPaths) -> Result<fs::File, CliError> {
     let lock = rollout::lock_rollout_coordinator(paths)?;

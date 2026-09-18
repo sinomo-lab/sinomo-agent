@@ -1,4 +1,6 @@
-//! Module-owned provider and subscription-usage command grammar.
+//! Model, provider, usage, and realtime command registration.
+pub mod models;
+pub mod voice;
 use crate::{normalize_provider_account_name, subscription_usage_provider_ids};
 use sinomo_runtime::cli_registry::{
     CliAutocompleteChoice, CliCommandMatches, CliCommandParseOutcome, CliCommandPolicy,
@@ -128,6 +130,8 @@ pub fn register_cli_commands<E: Into<sinomo_runtime::cli_registry::CliCommandErr
     registry: CliCommandRegistry,
     run_provider: fn(ProviderCliCommand) -> Result<(), E>,
     run_usage: fn(UsageOptions) -> Result<(), E>,
+    run_models: models::ModelCommandRunner,
+    run_voice: fn(voice::VoiceCliCommand) -> Result<(), E>,
 ) -> Result<CliCommandRegistry, String> {
     registry
         .try_register(DeclarativeCommandHandler::new(
@@ -143,7 +147,9 @@ pub fn register_cli_commands<E: Into<sinomo_runtime::cli_registry::CliCommandErr
             usage_cli_spec,
             parse_usage_matches,
             run_usage,
-        ))
+        ))?
+        .try_register(models::models_cli_command_handler(run_models))?
+        .try_register(voice::voice_cli_command_handler(run_voice))
 }
 
 pub fn parse_provider_command(args: &[String]) -> Result<ProviderCliCommand, CliParseError> {

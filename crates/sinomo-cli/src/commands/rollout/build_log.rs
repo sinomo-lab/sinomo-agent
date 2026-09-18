@@ -1,26 +1,5 @@
 use super::*;
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) struct BuildLogOptions {
-    job_id: Id,
-    target: Option<String>,
-    follow: bool,
-}
-
-impl BuildLogOptions {
-    pub(super) fn parse(matches: &CliCommandMatches) -> Result<Self, CliParseError> {
-        let value = matches.value("--job").ok_or_else(|| CliParseError::Parse {
-            detail: "build-log requires --job".into(),
-        })?;
-        Ok(Self {
-            job_id: Id::new(value).map_err(|error| CliParseError::Parse {
-                detail: error.to_string(),
-            })?,
-            target: matches.value("--target").map(str::to_owned),
-            follow: matches.contains("--follow"),
-        })
-    }
-}
+pub(crate) use sinomo_runtime::rollout_host::cli::BuildLogOptions;
 
 pub(super) fn run(options: BuildLogOptions) -> Result<(), CliError> {
     use sinomo_runtime::build::{

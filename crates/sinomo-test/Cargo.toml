@@ -10,6 +10,8 @@ rust-version.workspace = true
 ring = "r1"
 
 [dependencies]
+sinomo-api.workspace = true
+sinomo-cli-registry.workspace = true
 sinomo-core = { path = "../sinomo-core" }
 serde.workspace = true
 serde_json.workspace = true

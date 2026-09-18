@@ -494,8 +494,13 @@ owns its registration, parser, help, and completion; the CLI contains no
 Evolution-specific proxy. Catalog incarnation and generation checks fence
 stale calls, and native invocation leases survive caller cancellation until
 blocking work finishes. The `sinomo-runtime/cli-client` profile exposes the CLI
-framework without enabling daemon implementations. Provider and usage command
-grammars live in `sinomo-lm` behind its optional `cli` feature; local media and
+framework without enabling daemon implementations. All domain parsers live
+with their owners: agent/skill in `sinomo-agent`, memory in `sinomo-memory`, DFS
+in `sinomo-dfs`, rollout in `sinomo-rollout-host`, tests in `sinomo-test`, and
+models/providers/usage/voice in `sinomo-lm` behind its optional `cli` feature.
+The CLI composes owner registrations and supplies terminal and execution
+adapters. Bootstrap commands and R0 adapters remain CLI-owned. Linked modules
+still register locally; external modules use daemon discovery. Local media and
 sign-in remain client capabilities. No additional crates are needed.
 
 Runtime activation is component-based. Every implementation supplies a

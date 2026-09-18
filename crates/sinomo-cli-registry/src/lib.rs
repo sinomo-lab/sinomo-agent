@@ -11,6 +11,47 @@ use std::sync::Arc;
 mod declarative;
 pub use declarative::DeclarativeCommandHandler;
 
+/// Convert a domain validation error without depending on an application error type.
+pub fn semantic_parse_error(error: impl fmt::Display) -> CliParseError {
+    CliParseError::Parse {
+        detail: error.to_string(),
+    }
+}
+
+pub fn required_option<'a>(
+    matches: &'a CliCommandMatches,
+    option: &str,
+) -> Result<&'a str, CliParseError> {
+    matches.value(option).ok_or_else(|| CliParseError::Parse {
+        detail: format!("declarative parser omitted required option `{option}`"),
+    })
+}
+
+pub fn required_positional(
+    matches: &CliCommandMatches,
+    index: usize,
+) -> Result<&str, CliParseError> {
+    matches
+        .positionals()
+        .get(index)
+        .map(String::as_str)
+        .ok_or_else(|| CliParseError::Parse {
+            detail: format!("declarative parser omitted required positional {index}"),
+        })
+}
+
+/// Parse typed intent; callers rendering help should use the owner's command handler.
+pub fn parse_command_args<T>(
+    specification: CliCommandSpec,
+    args: &[String],
+    parse: fn(&CliCommandMatches) -> Result<T, CliParseError>,
+) -> Result<T, CliParseError> {
+    match specification.parse(args)? {
+        CliCommandParseOutcome::Matches(matches) => parse(&matches),
+        CliCommandParseOutcome::Help(_) => Err(CliParseError::Usage),
+    }
+}
+
 pub fn export_module_command(
     handler: &dyn CliCommandHandler,
     command_id: &str,
