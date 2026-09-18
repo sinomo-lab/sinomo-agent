@@ -5,8 +5,7 @@ use crate::openai::{
 use crate::{
     LanguageModelError, LanguageModelHostAccess, LanguageModelInvocation, LanguageModelProvider,
     LanguageModelProviderCapabilities, LanguageModelProviderInfo, LanguageModelProviderOptions,
-    LanguageModelRequest, LanguageModelResponse, LanguageModelResponseItem,
-    LanguageModelStreamEvent, selected_model,
+    LanguageModelRequest, LanguageModelResponse, LanguageModelStreamEvent, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, HeaderValue};
@@ -200,6 +199,9 @@ impl LocalResponsesProvider {
 }
 
 impl LanguageModelProvider for LocalResponsesProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: self.config.runtime.provider_id().to_string(),
@@ -244,13 +246,9 @@ impl LanguageModelProvider for LocalResponsesProvider {
         let tool_calls = extract_openai_tool_calls(&value);
         Ok(LanguageModelResponse {
             provider: provider.to_string(),
-            model,
+            model: model.clone(),
             content: extract_openai_response_text(&value),
-            items: tool_calls
-                .iter()
-                .cloned()
-                .map(|call| LanguageModelResponseItem::ToolCall { call })
-                .collect(),
+            items: crate::openai::openai_response_items(&value, provider, &model, &tool_calls),
             tool_calls,
             usage: extract_openai_usage(&value),
         })

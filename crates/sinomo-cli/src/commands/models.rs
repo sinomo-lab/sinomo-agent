@@ -191,7 +191,7 @@ pub(crate) fn models_cli_spec() -> CliCommandSpec {
                         "--reasoning-effort",
                         "reasoning effort override",
                         CliValueSpec::new(
-                            "none|minimal|low|medium|high|xhigh|max|clear",
+                            "none|minimal|low|medium|high|xhigh|max|ultra|clear",
                             "reasoning effort or clear",
                         )
                         .with_choices([
@@ -202,6 +202,7 @@ pub(crate) fn models_cli_spec() -> CliCommandSpec {
                             choice("high", "high reasoning effort"),
                             choice("xhigh", "extra-high reasoning effort"),
                             choice("max", "maximum supported reasoning effort"),
+                            choice("ultra", "Codex ultra reasoning selection"),
                             choice("clear", "remove the configured override"),
                             choice("unset", "remove the configured override"),
                             choice("default", "remove the configured override"),

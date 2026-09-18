@@ -2212,6 +2212,7 @@ fn session_projection_is_rendered_as_current_work_budget_lane() {
         event_id: None,
     });
     session.transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "I will keep working on it.".to_string(),

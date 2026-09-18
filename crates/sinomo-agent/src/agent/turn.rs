@@ -418,6 +418,7 @@ impl<M: InteractionModel> Agent<M> {
                     item_id: TaskId::generate(),
                     step_index,
                     content: response.content.clone(),
+                    native_items: response.continuation_items(),
                 };
                 self.trace(
                     &input.session.session_id,
@@ -519,7 +520,11 @@ impl<M: InteractionModel> Agent<M> {
                     step_index,
                     model_visible_assistant_content(&response.content),
                 )
-                .with_native_items(native_tool_call_items_from_decision(&decision)),
+                .with_native_items({
+                    let mut native_items = response.continuation_items();
+                    native_items.extend(native_tool_call_items_from_decision(&decision));
+                    native_items
+                }),
             );
             for event in &step_model_events {
                 self.trace(

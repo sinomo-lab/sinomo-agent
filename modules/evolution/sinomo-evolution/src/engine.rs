@@ -4395,6 +4395,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     .provider_credentials_file(GitHubCopilotProvider::PROVIDER_ID);
                 let default_config = GitHubCopilotConfig::default();
                 let provider = GitHubCopilotProvider::new(GitHubCopilotConfig {
+                    options: Default::default(),
                     client_id: default_config.client_id,
                     github_host: default_config.github_host,
                     api_base_url: default_config.api_base_url,
@@ -4520,6 +4521,7 @@ impl MutationModel for EvolutionLanguageModelMutationModel {
                     .data_dir
                     .provider_credentials_file(NvidiaProvider::PROVIDER_ID);
                 let provider = NvidiaProvider::new(NvidiaConfig {
+                    options: Default::default(),
                     api_base_url: NvidiaConfig::default().api_base_url,
                     default_model: model_or_default(
                         &self.model,

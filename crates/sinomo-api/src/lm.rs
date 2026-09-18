@@ -7,16 +7,16 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5";
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 pub const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
 pub const CODEX_CLI_PROVIDER_ID: &str = "codex-cli";
 pub const DEEPSEEK_PROVIDER_ID: &str = "deepseek";
-pub const GEMINI_DEFAULT_MODEL: &str = "gemini-2.5-flash";
+pub const GEMINI_DEFAULT_MODEL: &str = "gemini-3.8-flash";
 pub const GEMINI_PROVIDER_ID: &str = "gemini";
 pub const GITHUB_COPILOT_CLI_DEFAULT_MODEL: &str = "copilot-default";
 pub const GITHUB_COPILOT_CLI_PROVIDER_ID: &str = "github-copilot-cli";
-pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.4";
+pub const GITHUB_COPILOT_DEFAULT_MODEL: &str = "gpt-5.6-sol";
 pub const GITHUB_COPILOT_PROVIDER_ID: &str = "github-copilot";
 pub const NVIDIA_PROVIDER_ID: &str = "nvidia";
 pub const OPENAI_PROVIDER_ID: &str = "openai";
@@ -170,11 +170,13 @@ pub enum ProviderReasoningEffort {
     #[serde(rename = "xhigh", alias = "x-high", alias = "extra-high")]
     XHigh,
     Max,
+    Ultra,
 }
 
 impl ProviderReasoningEffort {
-    pub const VALUES: &'static [&'static str] =
-        &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    pub const VALUES: &'static [&'static str] = &[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
 
     pub fn as_config_value(self) -> &'static str {
         match self {
@@ -185,6 +187,7 @@ impl ProviderReasoningEffort {
             Self::High => "high",
             Self::XHigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -195,7 +198,7 @@ impl ProviderReasoningEffort {
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
-            Self::XHigh | Self::Max => Some("xhigh"),
+            Self::XHigh | Self::Max | Self::Ultra => Some("xhigh"),
         }
     }
 
@@ -206,7 +209,9 @@ impl ProviderReasoningEffort {
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
-            Self::XHigh | Self::Max => Some("xhigh"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Ultra => Some("ultra"),
         }
     }
 
@@ -217,7 +222,7 @@ impl ProviderReasoningEffort {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
-            Self::Max => Some("max"),
+            Self::Max | Self::Ultra => Some("max"),
         }
     }
 
@@ -228,7 +233,7 @@ impl ProviderReasoningEffort {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
-            Self::Max => Some("max"),
+            Self::Max | Self::Ultra => Some("max"),
         }
     }
 }
@@ -251,6 +256,7 @@ impl FromStr for ProviderReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" | "x-high" | "extra-high" => Ok(Self::XHigh),
             "max" | "maximum" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => Err(format!(
                 "invalid reasoning effort `{value}`; expected one of {}",
                 Self::VALUES.join("|")
@@ -452,6 +458,7 @@ pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     // OpenAI-style reasoning model families (also the ones Copilot proxies).
     let openai_reasoning = model.contains("gpt-5")
+        || model.contains("gpt-6")
         || model.contains("codex")
         || model.starts_with("o1")
         || model.starts_with("o3")
@@ -461,16 +468,24 @@ pub fn model_supports_reasoning_effort(provider: &str, model: &str) -> bool {
         // Agent CLIs that always run a reasoning model.
         CODEX_CLI_PROVIDER_ID | CODEX_PROVIDER_ID | CLAUDE_CODE_PROVIDER_ID => true,
         // Anthropic extended-thinking models (the Claude 4 family).
-        ANTHROPIC_PROVIDER_ID => {
-            model.contains("opus") || model.contains("sonnet") || model.contains("haiku-4")
+        ANTHROPIC_PROVIDER_ID | CLAUDE_PROVIDER_ID => {
+            model.contains("opus")
+                || model.contains("sonnet")
+                || model.contains("fable")
+                || model.contains("mythos")
+                || model.contains("haiku-4")
         }
         // OpenAI: reasoning models only (not gpt-4*, etc.).
         OPENAI_PROVIDER_ID => openai_reasoning,
         // Copilot proxies many backends; gate on the underlying reasoning model.
         GITHUB_COPILOT_PROVIDER_ID | GITHUB_COPILOT_CLI_PROVIDER_ID => {
-            openai_reasoning || model.contains("claude") || model.contains("gemini-2.5")
+            openai_reasoning
+                || model.contains("claude")
+                || model.contains("gemini-2.5")
+                || model.contains("gemini-3")
         }
-        // gemini, deepseek, nvidia, and unknown providers do not take a reasoning effort.
+        GEMINI_PROVIDER_ID => model.starts_with("gemini-3") || model.starts_with("gemini-2.5"),
+        DEEPSEEK_PROVIDER_ID => model.starts_with("deepseek"),
         _ => false,
     }
 }
@@ -622,12 +637,17 @@ pub fn normalize_nvidia_model_id(model: &str) -> String {
     while let Some(rest) = normalized.strip_prefix("nvidia/nvidia/") {
         normalized = format!("nvidia/{rest}");
     }
+    if let Some(rest) = normalized.strip_prefix("nvidia/")
+        && rest.contains('/')
+    {
+        return rest.to_string();
+    }
     normalized
 }
 
 pub const DEEPSEEK_V4_FLASH_MODEL: &str = "deepseek-v4-flash";
 
-pub const DEEPSEEK_DEFAULT_MODEL: &str = DEEPSEEK_V4_FLASH_MODEL;
+pub const DEEPSEEK_DEFAULT_MODEL: &str = "deepseek-flash";
 
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";
 
@@ -643,9 +663,9 @@ pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-code-default";
 
 pub const CLAUDE_PROVIDER_ID: &str = "claude";
 
-pub const CLAUDE_DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+pub const CLAUDE_DEFAULT_MODEL: &str = ANTHROPIC_DEFAULT_MODEL;
 
-pub const CODEX_DEFAULT_MODEL: &str = OPENAI_DEFAULT_MODEL;
+pub const CODEX_DEFAULT_MODEL: &str = "gpt-5.6-sol";
 
 pub const CODEX_PROVIDER_ID: &str = "codex";
 

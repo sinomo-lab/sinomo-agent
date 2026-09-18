@@ -147,13 +147,23 @@ impl CodexStyleAgentCompactionEngine {
         &self,
         request: &AgentCompactionRequest<'_>,
     ) -> Result<LanguageModelRequest, AgentError> {
+        // Opaque protocol state is replayed only through provider-native items.
+        // It has no value as summarizer prose and may belong to a different model.
+        let mut source_transcript = request.source_transcript.clone();
+        for item in &mut source_transcript.items {
+            if let crate::AgentItem::AssistantText { native_items, .. } = item {
+                native_items.retain(|item| {
+                    !matches!(item, LanguageModelRequestItem::ProviderContinuation { .. })
+                });
+            }
+        }
         let payload = serde_json::json!({
             "reason": &request.reason,
             "trigger": &request.trigger,
             "previous_projection": request.previous_projection,
             "steering_queue": request.steering,
             "follow_up_queue": request.follow_ups,
-            "source_transcript": request.source_transcript,
+            "source_transcript": source_transcript,
             "retained_tail_count": request.retained_tail_count,
             "token_estimate_before": request.token_estimate_before,
             "instructions": CODEX_STYLE_COMPACTION_USER_PROMPT,

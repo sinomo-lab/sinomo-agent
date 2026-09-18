@@ -1,3 +1,7 @@
+pub(crate) mod wire;
+
+pub use sinomo_runtime::api::lm::ANTHROPIC_DEFAULT_MODEL;
+
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
@@ -79,6 +83,20 @@ impl AnthropicProvider {
         )
     }
 
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        crate::catalog::list_models(
+            &self.http,
+            &crate::catalog::endpoint(&self.config.api_base_url, "v1/models"),
+            anthropic_headers(
+                &self.api_key()?,
+                Self::PROVIDER_ID,
+                &self.config.default_model,
+            )?,
+            crate::catalog::CatalogProtocol::Anthropic,
+            Self::PROVIDER_ID,
+        )
+    }
+
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
         let request = LanguageModelRequest {
             provider: Self::PROVIDER_ID.to_string(),
@@ -109,7 +127,13 @@ impl Default for AnthropicProvider {
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model).or_else(|| {
         let model = model.to_ascii_lowercase();
-        if model.contains("claude") {
+        if model.starts_with("claude-sonnet-5")
+            || model.starts_with("claude-opus-5")
+            || model.starts_with("claude-fable-5")
+            || model.starts_with("claude-mythos-5")
+        {
+            Some(1_000_000)
+        } else if model.contains("claude") {
             Some(200_000)
         } else {
             None
@@ -118,6 +142,9 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
 }
 
 impl LanguageModelProvider for AnthropicProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: Self::PROVIDER_ID.to_string(),
@@ -136,19 +163,14 @@ impl LanguageModelProvider for AnthropicProvider {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let api_key = self.api_key()?;
-        let url = format!(
-            "{}/v1/messages",
-            self.config.api_base_url.trim_end_matches('/')
-        );
+        let url = crate::catalog::endpoint(&self.config.api_base_url, "v1/messages");
+        let payload = anthropic_messages_payload(request, &model, &self.config.options);
+        validate_anthropic_payload(&payload, Self::PROVIDER_ID, &model)?;
         let response = self
             .http
             .post(url)
             .headers(anthropic_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&anthropic_messages_payload(
-                request,
-                &model,
-                &self.config.options,
-            ))
+            .json(&payload)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -173,24 +195,7 @@ impl LanguageModelProvider for AnthropicProvider {
                 detail: source.to_string(),
             }
         })?;
-        let content = extract_anthropic_text(&value);
-        let usage = value.get("usage").map(|usage| LanguageModelUsage {
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(serde_json::Value::as_u64),
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(serde_json::Value::as_u64),
-        });
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage,
-        })
+        Ok(wire::response(&value, Self::PROVIDER_ID, &model))
     }
 
     fn complete_streaming_events(
@@ -200,11 +205,9 @@ impl LanguageModelProvider for AnthropicProvider {
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
         let api_key = self.api_key()?;
-        let url = format!(
-            "{}/v1/messages",
-            self.config.api_base_url.trim_end_matches('/')
-        );
+        let url = crate::catalog::endpoint(&self.config.api_base_url, "v1/messages");
         let mut payload = anthropic_messages_payload(request, &model, &self.config.options);
+        validate_anthropic_payload(&payload, Self::PROVIDER_ID, &model)?;
         payload["stream"] = serde_json::json!(true);
         let mut headers = anthropic_headers(&api_key, Self::PROVIDER_ID, &model)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -273,20 +276,12 @@ pub(crate) fn anthropic_messages_payload(
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let mut messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .filter(|message| message.role != LanguageModelRole::System)
-        .map(|message| {
-            serde_json::json!({
-                "role": match message.role {
-                    LanguageModelRole::Assistant => "assistant",
-                    _ => "user",
-                },
-                "content": message.content,
-            })
-        })
-        .collect();
+    let mut messages = wire::messages(request, model);
+    if messages.is_empty() {
+        messages = request.messages.iter().filter(|m| m.role != LanguageModelRole::System).map(|m| serde_json::json!({
+            "role": if m.role == LanguageModelRole::Assistant {"assistant"} else {"user"}, "content":m.content,
+        })).collect();
+    }
     if messages.is_empty() {
         messages.push(serde_json::json!({
             "role": "user",
@@ -294,44 +289,95 @@ pub(crate) fn anthropic_messages_payload(
         }));
     }
 
-    let thinking_budget = options.reasoning_budget_tokens;
-    let adaptive_effort = options
-        .reasoning_effort
-        .and_then(|effort| effort.as_anthropic_effort_value());
-    let mut max_tokens = request.max_output_tokens.unwrap_or(1024);
+    let adaptive = supports_adaptive_thinking(model);
+    let thinking_disabled = options.reasoning_effort == Some(crate::ProviderReasoningEffort::None)
+        || options.reasoning_budget_tokens == Some(0);
+    let thinking_budget = options.reasoning_budget_tokens.or_else(|| {
+        (!adaptive && options.reasoning_effort.is_some() && !thinking_disabled).then_some(8192)
+    });
+    let mut max_tokens = request.max_output_tokens.unwrap_or(4096);
     if let Some(budget) = thinking_budget
+        && budget > 0
         && max_tokens <= budget
     {
         max_tokens = budget.saturating_add(1024);
     }
-
-    let mut payload = serde_json::json!({
-        "model": model,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    });
+    let mut payload =
+        serde_json::json!({"model":model,"max_tokens":max_tokens,"messages":messages});
     if !system.is_empty() {
         payload["system"] = serde_json::json!(system);
     }
-    if let Some(temperature) = request.temperature {
+    if thinking_disabled {
+        payload["thinking"] = serde_json::json!({"type":"disabled"});
+    } else if let Some(budget) = thinking_budget {
+        payload["thinking"] = serde_json::json!({"type":"enabled","budget_tokens":budget});
+    } else if adaptive {
+        payload["thinking"] = serde_json::json!({"type":"adaptive"});
+    }
+    let effort_supported = adaptive || model.starts_with("claude-opus-4-5");
+    if effort_supported
+        && let Some(effort) = options
+            .reasoning_effort
+            .and_then(|effort| effort.as_anthropic_effort_value())
+    {
+        let effort = if (model.starts_with("claude-opus-4-5") && matches!(effort, "xhigh" | "max"))
+            || (matches!(model, "claude-opus-4-6" | "claude-sonnet-4-6") && effort == "xhigh")
+        {
+            "high"
+        } else {
+            effort
+        };
+        payload["output_config"]["effort"] = serde_json::json!(effort);
+    }
+    if !matches!(
+        payload["thinking"]["type"].as_str(),
+        Some("enabled" | "adaptive")
+    ) && let Some(temperature) = request.temperature
+    {
         payload["temperature"] = serde_json::json!(temperature);
     }
-    if let Some(budget) = thinking_budget
-        && budget > 0
-    {
-        payload["thinking"] = serde_json::json!({
-            "type": "enabled",
-            "budget_tokens": budget,
-        });
-    }
-    if thinking_budget.is_none() && adaptive_effort.is_some() {
-        payload["thinking"] = serde_json::json!({ "type": "adaptive" });
-    }
-    if let Some(effort) = adaptive_effort {
-        payload["output_config"] = serde_json::json!({ "effort": effort });
-    }
+    wire::add_tools(&mut payload, request);
     apply_provider_vendor_options_to_payload(&mut payload, options);
     payload
+}
+
+fn supports_adaptive_thinking(model: &str) -> bool {
+    [
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-sonnet-4-6",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-mythos-5",
+    ]
+    .iter()
+    .any(|prefix| model.starts_with(prefix))
+}
+
+pub(crate) fn validate_anthropic_payload(
+    payload: &serde_json::Value,
+    provider: &str,
+    model: &str,
+) -> Result<(), LanguageModelError> {
+    if supports_adaptive_thinking(model) && payload["thinking"]["type"] == "enabled" {
+        return Err(LanguageModelError::ProviderInvocationFailed {provider:provider.into(),model:model.into(),detail:"this Claude model uses adaptive thinking; select reasoning effort instead of a token budget".into()});
+    }
+    if matches!(
+        payload["thinking"]["type"].as_str(),
+        Some("adaptive" | "enabled")
+    ) && matches!(
+        payload["tool_choice"]["type"].as_str(),
+        Some("tool" | "any")
+    ) {
+        return Err(LanguageModelError::ProviderInvocationFailed {
+            provider: provider.into(),
+            model: model.into(),
+            detail: "forced Claude tool choice requires thinking disabled".into(),
+        });
+    }
+    Ok(())
 }
 
 pub(crate) fn extract_anthropic_text(value: &serde_json::Value) -> String {
@@ -376,6 +422,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
     let mut finish_reason = None;
     let mut saw_usage = false;
     let mut emitted_finished = false;
+    let mut blocks = wire::StreamBlocks::default();
 
     read_server_sent_events(response, provider, model, |event| {
         let mut value =
@@ -394,6 +441,7 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
         {
             object.insert("type".to_string(), serde_json::json!(event_name));
         }
+        blocks.event(&value, provider, model, on_event)?;
         match value
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -481,28 +529,18 @@ pub(crate) fn stream_anthropic_messages_response_with_provider(
 
     let usage = saw_usage.then_some(usage);
     if !emitted_finished {
-        if let Some(usage) = &usage {
-            on_event(LanguageModelStreamEvent::Usage {
-                usage: usage.clone(),
-            });
-        }
-        on_event(LanguageModelStreamEvent::Finished {
-            finish_reason: finish_reason.clone(),
-        });
+        return Err(crate::incomplete_provider_stream(provider, model, on_event));
     }
 
-    let items = (!reasoning.trim().is_empty())
+    let items: Vec<_> = (!reasoning.trim().is_empty())
         .then_some(LanguageModelResponseItem::ReasoningSummary { summary: reasoning })
         .into_iter()
         .collect();
-    Ok(LanguageModelResponse {
-        provider: provider.to_string(),
-        model: model.to_string(),
-        content,
-        items,
-        tool_calls: Vec::new(),
-        usage,
-    })
+    let mut response = blocks.response(provider, model);
+    response.items.extend(items);
+    response.content = content;
+    response.usage = usage;
+    Ok(response)
 }
 
 fn anthropic_thinking_delta(value: &serde_json::Value) -> Option<&str> {
@@ -577,7 +615,7 @@ mod tests {
             .vendor_options
             .insert("metadata.trace".to_string(), "true".to_string());
 
-        let payload = anthropic_messages_payload(&request(), "claude-sonnet-4-20250514", &options);
+        let payload = anthropic_messages_payload(&request(), "claude-sonnet-5", &options);
 
         assert_eq!(payload["thinking"]["type"], "adaptive");
         assert_eq!(payload["output_config"]["effort"], "high");
@@ -597,7 +635,10 @@ mod tests {
 
         assert_eq!(payload["thinking"]["type"], "enabled");
         assert_eq!(payload["thinking"]["budget_tokens"], 10_000);
-        assert_eq!(payload["output_config"]["effort"], "max");
+        assert!(
+            payload.get("output_config").is_none(),
+            "Sonnet 4 does not accept effort"
+        );
         assert_eq!(payload["max_tokens"], 11_024);
     }
 

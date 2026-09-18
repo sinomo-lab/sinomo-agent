@@ -1334,6 +1334,7 @@ fn channel_message_agent_item(
             if participant_id == &participant.participant_id =>
         {
             AgentItem::AssistantText {
+                native_items: Vec::new(),
                 item_id,
                 step_index,
                 content,
@@ -2320,6 +2321,7 @@ mod tests {
                     text: response.clone(),
                 });
                 let item = AgentItem::AssistantText {
+                    native_items: Vec::new(),
                     item_id: TaskId::generate(),
                     step_index: session.transcript.items.len(),
                     content: response.clone(),

@@ -177,7 +177,7 @@ impl Default for CodexCliProvider {
 }
 
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
-    crate::openai::inferred_context_window_tokens(model)
+    crate::codex::inferred_context_window_tokens(model)
 }
 
 impl LanguageModelProvider for CodexCliProvider {
@@ -351,17 +351,19 @@ mod tests {
 
     #[test]
     fn command_args_include_reasoning_effort_config() {
-        let provider = CodexCliProvider::new(CodexCliConfig {
-            reasoning_effort: Some(ProviderReasoningEffort::XHigh),
-            ..CodexCliConfig::default()
-        });
-
-        let args = provider.command_args(&request(), None);
-
-        assert!(
-            args.windows(2)
-                .any(|pair| pair == ["-c", "model_reasoning_effort=\"xhigh\""])
-        );
+        for effort in [
+            ProviderReasoningEffort::XHigh,
+            ProviderReasoningEffort::Max,
+            ProviderReasoningEffort::Ultra,
+        ] {
+            let provider = CodexCliProvider::new(CodexCliConfig {
+                reasoning_effort: Some(effort),
+                ..CodexCliConfig::default()
+            });
+            let args = provider.command_args(&request(), None);
+            let setting = format!("model_reasoning_effort=\"{effort}\"");
+            assert!(args.windows(2).any(|pair| pair == ["-c", setting.as_str()]));
+        }
     }
 
     #[test]

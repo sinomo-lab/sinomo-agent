@@ -1,13 +1,12 @@
 use crate::anthropic::{
-    anthropic_messages_payload, extract_anthropic_text,
-    stream_anthropic_messages_response_with_provider,
+    anthropic_messages_payload, stream_anthropic_messages_response_with_provider,
 };
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelProviderOptions, LanguageModelProviderUsage,
     LanguageModelRequest, LanguageModelResponse, LanguageModelResponseFormat, LanguageModelRole,
-    LanguageModelStreamEvent, LanguageModelUsage, LanguageModelUsageProvider,
-    PROVIDER_DEFAULT_MODEL, read_provider_credentials_json_value, selected_model, unix_timestamp,
+    LanguageModelStreamEvent, LanguageModelUsageProvider, PROVIDER_DEFAULT_MODEL,
+    read_provider_credentials_json_value, selected_model, unix_timestamp,
     write_provider_credentials_json_value,
 };
 use base64::Engine;
@@ -256,36 +255,35 @@ impl ClaudeProvider {
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
         let mut tokens = self.oauth_tokens()?;
-        let mut response = self.get_models(&tokens)?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED
-            && !tokens.refresh_token.is_empty()
-        {
-            tokens = self.refresh_oauth_tokens(tokens)?;
-            response = self.get_models(&tokens)?;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            return Err(claude_invocation_error(
-                PROVIDER_DEFAULT_MODEL,
-                format!("Claude models API failed: HTTP {status}: {body}"),
-            ));
-        }
-        let value = response.json::<serde_json::Value>().map_err(|source| {
-            claude_invocation_error(PROVIDER_DEFAULT_MODEL, source.to_string())
-        })?;
-        let mut models = value
-            .get("data")
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry.get("id").and_then(serde_json::Value::as_str))
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        if models.is_empty() {
-            models.push(self.config.default_model.clone());
-        }
-        Ok(models)
+        let mut refreshed = false;
+        crate::catalog::collect_models(
+            crate::catalog::CatalogProtocol::Anthropic,
+            Self::PROVIDER_ID,
+            |cursor| {
+                let mut response = self.get_models(&tokens, cursor)?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    && !refreshed
+                    && !tokens.refresh_token.is_empty()
+                {
+                    tokens = self.refresh_oauth_tokens(tokens.clone())?;
+                    refreshed = true;
+                    response = self.get_models(&tokens, cursor)?;
+                }
+                if !response.status().is_success() {
+                    return Err(claude_invocation_error(
+                        PROVIDER_DEFAULT_MODEL,
+                        format!(
+                            "Claude models API failed: HTTP {}: {}",
+                            response.status(),
+                            response.text().unwrap_or_default()
+                        ),
+                    ));
+                }
+                response
+                    .json()
+                    .map_err(|e| claude_invocation_error(PROVIDER_DEFAULT_MODEL, e.to_string()))
+            },
+        )
     }
 
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
@@ -438,16 +436,21 @@ impl ClaudeProvider {
     fn get_models(
         &self,
         tokens: &ClaudeOAuthTokens,
+        cursor: Option<&str>,
     ) -> Result<reqwest::blocking::Response, LanguageModelError> {
-        let url = format!(
-            "{}/v1/models",
-            self.config.api_base_url.trim_end_matches('/')
-        );
-        self.http
-            .get(url)
-            .headers(self.claude_headers(tokens, PROVIDER_DEFAULT_MODEL)?)
+        let mut request = self
+            .http
+            .get(crate::catalog::endpoint(
+                &self.config.api_base_url,
+                "v1/models",
+            ))
+            .headers(self.claude_headers(tokens, PROVIDER_DEFAULT_MODEL)?);
+        if let Some(cursor) = cursor {
+            request = request.query(&[("after_id", cursor)]);
+        }
+        request
             .send()
-            .map_err(|source| claude_invocation_error(PROVIDER_DEFAULT_MODEL, source.to_string()))
+            .map_err(|e| claude_invocation_error(PROVIDER_DEFAULT_MODEL, e.to_string()))
     }
 
     fn claude_code_user_agent(&self) -> String {
@@ -491,10 +494,7 @@ impl ClaudeProvider {
         tokens: &ClaudeOAuthTokens,
         payload: &serde_json::Value,
     ) -> Result<reqwest::blocking::Response, LanguageModelError> {
-        let url = format!(
-            "{}/v1/messages",
-            self.config.api_base_url.trim_end_matches('/')
-        );
+        let url = crate::catalog::endpoint(&self.config.api_base_url, "v1/messages");
         let mut headers = self.claude_headers(tokens, model)?;
         if payload.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
             headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
@@ -546,6 +546,7 @@ impl LanguageModelProvider for ClaudeProvider {
         let model = selected_model(&self.config.default_model, request);
         let mut tokens = self.oauth_tokens()?;
         let mut payload = anthropic_messages_payload(request, &model, &self.config.options);
+        crate::anthropic::validate_anthropic_payload(&payload, Self::PROVIDER_ID, &model)?;
         payload["stream"] = serde_json::json!(true);
         let mut response = self.post_messages(&model, &tokens, &payload)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED
@@ -579,24 +580,11 @@ impl LanguageModelProvider for ClaudeProvider {
         let value = response
             .json::<serde_json::Value>()
             .map_err(|source| claude_invocation_error(&model, source.to_string()))?;
-        let content = extract_anthropic_text(&value);
-        let usage = value.get("usage").map(|usage| LanguageModelUsage {
-            input_tokens: usage
-                .get("input_tokens")
-                .and_then(serde_json::Value::as_u64),
-            output_tokens: usage
-                .get("output_tokens")
-                .and_then(serde_json::Value::as_u64),
-        });
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage,
-        })
+        Ok(crate::anthropic::wire::response(
+            &value,
+            Self::PROVIDER_ID,
+            &model,
+        ))
     }
 }
 

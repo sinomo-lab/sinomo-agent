@@ -141,6 +141,46 @@ fn agent_executes_tool_calls_and_continues_until_final_answer() {
 }
 
 #[test]
+fn active_tool_turn_keeps_provider_continuation_for_the_next_request() {
+    struct NativeStateModel(SequencedModel);
+    impl InteractionModel for NativeStateModel {
+        fn complete(
+            &self,
+            request: &LanguageModelRequest,
+        ) -> Result<LanguageModelResponse, LanguageModelError> {
+            let mut response = self.0.complete(request)?;
+            if response.content == "tool turn" {
+                response.content.clear();
+                response.tool_calls = vec![sinomo_lm::LanguageModelToolCall {
+                    call_id: Some("signed-call".into()),
+                    name: "echo".into(),
+                    input: serde_json::json!({"text":"hello"}),
+                    summary: None,
+                }];
+                response.items = vec![sinomo_lm::LanguageModelResponseItem::ProviderContinuation {
+                    continuation: sinomo_lm::LanguageModelProviderContinuation {
+                        provider: response.provider.clone(),
+                        model: response.model.clone(),
+                        items: vec![serde_json::json!({"signature":"opaque-signature"})],
+                        tool_call_ids: vec!["signed-call".into()],
+                    },
+                }];
+            }
+            Ok(response)
+        }
+    }
+    let final_answer=serde_json::json!({"response_mode":"answer","text":"Done.","tool_calls":[],"background_handoff":null,"next_state":"listening"}).to_string();
+    let model = NativeStateModel(SequencedModel::new(["tool turn".to_string(), final_answer]));
+    let agent = Agent::new(model, "fake", "fake")
+        .with_tool_registry(AgentToolRegistry::new().with_tool(EchoTool));
+    let run = agent.run(&agent_input("use a tool")).unwrap();
+    let requests = agent.model.0.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].items.iter().any(|item|matches!(item,LanguageModelRequestItem::ProviderContinuation {continuation} if continuation.items[0]["signature"]=="opaque-signature")));
+    assert!(run.items.iter().any(|item|matches!(item,AgentItem::AssistantText {native_items,..} if native_items.iter().any(|item|matches!(item,LanguageModelRequestItem::ProviderContinuation {..})))));
+}
+
+#[test]
 fn agent_records_provider_stream_reasoning_tool_usage_and_finish_events() {
     let first_response = r#"{
         "response_mode": "defer",
@@ -1165,12 +1205,14 @@ fn openai_workspace_agent_surfaces_expose_apply_patch() {
         .iter()
         .find(|descriptor| descriptor.spec.name == "apply_patch")
         .expect("openai apply_patch descriptor");
-    assert!(apply_patch.provider_specs.iter().any(|spec| {
-        spec.provider == "openai"
-            && spec.custom.as_ref().is_some_and(|custom| {
-                matches!(&custom.format, AgentToolCustomFormat::Grammar { .. })
-            })
-    }));
+    for provider in ["openai", "codex"] {
+        assert!(apply_patch.provider_specs.iter().any(|spec| {
+            spec.provider == provider
+                && spec.custom.as_ref().is_some_and(|custom| {
+                    matches!(&custom.format, AgentToolCustomFormat::Grammar { .. })
+                })
+        }));
+    }
 
     let fake_config = AgentConfig::new("fake", "fake")
         .with_agent_definition(AgentDefinition::coding())

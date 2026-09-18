@@ -1516,6 +1516,7 @@ fn runtime_merge_advances_revision_for_inputs_queued_during_a_turn() {
     live.state_revision = 5;
     let mut completed = base;
     completed.transcript.push(AgentItem::AssistantText {
+        native_items: Vec::new(),
         item_id: TaskId::generate(),
         step_index: 0,
         content: "completed turn".to_string(),

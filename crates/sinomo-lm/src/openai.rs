@@ -7,8 +7,7 @@ use crate::{
     LanguageModelResponseFormat, LanguageModelResponseItem, LanguageModelRole,
     LanguageModelStreamEvent, LanguageModelToolCall, LanguageModelToolChoice,
     LanguageModelToolSpec, LanguageModelUsage, PROVIDER_DEFAULT_MODEL,
-    apply_provider_vendor_options_to_payload, read_server_sent_events, render_plain_prompt,
-    selected_model,
+    apply_provider_vendor_options_to_payload, read_server_sent_events, selected_model,
 };
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -145,6 +144,20 @@ impl OpenAiProvider {
         )
     }
 
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        crate::catalog::list_models(
+            &self.http,
+            &crate::catalog::endpoint(&self.config.api_base_url, "models"),
+            openai_headers(
+                &self.api_key()?,
+                Self::PROVIDER_ID,
+                &self.config.default_model,
+            )?,
+            crate::catalog::CatalogProtocol::OpenAi,
+            Self::PROVIDER_ID,
+        )
+    }
+
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
         let request = LanguageModelRequest {
             provider: Self::PROVIDER_ID.to_string(),
@@ -267,7 +280,13 @@ impl Default for OpenAiProvider {
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
     crate::parse_declared_context_window_tokens(model).or_else(|| {
         let model = model.to_ascii_lowercase();
-        if model.contains("gpt-5.6") {
+        if model.contains("gpt-5.6")
+            || model.starts_with("gpt-6")
+            || matches!(
+                model.as_str(),
+                "gpt-5.4" | "gpt-5.4-pro" | "gpt-5.5" | "gpt-5.5-pro"
+            )
+        {
             Some(OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS)
         } else if model.contains("gpt-5")
             || model.contains("gpt-4.1")
@@ -283,7 +302,13 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
 
 pub(crate) fn inferred_max_context_window_tokens(model: &str) -> Option<usize> {
     let model = model.to_ascii_lowercase();
-    if model.contains("gpt-5.6") {
+    if model.contains("gpt-5.6")
+        || model.starts_with("gpt-6")
+        || matches!(
+            model.as_str(),
+            "gpt-5.4" | "gpt-5.4-pro" | "gpt-5.5" | "gpt-5.5-pro"
+        )
+    {
         Some(OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS)
     } else {
         inferred_context_window_tokens(&model)
@@ -296,6 +321,9 @@ pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
 }
 
 impl LanguageModelProvider for OpenAiProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: Self::PROVIDER_ID.to_string(),
@@ -353,11 +381,7 @@ impl LanguageModelProvider for OpenAiProvider {
         })?;
         let content = extract_openai_response_text(&value);
         let tool_calls = extract_openai_tool_calls(&value);
-        let items = tool_calls
-            .iter()
-            .cloned()
-            .map(|call| LanguageModelResponseItem::ToolCall { call })
-            .collect();
+        let items = openai_response_items(&value, Self::PROVIDER_ID, &model, &tool_calls);
         let usage = value.get("usage").map(|usage| LanguageModelUsage {
             input_tokens: usage
                 .get("input_tokens")
@@ -456,7 +480,7 @@ pub(crate) fn openai_responses_payload(
         .map(|message| message.content.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let input = openai_responses_input(request);
+    let input = openai_responses_input(request, model);
     let mut payload = serde_json::json!({
         "model": model,
         "input": input,
@@ -491,10 +515,18 @@ pub(crate) fn openai_responses_payload(
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
     }
-    if let Some(effort) = options
-        .reasoning_effort
-        .and_then(|effort| effort.as_openai_responses_value())
-    {
+    if let Some(effort) = options.reasoning_effort.and_then(|effort| {
+        if model.starts_with("gpt-6") || model.starts_with("gpt-5.6") {
+            Some(match effort {
+                crate::ProviderReasoningEffort::Max | crate::ProviderReasoningEffort::Ultra => {
+                    "max"
+                }
+                _ => effort.as_config_value(),
+            })
+        } else {
+            effort.as_openai_responses_value()
+        }
+    }) {
         payload["reasoning"] = serde_json::json!({ "effort": effort });
     }
     if let Some(verbosity) = options.text_verbosity {
@@ -506,7 +538,15 @@ pub(crate) fn openai_responses_payload(
         }
         payload["text"]["verbosity"] = serde_json::json!(verbosity.as_config_value());
     }
+    if matches!(request.provider.as_str(), "openai" | "github-copilot") {
+        payload["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    }
     apply_provider_vendor_options_to_payload(&mut payload, options);
+    if model.starts_with("gpt-6") {
+        for key in ["temperature", "top_p", "top_logprobs"] {
+            payload.as_object_mut().unwrap().remove(key);
+        }
+    }
     payload
 }
 
@@ -769,14 +809,21 @@ fn openai_responses_tool_spec(tool: &LanguageModelToolSpec) -> serde_json::Value
     })
 }
 
-fn openai_responses_input(request: &LanguageModelRequest) -> serde_json::Value {
-    let items = request
-        .items
+fn openai_responses_input(request: &LanguageModelRequest, model: &str) -> serde_json::Value {
+    let items = crate::provider_request_items(request, &request.provider, model)
         .iter()
-        .filter_map(|item| openai_responses_input_item(item, &request.tools))
+        .flat_map(|item| match item {
+            LanguageModelRequestItem::ProviderContinuation { continuation } => {
+                continuation.items.clone()
+            }
+            _ => openai_responses_input_item(item, &request.tools)
+                .into_iter()
+                .collect(),
+        })
         .collect::<Vec<_>>();
     if items.is_empty() {
-        serde_json::json!(render_openai_input_prompt(request))
+        serde_json::json!(request.messages.iter().filter(|message|message.role!=LanguageModelRole::System)
+            .map(|message|serde_json::json!({"role":openai_message_role(&message.role),"content":message.content})).collect::<Vec<_>>())
     } else {
         serde_json::Value::Array(items)
     }
@@ -787,6 +834,7 @@ fn openai_responses_input_item(
     tools: &[LanguageModelToolSpec],
 ) -> Option<serde_json::Value> {
     match item {
+        LanguageModelRequestItem::ProviderContinuation { .. } => None,
         LanguageModelRequestItem::Message { role, content } => {
             if *role == LanguageModelRole::System || content.trim().is_empty() {
                 return None;
@@ -808,7 +856,12 @@ fn openai_responses_input_item(
             name,
             input,
         } => {
-            if openai_custom_tool_spec_by_name(name, tools).is_some() {
+            if let Some(custom) = openai_custom_tool_spec_by_name(name, tools) {
+                let input = custom
+                    .raw_input_argument
+                    .as_deref()
+                    .and_then(|key| input.get(key))
+                    .unwrap_or(input);
                 Some(serde_json::json!({
                     "type": "custom_tool_call",
                     "call_id": call_id,
@@ -942,29 +995,6 @@ fn normalized_tool_input_schema(tool: &LanguageModelToolSpec) -> serde_json::Val
         })
     } else {
         tool.input_schema.clone()
-    }
-}
-
-fn render_openai_input_prompt(request: &LanguageModelRequest) -> String {
-    let mut prompt = String::new();
-    for message in request
-        .messages
-        .iter()
-        .filter(|message| message.role != LanguageModelRole::System)
-    {
-        prompt.push_str(match message.role {
-            LanguageModelRole::User => "user",
-            LanguageModelRole::Assistant => "assistant",
-            LanguageModelRole::System => "system",
-        });
-        prompt.push_str(":\n");
-        prompt.push_str(&message.content);
-        prompt.push_str("\n\n");
-    }
-    if prompt.is_empty() {
-        render_plain_prompt(request)
-    } else {
-        prompt
     }
 }
 
@@ -1117,7 +1147,8 @@ pub(crate) fn stream_openai_responses_response(
         Ok(())
     })?;
 
-    let mut final_response = completed_response.unwrap_or_else(|| serde_json::json!({}));
+    let mut final_response = completed_response
+        .ok_or_else(|| crate::incomplete_provider_stream(provider, model, on_event))?;
     let missing_or_empty_output = final_response
         .get("output")
         .and_then(serde_json::Value::as_array)
@@ -1146,6 +1177,11 @@ pub(crate) fn stream_openai_responses_response(
             .cloned()
             .map(|call| LanguageModelResponseItem::ToolCall { call }),
     );
+    items.extend(
+        openai_response_items(&final_response, provider, model, &tool_calls)
+            .into_iter()
+            .filter(|item| matches!(item, LanguageModelResponseItem::ProviderContinuation { .. })),
+    );
     let usage = extract_openai_usage(&final_response);
     if !emitted_finished {
         if let Some(usage) = &usage {
@@ -1166,6 +1202,36 @@ pub(crate) fn stream_openai_responses_response(
         tool_calls,
         usage,
     })
+}
+
+pub(crate) fn openai_response_items(
+    value: &serde_json::Value,
+    provider: &str,
+    model: &str,
+    calls: &[LanguageModelToolCall],
+) -> Vec<LanguageModelResponseItem> {
+    let mut items: Vec<_> = calls
+        .iter()
+        .cloned()
+        .map(|call| LanguageModelResponseItem::ToolCall { call })
+        .collect();
+    let output = value
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("message" | "reasoning" | "function_call" | "custom_tool_call")
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !output.is_empty() {
+        items.push(crate::response_continuation(provider, model, output, calls));
+    }
+    items
 }
 
 pub(crate) fn extract_openai_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
@@ -1346,10 +1412,10 @@ mod tests {
         assert_eq!(payload["max_output_tokens"], 200);
         assert_eq!(payload["text"]["format"]["type"], "json_object");
         assert!(
-            payload["input"]
+            payload["input"][0]["content"]
                 .as_str()
                 .unwrap()
-                .contains("user:\nSummarize evt_1.")
+                .contains("Summarize evt_1.")
         );
     }
 

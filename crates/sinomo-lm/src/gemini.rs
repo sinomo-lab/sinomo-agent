@@ -1,9 +1,13 @@
+mod wire;
+
+pub use sinomo_runtime::api::lm::GEMINI_DEFAULT_MODEL;
+
 use crate::api_key::{default_api_key_credentials_path, resolve_api_key, save_api_key_credential};
 use crate::{
     LanguageModelError, LanguageModelInvocation, LanguageModelMessage, LanguageModelProvider,
     LanguageModelProviderInfo, LanguageModelRequest, LanguageModelResponse,
     LanguageModelResponseFormat, LanguageModelRole, LanguageModelStreamEvent, LanguageModelUsage,
-    PROVIDER_DEFAULT_MODEL, read_server_sent_events, render_plain_prompt, selected_model,
+    PROVIDER_DEFAULT_MODEL, render_plain_prompt, selected_model,
 };
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
@@ -15,11 +19,13 @@ pub struct GeminiConfig {
     pub default_model: String,
     pub api_key: Option<String>,
     pub credentials_path: Option<PathBuf>,
+    pub options: crate::LanguageModelProviderOptions,
 }
 
 impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
+            options: crate::LanguageModelProviderOptions::default(),
             api_base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_model: sinomo_runtime::api::lm::GEMINI_DEFAULT_MODEL.to_string(),
             api_key: None,
@@ -75,6 +81,20 @@ impl GeminiProvider {
         )
     }
 
+    pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        crate::catalog::list_models(
+            &self.http,
+            &crate::catalog::endpoint(&self.config.api_base_url, "models"),
+            gemini_headers(
+                &self.api_key()?,
+                Self::PROVIDER_ID,
+                &self.config.default_model,
+            )?,
+            crate::catalog::CatalogProtocol::Gemini,
+            Self::PROVIDER_ID,
+        )
+    }
+
     pub fn test_connection(&self) -> Result<(), LanguageModelError> {
         let request = LanguageModelRequest {
             provider: Self::PROVIDER_ID.to_string(),
@@ -107,6 +127,9 @@ pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
 }
 
 impl LanguageModelProvider for GeminiProvider {
+    fn available_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        self.list_models()
+    }
     fn info(&self) -> LanguageModelProviderInfo {
         LanguageModelProviderInfo {
             provider: Self::PROVIDER_ID.to_string(),
@@ -134,7 +157,11 @@ impl LanguageModelProvider for GeminiProvider {
             .http
             .post(url)
             .headers(gemini_headers(&api_key, Self::PROVIDER_ID, &model)?)
-            .json(&gemini_generate_content_payload(request, &model))
+            .json(&gemini_payload_with_options(
+                request,
+                &model,
+                &self.config.options,
+            )?)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -159,17 +186,7 @@ impl LanguageModelProvider for GeminiProvider {
                 detail: source.to_string(),
             }
         })?;
-        let content = extract_gemini_response_text(&value);
-        let usage = extract_gemini_usage(&value);
-
-        Ok(LanguageModelResponse {
-            provider: Self::PROVIDER_ID.to_string(),
-            model,
-            content,
-            items: Vec::new(),
-            tool_calls: Vec::new(),
-            usage,
-        })
+        Ok(wire::response(&value, &model))
     }
 
     fn complete_streaming_events(
@@ -190,7 +207,11 @@ impl LanguageModelProvider for GeminiProvider {
             .http
             .post(url)
             .headers(headers)
-            .json(&gemini_generate_content_payload(request, &model))
+            .json(&gemini_payload_with_options(
+                request,
+                &model,
+                &self.config.options,
+            )?)
             .send()
             .map_err(|source| LanguageModelError::ProviderInvocationFailed {
                 provider: Self::PROVIDER_ID.to_string(),
@@ -248,7 +269,7 @@ fn gemini_model_path(model: &str) -> String {
 
 pub(crate) fn gemini_generate_content_payload(
     request: &LanguageModelRequest,
-    _model: &str,
+    model: &str,
 ) -> serde_json::Value {
     let system = request
         .messages
@@ -271,6 +292,10 @@ pub(crate) fn gemini_generate_content_payload(
             })
         })
         .collect();
+    let native_contents = wire::contents(request, model);
+    if !native_contents.is_empty() {
+        contents = native_contents;
+    }
     if contents.is_empty() {
         contents.push(serde_json::json!({
             "role": "user",
@@ -309,24 +334,14 @@ pub(crate) fn gemini_generate_content_payload(
 
 pub(crate) fn extract_gemini_response_text(value: &serde_json::Value) -> String {
     value
-        .get("candidates")
+        .pointer("/candidates/0/content/parts")
         .and_then(serde_json::Value::as_array)
-        .map(|candidates| {
-            candidates
-                .iter()
-                .flat_map(|candidate| {
-                    candidate
-                        .get("content")
-                        .and_then(|content| content.get("parts"))
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                })
-                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["thought"] != true)
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 pub(crate) fn extract_gemini_usage(value: &serde_json::Value) -> Option<LanguageModelUsage> {
@@ -336,7 +351,8 @@ pub(crate) fn extract_gemini_usage(value: &serde_json::Value) -> Option<Language
             .and_then(serde_json::Value::as_u64),
         output_tokens: usage
             .get("candidatesTokenCount")
-            .and_then(serde_json::Value::as_u64),
+            .and_then(serde_json::Value::as_u64)
+            .map(|count| count.saturating_add(usage["thoughtsTokenCount"].as_u64().unwrap_or(0))),
     })
 }
 
@@ -345,66 +361,17 @@ fn stream_gemini_generate_content_response(
     model: &str,
     on_event: &mut dyn FnMut(LanguageModelStreamEvent),
 ) -> Result<LanguageModelResponse, LanguageModelError> {
-    let mut content = String::new();
-    let mut usage = None;
-    let mut finish_reason = None;
+    wire::stream(response, model, on_event)
+}
 
-    read_server_sent_events(response, GeminiProvider::PROVIDER_ID, model, |event| {
-        let value = serde_json::from_str::<serde_json::Value>(&event.data).map_err(|source| {
-            LanguageModelError::ProviderInvocationFailed {
-                provider: GeminiProvider::PROVIDER_ID.to_string(),
-                model: model.to_string(),
-                detail: format!(
-                    "failed to parse Gemini stream event: {source}: {}",
-                    event.data
-                ),
-            }
-        })?;
-        if let Some(detail) = value
-            .pointer("/error/message")
-            .and_then(serde_json::Value::as_str)
-        {
-            on_event(LanguageModelStreamEvent::Error {
-                detail: detail.to_string(),
-            });
-            return Err(LanguageModelError::ProviderInvocationFailed {
-                provider: GeminiProvider::PROVIDER_ID.to_string(),
-                model: model.to_string(),
-                detail: detail.to_string(),
-            });
-        }
-        let delta = extract_gemini_response_text(&value);
-        if !delta.is_empty() {
-            content.push_str(&delta);
-            on_event(LanguageModelStreamEvent::TextDelta { delta });
-        }
-        if let Some(event_usage) = extract_gemini_usage(&value) {
-            usage = Some(event_usage);
-        }
-        if let Some(reason) = value
-            .pointer("/candidates/0/finishReason")
-            .and_then(serde_json::Value::as_str)
-        {
-            finish_reason = Some(reason.to_string());
-        }
-        Ok(())
-    })?;
-
-    if let Some(usage) = &usage {
-        on_event(LanguageModelStreamEvent::Usage {
-            usage: usage.clone(),
-        });
-    }
-    on_event(LanguageModelStreamEvent::Finished { finish_reason });
-
-    Ok(LanguageModelResponse {
-        provider: GeminiProvider::PROVIDER_ID.to_string(),
-        model: model.to_string(),
-        content,
-        items: Vec::new(),
-        tool_calls: Vec::new(),
-        usage,
-    })
+fn gemini_payload_with_options(
+    request: &LanguageModelRequest,
+    model: &str,
+    options: &crate::LanguageModelProviderOptions,
+) -> Result<serde_json::Value, LanguageModelError> {
+    let mut payload = gemini_generate_content_payload(request, model);
+    wire::options(&mut payload, request, model, options)?;
+    Ok(payload)
 }
 
 #[cfg(test)]

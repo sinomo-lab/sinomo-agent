@@ -139,12 +139,10 @@ pub(super) fn descriptor() -> AgentToolDescriptor {
                 }
             }
         }))
-        .with_provider_specs([AgentToolProviderSpec::custom_grammar(
-            "openai",
-            "lark",
-            APPLY_PATCH_LARK_GRAMMAR,
-        )
-        .with_raw_input_argument("patch")])
+        .with_provider_specs(["openai", "codex"].map(|provider| {
+            AgentToolProviderSpec::custom_grammar(provider, "lark", APPLY_PATCH_LARK_GRAMMAR)
+                .with_raw_input_argument("patch")
+        }))
 }
 
 fn input_patch_string(call: &AgentToolCall) -> Option<String> {

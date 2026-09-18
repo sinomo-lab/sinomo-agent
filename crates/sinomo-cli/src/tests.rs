@@ -17011,6 +17011,39 @@ fn model_options_parser_accepts_reasoning_and_vendor_options() {
 }
 
 #[test]
+fn model_options_parser_accepts_codex_max_and_ultra() {
+    for (value, effort) in [
+        ("max", ProviderReasoningEffort::Max),
+        ("ultra", ProviderReasoningEffort::Ultra),
+    ] {
+        let ModelsCliCommand::Options(ModelOptionsCliCommand::Set(options)) = parse_models_args(&[
+            "options",
+            "set",
+            "--provider",
+            "codex",
+            "--model",
+            "gpt-6-astra",
+            "--reasoning-effort",
+            value,
+            "--vendor-option",
+            "service_tier=priority",
+        ])
+        .expect("Codex model options") else {
+            panic!("expected model options set")
+        };
+        assert_eq!(
+            options.reasoning_effort,
+            Some(ModelOptionValueUpdate::Set(effort))
+        );
+        assert_eq!(options.target.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(
+            options.vendor_options,
+            vec![("service_tier".to_string(), "priority".to_string())]
+        );
+    }
+}
+
+#[test]
 fn model_options_parser_distinguishes_clear_from_none() {
     let ModelsCliCommand::Options(command) = parse_models_args(&[
         "options",

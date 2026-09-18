@@ -26,6 +26,13 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+mod models;
+mod wire;
+use models::builtin_model_info;
+pub use models::{
+    CodexModelInfo, CodexReasoningLevel, CodexServiceTier, codex_builtin_model_catalog,
+};
+
 pub use sinomo_runtime::api::lm::CODEX_DEFAULT_MODEL;
 pub use sinomo_runtime::api::lm::CODEX_PROVIDER_ID;
 const LEGACY_CODEX_CHATGPT_DEFAULT_MODEL: &str = "gpt-5.2-codex";
@@ -35,8 +42,9 @@ pub const SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR: &str = "SINOMO_CODEX_CREDENTIAL
 pub const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 pub const CODEX_AUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CODEX_CHATGPT_API_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-// Match the open-source Codex workspace version used by its models manager.
-pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.0.0";
+// Catalog compatibility floor at upstream c775dd3c3 (including GPT-6 Astra).
+// Upstream Cargo.toml uses a development placeholder, which hides version-gated models.
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.153.0";
 /// The image model the Codex backend serves to ChatGPT subscription sign-ins.
 pub const CODEX_DEFAULT_IMAGE_MODEL: &str = crate::openai::OPENAI_DEFAULT_IMAGE_MODEL;
 /// The Codex backend's standalone web search endpoint, relative to the API base URL.
@@ -193,7 +201,15 @@ fn missing_codex_chatgpt_auth() -> LanguageModelError {
 }
 
 pub(crate) fn inferred_context_window_tokens(model: &str) -> Option<usize> {
-    crate::openai::inferred_context_window_tokens(model)
+    builtin_model_info(model)
+        .and_then(|info| info.context_window)
+        .or_else(|| crate::openai::inferred_context_window_tokens(model))
+}
+
+pub(crate) fn inferred_max_context_window_tokens(model: &str) -> Option<usize> {
+    builtin_model_info(model)
+        .and_then(|info| info.max_context_window.or(info.context_window))
+        .or_else(|| crate::openai::inferred_max_context_window_tokens(model))
 }
 
 pub(crate) fn prefers_native_tool_protocol(model: &str) -> bool {
@@ -418,6 +434,7 @@ fn jwt_auth_claims(jwt: &str) -> serde_json::Value {
 pub struct OpenAiResponsesCodexClient {
     config: OpenAiResponsesCodexConfig,
     http: Client,
+    models: std::sync::Arc<std::sync::RwLock<Vec<CodexModelInfo>>>,
 }
 
 impl OpenAiResponsesCodexClient {
@@ -426,7 +443,11 @@ impl OpenAiResponsesCodexClient {
             .connect_timeout(config.transport_health_timeout)
             .build()
             .expect("Codex HTTP client configuration is valid");
-        Self { config, http }
+        Self {
+            config,
+            http,
+            models: Default::default(),
+        }
     }
 
     pub fn chatgpt_tokens(&self) -> Result<CodexChatGptTokens, LanguageModelError> {
@@ -448,6 +469,16 @@ impl OpenAiResponsesCodexClient {
     }
 
     pub fn list_models(&self) -> Result<Vec<String>, LanguageModelError> {
+        Ok(self
+            .list_model_catalog()?
+            .into_iter()
+            .map(|info| info.slug)
+            .collect())
+    }
+
+    /// Discover account-visible models and their provider capabilities.
+    /// A successful refresh also updates this client's request protocol defaults.
+    pub fn list_model_catalog(&self) -> Result<Vec<CodexModelInfo>, LanguageModelError> {
         let mut tokens = self.chatgpt_tokens()?;
         let mut response = self.get_models(&tokens)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -479,7 +510,7 @@ impl OpenAiResponsesCodexClient {
                 detail: format!("failed to decode Codex models response: {source}; body: {body}"),
             }
         })?;
-        let models = extract_codex_model_ids(&value);
+        let models = models::extract_model_catalog(&value);
         if models.is_empty() {
             return Err(LanguageModelError::ProviderInvocationFailed {
                 provider: CODEX_PROVIDER_ID.to_string(),
@@ -487,7 +518,18 @@ impl OpenAiResponsesCodexClient {
                 detail: "Codex backend models API returned no picker-visible models".to_string(),
             });
         }
+        if let Ok(mut cache) = self.models.write() {
+            *cache = models.clone();
+        }
         Ok(models)
+    }
+
+    fn model_info(&self, model: &str) -> Option<CodexModelInfo> {
+        self.models
+            .read()
+            .ok()
+            .and_then(|models| models.iter().find(|info| info.slug == model).cloned())
+            .or_else(|| builtin_model_info(model).cloned())
     }
 
     pub fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
@@ -880,7 +922,9 @@ impl CodexClient for OpenAiResponsesCodexClient {
             "{}/responses",
             self.config.api_base_url.trim_end_matches('/')
         );
-        let payload = openai_responses_codex_payload(&request);
+        let info = self.model_info(&request.model);
+        let payload = openai_responses_codex_payload_with_model(&request, info.as_ref())?;
+        wire::validate_model_options(&payload, info.as_ref())?;
         let response_model = request.model.clone();
         let worker_client = self.clone();
         let worker_cancellation = cancellation.clone();
@@ -1064,14 +1108,19 @@ impl OpenAiResponsesCodexClient {
                 "before HTTP request",
             )));
         }
-        let send = http
-            .post(url)
-            .headers(
-                codex_headers(tokens, CODEX_PROVIDER_ID, &request.model)
-                    .map_err(CodexHttpAttemptError::Terminal)?,
-            )
-            .json(payload)
-            .send();
+        let mut headers = codex_headers(tokens, CODEX_PROVIDER_ID, &request.model)
+            .map_err(CodexHttpAttemptError::Terminal)?;
+        if payload
+            .pointer("/input/0/type")
+            .and_then(serde_json::Value::as_str)
+            == Some("additional_tools")
+        {
+            headers.insert(
+                wire::RESPONSES_LITE_HEADER,
+                HeaderValue::from_static("true"),
+            );
+        }
+        let send = http.post(url).headers(headers).json(payload).send();
         tokio::pin!(send);
         let response = tokio::select! {
             _ = wait_for_codex_cancellation(cancellation) => {
@@ -1522,7 +1571,10 @@ impl CodexContextManager for DefaultCodexContextManager {
                 .map(CodexMessage::from_language_model_message)
                 .collect()
         } else {
-            codex_messages_from_request_items(&request.items)
+            codex_messages_from_request_items(
+                &crate::provider_request_items(request, CODEX_PROVIDER_ID, &request.model),
+                &request.tools,
+            )
         };
         if let Some(max_messages) = self.max_messages
             && messages.len() > max_messages
@@ -1627,6 +1679,10 @@ impl CodexProvider<OpenAiResponsesCodexClient> {
         self.client.list_models()
     }
 
+    pub fn list_model_catalog(&self) -> Result<Vec<CodexModelInfo>, LanguageModelError> {
+        self.client.list_model_catalog()
+    }
+
     pub fn usage(&self) -> Result<LanguageModelProviderUsage, LanguageModelError> {
         self.client.usage()
     }
@@ -1721,7 +1777,15 @@ where
         on_event: &mut dyn FnMut(LanguageModelStreamEvent),
     ) -> Result<LanguageModelResponse, LanguageModelError> {
         let model = selected_model(&self.config.default_model, request);
-        let mut messages = self.context_manager.prepare_messages(request);
+        let context_request = if request.model == model {
+            std::borrow::Cow::Borrowed(request)
+        } else {
+            std::borrow::Cow::Owned(LanguageModelRequest {
+                model: model.clone(),
+                ..request.clone()
+            })
+        };
+        let mut messages = self.context_manager.prepare_messages(&context_request);
         if let Some(system_prompt) = self.prompt_builder.build_system_prompt(request) {
             messages.insert(0, CodexMessage::system(system_prompt));
         }
@@ -1755,8 +1819,12 @@ where
             if response.tool_calls.is_empty() {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
+                    items: codex_language_model_response_items(
+                        &response,
+                        &self.config.provider_id,
+                        &model,
+                    ),
                     model,
-                    items: codex_language_model_response_items(&response),
                     content: response.content,
                     tool_calls: Vec::new(),
                     usage: response.usage,
@@ -1770,8 +1838,12 @@ where
             {
                 return Ok(LanguageModelResponse {
                     provider: self.config.provider_id.clone(),
+                    items: codex_language_model_response_items(
+                        &response,
+                        &self.config.provider_id,
+                        &model,
+                    ),
                     model,
-                    items: codex_language_model_response_items(&response),
                     content: response.content,
                     tool_calls: codex_language_model_tool_calls(&response.tool_calls),
                     usage: response.usage,
@@ -1791,7 +1863,17 @@ where
 
             for call in response.tool_calls {
                 let result = self.tools.execute(&call);
-                messages.push(CodexMessage::tool_result(result));
+                if tools
+                    .iter()
+                    .any(|tool| tool.name == call.name && tool.custom.is_some())
+                {
+                    messages.push(CodexMessage::raw_item(serde_json::json!({
+                        "type": "custom_tool_call_output", "call_id": result.call_id,
+                        "name": result.name, "output": result.content,
+                    })));
+                } else {
+                    messages.push(CodexMessage::tool_result(result));
+                }
             }
         }
 
@@ -1865,6 +1947,8 @@ pub struct CodexToolDescriptor {
     pub name: String,
     pub description: String,
     pub parameters: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom: Option<crate::LanguageModelCustomToolSpec>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -2037,32 +2121,12 @@ fn codex_headers_with_accept(
     Ok(headers)
 }
 
+#[cfg(test)]
 fn extract_codex_model_ids(value: &serde_json::Value) -> Vec<String> {
-    let Some(models) = value
-        .get("models")
-        .or_else(|| value.get("data"))
-        .and_then(serde_json::Value::as_array)
-        .or_else(|| value.as_array())
-    else {
-        return Vec::new();
-    };
-
-    let mut entries = models
-        .iter()
-        .filter_map(codex_model_list_entry)
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-
-    let mut seen = Vec::new();
-    let mut ids = Vec::new();
-    for (_, id) in entries {
-        if seen.iter().any(|existing| existing == &id) {
-            continue;
-        }
-        seen.push(id.clone());
-        ids.push(id);
-    }
-    ids
+    models::extract_model_catalog(value)
+        .into_iter()
+        .map(|info| info.slug)
+        .collect()
 }
 
 fn codex_model_list_entry(value: &serde_json::Value) -> Option<(i64, String)> {
@@ -2190,7 +2254,16 @@ fn codex_json_f64(value: Option<&serde_json::Value>) -> Option<f64> {
     }
 }
 
+#[cfg(test)]
 fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Value {
+    openai_responses_codex_payload_with_model(request, builtin_model_info(&request.model))
+        .expect("valid Codex test request")
+}
+
+fn openai_responses_codex_payload_with_model(
+    request: &CodexModelRequest,
+    info: Option<&CodexModelInfo>,
+) -> Result<serde_json::Value, LanguageModelError> {
     let instructions = codex_request_instructions(request);
     let mut input: Vec<serde_json::Value> = request
         .messages
@@ -2198,18 +2271,7 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
         .filter(|message| message.role != CodexRole::System)
         .map(openai_responses_input_item)
         .collect();
-    let tools: Vec<serde_json::Value> = request
-        .tools
-        .iter()
-        .map(|tool| {
-            serde_json::json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            })
-        })
-        .collect();
+    let tools: Vec<serde_json::Value> = request.tools.iter().map(wire::tool_spec).collect();
     if request.response_format == LanguageModelResponseFormat::JsonObject
         && !openai_responses_input_mentions_json(request)
     {
@@ -2227,12 +2289,13 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
         "instructions": instructions,
         "stream": true,
         "store": false,
+        "include": ["reasoning.encrypted_content"],
     });
     if !tools.is_empty() {
         payload["tools"] = serde_json::json!(tools);
     }
     if let Some(tool_choice) = &request.tool_choice {
-        payload["tool_choice"] = codex_responses_tool_choice(tool_choice);
+        payload["tool_choice"] = codex_responses_tool_choice(tool_choice, &request.tools);
     }
     if let Some(parallel_tool_calls) = request.parallel_tool_calls {
         payload["parallel_tool_calls"] = serde_json::json!(parallel_tool_calls);
@@ -2243,7 +2306,7 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
     if let Some(effort) = request
         .options
         .reasoning_effort
-        .and_then(|effort| effort.as_openai_responses_value())
+        .and_then(|effort| effort.as_codex_cli_value())
     {
         payload["reasoning"] = serde_json::json!({ "effort": effort });
     }
@@ -2257,7 +2320,8 @@ fn openai_responses_codex_payload(request: &CodexModelRequest) -> serde_json::Va
         payload["text"]["verbosity"] = serde_json::json!(verbosity.as_config_value());
     }
     apply_provider_vendor_options_to_payload(&mut payload, &request.options);
-    payload
+    wire::apply_model_profile(&mut payload, info)?;
+    Ok(payload)
 }
 
 fn openai_responses_input_mentions_json(request: &CodexModelRequest) -> bool {
@@ -2328,15 +2392,32 @@ fn openai_responses_input_item(message: &CodexMessage) -> serde_json::Value {
     }
 }
 
-fn codex_messages_from_request_items(items: &[LanguageModelRequestItem]) -> Vec<CodexMessage> {
+fn codex_messages_from_request_items(
+    items: &[LanguageModelRequestItem],
+    tools: &[LanguageModelToolSpec],
+) -> Vec<CodexMessage> {
     items
         .iter()
-        .filter_map(codex_message_from_request_item)
+        .flat_map(|item| match item {
+            LanguageModelRequestItem::ProviderContinuation { continuation } => continuation
+                .items
+                .iter()
+                .cloned()
+                .map(CodexMessage::raw_item)
+                .collect(),
+            _ => codex_message_from_request_item(item, tools)
+                .into_iter()
+                .collect::<Vec<_>>(),
+        })
         .collect()
 }
 
-fn codex_message_from_request_item(item: &LanguageModelRequestItem) -> Option<CodexMessage> {
+fn codex_message_from_request_item(
+    item: &LanguageModelRequestItem,
+    tools: &[LanguageModelToolSpec],
+) -> Option<CodexMessage> {
     match item {
+        LanguageModelRequestItem::ProviderContinuation { .. } => None,
         LanguageModelRequestItem::Message { role, content } => {
             if content.trim().is_empty() {
                 return None;
@@ -2350,12 +2431,32 @@ fn codex_message_from_request_item(item: &LanguageModelRequestItem) -> Option<Co
             call_id,
             name,
             input,
+        } if wire::custom_tool(name, tools).is_some() => {
+            Some(CodexMessage::raw_item(serde_json::json!({
+                "type": "custom_tool_call", "call_id": call_id, "name": name,
+                "input": wire::custom_input(input, wire::custom_tool(name, tools).unwrap()),
+            })))
+        }
+        LanguageModelRequestItem::ToolCall {
+            call_id,
+            name,
+            input,
         } => Some(CodexMessage::raw_item(serde_json::json!({
             "type": "function_call",
             "call_id": call_id,
             "name": name,
             "arguments": codex_tool_value_text(input),
         }))),
+        LanguageModelRequestItem::ToolCallOutput {
+            call_id,
+            name,
+            output,
+        } if wire::custom_tool(name, tools).is_some() => {
+            Some(CodexMessage::raw_item(serde_json::json!({
+                "type": "custom_tool_call_output", "call_id": call_id, "name": name,
+                "output": codex_tool_value_text(output),
+            })))
+        }
         LanguageModelRequestItem::ToolCallOutput {
             call_id,
             name,
@@ -2399,6 +2500,7 @@ fn codex_tool_descriptors(
             name: tool.name.clone(),
             description: tool.description.clone(),
             parameters: normalized_codex_tool_input_schema(tool),
+            custom: wire::custom_tool(&tool.name, tools).cloned(),
         });
     }
     descriptors
@@ -2422,19 +2524,24 @@ fn codex_tool_value_text(value: &serde_json::Value) -> String {
     }
 }
 
-fn codex_responses_tool_choice(tool_choice: &LanguageModelToolChoice) -> serde_json::Value {
+fn codex_responses_tool_choice(
+    tool_choice: &LanguageModelToolChoice,
+    tools: &[CodexToolDescriptor],
+) -> serde_json::Value {
     match tool_choice {
         LanguageModelToolChoice::Auto => serde_json::json!("auto"),
         LanguageModelToolChoice::None => serde_json::json!("none"),
         LanguageModelToolChoice::Required => serde_json::json!("required"),
         LanguageModelToolChoice::Tool { name } => {
-            serde_json::json!({ "type": "function", "name": name })
+            serde_json::json!({ "type": if tools.iter().any(|tool| tool.name == *name && tool.custom.is_some()) { "custom" } else { "function" }, "name": name })
         }
     }
 }
 
 fn codex_language_model_response_items(
     response: &CodexModelResponse,
+    provider: &str,
+    model: &str,
 ) -> Vec<LanguageModelResponseItem> {
     let mut items = response
         .tool_calls
@@ -2443,6 +2550,14 @@ fn codex_language_model_response_items(
             call: codex_language_model_tool_call(call),
         })
         .collect::<Vec<_>>();
+    if !response.continuation_items.is_empty() {
+        items.push(crate::response_continuation(
+            provider,
+            model,
+            response.continuation_items.clone(),
+            &codex_language_model_tool_calls(&response.tool_calls),
+        ));
+    }
     if !response.content.trim().is_empty() {
         items.push(LanguageModelResponseItem::Message {
             role: LanguageModelRole::Assistant,
@@ -2486,7 +2601,7 @@ fn parse_openai_responses_codex_response(value: &serde_json::Value) -> CodexMode
         .filter(|item| {
             matches!(
                 item.get("type").and_then(serde_json::Value::as_str),
-                Some("function_call" | "reasoning")
+                Some("function_call" | "custom_tool_call" | "reasoning" | "message" | "compaction")
             )
         })
         .collect();
@@ -2771,7 +2886,7 @@ fn stream_events_from_openai_output_item(
             .into_iter()
             .map(|summary| LanguageModelStreamEvent::ReasoningSummary { summary })
             .collect(),
-        "function_call" => parse_function_call_item(item)
+        "function_call" | "custom_tool_call" => parse_function_call_item(item)
             .map(|call| {
                 vec![
                     LanguageModelStreamEvent::ToolCallStarted {
@@ -2919,14 +3034,20 @@ fn extract_output_text(output: &[serde_json::Value]) -> String {
 }
 
 fn parse_function_call_item(item: &serde_json::Value) -> Option<CodexToolCall> {
-    if item.get("type").and_then(serde_json::Value::as_str) != Some("function_call") {
+    let kind = item.get("type").and_then(serde_json::Value::as_str);
+    if !matches!(kind, Some("function_call" | "custom_tool_call")) {
         return None;
     }
-    let arguments = item
-        .get("arguments")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|arguments| serde_json::from_str(arguments).ok())
-        .unwrap_or(serde_json::Value::Null);
+    let arguments = if kind == Some("custom_tool_call") {
+        item.get("input")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    } else {
+        item.get("arguments")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|arguments| serde_json::from_str(arguments).ok())
+            .unwrap_or(serde_json::Value::Null)
+    };
     Some(CodexToolCall {
         call_id: item
             .get("call_id")
@@ -2934,14 +3055,23 @@ fn parse_function_call_item(item: &serde_json::Value) -> Option<CodexToolCall> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        name: item
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        name: {
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            match item.get("namespace").and_then(serde_json::Value::as_str) {
+                None | Some("" | "functions") => name.to_string(),
+                Some(namespace) => format!("{namespace}.{name}"),
+            }
+        },
         input: arguments,
     })
 }
+
+#[cfg(test)]
+#[path = "codex/compatibility_tests.rs"]
+mod compatibility_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3000,7 +3130,7 @@ mod tests {
         }
     }
 
-    fn transport_client(
+    pub(super) fn transport_client(
         base_url: &str,
         health_timeout: Duration,
         dir: &sinomo_testdir::TestDir,
@@ -3025,7 +3155,7 @@ mod tests {
         })
     }
 
-    fn test_server(
+    pub(super) fn test_server(
         handler: impl FnOnce(TcpListener) + Send + 'static,
     ) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
@@ -3056,7 +3186,7 @@ mod tests {
     /// test binary wedges instead of reporting a failure. Nothing times it out and nothing kills it,
     /// so a run can sit for hours. Polling to a deadline turns that into a legible assertion naming
     /// the request that never came.
-    fn accept_expected(listener: &TcpListener, expectation: &str) -> TcpStream {
+    pub(super) fn accept_expected(listener: &TcpListener, expectation: &str) -> TcpStream {
         listener
             .set_nonblocking(true)
             .expect("nonblocking test listener");
@@ -3089,6 +3219,14 @@ mod tests {
 
     /// Reads a request and keeps its body so payload-shaping assertions can inspect it.
     fn read_http_request_with_body(stream: &mut TcpStream) -> (String, String) {
+        let (headers, body) = read_http_request_parts(stream);
+        (
+            headers.lines().next().expect("request line").to_string(),
+            body,
+        )
+    }
+
+    pub(super) fn read_http_request_parts(stream: &mut TcpStream) -> (String, String) {
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("request read timeout");
@@ -3118,7 +3256,7 @@ mod tests {
             bytes.extend_from_slice(&buffer[..read]);
         }
         (
-            headers.lines().next().expect("request line").to_string(),
+            headers,
             String::from_utf8_lossy(&bytes[header_end..]).to_string(),
         )
     }
@@ -3369,7 +3507,7 @@ mod tests {
     #[test]
     fn openai_responses_payload_preserves_tools_and_tool_outputs() {
         let payload = openai_responses_codex_payload(&CodexModelRequest {
-            model: CODEX_DEFAULT_MODEL.to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![
                 CodexMessage::system("system prompt"),
                 CodexMessage::user("run tool"),
@@ -3399,7 +3537,7 @@ mod tests {
         });
 
         assert_eq!(payload["instructions"], "system prompt");
-        assert_eq!(payload["model"], CODEX_DEFAULT_MODEL);
+        assert_eq!(payload["model"], "gpt-5.5");
         assert_eq!(payload["tools"][0]["name"], "read_context");
         assert!(
             payload["input"][0]["content"]
@@ -3421,7 +3559,7 @@ mod tests {
     #[test]
     fn openai_responses_json_payload_does_not_duplicate_json_reminder() {
         let payload = openai_responses_codex_payload(&CodexModelRequest {
-            model: CODEX_DEFAULT_MODEL.to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![
                 CodexMessage::system("system prompt"),
                 CodexMessage::user("Return JSON for this decision."),
@@ -3468,7 +3606,7 @@ mod tests {
     #[test]
     fn openai_responses_payload_includes_default_instructions_without_system_prompt() {
         let payload = openai_responses_codex_payload(&CodexModelRequest {
-            model: CODEX_DEFAULT_MODEL.to_string(),
+            model: "gpt-5.5".to_string(),
             messages: vec![CodexMessage::user("hello")],
             tools: Vec::new(),
             temperature: None,
@@ -3603,7 +3741,7 @@ mod tests {
         assert_eq!(parsed.content, "partial");
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].input["path"], "README.md");
-        assert_eq!(parsed.continuation_items.len(), 2);
+        assert_eq!(parsed.continuation_items.len(), 3);
         assert_eq!(parsed.usage.unwrap().input_tokens, Some(10));
         assert!(parsed.stream_events.iter().any(|event| {
             matches!(
@@ -4756,6 +4894,7 @@ mod tests {
             CodexToolDescriptor {
                 name: "read_context".to_string(),
                 description: "Read scoped context.".to_string(),
+                custom: None,
                 parameters: serde_json::json!({
                     "type": "object",
                     "properties": {

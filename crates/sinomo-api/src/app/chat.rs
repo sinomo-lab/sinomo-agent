@@ -114,10 +114,12 @@ pub fn fallback_agent_summaries() -> Vec<AgentSummary> {
 }
 
 pub fn reasoning_efforts() -> Vec<String> {
-    ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
