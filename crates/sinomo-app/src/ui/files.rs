@@ -14797,7 +14797,7 @@ impl VirtualFileTaskContent {
         .spacing(Self::GAP)
         .selection_mode(VirtualListSelectionMode::None)
         .chrome(VirtualListChrome::Transparent)
-        .overlay_scroll_bars(false)
+        .scroll_bars(false)
         .theme_when(clone_reader(reader))
         .row_name(|_id, task| task.title.clone())
         .row_description(|_id, task| format!("{}; {}", task.state.label(), task.detail));
