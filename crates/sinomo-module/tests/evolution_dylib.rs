@@ -52,7 +52,11 @@ fn independently_built_evolution_dylib_serves_its_cli_contract() {
         .expect("evolution agent export");
     assert_eq!(
         evolution_agent.skills,
-        ["evolution-planning", "evolution-review"]
+        [
+            "evolution-orchestration",
+            "evolution-planning",
+            "evolution-review"
+        ]
     );
     assert!(
         evolution_agent
