@@ -24,7 +24,7 @@ impl Default for AnthropicConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://api.anthropic.com".to_string(),
-            default_model: "claude-sonnet-4-20250514".to_string(),
+            default_model: sinomo_runtime::api::lm::ANTHROPIC_DEFAULT_MODEL.to_string(),
             api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_ANTHROPIC_CREDENTIALS_FILE",
@@ -42,7 +42,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub const PROVIDER_ID: &'static str = "anthropic";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::ANTHROPIC_PROVIDER_ID;
 
     pub fn new(config: AnthropicConfig) -> Self {
         Self {

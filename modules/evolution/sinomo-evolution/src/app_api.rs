@@ -1,6 +1,6 @@
 //! Daemon-owned application projection over evolution persistence and commands.
 
-use sinomo_app_contract::evolution as contract;
+use sinomo_runtime::api::app::evolution as contract;
 use sinomo_runtime::local::SinomoDataDir;
 
 use crate::persistence::{

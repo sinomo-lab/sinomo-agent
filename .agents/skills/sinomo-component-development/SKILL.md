@@ -60,7 +60,7 @@ the shared `ActiveNativeComponent` binding rather than another host-loader crate
    best-effort component events.
 6. Register settings through `ConfigDefinition`/module settings surfaces and
    persistent paths through `SinomoDataDir` plus storage contributions. Reuse the
-   generic settings UI. Export metrics through `sinomo-observe-contract` instead
+   generic settings UI. Export metrics through `sinomo-module-api::observe` instead
    of linking an external module to the recorder's process-global state.
 
 For behavior/UI contributions, the extension-point owner defines schemas,

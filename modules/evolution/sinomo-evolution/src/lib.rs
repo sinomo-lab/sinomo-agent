@@ -45,7 +45,7 @@ pub const EVOLUTION_SCORECARD_STALE_EVENT_KIND: &str = "evolution.scorecard.stal
 
 pub fn evolution_module_id() -> sinomo_runtime::module::ModuleId {
     sinomo_runtime::module::ModuleId::from_legacy_named(
-        sinomo_app_contract::evolution::EVOLUTION_MODULE_ID,
+        sinomo_runtime::api::app::evolution::EVOLUTION_MODULE_ID,
     )
     .expect("valid evolution module id")
 }

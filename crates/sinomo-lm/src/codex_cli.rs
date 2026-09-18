@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const CODEX_CLI_DEFAULT_MODEL: &str = "codex-default";
+pub use sinomo_runtime::api::lm::CODEX_CLI_DEFAULT_MODEL;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CodexCliConfig {
@@ -86,7 +86,7 @@ pub struct CodexCliProvider {
 }
 
 impl CodexCliProvider {
-    pub const PROVIDER_ID: &'static str = "codex-cli";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::CODEX_CLI_PROVIDER_ID;
 
     pub fn new(config: CodexCliConfig) -> Self {
         Self { config }

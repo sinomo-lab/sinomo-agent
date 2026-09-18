@@ -9,7 +9,7 @@ use sinomo_module_api::{
     SINOMO_NATIVE_MODULE_ABI_VERSION, ServiceOffer, SinomoModuleByteBuffer, SinomoModuleByteSlice,
     ServiceOperationOffer, SinomoModuleHostApiV2, SinomoModuleStatusCode, decode_sobj, encode_sobj,
 };
-use sinomo_observe_contract::{
+use sinomo_module_api::observe::{
     OBSERVE_METRIC_EXPORTER_CATEGORY, OBSERVE_METRIC_EXPORTER_INTERFACE_ID,
     OBSERVE_METRIC_EXPORTER_INTERFACE_VERSION, OBSERVE_METRIC_EXPORTER_OPERATION,
     ObserveMetricDescriptor, ObserveMetricExportRequest, ObserveMetricExportResponse,

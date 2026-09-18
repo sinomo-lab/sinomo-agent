@@ -8,7 +8,7 @@ use sinomo_agent::{
     AgentPackageProvenance, AgentPackageSource, AgentRole, AgentToolDescriptor,
     default_agent_tool_descriptors, image_generation_descriptor, web_search_descriptor,
 };
-use sinomo_app_contract::agent as contract;
+use sinomo_runtime::api::app::agent as contract;
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,

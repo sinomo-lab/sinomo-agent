@@ -6,6 +6,7 @@
 
 mod component;
 mod extension;
+pub mod observe;
 mod ui;
 
 pub use component::*;

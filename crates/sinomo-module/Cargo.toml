@@ -12,6 +12,7 @@ include = ["**/*.rs", "Cargo.toml", "wit/**"]
 ring = "r1"
 
 [dependencies]
+sinomo-api.workspace = true
 arc-swap.workspace = true
 base64.workspace = true
 blake3.workspace = true
@@ -32,5 +33,4 @@ sinomo-device = { path = "../sinomo-device" }
 sinomo-module-api = { path = "../sinomo-module-api" }
 
 [dev-dependencies]
-sinomo-observe-contract = { path = "../sinomo-observe-contract" }
 sinomo-testdir = { path = "../sinomo-testdir" }

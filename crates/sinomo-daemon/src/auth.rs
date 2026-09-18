@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub use sinomo_api::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
+pub use crate::host_api::{AuthenticatedDaemonCommand, DaemonSignerAuthority};
 
 pub const DAEMON_AUTH_PROTOCOL: &str = sinomo_core::network::DAEMON_AUTH_PROTOCOL;
 pub const DAEMON_AUTH_MAX_CLOCK_SKEW_SECONDS: i64 = 300;
@@ -38,7 +38,8 @@ pub use sinomo_core::network::SignedDaemonCommand;
 /// zero. Replay protection is bounded by the signed-command clock-skew freshness
 /// check, so the only behavioral change is that a process restart forgets nonces
 /// from the trailing skew window — which the freshness check already constrains.
-static DAEMON_AUTH_NONCES: OnceLock<sinomo_api::ScopedReplayNonceCache<PathBuf>> = OnceLock::new();
+static DAEMON_AUTH_NONCES: OnceLock<crate::host_api::ScopedReplayNonceCache<PathBuf>> =
+    OnceLock::new();
 static DAEMON_AUTH_VERIFIER_CONTEXTS: OnceLock<
     Mutex<HashMap<PathBuf, CachedDaemonAuthVerifierContext>>,
 > = OnceLock::new();
@@ -1170,7 +1171,7 @@ fn remember_daemon_auth_nonce(
         .checked_add(time::Duration::seconds(DAEMON_AUTH_NONCE_RETENTION_SECONDS))
         .ok_or(DaemonError::AuthDenied)?;
     let remembered = DAEMON_AUTH_NONCES
-        .get_or_init(sinomo_api::ScopedReplayNonceCache::default)
+        .get_or_init(crate::host_api::ScopedReplayNonceCache::default)
         .remember(
             paths.root.clone(),
             daemon_auth_nonce_key(envelope),

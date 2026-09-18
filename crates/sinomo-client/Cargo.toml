@@ -13,9 +13,8 @@ ring = "r2"
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-sinomo-app-contract = { path = "../sinomo-app-contract" }
 tokio.workspace = true
-sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["client"] }
+sinomo-runtime = { path = "../sinomo-runtime", default-features = false, features = ["client", "module-client"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

@@ -265,11 +265,8 @@ fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
     );
     assert_eq!(
         client.dependencies,
-        vec![
-            "sinomo-app-contract".to_string(),
-            "sinomo-runtime".to_string(),
-        ],
-        "sinomo-client may compose the R2 app contract but must reach workspace foundations only through sinomo-runtime"
+        vec!["sinomo-runtime".to_string()],
+        "sinomo-client must reach shared API contracts and foundations through sinomo-runtime"
     );
     assert!(
         !app.dependencies.contains(&daemon_host.name),
@@ -298,6 +295,119 @@ fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
                 .contains(&"sinomo-runtime".to_string()),
         "the dedicated daemon host, not the GUI, owns full product composition"
     );
+}
+
+#[test]
+fn shared_contracts_are_modules_and_do_not_depend_on_their_hosts() {
+    let packages = read_workspace_packages();
+    for retired in [
+        "sinomo-app-contract",
+        "sinomo-lm-contract",
+        "sinomo-dfs-api",
+        "sinomo-module-client",
+        "sinomo-observe-contract",
+    ] {
+        assert!(
+            !packages.contains_key(retired),
+            "{retired} was consolidated into shared API modules"
+        );
+    }
+    let api = &packages["sinomo-api"];
+    for host in [
+        "sinomo-daemon",
+        "sinomo-dfs",
+        "sinomo-module",
+        "sinomo-observe",
+        "sinomo-runtime",
+    ] {
+        assert!(
+            !api.dependencies.iter().any(|dependency| dependency == host),
+            "shared API contracts must not depend on host {host}"
+        );
+    }
+    let module_api = &packages["sinomo-module-api"];
+    assert!(
+        !module_api.dependencies.iter().any(|dependency| matches!(
+            dependency.as_str(),
+            "sinomo-api" | "sinomo-core" | "sinomo-runtime" | "sinomo-observe"
+        )),
+        "the module ABI and exporter values must stay independent of the runtime and recorder"
+    );
+}
+
+#[test]
+fn desktop_client_profiles_exclude_daemon_implementations_transitively() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    // Query profiles independently: workspace feature unification and app test
+    // fixtures intentionally enable the host and cannot certify a GUI build.
+    for (package, features) in [
+        ("sinomo-api", ""),
+        ("sinomo-client", ""),
+        (
+            "sinomo-runtime",
+            "client,device-client,module-client,observe-client",
+        ),
+        ("sinomo-app", "desktop,native-devices"),
+    ] {
+        for target in [
+            "x86_64-pc-windows-msvc",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+        ] {
+            let mut command = std::process::Command::new(env!("CARGO"));
+            command.current_dir(workspace).args([
+                "tree",
+                "--locked",
+                "-p",
+                package,
+                "--edges",
+                "normal,build",
+                "--prefix",
+                "none",
+                "--target",
+                target,
+            ]);
+            if package == "sinomo-runtime" {
+                command.arg("--no-default-features");
+            }
+            if !features.is_empty() {
+                command.args(["--features", features]);
+            }
+            let output = command.output().expect("inspect client dependency graph");
+            assert!(
+                output.status.success(),
+                "{package} ({target}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let tree = String::from_utf8_lossy(&output.stdout);
+            let packages = tree
+                .lines()
+                .filter_map(|line| line.split_whitespace().next())
+                .collect::<std::collections::BTreeSet<_>>();
+            for forbidden in [
+                "sinomo-daemon",
+                "sinomo-dfs",
+                "sinomo-dfs-nfs",
+                "sinomo-module",
+                "sinomo-observe",
+                "sinomo-agent",
+                "sinomo-cli",
+                "sinomo-product-profile",
+                "sinomo-build",
+                "sinomo-rollout",
+                "sinomo-sandbox",
+                "sinomo-vfs-sifs",
+            ] {
+                assert!(
+                    !packages.contains(forbidden),
+                    "{package} ({target}) must not link daemon implementation {forbidden}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -15,12 +15,12 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-use sinomo_app_contract::evolution as evolution_contract;
 use sinomo_lm::{
     LM_PROVIDER_CONFIG_KEY, LanguageModelError, ModelConfig, model_config_definition,
     model_config_from_cluster_kv_snapshot, model_config_store, normalize_model_id_for_provider,
     normalize_model_provider, resolve_default_model,
 };
+use sinomo_runtime::api::app::evolution as evolution_contract;
 use sinomo_runtime::api::default_main_daemon_status as daemon_default_main_daemon_status;
 use sinomo_runtime::cli_registry::{
     CliAutocompleteOption, CliAutocompleteSpec, CliAutocompleteValue, CliCommand,

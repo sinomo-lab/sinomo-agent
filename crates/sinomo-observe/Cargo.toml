@@ -26,7 +26,6 @@ sinomo-api = { path = "../sinomo-api" }
 sinomo-core = { path = "../sinomo-core" }
 sinomo-dfs = { path = "../sinomo-dfs" }
 sinomo-module = { path = "../sinomo-module" }
-sinomo-observe-contract = { path = "../sinomo-observe-contract" }
 sysinfo.workspace = true
 thiserror.workspace = true
 time.workspace = true

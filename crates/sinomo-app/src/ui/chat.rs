@@ -4976,7 +4976,9 @@ impl ChatState {
     fn runtime_matches_selection(&self, provider: &str, model: &str, account: &str) -> bool {
         self.info.provider == provider
             && self.info.model == model
-            && sinomo_lm::normalize_provider_account_name(self.info.account.as_deref()) == account
+            && sinomo_runtime::api::lm::normalize_provider_account_name(
+                self.info.account.as_deref(),
+            ) == account
     }
 
     fn current_model_selection_command(&self) -> Option<ChatCommand> {
@@ -5518,7 +5520,8 @@ impl ChatState {
             .map(|p| p.id.clone())
             .unwrap_or_default();
         let model = self.current_model();
-        !provider.is_empty() && sinomo_lm::model_supports_reasoning_effort(&provider, &model)
+        !provider.is_empty()
+            && sinomo_runtime::api::lm::model_supports_reasoning_effort(&provider, &model)
     }
 
     /// The current model list for the active provider (for the composer's model `Select`).
@@ -18781,7 +18784,7 @@ mod tests {
         if state.providers.is_empty() {
             state.providers.push(ProviderSummary {
                 id: "openai".to_string(),
-                account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+                account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
                 name: "OpenAI".to_string(),
                 models: vec!["gpt-5".to_string()],
                 capabilities: crate::backend::config::provider_capabilities("openai"),
@@ -28428,7 +28431,7 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
             capabilities: crate::backend::config::provider_capabilities("deepseek"),
@@ -28457,7 +28460,7 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
             capabilities: crate::backend::config::provider_capabilities("deepseek"),
@@ -28470,7 +28473,7 @@ mod tests {
             agent: "main".to_string(),
             provider: "github-copilot".to_string(),
             model: "gpt-5.4".to_string(),
-            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            account: Some(sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
             effort: None,
         }));
 
@@ -28493,7 +28496,7 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: vec!["deepseek-v4-flash".to_string()],
             capabilities: crate::backend::config::provider_capabilities("deepseek"),
@@ -28505,7 +28508,7 @@ mod tests {
             agent: "main".to_string(),
             provider: "github-copilot".to_string(),
             model: "gpt-5.4".to_string(),
-            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            account: Some(sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
             effort: None,
         };
 
@@ -28520,7 +28523,7 @@ mod tests {
 
         assert_eq!(provider, "deepseek");
         assert_eq!(model, "deepseek-v4-flash");
-        assert_eq!(account, sinomo_lm::DEFAULT_PROVIDER_ACCOUNT);
+        assert_eq!(account, sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT);
         assert!(
             !state.runtime_matches_selection(&provider, &model, &account),
             "submit must switch the worker before sending when the runtime is stale"
@@ -28533,7 +28536,7 @@ mod tests {
         let mut state = ChatState::new(&backend);
         state.providers = vec![ProviderSummary {
             id: "deepseek".to_string(),
-            account: sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
+            account: sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string(),
             name: "DeepSeek".to_string(),
             models: Vec::new(),
             capabilities: crate::backend::config::provider_capabilities("deepseek"),
@@ -28545,7 +28548,7 @@ mod tests {
             agent: "main".to_string(),
             provider: "github-copilot".to_string(),
             model: "gpt-5.4".to_string(),
-            account: Some(sinomo_lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
+            account: Some(sinomo_runtime::api::lm::DEFAULT_PROVIDER_ACCOUNT.to_string()),
             effort: None,
         };
 

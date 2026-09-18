@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
 
+# Retired packages may leave empty directories in existing checkouts.
+exclude = [
+    "crates/sinomo-app-contract",
+    "crates/sinomo-dfs-api",
+    "crates/sinomo-lm-contract",
+    "crates/sinomo-module-client",
+    "crates/sinomo-observe-contract",
+]
+
 members = [
     "crates/*",
     "modules/*/*",
@@ -10,7 +19,6 @@ default-members = [
     "crates/sinomo",
     "crates/sinomo-actions",
     "crates/sinomo-agent",
-    "crates/sinomo-app-contract",
     "crates/sinomo-api",
     "crates/sinomo-app",
     "crates/sinomo-app-daemon",
@@ -45,7 +53,6 @@ default-members = [
     "crates/sinomo-node",
     "crates/sinomo-object",
     "crates/sinomo-observe",
-    "crates/sinomo-observe-contract",
     "crates/sinomo-policy",
     "crates/sinomo-product-profile",
     "crates/sinomo-pytorch",
@@ -118,6 +125,11 @@ wasmer-vm = { path = "modules/sandbox/wasix/vendor/wasmer-vm" }
 wasmer-wasix = { path = "modules/sandbox/wasix/vendor/wasmer-wasix" }
 
 [workspace.dependencies]
+sinomo-api = { path = "crates/sinomo-api" }
+sinomo-module-api = { path = "crates/sinomo-module-api" }
+sinomo-core = { path = "crates/sinomo-core", default-features = false }
+sinomo-config = { path = "crates/sinomo-config" }
+sinomo-testdir = { path = "crates/sinomo-testdir" }
 dunce = "1.0.5"
 toml_edit = "0.25.13"
 arc-swap = "1.9.2"

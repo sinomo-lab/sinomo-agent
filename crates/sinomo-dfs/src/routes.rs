@@ -1,20 +1,19 @@
 //! DFS object-RPC route constants and typed route/message conversion helpers.
 
 use crate::{
-    DaemonDfsInspectionRequest, DaemonDfsInspectionResponse, DfsFileSystemId, DfsMessageCommand,
-    DfsMessageResponse, DfsMetadataJournalBatchCommand, DfsMetadataJournalBatchResponse,
-    DfsMetadataShardConfig, DfsMetadataShardId, DfsMetadataSnapshotInstallCommand,
-    DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand, DfsNamespaceOperation,
-    DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
+    DfsFileSystemId, DfsMessageCommand, DfsMessageResponse, DfsMetadataJournalBatchCommand,
+    DfsMetadataJournalBatchResponse, DfsMetadataShardConfig, DfsMetadataShardId,
+    DfsMetadataSnapshotInstallCommand, DfsMetadataSnapshotInstallResponse, DfsNamespaceCommand,
+    DfsNamespaceOperation, DfsNetworkMessage, DfsOperatorStatus, DfsRoutedMessage, DfsSmokeReport,
 };
 use sinomo_core::network::{
     NetworkError, ObjectRpcCall, ObjectRpcReplayableCall, ObjectRpcRequest, ObjectRpcResponse,
 };
 use sinomo_core::node::NodeId;
 
-pub const DFS_RPC_CATEGORY: &str = "dfs";
+pub use sinomo_api::dfs::routes::DFS_RPC_CATEGORY;
 pub const DFS_STATUS_ROUTE: &str = "/dfs/status";
-pub const DFS_INSPECTION_ROUTE: &str = "/dfs/inspection";
+pub use sinomo_api::dfs::routes::DFS_INSPECTION_ROUTE;
 pub const DFS_SMOKE_ROUTE: &str = "/dfs/smoke";
 pub const DFS_METADATA_JOURNAL_BATCH_ROUTE: &str = "/dfs/metadata/journal-batch";
 pub const DFS_METADATA_SNAPSHOT_INSTALL_ROUTE: &str = "/dfs/metadata/snapshot-install";
@@ -516,17 +515,9 @@ pub fn decode_dfs_status_rpc_response(
     response.decode_body()
 }
 
-pub fn dfs_inspection_rpc_request(
-    request: &DaemonDfsInspectionRequest,
-) -> Result<ObjectRpcRequest, NetworkError> {
-    ObjectRpcRequest::encode_body(DFS_INSPECTION_ROUTE, DFS_RPC_CATEGORY, request)
-}
+pub use sinomo_api::dfs::routes::dfs_inspection_rpc_request;
 
-pub fn decode_dfs_inspection_rpc_response(
-    response: &ObjectRpcResponse,
-) -> Result<DaemonDfsInspectionResponse, NetworkError> {
-    response.decode_body()
-}
+pub use sinomo_api::dfs::routes::decode_dfs_inspection_rpc_response;
 
 pub fn dfs_smoke_rpc_request() -> Result<ObjectRpcRequest, NetworkError> {
     ObjectRpcRequest::encode_body(DFS_SMOKE_ROUTE, DFS_RPC_CATEGORY, &())

@@ -2350,7 +2350,7 @@ impl SifsOneShotBulkWriteRequester {
             .map_err(|error| format!("cannot discover DFS service peers: {error}"))?;
         let local_node_id = state.local_node_id;
 
-        let peer_transport = sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone())
+        let peer_transport = sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone())
             .map_err(|error| {
                 format!(
                     "one-shot SIFS bulk write requires the resident daemon DFS transport: {error}"
@@ -2668,7 +2668,7 @@ fn open_sifs_service_read_only_until(
     let content = LocalContentStore::new(data_dir.dfs_dir().join("content"))
         .map_err(|error| format!("cannot open DFS content store: {error}"))?;
     let (sync_peer_transport, async_peer_transport) =
-        match sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone()) {
+        match sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()) {
             Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
             Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
                 rpc_runtime.clone(),
@@ -2761,7 +2761,7 @@ fn open_sifs_service_with_hydration_until(
     // Both daemon-backed and direct routing use the same canonical call/result
     // contract, preserving typed response values and explicit attachments.
     let (sync_peer_transport, async_peer_transport) =
-        match sinomo_runtime::api::DaemonDfsPeerTransport::connect(data_dir.clone()) {
+        match sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(data_dir.clone()) {
             Ok(peer_transport) => shared_sifs_peer_transports(peer_transport),
             Err(_) => shared_sifs_peer_transports(SifsDfsPeerTransport::new(
                 rpc_runtime.clone(),
@@ -3189,7 +3189,7 @@ impl SifsControlPlaneKvClient {
         #[cfg(test)]
         let peer_transport = self.peer_transport.clone().map_or_else(
             || {
-                sinomo_runtime::api::DaemonDfsPeerTransport::connect(self.data_dir.clone())
+                sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(self.data_dir.clone())
                     .map(|transport| Arc::new(transport) as Arc<dyn DfsPeerTransport>)
                     .map_err(|source| DfsPeerTransportError::new(source.to_string()))
             },
@@ -3197,7 +3197,7 @@ impl SifsControlPlaneKvClient {
         )?;
         #[cfg(not(test))]
         let peer_transport: Arc<dyn DfsPeerTransport> = Arc::new(
-            sinomo_runtime::api::DaemonDfsPeerTransport::connect(self.data_dir.clone())
+            sinomo_runtime::dfs::DaemonDfsPeerTransport::connect(self.data_dir.clone())
                 .map_err(|source| DfsPeerTransportError::new(source.to_string()))?,
         );
         let result = peer_transport.call_object_rpc(

@@ -1,3 +1,13 @@
+mod host_api;
+pub use host_api::{
+    DaemonEventHub, DaemonEventMirror, DaemonEventService, DaemonLifecycleFuture,
+    DaemonLifecycleHost, DaemonOperationsFuture, DaemonOperationsHost, DaemonShutdownKind,
+    HostedDaemonLifecycleService, HostedDaemonOperationsService, ReplayNonceCachePoisoned,
+    ScopedReplayNonceCache, daemon_object_rpc_forward_options,
+    daemon_object_rpc_forward_transport_timeouts, enforce_daemon_object_rpc_forward_route_affinity,
+    register_daemon_event_service, register_hosted_daemon_lifecycle_service,
+    register_hosted_daemon_operations_service,
+};
 mod api;
 mod auth;
 mod client;

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5.6-sol";
+pub use sinomo_runtime::api::lm::OPENAI_DEFAULT_MODEL;
 pub const OPENAI_LONG_CONTEXT_PRICE_THRESHOLD_TOKENS: usize = 272_000;
 pub const OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS: usize = 1_050_000;
 pub const OPENAI_DEFAULT_WEB_SEARCH_MODEL: &str = "gpt-5.6-luna";
@@ -113,7 +113,7 @@ pub struct OpenAiImageResponse {
 }
 
 impl OpenAiProvider {
-    pub const PROVIDER_ID: &'static str = "openai";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::OPENAI_PROVIDER_ID;
 
     pub fn new(config: OpenAiConfig) -> Self {
         Self {

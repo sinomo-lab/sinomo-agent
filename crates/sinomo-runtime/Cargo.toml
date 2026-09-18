@@ -16,19 +16,20 @@ client = [
     "dep:sinomo-api",
     "dep:sinomo-config",
     "dep:sinomo-core",
-    "dep:sinomo-dfs",
     "sinomo-core/client",
     "dep:sinomo-module-api",
 ]
 # Native device contracts and process-local capture used by graphical clients.
 # This does not enable daemon, DFS, module-host, rollout, or sandbox implementations.
 device-client = ["client", "dep:sinomo-device"]
-module-client = ["client", "dep:sinomo-module"]
-observe-client = ["module-client", "dep:sinomo-observe"]
-dfs-nfs-client = ["module-client", "dep:sinomo-dfs-nfs"]
+module-client = ["client"]
+observe-client = ["client"]
 # Complete trusted-runtime aggregation. This preserves the historical facade for daemon hosts,
 # R2 services, CLI applications, tests, and native module packages.
 host = [
+    "dep:sinomo-observe",
+    "dep:sinomo-module",
+    "dep:sinomo-dfs",
     "client",
     "dep:sinomo-build",
     "dep:sinomo-build-client",
@@ -36,7 +37,7 @@ host = [
     "dep:sinomo-cli-registry",
     "dep:sinomo-daemon",
     "device-client",
-    "dfs-nfs-client",
+    "dep:sinomo-dfs-nfs",
     "dep:sinomo-eval",
     "dep:sinomo-installer",
     "module-client",
@@ -62,7 +63,7 @@ native-devices = ["device-client", "sinomo-device/native-devices"]
 cluster-test-support = ["client", "sinomo-core/cluster-test-support"]
 
 [dependencies]
-sinomo-api = { path = "../sinomo-api", optional = true }
+sinomo-api = { path = "../sinomo-api", default-features = false, optional = true }
 sinomo-build = { path = "../sinomo-build", optional = true }
 sinomo-build-client = { path = "../sinomo-build-client", optional = true }
 sinomo-cli-registry = { path = "../sinomo-cli-registry", optional = true }

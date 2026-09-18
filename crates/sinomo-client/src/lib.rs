@@ -9,14 +9,15 @@ pub mod chat;
 pub mod connection;
 pub mod daemon_process;
 pub mod evolution;
+pub mod modules;
 pub mod sifs;
 pub mod skills;
 
-pub use sinomo_app_contract::agent as agent_contract;
-pub use sinomo_app_contract::chat as chat_contract;
-pub use sinomo_app_contract::evolution as evolution_contract;
-pub use sinomo_app_contract::skill as skill_contract;
 pub use sinomo_runtime::api;
+pub use sinomo_runtime::api::app::agent as agent_contract;
+pub use sinomo_runtime::api::app::chat as chat_contract;
+pub use sinomo_runtime::api::app::evolution as evolution_contract;
+pub use sinomo_runtime::api::app::skill as skill_contract;
 
 pub use agents::AgentManagementClient;
 pub use app_status::{AppClusterInvite, AppClusterStatus};
@@ -24,6 +25,7 @@ pub use chat::{ChatDaemonClient, ChatHistoryClient};
 pub use connection::{LocalDaemonConnection, connect_or_start_local_daemon};
 pub use daemon_process::{OwnedDaemonHandle, StartAppDaemonOutcome, start_app_owned_daemon};
 pub use evolution::EvolutionClient;
+pub use modules::{ModuleObservationsResponse, read_module_observations};
 pub use sifs::*;
 pub use skills::SkillClient;
 
@@ -57,7 +59,7 @@ mod dependency_tests {
                 "-p",
                 "sinomo-client",
                 "--edges",
-                "normal",
+                "normal,build",
                 "--prefix",
                 "none",
             ])
@@ -76,11 +78,14 @@ mod dependency_tests {
             .filter(|name| !name.starts_with('('))
             .collect::<BTreeSet<_>>();
         for forbidden in [
+            "sinomo-dfs",
+            "sinomo-dfs-nfs",
+            "sinomo-module",
+            "sinomo-observe",
             "sinomo-daemon",
             "sinomo-build",
             "sinomo-rollout",
             "sinomo-sandbox",
-            "sinomo-observe",
             "sinomo-agent",
             "sinomo-lm",
             "sinomo-evolution",

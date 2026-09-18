@@ -27,7 +27,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 sinomo-agent = { path = "../../../crates/sinomo-agent" }
-sinomo-app-contract = { path = "../../../crates/sinomo-app-contract" }
 sinomo-lm = { path = "../../../crates/sinomo-lm" }
 sinomo-module-api = { path = "../../../crates/sinomo-module-api" }
 sinomo-runtime = { path = "../../../crates/sinomo-runtime" }

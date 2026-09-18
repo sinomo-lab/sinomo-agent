@@ -55,7 +55,6 @@ name = "sinomo-external-component-fixture"
 version = "0.1.0"
 dependencies = [
  "sinomo-module-api",
- "sinomo-observe-contract",
 ]
 
 [[package]]
@@ -73,13 +72,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "thiserror",
-]
-
-[[package]]
-name = "sinomo-observe-contract"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]

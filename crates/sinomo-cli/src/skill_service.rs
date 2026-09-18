@@ -1,6 +1,6 @@
 //! Daemon-owned application service for skill catalog management.
 
-use sinomo_app_contract::skill as contract;
+use sinomo_runtime::api::app::skill as contract;
 use sinomo_runtime::network::ObjectRpcRequest;
 use sinomo_runtime::service::{
     Service, ServiceContext, ServiceDisposition, ServiceError, ServiceFuture,

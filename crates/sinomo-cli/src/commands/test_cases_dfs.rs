@@ -57,6 +57,8 @@
 //!   large-object throughput probes that exercise streaming body transfer and
 //!   read-side no-write accounting.
 
+use sinomo_runtime::dfs::DaemonDfsApiClientExt;
+
 use crate::app_api::SifsBrowser;
 use crate::file_manager::FileManagerBackend;
 use crate::sifs_file_manager::{

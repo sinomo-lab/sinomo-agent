@@ -9520,12 +9520,13 @@ dependencies = [
 name = "sinomo-api"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "fs2",
  "serde",
  "serde_json",
  "sinomo-config",
  "sinomo-core",
- "sinomo-dfs",
+ "sinomo-module-api",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
@@ -9559,6 +9560,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -9568,14 +9570,6 @@ dependencies = [
  "sinomo-app",
  "sinomo-ui",
  "tracing",
-]
-
-[[package]]
-name = "sinomo-app-contract"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -9681,7 +9675,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
- "sinomo-app-contract",
  "sinomo-audio",
  "sinomo-dfs-fuse",
  "sinomo-lm",
@@ -9709,7 +9702,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "sinomo-app-contract",
  "sinomo-runtime",
  "tokio",
  "windows-sys 0.61.2",
@@ -9849,11 +9841,11 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sinomo-api",
  "sinomo-config",
  "sinomo-core",
  "sinomo-device",
  "sinomo-module",
- "sinomo-observe-contract",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
@@ -9950,7 +9942,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sinomo-agent",
- "sinomo-app-contract",
  "sinomo-lm",
  "sinomo-module-api",
  "sinomo-runtime",
@@ -10084,12 +10075,12 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sinomo-api",
  "sinomo-cli-registry",
  "sinomo-config",
  "sinomo-core",
  "sinomo-device",
  "sinomo-module-api",
- "sinomo-observe-contract",
  "sinomo-testdir",
  "thiserror 2.0.20",
  "time",
@@ -10195,7 +10186,6 @@ dependencies = [
  "sinomo-core",
  "sinomo-dfs",
  "sinomo-module",
- "sinomo-observe-contract",
  "sinomo-testdir",
  "sysinfo",
  "thiserror 2.0.20",
@@ -10203,13 +10193,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "sinomo-observe-contract"
-version = "0.1.0"
-dependencies = [
- "serde",
 ]
 
 [[package]]

@@ -2271,7 +2271,7 @@ async fn dispatch_daemon_object_rpc_call_request_async(
             payload.is_ok(),
         );
         let (mut payload, request_body) = payload?;
-        sinomo_api::enforce_daemon_object_rpc_forward_route_affinity(&route, &mut payload)?;
+        crate::host_api::enforce_daemon_object_rpc_forward_route_affinity(&route, &mut payload)?;
         let (forwarded, body) =
             crate::service_adapter::forward_object_rpc_call_from_daemon_control(
                 paths,

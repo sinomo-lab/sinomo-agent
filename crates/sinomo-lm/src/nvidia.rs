@@ -10,7 +10,7 @@ use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, USER_AGENT};
 use std::path::PathBuf;
 
-pub const NVIDIA_DEFAULT_MODEL: &str = "nvidia/nemotron-3-super-120b-a12b";
+pub use sinomo_runtime::api::lm::NVIDIA_DEFAULT_MODEL;
 
 const NVIDIA_MODEL_IDS: &[&str] = &[
     "nvidia/nemotron-3-super-120b-a12b",
@@ -48,7 +48,7 @@ pub struct NvidiaProvider {
 }
 
 impl NvidiaProvider {
-    pub const PROVIDER_ID: &'static str = "nvidia";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::NVIDIA_PROVIDER_ID;
 
     pub fn known_model_ids() -> Vec<String> {
         NVIDIA_MODEL_IDS
@@ -236,13 +236,7 @@ impl LanguageModelProvider for NvidiaProvider {
     }
 }
 
-pub fn normalize_nvidia_model_id(model: &str) -> String {
-    let mut normalized = model.trim().to_string();
-    while let Some(rest) = normalized.strip_prefix("nvidia/nvidia/") {
-        normalized = format!("nvidia/{rest}");
-    }
-    normalized
-}
+pub use sinomo_runtime::api::lm::normalize_nvidia_model_id;
 
 fn nvidia_chat_completions_url(api_base_url: &str) -> String {
     let base = api_base_url.trim().trim_end_matches('/');

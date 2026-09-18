@@ -21,7 +21,7 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             api_base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            default_model: "gemini-2.5-flash".to_string(),
+            default_model: sinomo_runtime::api::lm::GEMINI_DEFAULT_MODEL.to_string(),
             api_key: None,
             credentials_path: default_api_key_credentials_path(
                 "SINOMO_GEMINI_CREDENTIALS_FILE",
@@ -38,7 +38,7 @@ pub struct GeminiProvider {
 }
 
 impl GeminiProvider {
-    pub const PROVIDER_ID: &'static str = "gemini";
+    pub const PROVIDER_ID: &'static str = sinomo_runtime::api::lm::GEMINI_PROVIDER_ID;
 
     pub fn new(config: GeminiConfig) -> Self {
         Self {

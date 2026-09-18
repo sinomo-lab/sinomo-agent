@@ -26,8 +26,8 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-pub const CODEX_DEFAULT_MODEL: &str = crate::openai::OPENAI_DEFAULT_MODEL;
-pub const CODEX_PROVIDER_ID: &str = "codex";
+pub use sinomo_runtime::api::lm::CODEX_DEFAULT_MODEL;
+pub use sinomo_runtime::api::lm::CODEX_PROVIDER_ID;
 const LEGACY_CODEX_CHATGPT_DEFAULT_MODEL: &str = "gpt-5.2-codex";
 const CODEX_DEFAULT_INSTRUCTIONS: &str =
     "You are Sinomo's Codex model provider. Answer the user's request clearly and accurately.";

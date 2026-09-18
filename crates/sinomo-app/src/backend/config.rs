@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use sinomo_client::chat_contract::{ProviderCapabilities, ProviderSummary};
-use sinomo_lm::{
-    CODEX_PROVIDER_ID, DEFAULT_PROVIDER_ACCOUNT, GitHubCopilotProvider, LM_PROVIDER_CONFIG_KEY,
-    LM_PROVIDER_HEALTH_CONFIG_KEY, LM_STUDIO_PROVIDER_ID, LanguageModelProviderHealthConfig,
-    LanguageModelProviderHealthSnapshot, LanguageModelProviderOptions, ModelConfig,
-    OLLAMA_PROVIDER_ID, ProviderAccountConfig, ProviderReasoningEffort, ProviderTextVerbosity,
-    model_supports_reasoning_effort, normalize_model_provider, normalize_provider_account_name,
-    provider_health_account_key, upsert_provider_account_config,
+use sinomo_runtime::api::lm::{
+    CODEX_PROVIDER_ID, DEFAULT_PROVIDER_ACCOUNT, GITHUB_COPILOT_PROVIDER_ID,
+    LM_PROVIDER_CONFIG_KEY, LM_PROVIDER_HEALTH_CONFIG_KEY, LM_STUDIO_PROVIDER_ID,
+    LanguageModelProviderHealthConfig, LanguageModelProviderHealthSnapshot,
+    LanguageModelProviderOptions, ModelConfig, OLLAMA_PROVIDER_ID, ProviderAccountConfig,
+    ProviderReasoningEffort, ProviderTextVerbosity, model_supports_reasoning_effort,
+    normalize_model_provider, normalize_provider_account_name, provider_health_account_key,
+    upsert_provider_account_config,
 };
 use sinomo_runtime::config::{
     ConfigClient, ConfigClusterMode, ConfigOperationalErrorPresentation, ConfigSchema, ConfigStore,
@@ -97,16 +98,21 @@ impl ConfigItem {
 /// Build the config registry/store the app knows about (mirrors the CLI wiring).
 #[cfg(any(test, target_os = "android"))]
 pub fn build_config_store() -> Result<ConfigStore, String> {
+    let data_dir = sinomo_runtime::local::SinomoDataDir::from_env_or_home()
+        .map_err(|e| format!("resolve product data directory: {e}"))?;
+    build_config_store_for_data_dir(&data_dir)
+}
+
+#[cfg(any(test, target_os = "android"))]
+fn build_config_store_for_data_dir(data_dir: &SinomoDataDir) -> Result<ConfigStore, String> {
     let builder = sinomo_runtime::config::ConfigRegistry::builder();
     let builder = sinomo_runtime::module::register_config_definitions(builder)
         .map_err(|e| format!("module config: {e}"))?;
-    let data_dir = sinomo_runtime::local::SinomoDataDir::from_env_or_home()
-        .map_err(|e| format!("resolve product data directory: {e}"))?;
-    let cluster_initialized = sinomo_runtime::network::ClusterPaths::new(&data_dir)
+    let cluster_initialized = sinomo_runtime::network::ClusterPaths::new(data_dir)
         .state
         .exists();
     let catalog = sinomo_product_profile::base_component_catalog(
-        &data_dir,
+        data_dir,
         sinomo_product_profile::ProductComponentProfile::embedded(cluster_initialized),
     )
     .map_err(|e| format!("build embedded product component catalog: {e}"))?;
@@ -235,7 +241,10 @@ pub fn cluster_provider_summaries(client: &dyn ConfigClient) -> Vec<ProviderSumm
                 counts.get(&provider).copied().unwrap_or(0),
             ),
             models: vec![account.default_model.clone().unwrap_or_else(|| {
-                sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
+                sinomo_runtime::api::lm::effective_model_name(
+                    &provider,
+                    sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL,
+                )
             })],
             capabilities: provider_capabilities(&provider),
         });
@@ -262,13 +271,16 @@ mod tests {
             std::process::id()
         ));
         let data_dir = SinomoDataDir::new(root.clone());
-        let store = Arc::new(build_config_store().expect("config store"));
+        let store = Arc::new(build_config_store_for_data_dir(&data_dir).expect("config store"));
         (LocalConfigClient::new(store, data_dir, None), root)
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn app_fallback_registry_includes_sifs_mount_config_and_read_only_status() {
-        let store = build_config_store().expect("config store");
+        let root = sinomo_testdir::TestDir::new("app-fallback-mount-catalog");
+        let store = build_config_store_for_data_dir(&SinomoDataDir::new(&root))
+            .expect("isolated config store");
         let mount = store
             .registry()
             .get(sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY)
@@ -293,9 +305,28 @@ mod tests {
         assert_eq!(status.module_id, mount.module_id);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn app_fallback_registry_requires_an_installed_windows_mount_provider() {
+        let root = sinomo_testdir::TestDir::new("app-fallback-no-mount-provider");
+        let store = build_config_store_for_data_dir(&SinomoDataDir::new(&root))
+            .expect("isolated config store");
+        for key in [
+            sinomo_runtime::dfs::SIFS_MOUNT_CONFIG_KEY,
+            sinomo_runtime::dfs::SIFS_MOUNT_STATUS_CONFIG_KEY,
+        ] {
+            assert!(
+                store.registry().get(key).is_err(),
+                "Windows mount settings must be contributed by an installed adapter"
+            );
+        }
+    }
+
     #[test]
     fn app_fallback_registry_discovers_nfs_module_ui_from_surfaces() {
-        let store = build_config_store().expect("config store");
+        let root = sinomo_testdir::TestDir::new("app-fallback-nfs-catalog");
+        let store = build_config_store_for_data_dir(&SinomoDataDir::new(&root))
+            .expect("isolated config store");
         let config = store
             .registry()
             .get(sinomo_runtime::dfs_nfs::NFS_MOUNT_CONFIG_KEY)
@@ -423,7 +454,7 @@ mod tests {
             CODEX_PROVIDER_ID,
             DEFAULT_PROVIDER_ACCOUNT,
             "",
-            sinomo_lm::OPENAI_DEFAULT_MODEL,
+            sinomo_runtime::api::lm::OPENAI_DEFAULT_MODEL,
             "",
         )
         .expect("add Codex account");
@@ -474,7 +505,7 @@ mod tests {
             "deepseek",
             "default",
             "sk-test",
-            sinomo_lm::DEEPSEEK_DEFAULT_MODEL,
+            sinomo_runtime::api::lm::DEEPSEEK_DEFAULT_MODEL,
             "",
         )
         .expect("add provider");
@@ -483,7 +514,7 @@ mod tests {
         assert_eq!(
             form.known_models,
             vec![
-                sinomo_lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
+                sinomo_runtime::api::lm::DEEPSEEK_V4_FLASH_MODEL.to_string(),
                 sinomo_lm::DEEPSEEK_V4_PRO_MODEL.to_string()
             ]
         );
@@ -752,7 +783,7 @@ pub fn migrate_legacy_device_login_provider_accounts(
         return Ok(false);
     }
 
-    let providers = [GitHubCopilotProvider::PROVIDER_ID, CODEX_PROVIDER_ID]
+    let providers = [GITHUB_COPILOT_PROVIDER_ID, CODEX_PROVIDER_ID]
         .into_iter()
         .filter(|provider| {
             std::fs::metadata(data_dir.provider_credentials_file(provider))
@@ -836,7 +867,10 @@ pub fn provider_capabilities(provider: &str) -> ProviderCapabilities {
 pub fn provider_default_model(id: &str) -> String {
     normalize_model_provider(id)
         .map(|provider| {
-            sinomo_lm::effective_model_name(&provider, sinomo_lm::PROVIDER_DEFAULT_MODEL)
+            sinomo_runtime::api::lm::effective_model_name(
+                &provider,
+                sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL,
+            )
         })
         .unwrap_or_default()
 }
@@ -1424,7 +1458,7 @@ fn update_provider_context_options(
     let model = account
         .default_model
         .as_deref()
-        .unwrap_or(sinomo_lm::PROVIDER_DEFAULT_MODEL);
+        .unwrap_or(sinomo_runtime::api::lm::PROVIDER_DEFAULT_MODEL);
     let effective_default = sinomo_lm::inferred_model_context_window_tokens(&provider, model);
     let effective_max = sinomo_lm::inferred_model_max_context_window_tokens(&provider, model);
     if let (Some(limit), Some(max)) = (account.options.max_context_tokens, effective_max)
@@ -1432,7 +1466,7 @@ fn update_provider_context_options(
     {
         return Err(format!(
             "maximum context tokens {limit} exceeds the known {max}-token window for {}",
-            sinomo_lm::effective_model_name(&provider, model)
+            sinomo_runtime::api::lm::effective_model_name(&provider, model)
         ));
     }
     let active_limit = account

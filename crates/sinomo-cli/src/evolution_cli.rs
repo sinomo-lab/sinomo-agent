@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use sinomo_app_contract::evolution as contract;
+use sinomo_runtime::api::app::evolution as contract;
 use sinomo_runtime::cli_registry::{
     CliCommand, CliCommandContext, CliCommandError, CliCommandHandler, CliCommandHelp,
     CliCommandMetadata, CliCommandPolicy, CliParseError,

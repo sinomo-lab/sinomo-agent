@@ -1,0 +1,1878 @@
+//! DFS clients that hand work to the authoritative local daemon.
+use crate::*;
+use sinomo_api::transport::*;
+use sinomo_api::*;
+use sinomo_core::local::SinomoDataDir;
+use sinomo_core::network::{ObjectRpcCall, ObjectRpcRequest, ObjectRpcResponse, ObjectRpcResult};
+use sinomo_core::node::NodeId;
+use std::time::Duration;
+
+pub use crate::{
+    DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+    DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE as DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+};
+/// Normal whole-call budget for the local mounted-mutation durability handoff.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Largest caller-selected whole-call budget. Every request retains an
+/// absolute deadline even while authenticated keepalives show transport
+/// progress.
+pub const DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Explicit local-command client used by separately supervised filesystem
+/// mount processes to transfer mutation ownership to the main daemon.
+///
+/// This client never discovers a data directory from the process environment:
+/// the mount supervisor must provide both the directory and the daemon address
+/// it launched against. Only a loopback address is accepted, so the durable
+/// marker protocol cannot be exposed as an ordinary routed cluster RPC.
+#[derive(Clone, Debug)]
+pub struct DaemonDfsMountedMutationHandoffClient {
+    data_dir: SinomoDataDir,
+    address: String,
+    timeout: Duration,
+}
+
+impl DaemonDfsMountedMutationHandoffClient {
+    pub fn new(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+    ) -> Result<Self, DaemonApiError> {
+        data_dir.ensure_root_layout()?;
+        let address = address.into();
+        if !sinomo_core::network::is_loopback_connect_address(&address) {
+            return Err(DaemonApiError::Network {
+                address,
+                detail:
+                    "mounted-mutation handoff requires an explicit main-daemon loopback address"
+                        .to_string(),
+            });
+        }
+        Ok(Self {
+            data_dir,
+            address,
+            timeout: DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT,
+        })
+    }
+
+    /// Override the one whole-call budget while retaining a finite upper
+    /// bound. The same duration also bounds connection establishment and every
+    /// interval without stream progress.
+    pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, DaemonApiError> {
+        if timeout.is_zero() || timeout > DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT {
+            return Err(DaemonApiError::Parse {
+                detail: format!(
+                    "mounted-mutation handoff timeout must be greater than zero and no more than {:?}",
+                    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT
+                ),
+            });
+        }
+        self.timeout = timeout;
+        Ok(self)
+    }
+
+    pub fn data_dir(&self) -> &SinomoDataDir {
+        &self.data_dir
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    pub fn probe(&self) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::Probe)?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Ready,
+            None,
+            None,
+            0,
+        )
+    }
+
+    /// Durably arm a prepared marker. A successful return is the authoritative
+    /// fsynced precondition which permits the caller to enter the mutation.
+    pub fn arm(
+        &self,
+        marker_id: crate::MountedSifsMutationMarkerId,
+        marker_nonce: crate::MountedSifsMutationNonce,
+        arm_request_id: crate::MountedSifsMutationArmRequestId,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            0,
+        )
+    }
+
+    pub fn commit_applied(
+        &self,
+        marker_id: crate::MountedSifsMutationMarkerId,
+        marker_nonce: crate::MountedSifsMutationNonce,
+        arm_request_id: crate::MountedSifsMutationArmRequestId,
+        captured_work: crate::MountedSifsMutationCapturedWork,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let expected_max_appended_repair_record_count =
+            captured_work.committed_repair_records.len();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            expected_max_appended_repair_record_count,
+        )
+    }
+
+    /// Preserve an ambiguous mutation error together with every exact work bit
+    /// and repair record captured before the error. This transition deliberately
+    /// has no convenience path which substitutes an empty capture.
+    pub fn commit_unknown(
+        &self,
+        marker_id: crate::MountedSifsMutationMarkerId,
+        marker_nonce: crate::MountedSifsMutationNonce,
+        arm_request_id: crate::MountedSifsMutationArmRequestId,
+        observation: crate::MountedSifsMutationErrorObservation,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let expected_max_appended_repair_record_count =
+            observation.captured_work.committed_repair_records.len();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            observation,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            expected_max_appended_repair_record_count,
+        )
+    }
+
+    pub fn prove_no_write(
+        &self,
+        marker_id: crate::MountedSifsMutationMarkerId,
+        marker_nonce: crate::MountedSifsMutationNonce,
+        arm_request_id: crate::MountedSifsMutationArmRequestId,
+        proof_code: impl Into<String>,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let expected_arm_request_id = arm_request_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code: proof_code.into(),
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::ProvenNoWrite,
+            Some(&expected_marker_id),
+            Some(&expected_arm_request_id),
+            0,
+        )
+    }
+
+    /// Abort only a marker whose mutation was positively never started. The
+    /// daemon rejects an armed or later marker rather than accepting an empty
+    /// work receipt.
+    pub fn abort_unstarted(
+        &self,
+        marker_id: crate::MountedSifsMutationMarkerId,
+        marker_nonce: crate::MountedSifsMutationNonce,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let expected_marker_id = marker_id.clone();
+        let response = self.call(DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+            marker_id,
+            marker_nonce,
+        })?;
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            Some(&expected_marker_id),
+            None,
+            0,
+        )
+    }
+
+    fn call(
+        &self,
+        request: DaemonDfsMountedMutationHandoffRequest,
+    ) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+        let call = daemon_dfs_mounted_mutation_handoff_call(&request)?;
+        let data_dir = self.data_dir.clone();
+        let address = self.address.clone();
+        let timeout = self.timeout;
+        block_on_daemon_client(Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let deadline = daemon_api_overall_deadline(Some(timeout));
+            let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
+            run_daemon_api_with_overall_deadline(
+                "mounted-mutation main-daemon handoff",
+                deadline,
+                Box::pin(async move {
+                    call_daemon_address_rpc_async(data_dir, &address, call, options, &runtime)
+                        .await?
+                        .decode_body()
+                        .await
+                        .map_err(Into::into)
+                }),
+            )
+            .await
+        }))
+    }
+}
+
+fn daemon_dfs_mounted_mutation_handoff_options(
+    timeout: Duration,
+) -> sinomo_core::network::ClusterObjectRpcOptions {
+    sinomo_core::network::ClusterObjectRpcOptions::new(
+        sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(timeout),
+    )
+    .with_overall_timeout(timeout)
+    .with_destination_process_affinity(sinomo_core::network::DestinationProcessAffinity::MainDaemon)
+}
+
+fn daemon_dfs_mounted_mutation_handoff_call(
+    request: &DaemonDfsMountedMutationHandoffRequest,
+) -> Result<ObjectRpcCall, DaemonApiError> {
+    request
+        .validate()
+        .map_err(|detail| DaemonApiError::Parse { detail })?;
+    let replayable = ObjectRpcCall::encode_replayable_value(
+        DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+        DAEMON_RPC_CATEGORY,
+        request,
+    )?;
+    let encoded_bytes = replayable.encoded_value_bytes();
+    if encoded_bytes > DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff request is {encoded_bytes} encoded bytes; max is {DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES}"
+            ),
+        });
+    }
+    let mut call = replayable.call();
+    call.request = call.request.with_response_retry_safe();
+    if let Some(operation_id) = daemon_dfs_mounted_mutation_handoff_operation_id(request) {
+        call.request = call.request.with_operation_id(operation_id);
+    }
+    Ok(call)
+}
+
+fn daemon_dfs_mounted_mutation_handoff_operation_id(
+    request: &DaemonDfsMountedMutationHandoffRequest,
+) -> Option<&str> {
+    match request {
+        DaemonDfsMountedMutationHandoffRequest::Probe => None,
+        DaemonDfsMountedMutationHandoffRequest::Arm { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::CommitApplied { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::CommitUnknown { arm_request_id, .. }
+        | DaemonDfsMountedMutationHandoffRequest::ProveNoWrite { arm_request_id, .. } => {
+            Some(arm_request_id.as_str())
+        }
+        DaemonDfsMountedMutationHandoffRequest::AbortUnstarted { marker_id, .. } => {
+            Some(marker_id.as_str())
+        }
+    }
+}
+
+fn validate_daemon_dfs_mounted_mutation_handoff_response(
+    response: DaemonDfsMountedMutationHandoffResponse,
+    expected_phase: crate::DaemonDfsMountedMutationHandoffPhase,
+    expected_marker_id: Option<&sinomo_core::Id>,
+    expected_arm_request_id: Option<&sinomo_core::Id>,
+    expected_max_appended_repair_record_count: usize,
+) -> Result<DaemonDfsMountedMutationHandoffResponse, DaemonApiError> {
+    if response.phase != expected_phase
+        || response.marker_id.as_ref() != expected_marker_id
+        || response.arm_request_id.as_ref() != expected_arm_request_id
+    {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff returned mismatched acknowledgement: phase={:?}, marker_id={:?}, arm_request_id={:?}",
+                response.phase, response.marker_id, response.arm_request_id
+            ),
+        });
+    }
+    if response.appended_repair_record_count > expected_max_appended_repair_record_count {
+        return Err(DaemonApiError::Parse {
+            detail: format!(
+                "mounted-mutation handoff acknowledgement reports {} appended repair records; this request supplied at most {}",
+                response.appended_repair_record_count, expected_max_appended_repair_record_count
+            ),
+        });
+    }
+    Ok(response)
+}
+
+/// DFS peer transport that deliberately terminates at the running local
+/// daemon. The daemon owns endpoint selection, retries, authentication, and
+/// cluster streams; mounted clients never open a competing cluster
+/// router or fall back to direct advertised endpoints.
+#[derive(Clone, Debug)]
+pub struct DaemonDfsPeerTransport {
+    data_dir: SinomoDataDir,
+    address: String,
+    local_node_id: NodeId,
+    connected_process_affinity: sinomo_api::DaemonObjectRpcDestinationProcessAffinity,
+    runtime: std::sync::Arc<tokio::runtime::Runtime>,
+}
+
+impl DaemonDfsPeerTransport {
+    /// Discovers and probes the main daemon for `data_dir` once, when a mounted
+    /// service is opened. Clustered mounts fail closed when no local daemon is
+    /// available instead of silently changing transport semantics.
+    pub fn connect(data_dir: SinomoDataDir) -> Result<Self, DaemonApiError> {
+        data_dir.ensure_root_layout()?;
+        let client = DaemonApiClient::connect_for_paths(&DaemonPaths::new(&data_dir))?;
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let local_node_id =
+            sinomo_core::cluster::read_cluster_state_without_kv(&cluster_paths)?.local_node_id;
+        let runtime = daemon_dfs_peer_runtime()?;
+        Ok(Self {
+            data_dir,
+            address: client.address().to_owned(),
+            local_node_id,
+            connected_process_affinity:
+                sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            runtime,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn at_address(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        local_node_id: NodeId,
+    ) -> Self {
+        Self::at_address_with_process_affinity(
+            data_dir,
+            address,
+            local_node_id,
+            sinomo_api::DaemonObjectRpcDestinationProcessAffinity::Any,
+        )
+    }
+
+    #[cfg(test)]
+    fn at_address_with_process_affinity(
+        data_dir: SinomoDataDir,
+        address: impl Into<String>,
+        local_node_id: NodeId,
+        connected_process_affinity: sinomo_api::DaemonObjectRpcDestinationProcessAffinity,
+    ) -> Self {
+        Self {
+            data_dir,
+            address: address.into(),
+            local_node_id,
+            connected_process_affinity,
+            runtime: daemon_dfs_peer_runtime().expect("daemon DFS peer runtime"),
+        }
+    }
+
+    async fn call_rpc_inner(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: crate::DfsObjectRpcSendOptions,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<ObjectRpcResult, DaemonApiError> {
+        send_daemon_object_rpc_call_with_affinity_async(
+            self.data_dir.clone(),
+            &self.address,
+            DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+            target_node_id,
+            call,
+            options.connect_timeout,
+            None,
+            options.overall_timeout,
+            options.observe_connectivity,
+            sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+            sinomo_core::network::DaemonRpcTimeouts::default(),
+            Some(&self.local_node_id),
+            Some(self.connected_process_affinity),
+            runtime,
+        )
+        .await
+    }
+}
+
+fn daemon_dfs_peer_runtime() -> Result<std::sync::Arc<tokio::runtime::Runtime>, DaemonApiError> {
+    static SHARED: std::sync::OnceLock<Result<std::sync::Arc<tokio::runtime::Runtime>, String>> =
+        std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("sinomo-daemon-dfs-peer")
+                .enable_all()
+                .build()
+                .map(std::sync::Arc::new)
+                .map_err(|source| source.to_string())
+        })
+        .clone()
+        .map_err(|detail| DaemonApiError::Network {
+            address: "daemon DFS peer runtime".to_string(),
+            detail,
+        })
+}
+
+impl crate::DfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_object_rpc(
+        &self,
+        target_node_id: &NodeId,
+        call: ObjectRpcCall,
+        options: crate::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResult, crate::DfsPeerTransportError> {
+        let runtime = self.runtime.handle().clone();
+        block_on_daemon_client_on_owner_runtime(
+            &runtime,
+            Box::pin(async {
+                self.call_rpc_inner(target_node_id, call, options, &runtime)
+                    .await
+            }),
+        )
+        .and_then(|result| {
+            result.response.error_detail()?;
+            Ok(result)
+        })
+        .map_err(daemon_api_dfs_peer_transport_error)
+    }
+}
+
+impl crate::AsyncDfsPeerTransport for DaemonDfsPeerTransport {
+    fn call_object_rpc_async<'a>(
+        &'a self,
+        target_node_id: &'a NodeId,
+        call: ObjectRpcCall,
+        options: crate::DfsObjectRpcSendOptions,
+    ) -> crate::DfsPeerTransportFuture<'a, Result<ObjectRpcResult, crate::DfsPeerTransportError>>
+    {
+        Box::pin(async move {
+            let runtime = tokio::runtime::Handle::try_current()
+                .map_err(|source| crate::DfsPeerTransportError::new(source.to_string()))?;
+            let result = self
+                .call_rpc_inner(target_node_id, call, options, &runtime)
+                .await
+                .map_err(daemon_api_dfs_peer_transport_error)?;
+            result
+                .response
+                .error_detail()
+                .map_err(crate::DfsPeerTransportError::from_network)?;
+            Ok(result)
+        })
+    }
+}
+
+fn daemon_api_dfs_peer_transport_error(source: DaemonApiError) -> crate::DfsPeerTransportError {
+    let delivery_state = source.delivery_state();
+    match source {
+        DaemonApiError::UnknownRoute { route } => crate::DfsPeerTransportError::from_network(
+            sinomo_core::network::NetworkError::UnknownRoute { route },
+        ),
+        source => {
+            crate::DfsPeerTransportError::with_delivery_state(source.to_string(), delivery_state)
+        }
+    }
+}
+
+/// DFS forwarding over a generic daemon API client.
+pub trait DaemonDfsApiClientExt {
+    fn dfs_object_rpc_to_target(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResponse, DaemonApiError>;
+    fn dfs_object_rpc_to_target_with_options(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        options: crate::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResponse, DaemonApiError>;
+}
+impl DaemonDfsApiClientExt for DaemonApiClient {
+    /// Sends a DFS object-RPC from inside the running local daemon.
+    fn dfs_object_rpc_to_target(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        connect_timeout: Duration,
+        observe_connectivity: bool,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        self.dfs_object_rpc_to_target_with_options(
+            target_node_id,
+            request,
+            crate::DfsObjectRpcSendOptions::new(connect_timeout)
+                .with_observe_connectivity(observe_connectivity),
+        )
+    }
+    /// Sends a DFS object-RPC while keeping transport phase limits separate
+    /// from an optional DFS operation-wide deadline.
+    fn dfs_object_rpc_to_target_with_options(
+        &self,
+        target_node_id: &NodeId,
+        request: &ObjectRpcRequest,
+        options: crate::DfsObjectRpcSendOptions,
+    ) -> Result<ObjectRpcResponse, DaemonApiError> {
+        let data_dir = SinomoDataDir::from_env_or_home()?;
+        let address = self.address().to_owned();
+        let outer_timeouts =
+            sinomo_core::network::DaemonRpcTimeouts::connect_and_idle(self.timeout());
+        let target_node_id = target_node_id.clone();
+        let request = request.clone();
+        block_on_daemon_client(Box::pin(async move {
+            let runtime = tokio::runtime::Handle::current();
+            let deadline = daemon_api_overall_deadline(options.overall_timeout);
+            run_daemon_api_with_overall_deadline(
+                "daemon-mediated DFS object RPC value call",
+                deadline,
+                Box::pin(async move {
+                    let call = ObjectRpcCall::value(request);
+                    let result = send_daemon_object_rpc_call_with_affinity_async(
+                        data_dir,
+                        &address,
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_ROUTE,
+                        &target_node_id,
+                        call,
+                        options.connect_timeout,
+                        None,
+                        options.overall_timeout,
+                        options.observe_connectivity,
+                        sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                        outer_timeouts,
+                        None,
+                        None,
+                        &runtime,
+                    )
+                    .await?;
+                    decode_object_rpc_value_response(result).await
+                }),
+            )
+            .await
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mounted_mutation_test_ids() -> (
+        crate::MountedSifsMutationMarkerId,
+        crate::MountedSifsMutationNonce,
+        crate::MountedSifsMutationArmRequestId,
+    ) {
+        (
+            sinomo_core::Id::derived("test.mounted-mutation.client.marker", b"marker"),
+            sinomo_core::Id::derived("test.mounted-mutation.client.nonce", b"nonce"),
+            sinomo_core::Id::derived("test.mounted-mutation.client.arm", b"arm"),
+        )
+    }
+
+    fn mounted_mutation_test_capture(
+        repair_records: Vec<crate::DfsRepairAttemptRecord>,
+    ) -> crate::MountedSifsMutationCapturedWork {
+        crate::MountedSifsMutationCapturedWork {
+            committed_work: crate::DfsCommittedWork {
+                publish_metadata: true,
+                ..crate::DfsCommittedWork::default()
+            },
+            committed_repair_records: repair_records,
+        }
+    }
+
+    fn mounted_mutation_test_repair_record(
+        last_error: Option<String>,
+    ) -> crate::DfsRepairAttemptRecord {
+        crate::DfsRepairAttemptRecord {
+            intent_id: "mounted-mutation-test-intent".to_string(),
+            object_id: sinomo_core::Id::derived("test.mounted-mutation.client.object", b"object"),
+            version: sinomo_core::Id::derived("test.mounted-mutation.client.version", b"version"),
+            content_hash: "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            missing_replica_node_id: NodeId::from_legacy_named(
+                "node_mounted_mutation_client_missing_replica",
+            )
+            .expect("test node id"),
+            attempts: 0,
+            in_flight: false,
+            last_attempt_unix_nanos: 0,
+            next_retry_unix_nanos: 0,
+            transfer_request_id: None,
+            last_error,
+        }
+    }
+
+    #[test]
+    fn mounted_mutation_client_is_explicit_loopback_and_deadline_bounded() {
+        let (_root, data_dir) = test_channel_data_dir("api-mounted-mutation-client");
+        let client =
+            DaemonDfsMountedMutationHandoffClient::new(data_dir.clone(), "127.0.0.1:39393")
+                .expect("explicit loopback client");
+        assert_eq!(client.data_dir().root(), data_dir.root());
+        assert_eq!(client.address(), "127.0.0.1:39393");
+        assert_eq!(
+            client.timeout(),
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_DEFAULT_TIMEOUT
+        );
+
+        let timeout = Duration::from_millis(750);
+        let options = daemon_dfs_mounted_mutation_handoff_options(timeout);
+        assert_eq!(options.overall_timeout(), Some(timeout));
+        assert_eq!(
+            options.destination_process_affinity(),
+            sinomo_core::network::DestinationProcessAffinity::MainDaemon
+        );
+        assert!(client.clone().with_timeout(Duration::ZERO).is_err());
+        assert!(
+            client
+                .with_timeout(
+                    DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_TIMEOUT + Duration::from_nanos(1),
+                )
+                .is_err()
+        );
+
+        let error = DaemonDfsMountedMutationHandoffClient::new(data_dir, "10.0.0.20:39393")
+            .expect_err("remote handoff address must fail closed");
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[test]
+    fn mounted_mutation_transitions_are_same_id_response_retry_safe() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let arm = DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+        };
+        let arm_call = daemon_dfs_mounted_mutation_handoff_call(&arm).expect("arm call");
+        assert_eq!(
+            arm_call.request.route,
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE
+        );
+        assert_eq!(arm_call.request.category, DAEMON_RPC_CATEGORY);
+        assert!(arm_call.request.is_response_retry_safe());
+        assert_eq!(
+            arm_call.request.operation_id(),
+            Some(arm_request_id.as_str())
+        );
+
+        let commit = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            captured_work: mounted_mutation_test_capture(Vec::new()),
+        };
+        let commit_call = daemon_dfs_mounted_mutation_handoff_call(&commit).expect("commit call");
+        assert!(commit_call.request.is_response_retry_safe());
+        assert_eq!(
+            commit_call.request.operation_id(),
+            arm_call.request.operation_id(),
+            "arm and commit must retain the caller-stable arm request id"
+        );
+
+        let abort = DaemonDfsMountedMutationHandoffRequest::AbortUnstarted {
+            marker_id: marker_id.clone(),
+            marker_nonce,
+        };
+        let abort_call = daemon_dfs_mounted_mutation_handoff_call(&abort).expect("abort call");
+        assert!(abort_call.request.is_response_retry_safe());
+        assert_eq!(abort_call.request.operation_id(), Some(marker_id.as_str()));
+
+        let probe = daemon_dfs_mounted_mutation_handoff_call(
+            &DaemonDfsMountedMutationHandoffRequest::Probe,
+        )
+        .expect("probe call");
+        assert!(probe.request.is_response_retry_safe());
+        assert_eq!(probe.request.operation_id(), None);
+    }
+
+    #[test]
+    fn mounted_mutation_client_rejects_oversized_semantic_and_encoded_payloads() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let record = mounted_mutation_test_repair_record(None);
+        let too_many = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            captured_work: mounted_mutation_test_capture(vec![
+                record;
+                crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+                    + 1
+            ]),
+        };
+        let error = daemon_dfs_mounted_mutation_handoff_call(&too_many)
+            .expect_err("repair-record cardinality limit");
+        assert!(error.to_string().contains("repair records"));
+
+        let large_record = mounted_mutation_test_repair_record(Some("e".repeat(10 * 1024)));
+        let oversized = DaemonDfsMountedMutationHandoffRequest::CommitApplied {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            captured_work: mounted_mutation_test_capture(vec![
+                large_record;
+                crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_REPAIR_RECORDS
+            ]),
+        };
+        let error = daemon_dfs_mounted_mutation_handoff_call(&oversized)
+            .expect_err("encoded payload limit");
+        assert!(error.to_string().contains("encoded bytes"));
+        assert!(error.to_string().contains("max is"));
+    }
+
+    #[test]
+    fn mounted_mutation_response_requires_exact_acknowledgement_identity() {
+        let (marker_id, _marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let response = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            appended_repair_record_count: 0,
+        };
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            response.clone(),
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&marker_id),
+            Some(&arm_request_id),
+            0,
+        )
+        .expect("matching arm acknowledgement");
+
+        let wrong_arm = sinomo_core::Id::derived("test.mounted-mutation.client.arm", b"wrong");
+        let error = validate_daemon_dfs_mounted_mutation_handoff_response(
+            response,
+            crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            Some(&marker_id),
+            Some(&wrong_arm),
+            0,
+        )
+        .expect_err("mismatched arm acknowledgement");
+        assert!(error.to_string().contains("mismatched acknowledgement"));
+
+        let aborted = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: None,
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            appended_repair_record_count: 0,
+        };
+        validate_daemon_dfs_mounted_mutation_handoff_response(
+            aborted.clone(),
+            crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+            Some(&marker_id),
+            None,
+            0,
+        )
+        .expect("abort acknowledgement echoes marker identity");
+
+        let missing_marker = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: None,
+            ..aborted
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                missing_marker,
+                crate::DaemonDfsMountedMutationHandoffPhase::AbortedUnstarted,
+                Some(&marker_id),
+                None,
+                0,
+            )
+            .is_err(),
+            "every non-probe transition must echo its marker identity"
+        );
+
+        let impossible_arm_count = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+            appended_repair_record_count: 1,
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                impossible_arm_count,
+                crate::DaemonDfsMountedMutationHandoffPhase::Armed,
+                Some(&marker_id),
+                Some(&arm_request_id),
+                0,
+            )
+            .is_err(),
+            "non-commit acknowledgements must not claim appended repairs"
+        );
+
+        let excessive_commit_count = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id.clone()),
+            arm_request_id: Some(arm_request_id.clone()),
+            phase: crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            appended_repair_record_count: 2,
+        };
+        assert!(
+            validate_daemon_dfs_mounted_mutation_handoff_response(
+                excessive_commit_count,
+                crate::DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+                Some(&marker_id),
+                Some(&arm_request_id),
+                1,
+            )
+            .is_err(),
+            "commit acknowledgement count must be bounded by supplied records"
+        );
+    }
+
+    fn test_channel_data_dir(label: &str) -> (sinomo_testdir::TestDir, SinomoDataDir) {
+        let root = sinomo_testdir::TestDir::new(label);
+        let data_dir = SinomoDataDir::new(root.path());
+        data_dir.ensure_root_layout().expect("test data dir");
+        (root, data_dir)
+    }
+
+    async fn accept_test_stream_native_carrier(
+        stream: sinomo_core::network::AsyncDaemonControlStream,
+    ) -> Result<sinomo_core::network::RoutedStreamAcceptor, sinomo_core::network::NetworkError>
+    {
+        let mut stream = stream.into_inner();
+        let context =
+            sinomo_core::network::read_local_object_rpc_carrier_prelude(&mut stream).await?;
+        sinomo_core::network::accept_local_object_rpc_stream_carrier(Box::new(stream), &context)
+    }
+
+    async fn serve_test_peer_stream_native_service<F, Fut>(
+        stream: sinomo_core::network::PeerStream,
+        handler: F,
+    ) -> Result<(), sinomo_core::network::NetworkError>
+    where
+        F: FnOnce(
+            sinomo_core::network::ObjectRpcIncomingRequest,
+            sinomo_core::network::RpcPeerContext,
+        ) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    sinomo_core::network::ObjectRpcOutgoingResponse,
+                    sinomo_core::network::NetworkError,
+                >,
+            >,
+    {
+        let context = sinomo_core::network::RpcPeerContext::unauthenticated_local(
+            stream.session_id.clone(),
+            stream.channel_binding,
+        );
+        sinomo_core::network::serve_service_rpc_peer_stream(
+            stream,
+            &context,
+            sinomo_core::network::ObjectFrameIoOptions::default(),
+            handler,
+        )
+        .await
+    }
+
+    async fn serve_test_logical_stream_native_service<F, Fut>(
+        acceptor: &mut sinomo_core::network::RoutedStreamAcceptor,
+        handler: F,
+    ) -> Result<(), sinomo_core::network::NetworkError>
+    where
+        F: FnOnce(
+            sinomo_core::network::ObjectRpcIncomingRequest,
+            sinomo_core::network::RpcPeerContext,
+        ) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    sinomo_core::network::ObjectRpcOutgoingResponse,
+                    sinomo_core::network::NetworkError,
+                >,
+            >,
+    {
+        let stream =
+            acceptor
+                .accept()
+                .await?
+                .ok_or_else(|| sinomo_core::network::NetworkError::Io {
+                    operation: "accept test local RPC logical stream".to_string(),
+                    detail: "local RPC carrier closed before the logical stream arrived"
+                        .to_string(),
+                })?;
+        serve_test_peer_stream_native_service(stream, handler).await
+    }
+
+    async fn serve_test_stream_native_service<F, Fut>(
+        stream: sinomo_core::network::AsyncDaemonControlStream,
+        handler: F,
+    ) -> Result<(), sinomo_core::network::NetworkError>
+    where
+        F: FnOnce(
+            sinomo_core::network::ObjectRpcIncomingRequest,
+            sinomo_core::network::RpcPeerContext,
+        ) -> Fut,
+        Fut: std::future::Future<
+                Output = Result<
+                    sinomo_core::network::ObjectRpcOutgoingResponse,
+                    sinomo_core::network::NetworkError,
+                >,
+            >,
+    {
+        let mut acceptor = accept_test_stream_native_carrier(stream).await?;
+        serve_test_logical_stream_native_service(&mut acceptor, handler).await
+    }
+
+    fn write_test_cluster_state(
+        data_dir: &SinomoDataDir,
+        label: &str,
+        local_node_id: NodeId,
+        public_key: String,
+    ) {
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named(format!("cluster_{label}"))
+                .expect("cluster id"),
+            format!("API test cluster {label}"),
+            local_node_id,
+            "local",
+            public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn daemon_dfs_peer_transport_sends_the_fail_closed_main_dfs_forward_route() {
+        let (_root, data_dir) = test_channel_data_dir("sinomo-api-dfs-forward-route");
+        let local_node =
+            NodeId::from_legacy_named("node_api_dfs_forward_local").expect("local node");
+        let target_node =
+            NodeId::from_legacy_named("node_api_dfs_forward_target").expect("target node");
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let expected_target = target_node.clone();
+        let server = tokio::spawn(async move {
+            let carrier = listener.accept().await.expect("accept local RPC carrier");
+            let mut acceptor = accept_test_stream_native_carrier(carrier)
+                .await
+                .expect("accept stream-native local RPC carrier");
+            serve_test_logical_stream_native_service(
+                &mut acceptor,
+                move |inbound, _peer| async move {
+                    assert_eq!(
+                        inbound.request.route,
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                        "the real DFS peer transport must use a route an old daemon cannot silently downgrade"
+                    );
+                    let forward = inbound
+                        .decode_body::<DaemonObjectRpcForwardRequest>()
+                        .await
+                        .expect("forward request");
+                    assert_eq!(forward.target_node_id, expected_target);
+                    assert_eq!(
+                        forward.destination_process_affinity,
+                        sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                        "DFS forwarding must terminate at the main daemon; shadow DFS is fail-closed"
+                    );
+                    let inner = ObjectRpcResponse::encode_body(forward.request.route, &"dfs-pong")
+                        .expect("inner response");
+                    sinomo_core::network::ObjectRpcOutgoingResponse::encode_borrowed_value(
+                        DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                        &DaemonObjectRpcForwardResponse::Success {
+                            response: inner,
+                            streamed_value_body: false,
+                            forward_elapsed_micros: 0,
+                        },
+                    )
+                },
+            )
+            .await
+            .expect("serve stream-native DFS forward session");
+        });
+
+        let transport =
+            DaemonDfsPeerTransport::at_address(data_dir.clone(), address.clone(), local_node);
+        let request = ObjectRpcRequest::encode_body("/dfs/test/actual-forward", "dfs", &())
+            .expect("DFS request");
+        let result = transport
+            .call_rpc_inner(
+                &target_node,
+                ObjectRpcCall::value(request),
+                crate::DfsObjectRpcSendOptions::new(Duration::from_secs(2))
+                    .with_overall_timeout(Duration::from_secs(2)),
+                &tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("DFS forwarded call");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("inner response"),
+            "dfs-pong"
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn daemon_dfs_peer_transport_uses_proven_main_for_a_local_target() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-dfs-local-target-session");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_dfs_local_target_session").expect("local node");
+        let cluster_paths = sinomo_core::network::ClusterPaths::new(&data_dir);
+        let state = sinomo_core::ClusterBootstrapState::initialized_locally(
+            sinomo_core::node::ClusterId::from_legacy_named("cluster_api_dfs_local_target_session")
+                .expect("cluster id"),
+            "API DFS local target session",
+            local_node.clone(),
+            "local",
+            identity.public_key,
+            time::OffsetDateTime::now_utc(),
+        );
+        sinomo_core::cluster::write_cluster_state(&cluster_paths, &state).expect("cluster state");
+
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let request_body = vec![0x41_u8; 512 * 1024 + 31];
+        let response_body = vec![0x52_u8; 768 * 1024 + 47];
+        let expected_request = request_body.clone();
+        let server_response = response_body.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener
+                .accept()
+                .await
+                .expect("accept local service stream");
+            serve_test_stream_native_service(stream, move |incoming, _peer| async move {
+                assert_eq!(
+                    incoming.request.route,
+                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+                    "a transport connected through the main-daemon discovery path must keep the local target on the one-hop direct path"
+                );
+                let request_body = incoming
+                    .body
+                    .collect_to_vec(1024 * 1024)
+                    .await
+                    .expect("local request body");
+                assert_eq!(request_body, expected_request);
+                let inner = ObjectRpcResponse::encode_body(
+                    sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+                    &"local-ok",
+                )
+                .expect("local response head");
+                Ok(sinomo_core::network::ObjectRpcOutgoingResponse {
+                    response: inner,
+                    body: sinomo_core::network::ObjectRpcBodySource::bytes(server_response),
+                })
+            })
+            .await
+            .expect("serve local stream-native request");
+        });
+
+        let transport = DaemonDfsPeerTransport::at_address_with_process_affinity(
+            data_dir.clone(),
+            address.clone(),
+            local_node.clone(),
+            sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+        );
+        let request = ObjectRpcRequest::encode_body(
+            sinomo_core::kv::CLUSTER_KV_TXN_ROUTE,
+            sinomo_core::kv::CLUSTER_KV_RPC_CATEGORY,
+            &"local-request",
+        )
+        .expect("local request head");
+        let result = crate::AsyncDfsPeerTransport::call_object_rpc_async(
+            &transport,
+            &local_node,
+            ObjectRpcCall::new(
+                request,
+                sinomo_core::network::ObjectRpcBodySource::bytes(request_body),
+            ),
+            crate::DfsObjectRpcSendOptions::default().with_overall_timeout(Duration::from_secs(30)),
+        )
+        .await
+        .expect("local target RPC");
+
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("local response"),
+            "local-ok"
+        );
+        assert_eq!(
+            result
+                .body
+                .collect_to_vec(1024 * 1024)
+                .await
+                .expect("local response body"),
+            response_body
+        );
+        server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn unproven_local_main_target_uses_the_fail_closed_forward_route() {
+        let root = sinomo_testdir::TestDir::new("sinomo-api-unproven-local-main-forward");
+        let data_dir = SinomoDataDir::new(&root);
+        data_dir.ensure_root_layout().expect("data directory");
+        let identity = sinomo_core::node::load_or_create_main_node_identity(&data_dir.root())
+            .expect("main identity");
+        let local_node =
+            NodeId::from_legacy_named("node_api_unproven_local_main_forward").expect("local node");
+        write_test_cluster_state(
+            &data_dir,
+            "unproven_local_main_forward",
+            local_node.clone(),
+            identity.public_key,
+        );
+        let listener = sinomo_core::network::AsyncDaemonControlListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr_string().expect("listener address");
+        let expected_node = local_node.clone();
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("accept local carrier");
+            serve_test_stream_native_service(stream, move |incoming, _peer| async move {
+                assert_eq!(
+                    incoming.request.route, DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                    "an address-only client must not direct-dispatch or use a legacy route"
+                );
+                let payload: DaemonObjectRpcForwardRequest =
+                    incoming.decode_body().await.expect("forward payload");
+                assert_eq!(payload.target_node_id, expected_node);
+                assert_eq!(
+                    payload.destination_process_affinity,
+                    sinomo_api::DaemonObjectRpcDestinationProcessAffinity::MainDaemon,
+                );
+                let inner = ObjectRpcResponse::encode_body(payload.request.route, &"forwarded")
+                    .expect("inner response");
+                sinomo_core::network::ObjectRpcOutgoingResponse::encode_borrowed_value(
+                    DAEMON_DFS_OBJECT_RPC_FORWARD_MAIN_ROUTE,
+                    &DaemonObjectRpcForwardResponse::Success {
+                        response: inner,
+                        streamed_value_body: false,
+                        forward_elapsed_micros: 0,
+                    },
+                )
+            })
+            .await
+            .expect("serve fail-closed forward");
+        });
+
+        let transport = DaemonDfsPeerTransport::at_address(data_dir, address, local_node.clone());
+        let request = ObjectRpcRequest::encode_body("/test/unproven-local-main", "test", &())
+            .expect("inner request");
+        let result = transport
+            .call_rpc_inner(
+                &local_node,
+                ObjectRpcCall::value(request),
+                crate::DfsObjectRpcSendOptions::new(Duration::from_secs(2))
+                    .with_overall_timeout(Duration::from_secs(5)),
+                &tokio::runtime::Handle::current(),
+            )
+            .await
+            .expect("unproven local forward");
+        assert_eq!(
+            result
+                .response
+                .decode_body::<String>()
+                .expect("inner response"),
+            "forwarded",
+        );
+        server.await.expect("server task");
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    fn mounted_mutation_test_ids() -> (
+        crate::MountedSifsMutationMarkerId,
+        crate::MountedSifsMutationNonce,
+        crate::MountedSifsMutationArmRequestId,
+    ) {
+        (
+            sinomo_core::Id::derived("test.mounted-mutation.marker", b"marker"),
+            sinomo_core::Id::derived("test.mounted-mutation.nonce", b"nonce"),
+            sinomo_core::Id::derived("test.mounted-mutation.arm", b"arm"),
+        )
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_wire_is_versioned_and_typed() {
+        assert_eq!(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_V1_ROUTE,
+            "/daemon/dfs/mounted-mutation/handoff-v1"
+        );
+        assert_eq!(
+            DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES,
+            crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_STATE_BYTES
+        );
+
+        let probe = serde_json::to_value(DaemonDfsMountedMutationHandoffRequest::Probe)
+            .expect("encode probe");
+        assert_eq!(probe, serde_json::json!({ "operation": "probe" }));
+
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let arm = serde_json::to_value(DaemonDfsMountedMutationHandoffRequest::Arm {
+            marker_id: marker_id.clone(),
+            marker_nonce,
+            arm_request_id: arm_request_id.clone(),
+        })
+        .expect("encode arm");
+        assert_eq!(arm["operation"], "arm");
+        assert_eq!(arm["marker_id"], marker_id.as_str());
+        assert_eq!(arm["arm_request_id"], arm_request_id.as_str());
+
+        let response = DaemonDfsMountedMutationHandoffResponse {
+            marker_id: Some(marker_id),
+            arm_request_id: Some(arm_request_id),
+            phase: DaemonDfsMountedMutationHandoffPhase::DaemonAccepted,
+            appended_repair_record_count: 2,
+        };
+        let encoded = serde_json::to_value(&response).expect("encode response");
+        assert_eq!(encoded["phase"], "daemon-accepted");
+        assert_eq!(encoded["appended_repair_record_count"], 2);
+        assert_eq!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffResponse>(encoded)
+                .expect("decode response"),
+            response
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_error_never_decodes_as_an_empty_applied_capture() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let captured_work = crate::MountedSifsMutationCapturedWork {
+            committed_work: crate::DfsCommittedWork::default(),
+            committed_repair_records: Vec::new(),
+        };
+        let unknown = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            observation: crate::MountedSifsMutationErrorObservation {
+                captured_work,
+                error_code: "backend-returned-error-after-entry".to_string(),
+            },
+        };
+        let encoded = serde_json::to_value(&unknown).expect("encode unknown result");
+        assert_eq!(encoded["operation"], "commit-unknown");
+        assert!(encoded.get("observation").is_some());
+        assert!(encoded.get("captured_work").is_none());
+        assert_eq!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffRequest>(encoded)
+                .expect("decode unknown result"),
+            unknown
+        );
+        let wire = sinomo_core::network::SinomoObjectCodec::network_frame()
+            .encode(&unknown)
+            .expect("encode SOBJ request value");
+        assert!(wire.len() <= DAEMON_DFS_MOUNTED_MUTATION_HANDOFF_MAX_PAYLOAD_BYTES);
+        assert_eq!(
+            sinomo_core::network::SinomoObjectCodec::network_frame()
+                .decode::<DaemonDfsMountedMutationHandoffRequest>(&wire)
+                .expect("decode SOBJ request value"),
+            unknown
+        );
+
+        let ambiguous_legacy = serde_json::json!({
+            "operation": "commit",
+            "marker_id": marker_id,
+            "marker_nonce": marker_nonce,
+            "arm_request_id": arm_request_id
+        });
+        assert!(
+            serde_json::from_value::<DaemonDfsMountedMutationHandoffRequest>(ambiguous_legacy)
+                .is_err(),
+            "an unclassified error must not decode as an empty applied capture"
+        );
+    }
+
+    #[test]
+    fn mounted_mutation_handoff_validates_bounded_labels() {
+        let (marker_id, marker_nonce, arm_request_id) = mounted_mutation_test_ids();
+        let empty_proof = DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            proof_code: String::new(),
+        };
+        let error = empty_proof.validate().expect_err("empty proof code");
+        assert!(error.contains("proof_code cannot be empty"));
+
+        let empty_error = DaemonDfsMountedMutationHandoffRequest::CommitUnknown {
+            marker_id: marker_id.clone(),
+            marker_nonce: marker_nonce.clone(),
+            arm_request_id: arm_request_id.clone(),
+            observation: crate::MountedSifsMutationErrorObservation {
+                captured_work: crate::MountedSifsMutationCapturedWork::default(),
+                error_code: String::new(),
+            },
+        };
+        let error = empty_error.validate().expect_err("empty error code");
+        assert!(error.contains("error_code cannot be empty"));
+
+        let request = DaemonDfsMountedMutationHandoffRequest::ProveNoWrite {
+            marker_id,
+            marker_nonce,
+            arm_request_id,
+            proof_code: "x"
+                .repeat(crate::MOUNTED_SIFS_MUTATION_OUTBOX_MAX_LABEL_BYTES.saturating_add(1)),
+        };
+        let error = request.validate().expect_err("oversized proof code");
+        assert!(error.contains("proof_code"));
+        assert!(error.contains("max is"));
+    }
+
+    #[test]
+    fn dfs_subscription_covers_namespace_and_placement_events() {
+        let request = DaemonEventSubscribeRequest::for_dfs_path_prefix("/users/project");
+        assert_eq!(request.event_kind_prefixes, vec!["dfs."]);
+        assert_eq!(request.path_prefixes, vec!["/users/project"]);
+    }
+
+    #[test]
+    fn older_browser_list_requests_default_to_lightweight_entries() {
+        let request: DaemonDfsBrowserListRequest = serde_json::from_value(serde_json::json!({
+            "path": "/users"
+        }))
+        .expect("decode legacy list request");
+        assert!(!request.include_metadata);
+    }
+
+    #[test]
+    fn older_browser_entry_metadata_defaults_live_placement_to_none() {
+        let metadata: DaemonDfsBrowserEntryMetadata = serde_json::from_value(serde_json::json!({
+            "object_id": "object-report",
+            "version": "version-1",
+            "modified_at_unix_nanos": 0,
+            "policy": "replicated-eventual",
+            "current_locations": ["node-a"]
+        }))
+        .expect("decode legacy entry metadata");
+        assert!(metadata.placement.is_none());
+    }
+
+    #[test]
+    fn conditional_replace_has_a_dedicated_fail_closed_route() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE,
+            DAEMON_DFS_BROWSER_WRITE_FILE_ROUTE
+        );
+        assert!(
+            DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_REPLACE_FILE_IF_VERSION_ROUTE)
+        );
+
+        let write = serde_json::to_value(DaemonDfsBrowserWriteFileRequest {
+            path: "/notes.txt".to_string(),
+            bytes: b"plain write".to_vec(),
+        })
+        .expect("serialize plain write");
+        assert_eq!(write.as_object().map(|fields| fields.len()), Some(2));
+        assert!(write.get("expected_object_id").is_none());
+        assert!(write.get("expected_version").is_none());
+    }
+
+    #[test]
+    fn placement_authority_admin_route_is_not_a_browser_local_command() {
+        assert!(!DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE));
+        assert_eq!(
+            DAEMON_DFS_PLACEMENT_AUTHORITY_ADMIN_ROUTE,
+            "/daemon/dfs/placement-authority"
+        );
+    }
+
+    #[test]
+    fn placement_routes_are_typed_and_inheritance_is_explicit() {
+        for route in [
+            DAEMON_DFS_BROWSER_PLACEMENT_PREVIEW_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_PROGRESS_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_ACTIVITY_ROUTE,
+        ] {
+            assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&route));
+        }
+        let request = DaemonDfsBrowserPlacementUpdateRequest {
+            path: "/users/team".to_string(),
+            policy: None,
+            scope: crate::DfsPlacementScope::SelfOnly,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode placement update");
+        let decoded: DaemonDfsBrowserPlacementUpdateRequest =
+            serde_json::from_slice(&encoded).expect("decode placement update");
+        assert_eq!(decoded, request);
+        assert!(decoded.policy.is_none());
+    }
+
+    #[test]
+    fn placement_update_v2_requires_a_preview_token_on_a_dedicated_route() {
+        assert_ne!(
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE,
+            DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_ROUTE
+        );
+        assert!(DAEMON_DFS_BROWSER_ROUTES.contains(&DAEMON_DFS_BROWSER_PLACEMENT_UPDATE_V2_ROUTE));
+
+        let missing_token = serde_json::json!({
+            "path": "/users/team",
+            "scope": "self-only"
+        });
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserPlacementUpdateV2Request>(missing_token)
+                .is_err(),
+            "the fail-closed route must not default a missing preview token"
+        );
+    }
+
+    #[test]
+    fn placement_activity_request_defaults_to_a_bounded_unfiltered_page() {
+        let request: DaemonDfsBrowserPlacementActivityRequest =
+            serde_json::from_value(serde_json::json!({})).expect("default activity request");
+        assert!(request.statuses.is_empty());
+        assert!(request.path_prefix.is_none());
+        assert!(request.cursor.is_none());
+        assert_eq!(
+            request.limit,
+            crate::DEFAULT_DFS_PLACEMENT_RECONCILIATION_ACTIVITY_PAGE_SIZE
+        );
+
+        let encoded = serde_json::to_value(DaemonDfsBrowserPlacementActivityRequest {
+            statuses: vec![crate::DfsPlacementReconciliationActivityStatus::Retrying],
+            path_prefix: Some("/team".to_string()),
+            cursor: Some(crate::DfsPlacementReconciliationActivityCursor {
+                created_at_unix_nanos: 42,
+                job_id: "activity-job".to_string(),
+            }),
+            limit: 25,
+        })
+        .expect("encode activity request");
+        let decoded: DaemonDfsBrowserPlacementActivityRequest =
+            serde_json::from_value(encoded).expect("decode activity request");
+        assert_eq!(decoded.limit, 25);
+        assert_eq!(
+            decoded.statuses,
+            vec![crate::DfsPlacementReconciliationActivityStatus::Retrying]
+        );
+
+        let legacy_page: DaemonDfsBrowserPlacementActivityResponse =
+            serde_json::from_value(serde_json::json!({"page": {"activities": []}}))
+                .expect("activity completeness flags are backward-compatible defaults");
+        assert!(!legacy_page.page.partial);
+        assert!(!legacy_page.page.history_truncated);
+    }
+
+    #[test]
+    fn conditional_replace_outcomes_preserve_receipt_and_error_kinds() {
+        let committed = DaemonDfsBrowserReplaceFileIfVersionResponse {
+            outcome: DaemonDfsBrowserReplaceFileIfVersionOutcome::Committed {
+                receipt: DaemonDfsBrowserWriteReceipt {
+                    object_id: "object-1".to_string(),
+                    version: "version-2".to_string(),
+                    content_hash: Some("hash-2".to_string()),
+                    size_bytes: Some(7),
+                },
+                maintenance_warning: Some("maintenance queued".to_string()),
+            },
+        };
+        let encoded = serde_json::to_vec(&committed).expect("encode committed outcome");
+        let decoded: DaemonDfsBrowserReplaceFileIfVersionResponse =
+            serde_json::from_slice(&encoded).expect("decode committed outcome");
+        assert_eq!(decoded, committed);
+        assert!(decoded.outcome.is_committed());
+
+        for outcome in [
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::Conflict {
+                detail: "stale base".to_string(),
+            },
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::NotFound {
+                detail: "removed".to_string(),
+            },
+            DaemonDfsBrowserReplaceFileIfVersionOutcome::Rejected {
+                detail: "not writable".to_string(),
+            },
+        ] {
+            let encoded = serde_json::to_vec(&outcome).expect("encode typed outcome");
+            let decoded: DaemonDfsBrowserReplaceFileIfVersionOutcome =
+                serde_json::from_slice(&encoded).expect("decode typed outcome");
+            assert_eq!(decoded, outcome);
+            assert!(!decoded.is_committed());
+        }
+    }
+
+    #[test]
+    fn dfs_browser_read_file_wire_preserves_found_and_types_unavailability() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+        struct LegacyReadFileResponse {
+            bytes: Vec<u8>,
+        }
+
+        let legacy: DaemonDfsBrowserReadFileResponse =
+            serde_json::from_value(serde_json::json!({"bytes": [1, 2, 3]}))
+                .expect("decode legacy successful read");
+        assert_eq!(
+            legacy.into_result().expect("legacy found bytes"),
+            vec![1, 2, 3]
+        );
+
+        let found = DaemonDfsBrowserReadFileResponse::found(vec![4, 5]);
+        let found_wire = serde_json::to_value(&found).expect("encode found response");
+        assert_eq!(found_wire, serde_json::json!({"bytes": [4, 5]}));
+
+        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &found,
+        )
+        .expect("encode current success response");
+        let legacy_found: LegacyReadFileResponse = found_rpc
+            .decode_body()
+            .expect("legacy client decodes current success response");
+        assert_eq!(legacy_found.bytes, vec![4, 5]);
+
+        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &LegacyReadFileResponse { bytes: vec![6, 7] },
+        )
+        .expect("encode legacy success response");
+        let current_from_legacy: DaemonDfsBrowserReadFileResponse = legacy_rpc
+            .decode_body()
+            .expect("current client decodes legacy success response");
+        assert_eq!(
+            current_from_legacy
+                .into_result()
+                .expect("legacy response contains bytes"),
+            vec![6, 7]
+        );
+
+        let missing = DaemonDfsBrowserReadFileResponse::not_found("/missing");
+        assert!(matches!(
+            missing.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::NotFound { ref path }) if path == "/missing"
+        ));
+
+        let unavailable = DaemonDfsBrowserReadFileResponse::content_unavailable(
+            "/catalog.sobj",
+            "metadata is authoritative; content mirror is incomplete",
+        );
+        let unavailable_wire =
+            serde_json::to_value(&unavailable).expect("encode unavailable response");
+        assert!(unavailable_wire.get("bytes").is_none());
+        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_ROUTE,
+            &unavailable,
+        )
+        .expect("encode unavailable response");
+        assert!(
+            unavailable_rpc
+                .decode_body::<LegacyReadFileResponse>()
+                .is_err(),
+            "legacy clients must fail closed when bytes are unavailable"
+        );
+        let unavailable: DaemonDfsBrowserReadFileResponse = unavailable_rpc
+            .decode_body()
+            .expect("current client decodes typed unavailable response");
+        assert!(matches!(
+            unavailable.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { ref path, .. })
+                if path == "/catalog.sobj"
+        ));
+    }
+
+    #[test]
+    fn dfs_browser_stat_wire_preserves_success_and_types_confirmed_absence() {
+        let legacy = DaemonDfsBrowserStatResponse {
+            file_system_id: "sifs".to_string(),
+            object_id: "object-stat-wire".to_string(),
+            path: "/present.txt".to_string(),
+            kind: crate::DfsObjectKind::File,
+            version: "version-stat-wire".to_string(),
+            content_hash: Some("blake3:stat-wire".to_string()),
+            size_bytes: Some(3),
+            link_count: 1,
+            mode: 0o644,
+            uid: 1000,
+            gid: 1000,
+            accessed_at_unix_nanos: 1,
+            modified_at_unix_nanos: 2,
+            created_at_unix_nanos: 3,
+            changed_at_unix_nanos: 4,
+            policy: sinomo_core::DfsObjectPolicy::ReplicatedEventual,
+            current_locations: vec!["node-stat-wire".to_string()],
+            local_pins: Vec::new(),
+            health: None,
+            metadata_shard: None,
+            placement: None,
+        };
+
+        let current = DaemonDfsBrowserStatOutcomeResponse::found(legacy.clone());
+        assert_eq!(
+            serde_json::to_value(&current).expect("encode current stat success"),
+            serde_json::to_value(&legacy).expect("encode legacy stat success")
+        );
+        let current_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &current,
+        )
+        .expect("encode current stat success");
+        let legacy_from_current: DaemonDfsBrowserStatResponse = current_rpc
+            .decode_body()
+            .expect("legacy client decodes current stat success");
+        assert_eq!(legacy_from_current, legacy);
+
+        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &legacy,
+        )
+        .expect("encode legacy stat success");
+        let current_from_legacy: DaemonDfsBrowserStatOutcomeResponse = legacy_rpc
+            .decode_body()
+            .expect("current client decodes legacy stat success");
+        assert_eq!(
+            current_from_legacy
+                .into_result()
+                .expect("legacy found stat"),
+            legacy
+        );
+
+        let missing = DaemonDfsBrowserStatOutcomeResponse::not_found("/missing.txt");
+        let missing_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &missing,
+        )
+        .expect("encode typed missing stat");
+        assert!(
+            missing_rpc
+                .decode_body::<DaemonDfsBrowserStatResponse>()
+                .is_err(),
+            "legacy clients must fail decoding a typed stat failure"
+        );
+        let missing: DaemonDfsBrowserStatOutcomeResponse = missing_rpc
+            .decode_body()
+            .expect("current client decodes typed missing stat");
+        assert!(matches!(
+            missing.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::NotFound { ref path })
+                if path == "/missing.txt"
+        ));
+
+        let mut mixed = serde_json::to_value(&legacy).expect("encode legacy stat success");
+        mixed
+            .as_object_mut()
+            .expect("stat success is an object")
+            .insert(
+                "failure".to_string(),
+                serde_json::to_value(DaemonDfsBrowserReadFileFailure::NotFound {
+                    path: "/present.txt".to_string(),
+                })
+                .expect("encode typed stat failure"),
+            );
+        assert!(
+            serde_json::from_value::<DaemonDfsBrowserStatOutcomeResponse>(mixed.clone()).is_err(),
+            "a mixed success and failure stat body must fail closed"
+        );
+        let mixed_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_STAT_ROUTE,
+            &mixed,
+        )
+        .expect("encode adversarial mixed stat body");
+        assert!(
+            mixed_rpc
+                .decode_body::<DaemonDfsBrowserStatOutcomeResponse>()
+                .is_err(),
+            "the SOBJ wire decoder must reject a mixed stat body"
+        );
+    }
+
+    #[test]
+    fn dfs_browser_prefix_wire_preserves_success_and_fails_closed_across_versions() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+        struct LegacyPrefixResponse {
+            bytes: Vec<u8>,
+            truncated: bool,
+        }
+
+        let found = DaemonDfsBrowserReadFilePrefixResponse::found(vec![1, 2, 3], true);
+        let found_wire = serde_json::to_value(&found).expect("encode current prefix success");
+        assert_eq!(
+            found_wire,
+            serde_json::json!({"bytes": [1, 2, 3], "truncated": true})
+        );
+        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            &found,
+        )
+        .expect("encode current prefix success");
+        let legacy_found: LegacyPrefixResponse = found_rpc
+            .decode_body()
+            .expect("legacy client decodes current prefix success");
+        assert_eq!(legacy_found.bytes, vec![1, 2, 3]);
+        assert!(legacy_found.truncated);
+
+        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            &LegacyPrefixResponse {
+                bytes: vec![4, 5],
+                truncated: false,
+            },
+        )
+        .expect("encode legacy prefix success");
+        let current: DaemonDfsBrowserReadFilePrefixResponse = legacy_rpc
+            .decode_body()
+            .expect("current client decodes legacy prefix success");
+        assert_eq!(
+            current.into_result().expect("legacy prefix success"),
+            (vec![4, 5], false)
+        );
+
+        let unavailable = DaemonDfsBrowserReadFilePrefixResponse::content_unavailable(
+            "/preview.bin",
+            "metadata is authoritative; content mirror is incomplete",
+        );
+        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILE_PREFIX_ROUTE,
+            &unavailable,
+        )
+        .expect("encode current unavailable prefix");
+        assert!(
+            unavailable_rpc
+                .decode_body::<LegacyPrefixResponse>()
+                .is_err(),
+            "legacy clients must fail decoding a typed unavailable prefix"
+        );
+        let current: DaemonDfsBrowserReadFilePrefixResponse = unavailable_rpc
+            .decode_body()
+            .expect("current client decodes unavailable prefix");
+        assert!(matches!(
+            current.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::ContentUnavailable { ref path, .. })
+                if path == "/preview.bin"
+        ));
+
+        let missing = DaemonDfsBrowserReadFilePrefixResponse::not_found("/missing-preview.bin");
+        assert!(matches!(
+            missing.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::NotFound { ref path })
+                if path == "/missing-preview.bin"
+        ));
+    }
+
+    #[test]
+    fn dfs_browser_bulk_read_wire_preserves_success_and_fails_closed_across_versions() {
+        #[derive(Debug, serde::Serialize, serde::Deserialize, Eq, PartialEq)]
+        struct LegacyFileRead {
+            path: String,
+            bytes: Option<Vec<u8>>,
+            error: Option<String>,
+        }
+
+        let found = DaemonDfsBrowserFileRead::found("/record.json", vec![1, 2, 3]);
+        let found_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &found,
+        )
+        .expect("encode current bulk success");
+        let legacy_found: LegacyFileRead = found_rpc
+            .decode_body()
+            .expect("legacy client decodes current bulk success");
+        assert_eq!(
+            legacy_found,
+            LegacyFileRead {
+                path: "/record.json".to_string(),
+                bytes: Some(vec![1, 2, 3]),
+                error: None,
+            }
+        );
+
+        let legacy_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &LegacyFileRead {
+                path: "/legacy.json".to_string(),
+                bytes: Some(vec![4, 5]),
+                error: None,
+            },
+        )
+        .expect("encode legacy bulk success");
+        let current: DaemonDfsBrowserFileRead = legacy_rpc
+            .decode_body()
+            .expect("current client decodes legacy bulk success");
+        assert_eq!(current.into_result().expect("legacy success"), vec![4, 5]);
+
+        let unavailable = DaemonDfsBrowserFileRead::content_unavailable(
+            "/record.json",
+            "authoritative metadata exists but content is not readable",
+        );
+        let unavailable_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &unavailable,
+        )
+        .expect("encode typed bulk unavailability");
+        let legacy_unavailable: LegacyFileRead = unavailable_rpc
+            .decode_body()
+            .expect("legacy client decodes the compatible outer item");
+        assert!(
+            legacy_unavailable.bytes.is_none() && legacy_unavailable.error.is_none(),
+            "legacy clients must receive no value that can be mistaken for successful content"
+        );
+
+        let legacy_error_rpc = sinomo_core::network::ObjectRpcResponse::encode_body(
+            DAEMON_DFS_BROWSER_READ_FILES_ROUTE,
+            &LegacyFileRead {
+                path: "/legacy-missing.json".to_string(),
+                bytes: None,
+                error: Some("SIFS path not found: /legacy-missing.json".to_string()),
+            },
+        )
+        .expect("encode legacy untyped failure");
+        let current: DaemonDfsBrowserFileRead = legacy_error_rpc
+            .decode_body()
+            .expect("current client decodes legacy untyped failure");
+        assert!(matches!(
+            current.into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::InvalidResponse { .. })
+        ));
+
+        assert!(matches!(
+            DaemonDfsBrowserFileRead::not_found("/confirmed-missing.json").into_result(),
+            Err(DaemonDfsBrowserReadFileFailure::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn daemon_api_error_preserves_possibly_applied_delivery_state() {
+        let error = DaemonApiError::from(sinomo_core::network::NetworkError::timeout(
+            "conditional replace response",
+            sinomo_core::network::NetworkTimeoutPhase::FirstByte,
+            std::time::Duration::from_secs(1),
+            sinomo_core::network::NetworkDeliveryState::PossiblyApplied,
+        ));
+        assert_eq!(
+            error.delivery_state(),
+            Some(sinomo_core::network::NetworkDeliveryState::PossiblyApplied)
+        );
+    }
+}

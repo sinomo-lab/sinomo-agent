@@ -1650,7 +1650,7 @@ fn print_observe_metric_watch_records(
     if json {
         let json = serde_json::to_string(&ObserveMetricWatchSample {
             interval_seconds,
-            sample: ObserveMetricsResponse::from_metrics(metrics),
+            sample: crate::observe_metrics_response_from_metrics(metrics),
         })
         .map_err(command_error)?;
         context.stdout_line(format_args!("{json}"))?;
@@ -1697,9 +1697,10 @@ fn print_observe_metric_records(
     json: bool,
 ) -> Result<(), CliCommandError> {
     if json {
-        let json =
-            serde_json::to_string_pretty(&ObserveMetricsResponse::from_metrics(metrics.clone()))
-                .map_err(command_error)?;
+        let json = serde_json::to_string_pretty(&crate::observe_metrics_response_from_metrics(
+            metrics.clone(),
+        ))
+        .map_err(command_error)?;
         context.stdout_line(format_args!("{json}"))?;
         return Ok(());
     }
@@ -2899,7 +2900,7 @@ mod tests {
                 }
                 sinomo_core::network::ObjectRpcResponse::encode_body(
                     OBSERVE_METRICS_ROUTE,
-                    &ObserveMetricsResponse::from_metrics(Vec::new()),
+                    &crate::observe_metrics_response_from_metrics(Vec::new()),
                 )
                 .map_err(|error| error.to_string())
             })
@@ -2945,7 +2946,7 @@ mod tests {
                 return Err("node unavailable".to_string());
             }
             let mut response =
-                ObserveMetricsResponse::from_metrics(vec![ObserveMetricRecord::gauge(
+                crate::observe_metrics_response_from_metrics(vec![ObserveMetricRecord::gauge(
                     "sinomo.test.load",
                     Default::default(),
                     0.5,
@@ -2999,7 +3000,7 @@ mod tests {
                 in_flight.fetch_sub(1, Ordering::SeqCst);
                 sinomo_core::network::ObjectRpcResponse::encode_body(
                     OBSERVE_METRICS_ROUTE,
-                    &ObserveMetricsResponse::from_metrics(Vec::new()),
+                    &crate::observe_metrics_response_from_metrics(Vec::new()),
                 )
                 .map_err(|error| error.to_string())
             })

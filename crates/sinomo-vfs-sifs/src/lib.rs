@@ -114,7 +114,7 @@ impl MountedSifsVfsBackend {
         let cluster_paths = ClusterPaths::new(&data_dir);
         let opened = if cluster_paths.state.exists() {
             let peer_transport = Arc::new(
-                sinomo_api::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(|source| {
+                sinomo_dfs::DaemonDfsPeerTransport::connect(data_dir.clone()).map_err(|source| {
                     VfsError::Backend {
                         backend: "mounted-sifs".to_string(),
                         path: "/".to_string(),

@@ -2,6 +2,7 @@
 /dist
 /crates/*/target/
 /modules/*/*/target/
+/fixtures/*/target/
 /tmp
 /benchmark-results
 /.codegraph/
