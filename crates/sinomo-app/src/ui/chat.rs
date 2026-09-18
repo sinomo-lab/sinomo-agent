@@ -1934,6 +1934,83 @@ struct ChatSessionsStructure {
     channel_config_error: Option<ChannelConfigError>,
 }
 
+/// Only changes to the editor's content may replace its controls. Conversation
+/// progress must preserve pointer capture, text selection, and keyboard focus.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChatSessionEditStructure {
+    session_id: String,
+    title: String,
+    kind: ConversationKind,
+    participant_count: usize,
+    participant_names: Vec<String>,
+    details_open: bool,
+    confirming_delete: bool,
+    rename_pending: bool,
+    rename_error: Option<String>,
+    agents: Vec<(String, String)>,
+    creating_channel: bool,
+    channel_notice: Option<String>,
+    channel_config_pending: bool,
+    channel_config_error: Option<String>,
+}
+
+impl ChatSessionEditStructure {
+    fn from_snapshot(snapshot: &ChatStructureSnapshot) -> Option<Self> {
+        let edit_id = snapshot.session_edit_id.as_deref()?;
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == edit_id)?;
+        let is_channel = session.kind == ConversationKind::Channel;
+        Some(Self {
+            session_id: session.id.clone(),
+            title: session.title.clone(),
+            kind: session.kind,
+            participant_count: session.participant_count,
+            participant_names: session.participant_names.clone(),
+            details_open: snapshot.session_edit_details_open,
+            confirming_delete: snapshot.session_delete_confirm_id.as_deref() == Some(edit_id),
+            rename_pending: snapshot
+                .pending_session_rename
+                .as_ref()
+                .is_some_and(|pending| pending.session_id == edit_id),
+            rename_error: snapshot
+                .session_rename_error
+                .as_ref()
+                .filter(|error| error.session_id == edit_id)
+                .map(|error| error.detail.clone()),
+            agents: if is_channel {
+                snapshot
+                    .agents
+                    .iter()
+                    .map(|(key, name, _)| (key.clone(), name.clone()))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            creating_channel: is_channel
+                && snapshot.channel_create_pending
+                && snapshot.session_id == edit_id,
+            channel_notice: snapshot
+                .notice
+                .as_ref()
+                .filter(|notice| {
+                    let lower = notice.to_ascii_lowercase();
+                    is_channel
+                        && (lower.contains("channel create failed")
+                            || lower.contains("channel config failed"))
+                })
+                .cloned(),
+            channel_config_pending: is_channel && snapshot.pending_channel_config.is_some(),
+            channel_config_error: snapshot
+                .channel_config_error
+                .as_ref()
+                .filter(|error| is_channel && error.channel_id == edit_id)
+                .map(|error| error.detail.clone()),
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ChatModelSelectorStructure {
     theme: (AppThemeMode, AppTextScale),
@@ -10861,6 +10938,23 @@ fn session_edit_details(
     participant_count: usize,
     participant_names: &[String],
 ) -> impl Widget + use<> {
+    let session_id = session.id.clone();
+    let updated =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat editor updated time", move |key| {
+                key.0
+                    .as_deref()
+                    .and_then(|snapshot| {
+                        snapshot
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == session_id)
+                    })
+                    .map(|session| session.updated_unix)
+            });
+    let updated_shared = shared.clone();
     let storage = match session.kind {
         ConversationKind::Chat => "SIFS-backed chat list",
         ConversationKind::Channel => "SIFS channel record and timeline",
@@ -10877,10 +10971,15 @@ fn session_edit_details(
             shared,
             format!("Session ID: {}", compact_line(&session.id, 48)),
         ))
-        .with_child(muted_label(
-            shared,
-            format!("Updated: {}", session_updated_label(session.updated_unix)),
-        ))
+        .with_child(RebuildOnChange::new_observable(updated, move |updated| {
+            WidgetPod::new(muted_label(
+                &updated_shared,
+                format!(
+                    "Updated: {}",
+                    session_updated_label(updated.unwrap_or_default())
+                ),
+            ))
+        }))
         .with_child(muted_label(shared, format!("Storage: {storage}")));
 
     if session.kind == ConversationKind::Channel {
@@ -12353,7 +12452,15 @@ fn session_edit_dialog(shared: &Shared, reader: &ThemeReader) -> Option<WidgetPo
             ConversationKind::Chat => "Edit chat",
         }
     };
-    let source = shared.signals().chat_structure.clone();
+    let source =
+        shared
+            .signals()
+            .chat_structure
+            .select_named("chat session editor structure", |key| {
+                key.0
+                    .as_deref()
+                    .and_then(ChatSessionEditStructure::from_snapshot)
+            });
     let content_shared = shared.clone();
     let content_reader = Rc::clone(reader);
     let body = RebuildOnChange::new_observable(source, move |_structure| {
@@ -21327,6 +21434,146 @@ mod tests {
             "close button should dismiss the edit dialog"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn session_edit_dialog_accepts_pointer_and_keyboard_in_shell() -> sui::Result<()> {
+        for width in [1100.0, 520.0] {
+            let shared = Shared::new(AppState::ready(Backend::local_fallback()));
+            let channel_id = SessionId::generate();
+            let session_id = channel_id.to_string();
+            seed_backend_chat(
+                &shared.chat().data_dir,
+                &channel_id,
+                "Dialog chat",
+                &[ChatMessage::user("Hello")],
+            );
+            {
+                let mut chat = shared.chat_mut();
+                chat.sessions = vec![SessionRef {
+                    id: session_id.clone(),
+                    title: "Dialog chat".to_string(),
+                    kind: ConversationKind::Chat,
+                    updated_unix: 1,
+                    participant_count: 1,
+                    participant_names: Vec::new(),
+                }];
+                chat.session_id = session_id.clone();
+                chat.models_loading = false;
+            }
+            shared.borrow_mut().window_placement.size = Some([width, 800.0]);
+            let runtime = crate::build_runtime(shared.clone())?;
+            let app = sui_testing::TestApp::from_runtime(runtime)?;
+            let window = app.main_window()?;
+            window
+                .root()
+                .dispatch_event(Event::Window(sui::WindowEvent::Resized(Size::new(
+                    width, 800.0,
+                ))))?;
+            let background_update = || -> sui::Result<()> {
+                {
+                    let mut chat = shared.chat_mut();
+                    chat.push_activity(
+                        "Background progress",
+                        "The active conversation received another update.",
+                        ActivityTone::Running,
+                    );
+                    chat.sessions[0].updated_unix += 86_400;
+                }
+                app.run_until_idle()
+            };
+            let click = |role, name: &str| -> sui::Result<()> {
+                let snapshot = window.snapshot()?;
+                let bounds = named_node_bounds(&snapshot, role, name);
+                let point = Point::new(
+                    bounds.x() + bounds.width() / 2.0,
+                    bounds.y() + bounds.height() / 2.0,
+                );
+                // Desktop events can render between hover, press, and release.
+                for kind in [
+                    PointerEventKind::Move,
+                    PointerEventKind::Down,
+                    PointerEventKind::Up,
+                ] {
+                    let mut pointer = sui::PointerEvent::new(kind, point);
+                    if kind != PointerEventKind::Move {
+                        pointer.button = Some(PointerButton::Primary);
+                    }
+                    if kind == PointerEventKind::Down {
+                        pointer.buttons = sui::PointerButtons::new(1);
+                    }
+                    window.root().dispatch_event(Event::Pointer(pointer))?;
+                    if kind == PointerEventKind::Down && shared.chat().session_edit_id.is_some() {
+                        background_update()?;
+                    }
+                }
+                Ok(())
+            };
+
+            click(
+                SemanticsRole::Button,
+                if width >= WIDE_THRESHOLD {
+                    "Edit Dialog chat"
+                } else {
+                    "Edit current conversation"
+                },
+            )?;
+            assert_eq!(
+                shared.chat().session_edit_id.as_deref(),
+                Some(session_id.as_str())
+            );
+            click(SemanticsRole::Button, "Show details")?;
+            assert!(
+                shared.chat().session_edit_details_open,
+                "details at width {width}"
+            );
+            click(SemanticsRole::Button, "Hide details")?;
+            assert!(!shared.chat().session_edit_details_open);
+            click(SemanticsRole::Button, "Show details")?;
+            let input_name = format!("chat-session-title-{session_id}");
+            click(SemanticsRole::TextInput, &input_name)?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "End",
+                    KeyState::Pressed,
+                )))?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "!",
+                    KeyState::Pressed,
+                )))?;
+            assert_eq!(shared.chat().session_title_draft, "Dialog chat!");
+            background_update()?;
+            window
+                .root()
+                .dispatch_event(Event::Keyboard(sui::KeyboardEvent::new(
+                    "?",
+                    KeyState::Pressed,
+                )))?;
+            assert_eq!(shared.chat().session_title_draft, "Dialog chat!?");
+            window
+                .get_by_text(format!(
+                    "Updated: {}",
+                    session_updated_label(shared.chat().sessions[0].updated_unix),
+                ))
+                .expect()
+                .to_be_visible()?;
+            click(SemanticsRole::Button, "Save")?;
+            {
+                let mut chat = shared.chat_mut();
+                assert_eq!(chat.next_session_rename_request_id, 1);
+                wait_for(&mut chat, Duration::from_secs(5), |chat| {
+                    chat.pending_session_rename.is_none()
+                });
+                assert!(chat.session_rename_error.is_none());
+                assert_eq!(chat.sessions[0].title, "Dialog chat!?");
+            }
+            click(SemanticsRole::Button, "Done")?;
+            assert!(shared.chat().session_edit_id.is_none());
+        }
         Ok(())
     }
 
