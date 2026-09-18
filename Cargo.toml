@@ -3,6 +3,7 @@ resolver = "3"
 
 # Retired packages may leave empty directories in existing checkouts.
 exclude = [
+    "crates/sinomo-app-daemon",
     "crates/sinomo-app-contract",
     "crates/sinomo-dfs-api",
     "crates/sinomo-lm-contract",
@@ -21,7 +22,6 @@ default-members = [
     "crates/sinomo-agent",
     "crates/sinomo-api",
     "crates/sinomo-app",
-    "crates/sinomo-app-daemon",
     "crates/sinomo-audio",
     "crates/sinomo-base",
     "crates/sinomo-build",

@@ -460,7 +460,7 @@ fn validate_requested_outputs(
     {
         let supported_binary = matches!(
             output.name.as_str(),
-            "sinomo" | "sinomo-app" | "sinomo-app-daemon" | "sinomo-ui-extension-host"
+            "sinomo" | "sinomo-app" | "sinomo-ui-extension-host"
         );
         if !supported_binary
             || output.package != output.name
@@ -713,15 +713,10 @@ mod tests {
     #[test]
     fn requested_outputs_accept_complete_desktop_release() {
         let plan = binary_plan(
-            [
-                "sinomo",
-                "sinomo-app",
-                "sinomo-app-daemon",
-                "sinomo-ui-extension-host",
-            ]
-            .into_iter()
-            .map(|name| BuildOutputRequest::binary(name, name))
-            .collect(),
+            ["sinomo", "sinomo-app", "sinomo-ui-extension-host"]
+                .into_iter()
+                .map(|name| BuildOutputRequest::binary(name, name))
+                .collect(),
         );
         validate_requested_outputs(Path::new("cargo"), Path::new("."), &plan)
             .expect("desktop release outputs must pass the build worker's validation");
@@ -735,6 +730,7 @@ mod tests {
         aliased_target.cargo_target = "sinomo".into();
         for output in [
             BuildOutputRequest::binary("unknown-binary", "unknown-binary"),
+            BuildOutputRequest::binary("sinomo-app-daemon", "sinomo-app-daemon"),
             BuildOutputRequest::binary("sinomo-app", "sinomo"),
             BuildOutputRequest::binary("sinomo", "sinomo-app"),
             aliased_name,

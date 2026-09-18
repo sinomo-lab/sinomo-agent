@@ -9,10 +9,10 @@ fn main() -> ExitCode {
             let helper = std::env::var_os(sinomo_client::api::SINOMO_APP_DAEMON_BINARY_ENV)
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| {
-                    app.with_file_name(format!("sinomo-app-daemon{}", std::env::consts::EXE_SUFFIX))
+                    app.with_file_name(format!("sinomo{}", std::env::consts::EXE_SUFFIX))
                 });
             std::process::Command::new(helper)
-                .arg("--app-supervisor")
+                .args(["app", "supervise", "--"])
                 .arg(app)
                 .args(std::env::args_os().skip(1))
                 .status()

@@ -68,7 +68,7 @@ cargo build
 cargo check --workspace
 
 # Graphical desktop application and its supervised sibling helpers.
-cargo build -p sinomo-app-daemon -p sinomo-ui-extension-host -p sinomo-app
+cargo build -p sinomo -p sinomo-ui-extension-host -p sinomo-app
 cargo run -p sinomo-app
 ```
 
@@ -76,10 +76,17 @@ The desktop app needs platform libraries used by SUI/wgpu and native audio and
 video backends. The repository does not yet maintain a verified package list
 for every Linux distribution, macOS, and Windows release; treat the CLI as the
 portable baseline and diagnose app dependencies for the target platform.
-The app resolves `sinomo-app-daemon` and `sinomo-ui-extension-host` beside its
+The app resolves `sinomo` and `sinomo-ui-extension-host` beside its
 own executable and never searches `PATH`; packages must therefore install or
 bundle all three artifacts together. The UI helper starts lazily only when an
 active module contributes a custom surface.
+
+`cargo run -p sinomo-app` rebuilds only the app and its library dependencies,
+not the sibling helper executables. Repeat the three-package build above after
+updating CLI or launcher code. The app starts `sinomo app supervise`, which
+leases `sinomo daemon run --app-owned` when no daemon is already running. If
+`SINOMO_APP_DAEMON_BINARY` is set, it must point to an up-to-date `sinomo`
+executable that supports these commands.
 
 These packages are deliberately outside default members because they require a
 platform, runtime, or explicit benchmark choice:

@@ -9479,6 +9479,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sinomo-cli",
+ "sinomo-client",
  "sinomo-runtime",
  "sinomo-testdir",
 ]
@@ -9570,16 +9571,6 @@ dependencies = [
  "sinomo-app",
  "sinomo-ui",
  "tracing",
-]
-
-[[package]]
-name = "sinomo-app-daemon"
-version = "0.1.0"
-dependencies = [
- "sinomo-cli",
- "sinomo-client",
- "sinomo-runtime",
- "sinomo-testdir",
 ]
 
 [[package]]

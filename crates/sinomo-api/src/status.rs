@@ -38,7 +38,7 @@ pub const SINOMO_DAEMON_API_PROTOCOL_VERSION: u32 = 1;
 /// Environment variable set only on an app-owned daemon child. The value is observational
 /// process-instance identity, not an authority token.
 pub const SINOMO_APP_DAEMON_LAUNCH_ID_ENV: &str = "SINOMO_APP_DAEMON_LAUNCH_ID";
-/// Optional development/test override for the sibling app-daemon executable.
+/// Optional development/test override for the sibling `sinomo` CLI executable used by the app.
 pub const SINOMO_APP_DAEMON_BINARY_ENV: &str = "SINOMO_APP_DAEMON_BINARY";
 
 static DAEMON_BUILD_INFO: OnceLock<DaemonBuildInfo> = OnceLock::new();

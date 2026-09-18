@@ -138,14 +138,14 @@ explicit current workspace.
 To open the graphical application from the repository:
 
 ```sh
-cargo build -p sinomo-app-daemon -p sinomo-ui-extension-host -p sinomo-app
+cargo build -p sinomo -p sinomo-ui-extension-host -p sinomo-app
 cargo run -p sinomo-app
 ```
 
 The app and CLI use the same selected data directory and daemon state. If no
-daemon is running, the desktop launcher starts the sibling `sinomo-app-daemon`
-process and holds its lifetime lease across app updates. An already-running daemon is merely
-attached and is not stopped when the window closes.
+daemon is running, the desktop launcher starts the sibling CLI with
+`sinomo daemon run --app-owned` and holds its lifetime lease across app updates.
+An already-running daemon is merely attached and is not stopped when the window closes.
 Custom module previews additionally use the sibling
 `sinomo-ui-extension-host`; it is started only for a selected custom surface
 and is terminated with that surface or the app.

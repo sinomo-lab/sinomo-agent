@@ -319,7 +319,7 @@ compilation.
 Build the app with both sibling helpers:
 
 ```sh
-cargo build -p sinomo-app-daemon -p sinomo-ui-extension-host -p sinomo-app
+cargo build -p sinomo -p sinomo-ui-extension-host -p sinomo-app
 ```
 
 Do not expose a `WidgetPod`, Rust trait object, native widget callback, raw

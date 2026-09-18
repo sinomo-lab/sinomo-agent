@@ -1,4 +1,5 @@
 use super::*;
+use sinomo_core::local::SinomoDataDir;
 
 pub(super) fn bundle(root: &Path, version: &str) -> PathBuf {
     let directory = root.join(version);
@@ -12,6 +13,79 @@ pub(super) fn bundle(root: &Path, version: &str) -> PathBuf {
     }
     write_bundle_manifest(&directory, version.into(), &names).unwrap();
     directory
+}
+
+#[test]
+fn installed_legacy_bundle_uses_bootstrap_cli_but_cannot_be_staged_again() {
+    let root = sinomo_testdir::TestDir::new("desktop-installed-legacy");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let releases = DesktopReleases::new(data_dir.root());
+    let directory = bundle(&root, "legacy");
+    let mut manifest = read_manifest(&directory).unwrap();
+    let cli_name = crate::executable_name("sinomo");
+    let legacy_name = crate::executable_name("sinomo-app-daemon");
+    let entry = manifest
+        .files
+        .iter_mut()
+        .find(|file| file.path == cli_name)
+        .unwrap();
+    fs::rename(directory.join(&cli_name), directory.join(&legacy_name)).unwrap();
+    entry.path = legacy_name.clone();
+    atomic_json(&directory.join(APP_BUNDLE_MANIFEST), &manifest).unwrap();
+    assert!(
+        releases
+            .stage(&directory)
+            .unwrap_err()
+            .contains("missing sinomo")
+    );
+
+    // Reconstruct a release installed by the previous version without changing the new
+    // staging policy. Its manifest identity and every historical file remain mandatory.
+    let id = release_id(&manifest).unwrap();
+    let installed = releases.release_dir(&id).unwrap();
+    fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    fs::rename(directory, &installed).unwrap();
+    releases
+        .change(|state| {
+            state.status.active_release = Some(id);
+            Ok(())
+        })
+        .unwrap();
+    let bootstrap = std::env::current_exe().unwrap();
+    let error = supervise_app(&data_dir, &bootstrap, &[], |cli| {
+        assert!(
+            cli.is_none(),
+            "legacy helpers must not be selected as CLI hosts"
+        );
+        Err::<(), _>("verified legacy launch".into())
+    })
+    .unwrap_err();
+    assert_eq!(error, "verified legacy launch");
+
+    fs::write(installed.join(legacy_name), b"tampered old helper").unwrap();
+    let error = supervise_app(&data_dir, &bootstrap, &[], |_| -> Result<()> {
+        panic!("tampered legacy bundle must fail before runtime startup")
+    })
+    .unwrap_err();
+    assert!(error.contains("mismatch"));
+}
+
+#[test]
+fn desktop_bundle_requires_and_verifies_the_cli_host() {
+    let root = sinomo_testdir::TestDir::new("desktop-cli-bundle");
+    let directory = bundle(&root, "cli-host");
+    let manifest = read_manifest(&directory).unwrap();
+    verify_bundle(&directory, &manifest).unwrap();
+    let cli = crate::executable_name("sinomo");
+    let mut missing_cli = manifest.clone();
+    missing_cli.files.retain(|file| file.path != cli);
+    assert!(
+        validate_manifest(&missing_cli)
+            .unwrap_err()
+            .contains(&format!("missing {cli}"))
+    );
+    fs::write(directory.join(cli), b"tampered CLI").unwrap();
+    assert!(verify_bundle(&directory, &manifest).is_err());
 }
 
 #[test]

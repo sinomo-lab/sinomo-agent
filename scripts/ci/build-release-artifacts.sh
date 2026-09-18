@@ -57,7 +57,7 @@ for target in "${targets[@]}"; do
   echo "Building sinomo for ${target}"
   packages=(-p sinomo)
   if [[ "${release_profile}" == desktop ]]; then
-    packages+=(-p sinomo-app -p sinomo-app-daemon -p sinomo-ui-extension-host)
+    packages+=(-p sinomo-app -p sinomo-ui-extension-host)
     archive_name="${archive_name/sinomo-/sinomo-desktop-}"
   fi
   cargo build --locked --release "${packages[@]}" --target "${target}"
@@ -78,7 +78,7 @@ for target in "${targets[@]}"; do
     if [[ "${target}" == *windows* ]]; then artifact_os="windows"; suffix=".exe"; fi
     "${manifest_tool}" rollout app package --directory "${release_directory}" \
       --revision "${source_revision}" --target-os "${artifact_os}" --target-arch "${artifact_arch}"
-    archive_files+=("sinomo-app${suffix}" "sinomo-app-daemon${suffix}" "sinomo-ui-extension-host${suffix}" desktop-release.json)
+    archive_files+=("sinomo-app${suffix}" "sinomo-ui-extension-host${suffix}" desktop-release.json)
   fi
   if [[ "${archive_name}" == *.zip ]]; then
     archive_paths=()

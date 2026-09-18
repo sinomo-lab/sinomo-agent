@@ -1,5 +1,6 @@
 use super::*;
 
+mod app;
 mod cluster;
 mod daemon;
 mod debug;
@@ -19,6 +20,7 @@ mod test_cases_dfs;
 mod test_cases_models;
 mod test_cases_network;
 
+pub(crate) use app::*;
 pub(crate) use cluster::*;
 pub(crate) use daemon::*;
 pub(crate) use debug::*;

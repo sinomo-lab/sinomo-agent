@@ -10,6 +10,7 @@ use sinomo_runtime::cluster::ClusterKvPathsExt;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DaemonCliCommand {
     Run(DaemonRunOptions),
+    RunAppOwned(DaemonRunOptions),
     Start(DaemonRunOptions),
     Status(DaemonStatusOptions),
     Stop(DaemonRunOptions),
@@ -57,10 +58,15 @@ fn daemon_cli_spec() -> CliCommandSpec {
             ),
         ])
     };
+    let mut run = daemon_action("run", "run the main daemon in the foreground");
+    run.options.push(CliOptionSpec::flag(
+        "--app-owned",
+        "lease this foreground daemon to the desktop launcher through stdin",
+    ));
     CliCommandSpec::new("daemon", "control local Sinomo daemons")
         .help_on_empty()
         .with_children([
-            daemon_action("run", "run the main daemon in the foreground"),
+            run,
             daemon_action("start", "start the main daemon detached"),
             daemon_action("status", "show main daemon status"),
             daemon_action("stop", "stop the main daemon"),
@@ -137,6 +143,9 @@ fn parse_daemon_matches(matches: &CliCommandMatches) -> Result<DaemonCliCommand,
             .and_then(|options| daemon_status_options_from_matches(matches, options))
     };
     match path.as_slice() {
+        ["daemon", "run"] if matches.contains("--app-owned") => {
+            main().map(DaemonCliCommand::RunAppOwned)
+        }
         ["daemon", "run"] => main().map(DaemonCliCommand::Run),
         ["daemon", "start"] => main().map(DaemonCliCommand::Start),
         ["daemon", "status"] => main_status().map(DaemonCliCommand::Status),
@@ -160,6 +169,7 @@ pub(crate) fn parse_daemon_schema_for_test(args: &[String]) -> Result<DaemonCliC
 pub(crate) fn run_daemon_cli_command(command: DaemonCliCommand) -> Result<(), CliError> {
     match command {
         DaemonCliCommand::Run(options) => run_daemon(options),
+        DaemonCliCommand::RunAppOwned(options) => run_leased_app_daemon(options),
         DaemonCliCommand::Start(options) => start_daemon(options),
         DaemonCliCommand::Status(options) => print_daemon_status(options),
         DaemonCliCommand::Stop(options) => stop_daemon(options),
@@ -252,7 +262,7 @@ pub(crate) fn run_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
 
 /// Run the main daemon as a foreground child owned by the graphical app.
 ///
-/// The process lifecycle is supplied by the small `sinomo-app-daemon` wrapper; this function
+/// The process lifecycle is supplied by `daemon run --app-owned`; this function
 /// deliberately changes only the product host role. It keeps the same data directory, lock,
 /// cluster identity, service routes, and authority paths as a normal main daemon.
 pub(crate) fn run_app_owned_daemon_host(options: DaemonRunOptions) -> Result<(), CliError> {

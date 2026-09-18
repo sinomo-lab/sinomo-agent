@@ -750,15 +750,16 @@ pub fn run_desktop_app_supervisor(
     app: &Path,
     args: &[String],
 ) -> Result<i32, String> {
-    sinomo_runtime::rollout::desktop::supervise_app(data_dir, app, args, |selected_app| {
-        let helper = selected_app.with_file_name(sinomo_runtime::rollout::executable_name(
-            "sinomo-app-daemon",
-        ));
-        let managed = sinomo_runtime::rollout::desktop::DesktopReleases::new(data_dir.root())
-            .status()?
-            .active_release
-            .is_some();
-        sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), managed.then_some(helper))
+    sinomo_runtime::rollout::desktop::supervise_app(data_dir, app, args, |bundled_cli| {
+        let binary = bundled_cli
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                std::env::var_os(sinomo_runtime::api::SINOMO_APP_DAEMON_BINARY_ENV)
+                    .map(PathBuf::from)
+            })
+            .map(Ok)
+            .unwrap_or_else(|| std::env::current_exe().map_err(|error| error.to_string()))?;
+        sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), Some(binary))
     })
 }
 
@@ -1628,6 +1629,7 @@ pub fn default_cli_command_registry() -> CliCommandRegistry {
     let module_config = default_module_cli_command_config(local_data_dir.as_ref());
     let mut registry = CliCommandRegistry::new()
         .register(help_cli_command_handler())
+        .register(app_cli_command_handler())
         .register(cluster_cli_command_handler())
         .register(install_cli_command_handler())
         .register(uninstall_cli_command_handler())
@@ -5269,14 +5271,6 @@ pub(crate) fn ensure_cluster_directory_installed() {
 pub fn run(args: Vec<String>) -> Result<(), CliError> {
     init_explicit_cli_dfs_perf_tracing(&args);
     run_parsed_cli_invocation(parse_cli_invocation(&args)?)
-}
-
-/// Host the full main-daemon product catalog in a foreground process whose external wrapper owns
-/// its lifetime. This is intentionally separate from CLI parsing so the graphical app's sibling
-/// daemon executable does not masquerade as a general command-line surface.
-pub fn run_app_owned_daemon(options: DaemonRunOptions) -> Result<(), CliError> {
-    ensure_cluster_directory_installed();
-    commands::run_app_owned_daemon_host(options)
 }
 
 fn init_explicit_cli_dfs_perf_tracing(args: &[String]) {

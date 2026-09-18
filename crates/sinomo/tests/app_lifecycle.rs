@@ -11,24 +11,186 @@ use sinomo_runtime::local::SinomoDataDir;
 
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
-#[cfg(unix)]
+struct TestProcess(Child);
+
+impl std::ops::Deref for TestProcess {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TestProcess {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+// The supervisor launches this test executable as a headless GUI stand-in. It uses the same
+// client readiness path as the real GUI, allowing lifecycle and exit-code checks on every OS.
+#[test]
+#[ignore = "subprocess fixture for desktop_cli_supervises_and_reaps_its_owned_daemon"]
+fn supervised_app_fixture() {
+    assert!(std::env::var_os(sinomo_client::api::app::update::APP_SUPERVISED_ENV).is_some());
+    assert!(std::env::var_os(sinomo_client::api::app::update::APP_LAUNCH_TOKEN_ENV).is_some());
+    let data_dir = SinomoDataDir::from_env_or_home().unwrap();
+    let status = sinomo_client::connect_to_supervised_daemon(&data_dir, &|_| {}).unwrap();
+    std::fs::write(
+        data_dir.root().join("fixture-daemon-pid"),
+        status.pid.to_string(),
+    )
+    .unwrap();
+    std::process::exit(
+        std::env::var("SINOMO_TEST_APP_EXIT")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+}
+
+#[test]
+fn desktop_cli_supervises_and_reaps_its_owned_daemon() {
+    for exit_code in [0, 23] {
+        let root = sinomo_testdir::TestDir::new("desktop-cli-supervisor");
+        let data_dir = SinomoDataDir::new(root.join("data"));
+        let mut child = TestProcess(
+            desktop_supervisor_command(&data_dir, exit_code)
+                .spawn()
+                .expect("start CLI desktop supervisor"),
+        );
+        let exit = wait_for_exit(&mut child, Duration::from_secs(60));
+        assert_eq!(exit.code(), Some(exit_code));
+        assert!(data_dir.root().join("fixture-daemon-pid").is_file());
+        assert!(matches!(
+            probe_daemon_status(&DaemonPaths::new(&data_dir), PROBE_TIMEOUT),
+            DaemonProbeStatus::NotRunning
+        ));
+    }
+}
+
+#[test]
+fn desktop_cli_leaves_an_independent_daemon_running() {
+    let root = sinomo_testdir::TestDir::new("desktop-cli-independent-daemon");
+    let data_dir = SinomoDataDir::new(root.join("data"));
+    let mut daemon = TestProcess(
+        Command::new(env!("CARGO_BIN_EXE_sinomo"))
+            .args(["daemon", "run", "--host", "127.0.0.1", "--port"])
+            .arg(available_loopback_port().to_string())
+            .env("SINOMO_DATA_DIR", data_dir.root())
+            .env_remove(SINOMO_APP_DAEMON_LAUNCH_ID_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let paths = DaemonPaths::new(&data_dir);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        assert!(
+            daemon.try_wait().unwrap().is_none(),
+            "independent daemon exited"
+        );
+        if let DaemonProbeStatus::Running(status) = probe_daemon_status(&paths, PROBE_TIMEOUT) {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "independent daemon readiness timed out"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.app_launch_id.is_none());
+    let mut supervisor = TestProcess(desktop_supervisor_command(&data_dir, 0).spawn().unwrap());
+    assert!(wait_for_exit(&mut supervisor, Duration::from_secs(30)).success());
+    let still_running = match probe_daemon_status(&paths, PROBE_TIMEOUT) {
+        DaemonProbeStatus::Running(status) => status,
+        other => panic!("independent daemon was stopped: {other:?}"),
+    };
+    assert_eq!(still_running.pid, daemon.id());
+    sinomo_runtime::daemon::send_daemon_shutdown_request(&status.address, Duration::from_secs(5))
+        .unwrap();
+    assert!(wait_for_exit(&mut daemon, Duration::from_secs(15)).success());
+}
+
+#[test]
+fn app_owned_daemon_requires_a_launch_identity_and_stops_on_early_eof() {
+    let root = sinomo_testdir::TestDir::new("desktop-cli-lease-validation");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sinomo"));
+    command
+        .args(["daemon", "run", "--app-owned"])
+        .env("SINOMO_DATA_DIR", root.path())
+        .env_remove(SINOMO_APP_DAEMON_LAUNCH_ID_ENV)
+        .stdin(Stdio::null());
+    let rejected = command.output().unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("requires an app lifecycle lease identity")
+    );
+    let mut child = TestProcess(
+        command
+            .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, "early-eof")
+            .args(["--host", "127.0.0.1", "--port"])
+            .arg(available_loopback_port().to_string())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(wait_for_exit(&mut child, Duration::from_secs(15)).success());
+    assert!(matches!(
+        probe_daemon_status(
+            &DaemonPaths::new(&SinomoDataDir::new(root.path())),
+            PROBE_TIMEOUT
+        ),
+        DaemonProbeStatus::NotRunning
+    ));
+}
+
+fn desktop_supervisor_command(data_dir: &SinomoDataDir, exit_code: i32) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sinomo"));
+    command
+        .args(["app", "supervise", "--"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "supervised_app_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SINOMO_DATA_DIR", data_dir.root())
+        .env(
+            sinomo_runtime::api::SINOMO_APP_DAEMON_BINARY_ENV,
+            env!("CARGO_BIN_EXE_sinomo"),
+        )
+        .env(
+            sinomo_runtime::api::SINOMO_DAEMON_PORT_ENV,
+            available_loopback_port().to_string(),
+        )
+        .env("SINOMO_TEST_APP_EXIT", exit_code.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    command
+}
+
 #[test]
 fn desktop_supervisor_initializes_and_restarts_only_its_owned_runtime() {
-    use std::os::unix::fs::PermissionsExt;
     let root = sinomo_testdir::TestDir::new("desktop-supervisor-runtime");
     let data_dir = SinomoDataDir::new(root.join("data"));
     data_dir.ensure_root_layout().unwrap();
-    let wrapper = root.join("ephemeral-helper");
-    let port = available_loopback_port();
-    let executable = env!("CARGO_BIN_EXE_sinomo-app-daemon").replace('\'', "'\\''");
-    std::fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec '{executable}' \"$@\" --host 127.0.0.1 --port {port}\n"),
+    let supervisor = sinomo_client::AppDaemonSupervisor::start(
+        data_dir.clone(),
+        Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_sinomo"))),
     )
     .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let supervisor =
-        sinomo_client::AppDaemonSupervisor::start(data_dir.clone(), Some(wrapper)).unwrap();
     let status = sinomo_client::connect_to_supervised_daemon(&data_dir, &|_| {}).unwrap();
     assert!(
         status.cluster.is_some(),
@@ -55,7 +217,7 @@ fn desktop_supervisor_initializes_and_restarts_only_its_owned_runtime() {
 #[test]
 fn automatic_port_fallback_is_discovered_through_shared_status() {
     let occupied = TcpListener::bind(("127.0.0.1", SINOMO_DAEMON_DEFAULT_PORT)).ok();
-    let root = sinomo_testdir::TestDir::new("sinomo-app-daemon-port-fallback");
+    let root = sinomo_testdir::TestDir::new("sinomo-app-owned-port-fallback");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());
     data_dir.ensure_root_layout().expect("data layout");
     let launch_id = format!("fallback-test-{}", std::process::id());
@@ -78,7 +240,7 @@ fn automatic_port_fallback_is_discovered_through_shared_status() {
 
 #[test]
 fn lifetime_pipe_bounds_the_real_daemon_process() {
-    let root = sinomo_testdir::TestDir::new("sinomo-app-daemon-lifecycle");
+    let root = sinomo_testdir::TestDir::new("sinomo-app-owned-lifecycle");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());
     data_dir.ensure_root_layout().expect("data layout");
     let port = available_loopback_port();
@@ -109,6 +271,24 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
         .expect("open SIFS through the frontend client");
     sifs.list("/")
         .expect("list SIFS through the frontend client");
+    // Cluster service publication follows local daemon readiness asynchronously. Wait for
+    // the same provider-backed catalog used by chat before opening a session.
+    let agent_client = sinomo_client::AgentManagementClient::at_address(status.address.clone());
+    let catalog_deadline = Instant::now() + Duration::from_secs(15);
+    let agents = loop {
+        let snapshot = agent_client
+            .snapshot(None)
+            .expect("query agent catalog readiness");
+        if snapshot.error.is_none() {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < catalog_deadline,
+            "agent catalog was not ready: {:?}",
+            snapshot.error
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
     let chat = sinomo_client::ChatDaemonClient::at_address(
         status.address.clone(),
         format!("lifecycle-chat-{}-{port}", std::process::id()),
@@ -156,10 +336,6 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
     history_client
         .delete(channel_id)
         .expect("delete channel through daemon history contract");
-    let agent_client = sinomo_client::AgentManagementClient::at_address(status.address.clone());
-    let agents = agent_client
-        .snapshot(None)
-        .expect("read agent management snapshot through daemon contract");
     assert!(agents.agents.iter().any(|agent| agent.id == "main-agent"));
     let custom_agent = sinomo_client::agent_contract::AgentDefinition::custom(
         "lifecycle-agent",
@@ -202,7 +378,7 @@ fn lifetime_pipe_bounds_the_real_daemon_process() {
 
 #[test]
 fn losing_helper_never_stops_the_existing_daemon() {
-    let root = sinomo_testdir::TestDir::new("sinomo-app-daemon-existing-owner");
+    let root = sinomo_testdir::TestDir::new("sinomo-app-owned-existing-owner");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());
     data_dir.ensure_root_layout().expect("data layout");
     let port = available_loopback_port();
@@ -232,7 +408,7 @@ fn losing_helper_never_stops_the_existing_daemon() {
 
 #[test]
 fn identity_changing_cluster_init_allows_an_owned_replacement() {
-    let root = sinomo_testdir::TestDir::new("sinomo-app-daemon-cluster-init-restart");
+    let root = sinomo_testdir::TestDir::new("sinomo-app-owned-cluster-init-restart");
     let data_dir = SinomoDataDir::new(root.path().to_path_buf());
     data_dir.ensure_root_layout().expect("data layout");
     let port = available_loopback_port();
@@ -264,32 +440,38 @@ fn identity_changing_cluster_init_allows_an_owned_replacement() {
     assert!(wait_for_exit(&mut second, Duration::from_secs(15)).success());
 }
 
-fn spawn_helper(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_sinomo-app-daemon"))
-        .arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(port.to_string())
-        .env("SINOMO_DATA_DIR", data_dir.root())
-        .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn app daemon helper")
+fn spawn_helper(data_dir: &SinomoDataDir, port: u16, launch_id: &str) -> TestProcess {
+    TestProcess(
+        Command::new(env!("CARGO_BIN_EXE_sinomo"))
+            .args(["daemon", "run", "--app-owned"])
+            .arg("--host")
+            .arg("127.0.0.1")
+            .arg("--port")
+            .arg(port.to_string())
+            .env("SINOMO_DATA_DIR", data_dir.root())
+            .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn app daemon helper"),
+    )
 }
 
-fn spawn_automatic_helper(data_dir: &SinomoDataDir, launch_id: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_sinomo-app-daemon"))
-        .arg("--host")
-        .arg("127.0.0.1")
-        .env("SINOMO_DATA_DIR", data_dir.root())
-        .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn automatic app daemon helper")
+fn spawn_automatic_helper(data_dir: &SinomoDataDir, launch_id: &str) -> TestProcess {
+    TestProcess(
+        Command::new(env!("CARGO_BIN_EXE_sinomo"))
+            .args(["daemon", "run", "--app-owned"])
+            .arg("--host")
+            .arg("127.0.0.1")
+            .env("SINOMO_DATA_DIR", data_dir.root())
+            .env(SINOMO_APP_DAEMON_LAUNCH_ID_ENV, launch_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn automatic app daemon helper"),
+    )
 }
 
 fn available_loopback_port() -> u16 {

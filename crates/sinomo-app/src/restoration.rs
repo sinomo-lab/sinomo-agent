@@ -3,8 +3,10 @@ use crate::{
     ui::chat::ChatWorkspaceSnapshot,
 };
 use sinomo_runtime::{
+    core::storage::durable_file::{
+        DurableAtomicFileOptions, ensure_private_directory, write_file_atomic,
+    },
     local::SinomoDataDir,
-    storage::durable_file::{DurableAtomicFileOptions, write_file_atomic},
 };
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -56,10 +58,8 @@ pub(crate) fn save(shared: &Shared) -> Result<(), String> {
         return Err("workspace snapshot exceeds the restoration limit".into());
     }
     std::fs::create_dir_all(app.data_dir.shared_configs_dir()).map_err(|e| e.to_string())?;
-    sinomo_runtime::storage::durable_file::ensure_private_directory(
-        &app.data_dir.shared_configs_dir().join("app"),
-    )
-    .map_err(|e| e.to_string())?;
+    ensure_private_directory(&app.data_dir.shared_configs_dir().join("app"))
+        .map_err(|e| e.to_string())?;
     let path = app
         .data_dir
         .root()

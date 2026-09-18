@@ -175,7 +175,8 @@ One installation contributes one normal cluster member. The main daemon owns
 cluster participation. The shadow daemon is a supervision and recovery endpoint
 and does not vote, own DFS data, or accept normal workload placement. A desktop
 graphical app attaches to that main daemon when it already exists; otherwise it
-starts the same full product in a sibling foreground process. The desktop
+starts the same full product with the sibling `sinomo daemon run --app-owned`
+CLI executable. `sinomo app supervise` owns desktop supervision. The desktop
 launcher keeps the inherited lifetime lease and exact child handle across GUI
 restarts. It stops only its own daemon when the desktop session finally closes;
 an installed daemon remains independent. The GUI process never hosts the daemon

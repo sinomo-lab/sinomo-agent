@@ -1004,7 +1004,7 @@ fn start_in_process_daemon(
     let _ = agent_runtime_control;
     let (exit_tx, exit_rx) = mpsc::channel::<String>();
     let thread = thread::Builder::new()
-        .name("sinomo-app-daemon".to_string())
+        .name("sinomo-app-connection".to_string())
         .spawn(move || {
             let data_dir = loop_paths
                 .root

@@ -26,4 +26,5 @@ sinomo-runtime = { path = "../sinomo-runtime" }
 
 [dev-dependencies]
 serde_json.workspace = true
+sinomo-client = { path = "../sinomo-client" }
 sinomo-testdir = { path = "../sinomo-testdir" }

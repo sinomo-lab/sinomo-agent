@@ -144,6 +144,7 @@ pub(crate) fn start_app_owned_daemon_with_binary(
     let options = DaemonRunOptions::main_from_environment()?;
     let mut command = Command::new(&binary);
     prepare_app_daemon_command(&mut command);
+    command.args(["daemon", "run", "--app-owned"]);
     command.arg("--host").arg(&options.host);
     if !options.port_fallback {
         command.arg("--port").arg(options.port.to_string());
@@ -245,7 +246,7 @@ fn app_daemon_binary() -> Result<PathBuf, String> {
     }
     let current = std::env::current_exe()
         .map_err(|error| format!("resolve graphical app executable: {error}"))?;
-    let file_name = format!("sinomo-app-daemon{}", std::env::consts::EXE_SUFFIX);
+    let file_name = format!("sinomo{}", std::env::consts::EXE_SUFFIX);
     let direct = current.with_file_name(&file_name);
     if direct.is_file() {
         return Ok(direct);
@@ -262,7 +263,7 @@ fn app_daemon_binary() -> Result<PathBuf, String> {
         }
     }
     Err(format!(
-        "the required sibling daemon helper `{file_name}` was not found beside {}; build/package sinomo-app and sinomo-app-daemon together or set {SINOMO_APP_DAEMON_BINARY_ENV}",
+        "the required sibling CLI executable `{file_name}` was not found beside {}; build/package sinomo-app and sinomo together or set {SINOMO_APP_DAEMON_BINARY_ENV}",
         current.display()
     ))
 }
@@ -397,7 +398,7 @@ mod tests {
     #[test]
     fn helper_override_must_name_a_file() {
         let missing =
-            std::env::temp_dir().join(format!("sinomo-app-daemon-missing-{}", next_launch_id()));
+            std::env::temp_dir().join(format!("sinomo-app-cli-missing-{}", next_launch_id()));
         let error = validate_app_daemon_binary(missing.clone(), "TEST_OVERRIDE")
             .expect_err("missing helper must fail");
         assert!(error.contains("TEST_OVERRIDE"));

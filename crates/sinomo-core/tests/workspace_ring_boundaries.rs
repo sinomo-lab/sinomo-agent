@@ -242,12 +242,16 @@ fn r2_and_application_crates_cross_the_boundary_through_sinomo_runtime() {
 #[test]
 fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
     let packages = read_workspace_packages();
+    assert!(
+        !packages.contains_key("sinomo-app-daemon"),
+        "desktop sessions must reuse the sinomo CLI binary"
+    );
     let app = packages
         .get("sinomo-app")
         .expect("sinomo-app package should exist");
     let daemon_host = packages
-        .get("sinomo-app-daemon")
-        .expect("sinomo-app-daemon package should exist");
+        .get("sinomo")
+        .expect("sinomo CLI package should exist");
     let ui_extension_host = packages
         .get("sinomo-ui-extension-host")
         .expect("sinomo-ui-extension-host package should exist");
@@ -293,7 +297,7 @@ fn graphical_app_and_app_owned_daemon_remain_separate_artifacts() {
             && daemon_host
                 .dependencies
                 .contains(&"sinomo-runtime".to_string()),
-        "the dedicated daemon host, not the GUI, owns full product composition"
+        "the CLI daemon host owns full product composition"
     );
 }
 
@@ -508,7 +512,7 @@ fn evolution_is_an_external_module_not_a_host_dependency() {
         is_native_module_package(evolution),
         "sinomo-evolution must live under modules/ as an independently built artifact"
     );
-    for host in ["sinomo", "sinomo-cli", "sinomo-app", "sinomo-app-daemon"] {
+    for host in ["sinomo", "sinomo-cli", "sinomo-app"] {
         let host = packages.get(host).expect("host package should exist");
         assert!(
             !host.dependencies.contains(&evolution.name),

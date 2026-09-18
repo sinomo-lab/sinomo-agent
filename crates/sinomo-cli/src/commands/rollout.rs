@@ -1436,15 +1436,10 @@ fn cluster_build_outputs_for_target(
     selection: &ClusterBuildOutputSelection,
 ) -> Result<Vec<BuildOutputRequest>, CliError> {
     if matches!(selection, ClusterBuildOutputSelection::Desktop) {
-        return Ok([
-            "sinomo",
-            "sinomo-app",
-            "sinomo-app-daemon",
-            "sinomo-ui-extension-host",
-        ]
-        .into_iter()
-        .map(|name| BuildOutputRequest::binary(name, name))
-        .collect());
+        return Ok(["sinomo", "sinomo-app", "sinomo-ui-extension-host"]
+            .into_iter()
+            .map(|name| BuildOutputRequest::binary(name, name))
+            .collect());
     }
     let (module_selection, include_binary) = match selection {
         ClusterBuildOutputSelection::FullRollout => (NativeModuleSelection::Default, true),
@@ -1818,7 +1813,7 @@ fn download_cluster_build_artifacts(
                     downloaded.binary.replace(destination).is_some()
                 } else if matches!(
                     artifact.name.as_str(),
-                    "sinomo-app" | "sinomo-app-daemon" | "sinomo-ui-extension-host"
+                    "sinomo-app" | "sinomo-ui-extension-host"
                 ) {
                     downloaded
                         .desktop_binaries

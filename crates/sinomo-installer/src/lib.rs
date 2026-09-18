@@ -172,7 +172,7 @@ mod desktop_install_tests {
     use super::*;
 
     #[test]
-    fn desktop_install_packages_both_binaries_and_later_install_offers_an_update() {
+    fn desktop_install_packages_all_binaries_and_later_install_offers_an_update() {
         let root = sinomo_testdir::TestDir::new("desktop-install");
         let layout = InstallLayout::new(&SinomoDataDir::new(root.join("data")), root.join("boot"));
         let source = root.join("source");

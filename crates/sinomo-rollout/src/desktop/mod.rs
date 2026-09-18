@@ -23,11 +23,7 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, String>;
-pub const DESKTOP_BINARY_STEMS: [&str; 3] = [
-    "sinomo-app",
-    "sinomo-app-daemon",
-    "sinomo-ui-extension-host",
-];
+pub const DESKTOP_BINARY_STEMS: [&str; 3] = ["sinomo-app", "sinomo", "sinomo-ui-extension-host"];
 
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_BUNDLE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -364,6 +360,13 @@ pub fn validate_manifest(manifest: &AppBundleManifest) -> Result<()> {
 }
 
 fn validate_manifest_shape(manifest: &AppBundleManifest) -> Result<()> {
+    validate_manifest_shape_for_binaries(manifest, &DESKTOP_BINARY_STEMS)
+}
+
+fn validate_manifest_shape_for_binaries(
+    manifest: &AppBundleManifest,
+    binaries: &[&str],
+) -> Result<()> {
     if manifest.schema_version != 1
         || manifest.restoration_schema != 1
         || manifest.daemon_protocol != sinomo_api::SINOMO_DAEMON_API_PROTOCOL_VERSION
@@ -401,7 +404,7 @@ fn validate_manifest_shape(manifest: &AppBundleManifest) -> Result<()> {
     if size > MAX_BUNDLE_BYTES {
         return Err("desktop bundle too large".into());
     }
-    for name in DESKTOP_BINARY_STEMS {
+    for name in binaries {
         let name = if manifest.target_os == "windows" {
             format!("{name}.exe")
         } else {
@@ -477,6 +480,10 @@ pub fn verify_bundle(root: &Path, manifest: &AppBundleManifest) -> Result<()> {
 
 pub fn verify_bundle_content(root: &Path, manifest: &AppBundleManifest) -> Result<()> {
     validate_manifest_shape(manifest)?;
+    verify_manifest_files(root, manifest)
+}
+
+fn verify_manifest_files(root: &Path, manifest: &AppBundleManifest) -> Result<()> {
     for entry in &manifest.files {
         let path = checked_file(root, &entry.path)?;
         let mut file = File::open(path).map_err(err)?;
@@ -525,7 +532,8 @@ pub fn write_bundle_manifest_for_target(
             path: name.clone(),
             size,
             content_hash: hash.finalize().to_hex().to_string(),
-            executable: name.starts_with("sinomo-"),
+            executable: matches!(name.as_str(), "sinomo" | "sinomo.exe")
+                || name.starts_with("sinomo-"),
         });
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
