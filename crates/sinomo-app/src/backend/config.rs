@@ -423,7 +423,7 @@ mod tests {
             CODEX_PROVIDER_ID,
             DEFAULT_PROVIDER_ACCOUNT,
             "",
-            sinomo_lm::OPENAI_DEFAULT_MODEL,
+            sinomo_lm::CODEX_DEFAULT_MODEL,
             "",
         )
         .expect("add Codex account");
@@ -432,26 +432,35 @@ mod tests {
             &client,
             CODEX_PROVIDER_ID,
             DEFAULT_PROVIDER_ACCOUNT,
-            "1000000",
+            "872000",
         )
         .expect("save long context cap");
         set_provider_auto_compact_token_limit(
             &client,
             CODEX_PROVIDER_ID,
             DEFAULT_PROVIDER_ACCOUNT,
-            "900000",
+            "750000",
         )
         .expect("save compaction threshold");
 
+        set_provider_effort(
+            &client,
+            CODEX_PROVIDER_ID,
+            DEFAULT_PROVIDER_ACCOUNT,
+            reasoning_effort_index(Some("ultra")),
+        )
+        .expect("save ultra selection");
         let form = provider_forms(&client).pop().expect("provider form");
-        assert_eq!(form.max_context_tokens, Some(1_000_000));
-        assert_eq!(form.auto_compact_token_limit, Some(900_000));
+        assert_eq!(form.reasoning_effort.as_deref(), Some("ultra"));
+        assert!(form.known_models.iter().any(|model| model == "gpt-6-astra"));
+        assert_eq!(form.max_context_tokens, Some(872_000));
+        assert_eq!(form.auto_compact_token_limit, Some(750_000));
         assert!(
             set_provider_max_context_tokens(
                 &client,
                 CODEX_PROVIDER_ID,
                 DEFAULT_PROVIDER_ACCOUNT,
-                "1100000",
+                "900000",
             )
             .is_err()
         );
@@ -1466,7 +1475,7 @@ pub fn cycle_provider_reasoning_effort(
 /// The reasoning-effort options offered in the Settings Select, in order. Index 0 (`"default"`)
 /// clears the override; the rest map to a concrete [`ProviderReasoningEffort`].
 pub const REASONING_EFFORT_OPTIONS: &[&str] = &[
-    "default", "minimal", "low", "medium", "high", "xhigh", "max",
+    "default", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
 pub const TEXT_VERBOSITY_OPTIONS: &[&str] = &["default", "low", "medium", "high"];

@@ -1165,12 +1165,14 @@ fn openai_workspace_agent_surfaces_expose_apply_patch() {
         .iter()
         .find(|descriptor| descriptor.spec.name == "apply_patch")
         .expect("openai apply_patch descriptor");
-    assert!(apply_patch.provider_specs.iter().any(|spec| {
-        spec.provider == "openai"
-            && spec.custom.as_ref().is_some_and(|custom| {
-                matches!(&custom.format, AgentToolCustomFormat::Grammar { .. })
-            })
-    }));
+    for provider in ["openai", "codex"] {
+        assert!(apply_patch.provider_specs.iter().any(|spec| {
+            spec.provider == provider
+                && spec.custom.as_ref().is_some_and(|custom| {
+                    matches!(&custom.format, AgentToolCustomFormat::Grammar { .. })
+                })
+        }));
+    }
 
     let fake_config = AgentConfig::new("fake", "fake")
         .with_agent_definition(AgentDefinition::coding())

@@ -10,8 +10,9 @@ fn explicit_long_context_and_compaction_limits_follow_provider_options() {
         Some(900_000),
     );
 
-    assert_eq!(budget.max_context_bytes, Some(4_000_000));
-    assert_eq!(budget.compaction_threshold_bytes(), Some(3_600_000));
+    // Codex's catalog caps this model at 872k, independently of the API provider.
+    assert_eq!(budget.max_context_bytes, Some(872_000 * 4));
+    assert_eq!(budget.compaction_threshold_bytes(), Some(872_000 * 4));
 
     let cost_aware = AgentContextBudget::for_loaded_model("codex", "gpt-5.6-sol", None);
     assert_eq!(

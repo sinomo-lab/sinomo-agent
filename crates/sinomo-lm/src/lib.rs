@@ -29,12 +29,14 @@ pub use claude_code::{
 };
 pub use codex::{
     CODEX_AUTH_CLIENT_ID, CODEX_AUTH_ISSUER, CODEX_CHATGPT_API_BASE_URL, CODEX_DEFAULT_IMAGE_MODEL,
-    CODEX_DEFAULT_MODEL, CODEX_PROVIDER_ID, CodexChatGptTokens, CodexClient, CodexConfig,
-    CodexContextManager, CodexDeviceCode, CodexDevicePoll, CodexMessage, CodexModelRequest,
-    CodexModelResponse, CodexPromptBuilder, CodexProvider, CodexRole, CodexTool, CodexToolCall,
+    CODEX_DEFAULT_MODEL, CODEX_MODELS_CLIENT_VERSION, CODEX_PROVIDER_ID, CodexChatGptTokens,
+    CodexClient, CodexConfig, CodexContextManager, CodexDeviceCode, CodexDevicePoll, CodexMessage,
+    CodexModelInfo, CodexModelRequest, CodexModelResponse, CodexPromptBuilder, CodexProvider,
+    CodexReasoningLevel, CodexRole, CodexServiceTier, CodexTool, CodexToolCall,
     CodexToolDescriptor, CodexToolRegistry, CodexToolResult, DefaultCodexContextManager,
     DefaultCodexPromptBuilder, OpenAiResponsesCodexClient, OpenAiResponsesCodexConfig,
-    SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR, codex_credentials_file_in_data_dir,
+    SINOMO_CODEX_CREDENTIALS_FILE_ENV_VAR, codex_builtin_model_catalog,
+    codex_credentials_file_in_data_dir,
 };
 pub use codex_cli::{
     CODEX_CLI_DEFAULT_MODEL, CodexCliConfig, CodexCliProvider, CodexColor, CodexSandboxMode,
@@ -224,14 +226,14 @@ pub struct LanguageModelProviderToolSpec {
     pub custom: Option<LanguageModelCustomToolSpec>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct LanguageModelCustomToolSpec {
     pub format: LanguageModelCustomToolFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_input_argument: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LanguageModelCustomToolFormat {
     Grammar { syntax: String, definition: String },
@@ -853,11 +855,13 @@ pub enum ProviderReasoningEffort {
     #[serde(rename = "xhigh", alias = "x-high", alias = "extra-high")]
     XHigh,
     Max,
+    Ultra,
 }
 
 impl ProviderReasoningEffort {
-    pub const VALUES: &'static [&'static str] =
-        &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    pub const VALUES: &'static [&'static str] = &[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
 
     pub fn as_config_value(self) -> &'static str {
         match self {
@@ -868,6 +872,7 @@ impl ProviderReasoningEffort {
             Self::High => "high",
             Self::XHigh => "xhigh",
             Self::Max => "max",
+            Self::Ultra => "ultra",
         }
     }
 
@@ -878,7 +883,7 @@ impl ProviderReasoningEffort {
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
-            Self::XHigh | Self::Max => Some("xhigh"),
+            Self::XHigh | Self::Max | Self::Ultra => Some("xhigh"),
         }
     }
 
@@ -889,7 +894,9 @@ impl ProviderReasoningEffort {
             Self::Low => Some("low"),
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
-            Self::XHigh | Self::Max => Some("xhigh"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+            Self::Ultra => Some("ultra"),
         }
     }
 
@@ -900,7 +907,7 @@ impl ProviderReasoningEffort {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
-            Self::Max => Some("max"),
+            Self::Max | Self::Ultra => Some("max"),
         }
     }
 
@@ -911,7 +918,7 @@ impl ProviderReasoningEffort {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::XHigh => Some("xhigh"),
-            Self::Max => Some("max"),
+            Self::Max | Self::Ultra => Some("max"),
         }
     }
 }
@@ -934,6 +941,7 @@ impl FromStr for ProviderReasoningEffort {
             "high" => Ok(Self::High),
             "xhigh" | "x-high" | "extra-high" => Ok(Self::XHigh),
             "max" | "maximum" => Ok(Self::Max),
+            "ultra" => Ok(Self::Ultra),
             _ => Err(format!(
                 "invalid reasoning effort `{value}`; expected one of {}",
                 Self::VALUES.join("|")
@@ -1132,9 +1140,10 @@ pub fn inferred_model_max_context_window_tokens(provider: &str, model: &str) -> 
     let provider = normalize_model_provider(provider)?;
     let model = effective_model_name(&provider, model);
     match provider.as_str() {
-        CODEX_PROVIDER_ID | OpenAiProvider::PROVIDER_ID => {
-            openai::inferred_max_context_window_tokens(&model)
+        CODEX_PROVIDER_ID | CodexCliProvider::PROVIDER_ID => {
+            codex::inferred_max_context_window_tokens(&model)
         }
+        OpenAiProvider::PROVIDER_ID => openai::inferred_max_context_window_tokens(&model),
         _ => inferred_model_context_window_tokens(&provider, &model),
     }
 }
@@ -1261,6 +1270,7 @@ fn reasoning_effort_schema() -> ConfigSchemaValue {
         ConfigSchemaChoice::new("high", "High"),
         ConfigSchemaChoice::new("xhigh", "Extra high"),
         ConfigSchemaChoice::new("max", "Maximum"),
+        ConfigSchemaChoice::new("ultra", "Ultra"),
     ])
 }
 
@@ -2406,10 +2416,15 @@ pub fn subscription_usage_provider_ids() -> &'static [&'static str] {
     ]
 }
 
-/// Return a provider's complete built-in model catalog without reading credentials or making a
-/// network request. Providers whose catalog is account- or server-defined return an empty list.
+/// Return known model names without credentials or network access. These are
+/// configuration suggestions; authenticated discovery determines account access.
 pub fn provider_known_model_ids(provider: &str) -> Vec<String> {
     match provider {
+        CODEX_PROVIDER_ID | CodexCliProvider::PROVIDER_ID => codex_builtin_model_catalog()
+            .iter()
+            .filter(|info| info.visibility == "list")
+            .map(|info| info.slug.clone())
+            .collect(),
         DeepSeekProvider::PROVIDER_ID => DeepSeekProvider::known_model_ids(),
         NvidiaProvider::PROVIDER_ID => NvidiaProvider::known_model_ids(),
         _ => Vec::new(),
@@ -4712,7 +4727,7 @@ mod tests {
         );
         assert_eq!(
             inferred_model_max_context_window_tokens(CODEX_PROVIDER_ID, "provider-default"),
-            Some(OPENAI_GPT_5_6_MAX_CONTEXT_WINDOW_TOKENS)
+            Some(872_000)
         );
         assert_eq!(
             inferred_model_context_window_tokens("deepseek", "provider-default"),
@@ -4925,6 +4940,12 @@ mod tests {
         definition
             .validate_value(&value)
             .expect("nested provider config matches schema");
+
+        value["accounts"][0]["model_options"][0]["options"]["reasoning_effort"] =
+            serde_json::Value::String("ultra".to_string());
+        definition
+            .validate_value(&value)
+            .expect("ultra matches provider option schema");
 
         value["accounts"][0]["model_options"][0]["options"]["reasoning_effort"] =
             serde_json::Value::String("impossibly-high".to_string());
