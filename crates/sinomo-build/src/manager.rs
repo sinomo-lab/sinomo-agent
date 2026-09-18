@@ -458,14 +458,18 @@ fn validate_requested_outputs(
         .iter()
         .filter(|output| output.kind == BuildArtifactKind::Binary)
     {
-        if output.name != "sinomo"
-            || output.package != "sinomo"
-            || output.cargo_target != "sinomo"
+        let supported_binary = matches!(
+            output.name.as_str(),
+            "sinomo" | "sinomo-app" | "sinomo-app-daemon" | "sinomo-ui-extension-host"
+        );
+        if !supported_binary
+            || output.package != output.name
+            || output.cargo_target != output.name
             || output.native_dylib.is_some()
         {
             return Err(BuildError::InvalidValue {
                 detail: format!(
-                    "unsupported binary output descriptor {}/{}/{}; expected sinomo/sinomo/sinomo",
+                    "unsupported binary output descriptor {}/{}/{}; expected a supported Sinomo binary with matching name, package, and Cargo target",
                     output.name, output.package, output.cargo_target
                 ),
             });
@@ -678,6 +682,68 @@ fn copy_build_artifact(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn binary_plan(outputs: Vec<BuildOutputRequest>) -> BuildPlan {
+        let source_hash = crate::build_content_hash(b"source");
+        BuildPlan::new(
+            crate::BuildSource {
+                label: "desktop-source".into(),
+                revision: None,
+                identity_hash: None,
+                bundle_hash: source_hash.clone(),
+                bundle_bytes: 6,
+            },
+            BuildKeyInput {
+                source_hash,
+                source_revision: None,
+                lockfile_hash: crate::build_content_hash(b"lock"),
+                target: crate::BuildTarget::new("windows", "x86_64")
+                    .unwrap()
+                    .with_rust_target("x86_64-pc-windows-msvc")
+                    .unwrap(),
+                profile: "release".into(),
+                features: Vec::new(),
+                toolchain_fingerprint: "desktop-test".into(),
+                outputs,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn requested_outputs_accept_complete_desktop_release() {
+        let plan = binary_plan(
+            [
+                "sinomo",
+                "sinomo-app",
+                "sinomo-app-daemon",
+                "sinomo-ui-extension-host",
+            ]
+            .into_iter()
+            .map(|name| BuildOutputRequest::binary(name, name))
+            .collect(),
+        );
+        validate_requested_outputs(Path::new("cargo"), Path::new("."), &plan)
+            .expect("desktop release outputs must pass the build worker's validation");
+    }
+
+    #[test]
+    fn requested_outputs_reject_unknown_or_aliased_desktop_binaries() {
+        let mut aliased_name = BuildOutputRequest::binary("sinomo-app", "sinomo-app");
+        aliased_name.name = "sinomo".into();
+        let mut aliased_target = BuildOutputRequest::binary("sinomo-app", "sinomo-app");
+        aliased_target.cargo_target = "sinomo".into();
+        for output in [
+            BuildOutputRequest::binary("unknown-binary", "unknown-binary"),
+            BuildOutputRequest::binary("sinomo-app", "sinomo"),
+            BuildOutputRequest::binary("sinomo", "sinomo-app"),
+            aliased_name,
+            aliased_target,
+        ] {
+            let plan = binary_plan(vec![output]);
+            assert!(validate_requested_outputs(Path::new("cargo"), Path::new("."), &plan).is_err());
+        }
+    }
 
     fn git(repo: &Path, args: &[&str]) {
         let output = crate::process::noninteractive_command("git")
